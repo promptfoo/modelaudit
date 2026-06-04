@@ -674,29 +674,59 @@ def _read_jfrog_content_prefix(
 def _detect_jfrog_mxnet_symbol_route(
     prefix: bytes,
     size_hint: int,
+    file_url: str,
 ) -> str | None:
-    """Return a bounded MXNet JSON route for a suffix-skipped JFrog artifact."""
-    from modelaudit.utils.file.detection import _detect_mxnet_symbol_prefix_route
+    """Return a bounded MXNet/XGBoost JSON route for a suffix-skipped JFrog artifact."""
+    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
 
     normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
     if not normalized_prefix.lstrip().startswith(b"{"):
         return None
 
-    return _detect_mxnet_symbol_prefix_route(
+    mxnet_route = _detect_mxnet_symbol_prefix_route(
         normalized_prefix,
         sample_is_prefix=(size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES),
         fail_closed_without_hint=True,
     )
+    suffix = PurePosixPath(urlparse(file_url).path).suffix.lower()
+    if mxnet_route != "mxnet" or (suffix != ".json" and size_hint > MXNET_SYMBOL_SIGNATURE_READ_BYTES):
+        return mxnet_route
+
+    from modelaudit.scanners.xgboost_scanner import XGBoostScanner
+
+    with tempfile.TemporaryDirectory(prefix="modelaudit_jfrog_probe_") as probe_dir:
+        probe_path = Path(probe_dir) / f"probe{suffix}"
+        probe_path.write_bytes(prefix)
+        xgboost_probe_bytes = None if suffix == ".json" else MXNET_SYMBOL_SIGNATURE_READ_BYTES
+        if XGBoostScanner._is_xgboost_json(str(probe_path), max_bytes=xgboost_probe_bytes):
+            return "xgboost"
+        if XGBoostScanner._is_probable_mxnet_overlap_candidate(str(probe_path), max_bytes=xgboost_probe_bytes):
+            return "xgboost"
+
+    return mxnet_route
+
+
+def _detect_jfrog_extensionless_xgboost_ubjson_route(file_url: str, prefix: bytes) -> str | None:
+    """Preserve bounded XGBoost UBJSON routes only for extensionless artifacts."""
+    if PurePosixPath(urlparse(file_url).path).suffix:
+        return None
+
+    from modelaudit.utils.file.detection import _detect_extensionless_xgboost_ubjson_route
+
+    return _detect_extensionless_xgboost_ubjson_route(prefix)
 
 
 def _detect_jfrog_jax_json_checkpoint_route(prefix: bytes, size_hint: int) -> str | None:
     from modelaudit.utils.file.detection import has_jax_json_checkpoint_structure
 
     normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
-    if not normalized_prefix.lstrip().startswith(b"{"):
+    sample_is_prefix = (size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES)
+    trimmed_prefix = normalized_prefix.lstrip()
+    if not trimmed_prefix:
+        return "jax_checkpoint" if sample_is_prefix else None
+    if not trimmed_prefix.startswith(b"{"):
         return None
 
-    sample_is_prefix = (size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES)
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -753,7 +783,7 @@ def _detect_jfrog_flax_msgpack_route(prefix: bytes, size_hint: int) -> str | Non
         declared_size,
         sample_is_prefix=sample_is_prefix,
     )
-    return "flax_msgpack" if route_state is True else None
+    return "flax_msgpack" if route_state is not False else None
 
 
 def _detect_jfrog_llamafile_route(prefix: bytes) -> str | None:
@@ -813,9 +843,13 @@ def _detect_jfrog_content_route_format(
     if _is_content_routed_lightgbm_signature(prefix):
         return "lightgbm", probe_download_url
 
+    xgboost_ubjson_route = _detect_jfrog_extensionless_xgboost_ubjson_route(file_url, prefix)
+    if xgboost_ubjson_route is not None:
+        return xgboost_ubjson_route, probe_download_url
     mxnet_route = _detect_jfrog_mxnet_symbol_route(
         prefix,
         size_hint,
+        file_url,
     )
     if mxnet_route is not None:
         return mxnet_route, probe_download_url
@@ -883,6 +917,7 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
         MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
         XML_MODEL_INCONCLUSIVE_FORMAT,
     )
 
@@ -899,7 +934,9 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
     if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.add("mxnet")
+        scanner_ids.update({"jax_checkpoint", "mxnet"})
+    if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("xgboost")
     if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"openvino", "pmml"})
     return scanner_ids

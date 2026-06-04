@@ -16,7 +16,11 @@ import pytest
 import requests
 
 from modelaudit.scanner_selection import scanner_selection_config_from_inputs
-from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from modelaudit.utils.file.detection import (
+    MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
+)
 from modelaudit.utils.sources.jfrog import (
     _scanner_ids_for_detected_jfrog_format,
     detect_jfrog_target_type,
@@ -65,6 +69,14 @@ def _encode_proto_varint(value: int) -> bytes:
         value >>= 7
     encoded.append(value)
     return bytes(encoded)
+
+
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
 
 
 def _build_tensorflow_remote_route_payloads() -> dict[str, bytes]:
@@ -1331,6 +1343,48 @@ class TestJFrogFolderDownload:
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_scanner_selection_preserves_bounded_jax_json_candidates(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """JAX-only scans must preserve identities or objects beyond the remote probe window."""
+        late_identity_url = "https://company.jfrog.io/artifactory/repo/models/late-identity.payload"
+        late_object_url = "https://company.jfrog.io/artifactory/repo/models/late-object.payload"
+        near_match_url = "https://company.jfrog.io/artifactory/repo/models/ajax.payload"
+        payloads = {
+            late_identity_url: (b'{"padding":"' + (b"x" * 70_000) + b'","framework":"jax","checkpoint_type":"orbax"}'),
+            late_object_url: (b" " * 70_000) + b'{"framework":"jax"}',
+            near_match_url: b'{"framework":"ajax","format":"checkpoint"}',
+        }
+        mock_list.return_value = [
+            {"name": Path(urlparse(url).path).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["jax_checkpoint"]),
+        )
+
+        assert {call.args[0] for call in mock_download.call_args_list} == {late_identity_url, late_object_url}
+        assert not (tmp_path / "ajax.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_selective_includes_truncated_flax_prefix(
         self,
         mock_list: MagicMock,
@@ -1368,6 +1422,132 @@ class TestJFrogFolderDownload:
             access_token=None,
             timeout=30,
         )
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_inconclusive_flax_prefix(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Flax probes that exhaust their bounded prefix must fail closed."""
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/checkpoint.payload"
+        payload = b"\xa0" * 100_000
+        mock_list.return_value = [
+            {"name": "checkpoint.payload", "path": payload_url, "size": len(payload), "human_size": "Unknown"}
+        ]
+        mock_get.return_value = _FakeStreamingResponse(payload)
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["flax_msgpack"]),
+        )
+
+        assert mock_get.call_args.kwargs["headers"]["Range"] == "bytes=0-65535"
+        mock_download.assert_called_once_with(
+            payload_url,
+            cache_dir=tmp_path,
+            api_token=None,
+            access_token=None,
+            timeout=30,
+        )
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_scanner_selection_preserves_xgboost_content_routes(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """XGBoost-only scans should preserve bounded UBJSON and MXNet-overlap routes."""
+        extensionless_url = "https://company.jfrog.io/artifactory/repo/models/booster"
+        inconclusive_url = "https://company.jfrog.io/artifactory/repo/models/large-booster"
+        overlap_url = "https://company.jfrog.io/artifactory/repo/models/polyglot.payload"
+        benign_url = "https://company.jfrog.io/artifactory/repo/models/manifest"
+        extensionless_payload = (
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+            + _ubjson_key(b"version")
+            + b"[]"
+            + b"}"
+        )
+        inconclusive_payload = (
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"metadata")
+            + _ubjson_string(b"x" * 100_000)
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+            + b"}"
+        )
+        overlap_payload = (
+            b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+            b'"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}'
+        )
+        benign_payload = b'{"kind":"manifest","safe":true}'
+        payloads = {
+            extensionless_url: extensionless_payload,
+            inconclusive_url: inconclusive_payload,
+            overlap_url: overlap_payload,
+            benign_url: benign_payload,
+        }
+        mock_list.return_value = [
+            {"name": Path(urlparse(url).path).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["xgboost"]),
+        )
+
+        assert {call.args[0] for call in mock_download.call_args_list} == {
+            extensionless_url,
+            inconclusive_url,
+            overlap_url,
+        }
+        assert not (tmp_path / "manifest").exists()
+
+    def test_jfrog_inconclusive_xgboost_ubjson_candidates_include_xgboost_owner(self) -> None:
+        scanner_ids = _scanner_ids_for_detected_jfrog_format(XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT)
+
+        assert scanner_ids == {"xgboost"}
+
+    def test_jfrog_inconclusive_json_candidates_include_jax_and_mxnet_owners(self) -> None:
+        scanner_ids = _scanner_ids_for_detected_jfrog_format(MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT)
+
+        assert scanner_ids == {"jax_checkpoint", "mxnet"}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
