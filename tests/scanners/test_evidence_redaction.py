@@ -142,6 +142,41 @@ def test_unterminated_r_raw_assignment_fails_closed() -> None:
     assert redacted.endswith(f"token <- {REDACTED_EVIDENCE_VALUE}")
 
 
+def test_malformed_r_raw_prefix_does_not_hide_later_assignment() -> None:
+    """A malformed raw candidate should not consume a later valid credential literal."""
+    redacted = redact_evidence_string(
+        'r"{BROKEN_PREFIX; token <- r"(LATER_RAW_SECRET)"',
+        max_chars=500,
+    )
+
+    assert "LATER_RAW_SECRET" not in redacted
+    assert redacted.endswith(f"token <- {REDACTED_EVIDENCE_VALUE}")
+
+
+def test_unterminated_quoted_r_assignments_fail_closed() -> None:
+    """Incomplete ordinary string literals should not leak their remaining payload."""
+    double_quoted = redact_evidence_string('token <- "DOUBLE_QUOTED_SECRET', max_chars=500)
+    single_quoted = redact_evidence_string("password <<- 'SINGLE_QUOTED_SECRET", max_chars=500)
+
+    assert double_quoted == f"token <- {REDACTED_EVIDENCE_VALUE}"
+    assert single_quoted == f"password <<- {REDACTED_EVIDENCE_VALUE}"
+
+
+def test_redacts_full_rightward_assignment_expressions() -> None:
+    """Rightward assignment evidence should redact calls and parenthesized values."""
+    redacted = redact_evidence_string(
+        'base::system("curl"); paste("PREFIX;RIGHTWARD_SECRET", collapse=";") -> token; '
+        '("PARENTHESIZED_SECRET") -> password',
+        max_chars=500,
+    )
+
+    assert 'base::system("curl")' in redacted
+    assert "PREFIX" not in redacted
+    assert "RIGHTWARD_SECRET" not in redacted
+    assert "PARENTHESIZED_SECRET" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2
+
+
 def test_rightward_raw_assignment_does_not_bypass_redaction_with_long_identifier() -> None:
     """Rightward targets should be inspected beyond the stored evidence length."""
     long_identifier = f"service_{'a' * 300}_token"
@@ -163,3 +198,25 @@ def test_large_rightward_assignment_evidence_avoids_pathological_backtracking() 
 
     assert "LONG_RIGHTWARD_SECRET" not in redacted
     assert redacted.startswith(f"{REDACTED_EVIDENCE_VALUE} -> service_token ")
+
+
+def test_many_raw_assignments_are_redacted_in_one_pass() -> None:
+    """Repeated raw literals should not rebuild the full evidence string per match."""
+    text = "; ".join(f'token <- r"(RAW_SECRET_{index:04d})"' for index in range(2_000))
+
+    redacted = redact_evidence_string(text, max_chars=len(text) * 2)
+
+    assert "RAW_SECRET_0000" not in redacted
+    assert "RAW_SECRET_1999" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2_000
+
+
+def test_many_rightward_assignments_are_redacted_in_one_pass() -> None:
+    """Repeated rightward targets should reuse lexical statement analysis."""
+    text = "; ".join(f"RIGHTWARD_SECRET_{index:04d} -> token" for index in range(2_000))
+
+    redacted = redact_evidence_string(text, max_chars=len(text) * 2)
+
+    assert "RIGHTWARD_SECRET_0000" not in redacted
+    assert "RIGHTWARD_SECRET_1999" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2_000
