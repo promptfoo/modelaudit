@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
 - redact and detect secrets in R serialized executable samples across native assignment syntax
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
