@@ -1408,3 +1408,18 @@ class TestDetectNetworkCommunication:
         cc_findings = [f for f in findings if f["type"] == "cc_pattern"]
         assert len(cc_findings) == 1
         assert cc_findings[0]["pattern"] == "my_custom_pattern"
+
+
+def test_network_finding_limit_preserves_high_signal_before_noisy_urls() -> None:
+    detector = NetworkCommDetector({"max_findings": 2})
+    data = (b"https://docs.example.com/reference\n" * 10) + b"callback_url=https://evil.example/exfil\n"
+
+    findings = detector.scan(data, "tokens.txt")
+
+    reported = [finding for finding in findings if finding["type"] != "detector_finding_limit"]
+    assert len(reported) == 2
+    assert any(finding["type"] == "cc_pattern" for finding in reported)
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["max_findings"] == 2
+    assert findings[-1]["analysis_incomplete"] is True
+    assert findings[-1]["truncated_finding"]["type"] == "url_detected"
