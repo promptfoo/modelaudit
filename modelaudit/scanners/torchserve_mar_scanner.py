@@ -1133,74 +1133,81 @@ class TorchServeMarScanner(BaseScanner):
         aliases: dict[str, str] = {}
         shadowed_names: set[str] = set()
         static_truthiness_bindings: dict[str, bool] = {}
-        for node in tree.body:
-            if (
-                isinstance(node, ast.Expr)
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)
-            ):
-                # Module docstring.
-                continue
-            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-                # Bare module metadata constants do not execute code.
-                continue
-            if isinstance(node, ast.Pass):
-                continue
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    binding_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                    aliases[binding_name] = alias.name if alias.asname else binding_name
-                    shadowed_names.discard(binding_name)
-                    static_truthiness_bindings.pop(binding_name, None)
-                continue
-            if isinstance(node, ast.ImportFrom):
-                if node.module is not None:
+
+        def statements_have_import_time_execution(statements: list[ast.stmt]) -> bool:
+            for node in statements:
+                if (
+                    isinstance(node, ast.Expr)
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                ):
+                    # Module docstring.
+                    continue
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                    # Bare module metadata constants do not execute code.
+                    continue
+                if isinstance(node, ast.Pass):
+                    continue
+                if isinstance(node, ast.Import):
                     for alias in node.names:
-                        if alias.name == "*":
-                            continue
-                        binding_name = alias.asname or alias.name
-                        aliases[binding_name] = f"{node.module}.{alias.name}"
+                        binding_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                        aliases[binding_name] = alias.name if alias.asname else binding_name
                         shadowed_names.discard(binding_name)
                         static_truthiness_bindings.pop(binding_name, None)
-                continue
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                aliases.pop(node.name, None)
-                shadowed_names.add(node.name)
-                static_truthiness_bindings.pop(node.name, None)
-                continue
-            if isinstance(node, ast.Assign | ast.AnnAssign):
-                is_safe_assignment = self._is_safe_import_time_assignment(node, aliases)
-                assignment_value = node.value
-                assignment_truthiness = (
-                    self._static_truthiness(assignment_value) if assignment_value is not None else None
-                )
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    for binding_name in self._target_binding_names(target):
-                        aliases.pop(binding_name, None)
-                        shadowed_names.add(binding_name)
-                        if assignment_truthiness is None:
-                            static_truthiness_bindings.pop(binding_name, None)
-                        else:
-                            static_truthiness_bindings[binding_name] = assignment_truthiness
-                if is_safe_assignment:
                     continue
-            if (
-                isinstance(node, ast.If)
-                and isinstance(node.test, ast.Name)
-                and node.test.id in static_truthiness_bindings
-            ):
-                if static_truthiness_bindings[node.test.id] is False:
+                if isinstance(node, ast.ImportFrom):
+                    if node.module is not None:
+                        for alias in node.names:
+                            if alias.name == "*":
+                                continue
+                            binding_name = alias.asname or alias.name
+                            aliases[binding_name] = f"{node.module}.{alias.name}"
+                            shadowed_names.discard(binding_name)
+                            static_truthiness_bindings.pop(binding_name, None)
+                    continue
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                    aliases.pop(node.name, None)
+                    shadowed_names.add(node.name)
+                    static_truthiness_bindings.pop(node.name, None)
+                    continue
+                if isinstance(node, ast.Assign | ast.AnnAssign):
+                    is_safe_assignment = self._is_safe_import_time_assignment(node, aliases)
+                    assignment_value = node.value
+                    assignment_truthiness = (
+                        self._static_truthiness(assignment_value) if assignment_value is not None else None
+                    )
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        for binding_name in self._target_binding_names(target):
+                            aliases.pop(binding_name, None)
+                            shadowed_names.add(binding_name)
+                            if assignment_truthiness is None:
+                                static_truthiness_bindings.pop(binding_name, None)
+                            else:
+                                static_truthiness_bindings[binding_name] = assignment_truthiness
+                    if is_safe_assignment:
+                        continue
+                if (
+                    isinstance(node, ast.If)
+                    and isinstance(node.test, ast.Name)
+                    and node.test.id in static_truthiness_bindings
+                ):
+                    selected_branch = node.body if static_truthiness_bindings[node.test.id] is True else node.orelse
+                    if statements_have_import_time_execution(selected_branch):
+                        return True
+                    continue
+                if isinstance(node, ast.If) and self._is_non_executing_import_guard(
+                    node,
+                    aliases,
+                    shadowed_names,
+                ):
+                    if statements_have_import_time_execution(node.orelse):
+                        return True
                     continue
                 return True
-            if isinstance(node, ast.If) and self._is_non_executing_import_guard(
-                node,
-                aliases,
-                shadowed_names,
-            ):
-                continue
-            return True
-        return False
+            return False
+
+        return statements_have_import_time_execution(tree.body)
 
     def _analyze_non_handler_python_files(
         self,
@@ -1477,10 +1484,8 @@ class TorchServeMarScanner(BaseScanner):
     def _static_truthiness(node: ast.AST) -> bool | None:
         if isinstance(node, ast.Constant):
             return bool(node.value)
-        if isinstance(node, ast.List | ast.Tuple | ast.Set):
-            return bool(node.elts)
-        if isinstance(node, ast.Dict):
-            return bool(node.keys)
+        if isinstance(node, ast.List | ast.Tuple | ast.Set | ast.Dict):
+            return TorchServeMarScanner._static_iterable_truthiness(node)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             operand_truthiness = TorchServeMarScanner._static_truthiness(node.operand)
             return None if operand_truthiness is None else not operand_truthiness
@@ -1691,6 +1696,35 @@ class TorchServeMarScanner(BaseScanner):
                 collector.visit(statement)
         return collector.bound_names - collector.global_names - collector.nonlocal_names
 
+    @classmethod
+    def _expanded_literal_call_arguments(cls, arguments: list[ast.expr]) -> list[ast.expr] | None:
+        expanded_arguments: list[ast.expr] = []
+        for argument in arguments:
+            if not isinstance(argument, ast.Starred):
+                expanded_arguments.append(argument)
+                continue
+            if not isinstance(argument.value, ast.List | ast.Tuple):
+                return None
+            nested_arguments = cls._expanded_literal_call_arguments(list(argument.value.elts))
+            if nested_arguments is None:
+                return None
+            expanded_arguments.extend(nested_arguments)
+        return expanded_arguments
+
+    @staticmethod
+    def _static_integer_value(node: ast.AST) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return int(node.value)
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.UAdd | ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+        ):
+            value = int(node.operand.value)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        return None
+
     def _module_names_for_import_helpers(
         self,
         node: ast.Call,
@@ -1706,9 +1740,10 @@ class TorchServeMarScanner(BaseScanner):
                 if resolved_helper_name in {"__import__", "builtins.__import__"}
                 else ("name", "package")
             )
-            if len(node.args) > len(helper_parameters) or any(isinstance(arg, ast.Starred) for arg in node.args):
+            expanded_args = self._expanded_literal_call_arguments(node.args)
+            if expanded_args is None or len(expanded_args) > len(helper_parameters):
                 continue
-            arguments_by_name = dict(zip(helper_parameters, node.args, strict=False))
+            arguments_by_name = dict(zip(helper_parameters, expanded_args, strict=False))
             valid_call = True
             for keyword in node.keywords:
                 if keyword.arg is None or keyword.arg not in helper_parameters or keyword.arg in arguments_by_name:
@@ -1724,6 +1759,11 @@ class TorchServeMarScanner(BaseScanner):
             module_name = self._static_string_value(module_arg)
             if not module_name:
                 continue
+
+            if resolved_helper_name in {"__import__", "builtins.__import__"}:
+                level_node = arguments_by_name.get("level")
+                if level_node is not None and self._static_integer_value(level_node) != 0:
+                    continue
 
             fromlist_node = arguments_by_name.get("fromlist")
             fromlist_truthiness = self._static_truthiness(fromlist_node) if fromlist_node is not None else False
@@ -2158,7 +2198,16 @@ class TorchServeMarScanner(BaseScanner):
 
             def _resolved_static_truthiness(self, node: ast.AST) -> bool | None:
                 if isinstance(node, ast.Name):
+                    if node.id in self.module_aliases:
+                        return True
                     return self.static_truthiness_aliases.get(node.id)
+                if isinstance(node, ast.Call) and scanner._dynamic_import_module_names(
+                    node,
+                    self.import_aliases,
+                    self.import_loader_aliases,
+                    self.shadowed_names,
+                ):
+                    return True
                 if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
                     operand_truthiness = self._resolved_static_truthiness(node.operand)
                     return None if operand_truthiness is None else not operand_truthiness
@@ -2253,6 +2302,37 @@ class TorchServeMarScanner(BaseScanner):
                     self._restore_state(initial_state)
                     self._record_name_assignment(name, value.orelse)
                     self._restore_state(self._merge_states(body_state, self._snapshot_state()))
+                    return
+                if isinstance(value, ast.BoolOp):
+                    possible_values: list[ast.expr] = []
+                    for index, possible_value in enumerate(value.values):
+                        if index == len(value.values) - 1:
+                            possible_values.append(possible_value)
+                            break
+                        truthiness = self._resolved_static_truthiness(possible_value)
+                        if isinstance(value.op, ast.And):
+                            if truthiness is False:
+                                possible_values.append(possible_value)
+                                break
+                            if truthiness is None:
+                                possible_values.append(possible_value)
+                        elif isinstance(value.op, ast.Or):
+                            if truthiness is True:
+                                possible_values.append(possible_value)
+                                break
+                            if truthiness is None:
+                                possible_values.append(possible_value)
+
+                    initial_state = self._snapshot_state()
+                    possible_states = []
+                    for possible_value in possible_values:
+                        self._restore_state(initial_state)
+                        self._record_name_assignment(name, possible_value)
+                        possible_states.append(self._snapshot_state())
+                    merged_state = possible_states[0]
+                    for possible_state in possible_states[1:]:
+                        merged_state = self._merge_states(merged_state, possible_state)
+                    self._restore_state(merged_state)
                     return
 
                 module_names = scanner._dynamic_import_module_names(
@@ -2669,13 +2749,27 @@ class TorchServeMarScanner(BaseScanner):
                     self._invalidate_target(target)
 
             def visit_BoolOp(self, node: ast.BoolOp) -> None:
-                for value in node.values:
+                possible_exit_states = []
+                for index, value in enumerate(node.values):
                     self.visit(value)
+                    value_state = self._snapshot_state()
+                    if index == len(node.values) - 1:
+                        possible_exit_states.append(value_state)
+                        break
                     truthiness = self._resolved_static_truthiness(value)
                     if isinstance(node.op, ast.And) and truthiness is False:
-                        return
+                        possible_exit_states.append(value_state)
+                        break
                     if isinstance(node.op, ast.Or) and truthiness is True:
-                        return
+                        possible_exit_states.append(value_state)
+                        break
+                    if truthiness is None:
+                        possible_exit_states.append(value_state)
+
+                merged_state = possible_exit_states[0]
+                for possible_state in possible_exit_states[1:]:
+                    merged_state = self._merge_states(merged_state, possible_state)
+                self._restore_state(merged_state)
 
             def visit_IfExp(self, node: ast.IfExp) -> None:
                 self.visit(node.test)
@@ -3049,9 +3143,9 @@ class TorchServeMarScanner(BaseScanner):
                 for item in node.items:
                     self.visit(item.context_expr)
                     if item.optional_vars is not None:
-                        bound_value = item.context_expr
-                        if isinstance(bound_value, ast.Call):
-                            helper_name = scanner._resolve_call_name(bound_value.func)
+                        bound_value: ast.expr | None = None
+                        if isinstance(item.context_expr, ast.Call):
+                            helper_name = scanner._resolve_call_name(item.context_expr.func)
                             if (
                                 helper_name is not None
                                 and scanner._apply_unshadowed_alias(
@@ -3061,10 +3155,13 @@ class TorchServeMarScanner(BaseScanner):
                                 )
                                 == "contextlib.nullcontext"
                             ):
-                                enter_result = self._nullcontext_enter_result(bound_value)
+                                enter_result = self._nullcontext_enter_result(item.context_expr)
                                 if enter_result is not None:
                                     bound_value = enter_result
-                        self._record_target_assignment(item.optional_vars, bound_value)
+                        if bound_value is None:
+                            self._invalidate_target(item.optional_vars)
+                        else:
+                            self._record_target_assignment(item.optional_vars, bound_value)
                 for statement in node.body:
                     self.visit(statement)
 

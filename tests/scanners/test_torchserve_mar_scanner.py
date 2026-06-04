@@ -1526,6 +1526,19 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
         ),
         (b"def handle(data, context):\n    for module in [*[]]:\n        __import__('os').system('id')\n"),
         (b"def handle(data, context):\n    return [__import__('os').system('id') for module in {**{}}]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    if [*[]]:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os', level=1).system('id')\n"),
+        (b"def handle(data, context):\n    with __import__('os') as module:\n        return module.system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') and __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1661,6 +1674,14 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
         (
             b"def handle(data, context):\n"
             b"    (module := __import__('os')) if context else (module := __import__('math'))\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    module = context and __import__('os')\n    return module.system('id')\n"),
+        (b"def handle(data, context):\n    return __import__(*['os']).system('id')\n"),
+        (b"import importlib\ndef handle(data, context):\n    return importlib.import_module(*['os']).system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    (context and (module := __import__('os'))) or (module := __import__('math'))\n"
             b"    return module.system('id')\n"
         ),
     ],
@@ -2049,6 +2070,19 @@ def test_import_time_analysis_respects_type_checking_rebinding() -> None:
     assert scanner._has_import_time_execution(imported_guard) is False
     assert scanner._has_import_time_execution(rebound_guard) is True
     assert scanner._has_import_time_execution(disabled_guard) is False
+
+
+def test_import_time_analysis_checks_selected_guard_else_branches() -> None:
+    scanner = TorchServeMarScanner()
+    false_guard_else = ast.parse(
+        "TYPE_CHECKING = False\nif TYPE_CHECKING:\n    pass\nelse:\n    __import__('os').system('id')\n"
+    )
+    imported_guard_else = ast.parse(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    pass\nelse:\n    __import__('os').system('id')\n"
+    )
+
+    assert scanner._has_import_time_execution(false_guard_else) is True
+    assert scanner._has_import_time_execution(imported_guard_else) is True
 
 
 def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:
