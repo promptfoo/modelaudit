@@ -132,6 +132,19 @@ def test_redacts_semicolon_and_nested_sensitive_query_parameters() -> None:
     assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
 
 
+def test_redacts_bracketed_sensitive_query_parameters() -> None:
+    """Array-style query keys should still be treated as sensitive keys."""
+    text = "https://example.com/hook?api_key[]=ARRAYSECRET123&token[0]=INDEXSECRET456&ok=1"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ARRAYSECRET123" not in redacted
+    assert "INDEXSECRET456" not in redacted
+    assert "api_key%5B%5D=<redacted>" in redacted
+    assert "token%5B0%5D=<redacted>" in redacted
+    assert "ok=1" in redacted
+
+
 def test_redacts_malformed_userinfo_url() -> None:
     """Malformed userinfo URLs should fail closed instead of returning raw evidence."""
     text = "download=https://user:LEAKY-PASS@[::1/path?token=QUERYSECRET"

@@ -753,6 +753,19 @@ def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
     assert preview.count("<redacted>") == 3
 
 
+def test_savedmodel_preview_redaction_removes_bracketed_query_credentials() -> None:
+    preview = _safe_decoded_preview(
+        "https://callback.example/hook?api_key[]=ARRAYSECRET123&token[0]=INDEXSECRET456&ok=1",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "INDEXSECRET456" not in preview
+    assert "api_key%5B%5D=<redacted>" in preview
+    assert "token%5B0%5D=<redacted>" in preview
+    assert "ok=1" in preview
+
+
 def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None:
     preview = _safe_decoded_preview(
         'private_key = """MULTILINESECRET123\nSTILLSECRET456"""\n'

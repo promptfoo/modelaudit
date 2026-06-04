@@ -100,6 +100,7 @@ HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
 NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]"
 )
+BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -132,7 +133,7 @@ def _redact_url(match: re.Match[str]) -> str:
     query_items = []
     normalized_query = HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query).replace(";", "&")
     for key, value in parse_qsl(normalized_query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
+        if _normalize_query_key(key) in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
             query_items.append((key, value))
@@ -157,6 +158,10 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
             break
         decoded = next_decoded
     return bool(NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded))
+
+
+def _normalize_query_key(key: str) -> str:
+    return BRACKETED_QUERY_KEY_SUFFIX_RE.sub("", key).lower()
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
