@@ -7064,6 +7064,160 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    @pytest.mark.parametrize(
+        ("helper_import", "endpoint"),
+        [
+            (b"from builtins import getattr as helper\n", b"helper(ctypes_alias, 'CDLL')('payload')\n"),
+            (b"from builtins import vars as helper\n", b"helper(ctypes_alias)['CDLL']('payload')\n"),
+            (
+                b"from builtins import (\n    getattr as helper,\n)\n",
+                b"helper(ctypes_alias, 'CDLL')('payload')\n",
+            ),
+        ],
+    )
+    def test_scan_model_detects_late_ctypes_call_through_imported_builtin_helper(
+        self, helper_import: bytes, endpoint: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + helper_import + b"import ctypes as ctypes_alias\n" + padding + endpoint
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("helper_import", "safe_rebind", "endpoint"),
+        [
+            (
+                b"from builtins import getattr as helper\n",
+                b"helper = lambda *_args: len\n",
+                b"helper(ctypes_alias, 'CDLL')('payload')\n",
+            ),
+            (
+                b"from builtins import vars as helper\n",
+                b"helper = lambda *_args: {'CDLL': len}\n",
+                b"helper(ctypes_alias)['CDLL']('payload')\n",
+            ),
+        ],
+    )
+    def test_scan_model_ignores_late_shadowed_imported_builtin_helper(
+        self, helper_import: bytes, safe_rebind: bytes, endpoint: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + helper_import + b"import ctypes as ctypes_alias\n" + padding + safe_rebind + endpoint
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            b"loader._dlltype = ctypes.CDLL\n",
+            b"loader.__dict__['_dlltype'] = ctypes.CDLL\n",
+            b"setattr(loader, '_dlltype', ctypes.CDLL)\n",
+            b"vars(loader)['_dlltype'] = ctypes.CDLL\n",
+        ],
+    )
+    def test_scan_model_detects_late_inert_libraryloader_dlltype_rebound(self, mutation: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport ctypes\nloader = ctypes.LibraryLoader(len)\n" + padding + mutation + b"loader.payload\n"
+        )
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "late_state",
+        [
+            b"loader.label = 'debug'\nloader.payload\n",
+            b"loader._dlltype = len\nloader.payload\n",
+        ],
+    )
+    def test_scan_model_ignores_late_inert_libraryloader_safe_state(self, late_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport ctypes\nloader = ctypes.LibraryLoader(len)\n" + padding + late_state
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            b"@runpy_alias.run_path('payload.py')\ndef payload():\n    pass\n",
+            b"def payload(value=runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"class Payload(runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"class Payload(metaclass=runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"def payload() -> runpy_alias.run_path('payload.py'):\n    pass\n",
+        ],
+    )
+    def test_scan_model_detects_late_runpy_definition_time_call(self, definition: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as runpy_alias\n" + padding + definition
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            b"@runpy_alias.run_path('payload.py')\ndef payload():\n    pass\n",
+            b"def payload(value=runpy_alias.run_path('payload.py')):\n    pass\n",
+        ],
+    )
+    def test_scan_model_ignores_late_safe_runpy_definition_time_call(self, definition: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as runpy_alias\nrunpy_alias.run_path = print\n" + padding + definition
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_late_deferred_runpy_annotation(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xfffrom __future__ import annotations\n"
+            b"import runpy as runpy_alias\n"
+            + padding
+            + b"def payload() -> runpy_alias.run_path('payload.py'):\n    pass\n"
+        )
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_late_ctypes_subscript_after_safe_rebind(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)

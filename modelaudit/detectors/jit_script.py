@@ -194,6 +194,7 @@ _TYPED_PROOF_MEMBER_NAMES = frozenset(
         "windll",
     }
 )
+_TYPED_STATE_MEMBER_NAMES = _TYPED_PROOF_MEMBER_NAMES | frozenset({"_dlltype"})
 _EMBEDDED_PYTHON_BYTE_LIMIT_REASON = "jit_embedded_python_byte_limit"
 _EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON = "jit_embedded_python_snippet_limit"
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
@@ -461,6 +462,8 @@ def _bounded_priority_embedded_python_candidate_at_offset(
         for header_start, header_end in _enclosing_compound_header_segments(candidate, usage_line[0]):
             add_segment(header_start, header_end)
         add_segment(*usage_line)
+        for definition_start, definition_end in _definition_time_usage_segments(candidate, *usage_line):
+            add_segment(definition_start, definition_end)
 
     tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
     tail_start = candidate.rfind(b"\n", 0, tail_start) + 1
@@ -523,8 +526,19 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
 def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
     aliases: set[bytes] = set()
     discovered_aliases = set(priority_aliases)
+    library_loader_constructors = _priority_library_loader_constructor_references(tree)
     expensive_probes = 0
     for target, value in _assignment_targets_and_values_in_tree(tree):
+        value_reference = _simple_reference_name(value)
+        if value_reference in library_loader_constructors:
+            library_loader_constructors.add(target)
+            aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
+            continue
+        if isinstance(value, ast.Call) and _simple_reference_name(value.func) in library_loader_constructors:
+            aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
+            continue
         if _expression_is_priority_alias_reference(value, discovered_aliases):
             aliases.add(target.encode("utf-8"))
             discovered_aliases.add(target)
@@ -546,6 +560,18 @@ def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: s
             aliases.add(target.encode("utf-8"))
             discovered_aliases.add(target)
     return aliases
+
+
+def _priority_library_loader_constructor_references(tree: ast.AST) -> set[str]:
+    references: set[str] = set()
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "ctypes":
+                    references.add(f"{alias.asname or 'ctypes'}.LibraryLoader")
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "ctypes":
+            references.update(alias.asname or alias.name for alias in statement.names if alias.name == "LibraryLoader")
+    return references
 
 
 def _assignment_targets_and_values_in_tree(tree: ast.AST) -> list[tuple[str, ast.AST]]:
@@ -827,7 +853,7 @@ def _priority_alias_usage_lines(
         def tracked_reference(owner: bytes, member: bytes) -> str | None:
             owner_name = owner.decode("utf-8")
             member_name = member.decode("utf-8")
-            if owner_name not in retained_alias_names or member_name not in _TYPED_PROOF_MEMBER_NAMES:
+            if owner_name not in retained_alias_names or member_name not in _TYPED_STATE_MEMBER_NAMES:
                 return None
             return f"{owner_name}.{member_name}"
 
@@ -909,7 +935,7 @@ def _priority_alias_usage_lines(
             member_name = _static_getattr_member_name(key)
             return (
                 f"{owner}.{member_name}"
-                if member_name is not None and member_name in _TYPED_PROOF_MEMBER_NAMES
+                if member_name is not None and member_name in _TYPED_STATE_MEMBER_NAMES
                 else None
             )
 
@@ -1074,7 +1100,7 @@ def _priority_alias_usage_lines(
             if owner is None or key is None:
                 return
             member_name = _static_getattr_member_name(key)
-            if member_name in _TYPED_PROOF_MEMBER_NAMES:
+            if member_name in _TYPED_STATE_MEMBER_NAMES:
                 deleted_keys.add(f"{owner}.{member_name}")
 
         for ast_statement in _deterministically_executed_statements(tree.body):
@@ -1084,7 +1110,7 @@ def _priority_alias_usage_lines(
                         isinstance(target, ast.Attribute)
                         and isinstance(target.value, ast.Name)
                         and target.value.id in retained_alias_names
-                        and target.attr in _TYPED_PROOF_MEMBER_NAMES
+                        and target.attr in _TYPED_STATE_MEMBER_NAMES
                     ):
                         deleted_keys.add(f"{target.value.id}.{target.attr}")
                     elif isinstance(target, ast.Subscript):
@@ -1101,7 +1127,7 @@ def _priority_alias_usage_lines(
                         and len(call.args) >= 2
                         and isinstance(call.args[0], ast.Name)
                         and call.args[0].id in retained_alias_names
-                        and (member_name := _static_getattr_member_name(call.args[1])) in _TYPED_PROOF_MEMBER_NAMES
+                        and (member_name := _static_getattr_member_name(call.args[1])) in _TYPED_STATE_MEMBER_NAMES
                     ):
                         deleted_keys.add(f"{call.args[0].id}.{member_name}")
                     elif isinstance(call.func, ast.Name) and call.func.id in typed_member_delete_aliases and call.args:
@@ -1715,7 +1741,7 @@ def _priority_alias_usage_lines(
                 )
             if import_span[1] <= search_start:
                 structural_context_line = (
-                    _compact_builtins_dict_import_statement(import_statement) or structural_context_line
+                    _compact_tracked_builtins_import_statement(import_statement) or structural_context_line
                 )
         context_line_indent = len(context_line) - len(context_line.lstrip())
         if structural_context_line.strip():
@@ -1754,6 +1780,14 @@ def _priority_alias_usage_lines(
             and "builtins.dict" not in shadowed_descriptor_names | uncertain_descriptor_names
         ):
             builtin_dict_descriptor_aliases.update(builtins_dict_import_aliases)
+        if context_guard_value is True and not context_is_scoped:
+            for alias_name, helper_name in _builtins_helper_import_alias_bindings(
+                canonical_context_import_line
+            ).items():
+                canonical_builtin_helper_aliases[alias_name] = helper_name
+                uncertain_canonical_builtin_helper_aliases.discard(alias_name)
+                shadowed_builtin_helper_names.discard(alias_name)
+                uncertain_builtin_helper_names.discard(alias_name)
         context_binding_name = _simple_late_binding_name(structural_context_line)
         context_descriptor_reference = _simple_late_assignment_value_reference(structural_context_line)
         context_canonical_helper = canonical_builtin_helper_aliases.get(context_descriptor_reference or "")
@@ -2194,7 +2228,7 @@ def _priority_alias_usage_lines(
                     )
                 )
                 and (
-                    any(member.encode("utf-8") in typed_member_statement for member in _TYPED_PROOF_MEMBER_NAMES)
+                    any(member.encode("utf-8") in typed_member_statement for member in _TYPED_STATE_MEMBER_NAMES)
                     or any(
                         marker in typed_member_statement
                         for marker in (b"__dict__", b"vars", b"setattr", b"update", b"__ior__", b"setdefault")
@@ -3208,6 +3242,15 @@ def _priority_alias_usage_lines(
                     and "builtins.dict" not in shadowed_descriptor_names | uncertain_descriptor_names
                 ):
                     builtin_dict_descriptor_aliases.update(builtins_dict_import_aliases)
+                if late_guard_value is True and not import_is_scoped:
+                    helper_import_bindings = _builtins_helper_import_alias_bindings(canonical_import_statement)
+                    for alias_name, helper_name in helper_import_bindings.items():
+                        canonical_builtin_helper_aliases[alias_name] = helper_name
+                        uncertain_canonical_builtin_helper_aliases.discard(alias_name)
+                        shadowed_builtin_helper_names.discard(alias_name)
+                        uncertain_builtin_helper_names.discard(alias_name)
+                    if helper_import_bindings:
+                        late_builtins_import_spans.append(import_span)
                 for name in _statement_defined_names(canonical_import_statement):
                     if name == "dict":
                         shadowed_descriptor_names.add("dict")
@@ -3709,6 +3752,13 @@ def _priority_alias_usage_lines(
             )
             if root_names:
                 state_spans, reaches_retained_alias, overflowed = retained_state_spans(root_names, line_start)
+                loader_protocol_spans: list[tuple[int, int]] = []
+                loader_protocol_overflowed = False
+                for root_name in root_names:
+                    protocol_spans, protocol_overflowed = typed_member_state_before(f"{root_name}._dlltype", line_start)
+                    if protocol_spans:
+                        loader_protocol_spans.append(protocol_spans[-1])
+                    loader_protocol_overflowed = loader_protocol_overflowed or protocol_overflowed
                 attribute_rule_codes = proof_rule_codes(root_names)
                 if (
                     not root_names.isdisjoint(fail_closed_dangerous_names)
@@ -3726,12 +3776,23 @@ def _priority_alias_usage_lines(
                     usage_lines.append(usage_span)
                     return usage_lines, frozenset({"S110"})
                 resolved_context = b"\n".join(
-                    [priority_context, *(candidate[start:end] for start, end in state_spans), member_load_line]
+                    [
+                        priority_context,
+                        *(candidate[start:end] for start, end in state_spans),
+                        *(candidate[start:end] for start, end in loader_protocol_spans),
+                        member_load_line,
+                    ]
                 )
                 has_native_member_marker = any(
                     loader_name in member_load_line for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")
                 )
-                if "S110" not in attribute_rule_codes and b"(" not in member_load_line and not has_native_member_marker:
+                if (
+                    "S110" not in attribute_rule_codes
+                    and b"(" not in member_load_line
+                    and not has_native_member_marker
+                    and not loader_protocol_spans
+                    and not loader_protocol_overflowed
+                ):
                     multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
@@ -3759,10 +3820,13 @@ def _priority_alias_usage_lines(
                     if root_name in pending_shadow_spans
                 )
                 usage_lines.extend(state_spans)
+                usage_lines.extend(loader_protocol_spans)
                 usage_lines.append(usage_span)
                 return (
                     usage_lines,
-                    replay_rule_codes if overflowed and reaches_retained_alias else frozenset(),
+                    replay_rule_codes
+                    if (overflowed and reaches_retained_alias) or loader_protocol_overflowed
+                    else frozenset(),
                 )
         elif line_end > search_start and b"(" in code_line:
             potential_root_names = _potential_late_callable_root_names(code_line).intersection(
@@ -8022,6 +8086,51 @@ def _first_body_statement_segment(
     return None
 
 
+def _definition_time_usage_segments(candidate: bytes, usage_start: int, usage_end: int) -> list[tuple[int, int]]:
+    """Complete retained definition-time expressions with enough syntax to parse."""
+    line_start = candidate.rfind(b"\n", 0, usage_start) + 1
+    segments: list[tuple[int, int]] = []
+    cursor = usage_end
+    structural_usage = _python_structural_line_bytes(candidate[line_start:usage_end]).lstrip()
+
+    if structural_usage.startswith(b"@"):
+        while cursor < len(candidate):
+            next_line_end = _line_end_offset(candidate, cursor)
+            next_line = candidate[cursor:next_line_end]
+            structural_next = _python_structural_line_bytes(next_line).lstrip()
+            if structural_next.startswith(b"@"):
+                segments.append((cursor, next_line_end))
+                cursor = next_line_end
+                continue
+            if not structural_next.startswith((b"def ", b"async def ", b"class ")):
+                return segments
+            header_start = cursor
+            header_end = next_line_end
+            parenthesis_depth = _line_parenthesis_delta(next_line)
+            while (
+                _line_has_explicit_continuation(candidate[header_start:header_end]) or parenthesis_depth > 0
+            ) and header_end < len(candidate):
+                continuation_start = header_end
+                header_end = _line_end_offset(candidate, continuation_start)
+                parenthesis_depth += _line_parenthesis_delta(candidate[continuation_start:header_end])
+            segments.append((header_start, header_end))
+            body_segment = _first_body_statement_segment(candidate, header_end, _line_indent_width(next_line))
+            if body_segment is not None:
+                segments.append(body_segment)
+            return segments
+        return segments
+
+    if structural_usage.startswith((b"def ", b"async def ", b"class ")):
+        body_segment = _first_body_statement_segment(
+            candidate,
+            usage_end,
+            _line_indent_width(candidate[line_start:usage_end]),
+        )
+        if body_segment is not None:
+            segments.append(body_segment)
+    return segments
+
+
 def _previous_header_context_segments(
     candidate: bytes,
     before_line_start: int,
@@ -8415,25 +8524,28 @@ def _tree_imports_priority_module(tree: ast.AST) -> bool:
     return False
 
 
-def _compact_builtins_dict_import_statement(statement: bytes) -> bytes | None:
-    dict_imports = _canonical_builtins_dict_import_aliases(statement)
-    if not dict_imports:
+def _compact_tracked_builtins_import_statement(statement: bytes) -> bytes | None:
+    tracked_imports = _canonical_builtins_member_import_aliases(
+        statement, frozenset({"dict", "getattr", "vars", "setattr", "delattr"})
+    )
+    if not tracked_imports:
         return None
     imports = ", ".join(
-        "dict" if (alias.asname or "dict") == "dict" else f"dict as {alias.asname}" for alias in dict_imports
+        alias.name if (alias.asname or alias.name) == alias.name else f"{alias.name} as {alias.asname}"
+        for alias in tracked_imports
     )
     return f"from builtins import {imports}\n".encode()
 
 
-def _canonical_builtins_dict_import_aliases(statement: bytes) -> list[ast.alias]:
+def _canonical_builtins_member_import_aliases(statement: bytes, member_names: frozenset[str]) -> list[ast.alias]:
     source, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
 
-    def selected_dict_imports(statements: list[ast.stmt]) -> list[ast.alias] | None:
-        dict_imports: list[ast.alias] = []
+    def selected_member_imports(statements: list[ast.stmt]) -> list[ast.alias] | None:
+        member_imports: list[ast.alias] = []
         for child in statements:
             if isinstance(child, ast.Pass):
                 continue
@@ -8449,21 +8561,33 @@ def _canonical_builtins_dict_import_aliases(statement: bytes) -> list[ast.alias]
                 except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
                     return None
                 selected_branch = child.body if bool(condition) else child.orelse
-                nested_imports = selected_dict_imports(selected_branch)
+                nested_imports = selected_member_imports(selected_branch)
                 if nested_imports is None:
                     return None
-                dict_imports.extend(nested_imports)
+                member_imports.extend(nested_imports)
                 continue
             if not isinstance(child, ast.ImportFrom) or child.module != "builtins":
                 return None
-            dict_imports.extend(alias for alias in child.names if alias.name == "dict")
-        return dict_imports
+            member_imports.extend(alias for alias in child.names if alias.name in member_names)
+        return member_imports
 
-    return selected_dict_imports(tree.body) or []
+    return selected_member_imports(tree.body) or []
+
+
+def _canonical_builtins_dict_import_aliases(statement: bytes) -> list[ast.alias]:
+    return _canonical_builtins_member_import_aliases(statement, frozenset({"dict"}))
 
 
 def _builtins_dict_import_alias_names(statement: bytes) -> set[str]:
     return {alias.asname or "dict" for alias in _canonical_builtins_dict_import_aliases(statement)}
+
+
+def _builtins_helper_import_alias_bindings(statement: bytes) -> dict[str, str]:
+    helper_names = frozenset({"getattr", "vars", "setattr", "delattr"})
+    return {
+        alias.asname or alias.name: alias.name
+        for alias in _canonical_builtins_member_import_aliases(statement, helper_names)
+    }
 
 
 def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> bool:
@@ -8645,7 +8769,7 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
                 statement_lines.append(lines[index])
 
         statement = b"".join(statement_lines).rstrip() + b"\n"
-        statement = _compact_builtins_dict_import_statement(statement) or statement
+        statement = _compact_tracked_builtins_import_statement(statement) or statement
         preserves_deferred_annotations = _is_deferred_annotations_directive(statement) and _source_defers_annotations(
             b"".join(lines[: index + 1])
         )
