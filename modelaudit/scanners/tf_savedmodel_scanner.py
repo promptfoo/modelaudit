@@ -22,7 +22,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import REDACTED_URL_CREDENTIALS, redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
@@ -132,6 +132,9 @@ _STANDALONE_KEY_SECRET_RE = re.compile(
 _PREVIEW_TOKEN_LOOKAHEAD_CHARS = 512
 _PREVIEW_TOKEN_SUFFIX_RE = re.compile(r"([A-Za-z0-9._~+-]+)\Z")
 _PREVIEW_TOKEN_CONTINUATION_RE = re.compile(r"[A-Za-z0-9._~+=-]*")
+_PREVIEW_URL_SUFFIX_RE = re.compile(r"(?i)(?P<scheme>(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://)[^\s\"'<>]*\Z")
+_PREVIEW_URL_CONTINUATION_RE = re.compile(r"[^\s\"'<>]*")
+_URL_AUTHORITY_TERMINATOR_RE = re.compile(r"[/?#]")
 
 
 def _redact_sensitive_preview_text(text: str) -> str:
@@ -140,8 +143,33 @@ def _redact_sensitive_preview_text(text: str) -> str:
     return _STANDALONE_KEY_SECRET_RE.sub("<redacted>", redacted)
 
 
-def _redact_preview_boundary_token_prefix(text: str, limit: int) -> str:
+def _url_authority_contains_userinfo(url_text: str) -> bool:
+    rest = url_text.split("://", 1)[1]
+    authority = _URL_AUTHORITY_TERMINATOR_RE.split(rest, maxsplit=1)[0]
+    return "@" in authority
+
+
+def _redact_preview_boundary_url_userinfo_prefix(text: str, limit: int) -> str:
     preview_source = text[:limit]
+    suffix_match = _PREVIEW_URL_SUFFIX_RE.search(preview_source)
+    if suffix_match is None:
+        return preview_source
+
+    lookahead = text[limit : limit + _PREVIEW_TOKEN_LOOKAHEAD_CHARS]
+    continuation_match = _PREVIEW_URL_CONTINUATION_RE.match(lookahead)
+    candidate = suffix_match.group(0) + (continuation_match.group(0) if continuation_match else "")
+    if not _url_authority_contains_userinfo(candidate) or _url_authority_contains_userinfo(suffix_match.group(0)):
+        return preview_source
+
+    return f"{preview_source[: suffix_match.start()]}{suffix_match.group('scheme')}{REDACTED_URL_CREDENTIALS}"
+
+
+def _redact_preview_boundary_secret_prefix(text: str, limit: int) -> str:
+    preview_source = text[:limit]
+    url_redacted = _redact_preview_boundary_url_userinfo_prefix(text, limit)
+    if url_redacted != preview_source:
+        return url_redacted
+
     suffix_match = _PREVIEW_TOKEN_SUFFIX_RE.search(preview_source)
     if suffix_match is None:
         return preview_source
@@ -157,7 +185,7 @@ def _redact_preview_boundary_token_prefix(text: str, limit: int) -> str:
 
 def _safe_decoded_preview(text: str, limit: int) -> str:
     """Return a bounded decoded preview safe for serialized findings."""
-    preview_source = _redact_preview_boundary_token_prefix(text, limit) if len(text) > limit else text
+    preview_source = _redact_preview_boundary_secret_prefix(text, limit) if len(text) > limit else text
     redacted = _redact_sensitive_preview_text(preview_source)
     if len(text) <= limit and len(redacted) <= limit:
         return redacted

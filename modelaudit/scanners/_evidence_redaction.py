@@ -47,21 +47,37 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "x-goog-signature",
     }
 )
-SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
     r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
     r"(?:[_.-][a-z0-9]+)*"
+)
+CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z][A-Za-z0-9]*)?"
+    r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
+    r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
+    r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
+    r"(?:[A-Z][A-Za-z0-9]*)?"
+)
+SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)" r"[^\s\"';&|]+"
 )
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
-QUOTED_VALUE_PATTERN: Final[str] = r"(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*?(?P=quote)"
-UNTERMINATED_QUOTED_VALUE_PATTERN: Final[str] = r"(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*\Z"
+STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
+QUOTED_VALUE_PATTERN: Final[str] = (
+    rf"{STRING_LITERAL_PREFIX_PATTERN}(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*?(?P=quote)"
+)
+UNTERMINATED_QUOTED_VALUE_PATTERN: Final[str] = (
+    rf"{STRING_LITERAL_PREFIX_PATTERN}(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*\Z"
+)
+UNQUOTED_VALUE_PATTERN: Final[str] = r"[^\s\"';&|,}\]]+(?![\"'])"
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|,}}]+"
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){UNQUOTED_VALUE_PATTERN}"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){QUOTED_VALUE_PATTERN}"
@@ -89,12 +105,12 @@ UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.co
 )
 QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
-    r"[^\s\"';&|,}]+"
+    rf"{UNQUOTED_VALUE_PATTERN}"
 )
 SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
     rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
-    r"[^\s\"';&|,\]}]+"
+    rf"{UNQUOTED_VALUE_PATTERN}"
 )
 HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
 NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
@@ -166,11 +182,13 @@ def _normalize_query_key(key: str) -> str:
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
     quote = match.group("quote")
-    return f"{match.group('prefix')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    string_prefix = match.group("string_prefix") or ""
+    return f"{match.group('prefix')}{string_prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
-    return f"{match.group('prefix')}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
+    string_prefix = match.group("string_prefix") or ""
+    return f"{match.group('prefix')}{string_prefix}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _redact_unquoted_assignment(match: re.Match[str]) -> str:

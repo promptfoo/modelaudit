@@ -60,6 +60,41 @@ def test_redacts_escaped_quote_secret_assignments() -> None:
     assert "os.system" in redacted
 
 
+def test_redacts_prefixed_string_literal_secret_assignments() -> None:
+    """Python string prefixes should be treated as part of quoted secret values."""
+    text = 'api_key = r"RAWSECRET123" headers["Authorization"] = b"BYTESECRET456" {"client_secret": f"MAPSECRET789"}'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "RAWSECRET123" not in redacted
+    assert "BYTESECRET456" not in redacted
+    assert "MAPSECRET789" not in redacted
+    assert f'api_key = r"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'headers["Authorization"] = b"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"client_secret": f"{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_redacts_camel_case_secret_assignments() -> None:
+    """Common camelCase credential keys should not preserve raw values."""
+    text = (
+        'dbPassword = "DBSECRET123" '
+        'sessionToken: "SESSIONSECRET456" '
+        '{"clientSecret": "MAPSECRET789"} '
+        'headers["githubToken"] = "GITHUBSECRET000"'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "DBSECRET123" not in redacted
+    assert "SESSIONSECRET456" not in redacted
+    assert "MAPSECRET789" not in redacted
+    assert "GITHUBSECRET000" not in redacted
+    assert f'dbPassword = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'sessionToken: "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"clientSecret": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'headers["githubToken"] = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
 def test_redacts_unterminated_quoted_secret_assignments() -> None:
     """Truncated preview windows should fail closed on unterminated secret strings."""
     text = 'api_key = "TRUNCATEDSECRET123'

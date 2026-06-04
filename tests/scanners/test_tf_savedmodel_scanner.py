@@ -794,6 +794,27 @@ def test_savedmodel_preview_redaction_removes_escaped_quote_secret() -> None:
     assert "os.system" in preview
 
 
+def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'api_key = r"RAWSECRET123"\n'
+        'dbPassword = f"DBSECRET456"\n'
+        'headers["githubToken"] = b"GITHUBSECRET789"\n'
+        'config = {"clientSecret": u"MAPSECRET000"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "RAWSECRET123" not in preview
+    assert "DBSECRET456" not in preview
+    assert "GITHUBSECRET789" not in preview
+    assert "MAPSECRET000" not in preview
+    assert 'api_key = r"<redacted>"' in preview
+    assert 'dbPassword = f"<redacted>"' in preview
+    assert 'headers["githubToken"] = b"<redacted>"' in preview
+    assert '"clientSecret": u"<redacted>"' in preview
+    assert "os.system" in preview
+
+
 def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
     private_tail = "PRIVATE_AFTER_LONG_SECRET_SHOULD_NOT_APPEAR"
     preview = _safe_decoded_preview(f'api_key = "{"A" * 10_000}"\n{private_tail}', 80)
@@ -813,6 +834,18 @@ def test_savedmodel_preview_redaction_redacts_boundary_crossing_tokens() -> None
     assert github_token not in preview
     assert private_tail not in preview
     assert "/<redacted>" in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_url_userinfo() -> None:
+    url_prefix = "https://user:very-secret-password"
+    private_tail = "PRIVATE_AFTER_USERINFO_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f"{'x' * (80 - len(url_prefix))}{url_prefix}@example.com/{private_tail}", 80)
+
+    assert "user:very-secret-password" not in preview
+    assert "very-secret-password" not in preview
+    assert private_tail not in preview
+    assert "https://<credentials-redacted>" in preview
     assert preview.endswith("...")
 
 
