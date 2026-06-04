@@ -738,7 +738,15 @@ class TestWeightDistributionScanner:
         tmp_path: Path,
     ) -> None:
         """Prerelease PyTorch versions must fail closed before torch.load."""
-        for torch_version in ["2.6.0rc1", "2.6.0a0", "2.6.0.dev20250101", "2.10.0a0"]:
+        for torch_version in [
+            "2.6.0rc1",
+            "2.6.0-rc1",
+            "2.6.0_rc1",
+            "2.6.0a0",
+            "2.6.0pre",
+            "2.6.0.dev20250101",
+            "2.10.0a0",
+        ]:
             load_called = False
 
             fake_torch: Any = types.ModuleType("torch")
@@ -770,15 +778,35 @@ class TestWeightDistributionScanner:
             assert "stable PyTorch 2.6.0 or newer" in scanner.extraction_unsafe_reason
             assert load_called is False
 
+    @pytest.mark.parametrize(
+        "torch_version",
+        [
+            "2.6.0",
+            "2.6.0+cpu",
+            "2.6.0.post1",
+            "2.6.0.post",
+            "2.6.0.post1+cpu",
+            "2.6.0_post1",
+            "2.6.0post2",
+            "2.6.0.post-3",
+            "2.6.0rev4",
+            "2.6.0-r5",
+            "2.6.0-6",
+            "2.6.0_rev7+cpu",
+            "2.6.0+cu124.gitabcdef",
+            "2.6.1",
+        ],
+    )
     def test_allows_torch_load_for_stable_patched_pytorch(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
+        torch_version: str,
     ) -> None:
         load_call: dict[str, object] = {}
 
         fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = "2.6.0+cpu"
+        fake_torch.__version__ = torch_version
 
         class FakeTensor:  # pragma: no cover - simple test double
             pass
@@ -794,7 +822,7 @@ class TestWeightDistributionScanner:
         fake_torch.load = fake_load
         monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
-        model_path = tmp_path / "stable.pt"
+        model_path = tmp_path / f"stable-{torch_version}.pt"
         model_path.write_bytes(b"not-a-valid-pytorch-model")
 
         scanner = WeightDistributionScanner()
@@ -838,7 +866,23 @@ class TestWeightDistributionScanner:
         assert scanner.extraction_unsafe
         assert load_called is False
 
-    @pytest.mark.parametrize("torch_version", ["2.6.0-custom", "2.6.0-unknown", "2.10.0-custom"])
+    @pytest.mark.parametrize(
+        "torch_version",
+        [
+            "2.6",
+            "3",
+            "2.6.0-custom",
+            "2.6.0-unknown",
+            "2.6.0+",
+            "2.6.0+cpu+extra",
+            "2.6.0.post1.dev0",
+            "2.6.0postevil",
+            "2.6.0revx",
+            "2.6.0-",
+            "2.6.0+cpu dev",
+            "2.10.0-custom",
+        ],
+    )
     def test_blocks_torch_load_for_unknown_patched_version_suffixes(
         self,
         monkeypatch: pytest.MonkeyPatch,
