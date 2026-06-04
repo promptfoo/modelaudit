@@ -4440,6 +4440,69 @@ class TestCVE202523304HydraTarget:
         )
         assert determine_exit_code(result) == 1
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "os.execlpe",
+            "os.spawnlp",
+            "os.spawnlpe",
+            "os.spawnv",
+            "os.spawnve",
+            "os.spawnvp",
+            "os.spawnvpe",
+            "os.posix_spawn",
+            "os.posix_spawnp",
+            "posix.system",
+            "posix.posix_spawn",
+            "posix.posix_spawnp",
+            "nt.system",
+            "os.startfile",
+            "nt.startfile",
+            "runpy.run_module",
+            "runpy.run_path",
+            "operator.call",
+        ],
+    )
+    def test_process_and_dynamic_execution_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Exact immediate execution aliases should not fall through to INFO-only review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "custom.spawnv_factory.SafeBuilder",
+            "custom.run_path_factory.SafeBuilder",
+            "operator.callable",
+        ],
+    )
+    def test_execution_alias_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact alias coverage should not promote similarly named custom factories."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
     def test_unknown_request_named_custom_target_remains_review_only(self, tmp_path: Path) -> None:
         """Exact sink coverage should not promote benign request-like custom factories."""
         config = {"model": {"_target_": "custom_package.requests_get_factory.SafeBuilder"}}
@@ -4487,6 +4550,117 @@ class TestCVE202523304HydraTarget:
         ]
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"target_value": "os.system", "model": {"_target_": "${target_value}", "command": "id"}},
+            {
+                "callable": {"module": "os", "leaf": "system"},
+                "model": {"_target_": "${callable.module}.${callable.leaf}", "command": "id"},
+            },
+            {
+                "target_value": "os.system",
+                "model": {"_target_": "${oc.select:target_value,{}}", "command": "id"},
+            },
+            {
+                "leaf": "load",
+                "model": {"_target_": "numpy.${oc.select:leaf,{}}", "file": "payload.npy", "allow_pickle": True},
+            },
+            {"safe_target": "nemo.Model", "model": {"_target_": "${safe_target}"}},
+            {"safe_target": "nemo.Model", "model": {"_target_": r"\\${safe_target}"}},
+            {"safe_target": "nemo.Model", "model": {"_target_": "$${safe_target}"}},
+        ],
+    )
+    def test_interpolated_target_fails_closed(self, tmp_path: Path, config: dict[str, Any]) -> None:
+        """Dynamic Hydra callable selectors must not fall through to INFO-only review."""
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [check for check in result.checks if check.name == "CVE-2025-23304: Interpolated Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["target"] == config["model"]["_target_"]
+        assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
+        assert not any(check.name == "Hydra _target_ Review" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        "target",
+        ["${target_value}", r"\${target_value}", "${oc.select:target_value,{}}"],
+    )
+    def test_interpolated_target_fails_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """A dynamic Hydra callable selector should produce aggregate exit 1."""
+        config = {"target_value": "os.system", "model": {"_target_": target, "command": "id"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "Interpolated _target_" in issue.message
+            for issue in result.issues
+        )
+
+    def test_interpolated_argument_for_safe_target_remains_safe(self, tmp_path: Path) -> None:
+        """Only interpolated callable selectors are failed closed, not ordinary Hydra arguments."""
+        config = {"optimizer_name": "adam", "model": {"_target_": "nemo.Model", "name": "${optimizer_name}"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name == "CVE-2025-23304: Interpolated Hydra _target_" for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == "nemo.Model"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize("target", [r"\${safe_target}", r"prefix\\\${safe_target}"])
+    def test_escaped_interpolation_like_target_fails_closed(self, tmp_path: Path, target: str) -> None:
+        """Escaped selectors can become active after repeated OmegaConf/Hydra resolution passes."""
+        config = {"safe_target": "nemo.Model", "model": {"_target_": target}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Interpolated Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(check.name == "Hydra _target_ Review" for check in result.checks)
+
+    def test_interpolated_target_diagnostics_redact_and_bound_config_evidence(self, tmp_path: Path) -> None:
+        """Interpolation findings should not retain unbounded secret-bearing config strings."""
+        secret = "INTERPOLATIONSECRET123"
+        path_secret = "PATHSECRET456"
+        target = f"${{oc.env:CALLABLE,token={secret}}}" + ("A" * 400)
+        path = _create_nemo_file(
+            tmp_path,
+            {f"client_secret={path_secret}": {"_target_": target}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Interpolated Hydra _target_"]
+        assert len(checks) == 1
+        check = checks[0]
+        assert secret not in check.message
+        assert path_secret not in check.message
+        assert secret not in check.details["target"]
+        assert path_secret not in check.details["config_path"]
+        assert "<redacted>" in check.details["target"]
+        assert "<redacted>" in check.details["config_path"]
+        assert len(check.details["target"]) <= 256
+        assert len(check.details["config_path"]) <= 256
 
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""
@@ -4629,6 +4803,29 @@ class TestCVE202523304HydraTarget:
         metadata = aggregate_result.file_metadata[str(path)]
         assert "nemo_config_traversal_node_limit" in metadata["scan_outcome_reasons"]
         assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_wide_yaml_config_preserves_interpolated_target_exit1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Interpolated targets found before a traversal limit retain security precedence."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        path = _create_nemo_file(
+            tmp_path,
+            {
+                "callable": "os.system",
+                "_target_": "${callable}",
+                **{f"child_{index}": {"value": index} for index in range(32)},
+            },
+        )
+
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_traversal_node_limit" in metadata["scan_outcome_reasons"]
+        assert any("Interpolated _target_" in issue.message for issue in aggregate_result.issues)
         assert determine_exit_code(aggregate_result) == 1
 
     def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
