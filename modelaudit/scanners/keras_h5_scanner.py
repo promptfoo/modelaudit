@@ -28,6 +28,7 @@ from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
+    check_lambda_list_function,
     check_subclassed_model,
     is_known_safe_keras_layer_class,
 )
@@ -1017,6 +1018,23 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
+        layer_name = layer_config.get("name", "lambda")
+        encoded_function_handled = False
+        if isinstance(function_str, dict):
+            encoded_function_handled = check_lambda_dict_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
+        elif isinstance(function_str, list):
+            encoded_function_handled = check_lambda_list_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
+
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
             # First check if it matches safe patterns
@@ -1034,63 +1052,67 @@ class KerasH5Scanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-                return
-
-            # This might be serialized Python code
-            is_valid, error = validate_python_syntax(function_str)
-
-            if is_valid:
-                # It's valid Python! Check if it's dangerous
-                is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
-
-                # Check if code is dangerous
-                if is_dangerous:
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=False,
-                        message="Lambda layer contains dangerous Python code",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "code_analysis": risk_desc,
-                            "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
-                        },
-                        rule_code="S507",  # Python embedded code
-                    )
-                else:
-                    # Valid Python but not dangerous - record as passed
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=True,
-                        message="Lambda layer contains safe Python code",
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "validation_status": "valid_python",
-                        },
-                        rule_code=None,  # Passing check
-                    )
             else:
-                # Not valid Python syntax - might be a configuration issue
-                # Only flag if it looks like attempted code execution
-                if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
-                    result.add_check(
-                        name="Lambda Layer Suspicious Keywords Check",
-                        passed=False,
-                        message="Lambda layer contains suspicious configuration",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "description": self.suspicious_layer_types["Lambda"],
-                            "layer_config": layer_config,
-                            "validation_error": error,
-                        },
-                        why=get_pattern_explanation("lambda_layer"),
-                        rule_code="S1103",
-                    )
-        elif module_name or function_name:
+                # This might be serialized Python code
+                is_valid, error = validate_python_syntax(function_str)
+
+                if is_valid:
+                    # It's valid Python! Check if it's dangerous
+                    is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
+
+                    # Check if code is dangerous
+                    if is_dangerous:
+                        result.add_check(
+                            name="Lambda Layer Code Analysis",
+                            passed=False,
+                            message="Lambda layer contains dangerous Python code",
+                            severity=IssueSeverity.CRITICAL,
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "code_analysis": risk_desc,
+                                "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
+                            },
+                            rule_code="S507",  # Python embedded code
+                        )
+                    else:
+                        # Valid Python but not dangerous - record as passed
+                        result.add_check(
+                            name="Lambda Layer Code Analysis",
+                            passed=True,
+                            message="Lambda layer contains safe Python code",
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "validation_status": "valid_python",
+                            },
+                            rule_code=None,  # Passing check
+                        )
+                else:
+                    # Not valid Python syntax - might be a configuration issue
+                    # Only flag if it looks like attempted code execution
+                    if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
+                        result.add_check(
+                            name="Lambda Layer Suspicious Keywords Check",
+                            passed=False,
+                            message="Lambda layer contains suspicious configuration",
+                            severity=IssueSeverity.WARNING,
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "description": self.suspicious_layer_types["Lambda"],
+                                "layer_config": layer_config,
+                                "validation_error": error,
+                            },
+                            why=get_pattern_explanation("lambda_layer"),
+                            rule_code="S1103",
+                        )
+        module_reference_values = (module_name, function_name)
+        has_invalid_module_reference = any(
+            value is not None and not isinstance(value, str) for value in module_reference_values
+        )
+        has_module_reference = any(isinstance(value, str) and bool(value.strip()) for value in module_reference_values)
+        if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
             if self._is_lambda_module_reference_dangerous(module_name, function_name):
                 result.add_check(
@@ -1107,7 +1129,22 @@ class KerasH5Scanner(BaseScanner):
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
                 )
-            else:
+            elif has_invalid_module_reference:
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=False,
+                    message="Lambda layer uses malformed module/function reference metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "module_type": type(module_name).__name__,
+                        "function_type": type(function_name).__name__,
+                    },
+                    why="Malformed Lambda module references cannot be safely classified.",
+                    rule_code="S1103",
+                )
+            elif not encoded_function_handled:
                 # Safe module reference - record as passed
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
@@ -1121,9 +1158,6 @@ class KerasH5Scanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-        elif isinstance(function_str, dict):
-            # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
-            check_lambda_dict_function(function_str, result, self.current_file_path, layer_config.get("name", "lambda"))
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
