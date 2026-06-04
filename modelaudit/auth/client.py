@@ -99,9 +99,7 @@ class AuthClient:
             app = data.get("app", {})
 
             # Set configuration exactly like promptfoo
-            cloud_config.set_api_host(host)
-            cloud_config.set_api_key(token)
-            cloud_config.set_app_url(app.get("url", "https://www.promptfoo.app"))
+            cloud_config.set_credentials(host, token, app.get("url", "https://www.promptfoo.app"))
 
             return {"user": CloudUser(user), "organization": CloudOrganization(organization), "app": CloudApp(app)}
 

@@ -107,6 +107,26 @@ class CloudConfig:
         self.config["apiKey"] = api_key
         self._save_config()
 
+    def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+        """Persist bearer-token configuration as one atomic cloud update."""
+        previous_config = dict(self.config)
+        expected_config = {
+            **previous_config,
+            "apiHost": validate_api_host_for_bearer_auth(api_host),
+            "apiKey": api_key,
+            "appUrl": app_url,
+        }
+        self.config = expected_config
+        try:
+            self._save_config()
+        except Exception:
+            self.config = previous_config
+            raise
+
+        if any(self.config.get(key) != expected_config[key] for key in ("apiHost", "apiKey", "appUrl")):
+            self.config = previous_config
+            raise OSError("Unable to persist cloud authentication credentials")
+
     def get_api_key(self) -> str | None:
         """Get API key."""
         return cast(str | None, self.config.get("apiKey"))

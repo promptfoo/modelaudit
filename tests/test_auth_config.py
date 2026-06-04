@@ -42,6 +42,11 @@ class _FakeCloudConfig:
     def set_api_key(self, api_key: str) -> None:
         self.api_key = api_key
 
+    def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+        self.api_host = api_host
+        self.api_key = api_key
+        self.app_url = app_url
+
     def set_app_url(self, app_url: str) -> None:
         self.app_url = app_url
 
@@ -378,14 +383,14 @@ def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalize
     assert fake_config.api_key == "secret-token"
 
 
-def test_validate_and_set_api_token_does_not_store_token_when_host_persistence_fails(
+def test_validate_and_set_api_token_does_not_change_credentials_when_atomic_persistence_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailingHostConfig(_FakeCloudConfig):
-        def set_api_host(self, api_host: str) -> None:
-            raise OSError(f"cannot persist {api_host}")
+    class FailingCredentialsConfig(_FakeCloudConfig):
+        def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+            raise OSError(f"cannot persist {api_host}, {api_key}, {app_url}")
 
-    fake_config = FailingHostConfig(api_host="https://old.example", api_key="old-token")
+    fake_config = FailingCredentialsConfig(api_host="https://old.example", api_key="old-token")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "fetch_with_proxy", lambda _url, **_kwargs: _FakeResponse())
 
@@ -397,6 +402,73 @@ def test_validate_and_set_api_token_does_not_store_token_when_host_persistence_f
 
     assert fake_config.api_host == "https://old.example"
     assert fake_config.api_key == "old-token"
+
+
+def test_cloud_config_set_credentials_uses_one_cloud_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    cloud_config.config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    writes: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(auth_config, "write_global_config_partial", lambda partial: writes.append(partial))
+    monkeypatch.setattr(cloud_config, "_reload", lambda: None)
+
+    cloud_config.set_credentials("https://NEW-API.EXAMPLE:443/", "new-token", "https://new-app.example")
+
+    expected_cloud_config = {
+        "appUrl": "https://new-app.example",
+        "apiHost": "https://new-api.example",
+        "apiKey": "new-token",
+    }
+    assert cloud_config.config == expected_cloud_config
+    assert writes == [{"cloud": expected_cloud_config}]
+
+
+def test_cloud_config_set_credentials_rolls_back_in_memory_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def fail_write(_partial: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(auth_config, "write_global_config_partial", fail_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        cloud_config.set_credentials("https://new-api.example", "new-token", "https://new-app.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_cloud_config_set_credentials_detects_silent_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def silently_restore_old_config() -> None:
+        cloud_config.config = dict(old_config)
+
+    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
+
+    with pytest.raises(OSError, match="Unable to persist cloud authentication credentials"):
+        cloud_config.set_credentials("https://new-api.example", "new-token", "https://new-app.example")
+
+    assert cloud_config.config == old_config
 
 
 def test_validate_and_set_api_token_rejects_redirect_response_without_persisting_token(
