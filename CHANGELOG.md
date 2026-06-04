@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- bound Jinja sandbox safety probes so render amplification fails closed instead of exhausting scanner resources
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
 - redact secret previews and URL path credentials from metadata scanner findings
@@ -106,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- fail closed when scanner selection disables required NumPy object-dtype embedded pickle analysis
 - classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
 - classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
 - classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
