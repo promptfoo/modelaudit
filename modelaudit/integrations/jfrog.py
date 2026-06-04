@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ModelAuditResultModel
+from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
 from ..utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
@@ -126,6 +127,9 @@ def scan_jfrog_artifact(
             folder_download_kwargs: dict[str, Any] = {}
             if scannable_extensions is not None:
                 folder_download_kwargs["scannable_extensions"] = scannable_extensions
+            scanner_selection = scan_kwargs.get(SCANNER_SELECTION_CONFIG_KEY)
+            if isinstance(scanner_selection, dict):
+                folder_download_kwargs["scanner_selection"] = scanner_selection
             download_path = download_jfrog_folder(
                 url,
                 cache_dir=download_dir,

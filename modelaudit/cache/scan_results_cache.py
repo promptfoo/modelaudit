@@ -16,6 +16,11 @@ from .optimized_config import build_cache_version_context
 logger = logging.getLogger(__name__)
 
 
+def _is_sampled_fingerprint(value: object) -> bool:
+    """Return whether a stored hash represents sampled, incomplete file content."""
+    return isinstance(value, str) and value.startswith("fingerprint:")
+
+
 @dataclass
 class CacheEntry:
     """Data class for cache entries."""
@@ -172,6 +177,11 @@ class ScanResultsCache:
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
+            if _is_sampled_fingerprint(cache_entry.get("file_info", {}).get("hash")):
+                cache_file_path.unlink()
+                self._record_cache_miss("invalid")
+                return None
+
             if (
                 file_path is not None
                 and file_stat is not None
@@ -319,11 +329,16 @@ class ScanResultsCache:
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
-            if file_stat is not None:
-                file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
-            else:
-                file_key = self.key_generator.generate_key(file_path)
-                content_hash = None
+            if file_stat is None:
+                file_stat = os.stat(file_path)
+
+            file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
+            if _is_sampled_fingerprint(content_hash):
+                logger.debug(
+                    "Skipping scan-result cache key for %s: sampled large-file fingerprints are not cacheable",
+                    file_path,
+                )
+                return None, None
 
             resolved_version_info = (
                 version_info if version_info is not None else self._get_version_info(version_context)
