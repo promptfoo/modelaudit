@@ -25,7 +25,6 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -41,6 +40,7 @@ from modelaudit_picklescan import (
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
+    _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     find_startup_hook_write_call_graphs,
 )
@@ -3114,7 +3114,7 @@ def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
     report = scan_bytes(payload, source="dill-dump.pkl")
 
     assert report.findings == ()
-    source_reason = call_graph._call_graph_source_unavailable_reason("dill")
+    source_reason = _call_graph_source_unavailable_reason("dill")
     if source_reason is None:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.CLEAN
