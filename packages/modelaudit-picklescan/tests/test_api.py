@@ -3519,6 +3519,26 @@ def test_scan_bytes_allows_source_available_import_only_global_with_inert_initia
     assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
 
 
+def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_inert_invoked_payload_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n)R.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_allows_import_only_global_with_inert_package_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3599,6 +3619,28 @@ def test_scan_bytes_warns_when_inert_source_module_assigns_getattr_hook(
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert marker.exists() is False
     assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_inert_source_module_destructures_getattr_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_destructured_getattr_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "destructured_module_getattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"(__getattr__,) = (lambda name: open({str(marker)!r}, 'w').write(name) and object,)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert pickle.loads(payload) is object
+    assert marker.read_text(encoding="utf-8") == "Gadget"
 
 
 def test_scan_bytes_warns_when_inert_source_imports_shadowed_stdlib_module(

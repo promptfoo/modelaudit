@@ -17,6 +17,7 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
+    find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
@@ -1016,8 +1017,15 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     enrichment_errors: list[tuple[str, Exception]] = []
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
+    analyzed_invocation_global_positions: frozenset[int] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
+    try:
+        invoked_global_positions = _invoked_global_positions(callable_invocations)
+    except Exception as error:
+        invoked_global_positions = frozenset()
+        callable_invocations_complete = False
+        enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
@@ -1046,6 +1054,12 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             unanalyzed_references = ()
             enrichment_errors.append(("python_call_graph_source_unavailable", error))
         try:
+            analyzed_invocation_global_positions = find_analyzed_callable_call_graph_global_positions(
+                callable_invocations
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_invocation_analysis", error))
+        try:
             inert_initialization_modules = _proven_inert_initialization_modules(report)
         except Exception as error:
             enrichment_errors.append(("python_import_initialization", error))
@@ -1068,6 +1082,8 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             report,
             inert_initialization_modules,
             trusted_import_references,
+            invoked_global_positions,
+            analyzed_invocation_global_positions,
         )
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
@@ -1159,6 +1175,8 @@ def _without_proven_safe_import_findings(
     report: PickleReport,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
+    invoked_global_positions: frozenset[int],
+    analyzed_invocation_global_positions: frozenset[int],
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -1168,6 +1186,8 @@ def _without_proven_safe_import_findings(
             finding,
             inert_initialization_modules,
             trusted_import_references,
+            invoked_global_positions,
+            analyzed_invocation_global_positions,
         )
     )
     if len(findings) == len(report.findings):
@@ -1197,10 +1217,29 @@ def _non_allowlisted_import_finding_is_proven_safe(
     finding: Finding,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
+    invoked_global_positions: frozenset[int],
+    analyzed_invocation_global_positions: frozenset[int],
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
-    return (module, name) in trusted_import_references or module in inert_initialization_modules
+    raw_position = finding.details.get("position")
+    position = raw_position if type(raw_position) is int else None
+    inert_reference_is_proven_safe = position is not None and (
+        position not in invoked_global_positions or position in analyzed_invocation_global_positions
+    )
+    return (module, name) in trusted_import_references or (
+        inert_reference_is_proven_safe and module in inert_initialization_modules
+    )
+
+
+def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
+    positions: set[int] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        if position is not None:
+            positions.add(position)
+    return frozenset(positions)
 
 
 def _with_call_graph_enrichment_errors(

@@ -601,6 +601,23 @@ def find_unanalyzed_callable_call_graph_references(
     return tuple(references)
 
 
+def find_analyzed_callable_call_graph_global_positions(
+    callable_invocations: object | None,
+) -> frozenset[int]:
+    """Return invoked global positions with source-backed call-graph entrypoints."""
+    _clear_source_sensitive_caches()
+    positions: set[int] = set()
+    for reference in _iter_callable_invocation_references(callable_invocations):
+        global_position = reference.get("global_position")
+        if type(global_position) is not int:
+            continue
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if module and name and _call_graph_entrypoints_for_reference(module, name, reference):
+            positions.add(global_position)
+    return frozenset(positions)
+
+
 def module_initialization_is_proven_inert(module_name: str) -> bool:
     """Return whether importing a source-backed module has no executable initialization."""
     parts = _bounded_module_name_parts(module_name)
@@ -1664,8 +1681,18 @@ def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:
         return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
     if isinstance(statement, ast.ImportFrom):
         return any((alias.asname or alias.name) == name for alias in statement.names)
-    if isinstance(statement, ast.Assign | ast.AnnAssign):
-        return name in _assignment_alias_target_names(statement)
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    return False
+
+
+def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, ast.Tuple | ast.List):
+        return any(_assignment_target_binds_name(item, name) for item in target.elts)
     return False
 
 
