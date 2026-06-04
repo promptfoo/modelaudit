@@ -622,10 +622,13 @@ def _module_source_context_initialization_is_proven_inert(context: _ModuleSource
 
 
 def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
-    """Return whether a known-safe reference resolves from a trusted runtime path."""
-    return (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES and _trusted_module_origin_kind(
-        module_name
-    ) is not None
+    """Return whether a known-safe reference is trusted or its optional module is unavailable."""
+    origin_kind = _trusted_module_origin_kind(module_name)
+    return (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES and origin_kind in {
+        "stdlib",
+        "site_packages",
+        "unresolved",
+    }
 
 
 @_register_source_sensitive_cache
@@ -641,7 +644,9 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
         spec = _find_module_spec_without_imports(module_name)
     except Exception:
         return None
-    if spec is None or spec.origin is None:
+    if spec is None:
+        return "unresolved"
+    if spec.origin is None:
         return None
     try:
         origin = Path(spec.origin).resolve()

@@ -133,6 +133,19 @@ def test_module_initialization_inert_proof_rejects_unbounded_module_depth(
     assert call_graph.module_initialization_is_proven_inert(".".join(["package"] * 33)) is False
 
 
+def test_import_only_reference_trust_preserves_reviewed_unavailable_optional_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", lambda _module_name: None)
+    call_graph._trusted_module_origin_kind.cache_clear()
+    try:
+        assert call_graph.import_only_reference_is_proven_trusted("dill", "dump") is True
+        assert call_graph.import_only_reference_is_proven_trusted("dill", "loads") is False
+        assert call_graph.import_only_reference_is_proven_trusted("private_payload", "Gadget") is False
+    finally:
+        call_graph._trusted_module_origin_kind.cache_clear()
+
+
 def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
