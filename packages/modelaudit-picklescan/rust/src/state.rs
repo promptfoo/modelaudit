@@ -452,6 +452,7 @@ fn global_ref_details(
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type ImportReferenceDedupeKey = (String, String, String);
 type CallableInvocationDedupeKey = (String, String, Option<usize>);
 
 #[derive(Clone)]
@@ -490,6 +491,7 @@ pub(crate) struct ScanState<'a> {
     errors: Vec<ScanError>,
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
+    import_reference_keys: HashSet<ImportReferenceDedupeKey>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     opcode_count: usize,
@@ -505,6 +507,7 @@ pub(crate) struct ScanState<'a> {
     next_buffer_count: usize,
     readonly_buffer_count: usize,
     readonly_buffer_empty_stack_count: usize,
+    readonly_buffer_invalid_stack_count: usize,
     first_buffer_opcode_position: Option<usize>,
     persistent_id_count: usize,
     first_persistent_id_position: Option<usize>,
@@ -552,6 +555,7 @@ impl<'a> ScanState<'a> {
             errors: Vec::new(),
             protocols: Vec::new(),
             import_references: Vec::new(),
+            import_reference_keys: HashSet::new(),
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
             opcode_count: 0,
@@ -567,6 +571,7 @@ impl<'a> ScanState<'a> {
             next_buffer_count: 0,
             readonly_buffer_count: 0,
             readonly_buffer_empty_stack_count: 0,
+            readonly_buffer_invalid_stack_count: 0,
             first_buffer_opcode_position: None,
             persistent_id_count: 0,
             first_persistent_id_position: None,
@@ -1001,6 +1006,7 @@ impl<'a> ScanState<'a> {
                 type_name: None, ..
             }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => 0,
         }
     }
@@ -1028,6 +1034,7 @@ impl<'a> ScanState<'a> {
             | StackValue::Bytes { .. }
             | StackValue::Primitive { .. }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => false,
         }
     }
@@ -1220,11 +1227,16 @@ impl<'a> ScanState<'a> {
                 }
             }
             "NEXT_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, false);
-                self.push_stack_value(StackValue::Other);
+                self.record_buffer_opcode(opcode.name, position, false, false);
+                self.push_stack_value(StackValue::ExternalBuffer);
             }
             "READONLY_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, self.stack.is_empty());
+                self.record_buffer_opcode(
+                    opcode.name,
+                    position,
+                    self.stack.is_empty(),
+                    Self::readonly_buffer_operand_is_definitely_invalid(self.stack.last()),
+                );
             }
             "MARK" => self.push_stack_value(StackValue::Mark),
             "POP" => {
@@ -1546,7 +1558,20 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize, empty_stack: bool) {
+    fn readonly_buffer_operand_is_definitely_invalid(value: Option<&StackValue>) -> bool {
+        !matches!(
+            value,
+            Some(StackValue::Bytes { .. } | StackValue::ExternalBuffer)
+        )
+    }
+
+    fn record_buffer_opcode(
+        &mut self,
+        op_name: &'static str,
+        position: usize,
+        empty_stack: bool,
+        invalid_stack: bool,
+    ) {
         if self.first_buffer_opcode_position.is_none() {
             self.first_buffer_opcode_position = Some(position);
         }
@@ -1556,6 +1581,9 @@ impl<'a> ScanState<'a> {
                 self.readonly_buffer_count += 1;
                 if empty_stack {
                     self.readonly_buffer_empty_stack_count += 1;
+                }
+                if invalid_stack {
+                    self.readonly_buffer_invalid_stack_count += 1;
                 }
             }
             _ => {}
@@ -1567,11 +1595,25 @@ impl<'a> ScanState<'a> {
         if buffer_opcode_count == 0 {
             return;
         }
+        let requires_external_buffer_context = self.next_buffer_count > 0;
+        let analysis_incomplete =
+            requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
+        if analysis_incomplete && self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
-            message: format!(
-                "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
-            ),
+            message: if requires_external_buffer_context {
+                format!(
+                    "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
+                )
+            } else if analysis_incomplete {
+                format!(
+                    "Encountered {buffer_opcode_count} malformed protocol 5 buffer opcode(s); stack context is opaque"
+                )
+            } else {
+                format!("Encountered {buffer_opcode_count} in-band protocol 5 buffer opcode(s)")
+            },
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("buffer_opcode"),
@@ -1593,8 +1635,16 @@ impl<'a> ScanState<'a> {
                     DetailValue::UInt(self.readonly_buffer_empty_stack_count as u64),
                 ),
                 (
+                    "readonly_buffer_invalid_stack_count".to_string(),
+                    DetailValue::UInt(self.readonly_buffer_invalid_stack_count as u64),
+                ),
+                (
                     "requires_external_buffer_context".to_string(),
-                    DetailValue::Bool(true),
+                    DetailValue::Bool(requires_external_buffer_context),
+                ),
+                (
+                    "analysis_incomplete".to_string(),
+                    DetailValue::Bool(analysis_incomplete),
                 ),
             ],
         });
@@ -6080,12 +6130,40 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_import_reference(&mut self, details: Vec<(String, DetailValue)>) {
+        let dedupe_key = Self::import_reference_detail_key(&details);
         if self.import_references.len() < MAX_IMPORT_REFERENCES {
+            if let Some(key) = dedupe_key.as_ref() {
+                self.import_reference_keys.insert(key.clone());
+            }
             self.import_references.push(details);
             return;
         }
+        if dedupe_key
+            .as_ref()
+            .is_some_and(|key| self.import_reference_keys.contains(key))
+        {
+            return;
+        }
+        self.record_import_references_truncated_notice();
+    }
+
+    fn import_reference_detail_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<ImportReferenceDedupeKey> {
+        let module = detail_string(details, "module")?;
+        let name = detail_string(details, "name")?;
+        if module == "torch" && name.ends_with("Storage") {
+            return None;
+        }
+        Some((module, name, detail_string(details, "opcode")?))
+    }
+
+    fn record_import_references_truncated_notice(&mut self) {
         if self.import_references_truncated {
             return;
+        }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
         }
         self.import_references_truncated = true;
         self.add_notice(Notice {
@@ -6712,9 +6790,10 @@ impl<'a> ScanState<'a> {
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
-            for reference in follow_on_scan.import_references {
-                self.push_import_reference(reference);
-            }
+            self.merge_follow_on_import_references(
+                follow_on_scan.import_references,
+                follow_on_scan.import_references_truncated,
+            );
             self.merge_follow_on_callable_invocations(
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
@@ -6739,6 +6818,19 @@ impl<'a> ScanState<'a> {
                 });
                 return;
             }
+        }
+    }
+
+    fn merge_follow_on_import_references(
+        &mut self,
+        follow_on_references: Vec<Vec<(String, DetailValue)>>,
+        follow_on_references_truncated: bool,
+    ) {
+        if follow_on_references_truncated {
+            self.record_import_references_truncated_notice();
+        }
+        for reference in follow_on_references {
+            self.push_import_reference(reference);
         }
     }
 
@@ -6892,6 +6984,10 @@ impl<'a> ScanState<'a> {
             import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("import_references", import_references)?;
+        metadata.set_item(
+            "import_references_truncated",
+            self.import_references_truncated,
+        )?;
         let callable_invocations = PyList::empty(py);
         for invocation in &self.callable_invocations {
             callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
@@ -6901,6 +6997,9 @@ impl<'a> ScanState<'a> {
             "callable_invocations_truncated",
             self.callable_invocations_truncated,
         )?;
+        if self.import_references_truncated || self.callable_invocations_truncated {
+            metadata.set_item("analysis_incomplete", true)?;
+        }
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -8326,7 +8425,7 @@ mod tests {
         );
         assert_eq!(
             detail_string(&finding.details, "name_operand").as_deref(),
-            Some("object")
+            Some("external_buffer")
         );
         assert!(scan
             .notices
@@ -8373,6 +8472,100 @@ mod tests {
             detail_usize(&notice.details, "readonly_buffer_count"),
             Some(2)
         );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+    }
+
+    #[test]
+    fn in_band_readonly_buffer_preserves_complete_coverage() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.";
+        let mut scan = ScanState::new(
+            "in-band-readonly-buffer.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "clean");
+        assert_eq!(detail_usize(&notice.details, "next_buffer_count"), Some(0));
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_count"),
+            Some(1)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(0)
+        );
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "requires_external_buffer_context" && matches!(value, DetailValue::Bool(false))
+        }));
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "analysis_incomplete" && matches!(value, DetailValue::Bool(false))
+        }));
+    }
+
+    #[test]
+    fn non_buffer_readonly_operand_fails_closed() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.";
+        let mut scan = ScanState::new(
+            "non-buffer-readonly.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
+            Some(0)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -8416,10 +8609,21 @@ mod tests {
             .iter()
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "malicious");
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(1)
         );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
     }
 
     #[test]
@@ -8670,6 +8874,7 @@ mod tests {
         }
 
         assert_eq!(scan.import_references.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(
             scan.notices
                 .iter()
@@ -8677,6 +8882,110 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_import_reference_over_cap_does_not_mark_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "duplicate-import-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            scan.push_import_reference(vec![
+                (
+                    "module".to_string(),
+                    DetailValue::String("cmath".to_string()),
+                ),
+                ("name".to_string(), DetailValue::String("sin".to_string())),
+                (
+                    "opcode".to_string(),
+                    DetailValue::String("GLOBAL".to_string()),
+                ),
+                ("position".to_string(), DetailValue::UInt(index as u64)),
+            ]);
+        }
+
+        assert_eq!(scan.import_references.len(), MAX_IMPORT_REFERENCES);
+        assert!(!scan.import_references_truncated);
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert!(scan
+            .notices
+            .iter()
+            .all(|notice| notice.code != Some("import_references_truncated")));
+    }
+
+    #[test]
+    fn security_distinct_import_reference_overflow_marks_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for (module, name, overflow_opcode) in [
+            ("cmath", "sin", "STACK_GLOBAL"),
+            ("torch", "FloatStorage", "GLOBAL"),
+        ] {
+            let mut scan = ScanState::new(
+                format!("{module}-{name}-import-cap.pkl"),
+                b"",
+                &options,
+                Some(0),
+                0,
+                0,
+                None,
+            );
+
+            for index in 0..MAX_IMPORT_REFERENCES {
+                scan.push_import_reference(vec![
+                    (
+                        "module".to_string(),
+                        DetailValue::String(module.to_string()),
+                    ),
+                    ("name".to_string(), DetailValue::String(name.to_string())),
+                    (
+                        "opcode".to_string(),
+                        DetailValue::String("GLOBAL".to_string()),
+                    ),
+                    ("position".to_string(), DetailValue::UInt(index as u64)),
+                ]);
+            }
+            scan.push_import_reference(vec![
+                (
+                    "module".to_string(),
+                    DetailValue::String(module.to_string()),
+                ),
+                ("name".to_string(), DetailValue::String(name.to_string())),
+                (
+                    "opcode".to_string(),
+                    DetailValue::String(overflow_opcode.to_string()),
+                ),
+                (
+                    "position".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+            ]);
+
+            assert!(scan.import_references_truncated, "{module}.{name}");
+            assert_eq!(scan.status, ScanStatus::Inconclusive, "{module}.{name}");
+        }
     }
 
     #[test]
@@ -8752,6 +9061,36 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn follow_on_import_reference_truncation_is_propagated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-truncated-imports.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.merge_follow_on_import_references(Vec::new(), true);
+
+        assert!(scan.import_references_truncated);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("import_references_truncated")));
     }
 
     #[test]

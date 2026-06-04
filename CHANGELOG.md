@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
+- fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
+- bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5
+- fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
+- redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
+- fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
 - classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
 - run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
@@ -36,9 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- include content-routed renamed JFrog folder artifacts in selective downloads with fail-closed bounded probes
 - strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
 - enforce direct Hugging Face file `--max-size` budgets before downloading
 - scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
@@ -52,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
-- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- block weight distribution `torch.load` on PyTorch prerelease, dev, and unknown versions before deserialization while preserving final, local, and PEP 440 post-release patched builds
+- fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
@@ -90,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
+- detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
 - fail closed when scanner selection disables required NumPy object-dtype embedded pickle analysis
