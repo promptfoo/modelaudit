@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import gzip
 import importlib
+import io
 import json
 import os
 import pickle
@@ -3165,6 +3166,92 @@ def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailab
     assert unavailable.scanner_name == "zip"
     assert unavailable.success is False
     assert unavailable.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_bypasses_stale_cache_when_pytorch_zip_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    pytorch_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "pytorch_zip" and not pytorch_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(model_path), config=config)
+        assert cached.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        pytorch_scanner_available = False
+        unavailable = scan_file(str(model_path), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert unavailable.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = io.BytesIO()
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+
+    outer_archive = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_archive, "w") as archive:
+        archive.writestr("nested.keras", nested_keras.getvalue())
+
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    keras_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip" and not keras_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(outer_archive), config=config)
+        assert cached.success is True
+        assert "keras_zip" in cached.metadata["scanner_dependency_ids"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        keras_scanner_available = False
+        unavailable = scan_file(str(outer_archive), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert "zip_analysis_incomplete" in unavailable.metadata["scan_outcome_reasons"]
+    nested_check = next(check for check in unavailable.checks if check.name == "Format Detection")
+    assert nested_check.location == f"{outer_archive}:nested.keras"
+    assert nested_check.details["preferred_scanner_id"] == "keras_zip"
 
 
 def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
