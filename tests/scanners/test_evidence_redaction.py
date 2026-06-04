@@ -49,6 +49,27 @@ def test_redacts_multiline_secret_assignments() -> None:
     assert "os.system" in redacted
 
 
+def test_redacts_escaped_quote_secret_assignments() -> None:
+    """Escaped delimiters should not terminate quoted secret redaction early."""
+    text = 'api_key = "prefix\\"ESCAPEDSECRET123" os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ESCAPEDSECRET123" not in redacted
+    assert f'api_key = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert "os.system" in redacted
+
+
+def test_redacts_unterminated_quoted_secret_assignments() -> None:
+    """Truncated preview windows should fail closed on unterminated secret strings."""
+    text = 'api_key = "TRUNCATEDSECRET123'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "TRUNCATEDSECRET123" not in redacted
+    assert f'api_key = "{REDACTED_EVIDENCE_VALUE}' in redacted
+
+
 def test_redacts_subscripted_and_mapping_secret_assignments() -> None:
     """Python and JSON-style containers should redact sensitive keyed values."""
     text = (
@@ -66,6 +87,20 @@ def test_redacts_subscripted_and_mapping_secret_assignments() -> None:
     assert 'headers["Authorization"] = "<redacted>"' in redacted
     assert '"client_secret": "<redacted>"' in redacted
     assert '"public_url": "https://example.com/model.bin"' in redacted
+
+
+def test_redacts_url_path_capability_tokens() -> None:
+    """Credential-shaped URL path segments should not survive evidence redaction."""
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"
+    text = f"https://callback.example/{github_token}/model https://callback.example/api/{jwt_token}/done"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert github_token not in redacted
+    assert jwt_token not in redacted
+    assert "https://callback.example/<redacted>/model" in redacted
+    assert "https://callback.example/api/<redacted>/done" in redacted
 
 
 def test_redacts_compound_sensitive_query_parameters() -> None:

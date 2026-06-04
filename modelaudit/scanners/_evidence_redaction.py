@@ -6,6 +6,8 @@ import re
 from typing import Final
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
+from modelaudit.detectors.network_comm import _redact_url_path_tokens
+
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
@@ -56,21 +58,34 @@ AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)" r"[^\s\"';&|]+"
 )
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
+QUOTED_VALUE_PATTERN: Final[str] = r"(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*?(?P=quote)"
+UNTERMINATED_QUOTED_VALUE_PATTERN: Final[str] = r"(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*\Z"
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|,}}]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
-    r"(?P<quote>\"\"\"|'''|[\"']).*?(?P=quote)"
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){QUOTED_VALUE_PATTERN}"
 )
 QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
-    r"(?P<quote>\"\"\"|'''|[\"']).*?(?P=quote)"
+    rf"{QUOTED_VALUE_PATTERN}"
 )
 SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
     rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
-    r"(?P<quote>\"\"\"|'''|[\"']).*?(?P=quote)"
+    rf"{QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
 )
 QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
@@ -111,6 +126,8 @@ def _redact_url(match: re.Match[str]) -> str:
     netloc = parsed.netloc
     if "@" in netloc:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
+    hostname = parsed.hostname or ""
+    path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path) if hostname else parsed.path
 
     query_items = []
     normalized_query = HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query).replace(";", "&")
@@ -124,7 +141,7 @@ def _redact_url(match: re.Match[str]) -> str:
         (
             parsed.scheme,
             netloc,
-            parsed.path,
+            path,
             urlencode(query_items, doseq=True, safe="<>"),
             "",
         )
@@ -147,6 +164,10 @@ def _redact_quoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
+
+
 def _redact_unquoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
@@ -165,6 +186,9 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
+    redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)

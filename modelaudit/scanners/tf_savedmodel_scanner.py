@@ -119,7 +119,16 @@ _COLLECTION_COMMAND_RE = re.compile(
 _COLLECTION_NETWORK_RE = re.compile(
     r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
 )
-_STANDALONE_KEY_SECRET_RE = re.compile(r"\b(?:AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{8,})\b")
+_STANDALONE_KEY_SECRET_RE = re.compile(
+    r"\b(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")\b"
+)
 
 
 def _redact_sensitive_preview_text(text: str) -> str:
@@ -130,8 +139,9 @@ def _redact_sensitive_preview_text(text: str) -> str:
 
 def _safe_decoded_preview(text: str, limit: int) -> str:
     """Return a bounded decoded preview safe for serialized findings."""
-    redacted = _redact_sensitive_preview_text(text)
-    if len(redacted) <= limit:
+    preview_source = text[:limit]
+    redacted = _redact_sensitive_preview_text(preview_source)
+    if len(text) <= limit and len(redacted) <= limit:
         return redacted
     return f"{redacted[:limit]}..."
 
