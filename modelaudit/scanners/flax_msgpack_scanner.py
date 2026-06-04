@@ -363,81 +363,65 @@ class FlaxMsgpackScanner(BaseScanner):
 
         return metadata
 
-    def _check_jax_specific_threats(self, obj: Any, result: ScanResult) -> None:
-        """Check for JAX/Flax specific security threats."""
+    def _check_jax_transform(
+        self,
+        key: str,
+        value: str,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        """Check one visible key/value pair for dangerous JAX transforms."""
+        for transform in _matching_jax_transforms(key.lower(), value):
+            result.add_check(
+                name="JAX Transform Security Check",
+                passed=False,
+                message=f"Suspicious JAX transform detected: {transform}",
+                severity=IssueSeverity.CRITICAL,
+                location=location,
+                details={
+                    "transform": transform,
+                    "context": value[:200],
+                },
+                rule_code="S1105",
+            )
 
-        def check_jax_transforms(data: Any, path: str = "") -> None:
-            """Check for potentially dangerous JAX transform usage."""
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    key_str = str(key).lower()
-                    value_str = str(value)
+    @staticmethod
+    def _check_jax_array_metadata(value: dict[Any, Any], location: str, result: ScanResult) -> None:
+        """Check one visible dictionary for suspicious JAX array metadata."""
+        if "__jax_array__" in value:
+            result.add_check(
+                name="JAX Array Metadata Check",
+                passed=False,
+                message="Suspicious JAX array metadata detected",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={"suspicious_key": "__jax_array__"},
+                rule_code="S905",
+            )
 
-                    for transform in _matching_jax_transforms(key_str, value_str):
-                        result.add_check(
-                            name="JAX Transform Security Check",
-                            passed=False,
-                            message=f"Suspicious JAX transform detected: {transform}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/{key}",
-                            details={
-                                "transform": transform,
-                                "context": value_str[:200] if len(value_str) > 200 else value_str,
-                            },
-                            rule_code="S1105",  # JAX compilation risks
-                        )
-
-                    check_jax_transforms(value, f"{path}/{key}" if path else key)
-            elif isinstance(data, list | tuple):
-                for i, value in enumerate(data):
-                    check_jax_transforms(value, f"{path}[{i}]")
-
-        # Check for JAX-specific attack patterns
-        check_jax_transforms(obj)
-
-        # Check for fake JAX arrays or suspicious array metadata
-        def check_array_metadata(data: Any, path: str = "") -> None:
-            if isinstance(data, dict):
-                # Look for fake JAX array indicators
-                if "__jax_array__" in data:
-                    result.add_check(
-                        name="JAX Array Metadata Check",
-                        passed=False,
-                        message="Suspicious JAX array metadata detected",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"suspicious_key": "__jax_array__"},
-                        rule_code="S905",
-                    )
-
-                # Check for unusual shape specifications that might indicate attacks
-                if "shape" in data and isinstance(data["shape"], list | tuple):
-                    shape = data["shape"]
-                    if any(dim < 0 for dim in shape if isinstance(dim, int)):
-                        result.add_check(
-                            name="Tensor Shape Validation",
-                            passed=False,
-                            message="Invalid tensor shape with negative dimensions",
-                            severity=IssueSeverity.INFO,
-                            location=path,
-                            details={"shape": shape},
-                            rule_code="S902",
-                        )
-                    elif any(dim > 10**9 for dim in shape if isinstance(dim, int)):
-                        result.add_check(
-                            name="Tensor Dimension Check",
-                            passed=False,
-                            message="Suspiciously large tensor dimensions",
-                            severity=IssueSeverity.WARNING,
-                            location=path,
-                            details={"shape": shape, "max_safe_dimension": 10**9},
-                            rule_code="S804",
-                        )
-
-                for key, value in data.items():
-                    check_array_metadata(value, f"{path}/{key}" if path else key)
-
-        check_array_metadata(obj)
+        shape = value.get("shape")
+        if not isinstance(shape, list | tuple):
+            return
+        if any(dim < 0 for dim in shape if isinstance(dim, int)):
+            result.add_check(
+                name="Tensor Shape Validation",
+                passed=False,
+                message="Invalid tensor shape with negative dimensions",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={"shape": shape},
+                rule_code="S902",
+            )
+        elif any(dim > 10**9 for dim in shape if isinstance(dim, int)):
+            result.add_check(
+                name="Tensor Dimension Check",
+                passed=False,
+                message="Suspiciously large tensor dimensions",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={"shape": shape, "max_safe_dimension": 10**9},
+                rule_code="S804",
+            )
 
     def _check_suspicious_strings(
         self,
@@ -677,6 +661,7 @@ class FlaxMsgpackScanner(BaseScanner):
         result: ScanResult,
         depth: int = 0,
         traversal_state: dict[str, Any] | None = None,
+        check_string_jax_transform: bool = True,
     ) -> None:
         """Recursively analyze msgpack content for security threats and anomalies."""
         if traversal_state is None:
@@ -738,6 +723,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 pass
 
         elif isinstance(value, str):
+            if check_string_jax_transform:
+                self._check_jax_transform("", value, location, result)
+
             # Check for suspicious string patterns
             self._check_suspicious_strings(value, location, result)
 
@@ -754,6 +742,8 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
 
         elif isinstance(value, dict):
+            self._check_jax_array_metadata(value, location, result)
+
             if len(value) > self.max_items_per_container:
                 self._add_structure_budget_check(
                     result,
@@ -781,13 +771,26 @@ class FlaxMsgpackScanner(BaseScanner):
                 if index >= self.max_items_per_container:
                     break
                 key_str = str(k)
+                self._check_jax_transform(
+                    key_str,
+                    v if isinstance(v, str) else "",
+                    f"{location}/{key_str}",
+                    result,
+                )
                 self._check_suspicious_keys(key_str, v, f"{location}/{key_str}", result)
 
                 # Check if key itself contains suspicious patterns
                 if isinstance(k, str):
                     self._check_suspicious_strings(k, f"{location}[key:{k}]", result)
 
-                self._analyze_content(v, f"{location}/{key_str}", result, depth + 1, traversal_state)
+                self._analyze_content(
+                    v,
+                    f"{location}/{key_str}",
+                    result,
+                    depth + 1,
+                    traversal_state,
+                    check_string_jax_transform=not isinstance(v, str),
+                )
 
         elif isinstance(value, list | tuple):
             if len(value) > self.max_items_per_container:
@@ -1472,22 +1475,12 @@ class FlaxMsgpackScanner(BaseScanner):
                 # Validate Flax structure with enhanced analysis
                 self._validate_flax_structure(obj, result, ml_analysis=ml_analysis)
 
-                # Check for JAX/Flax specific security threats
-                self._check_jax_specific_threats(obj, result)
-
             # Perform deep security analysis
             traversal_state = self._new_content_traversal_state(max_nodes=max_nodes_per_object)
             self._analyze_content(obj, "root", result, traversal_state=traversal_state)
 
             for object_index, stream_obj in enumerate(objects[1:], start=1):
                 stream_location = f"root[msgpack_object_{object_index}]"
-                if self._check_preanalysis_structure_budget(
-                    stream_obj,
-                    result,
-                    location=stream_location,
-                    max_nodes=max_nodes_per_object,
-                ):
-                    self._check_jax_specific_threats(stream_obj, result)
                 self._analyze_content(
                     stream_obj,
                     stream_location,

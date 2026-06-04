@@ -513,6 +513,48 @@ def test_flax_msgpack_decode_limit_scans_visible_oversized_container_prefix(
     )
 
 
+def test_flax_msgpack_decode_limit_scans_visible_jax_transform_prefix(tmp_path: Path) -> None:
+    """Dedicated JAX checks must run on the visible prefix of oversized containers."""
+    path = tmp_path / "oversized_jax_transform.msgpack"
+    create_msgpack_file(path, {"params": [{"jit_compile": "safe"}, "safe", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    jax_checks = [
+        check
+        for check in result.checks
+        if check.name == "JAX Transform Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["transform"] == "jit_compile"
+    ]
+    assert len(jax_checks) == 1
+
+
+def test_flax_msgpack_decode_limit_does_not_join_adjacent_jax_transform_parts(tmp_path: Path) -> None:
+    """Separate visible keys and values must not synthesize a JAX transform."""
+    path = tmp_path / "oversized_jax_transform_parts.msgpack"
+    create_msgpack_file(path, {"params": [{"jit": "compile"}, "safe", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert all(check.name != "JAX Transform Security Check" for check in result.checks)
+
+
 def test_flax_msgpack_decode_limit_does_not_join_adjacent_visible_strings(tmp_path: Path) -> None:
     """Structurally separate values must not become a synthetic suspicious pattern."""
     path = tmp_path / "oversized_benign_strings.msgpack"
