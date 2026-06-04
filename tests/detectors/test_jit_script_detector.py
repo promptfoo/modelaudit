@@ -2093,6 +2093,16 @@ class TestJITScriptDetector:
             (b"\x00\xffdef payload(values):\n    order = sorted\n    return order(values, key=eval)\n"),
             b"\x00\xffdef payload():\n    return eval.__getattribute__('__call__')('1+1')\n",
             b"\x00\xffdef payload():\n    return object.__getattribute__(eval, '__call__')('1+1')\n",
+            b"\x00\xffdef run(callback):\n    callback('1+1')\nrun(eval)\n",
+            b"\x00\xffclass H:\n    callbacks = [eval]\nH.callbacks[0]('1+1')\n",
+            b"\x00\xffclass H:\n    callbacks = [eval]\nH().callbacks[0]('1+1')\n",
+            b"\x00\xfflocals()['sink'] = eval\nsink('1+1')\n",
+            b"\x00\xffdef payload(holder):\n    holder.callbacks = [eval]\n    return holder.callbacks[0]('1+1')\n",
+            b"\x00\xffdef get_callback():\n    return {b'x': eval}\nget_callback()[b'x']('1+1')\n",
+            b"\x00\xfffrom builtins import getattr\ngetattr(__builtins__, 'eval')('1+1')\n",
+            b"\x00\xfffrom builtins import map\nlist(map(eval, ['1+1']))\n",
+            b"\x00\xffclass H:\n    def __init__(self):\n        self.sink = eval\nH().sink('1+1')\n",
+            b"\x00\xffclass H:\n    def __init__(self):\n        self.callbacks = [eval]\nH().callbacks[0]('1+1')\n",
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2137,6 +2147,24 @@ class TestJITScriptDetector:
                 b"\x00\xffdef benign():\n"
                 b"    object = type('Safe', (), {'__getattribute__': lambda *_args: len})\n"
                 b"    return object.__getattribute__(eval, '__call__')([])\n"
+            ),
+            b"\x00\xffdef run(callback):\n    return callback\nrun(eval)\n",
+            b"\x00\xffdef run(callback):\n    eval = len\n    eval([])\nrun(open)\n",
+            b"\x00\xffclass H:\n    callbacks = [eval]\n    callbacks = [len]\nH.callbacks[0]([])\n",
+            b"\x00\xfflocals = lambda: {}\nlocals()['sink'] = eval\nsink = len\nsink([])\n",
+            (
+                b"\x00\xffdef benign(holder):\n"
+                b"    holder.callbacks = [eval]\n"
+                b"    holder.callbacks = [len]\n"
+                b"    return holder.callbacks[0]([])\n"
+            ),
+            b"\x00\xfffrom builtins import map\nmap = lambda callback, values: values\nlist(map(eval, ['1+1']))\n",
+            (
+                b"\x00\xffclass H:\n"
+                b"    def __init__(self):\n"
+                b"        self.sink = eval\n"
+                b"        self.sink = len\n"
+                b"H().sink([])\n"
             ),
         ],
     )
