@@ -586,6 +586,39 @@ def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: st
     assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
+@pytest.mark.parametrize(
+    ("source", "rule_code", "dangerous_name"),
+    [
+        ("import ctypes\nctypes.CDLL(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+        ("from ctypes import CDLL as load_library\nload_library(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+        ("import webbrowser\nwebbrowser.open('https://example.invalid')\n", "S109", "webbrowser.open"),
+        (
+            "from webbrowser import open_new_tab as launch\nlaunch('https://example.invalid')\n",
+            "S109",
+            "webbrowser.open_new_tab",
+        ),
+    ],
+)
+def test_scan_zip_flags_direct_imported_python_member_primitives(
+    tmp_path: Path, source: str, rule_code: str, dangerous_name: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = source.replace("LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")))
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == rule_code
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
 def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -899,6 +932,7 @@ def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_p
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )
@@ -3482,6 +3516,28 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from ctypes import CDLL as load\nload = len\nload([])\n",
+        "import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
+        "from webbrowser import open as launch\nlaunch = len\nlaunch([])\n",
+        "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
+    ],
+)
+def test_scan_zip_allows_shadowed_direct_python_member_primitives(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )
