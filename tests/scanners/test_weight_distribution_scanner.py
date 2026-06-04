@@ -738,7 +738,15 @@ class TestWeightDistributionScanner:
         tmp_path: Path,
     ) -> None:
         """Prerelease PyTorch versions must fail closed before torch.load."""
-        for torch_version in ["2.6.0rc1", "2.6.0a0", "2.6.0.dev20250101", "2.10.0a0"]:
+        for torch_version in [
+            "2.6.0rc1",
+            "2.6.0-rc1",
+            "2.6.0_rc1",
+            "2.6.0a0",
+            "2.6.0pre",
+            "2.6.0.dev20250101",
+            "2.10.0a0",
+        ]:
             load_called = False
 
             fake_torch: Any = types.ModuleType("torch")
@@ -776,8 +784,15 @@ class TestWeightDistributionScanner:
             "2.6.0",
             "2.6.0+cpu",
             "2.6.0.post1",
+            "2.6.0.post",
             "2.6.0.post1+cpu",
             "2.6.0_post1",
+            "2.6.0post2",
+            "2.6.0.post-3",
+            "2.6.0rev4",
+            "2.6.0-r5",
+            "2.6.0-6",
+            "2.6.0_rev7+cpu",
             "2.6.0+cu124.gitabcdef",
             "2.6.1",
         ],
@@ -860,7 +875,10 @@ class TestWeightDistributionScanner:
             "2.6.0-unknown",
             "2.6.0+",
             "2.6.0+cpu+extra",
-            "2.6.0.post",
+            "2.6.0.post1.dev0",
+            "2.6.0postevil",
+            "2.6.0revx",
+            "2.6.0-",
             "2.6.0+cpu dev",
             "2.10.0-custom",
         ],

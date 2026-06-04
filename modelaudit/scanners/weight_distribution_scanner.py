@@ -15,7 +15,10 @@ _PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
 _TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_-]*)\s*$")
 _TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
 _TORCH_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
-_TORCH_STABLE_SUFFIX_PATTERN = re.compile(rf"(?i)^(?:{_TORCH_LOCAL_SUFFIX}|[._-]?post\d+(?:{_TORCH_LOCAL_SUFFIX})?)$")
+_TORCH_POSTRELEASE_SUFFIX = r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
+_TORCH_STABLE_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^(?:{_TORCH_LOCAL_SUFFIX}|{_TORCH_POSTRELEASE_SUFFIX}(?:{_TORCH_LOCAL_SUFFIX})?)$"
+)
 
 
 class WeightDistributionScanner(BaseScanner):
