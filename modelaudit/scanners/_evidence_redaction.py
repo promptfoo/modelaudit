@@ -262,7 +262,7 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
 
         try:
             ast.parse(candidate, mode="eval")
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             if STRING_LITERAL_START_RE.match(candidate):
                 continue
             if any(delimiter in candidate for delimiter in "([{"):
@@ -280,7 +280,7 @@ def _redact_python_expression_assignments(text: str) -> str:
     """Redact expression-valued sensitive assignments while preserving nearby code."""
     try:
         ast.parse(textwrap.dedent(text))
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
