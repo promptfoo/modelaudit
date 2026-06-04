@@ -504,6 +504,37 @@ def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path
     assert not any("exec" in issue.message.lower() for issue in result.issues)
 
 
+def test_numpy_structured_object_field_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    dtype = np.dtype([("payload", object), ("score", np.int64)])
+    arr = np.array([(_ExecPayload(), 7)], dtype=dtype)
+    path = tmp_path / "structured_object_numpy_only.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    dtype_checks = [
+        check
+        for check in result.checks
+        if check.name == "Data Type Safety Check" and check.details.get("handled_via") == "scanner_selection_skip"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "numpy_object_embedded_pickle_scanner_selection_skip" in reasons
+    assert "numpy_object_embedded_pickle_incomplete" in reasons
+    assert dtype_checks
+    assert dtype_checks[0].details["dtype_kind"] == "V"
+    assert dtype_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+
 def test_numpy_numeric_dtype_numpy_only_remains_conclusive(tmp_path: Path) -> None:
     path = tmp_path / "numeric_numpy_only.npy"
     np.save(path, np.arange(4))
