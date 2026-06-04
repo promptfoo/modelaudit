@@ -1,5 +1,6 @@
 """Tests for metadata scanner."""
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
@@ -340,6 +342,35 @@ class TestMetadataScanner:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
+    def test_scan_suspicious_urls_redacts_path_tokens_in_outputs(self, tmp_path: Path) -> None:
+        """Suspicious URL findings should not preserve credentials embedded in paths."""
+        aws_key = "AKIAABCDEFGHIJKLMNOP"
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            f"Download: https://tinyurl.com/download/{aws_key}/model.bin?token=SECRET_TOKEN#SECRET_FRAGMENT\n",
+            encoding="utf-8",
+        )
+
+        direct = MetadataScanner().scan(str(readme_path))
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+        sarif_output = format_sarif_output(aggregate, [str(readme_path)])
+
+        suspicious_url_issue = next(
+            issue for issue in direct.issues if issue.details.get("suspicious_domain") == "tinyurl.com"
+        )
+        assert suspicious_url_issue.details["url"] == "https://tinyurl.com/download/<redacted>/model.bin"
+        assert "tinyurl.com/download/<redacted>/model.bin" in suspicious_url_issue.message
+
+        serialized_outputs = [
+            json.dumps([issue.model_dump() for issue in direct.issues], sort_keys=True),
+            aggregate.model_dump_json(),
+            sarif_output,
+        ]
+        for serialized in serialized_outputs:
+            assert aws_key not in serialized
+            assert "SECRET_TOKEN" not in serialized
+            assert "SECRET_FRAGMENT" not in serialized
+
     def test_scan_ignores_non_suspicious_authenticated_url(self, tmp_path: Path) -> None:
         """Authenticated URLs without suspicious domains should stay quiet."""
         scanner = MetadataScanner()
@@ -368,6 +399,44 @@ class TestMetadataScanner:
 
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
+
+    def test_scan_exposed_secrets_redacts_match_preview_in_outputs(self, tmp_path: Path) -> None:
+        """Secret details should not preserve raw prefixes or token values."""
+        aws_key = "AKIAABCDEFGHIJKLMNOP"
+        openai_key = "sk-1234567890abcdef1234567890abcdef1234567890abcdef"
+        bearer_token = "Bearer AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            "\n".join(
+                [
+                    f"AWS key: {aws_key}",
+                    f"OpenAI key: {openai_key}",
+                    f"Auth header: {bearer_token}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        direct = MetadataScanner().scan(str(readme_path))
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+        sarif_output = format_sarif_output(aggregate, [str(readme_path)])
+
+        exposed_secret_issues = [
+            issue for issue in direct.issues if issue.message.startswith("Potential exposed secret in text metadata")
+        ]
+        assert len(exposed_secret_issues) >= 3
+        assert all(issue.details["match_preview"] == "<redacted>" for issue in exposed_secret_issues)
+
+        serialized_outputs = [
+            json.dumps([issue.details for issue in direct.issues], sort_keys=True),
+            aggregate.model_dump_json(),
+            sarif_output,
+        ]
+        for serialized in serialized_outputs:
+            assert aws_key not in serialized
+            assert openai_key not in serialized
+            assert bearer_token not in serialized
+            assert "AKIAABCDEFGHIJKLMNOP" not in serialized
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""

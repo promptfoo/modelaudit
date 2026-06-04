@@ -246,6 +246,201 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    def test_extract_embedded_python_marks_byte_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * ((jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"# pad\n")) + 1)
+        data = padding + b"import os\nos.system('id')\n"
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "late_payload.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["max_scan_bytes"] == jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+        assert not any(finding.type == "dangerous_import" and finding.import_ == "os" for finding in findings)
+
+    def test_scan_model_ignores_large_tensorflow_function_metadata_without_python(self) -> None:
+        detector = JITScriptDetector()
+        data = b"SavedFunction function_spec\n" + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+
+        findings = detector.scan_model(data, "tensorflow", "saved_model.pb")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_marks_late_tensorflow_function_source_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"SavedFunction function_spec\n"
+            + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+            + b"\nimport os\nos.system('id')\n"
+        )
+
+        findings = detector.scan_model(data, "tensorflow", "saved_model.pb")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_extract_embedded_python_marks_boundary_spanning_source_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT - len(b"\nimport "))
+            + b"\nimport os\nos.system('id')\n"
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "boundary_payload.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"def payload():\n    values = (\n",
+            b"class Payload:\n    values = (\n",
+        ],
+    )
+    def test_extract_embedded_python_marks_long_unparseable_definition_incomplete(self, header: bytes) -> None:
+        detector = JITScriptDetector()
+        continuation = b"        1,\n"
+        data = (
+            header
+            + continuation * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(continuation) + 1)
+            + b"    )\n"
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "long_definition.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            b"def payload is described here\n",
+            b"class Payload is described here\n",
+        ],
+    )
+    def test_scan_model_ignores_large_definition_like_prose(self, prose: bytes) -> None:
+        detector = JITScriptDetector()
+        data = prose + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+
+        findings = detector.scan_model(data, "pytorch", "definition_prose.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_does_not_duplicate_import_only_pytorch_source_findings(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b'import os\nos.system("id")\n', "pytorch", "payload.pt")
+
+        finding_signatures = {
+            (finding.type, finding.pattern, finding.import_, finding.operation, finding.message) for finding in findings
+        }
+        assert len(findings) == 3
+        assert len(finding_signatures) == len(findings)
+
+    def test_scan_model_marks_import_only_omitted_middle_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+        data = b"\x00\xff" + padding + b"\nimport harmless_middle\n" + padding
+
+        findings = detector.scan_model(data, "pytorch", "middle_import.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_large_prose_import_in_omitted_middle(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+        prose = b"\ninstructions import numpy for setup\nimport numpy is required by this model\n"
+        data = b"\x00\xff" + padding + prose + padding
+
+        findings = detector.scan_model(data, "pytorch", "prose_import.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_ignores_large_import_near_match(self) -> None:
+        detector = JITScriptDetector()
+        data = b"metadata_import harmless\n" * (
+            jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"metadata_import harmless\n") + 1
+        )
+
+        findings = detector.scan_model(data, "pytorch", "metadata.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_fails_closed_after_source_start_probe_budget(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index} is prose".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 1)
+        )
+
+        findings = detector.scan_model(data, "pytorch", "many_ambiguous_imports.pt")
+
+        assert any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "many_snippets.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["omitted_snippets"] > 0
+        assert incomplete[0].details["candidate_snippets"] > jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS
+
+    def test_extract_embedded_python_keeps_fully_covered_over_budget_source_clean(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "covered_snippets.pt")
+
+        assert not any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_extract_embedded_python_keeps_benign_within_budgets_clean(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "benign_snippets.pt")
+
+        assert findings == []
+
     def test_scan_model_detects_unmarked_from_import_source(self) -> None:
         detector = JITScriptDetector()
 
@@ -2076,6 +2271,17 @@ class TestJITScriptDetector:
         assert continued_runpy_candidate[0] in selected_candidates
         assert continued_from_runpy_candidate[0] in selected_candidates
         assert runpy_candidate[0] in selected_candidates
+
+    def test_prioritized_snippet_budget_counts_unique_spans(self) -> None:
+        duplicate = (b"import harmless\n", (0, 16), ((0, 16),))
+        unique = (b"import later\n", (20, 32), ((20, 32),))
+
+        selected, omitted_spans = jit_script_module._select_prioritized_embedded_python_snippets(
+            [*[duplicate] * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS, unique]
+        )
+
+        assert selected == [duplicate, unique]
+        assert omitted_spans == []
 
     def test_priority_snippets_are_budgeted_and_bounded_after_default_cap(self) -> None:
         def candidate(

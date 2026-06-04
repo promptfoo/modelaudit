@@ -27,6 +27,8 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "parse_incomplete",
         "known_stream_truncated",
         "buffer_opcode",
+        "import_references_truncated",
+        "callable_invocations_truncated",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -51,6 +53,8 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "parse_incomplete": "pickle_analysis_incomplete",
     "known_stream_truncated": "known_stream_truncated",
     "buffer_opcode": "protocol5_external_buffer_context",
+    "import_references_truncated": "import_references_truncated",
+    "callable_invocations_truncated": "callable_invocations_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
@@ -72,10 +76,15 @@ def _notice_marks_incomplete_coverage(notice: Notice) -> bool:
         return False
     if notice.code != "buffer_opcode":
         return True
+    readonly_buffer_invalid_stack_count = notice.details.get("readonly_buffer_invalid_stack_count")
+    if readonly_buffer_invalid_stack_count is None and notice.details.get(
+        "readonly_buffer_count"
+    ) != notice.details.get("readonly_buffer_empty_stack_count"):
+        return True
     counts = [
         notice.details.get("next_buffer_count"),
         notice.details.get("readonly_buffer_empty_stack_count"),
-        notice.details.get("readonly_buffer_invalid_stack_count", 0),
+        readonly_buffer_invalid_stack_count,
     ]
     if any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts):
         return True
@@ -195,9 +204,7 @@ def pickle_report_to_scan_result(
         for notice in report.notices
         if _notice_marks_incomplete_coverage(notice)
     ]
-    has_incomplete_coverage = report.status == ScanStatus.INCONCLUSIVE or (
-        report.status == ScanStatus.COMPLETE and bool(incomplete_notice_reasons)
-    )
+    has_incomplete_coverage = report.status == ScanStatus.INCONCLUSIVE or bool(incomplete_notice_reasons)
 
     if has_incomplete_coverage:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -368,7 +375,13 @@ def pickle_report_to_scan_result(
 
     scan_success = (
         (report.status == ScanStatus.COMPLETE and not has_incomplete_coverage)
-        or (has_incomplete_coverage and report.has_security_findings)
+        or (
+            report.has_security_findings
+            and (
+                report.status == ScanStatus.INCONCLUSIVE
+                or (report.status == ScanStatus.COMPLETE and bool(incomplete_notice_reasons))
+            )
+        )
         or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )
     result.finish(success=scan_success)
