@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import json
 import re
+from bisect import bisect_right
+from collections.abc import Iterator, Sequence
 from typing import Any, Final
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
@@ -83,6 +85,50 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:\[[a-z0-9_-]{0,32}\])*"
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
+SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[._-])*"
+    r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
+    r"credential|password|passwd|private[._-]?key|pwd|refresh[._-]?token|sas|secret|"
+    r"secret[._-]?key|signature|sig|token)"
+    r"(?:[._-][a-z0-9]+)*"
+)
+SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?:{SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+)
+SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[\s._-]+)*"
+    r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
+    r"client[\s._-]*secret|credential|password|passwd|private[\s._-]*key|pwd|"
+    r"refresh[\s._-]*token|sas|secret|secret[\s._-]*key|signature|sig|token)"
+    r"(?:[\s._-]+[a-z0-9]+)*"
+)
+SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
+    rf"(?:{SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+)
+SENSITIVE_R_ASSIGNMENT_IDENTIFIER: Final[str] = (
+    rf"""(?:`{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}`|"{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}"|"""
+    rf"""'{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}'|\b{SENSITIVE_R_BARE_ASSIGNMENT_KEY}\b)"""
+)
+R_ASSIGNMENT_INDEX_SUFFIX: Final[str] = r"(?:\s*(?:\[\[[^\]\r\n]{1,120}\]\]|\[[^\]\r\n]{1,120}\]))*"
+R_SENSITIVE_MEMBER_TARGET: Final[str] = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\$|@)\s*"
+    rf"(?:`{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}`|\b{SENSITIVE_R_BARE_ASSIGNMENT_KEY}\b)"
+    rf"{R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+R_SENSITIVE_QUOTED_SUBSCRIPT_TARGET: Final[str] = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\[\[\s*|\[\s*)"
+    rf"(?:\"{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}\"|'{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}')"
+    rf"\s*(?:\]\]|\]){R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+R_SENSITIVE_ASSIGNMENT_TARGET: Final[str] = (
+    rf"(?:{R_SENSITIVE_MEMBER_TARGET}|{R_SENSITIVE_QUOTED_SUBSCRIPT_TARGET}|"
+    rf"{SENSITIVE_R_ASSIGNMENT_IDENTIFIER}{R_ASSIGNMENT_INDEX_SUFFIX})"
+)
+R_LEFTWARD_ASSIGNMENT_OPERATOR: Final[str] = r"<{1,2}-"
+R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR: Final[str] = rf"(?:=|{R_LEFTWARD_ASSIGNMENT_OPERATOR})"
+R_RAW_STRING_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"""[rR]"(?P<dashes>-*)(?P<delimiter>[\(\[\{])""")
+R_RAW_STRING_CLOSING_DELIMITERS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
+R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS: Final[int] = 4_096
 DETAIL_KEY_PATTERN: Final[str] = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,80}(?:\[[A-Za-z0-9_-]{0,32}\]){0,8}"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*"
@@ -216,6 +262,270 @@ BLOCK_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<block>(?:\n(?P<indent>[ \t]+)[^\n]*)+)"
 )
 BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
+R_SENSITIVE_ASSIGNMENT_PREFIX: Final[str] = (
+    rf"(?P<prefix>{R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+)
+R_LEFTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i){R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_LEFTWARD_ASSIGNMENT_OPERATOR}\s*"
+)
+R_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i){R_SENSITIVE_ASSIGNMENT_PREFIX}{UNQUOTED_VALUE_PATTERN}"
+)
+R_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is){R_SENSITIVE_ASSIGNMENT_PREFIX}{QUOTED_VALUE_PATTERN}"
+)
+R_UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is){R_SENSITIVE_ASSIGNMENT_PREFIX}{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+R_RIGHTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)->{{1,2}}\s*{R_SENSITIVE_ASSIGNMENT_TARGET}"
+)
+R_QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<value>(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'))"
+    rf"(?P<suffix>\s*->{{1,2}}\s*{R_SENSITIVE_ASSIGNMENT_TARGET})"
+)
+LEFTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i){R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR}\s*$"
+)
+RIGHTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\s*->{{1,2}}\s*{R_SENSITIVE_ASSIGNMENT_TARGET}"
+)
+
+
+def _iter_r_raw_string_spans(text: str) -> Iterator[tuple[int, int, int, int, bool]]:
+    """Yield raw R literal and content spans, including unterminated candidates."""
+    cursor = 0
+    while prefix_match := R_RAW_STRING_PREFIX_RE.search(text, cursor):
+        literal_start = prefix_match.start()
+        content_start = prefix_match.end()
+        dashes = prefix_match.group("dashes")
+        closing_delimiter = R_RAW_STRING_CLOSING_DELIMITERS[prefix_match.group("delimiter")]
+        closing_sequence = f'{closing_delimiter}{dashes}"'
+        content_end = text.find(closing_sequence, content_start)
+        next_prefix_match = R_RAW_STRING_PREFIX_RE.search(text, content_start)
+        if content_end < 0 and next_prefix_match is not None:
+            yield literal_start, next_prefix_match.start(), content_start, next_prefix_match.start(), False
+            cursor = next_prefix_match.start()
+            continue
+        if content_end < 0:
+            yield literal_start, len(text), content_start, len(text), False
+            return
+
+        literal_end = content_end + len(closing_sequence)
+        yield literal_start, literal_end, content_start, content_end, True
+        cursor = literal_end
+
+
+def _r_non_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return R string, raw literal, backtick, and comment spans."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        raw_prefix_match = R_RAW_STRING_PREFIX_RE.match(text, cursor)
+        if raw_prefix_match is not None:
+            closing_delimiter = R_RAW_STRING_CLOSING_DELIMITERS[raw_prefix_match.group("delimiter")]
+            closing_sequence = f'{closing_delimiter}{raw_prefix_match.group("dashes")}"'
+            content_end = text.find(closing_sequence, raw_prefix_match.end())
+            if content_end < 0:
+                next_prefix_match = R_RAW_STRING_PREFIX_RE.search(text, raw_prefix_match.end())
+                literal_end = next_prefix_match.start() if next_prefix_match is not None else len(text)
+            else:
+                literal_end = content_end + len(closing_sequence)
+            spans.append((cursor, literal_end))
+            cursor = literal_end
+            continue
+
+        character = text[cursor]
+        if character == "#":
+            comment_end = text.find("\n", cursor)
+            if comment_end < 0:
+                comment_end = len(text)
+            spans.append((cursor, comment_end))
+            cursor = comment_end
+            continue
+
+        if character in "\"'`":
+            quote = character
+            literal_end = cursor + 1
+            escaped = False
+            while literal_end < len(text):
+                literal_character = text[literal_end]
+                literal_end += 1
+                if escaped:
+                    escaped = False
+                elif literal_character == "\\":
+                    escaped = True
+                elif literal_character == quote:
+                    break
+            spans.append((cursor, literal_end))
+            cursor = literal_end
+            continue
+
+        cursor += 1
+
+    return spans
+
+
+def _position_is_in_spans(position: int, spans: Sequence[tuple[int, int]]) -> bool:
+    span_index = bisect_right(spans, position, key=lambda span: span[0]) - 1
+    return span_index >= 0 and position < spans[span_index][1]
+
+
+def _r_statement_starts(text: str, non_code_spans: Sequence[tuple[int, int]]) -> list[int]:
+    """Return statement starts while ignoring separators inside non-code spans."""
+    statement_starts = [0]
+    nesting_depth = 0
+    cursor = 0
+    span_index = 0
+
+    while cursor < len(text):
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            nesting_depth += 1
+        elif character in ")]}":
+            nesting_depth = max(0, nesting_depth - 1)
+        elif character in ";\r\n" and nesting_depth == 0:
+            statement_starts.append(cursor + 1)
+        cursor += 1
+
+    return statement_starts
+
+
+def _r_statement_start_before(statement_starts: Sequence[int], position: int) -> int:
+    """Return the precomputed R statement start containing position."""
+    return statement_starts[bisect_right(statement_starts, position) - 1]
+
+
+def _replace_spans(text: str, replacements: list[tuple[int, int]]) -> str:
+    if not replacements:
+        return text
+
+    merged_replacements: list[tuple[int, int]] = []
+    for start, end in replacements:
+        if merged_replacements and start <= merged_replacements[-1][1]:
+            previous_start, previous_end = merged_replacements[-1]
+            merged_replacements[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged_replacements.append((start, end))
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in merged_replacements:
+        parts.extend((text[cursor:start], REDACTED_EVIDENCE_VALUE))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _redact_r_raw_assignments(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    for literal_start, literal_end, _content_start, _content_end, _is_terminated in _iter_r_raw_string_spans(text):
+        left_context = text[max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS) : literal_start]
+        if LEFTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE.search(left_context) or RIGHTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE.match(
+            text,
+            literal_end,
+        ):
+            replacements.append((literal_start, literal_end))
+
+    return _replace_spans(text, replacements)
+
+
+def _redact_leftward_assignment_expressions(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    non_code_spans = _r_non_code_spans(text)
+    statement_starts = _r_statement_starts(text, non_code_spans)
+    for target_match in R_LEFTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE.finditer(text):
+        if _position_is_in_spans(target_match.start(), non_code_spans):
+            continue
+
+        value_start = target_match.end()
+        statement_index = bisect_right(statement_starts, target_match.start()) - 1
+        value_end = (
+            statement_starts[statement_index + 1] - 1 if statement_index + 1 < len(statement_starts) else len(text)
+        )
+        while value_end > value_start and text[value_end - 1].isspace():
+            value_end -= 1
+
+        value = text[value_start:value_end]
+        if (
+            not value
+            or value == REDACTED_EVIDENCE_VALUE
+            or value.startswith(("'", '"'))
+            or R_RAW_STRING_PREFIX_RE.match(value) is not None
+            or re.fullmatch(r"[^\s,;(){}\[\]]+", value) is not None
+        ):
+            continue
+        if value_start < value_end:
+            replacements.append((value_start, value_end))
+
+    return _replace_spans(text, replacements)
+
+
+def _redact_rightward_assignment_expressions(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    previous_target_end = 0
+    non_code_spans = _r_non_code_spans(text)
+    statement_starts = _r_statement_starts(text, non_code_spans)
+    for target_match in R_RIGHTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE.finditer(text):
+        if _position_is_in_spans(target_match.start(), non_code_spans):
+            continue
+
+        value_end = target_match.start()
+        while value_end > 0 and text[value_end - 1].isspace():
+            value_end -= 1
+
+        value_start = max(
+            _r_statement_start_before(statement_starts, target_match.start()),
+            previous_target_end,
+        )
+        statement_prefix_start = value_start
+        statement_prefix = text[statement_prefix_start:value_end]
+        for assignment_pattern in (
+            R_QUOTED_SENSITIVE_ASSIGNMENT_RE,
+            R_SENSITIVE_ASSIGNMENT_RE,
+            QUOTED_SENSITIVE_ASSIGNMENT_RE,
+            SENSITIVE_ASSIGNMENT_RE,
+        ):
+            for assignment_match in assignment_pattern.finditer(statement_prefix):
+                trailing = statement_prefix[assignment_match.end() :]
+                if trailing[:1].isspace() and trailing.strip():
+                    value_start = max(value_start, statement_prefix_start + assignment_match.end())
+        while value_start < value_end and text[value_start].isspace():
+            value_start += 1
+
+        value = text[value_start:value_end]
+        already_redacted = value in {
+            REDACTED_EVIDENCE_VALUE,
+            f'"{REDACTED_EVIDENCE_VALUE}"',
+            f"'{REDACTED_EVIDENCE_VALUE}'",
+        }
+        direct_quoted_value = re.fullmatch(r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""", value, re.DOTALL)
+        if value_start < value_end and not already_redacted and direct_quoted_value is None:
+            replacements.append((value_start, value_end))
+        previous_target_end = target_match.end()
+
+    return _replace_spans(text, replacements)
+
+
+def _unfinished_r_assignment_literal_closing_sequence(text: str) -> str | None:
+    """Return the expected closer when an R assignment literal continues on the next line."""
+    for literal_start, literal_end, _content_start, _content_end, is_terminated in _iter_r_raw_string_spans(text):
+        if is_terminated or literal_end != len(text):
+            continue
+        prefix_match = R_RAW_STRING_PREFIX_RE.match(text, literal_start)
+        assert prefix_match is not None
+        closing_delimiter = R_RAW_STRING_CLOSING_DELIMITERS[prefix_match.group("delimiter")]
+        return f'{closing_delimiter}{prefix_match.group("dashes")}"'
+
+    if match := R_UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.search(text):
+        return match.group("quote")
+    return None
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -359,6 +669,19 @@ def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
 
 
 def _redact_unquoted_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _redact_r_quoted_rightward_assignment(match: re.Match[str]) -> str:
+    value = match.group("value")
+    quote = value[0]
+    return f"{quote}{REDACTED_EVIDENCE_VALUE}{quote}{match.group('suffix')}"
+
+
+def _redact_r_unterminated_quoted_assignment(match: re.Match[str]) -> str:
+    if "=" in match.group("prefix"):
+        string_prefix = match.group("string_prefix") or ""
+        return f"{match.group('prefix')}{string_prefix}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
@@ -645,7 +968,10 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     if quoted_structured_redaction is not None:
         return quoted_structured_redaction
 
-    redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), text)
+    redacted = _redact_r_raw_assignments(text)
+    redacted = _redact_leftward_assignment_expressions(redacted)
+    redacted = _redact_rightward_assignment_expressions(redacted)
+    redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
@@ -666,6 +992,16 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = R_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    redacted = R_UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(
+        _redact_r_unterminated_quoted_assignment,
+        redacted,
+    )
+    redacted = R_QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE.sub(
+        _redact_r_quoted_rightward_assignment,
+        redacted,
+    )
+    redacted = R_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = QUOTED_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)
     redacted = GENERIC_ASSIGNMENT_RE.sub(_redact_generic_assignment, redacted)
