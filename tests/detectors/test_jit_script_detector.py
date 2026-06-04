@@ -2100,7 +2100,9 @@ class TestJITScriptDetector:
             b"\x00\xffdef payload(holder):\n    holder.callbacks = [eval]\n    return holder.callbacks[0]('1+1')\n",
             b"\x00\xffdef get_callback():\n    return {b'x': eval}\nget_callback()[b'x']('1+1')\n",
             b"\x00\xfffrom builtins import getattr\ngetattr(__builtins__, 'eval')('1+1')\n",
+            b"\x00\xfffrom builtins import getattr as lookup\nlookup(__builtins__, 'eval')('1+1')\n",
             b"\x00\xfffrom builtins import map\nlist(map(eval, ['1+1']))\n",
+            b"\x00\xfffrom builtins import map as apply\nlist(apply(eval, ['1+1']))\n",
             b"\x00\xffclass H:\n    def __init__(self):\n        self.sink = eval\nH().sink('1+1')\n",
             b"\x00\xffclass H:\n    def __init__(self):\n        self.callbacks = [eval]\nH().callbacks[0]('1+1')\n",
         ],
@@ -2160,6 +2162,16 @@ class TestJITScriptDetector:
             ),
             b"\x00\xfffrom builtins import map\nmap = lambda callback, values: values\nlist(map(eval, ['1+1']))\n",
             (
+                b"\x00\xfffrom builtins import getattr as lookup\n"
+                b"lookup = lambda *_args: len\n"
+                b"lookup(__builtins__, 'eval')([])\n"
+            ),
+            (
+                b"\x00\xfffrom builtins import map as apply\n"
+                b"apply = lambda callback, values: values\n"
+                b"list(apply(eval, ['1+1']))\n"
+            ),
+            (
                 b"\x00\xffclass H:\n"
                 b"    def __init__(self):\n"
                 b"        self.sink = eval\n"
@@ -2175,6 +2187,34 @@ class TestJITScriptDetector:
 
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
         assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            (b"def get():\n    return {b'x': eval}\nget()[b'x']('1+1')\n", True),
+            (
+                b"def get():\n    return {b'x': len, b'unused': eval}\nget()[b'x']([])\n",
+                False,
+            ),
+        ],
+    )
+    def test_scan_model_serializes_non_json_function_container_keys(
+        self,
+        data: bytes,
+        expected: bool,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "Generic Python",
+            "payload.py",
+            include_full_source=True,
+        )
+
+        assert (
+            any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings) is expected
+        )
 
     @pytest.mark.parametrize(
         "data",

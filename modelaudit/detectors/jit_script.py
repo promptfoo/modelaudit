@@ -1954,6 +1954,28 @@ class JITScriptDetector:
                     return f"{self._BUILTIN_HELPER_MARKER}{name}:{name}" in self.builtins_module_aliases[index]
                 return True
 
+            def _lookup_builtin_helper(self, name: str) -> str | None:
+                marker_prefix = f"{self._BUILTIN_HELPER_MARKER}{name}:"
+                for index in self._visible_scope_indexes():
+                    if name not in self.alias_scopes[index]:
+                        continue
+                    return next(
+                        (
+                            marker.removeprefix(marker_prefix)
+                            for marker in self.builtins_module_aliases[index]
+                            if marker.startswith(marker_prefix)
+                        ),
+                        None,
+                    )
+                return None
+
+            def _is_builtin_helper_name(self, node: ast.AST, helper_name: str) -> bool:
+                if not isinstance(node, ast.Name):
+                    return False
+                if node.id == helper_name and self._is_unshadowed_name(helper_name):
+                    return True
+                return self._lookup_builtin_helper(node.id) == helper_name
+
             def _bind_builtin_helper(self, local_name: str, helper_name: str, *, scope_index: int = -1) -> None:
                 self._bind_name(local_name, None, scope_index=scope_index)
                 self.builtins_module_aliases[scope_index].add(
@@ -2572,9 +2594,7 @@ class JITScriptDetector:
                     return (*root, attribute_name) if root is not None else None
                 if (
                     isinstance(target, ast.Call)
-                    and isinstance(target.func, ast.Name)
-                    and target.func.id == "vars"
-                    and self._is_unshadowed_name("vars")
+                    and self._is_builtin_helper_name(target.func, "vars")
                     and len(target.args) == 1
                     and not target.keywords
                 ):
@@ -2586,9 +2606,10 @@ class JITScriptDetector:
                 if (
                     self.scope_kinds[-1] == "module"
                     and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id in {"globals", "locals"}
-                    and self._is_unshadowed_name(node.value.func.id)
+                    and (
+                        self._is_builtin_helper_name(node.value.func, "globals")
+                        or self._is_builtin_helper_name(node.value.func, "locals")
+                    )
                     and not node.value.args
                     and not node.value.keywords
                 ):
@@ -2638,9 +2659,7 @@ class JITScriptDetector:
                     )
                     or (
                         isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == "vars"
-                        and self._is_unshadowed_name("vars")
+                        and self._is_builtin_helper_name(node.func, "vars")
                         and len(node.args) == 1
                         and self._is_builtins_module(node.args[0])
                     )
@@ -2729,12 +2748,7 @@ class JITScriptDetector:
                         return return_binding[0]
                     if self._is_functools_partial(node.func) and node.args:
                         return self._resolve_builtin(node.args[0])
-                    if (
-                        len(node.args) >= 2
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == "getattr"
-                        and self._is_unshadowed_name("getattr")
-                    ):
+                    if len(node.args) >= 2 and self._is_builtin_helper_name(node.func, "getattr"):
                         names = self._constant_strings(node.args[1])
                         if "__call__" in names:
                             return self._resolve_builtin(node.args[0])
@@ -2767,9 +2781,7 @@ class JITScriptDetector:
                         len(node.args) >= 2
                         and isinstance(node.func, ast.Attribute)
                         and node.func.attr == "__getattribute__"
-                        and isinstance(node.func.value, ast.Name)
-                        and node.func.value.id == "object"
-                        and self._is_unshadowed_name("object")
+                        and self._is_builtin_helper_name(node.func.value, "object")
                     ):
                         if "__call__" in self._constant_strings(node.args[1]):
                             return self._resolve_builtin(node.args[0])
@@ -4207,17 +4219,11 @@ class JITScriptDetector:
                 target: ast.AST | None = None
                 name_node: ast.AST | None = None
                 value: ast.AST | None = None
-                is_builtin_setattr = (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "setattr"
-                    and self._is_unshadowed_name("setattr")
-                )
+                is_builtin_setattr = self._is_builtin_helper_name(node.func, "setattr")
                 is_object_setattr = (
                     isinstance(node.func, ast.Attribute)
                     and node.func.attr == "__setattr__"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "object"
-                    and self._is_unshadowed_name("object")
+                    and self._is_builtin_helper_name(node.func.value, "object")
                 )
                 if len(node.args) >= 3 and (is_builtin_setattr or is_object_setattr):
                     target, name_node, value = node.args[:3]
