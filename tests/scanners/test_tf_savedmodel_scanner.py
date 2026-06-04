@@ -815,6 +815,24 @@ def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() 
     assert "os.system" in preview
 
 
+def test_savedmodel_preview_redaction_removes_parenthesized_secret_values() -> None:
+    preview = _safe_decoded_preview(
+        'api_key = ("PARENSECRET123")\n'
+        'headers["Authorization"] = (\n  "HEADERSECRET456"\n)\n'
+        'config = {"clientSecret": ("MAPSECRET789")}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "PARENSECRET123" not in preview
+    assert "HEADERSECRET456" not in preview
+    assert "MAPSECRET789" not in preview
+    assert 'api_key = ("<redacted>")' in preview
+    assert 'headers["Authorization"] = (\n  "<redacted>"\n)' in preview
+    assert '"clientSecret": ("<redacted>")' in preview
+    assert "os.system" in preview
+
+
 def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
     private_tail = "PRIVATE_AFTER_LONG_SECRET_SHOULD_NOT_APPEAR"
     preview = _safe_decoded_preview(f'api_key = "{"A" * 10_000}"\n{private_tail}', 80)
@@ -847,6 +865,19 @@ def test_savedmodel_preview_redaction_redacts_boundary_crossing_url_userinfo() -
     assert private_tail not in preview
     assert "https://<credentials-redacted>" in preview
     assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_removes_nested_encoded_query_secrets() -> None:
+    preview = _safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fcb%2F%3Fapi_key%5B%5D%3DNESTEDARRAYSECRET123 "
+        "second=https://example.com/hook?payload=%7B%22api_key%22%3A%22JSONSECRET456%22%7D",
+        500,
+    )
+
+    assert "NESTEDARRAYSECRET123" not in preview
+    assert "JSONSECRET456" not in preview
+    assert "redirect=<redacted>" in preview
+    assert "payload=<redacted>" in preview
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

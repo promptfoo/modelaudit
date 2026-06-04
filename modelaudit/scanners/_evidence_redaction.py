@@ -75,46 +75,54 @@ QUOTED_VALUE_PATTERN: Final[str] = (
 UNTERMINATED_QUOTED_VALUE_PATTERN: Final[str] = (
     rf"{STRING_LITERAL_PREFIX_PATTERN}(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*\Z"
 )
-UNQUOTED_VALUE_PATTERN: Final[str] = r"[^\s\"';&|,}\]]+(?![\"'])"
+VALUE_OPENERS_PATTERN: Final[str] = r"(?:\(\s*)*"
+UNQUOTED_VALUE_PATTERN: Final[str] = r"(?!\()[^\s\"';&|,}\]]+(?![\"'])"
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){UNQUOTED_VALUE_PATTERN}"
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*{VALUE_OPENERS_PATTERN})"
+    rf"{UNQUOTED_VALUE_PATTERN}"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){QUOTED_VALUE_PATTERN}"
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*{VALUE_OPENERS_PATTERN})"
+    rf"{QUOTED_VALUE_PATTERN}"
 )
 QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
+    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
     rf"{QUOTED_VALUE_PATTERN}"
 )
 SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
-    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
     rf"{QUOTED_VALUE_PATTERN}"
 )
 UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*){UNTERMINATED_QUOTED_VALUE_PATTERN}"
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*{VALUE_OPENERS_PATTERN})"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
 )
 UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
+    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
 )
 UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
-    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
 )
 QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*)"
-    rf"{UNQUOTED_VALUE_PATTERN}"
+    rf"(?i)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
 )
 SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
-    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*)"
-    rf"{UNQUOTED_VALUE_PATTERN}"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
 )
 HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
 NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]"
+    rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}(?:\[[^\]]*\])*\s*[:=]"
 )
 BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 
@@ -173,7 +181,12 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
         if next_decoded == decoded:
             break
         decoded = next_decoded
-    return bool(NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded))
+    return bool(
+        NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+        or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.search(decoded)
+        or UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+    )
 
 
 def _normalize_query_key(key: str) -> str:

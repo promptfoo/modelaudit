@@ -95,6 +95,24 @@ def test_redacts_camel_case_secret_assignments() -> None:
     assert f'headers["githubToken"] = "{REDACTED_EVIDENCE_VALUE}"' in redacted
 
 
+def test_redacts_parenthesized_quoted_secret_assignments() -> None:
+    """Parenthesized quoted values should not bypass assignment redaction."""
+    text = (
+        'api_key = ("PARENSECRET123") '
+        'headers["Authorization"] = (\n  "HEADERSECRET456"\n) '
+        '{"clientSecret": ("MAPSECRET789")}'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "PARENSECRET123" not in redacted
+    assert "HEADERSECRET456" not in redacted
+    assert "MAPSECRET789" not in redacted
+    assert f'api_key = ("{REDACTED_EVIDENCE_VALUE}")' in redacted
+    assert f'headers["Authorization"] = (\n  "{REDACTED_EVIDENCE_VALUE}"\n)' in redacted
+    assert f'"clientSecret": ("{REDACTED_EVIDENCE_VALUE}")' in redacted
+
+
 def test_redacts_unterminated_quoted_secret_assignments() -> None:
     """Truncated preview windows should fail closed on unterminated secret strings."""
     text = 'api_key = "TRUNCATEDSECRET123'
@@ -165,6 +183,21 @@ def test_redacts_semicolon_and_nested_sensitive_query_parameters() -> None:
     assert "NESTEDSECRET456" not in redacted
     assert "HTMLSECRET789" not in redacted
     assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
+
+
+def test_redacts_nested_bracketed_and_json_sensitive_query_parameters() -> None:
+    """Encoded nested query/config values should redact sensitive payloads."""
+    text = (
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fcb%2F%3Fapi_key%5B%5D%3DNESTEDARRAYSECRET123 "
+        "second=https://example.com/hook?payload=%7B%22api_key%22%3A%22JSONSECRET456%22%7D"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "NESTEDARRAYSECRET123" not in redacted
+    assert "JSONSECRET456" not in redacted
+    assert "redirect=<redacted>" in redacted
+    assert "payload=<redacted>" in redacted
 
 
 def test_redacts_bracketed_sensitive_query_parameters() -> None:
