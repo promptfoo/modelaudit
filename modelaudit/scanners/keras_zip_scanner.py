@@ -1,6 +1,5 @@
 """Scanner for ZIP-based Keras model files (.keras format)."""
 
-import base64
 import json
 import os
 import re
@@ -13,10 +12,6 @@ from urllib.parse import urlsplit, urlunsplit
 from modelaudit.detectors.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_LAYER_TYPES,
-)
-from modelaudit.utils.helpers.code_validation import (
-    is_code_potentially_dangerous,
-    validate_python_syntax,
 )
 
 from ..config.explanations import (
@@ -38,8 +33,8 @@ from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
+    check_lambda_list_function,
     check_subclassed_model,
-    find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
 )
 from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
@@ -193,10 +188,10 @@ class KerasZipScanner(BaseScanner):
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
-    MAX_LAMBDA_LIST_CODE_B64_CHARS: ClassVar[int] = 1024 * 1024
     MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
     MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
+    MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -1615,14 +1610,7 @@ class KerasZipScanner(BaseScanner):
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-        if any(
-            external_reference_analysis.get(key)
-            for key in (
-                "link_visits_truncated",
-                "external_references_truncated",
-                "external_storage_segments_truncated",
-            )
-        ):
+        if external_reference_analysis.get("link_visits_truncated"):
             reason = "keras_zip_external_reference_analysis_limit_exceeded"
             self._mark_inconclusive_scan_result(result, reason)
             result.add_check(
@@ -1715,30 +1703,34 @@ class KerasZipScanner(BaseScanner):
         external_reference_count = 0
         external_storage_segments_truncated = False
 
-        def visit(name: str, link: Any) -> None:
+        def visit(name: str, link: Any, obj: Any, path_truncated: bool) -> None:
             nonlocal external_reference_count, external_storage_segments_truncated
             if isinstance(link, h5py.ExternalLink):
                 external_reference_count += 1
                 if len(findings) < cls.MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
-                    findings.append(
-                        {
-                            "kind": "ExternalLink",
-                            "hdf5_path": f"/{name}".replace("//", "/"),
-                            "filename": link.filename,
-                            "path": link.path,
-                        },
-                    )
+                    filename, filename_truncated = cls._bounded_hdf5_reference_text(link.filename)
+                    target_path, target_path_truncated = cls._bounded_hdf5_reference_text(link.path)
+                    link_finding: dict[str, Any] = {
+                        "kind": "ExternalLink",
+                        "hdf5_path": f"/{name}".replace("//", "/"),
+                        "filename": filename,
+                        "path": target_path,
+                    }
+                    if path_truncated:
+                        link_finding["hdf5_path_truncated"] = True
+                    if filename_truncated:
+                        link_finding["filename_truncated"] = True
+                    if target_path_truncated:
+                        link_finding["path_truncated"] = True
+                    findings.append(link_finding)
                 return
 
-            if not isinstance(link, h5py.HardLink):
-                return
-
-            obj = h5_file.get(name, getlink=False)
             if not isinstance(obj, h5py.Dataset):
                 return
 
-            external_storage = obj.external
-            if not external_storage:
+            external_storage_properties = obj.id.get_create_plist()
+            external_storage_segment_count = external_storage_properties.get_external_count()
+            if external_storage_segment_count <= 0:
                 return
 
             external_reference_count += 1
@@ -1746,19 +1738,33 @@ class KerasZipScanner(BaseScanner):
                 return
 
             segments = [
-                {"filename": filename, "offset": int(offset), "size": int(size)}
-                for filename, offset, size in external_storage[: cls.MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS]
+                {
+                    **cls._hdf5_external_storage_filename_details(filename),
+                    "offset": int(offset),
+                    "size": int(size),
+                }
+                for filename, offset, size in (
+                    external_storage_properties.get_external(index)
+                    for index in range(
+                        min(
+                            external_storage_segment_count,
+                            cls.MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS,
+                        )
+                    )
+                )
             ]
-            finding: dict[str, Any] = {
+            storage_finding: dict[str, Any] = {
                 "kind": "external_storage",
                 "hdf5_path": f"/{name}".replace("//", "/"),
                 "segments": segments,
             }
-            if len(external_storage) > len(segments):
+            if path_truncated:
+                storage_finding["hdf5_path_truncated"] = True
+            if external_storage_segment_count > len(segments):
                 external_storage_segments_truncated = True
-                finding["segment_count"] = len(external_storage)
-                finding["segments_truncated"] = True
-            findings.append(finding)
+                storage_finding["segment_count"] = external_storage_segment_count
+                storage_finding["segments_truncated"] = True
+            findings.append(storage_finding)
 
         visited_link_count, link_visits_truncated = cls._visit_hdf5_links(
             h5_file,
@@ -1785,10 +1791,10 @@ class KerasZipScanner(BaseScanner):
         """Traverse HDF5 links without following ExternalLink or SoftLink targets."""
         visited_link_count = 0
         visited_group_ids: set[Any] = set()
-        groups_to_visit: list[tuple[Any, str]] = [(h5_file, "")]
+        groups_to_visit: list[tuple[Any, str, bool]] = [(h5_file, "", False)]
 
         while groups_to_visit:
-            group, prefix = groups_to_visit.pop()
+            group, prefix, prefix_truncated = groups_to_visit.pop()
             group_identity = cls._hdf5_object_identity(group)
             if group_identity in visited_group_ids:
                 continue
@@ -1800,18 +1806,49 @@ class KerasZipScanner(BaseScanner):
                 visited_link_count += 1
 
                 child_key = str(child_name)
-                child_path = f"{prefix}/{child_key}" if prefix else child_key
+                child_path, child_path_truncated = cls._bounded_hdf5_child_path(
+                    prefix,
+                    child_key,
+                    prefix_truncated=prefix_truncated,
+                )
                 link = group.get(child_name, getlink=True)
-                visit(child_path, link)
+                obj = group.get(child_name, getlink=False) if isinstance(link, h5py.HardLink) else None
+                visit(child_path, link, obj, child_path_truncated)
 
-                if not isinstance(link, h5py.HardLink):
-                    continue
-
-                obj = group.get(child_name, getlink=False)
                 if isinstance(obj, h5py.Group):
-                    groups_to_visit.append((obj, child_path))
+                    groups_to_visit.append((obj, child_path, child_path_truncated))
 
         return visited_link_count, False
+
+    @classmethod
+    def _bounded_hdf5_child_path(
+        cls,
+        prefix: str,
+        child_name: str,
+        *,
+        prefix_truncated: bool,
+    ) -> tuple[str, bool]:
+        """Join an HDF5 child path while bounding retained evidence."""
+        child_path = f"{prefix}/{child_name}" if prefix else child_name
+        bounded_path, path_truncated = cls._bounded_hdf5_reference_text(child_path)
+        return bounded_path, prefix_truncated or path_truncated
+
+    @classmethod
+    def _bounded_hdf5_reference_text(cls, value: Any) -> tuple[str, bool]:
+        """Return bounded HDF5 path evidence and whether it was truncated."""
+        text = os.fsdecode(value)
+        if len(text) <= cls.MAX_HDF5_REFERENCE_TEXT_CHARS:
+            return text, False
+        return text[: cls.MAX_HDF5_REFERENCE_TEXT_CHARS], True
+
+    @classmethod
+    def _hdf5_external_storage_filename_details(cls, filename: Any) -> dict[str, Any]:
+        """Return bounded external-storage filename evidence."""
+        bounded_filename, filename_truncated = cls._bounded_hdf5_reference_text(filename)
+        details: dict[str, Any] = {"filename": bounded_filename}
+        if filename_truncated:
+            details["filename_truncated"] = True
+        return details
 
     @staticmethod
     def _hdf5_object_identity(obj: Any) -> Any:
@@ -1819,7 +1856,12 @@ class KerasZipScanner(BaseScanner):
         try:
             return ("h5o_addr", int(h5py.h5o.get_info(obj.id).addr))
         except Exception:
-            return ("python_id", id(obj))
+            try:
+                object_id = obj.id
+                hash(object_id)
+                return ("h5_object_id", object_id)
+            except Exception:
+                return ("python_id", id(obj))
 
     @staticmethod
     def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
@@ -1958,165 +2000,13 @@ class KerasZipScanner(BaseScanner):
         # Lambda layers in Keras ZIP format store the function as a list
         # where the first element is base64-encoded Python code
         function_data = layer_config.get("function")
+        location = f"{self.current_file_path} (layer: {layer_name})"
 
-        if function_data and isinstance(function_data, list) and len(function_data) > 0:
-            # First element is the base64-encoded function
-            encoded_function = function_data[0]
-
-            if (
-                encoded_function
-                and isinstance(encoded_function, str)
-                and len(encoded_function) > self.MAX_LAMBDA_LIST_CODE_B64_CHARS
-            ):
-                result.add_check(
-                    name="Lambda Layer Detection",
-                    passed=False,
-                    message=(
-                        f"Lambda layer '{layer_name}' contains list-format code that exceeds the bounded analysis limit"
-                    ),
-                    severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
-                    details={
-                        "layer_name": layer_name,
-                        "layer_class": "Lambda",
-                        "function_format": "list",
-                        "analysis_status": "code_size_limit_exceeded",
-                        "encoded_code_chars": len(encoded_function),
-                        "max_encoded_code_chars": self.MAX_LAMBDA_LIST_CODE_B64_CHARS,
-                    },
-                    why=(
-                        "Oversized Lambda bytecode was not decoded because it exceeds the bounded "
-                        "static-analysis limit."
-                    ),
-                )
-                encoded_function = ""
-
-            if encoded_function and isinstance(encoded_function, str):
-                try:
-                    # Decode the base64 function
-                    decoded = base64.b64decode(encoded_function)
-                    # Try to decode as string
-                    decoded_str = decoded.decode("utf-8", errors="ignore")
-
-                    # Check for dangerous patterns
-                    dangerous_patterns = [
-                        "exec",
-                        "eval",
-                        "__import__",
-                        "compile",
-                        "open",
-                        "subprocess",
-                        "os.system",
-                        "os.popen",
-                        "pickle",
-                        "marshal",
-                        "importlib",
-                        "runpy",
-                        "webbrowser",
-                        "socket",
-                        "http",
-                        "https",
-                        "urllib",
-                        "urllib3",
-                        "shutil",
-                        "ctypes",
-                    ]
-
-                    found_patterns = find_lambda_dangerous_patterns(decoded_str, dangerous_patterns)
-
-                    if found_patterns:
-                        result.add_check(
-                            name="Dangerous Lambda Layer",
-                            passed=False,
-                            message=f"Lambda layer '{layer_name}' contains dangerous code: {', '.join(found_patterns)}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (layer: {layer_name})",
-                            details={
-                                "layer_name": layer_name,
-                                "layer_class": "Lambda",
-                                "dangerous_patterns": found_patterns,
-                                "code_preview": (decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str),
-                                "encoding": "base64",
-                            },
-                            why=(
-                                "Lambda layers can execute arbitrary Python code during model inference, "
-                                "which poses a severe security risk."
-                            ),
-                        )
-                    else:
-                        # Check if it's valid Python code
-                        is_valid, error = validate_python_syntax(decoded_str)
-                        if is_valid:
-                            # Valid Python but no obvious dangerous patterns
-                            is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
-                            if is_dangerous:
-                                result.add_check(
-                                    name="Lambda Layer Code Analysis",
-                                    passed=False,
-                                    message=f"Lambda layer '{layer_name}' contains potentially dangerous code",
-                                    severity=IssueSeverity.WARNING,
-                                    location=f"{self.current_file_path} (layer: {layer_name})",
-                                    details={
-                                        "layer_name": layer_name,
-                                        "layer_class": "Lambda",
-                                        "code_analysis": risk_desc,
-                                        "code_preview": (
-                                            decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str
-                                        ),
-                                    },
-                                    why=get_pattern_explanation("lambda_layer"),
-                                )
-                            else:
-                                result.add_check(
-                                    name="Lambda Layer Code Analysis",
-                                    passed=True,
-                                    message=f"Lambda layer '{layer_name}' contains safe Python code",
-                                    location=f"{self.current_file_path} (layer: {layer_name})",
-                                    details={
-                                        "layer_name": layer_name,
-                                        "layer_class": "Lambda",
-                                    },
-                                )
-                        else:
-                            # Not valid Python - might be binary data
-                            result.add_check(
-                                name="Lambda Layer Detection",
-                                passed=False,
-                                message=(
-                                    f"Lambda layer '{layer_name}' contains opaque encoded bytecode with no dangerous "
-                                    "text patterns detected"
-                                ),
-                                severity=IssueSeverity.WARNING,
-                                location=f"{self.current_file_path} (layer: {layer_name})",
-                                details={
-                                    "layer_name": layer_name,
-                                    "layer_class": "Lambda",
-                                    "validation_error": error,
-                                    "analysis_status": "opaque_bytecode",
-                                },
-                                why=(
-                                    "Keras Lambda layers can embed bytecode that executes during model loading or "
-                                    "inference; no high-risk text patterns were detected."
-                                ),
-                            )
-
-                except Exception as e:
-                    result.add_check(
-                        name="Lambda Layer Decoding",
-                        passed=False,
-                        message=f"Failed to decode Lambda layer '{layer_name}' function",
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
-                        details={
-                            "layer_name": layer_name,
-                            "error": str(e),
-                        },
-                    )
+        if isinstance(function_data, list):
+            check_lambda_list_function(function_data, result, location, layer_name)
         elif isinstance(function_data, dict):
             # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
-            check_lambda_dict_function(
-                function_data, result, f"{self.current_file_path} (layer: {layer_name})", layer_name
-            )
+            check_lambda_dict_function(function_data, result, location, layer_name)
 
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
@@ -2126,13 +2016,27 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=f"Lambda layer '{layer_name}' references potentially dangerous module: {module_name}",
                 severity=IssueSeverity.CRITICAL,
-                location=f"{self.current_file_path} (layer: {layer_name})",
+                location=location,
                 details={
                     "layer_name": layer_name,
                     "module": module_name,
                     "function": function_name,
                 },
                 why=get_pattern_explanation("lambda_layer"),
+            )
+        elif any(value is not None and not isinstance(value, str) for value in (module_name, function_name)):
+            result.add_check(
+                name="Lambda Layer Module Reference Check",
+                passed=False,
+                message=f"Lambda layer '{layer_name}' uses malformed module/function reference metadata",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={
+                    "layer_name": layer_name,
+                    "module_type": type(module_name).__name__,
+                    "function_type": type(function_name).__name__,
+                },
+                why="Malformed Lambda module references cannot be safely classified.",
             )
 
     @staticmethod
