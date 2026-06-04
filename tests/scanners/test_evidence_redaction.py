@@ -38,6 +38,36 @@ def test_redacts_structured_secret_suffixes_pwd_and_token_auth() -> None:
     assert f"Authorization: Token {REDACTED_EVIDENCE_VALUE}" in redacted
 
 
+def test_redacts_multiline_secret_assignments() -> None:
+    """Multiline quoted values should not leak after the first newline."""
+    text = 'private_key = """-----BEGIN KEY-----\nMULTILINESECRET123\n-----END KEY-----"""\nos.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "MULTILINESECRET123" not in redacted
+    assert f'private_key = """{REDACTED_EVIDENCE_VALUE}"""' in redacted
+    assert "os.system" in redacted
+
+
+def test_redacts_subscripted_and_mapping_secret_assignments() -> None:
+    """Python and JSON-style containers should redact sensitive keyed values."""
+    text = (
+        'os.environ["API_KEY"] = "ENVSECRET123" '
+        'headers["Authorization"] = "HEADERSECRET456" '
+        '{"client_secret": "MAPSECRET789", "public_url": "https://example.com/model.bin"}'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ENVSECRET123" not in redacted
+    assert "HEADERSECRET456" not in redacted
+    assert "MAPSECRET789" not in redacted
+    assert 'os.environ["API_KEY"] = "<redacted>"' in redacted
+    assert 'headers["Authorization"] = "<redacted>"' in redacted
+    assert '"client_secret": "<redacted>"' in redacted
+    assert '"public_url": "https://example.com/model.bin"' in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"

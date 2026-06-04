@@ -737,6 +737,26 @@ def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
     assert preview.count("<redacted>") == 3
 
 
+def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'private_key = """MULTILINESECRET123\nSTILLSECRET456"""\n'
+        'os.environ["API_KEY"] = "ENVSECRET789"\n'
+        'headers["Authorization"] = "HEADERSECRET000"\n'
+        'config = {"client_secret": "MAPSECRET111", "callback": "https://callback.example/public"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "MULTILINESECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "ENVSECRET789" not in preview
+    assert "HEADERSECRET000" not in preview
+    assert "MAPSECRET111" not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/public" in preview
+    assert preview.count("<redacted>") == 4
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-collection-secret-value-00000000"
@@ -790,6 +810,45 @@ def test_pyfunc_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     assert raw_secret not in preview
     assert "<redacted>" in preview
     _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> None:
+    raw_secrets = [
+        "c081-multiline-secret-000000",
+        "c081-env-secret-111111",
+        "c081-auth-secret-222222",
+        "c081-map-secret-333333",
+    ]
+    python_code = (
+        "import os\n"
+        f'private_key = """{raw_secrets[0]}\n{raw_secrets[0]}"""\n'
+        f'os.environ["API_KEY"] = "{raw_secrets[1]}"\n'
+        f'headers = {{"Authorization": "{raw_secrets[2]}", "client_secret": "{raw_secrets[3]}"}}\n'
+        'os.system("curl https://callback.example/public")\n'
+    )
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_structured_secret_code",
+                "string_attrs": {"func": python_code},
+            }
+        ],
+        model_name="pyfunc_structured_preview_secret",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Python Code Analysis"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    for raw_secret in raw_secrets:
+        assert raw_secret not in preview
+        _assert_secret_absent_from_exported_result(result, raw_secret)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
