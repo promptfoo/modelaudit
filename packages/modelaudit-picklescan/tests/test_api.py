@@ -3153,6 +3153,27 @@ def test_scan_bytes_warns_when_invoked_dill_dump_resolves_to_shadow_module(
     )
 
 
+def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(b"\x80\x02cdill\ndump\n(tR.", source="unresolved-dill-dump.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
     payload = b"cdill\nloads\n."
 
@@ -3785,6 +3806,59 @@ def test_scan_bytes_warns_when_checked_hash_cache_overrides_inert_source(
     assert marker.read_text(encoding="utf-8") == "owned"
 
 
+@pytest.mark.parametrize("optimization_suffix", ["", ".opt-1", ".opt-2", ".opt-3"])
+def test_scan_bytes_warns_when_other_cpython_cache_targets_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optimization_suffix: str,
+) -> None:
+    module_name = f"modelaudit_c095_other_cpython_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    compiled_path = py_compile.compile(str(source_path), doraise=True)
+    assert compiled_path is not None
+    cache_path = Path(compiled_path)
+    current_tag = sys.implementation.cache_tag
+    assert current_tag is not None and current_tag.startswith("cpython-")
+    other_tag = "cpython-313" if current_tag != "cpython-313" else "cpython-312"
+    other_cache_name = cache_path.name.replace(current_tag, other_tag, 1).replace(
+        ".pyc",
+        f"{optimization_suffix}.pyc",
+    )
+    other_cache_path = cache_path.with_name(other_cache_name)
+    cache_path.replace(other_cache_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_inert_source_with_unrelated_cross_version_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_unrelated_cross_version_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    cache_directory = tmp_path / "__pycache__"
+    cache_directory.mkdir()
+    (cache_directory / "other_module.cpython-313.pyc").write_bytes(b"unrelated")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
 def test_scan_bytes_allows_inert_source_with_stale_timestamp_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4148,6 +4222,48 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "disabled-enrichment-shadow-marker"
+    (tmp_path / "numpy.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"cnumpy\nGadget\n."
+
+    report = scan_bytes(
+        payload,
+        source="disabled-enrichment-shadow-numpy.pkl",
+        enrich_call_graph=False,
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled() -> None:
+    report = scan_bytes(
+        b"ccollections\nOrderedDict\n.",
+        source="disabled-enrichment-ordered-dict.pkl",
+        enrich_call_graph=False,
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(

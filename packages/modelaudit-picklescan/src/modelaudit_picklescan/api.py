@@ -27,7 +27,6 @@ from .call_graph import (
     module_initialization_is_proven_inert,
     shared_source_sensitive_caches,
     trusted_import_reference_requires_invocation_analysis,
-    unresolved_trusted_import_reference_is_safe_when_invoked,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -978,7 +977,7 @@ def _scan_pickle_payload_native(
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
         report = _report_from_native_dict(raw_report)
-        return _with_call_graph_findings(report) if enrich_call_graph else report
+        return _with_call_graph_findings(report) if enrich_call_graph else _with_import_origin_findings(report)
     except Exception as error:
         return _engine_error_report(
             source=source,
@@ -1025,7 +1024,6 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     enrichment_errors: list[tuple[str, Exception]] = []
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
-    unresolved_trusted_invocation_positions: frozenset[int] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
     source_snapshot_stable = True
@@ -1090,13 +1088,6 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except Exception as error:
             enrichment_errors.append(("python_import_reference_trust", error))
         try:
-            unresolved_trusted_invocation_positions = _proven_unresolved_trusted_invocation_positions(
-                report,
-                invoked_global_positions,
-            )
-        except Exception as error:
-            enrichment_errors.append(("python_import_unresolved_invocation_trust", error))
-        try:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             source_snapshot_stable = False
@@ -1105,13 +1096,12 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     if (
         source_snapshot_stable
         and callable_invocations_complete
-        and (inert_initialization_modules or trusted_import_references or unresolved_trusted_invocation_positions)
+        and (inert_initialization_modules or trusted_import_references)
     ):
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,
             trusted_import_references,
-            unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
             analyzed_invocation_references,
@@ -1171,6 +1161,24 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         if enrichment_errors
         else updated_report
     )
+
+
+def _with_import_origin_findings(report: PickleReport) -> PickleReport:
+    enrichment_errors: list[tuple[str, Exception]] = []
+    with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        try:
+            report = _with_untrusted_allowlisted_import_findings(
+                report,
+                report.metadata.get("import_references"),
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_allowlist_origin", error))
+        try:
+            _ensure_shared_source_snapshot_stable(report_generation)
+        except _CallGraphAnalysisLimitError as error:
+            enrichment_errors.append(("python_import_origin_stability", error))
+    return _with_call_graph_enrichment_errors(report, tuple(enrichment_errors)) if enrichment_errors else report
 
 
 def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]:
@@ -1269,32 +1277,10 @@ def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[s
     return frozenset(references)
 
 
-def _proven_unresolved_trusted_invocation_positions(
-    report: PickleReport,
-    invoked_global_positions: frozenset[int],
-) -> frozenset[int]:
-    positions: list[int] = []
-    for finding in report.findings:
-        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
-            continue
-        module = str(finding.details.get("module", ""))
-        name = str(finding.details.get("name", ""))
-        position = _optional_int(finding.details.get("position"))
-        if (
-            position is None
-            or not _finding_is_invoked(finding, position, invoked_global_positions)
-            or not unresolved_trusted_import_reference_is_safe_when_invoked(module, name)
-        ):
-            continue
-        positions.append(position)
-    return frozenset(positions)
-
-
 def _without_proven_safe_import_findings(
     report: PickleReport,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
-    unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     analyzed_invocation_references: frozenset[tuple[str, str]],
@@ -1309,7 +1295,6 @@ def _without_proven_safe_import_findings(
             finding,
             inert_initialization_modules,
             trusted_import_references,
-            unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
             analyzed_invocation_references,
@@ -1344,7 +1329,6 @@ def _non_allowlisted_import_finding_is_proven_safe(
     finding: Finding,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
-    unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     analyzed_invocation_references: frozenset[tuple[str, str]],
@@ -1374,10 +1358,9 @@ def _non_allowlisted_import_finding_is_proven_safe(
         or invocation_is_analyzed
         or invocation_is_trusted_reconstruction
     )
-    return (
-        trusted_reference_is_proven_safe
-        and ((module, name) in trusted_import_references or position in unresolved_trusted_invocation_positions)
-    ) or (inert_reference_is_proven_safe and module in inert_initialization_modules)
+    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
+        inert_reference_is_proven_safe and module in inert_initialization_modules
+    )
 
 
 def _finding_is_invoked(

@@ -712,15 +712,6 @@ def trusted_import_reference_requires_invocation_analysis(module_name: str, name
     return (module_name, name) in _TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS
 
 
-def unresolved_trusted_import_reference_is_safe_when_invoked(module_name: str, name: str) -> bool:
-    """Return whether an unresolved, reviewed callable has safe invocation semantics."""
-    return (
-        (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES
-        and not trusted_import_reference_requires_invocation_analysis(module_name, name)
-        and _trusted_module_origin_kind(module_name) == "unresolved"
-    )
-
-
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
     if module_name == "__builtin__":
@@ -1786,14 +1777,22 @@ def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bo
         if cache_directory.is_dir():
             default_cache_name = cache_paths[0][0].name
             optimized_prefix = f"{default_cache_name[:-4]}.opt-"
+            expected_cache_names = {cache_path.name for cache_path, _ in cache_paths}
             for index, candidate in enumerate(cache_directory.iterdir()):
                 if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
                     return True
-                if not candidate.name.startswith(optimized_prefix) or not candidate.name.endswith(".pyc"):
+                if not candidate.is_file():
                     continue
-                optimization = candidate.name[len(optimized_prefix) : -4]
-                if optimization.isdecimal() and int(optimization) > 2 and candidate.is_file():
+                if _other_cpython_cache_targets_source(
+                    candidate.name,
+                    source_path,
+                    expected_cache_names,
+                ):
                     return True
+                if candidate.name.startswith(optimized_prefix) and candidate.name.endswith(".pyc"):
+                    optimization = candidate.name[len(optimized_prefix) : -4]
+                    if optimization.isdecimal() and int(optimization) > 2:
+                        return True
     except OSError:
         return True
     _track_shared_source_paths(
@@ -1804,6 +1803,23 @@ def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bo
         _bytecode_cache_can_override_source(cache_path, source_path, source, optimize_level)
         for cache_path, optimize_level in cache_paths
     )
+
+
+def _other_cpython_cache_targets_source(
+    candidate_name: str,
+    source_path: Path,
+    expected_cache_names: set[str],
+) -> bool:
+    if candidate_name in expected_cache_names:
+        return False
+    prefix = f"{source_path.stem}.cpython-"
+    if not candidate_name.startswith(prefix) or not candidate_name.endswith(".pyc"):
+        return False
+    tag_and_optimization = candidate_name[len(prefix) : -4]
+    version, separator, optimization = tag_and_optimization.partition(".opt-")
+    if not version.isdecimal():
+        return False
+    return not separator or optimization.isdecimal()
 
 
 def _bytecode_cache_can_override_source(
