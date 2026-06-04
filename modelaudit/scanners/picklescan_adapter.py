@@ -351,7 +351,13 @@ def pickle_report_to_scan_result(
 
     scan_success = (
         (report.status == ScanStatus.COMPLETE and not has_inconclusive_notice)
-        or (report.has_security_findings and (report.status == ScanStatus.INCONCLUSIVE or has_inconclusive_notice))
+        or (
+            report.has_security_findings
+            and (
+                report.status == ScanStatus.INCONCLUSIVE
+                or (report.status == ScanStatus.COMPLETE and has_inconclusive_notice)
+            )
+        )
         or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )
     result.finish(success=scan_success)

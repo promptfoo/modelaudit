@@ -665,6 +665,49 @@ def test_pickle_report_to_scan_result_keeps_legacy_truncated_findings_successful
     assert any(issue.rule_code == "S101" for issue in result.issues)
 
 
+def test_pickle_report_to_scan_result_keeps_operational_errors_unsuccessful_with_truncation_notice() -> None:
+    report = PickleReport(
+        source="short-read-import-reference-cap.pkl",
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Dangerous global reference found: posix.system",
+                severity=Severity.WARNING,
+                location="short-read-import-reference-cap.pkl (pos 0)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="short-read-import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+        errors=(
+            ScanError(
+                message="Could not read remainder of pickle stream",
+                category="short_read",
+                location="short-read-import-reference-cap.pkl",
+                exception_type="OSError",
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated", "short_read"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    assert any(issue.rule_code == "S101" for issue in result.issues)
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_callable_invocations() -> None:
     report = PickleReport(
         source="legacy-callable-invocation-cap.pkl",
