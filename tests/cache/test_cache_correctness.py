@@ -133,6 +133,9 @@ def test_cache_manager_cached_scan_does_not_cache_transient_clean_bytes(tmp_path
     file_path.write_bytes(malicious_payload)
     original_stat = file_path.stat()
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    cache = cache_manager.cache
+    original_change_token = cache._get_file_change_token(str(file_path), original_stat)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
 
@@ -144,7 +147,10 @@ def test_cache_manager_cached_scan_does_not_cache_transient_clean_bytes(tmp_path
             Path(path).write_bytes(malicious_payload)
             os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             deadline = time.monotonic() + 1.2
-            while Path(path).stat().st_ctime_ns == original_stat.st_ctime_ns and time.monotonic() < deadline:
+            while (
+                cache._get_file_change_token(path, Path(path).stat()) == original_change_token
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
                 Path(path).write_bytes(malicious_payload)
                 os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
@@ -152,9 +158,112 @@ def test_cache_manager_cached_scan_does_not_cache_transient_clean_bytes(tmp_path
         return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
 
     first = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
-    if file_path.stat().st_ctime_ns == original_stat.st_ctime_ns:
-        pytest.skip("filesystem does not expose a changed ctime for in-place writes")
+    assert cache._get_file_change_token(str(file_path), file_path.stat()) != original_change_token
     second = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+
+
+def test_store_result_rejects_changed_generation_when_stat_and_hash_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="change-token.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    file_stat = file_path.stat()
+    file_hash = cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    change_token = {"value": 1}
+
+    monkeypatch.setattr(cache, "_get_file_change_token", lambda _path, _stat: change_token["value"])
+    change_token["value"] = 2
+
+    stored = cache.store_result(
+        str(file_path),
+        expected,
+        10,
+        expected_file_stat=file_stat,
+        expected_file_hash=file_hash,
+        expected_change_token=1,
+        expected_parent_change_token=1,
+    )
+
+    assert stored is False
+    assert cache.get_cache_stats()["total_entries"] == 0
+
+
+def test_store_result_rejects_changed_parent_generation_when_file_identity_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="parent-change-token.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    file_stat = file_path.stat()
+    file_hash = cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    parent_path = str(file_path.parent)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    change_tokens = {str(file_path): 1, parent_path: 1}
+
+    monkeypatch.setattr(cache, "_get_file_change_token", lambda path, _stat: change_tokens[path])
+    change_tokens[parent_path] = 2
+
+    stored = cache.store_result(
+        str(file_path),
+        expected,
+        10,
+        expected_file_stat=file_stat,
+        expected_file_hash=file_hash,
+        expected_change_token=1,
+        expected_parent_change_token=1,
+    )
+
+    assert stored is False
+    assert cache.get_cache_stats()["total_entries"] == 0
+
+
+def test_cache_manager_cached_scan_does_not_cache_transient_path_replacement(tmp_path: Path) -> None:
+    model_path = _make_cacheable_file(tmp_path, name="model.dat")
+    clean_path = _make_cacheable_file(tmp_path, name="clean.dat")
+    backup_path = tmp_path / "model.backup"
+    malicious_payload = b"evil!:" + (b"x" * 2042)
+    clean_payload = b"clean:" + (b"y" * 2042)
+    model_path.write_bytes(malicious_payload)
+    clean_path.write_bytes(clean_payload)
+    original_stat = model_path.stat()
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    cache = cache_manager.cache
+    parent_path = str(model_path.parent)
+    original_parent_change_token = cache._get_file_change_token(parent_path, model_path.parent.stat())
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            model_path.rename(backup_path)
+            clean_path.rename(model_path)
+            prefix = Path(path).read_bytes()[:6].decode("utf-8")
+            model_path.rename(clean_path)
+            backup_path.rename(model_path)
+            os.utime(model_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            deadline = time.monotonic() + 1.2
+            while (
+                cache._get_file_change_token(parent_path, model_path.parent.stat()) == original_parent_change_token
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                model_path.rename(backup_path)
+                clean_path.rename(model_path)
+                model_path.rename(clean_path)
+                backup_path.rename(model_path)
+                os.utime(model_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            return {"payload_prefix": prefix}
+        return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
+
+    first = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
+    assert cache._get_file_change_token(parent_path, model_path.parent.stat()) != original_parent_change_token
+    second = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
 
     assert first["payload_prefix"] == "clean:"
     assert second["payload_prefix"] == "evil!:"
@@ -735,15 +844,14 @@ def test_batch_store_persists_bound_result(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
     assert cache_manager.cache is not None
-    file_stat = file_path.stat()
-    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    file_identity = cache_manager.cache.capture_file_identity(str(file_path))
     batch_ops = BatchCacheOperations(cache_manager)
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
 
     assert (
         batch_ops.batch_store(
             [(str(file_path), expected, 10)],
-            expected_file_identities={str(file_path): (file_stat, file_hash)},
+            expected_file_identities={str(file_path): file_identity},
         )
         == 1
     )
@@ -757,8 +865,8 @@ def test_batch_store_rejects_replaced_file_identity(tmp_path: Path) -> None:
     file_path.write_bytes(clean_payload)
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
     assert cache_manager.cache is not None
+    file_identity = cache_manager.cache.capture_file_identity(str(file_path))
     file_stat = file_path.stat()
-    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
     batch_ops = BatchCacheOperations(cache_manager)
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
 
@@ -768,7 +876,7 @@ def test_batch_store_rejects_replaced_file_identity(tmp_path: Path) -> None:
     assert (
         batch_ops.batch_store(
             [(str(file_path), expected, 10)],
-            expected_file_identities={str(file_path): (file_stat, file_hash)},
+            expected_file_identities={str(file_path): file_identity},
         )
         == 0
     )
@@ -782,8 +890,7 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
     batch_ops = BatchCacheOperations(cache_manager)
 
     assert cache_manager.cache is not None
-    file_stat = file_path.stat()
-    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    file_identity = cache_manager.cache.capture_file_identity(str(file_path))
     monkeypatch.setattr(cache_manager.cache, "_generate_cache_key_material", lambda *args, **kwargs: (None, None))
 
     stored_count = batch_ops.batch_store(
@@ -800,7 +907,7 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
                 10,
             )
         ],
-        expected_file_identities={str(file_path): (file_stat, file_hash)},
+        expected_file_identities={str(file_path): file_identity},
     )
 
     assert stored_count == 0
@@ -900,6 +1007,9 @@ def test_large_file_store_reuses_verified_post_scan_hash_for_cache_key(
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     version_context = build_cache_version_context({"timeout": 30})
     expected_hash = "secure:" + ("a" * 64)
+    expected_change_token = cache._get_file_change_token(str(file_path), file_stat)
+    parent_path = str(file_path.parent)
+    expected_parent_change_token = cache._get_file_change_token(parent_path, file_path.parent.stat())
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
     hash_calls = {"count": 0}
 
@@ -921,18 +1031,23 @@ def test_large_file_store_reuses_verified_post_scan_hash_for_cache_key(
             version_context=version_context,
             expected_file_stat=file_stat,
             expected_file_hash=expected_hash,
+            expected_change_token=expected_change_token,
+            expected_parent_change_token=expected_parent_change_token,
         )
         is True
     )
     assert hash_calls["count"] == 1
 
 
-@pytest.mark.parametrize("missing_part", ["stat", "hash"])
+@pytest.mark.parametrize("missing_part", ["stat", "hash", "change_token", "parent_change_token"])
 def test_store_result_rejects_incomplete_expected_identity(tmp_path: Path, missing_part: str) -> None:
     file_path = _make_cacheable_file(tmp_path, name="incomplete-identity.cache")
     file_stat = file_path.stat()
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     file_hash = cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    change_token = cache._get_file_change_token(str(file_path), file_stat)
+    parent_path = str(file_path.parent)
+    parent_change_token = cache._get_file_change_token(parent_path, file_path.parent.stat())
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
 
     stored = cache.store_result(
@@ -941,6 +1056,8 @@ def test_store_result_rejects_incomplete_expected_identity(tmp_path: Path, missi
         10,
         expected_file_stat=None if missing_part == "stat" else file_stat,
         expected_file_hash=None if missing_part == "hash" else file_hash,
+        expected_change_token=None if missing_part == "change_token" else change_token,
+        expected_parent_change_token=None if missing_part == "parent_change_token" else parent_change_token,
     )
 
     assert stored is False
@@ -954,6 +1071,9 @@ def test_store_result_rechecks_identity_after_verification_hash(
     expected_stat = file_path.stat()
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     expected_hash = cache.hasher.hash_file_with_stat(str(file_path), expected_stat)
+    expected_change_token = cache._get_file_change_token(str(file_path), expected_stat)
+    parent_path = str(file_path.parent)
+    expected_parent_change_token = cache._get_file_change_token(parent_path, file_path.parent.stat())
     original_hash_file_with_stat = cache.hasher.hash_file_with_stat
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
 
@@ -971,6 +1091,8 @@ def test_store_result_rechecks_identity_after_verification_hash(
         10,
         expected_file_stat=expected_stat,
         expected_file_hash=expected_hash,
+        expected_change_token=expected_change_token,
+        expected_parent_change_token=expected_parent_change_token,
     )
 
     assert stored is False

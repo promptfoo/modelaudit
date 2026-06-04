@@ -93,6 +93,8 @@ class CacheManager:
         version_context: dict[str, Any] | None = None,
         expected_file_stat: os.stat_result | None = None,
         expected_file_hash: str | None = None,
+        expected_change_token: int | None = None,
+        expected_parent_change_token: int | None = None,
     ) -> bool:
         """
         Store scan result in cache.
@@ -104,6 +106,8 @@ class CacheManager:
             version_context: Optional cache version context for config-sensitive invalidation
             expected_file_stat: File metadata captured before the scan
             expected_file_hash: Secure content hash captured before the scan
+            expected_change_token: Platform-specific modification token captured before the scan
+            expected_parent_change_token: Parent directory modification token captured before the scan
         """
         if not self.enabled or not self.cache:
             return False
@@ -115,6 +119,8 @@ class CacheManager:
             version_context=version_context,
             expected_file_stat=expected_file_stat,
             expected_file_hash=expected_file_hash,
+            expected_change_token=expected_change_token,
+            expected_parent_change_token=expected_parent_change_token,
         )
 
     def cached_scan(
@@ -161,9 +167,16 @@ class CacheManager:
         try:
             pre_scan_stat: os.stat_result | None = None
             pre_scan_hash: str | None = None
+            pre_scan_change_token: int | None = None
+            pre_scan_parent_change_token: int | None = None
             try:
-                pre_scan_stat = os.stat(file_path)
-                pre_scan_hash = self.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat) if self.cache else None
+                if self.cache is not None:
+                    (
+                        pre_scan_stat,
+                        pre_scan_hash,
+                        pre_scan_change_token,
+                        pre_scan_parent_change_token,
+                    ) = self.cache.capture_file_identity(file_path)
             except Exception as e:
                 logger.debug("Bypassing cache store for %s: pre-scan hashing failed: %s", file_path, e)
             scan_result = scanner_func(file_path, *args, **kwargs)
@@ -174,7 +187,13 @@ class CacheManager:
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
             cacheable_result = should_cache_scan_result(scan_result)
-            if cacheable_result and pre_scan_stat is not None and pre_scan_hash is not None:
+            if (
+                cacheable_result
+                and pre_scan_stat is not None
+                and pre_scan_hash is not None
+                and pre_scan_change_token is not None
+                and pre_scan_parent_change_token is not None
+            ):
                 self.store_result(
                     file_path,
                     scan_result,
@@ -182,6 +201,8 @@ class CacheManager:
                     version_context=version_context,
                     expected_file_stat=pre_scan_stat,
                     expected_file_hash=pre_scan_hash,
+                    expected_change_token=pre_scan_change_token,
+                    expected_parent_change_token=pre_scan_parent_change_token,
                 )
             elif not cacheable_result:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")

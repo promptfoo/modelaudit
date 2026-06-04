@@ -230,8 +230,12 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                     scan_start = time.perf_counter()
                     try:
-                        pre_scan_stat = os.stat(file_path)
-                        pre_scan_hash = cache_manager.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat)
+                        (
+                            pre_scan_stat,
+                            pre_scan_hash,
+                            pre_scan_change_token,
+                            pre_scan_parent_change_token,
+                        ) = cache_manager.cache.capture_file_identity(file_path)
                     except Exception as e:
                         logger.debug(f"Bypassing cache store for {file_path}: pre-scan hashing failed: {e}")
                         return func(*args, **kwargs)
@@ -250,6 +254,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                             version_context=version_context,
                             expected_file_stat=pre_scan_stat,
                             expected_file_hash=pre_scan_hash,
+                            expected_change_token=pre_scan_change_token,
+                            expected_parent_change_token=pre_scan_parent_change_token,
                         )
                     else:
                         logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")

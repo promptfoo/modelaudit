@@ -15,6 +15,8 @@ from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
 
+ScannedFileIdentity = tuple[os.stat_result, str, int, int]
+
 
 def _is_sampled_fingerprint(value: object) -> bool:
     """Return whether a stored hash represents sampled, incomplete file content."""
@@ -224,6 +226,8 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
         expected_file_stat: os.stat_result | None = None,
         expected_file_hash: str | None = None,
+        expected_change_token: int | None = None,
+        expected_parent_change_token: int | None = None,
     ) -> bool:
         """
         Store scan result in cache with optimized file system calls.
@@ -235,6 +239,8 @@ class ScanResultsCache:
             version_context: Optional cache version context for config-sensitive invalidation
             expected_file_stat: File metadata captured before the scan
             expected_file_hash: Secure content hash captured before the scan
+            expected_change_token: Platform-specific modification token captured before the scan
+            expected_parent_change_token: Parent directory modification token captured before the scan
         Returns:
             True when a cache entry was persisted, False when storage was skipped or failed.
         """
@@ -242,7 +248,15 @@ class ScanResultsCache:
             if os.path.islink(file_path):
                 logger.debug("Skipping cache store for symlink path %s", file_path)
                 return False
-            if (expected_file_stat is None) != (expected_file_hash is None):
+            expected_identity_parts = (
+                expected_file_stat,
+                expected_file_hash,
+                expected_change_token,
+                expected_parent_change_token,
+            )
+            if any(part is not None for part in expected_identity_parts) and any(
+                part is None for part in expected_identity_parts
+            ):
                 logger.debug("Skipping cache store for %s: incomplete expected file identity", file_path)
                 return False
 
@@ -252,6 +266,18 @@ class ScanResultsCache:
             if expected_file_stat is not None and not self._stat_matches(file_stat, expected_file_stat):
                 logger.debug("Skipping cache store for %s: file metadata changed during scan", file_path)
                 return False
+            if (
+                expected_change_token is not None
+                and self._get_file_change_token(file_path, file_stat) != expected_change_token
+            ):
+                logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
+                return False
+            parent_path = str(Path(file_path).parent)
+            if expected_parent_change_token is not None:
+                parent_stat = os.stat(parent_path)
+                if self._get_file_change_token(parent_path, parent_stat) != expected_parent_change_token:
+                    logger.debug("Skipping cache store for %s: parent directory changed during scan", file_path)
+                    return False
             if expected_file_hash is not None:
                 verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
                 if verified_current_hash != expected_file_hash:
@@ -261,6 +287,17 @@ class ScanResultsCache:
                 if expected_file_stat is not None and not self._stat_matches(post_hash_stat, expected_file_stat):
                     logger.debug("Skipping cache store for %s: file metadata changed during verification", file_path)
                     return False
+                if (
+                    expected_change_token is not None
+                    and self._get_file_change_token(file_path, post_hash_stat) != expected_change_token
+                ):
+                    logger.debug("Skipping cache store for %s: file changed during verification", file_path)
+                    return False
+                if expected_parent_change_token is not None:
+                    post_hash_parent_stat = os.stat(parent_path)
+                    if self._get_file_change_token(parent_path, post_hash_parent_stat) != expected_parent_change_token:
+                        logger.debug("Skipping cache store for %s: parent changed during verification", file_path)
+                        return False
                 file_stat = post_hash_stat
 
             version_info = self._get_version_info(version_context)
@@ -315,6 +352,99 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
             return False
+
+    def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
+        """Capture a stable stat, content hash, and platform change token before scanning."""
+        if os.path.islink(file_path):
+            raise ValueError(f"Symlink paths are not cacheable: {file_path}")
+
+        initial_stat = os.stat(file_path)
+        initial_change_token = self._get_file_change_token(file_path, initial_stat)
+        parent_path = str(Path(file_path).parent)
+        initial_parent_stat = os.stat(parent_path)
+        initial_parent_change_token = self._get_file_change_token(parent_path, initial_parent_stat)
+        content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
+        verified_stat = os.stat(file_path)
+        verified_change_token = self._get_file_change_token(file_path, verified_stat)
+        verified_parent_stat = os.stat(parent_path)
+        verified_parent_change_token = self._get_file_change_token(parent_path, verified_parent_stat)
+
+        if (
+            not self._stat_matches(initial_stat, verified_stat)
+            or initial_change_token != verified_change_token
+            or not self._stat_matches(initial_parent_stat, verified_parent_stat)
+            or initial_parent_change_token != verified_parent_change_token
+        ):
+            raise ValueError(f"File changed while capturing cache identity: {file_path}")
+
+        return verified_stat, content_hash, verified_change_token, verified_parent_change_token
+
+    @staticmethod
+    def _get_file_change_token(file_path: str, file_stat: os.stat_result) -> int:
+        """Return a modification generation that changes even when mtime is restored."""
+        if os.name != "nt":
+            return getattr(file_stat, "st_ctime_ns", int(file_stat.st_ctime * 1_000_000_000))
+
+        import ctypes
+        from ctypes import wintypes
+
+        class FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("creation_time", ctypes.c_longlong),
+                ("last_access_time", ctypes.c_longlong),
+                ("last_write_time", ctypes.c_longlong),
+                ("change_time", ctypes.c_longlong),
+                ("file_attributes", wintypes.DWORD),
+            ]
+
+        win_dll = ctypes.WinDLL  # type: ignore[attr-defined]
+        get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
+        win_error = ctypes.WinError  # type: ignore[attr-defined]
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateFileW(
+            file_path,
+            0x0080,
+            0x0001 | 0x0002 | 0x0004,
+            None,
+            3,
+            0x02000000,
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            raise win_error(get_last_error())
+
+        try:
+            basic_info = FileBasicInfo()
+            if not kernel32.GetFileInformationByHandleEx(
+                handle,
+                0,
+                ctypes.byref(basic_info),
+                ctypes.sizeof(basic_info),
+            ):
+                raise win_error(get_last_error())
+            return int(basic_info.change_time)
+        finally:
+            kernel32.CloseHandle(handle)
 
     @staticmethod
     def _stat_matches(left: os.stat_result, right: os.stat_result) -> bool:

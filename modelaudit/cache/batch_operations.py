@@ -9,6 +9,7 @@ from typing import Any
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_manager import CacheManager
 from .cache_policy import should_cache_scan_result
+from .scan_results_cache import ScannedFileIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ class BatchCacheOperations:
         scan_results: list[tuple[str, dict[str, Any], int | None]],
         max_workers: int = 2,
         version_context: dict[str, Any] | None = None,
-        expected_file_identities: dict[str, tuple[os.stat_result, str]] | None = None,
+        expected_file_identities: dict[str, ScannedFileIdentity] | None = None,
     ) -> int:
         """
         Store multiple scan results in cache with batch optimization.
@@ -154,7 +155,7 @@ class BatchCacheOperations:
         Args:
             scan_results: List of (file_path, scan_result, scan_duration_ms) tuples
             max_workers: Maximum number of concurrent I/O operations
-            expected_file_identities: File stat and hash captured with each scan result
+            expected_file_identities: File stat, hash, and change tokens captured with each scan result
 
         Returns:
             Number of successfully stored results
@@ -199,7 +200,7 @@ class BatchCacheOperations:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None,
         version_context: dict[str, Any] | None,
-        expected_file_identity: tuple[os.stat_result, str] | None,
+        expected_file_identity: ScannedFileIdentity | None,
     ) -> bool:
         """Store a single result and return success status."""
         try:
@@ -209,7 +210,9 @@ class BatchCacheOperations:
             if expected_file_identity is None:
                 logger.debug(f"Skipping unbound batch cache store for {os.path.basename(file_path)}")
                 return False
-            expected_file_stat, expected_file_hash = expected_file_identity
+            expected_file_stat, expected_file_hash, expected_change_token, expected_parent_change_token = (
+                expected_file_identity
+            )
 
             return self.cache_manager.store_result(
                 file_path,
@@ -218,6 +221,8 @@ class BatchCacheOperations:
                 version_context=version_context,
                 expected_file_stat=expected_file_stat,
                 expected_file_hash=expected_file_hash,
+                expected_change_token=expected_change_token,
+                expected_parent_change_token=expected_parent_change_token,
             )
         except Exception as e:
             logger.debug(f"Failed to store result for {file_path}: {e}")

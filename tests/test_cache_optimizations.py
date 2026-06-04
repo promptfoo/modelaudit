@@ -113,7 +113,7 @@ class TestCacheOptimizationPerformance:
             # Create test files
             test_files = []
             test_results: list[tuple[str, dict[str, Any], int | None]] = []
-            expected_file_identities: dict[str, tuple[os.stat_result, str]] = {}
+            expected_file_identities: dict[str, tuple[os.stat_result, str, int, int]] = {}
             assert cache_manager.cache is not None
 
             for i in range(10):  # Reduced number for faster test
@@ -121,11 +121,7 @@ class TestCacheOptimizationPerformance:
                 content = f"test content {i}" * 100  # ~1.3KB each
                 file_path.write_text(content)
                 test_files.append(str(file_path))
-                file_stat = file_path.stat()
-                expected_file_identities[str(file_path)] = (
-                    file_stat,
-                    cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat),
-                )
+                expected_file_identities[str(file_path)] = cache_manager.cache.capture_file_identity(str(file_path))
 
                 # Create mock scan result
                 scan_result = {
