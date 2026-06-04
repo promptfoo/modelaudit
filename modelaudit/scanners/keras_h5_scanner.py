@@ -89,6 +89,7 @@ class KerasH5Scanner(BaseScanner):
     )
     _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
     _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
+    _MAX_HDF5_LAYOUT_PROBE_ITEMS: ClassVar[int] = 4096
     _MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
     _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
@@ -359,7 +360,10 @@ class KerasH5Scanner(BaseScanner):
         if not layer_names:
             return False
 
-        for layer_name in layer_names:
+        for index, layer_name in enumerate(layer_names):
+            if index >= cls._MAX_HDF5_LAYOUT_PROBE_ITEMS:
+                return True
+
             link = h5_file.get(layer_name, getlink=True)
             if isinstance(link, h5py.ExternalLink):
                 return True
@@ -388,7 +392,10 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layers, h5py.Group):
             return False
 
-        for layer_name in layers:
+        for index, layer_name in enumerate(layers):
+            if index >= cls._MAX_HDF5_LAYOUT_PROBE_ITEMS:
+                return True
+
             layer_link = layers.get(layer_name, getlink=True)
             if isinstance(layer_link, h5py.ExternalLink):
                 return True

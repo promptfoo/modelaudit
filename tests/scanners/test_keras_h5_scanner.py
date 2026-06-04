@@ -715,6 +715,61 @@ def test_keras_h5_scanner_skips_generic_layer_names_attr_without_weight_groups(t
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_bounds_legacy_layout_probe_before_external_reference_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized legacy layout probes must route into bounded external-reference analysis."""
+    weights_path = tmp_path / "legacy_probe.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.attrs["layer_names"] = [b"layer_0", b"layer_1", b"layer_2"]
+        for index in range(3):
+            f.create_group(f"layer_{index}")
+        f["external_payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/external_payload",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+@pytest.mark.parametrize("layout", ["legacy", "keras3"])
+def test_keras_h5_scanner_layout_probe_limit_without_external_references_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """Layout probe exhaustion alone must not become a security finding or incomplete scan."""
+    weights_path = tmp_path / ("model.weights.h5" if layout == "keras3" else "legacy_probe.h5")
+    with h5py.File(weights_path, "w") as f:
+        if layout == "legacy":
+            f.attrs["layer_names"] = [b"layer_0", b"layer_1", b"layer_2"]
+            group = f
+        else:
+            group = f.create_group("layers")
+        for index in range(3):
+            group.create_group(f"layer_{index}")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
     """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
     external_source = tmp_path / "external_source.h5"
@@ -769,6 +824,34 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
             "kind": "ExternalLink",
             "hdf5_path": "/layers/dense/vars/0",
             "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_bounds_keras3_layout_probe_before_external_reference_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized Keras 3 layout probes must route into bounded external-reference analysis."""
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        for index in range(3):
+            layers.create_group(f"layer_{index}")
+        f["external_payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/external_payload",
+            "filename": "missing_external_source.h5",
             "path": "/payload",
         },
     ]
