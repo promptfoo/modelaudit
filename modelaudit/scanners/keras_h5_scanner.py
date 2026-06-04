@@ -49,11 +49,17 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
     _JSON_ATTRIBUTE_PARSE_FAILED: ClassVar[object] = object()
+    _SAFE_K_BACKEND_LAMBDA_FUNCTIONS_RE: ClassVar[str] = (
+        r"(?:abs|elu|hard_sigmoid|l2_normalize|relu|sigmoid|softmax|softplus|softsign|tanh)"
+    )
+    _SAFE_TF_NN_LAMBDA_FUNCTIONS_RE: ClassVar[str] = (
+        r"(?:elu|gelu|leaky_relu|l2_normalize|log_softmax|relu|relu6|selu|sigmoid|softmax|softplus|softsign|swish|tanh)"
+    )
     _SAFE_LAMBDA_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = (
         re.compile(r"^lambda\s+x\s*:\s*x\s*/\s*\d+$"),
         re.compile(r"^lambda\s+x\s*:\s*x\s*\*\s*\d+$"),
-        re.compile(r"^lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)$"),
-        re.compile(r"^lambda\s+x\s*:\s*K\.\w+\(x\)$"),
+        re.compile(rf"^lambda\s+x\s*:\s*tf\.nn\.{_SAFE_TF_NN_LAMBDA_FUNCTIONS_RE}\(x\)$"),
+        re.compile(rf"^lambda\s+x\s*:\s*K\.{_SAFE_K_BACKEND_LAMBDA_FUNCTIONS_RE}\(x\)$"),
         re.compile(r"^lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$"),
     )
     _SAFE_LAMBDA_MODULE_ROOTS: ClassVar[frozenset[str]] = frozenset(
@@ -1348,8 +1354,18 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def _is_lambda_module_reference_dangerous(cls, module_name: Any, function_name: Any) -> bool:
         """Return True when a Lambda module/function reference resolves to a risky symbol."""
-        if isinstance(function_name, str) and function_name.strip().lower() in cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
-            return True
+        if isinstance(function_name, str):
+            normalized_function_name = function_name.strip().lower()
+            if normalized_function_name in cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
+                return True
+
+            function_tokens = {
+                token.strip().lower()
+                for token in re.split(r"[^0-9A-Za-z_]+", normalized_function_name)
+                if token.strip()
+            }
+            if function_tokens & cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
+                return True
 
         if not isinstance(module_name, str):
             return False

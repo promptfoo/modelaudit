@@ -1150,6 +1150,7 @@ def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
     "function_str",
     [
         "lambda x: x * 2",
+        "lambda x: tf.nn.softmax(x)",
         "lambda x: K.softmax(x)",
         "lambda x: (x - 128) / 128",
     ],
@@ -1269,6 +1270,48 @@ def test_lambda_tf_safe_prefix_with_exec_is_not_allowlisted(tmp_path: Path) -> N
     assert any(
         check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "function_str",
+    [
+        "lambda x: K.get_value(x)",
+        "lambda x: tf.nn.embedding_lookup(x)",
+    ],
+)
+def test_lambda_framework_helpers_outside_source_allowlist_fail_closed(
+    tmp_path: Path,
+    function_str: str,
+) -> None:
+    """Trusted framework roots are not enough for a Lambda source pass."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unsafe_framework_helper_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": function_str}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis" and check.details.get("allowlist_status") == "not_allowlisted"
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].status == CheckStatus.FAILED
+    assert matching_checks[0].severity == IssueSeverity.WARNING
+    assert matching_checks[0].details["validation_status"] == "valid_python"
     assert not any(
         check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.PASSED
@@ -2359,6 +2402,77 @@ def test_lambda_trusted_framework_unknown_callback_stays_warning(tmp_path: Path)
         and check.details.get("function") == "write_file"
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("function_name", ["compat.v1.py_func", "io.system"])
+def test_lambda_dotted_dangerous_function_reference_is_critical(tmp_path: Path, function_name: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dotted_dangerous_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "module": "tensorflow",
+                            "function_name": function_name,
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name=f"dotted_dangerous_{function_name.replace('.', '_')}.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "tensorflow"
+        and check.details.get("function") == function_name
+        for check in result.checks
+    )
+
+
+def test_lambda_dotted_function_reference_uses_token_boundaries(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dotted_benign_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "module": "tensorflow",
+                            "function_name": "io.systematic_helper",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="dotted_benign_function_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("function") == "io.systematic_helper"
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].severity == IssueSeverity.WARNING
+    assert matching_checks[0].details["allowlist_status"] == "not_allowlisted"
 
 
 def test_lambda_allowlisted_framework_root_does_not_hide_python_callback_helper(tmp_path: Path) -> None:
