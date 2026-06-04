@@ -1274,6 +1274,7 @@ def _resolve_scan_source_for_path(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
+                    max_size=runtime.max_download_bytes,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -1318,7 +1319,12 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
-            download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
+            download_path = download_model(
+                path,
+                cache_dir=hf_cache_dir,
+                show_progress=show_progress,
+                max_size=runtime.max_download_bytes,
+            )
             download_duration = time.time() - download_start
             try:
                 download_size = sum(
