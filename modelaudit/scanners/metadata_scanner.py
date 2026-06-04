@@ -3,9 +3,10 @@
 import logging
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import unquote, urlparse
 
 from ..core_results import mark_operational_scan_error
+from ..detectors.network_comm import redact_url_for_finding
 from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
 from .base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
@@ -25,28 +26,11 @@ SUSPICIOUS_URL_DOMAINS = (
 )
 _METADATA_READ_FAILED_REASON = "metadata_read_failed"
 _METADATA_TIMEOUT_REASON = "scan_timeout"
+_REDACTED_SECRET_PREVIEW = "<redacted>"
 
 
 def _redact_url_for_display(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return "[invalid-url]"
-
-    if not parsed.scheme or not parsed.netloc:
-        return "[invalid-url]"
-
-    hostname = parsed.hostname or ""
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
-
-    netloc = f"{hostname}:{port}" if port else hostname
-    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+    return redact_url_for_finding(url)
 
 
 class MetadataScanner(BaseScanner):
@@ -364,9 +348,7 @@ class MetadataScanner(BaseScanner):
                                 location=file_path,
                                 details={
                                     "pattern_description": description,
-                                    "match_preview": matched_text[:20] + "..."
-                                    if len(matched_text) > 20
-                                    else matched_text,
+                                    "match_preview": _REDACTED_SECRET_PREVIEW,
                                     "length": len(secret_part),
                                 },
                                 why="Exposed secrets in documentation can lead to unauthorized access",
@@ -388,9 +370,7 @@ class MetadataScanner(BaseScanner):
                                 location=file_path,
                                 details={
                                     "pattern_description": description,
-                                    "match_preview": matched_text[:20] + "..."
-                                    if len(matched_text) > 20
-                                    else matched_text,
+                                    "match_preview": _REDACTED_SECRET_PREVIEW,
                                     "entropy": round(entropy, 2),
                                     "length": len(secret_part),
                                 },

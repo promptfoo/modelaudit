@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5
+- fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
+- redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
+- fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
+- skip scan-result caching for sampled large-file fingerprints
+- classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
+- run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - fail closed on noncanonical Keras ZIP Lambda and external-reference versions
@@ -33,9 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- include content-routed renamed JFrog folder artifacts in selective downloads with fail-closed bounded probes
 - strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
 - enforce direct Hugging Face file `--max-size` budgets before downloading
 - scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
@@ -52,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
+- scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
 - inspect mixed dict/list Keras HDF5 Lambda bytecode with bounded, marshal-aware analysis
@@ -99,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
 - classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- preserve Skops nested Python-member detection for high-risk calls reached through `__getattribute__`
 - classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
 - detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
 - classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members

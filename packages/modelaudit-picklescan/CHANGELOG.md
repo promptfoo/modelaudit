@@ -64,6 +64,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect dangerous positional lookups inside `str.format` replacement fields
 - recognize PyTorch ZIP archives that contain only hidden pickle members
 - report oversized pickle `FRAME` length mismatches as structural tampering
+- fail closed when novel pickle import-reference metadata exceeds the reporting cap without penalizing repeated benign imports
 
 ### Performance Improvements
 
