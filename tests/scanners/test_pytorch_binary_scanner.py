@@ -376,6 +376,20 @@ def test_pytorch_binary_scanner_detects_spaced_code_pattern_split_across_chunk_b
     )
 
 
+def test_pytorch_binary_scanner_detects_longest_spaced_code_pattern_across_chunk_boundary(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "boundary_longest_spaced_code_pattern.bin"
+    pattern = b"ctypes        .        windll        .        LoadLibrary        ("
+    _write_chunk_boundary_payload(binary_file, pattern, prefix_len=len(pattern) - 1)
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.details.get("pattern") == "ctypes.windll" and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+
 @pytest.mark.skip(
     reason="ML context filtering now ignores executable signatures in weight-like data to reduce false positives"
 )

@@ -23,7 +23,7 @@ class PyTorchBinaryScanner(BaseScanner):
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
     SHEBANG_CONTEXT_BYTES: ClassVar[int] = 50
-    CODE_PATTERN_OVERLAP_BYTES: ClassVar[int] = 64
+    SECURITY_CODE_REGEX_MAX_MATCH_BYTES: ClassVar[int] = len(b"ctypes.windll.LoadLibrary(") + 5 * 8
     SECURITY_CODE_PATTERNS: ClassVar[frozenset[bytes]] = frozenset(
         {
             b"eval(",
@@ -304,7 +304,7 @@ class PyTorchBinaryScanner(BaseScanner):
         longest_pattern = max(
             [
                 self.SHEBANG_CONTEXT_BYTES,
-                self.CODE_PATTERN_OVERLAP_BYTES,
+                self.SECURITY_CODE_REGEX_MAX_MATCH_BYTES + 1,
                 *(len(pattern) for pattern in BINARY_CODE_PATTERNS),
                 *(len(pattern.encode("utf-8")) for pattern in (self.blacklist_patterns or []) if pattern),
                 *(len(signature) for signature in EXECUTABLE_SIGNATURES),
