@@ -2980,12 +2980,20 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Directory summary
         output.append(f"Directory: {metadata['directory']}")
         output.append(f"Total Files: {metadata['summary']['total_files']}")
+        if metadata.get("analysis_incomplete"):
+            output.append("\nWarning: Metadata extraction is incomplete")
+            for event in metadata.get("budget_events", []):
+                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
             output.append(f"  {fmt}: {count}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            output.append(f"  {file_meta.get('file', 'unknown')} ({file_meta.get('format', 'unknown')})")
+            file_name = file_meta.get("file", "unknown")
+            if error := file_meta.get("error"):
+                output.append(f"  {file_name} (error: {error})")
+            else:
+                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:
