@@ -20,9 +20,15 @@ URL_RE: Final[re.Pattern[str]] = re.compile(
 )
 STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![A-Za-z0-9])(?:"
+    r"AIza[0-9A-Za-z_-]{35}|"
     r"AKIA[0-9A-Z]{16}|"
     r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"glpat-[A-Za-z0-9_-]{20}|"
+    r"npm_[A-Za-z0-9]{36}|"
+    r"sq0atp-[0-9A-Za-z_-]{22}|"
+    r"sq0csp-[0-9A-Za-z_-]{43}|"
+    r"(?:stripe|[sr]k)_live_[A-Za-z0-9]{24}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"

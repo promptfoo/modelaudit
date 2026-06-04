@@ -1235,6 +1235,38 @@ def test_scan_file_does_not_let_invalid_flax_prefix_mask_malicious_lightgbm(
     )
 
 
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax", ".msgpack"])
+def test_scan_file_routes_native_flax_suffix_lightgbm_content(tmp_path: Path, suffix: str) -> None:
+    disguised_lightgbm = tmp_path / f"payload{suffix}"
+    _write_malicious_lightgbm(disguised_lightgbm)
+
+    assert file_detection.detect_file_format(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_from_magic(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+
+    result = scan_file(str(disguised_lightgbm), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.flax"
+    _write_malicious_lightgbm(near_match, valid=False)
+
+    assert file_detection.detect_file_format(str(near_match)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert not any(check.name == "Command/Network Correlation Check" for check in result.checks)
+
+
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
 def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
@@ -1572,6 +1604,49 @@ def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_pat
     checkpoint = tmp_path / "stream-pickle-prefix.jpg"
     checkpoint.write_bytes(
         prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_scan_file_complete_pickle_does_not_merge_inconclusive_flax(tmp_path: Path, nested: bool) -> None:
+    payload = pickle.dumps((complex(1, 2), {f"field{i}": i for i in range(2500)}), protocol=4)
+    complete_pickle = tmp_path / "complete.pkl"
+    complete_pickle.write_bytes(payload)
+
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(complete_pickle)
+
+    target = complete_pickle
+    expected_scanner = "pickle"
+    if nested:
+        target = tmp_path / "complete.zip"
+        _create_misnamed_zip(target, {"complete.pkl": payload})
+        expected_scanner = "zip"
+
+    result = scan_file(str(target), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is True
+    assert "flax_msgpack_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_scan_file_still_detects_flax_after_complete_pickle_prefix(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "complete-pickle-prefix.jpg"
+    checkpoint.write_bytes(
+        pickle.dumps(None, protocol=4)
         + flax_msgpack_scanner.msgpack.packb(
             {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
             use_bin_type=True,

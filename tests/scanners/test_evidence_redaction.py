@@ -101,11 +101,26 @@ def test_redacts_azure_authority_userinfo_that_is_not_a_valid_container() -> Non
     assert redacted == "wasbs://<credentials-redacted>@account.blob.core.windows.net/model.bin"
 
 
-@pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
-def test_redacts_standalone_github_token_shapes(prefix: str) -> None:
+@pytest.mark.parametrize(
+    "token",
+    [
+        "ghp_" + "a" * 36,
+        "gho_" + "a" * 36,
+        "ghu_" + "a" * 36,
+        "ghs_" + "a" * 36,
+        "ghr_" + "a" * 36,
+        "AIza" + "a" * 35,
+        "glpat-" + "a" * 20,
+        "npm_" + "a" * 36,
+        "sq0atp-" + "a" * 22,
+        "sq0csp-" + "a" * 43,
+        "stripe_live_" + "a" * 24,
+        "sk_live_" + "a" * 24,
+        "rk_live_" + "a" * 24,
+    ],
+)
+def test_redacts_standalone_secret_token_shapes(token: str) -> None:
     """Secret-shaped strings should be redacted even without assignment syntax."""
-    token = f"{prefix}_" + "a" * 36
-
     redacted = redact_evidence_string(f"metadata key: {token}", max_chars=500)
 
     assert token not in redacted
