@@ -6,6 +6,8 @@ import pickle
 import pickletools
 import struct
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +180,362 @@ class TestModelMetadataExtractor:
             }
         ]
 
+    def test_extract_directory_metadata_allows_in_root_file_symlinks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A symlink to a regular file inside the scan root should remain scannable."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        target = scan_dir / "target.fake"
+        target.write_bytes(b"metadata")
+        linked_model = scan_dir / "linked.fake"
+        linked_model.symlink_to(target)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(linked_model), str(target)]
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["summary"]["formats"] == {"fake": 2}
+        assert all("error" not in file_metadata for file_metadata in metadata["files"])
+
+    def test_extract_directory_metadata_stops_at_file_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan beyond the aggregate file budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"model-{index}.fake").write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert len(scanned_paths) == 2
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["scan_outcome"] == "inconclusive"
+        assert metadata["scan_outcome_reasons"] == [
+            metadata_extractor_module.METADATA_DIRECTORY_BUDGET_REASON,
+        ]
+        assert metadata["budget_events"][0]["limit"] == "max_files"
+        assert metadata["budget_events"][0]["files_considered"] == 2
+
+    def test_extract_directory_metadata_stops_at_byte_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan files that exceed the aggregate byte budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        first = scan_dir / "a.fake"
+        second = scan_dir / "b.fake"
+        first.write_bytes(b"123")
+        second.write_bytes(b"4567")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 5)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(first)]
+        assert metadata["summary"]["total_files"] == 1
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_bytes"
+        assert metadata["budget_events"][0]["bytes_considered"] == 3
+        assert metadata["budget_events"][0]["next_file_size"] == 4
+
+    def test_extract_directory_metadata_counts_unstatable_entries_against_file_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Broken links should not bypass the aggregate file budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"broken-{index}.fake").symlink_to(scan_dir / f"missing-{index}.fake")
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_files"
+        assert metadata["budget_events"][0]["files_considered"] == 2
+        assert len(metadata["files"]) == 2
+
+    def test_extract_directory_metadata_does_not_dispatch_named_pipes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Special filesystem entries must not reach scanners that may block while opening them."""
+        mkfifo = getattr(os, "mkfifo", None)
+        if mkfifo is None:
+            pytest.skip("named pipes are not supported on this platform")
+
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        named_pipe = scan_dir / "blocking.pkl"
+        mkfifo(named_pipe)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": 0}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert metadata["files"] == [
+            {
+                "file": named_pipe.name,
+                "path": str(named_pipe),
+                "error": metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+            }
+        ]
+
+    def test_extract_directory_metadata_does_not_dispatch_symlinks_to_named_pipes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Symlinks must not let special filesystem entries reach scanners."""
+        mkfifo = getattr(os, "mkfifo", None)
+        if mkfifo is None:
+            pytest.skip("named pipes are not supported on this platform")
+
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        named_pipe = scan_dir / "target.pipe"
+        mkfifo(named_pipe)
+        linked_model = scan_dir / "blocking.pkl"
+        linked_model.symlink_to(named_pipe)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": 0}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert {file_metadata["file"]: file_metadata["error"] for file_metadata in metadata["files"]} == {
+            linked_model.name: metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+            named_pipe.name: metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+        }
+
+    def test_extract_directory_metadata_stops_at_depth_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan files below the aggregate depth budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        nested_dir = scan_dir / "level1" / "level2"
+        nested_dir.mkdir(parents=True)
+        nested_file = nested_dir / "deep.fake"
+        nested_file.write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_DEPTH", 1)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_depth"
+        assert metadata["budget_events"][0]["max_depth"] == 1
+        assert metadata["budget_events"][0]["observed_depth"] == 2
+
+    def test_extract_directory_metadata_stops_at_empty_directory_entry_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Empty directory trees should remain bounded."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"empty-{index}").mkdir()
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_ENTRIES", 2)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_entries"
+        assert metadata["budget_events"][0]["entries_considered"] == 2
+
+    def test_extract_directory_metadata_bounds_flat_directory_enumeration(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Flat directories should stop enumeration after the bounded sentinel."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        yielded_names: list[str] = []
+
+        class FakeEntry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.path = str(scan_dir / name)
+
+            def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                return False
+
+            def is_symlink(self) -> bool:
+                return False
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                return True
+
+        def iter_entries() -> Iterator[FakeEntry]:
+            for index in range(100):
+                name = f"file-{index}.fake"
+                yielded_names.append(name)
+                yield FakeEntry(name)
+
+        @contextmanager
+        def fake_scandir(_directory: object) -> Iterator[Iterator[FakeEntry]]:
+            yield iter_entries()
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+        monkeypatch.setattr(metadata_extractor_module.os, "scandir", fake_scandir)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert yielded_names == ["file-0.fake", "file-1.fake", "file-2.fake"]
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_files"
+
+    def test_extract_directory_metadata_in_budget_preserves_success(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In-budget directory metadata extraction should not report incomplete coverage."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        files = [scan_dir / "a.fake", scan_dir / "b.fake"]
+        for path in files:
+            path.write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 5)
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 100)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(path) for path in files]
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["summary"]["formats"] == {"fake": 2}
+        assert "scan_outcome" not in metadata
+        assert "budget_events" not in metadata
+
     def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
         extractor = metadata_extractor_module.ModelMetadataExtractor()
@@ -281,6 +639,43 @@ class TestModelMetadataExtractor:
         assert "pickle: 1" in output
         assert "model1.safetensors (safetensors)" in output
         assert "model2.pkl (pickle)" in output
+
+    def test_format_table_directory_surfaces_incomplete_budget_warning(self) -> None:
+        """Default table output should disclose partial metadata extraction."""
+        from modelaudit.cli import _format_metadata_table
+
+        metadata = {
+            "directory": "/test/path",
+            "summary": {"total_files": 1, "formats": {"safetensors": 1}},
+            "files": [{"file": "model.safetensors", "format": "safetensors"}],
+            "analysis_incomplete": True,
+            "budget_events": [{"limit": "max_files"}],
+        }
+
+        output = _format_metadata_table(metadata)
+
+        assert "Warning: Metadata extraction is incomplete" in output
+        assert "Budget exceeded: max_files" in output
+
+    def test_format_table_directory_surfaces_file_errors(self) -> None:
+        """Default table output should not disguise rejected filesystem entries as unknown formats."""
+        from modelaudit.cli import _format_metadata_table
+
+        metadata = {
+            "directory": "/test/path",
+            "summary": {"total_files": 0, "formats": {}},
+            "files": [
+                {
+                    "file": "blocking.pkl",
+                    "path": "/test/path/blocking.pkl",
+                    "error": metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+                }
+            ],
+        }
+
+        output = _format_metadata_table(metadata)
+
+        assert f"blocking.pkl (error: {metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR})" in output
 
     def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
