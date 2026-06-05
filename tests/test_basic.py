@@ -279,6 +279,7 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
             "second": "/tmp/src/second.py",
         },
         "loaded_module_sources": {},
+        "loaded_package_paths": {},
         "fingerprints": {
             "/tmp/src/first.py": "1111",
             "/tmp/src/second.py": "2222",
@@ -344,6 +345,37 @@ def test_merge_scan_results_marks_conflicting_module_sources_unreusable() -> Non
     assert source_fingerprints["reusable"] is False
     assert source_fingerprints["module_sources"]["helper"] == "/tmp/src/first.py"
     assert source_fingerprints["loaded_module_sources"]["helper"] == "/tmp/src/first.py"
+
+
+def test_merge_scan_results_marks_conflicting_loaded_package_paths_unreusable() -> None:
+    result1 = ScanResult(scanner_name="pytorch_zip")
+    result1._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {"helper": ["/tmp/src/first"]},
+        "fingerprints": {},
+    }
+    result2 = ScanResult(scanner_name="pickle")
+    result2._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {"helper": ["/tmp/src/second"]},
+        "fingerprints": {},
+    }
+
+    result1.merge(result2)
+
+    source_fingerprints = result1.to_dict(include_private_metadata=True)["_private_metadata"][
+        "call_graph_source_fingerprints"
+    ]
+    assert source_fingerprints["reusable"] is False
+    assert source_fingerprints["loaded_package_paths"]["helper"] == ["/tmp/src/first"]
 
 
 def test_blacklist_patterns(tmp_path):

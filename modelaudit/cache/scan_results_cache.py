@@ -5,13 +5,14 @@ import json
 import logging
 import marshal
 import os
+import stat
 import sys
 import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from importlib.machinery import SOURCE_SUFFIXES, FileFinder, ModuleSpec
+from importlib.machinery import BYTECODE_SUFFIXES, EXTENSION_SUFFIXES, SOURCE_SUFFIXES, FileFinder, ModuleSpec
 from pathlib import Path
-from types import FunctionType
+from types import FunctionType, ModuleType
 from typing import Any
 from zipimport import zipimporter
 
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
+_CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
@@ -184,9 +186,23 @@ def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def _has_loaded_parent_package(module_name: str) -> bool:
+def _loaded_parent_package_names(module_name: str) -> tuple[str, ...]:
     parts = module_name.split(".")
-    return any(".".join(parts[:index]) in sys.modules for index in range(1, len(parts)))
+    return tuple(
+        parent_name
+        for parent_name in (".".join(parts[:index]) for index in range(1, len(parts)))
+        if parent_name in sys.modules
+    )
+
+
+def _loaded_package_search_path(module_name: str) -> list[str] | None:
+    loaded_module = sys.modules.get(module_name)
+    if not isinstance(loaded_module, ModuleType):
+        return None
+    raw_search_path = vars(loaded_module).get("__path__")
+    if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
+        return None
+    return [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
 
 
 @dataclass
@@ -736,13 +752,57 @@ class ScanResultsCache:
 
     @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
-        if not path.is_file():
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_descriptor = os.open(path, flags)
+        except (FileNotFoundError, NotADirectoryError):
             return None
-        with path.open("rb") as source_file:
-            source = source_file.read(_CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES + 1)
-        if len(source) > _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES:
-            raise ValueError("source fingerprint budget exceeded")
-        return hashlib.sha256(source).hexdigest()
+        try:
+            before = os.fstat(file_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("source fingerprint candidate is not a regular file")
+            if str(path).endswith(tuple(EXTENSION_SUFFIXES)):
+                return _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+            max_bytes = (
+                _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES * 2
+                if str(path).endswith(tuple(BYTECODE_SUFFIXES))
+                else _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
+            )
+            if before.st_size > max_bytes:
+                raise ValueError("source fingerprint budget exceeded")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            source = b"".join(chunks)
+            after = os.fstat(file_descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_identity != after_identity:
+                raise ValueError("source fingerprint candidate changed while being read")
+            if len(source) > max_bytes:
+                raise ValueError("source fingerprint budget exceeded")
+            return hashlib.sha256(source).hexdigest()
+        finally:
+            os.close(file_descriptor)
 
     def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
         scan_result = cache_entry.get("scan_result")
@@ -774,8 +834,6 @@ class ScanResultsCache:
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if is_overridden and current_source != expected_source:
                 return False
-            if not is_overridden and _has_loaded_parent_package(module_name):
-                return False
         loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
         if not isinstance(loaded_module_sources, dict):
             return False
@@ -784,6 +842,21 @@ class ScanResultsCache:
                 return False
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if not is_overridden or current_source != expected_source:
+                return False
+        loaded_package_paths = fingerprint_metadata.get("loaded_package_paths")
+        if not isinstance(loaded_package_paths, dict):
+            return False
+        for module_name, expected_search_path in loaded_package_paths.items():
+            if not isinstance(module_name, str) or not isinstance(expected_search_path, list):
+                return False
+            if not all(isinstance(entry, str) for entry in expected_search_path):
+                return False
+            if _loaded_package_search_path(module_name) != expected_search_path:
+                return False
+        for module_name in module_sources:
+            if any(
+                parent_name not in loaded_package_paths for parent_name in _loaded_parent_package_names(module_name)
+            ):
                 return False
         fingerprints = fingerprint_metadata.get("fingerprints")
         if not isinstance(fingerprints, dict):

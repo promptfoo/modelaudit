@@ -30,7 +30,12 @@ from modelaudit.cache.optimized_config import (
     get_config_extractor,
     normalize_material_scan_config,
 )
-from modelaudit.cache.scan_results_cache import ScanResultsCache, _import_hook_identity, _source_resolution_context
+from modelaudit.cache.scan_results_cache import (
+    _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
+    ScanResultsCache,
+    _import_hook_identity,
+    _source_resolution_context,
+)
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
@@ -63,6 +68,7 @@ def _call_graph_fingerprint_metadata(
     *,
     module_sources: dict[str, str] | None = None,
     loaded_module_sources: dict[str, str] | None = None,
+    loaded_package_paths: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "reusable": True,
@@ -70,6 +76,7 @@ def _call_graph_fingerprint_metadata(
         "resolution_context": _source_resolution_context(),
         "module_sources": module_sources or {},
         "loaded_module_sources": loaded_module_sources or {},
+        "loaded_package_paths": loaded_package_paths or {},
         "fingerprints": fingerprints or {},
     }
 
@@ -298,6 +305,45 @@ def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_reuses_matching_loaded_parent_package_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_source = tmp_path / "first" / "cache_pkg" / "child.py"
+    second_source = tmp_path / "second" / "cache_pkg" / "child.py"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    first_source.write_text("def entrypoint():\n    return 1\n")
+    second_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    loaded_parent = ModuleType("cache_pkg")
+    loaded_parent.__path__ = [str(first_source.parent)]
+    loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    first_source_path = str(first_source.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
+                module_sources={"cache_pkg.child": first_source_path},
+                loaded_package_paths={"cache_pkg": [str(first_source.parent.absolute())]},
+            )
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    loaded_parent.__path__ = [str(second_source.parent)]
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_invalidates_when_loaded_module_disappears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -451,6 +497,30 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
 
     missing_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: Path) -> None:
+    extension_path = tmp_path / "native_module.so"
+    extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {str(extension_path.absolute()): _CALL_GRAPH_REGULAR_FILE_FINGERPRINT}
+            )
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    extension_path.unlink()
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 

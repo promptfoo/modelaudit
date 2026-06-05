@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import marshal
 import os
+import stat
 import sys
 import sysconfig
 import threading
@@ -45,6 +46,7 @@ _MAX_IMPORT_REFERENCES = 32
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
 _MAX_SOURCE_BYTES = 1024 * 1024
+_CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
@@ -113,14 +115,20 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         self.partial_path = partial_path
 
 
+class _SourceReadTooLargeError(OSError):
+    """Raised when a source-related file exceeds its bounded read budget."""
+
+
 @dataclass
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
-    fingerprints: dict[str, bytes | None] = field(default_factory=dict)
+    fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
+    loaded_package_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
     generation: int = 0
+    stable: bool = True
     reusable: bool = True
     lock: Any = field(default_factory=threading.RLock)
 
@@ -1075,15 +1083,68 @@ def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tupl
     )
 
 
-def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | None]:
-    if not path.is_file():
-        return True, None
+def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    file_descriptor = os.open(path, flags)
     try:
-        with path.open("rb") as source_file:
-            source = source_file.read(_MAX_SOURCE_BYTES + 1)
+        before = os.fstat(file_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(f"source candidate is not a regular file: {path}")
+        if max_bytes is None:
+            return b"", before
+        if before.st_size > max_bytes:
+            raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
+
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(file_descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise OSError(f"source candidate changed while being read: {path}")
+        if len(content) > max_bytes:
+            raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
+        return content, after
+    finally:
+        os.close(file_descriptor)
+
+
+def _read_bounded_source_text(path: Path) -> str:
+    source, _source_stat = _read_bounded_regular_file(path, _MAX_SOURCE_BYTES)
+    return source.decode("utf-8")
+
+
+def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | str | None]:
+    try:
+        if str(path).endswith(tuple(EXTENSION_SUFFIXES)):
+            _content, _source_stat = _read_bounded_regular_file(path, None)
+            return True, _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+        max_bytes = _MAX_SOURCE_BYTES * 2 if str(path).endswith(tuple(BYTECODE_SUFFIXES)) else _MAX_SOURCE_BYTES
+        source, _source_stat = _read_bounded_regular_file(path, max_bytes)
+    except (FileNotFoundError, NotADirectoryError):
+        return True, None
     except OSError:
-        return False, None
-    if len(source) > _MAX_SOURCE_BYTES:
         return False, None
     return True, hashlib.sha256(source).digest()
 
@@ -1094,13 +1155,15 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.fingerprints.clear()
     snapshot.module_sources.clear()
     snapshot.loaded_module_sources.clear()
+    snapshot.loaded_package_paths.clear()
     snapshot.generation += 1
+    snapshot.stable = True
     snapshot.reusable = True
 
 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     if (
-        not snapshot.reusable
+        not snapshot.stable
         or snapshot.search_context != _source_search_context()
         or snapshot.resolution_context != _source_resolution_context()
     ):
@@ -1114,6 +1177,10 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
             return False
     for module_name, expected_source in snapshot.loaded_module_sources.items():
         if _loaded_module_source_path(module_name) != expected_source:
+            return False
+    for module_name, expected_search_path in snapshot.loaded_package_paths.items():
+        is_loaded, current_search_path = _loaded_package_search_path(module_name)
+        if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
             return False
     return True
 
@@ -1159,6 +1226,7 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
                 },
                 "module_sources": {},
                 "loaded_module_sources": {},
+                "loaded_package_paths": {},
                 "fingerprints": {},
             }
         return {
@@ -1171,8 +1239,12 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
             },
             "module_sources": dict(sorted(snapshot.module_sources.items())),
             "loaded_module_sources": dict(sorted(snapshot.loaded_module_sources.items())),
+            "loaded_package_paths": {
+                module_name: list(search_path)
+                for module_name, search_path in sorted(snapshot.loaded_package_paths.items())
+            },
             "fingerprints": {
-                path: fingerprint.hex() if fingerprint is not None else None
+                path: fingerprint.hex() if isinstance(fingerprint, bytes) else fingerprint
                 for path, fingerprint in sorted(snapshot.fingerprints.items())
             },
         }
@@ -1182,23 +1254,53 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:
         return
-    estimated_candidate_count = len(parts) * 2 * (len(_SOURCE_RESOLUTION_SUFFIXES) + 1) * len(sys.path)
     module_name_length = sum(len(part) for part in parts) + len(parts) - 1
-    if (
-        estimated_candidate_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES
-        or module_name_length > _MAX_SOURCE_MODULE_NAME_CHARS
-    ):
+    if module_name_length > _MAX_SOURCE_MODULE_NAME_CHARS:
         with snapshot.lock:
+            snapshot.stable = False
             snapshot.reusable = False
         return
 
-    candidates: set[Path] = set()
-    for entry in sys.path:
-        root = Path(entry or os.getcwd())
-        for prefix_length in range(1, len(parts) + 1):
-            prefix = parts[:prefix_length]
-            module_candidate = root.joinpath(*prefix)
-            package_candidate = root.joinpath(*prefix, "__init__")
+    search_path = [str(Path(entry or os.getcwd())) for entry in sys.path]
+    for index, part in enumerate(parts):
+        qualified_name = ".".join(parts[: index + 1])
+        if index < len(parts) - 1:
+            is_loaded, loaded_search_path = _loaded_package_search_path(qualified_name)
+            if is_loaded:
+                if loaded_search_path is None:
+                    return
+                with snapshot.lock:
+                    expected_search_path = tuple(loaded_search_path)
+                    existing_search_path = snapshot.loaded_package_paths.get(qualified_name)
+                    if existing_search_path is not None and existing_search_path != expected_search_path:
+                        snapshot.stable = False
+                        snapshot.reusable = False
+                        return
+                    snapshot.loaded_package_paths[qualified_name] = expected_search_path
+                search_path = loaded_search_path
+                continue
+
+        considered_entries: list[str] = []
+        namespace_locations: list[str] = []
+        resolved_spec: ModuleSpec | None = None
+        for entry in search_path:
+            considered_entries.append(entry)
+            entry_spec = _find_standard_path_spec(qualified_name, [entry])
+            if entry_spec is None:
+                continue
+            if entry_spec.loader is not None:
+                resolved_spec = entry_spec
+                break
+            if entry_spec.submodule_search_locations is not None:
+                namespace_locations.extend(entry_spec.submodule_search_locations)
+        if resolved_spec is None and namespace_locations:
+            resolved_spec = ModuleSpec(qualified_name, loader=None, is_package=True)
+            resolved_spec.submodule_search_locations = namespace_locations
+
+        candidates: set[Path] = set()
+        for entry in considered_entries:
+            module_candidate = Path(entry).joinpath(part)
+            package_candidate = module_candidate.joinpath("__init__")
             for suffix in _SOURCE_RESOLUTION_SUFFIXES:
                 candidates.add(module_candidate.with_suffix(suffix).absolute())
                 candidates.add(package_candidate.with_suffix(suffix).absolute())
@@ -1206,25 +1308,33 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
                 cache_candidate = _source_cache_path(source_candidate)
                 if cache_candidate is not None:
                     candidates.add(cache_candidate)
-    with snapshot.lock:
-        if (
-            snapshot.search_context != _source_search_context()
-            or snapshot.resolution_context != _source_resolution_context()
-        ):
-            snapshot.reusable = False
-            return
-        if (
-            len(snapshot.fingerprints | {str(candidate): None for candidate in candidates})
-            > _MAX_SOURCE_FINGERPRINT_CANDIDATES
-        ):
-            snapshot.reusable = False
-            return
-        for candidate in candidates:
-            reusable, fingerprint = _source_candidate_fingerprint(candidate)
-            if not reusable:
+
+        with snapshot.lock:
+            if (
+                snapshot.search_context != _source_search_context()
+                or snapshot.resolution_context != _source_resolution_context()
+            ):
+                snapshot.stable = False
                 snapshot.reusable = False
                 return
-            snapshot.fingerprints[str(candidate)] = fingerprint
+            if (
+                len(snapshot.fingerprints | {str(candidate): None for candidate in candidates})
+                > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+            ):
+                snapshot.reusable = False
+                return
+            for candidate in candidates:
+                reusable, fingerprint = _source_candidate_fingerprint(candidate)
+                if not reusable:
+                    snapshot.reusable = False
+                    return
+                snapshot.fingerprints[str(candidate)] = fingerprint
+
+        if index == len(parts) - 1:
+            return
+        if resolved_spec is None or resolved_spec.submodule_search_locations is None:
+            return
+        search_path = list(resolved_spec.submodule_search_locations)
 
 
 def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> None:
@@ -1234,17 +1344,21 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
     candidate = path.absolute()
     with snapshot.lock:
         if snapshot.search_context != _source_search_context():
+            snapshot.stable = False
             snapshot.reusable = False
             return
         if snapshot.resolution_context != _source_resolution_context():
+            snapshot.stable = False
             snapshot.reusable = False
             return
         reusable, fingerprint = _source_candidate_fingerprint(candidate)
         if not reusable:
+            snapshot.stable = False
             snapshot.reusable = False
             return
         existing_source = snapshot.module_sources.get(module_name)
         if existing_source is not None and existing_source != str(candidate):
+            snapshot.stable = False
             snapshot.reusable = False
             return
         snapshot.module_sources[module_name] = str(candidate)
@@ -1254,6 +1368,7 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             str(candidate) not in snapshot.fingerprints
             and len(snapshot.fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
         ):
+            snapshot.stable = False
             snapshot.reusable = False
             return
         snapshot.fingerprints[str(candidate)] = fingerprint
@@ -1263,9 +1378,9 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
     source_path = _resolve_module_source(module_name)
     if source_path is not None:
         try:
-            if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-                return "source_too_large"
-            source = source_path.read_text(encoding="utf-8")
+            source = _read_bounded_source_text(source_path)
+        except _SourceReadTooLargeError:
+            return "source_too_large"
         except OSError:
             return "source_unreadable"
         except UnicodeError:
@@ -1368,15 +1483,19 @@ def _source_cache_path(source_path: Path) -> Path | None:
 
 def _effective_bytecode_matches_source(source_path: Path) -> bool:
     cache_path = _source_cache_path(source_path)
-    if cache_path is None or not cache_path.is_file():
+    if cache_path is None:
         return True
     try:
-        source = source_path.read_bytes()
-        bytecode = cache_path.read_bytes()
-        source_stat = source_path.stat()
+        bytecode, _bytecode_stat = _read_bounded_regular_file(cache_path, _MAX_SOURCE_BYTES * 2)
+    except FileNotFoundError:
+        return True
     except OSError:
         return False
-    if len(source) > _MAX_SOURCE_BYTES or len(bytecode) > _MAX_SOURCE_BYTES * 2 or len(bytecode) < 16:
+    try:
+        source, source_stat = _read_bounded_regular_file(source_path, _MAX_SOURCE_BYTES)
+    except OSError:
+        return False
+    if len(bytecode) < 16:
         return False
     if bytecode[:4] != MAGIC_NUMBER:
         return True
@@ -1950,9 +2069,7 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     if source_path is None:
         return None
     try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return None
-        source = source_path.read_text(encoding="utf-8")
+        source = _read_bounded_source_text(source_path)
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return None
@@ -2228,9 +2345,7 @@ def _source_function_context(
     if source_path is None:
         return None
     try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return None
-        source = source_path.read_text(encoding="utf-8")
+        source = _read_bounded_source_text(source_path)
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return None
@@ -2281,9 +2396,7 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     if source_path is None:
         return None
     try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return None
-        source = source_path.read_text(encoding="utf-8")
+        source = _read_bounded_source_text(source_path)
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return None
@@ -3043,9 +3156,7 @@ def _constructor_parameter_self_attribute_targets(class_name: str, parameter_nam
     if source_path is None:
         return ()
     try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return ()
-        source = source_path.read_text(encoding="utf-8")
+        source = _read_bounded_source_text(source_path)
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return ()
@@ -3937,6 +4048,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
         snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
         if snapshot is not None:
             with snapshot.lock:
+                snapshot.stable = False
                 snapshot.reusable = False
         return None
     parts = module_name.split(".")
@@ -3964,17 +4076,10 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
                 if snapshot is not None:
                     with snapshot.lock:
+                        snapshot.stable = False
                         snapshot.reusable = False
                 return None
             _track_shared_source_path(module_name, source_path, loaded=False)
-            if any(
-                partial_name in sys.modules
-                for partial_name in (".".join(parts[:index]) for index in range(1, len(parts)))
-            ):
-                snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-                if snapshot is not None:
-                    with snapshot.lock:
-                        snapshot.reusable = False
             return source_path
     return None
 

@@ -23,6 +23,7 @@ import warnings
 import zipfile
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
     FileFinder,
     ModuleSpec,
@@ -50,13 +51,16 @@ from modelaudit_picklescan import (
     scan_file,
 )
 from modelaudit_picklescan.call_graph import (
+    _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     CallGraphFinding,
     StartupHookWriteFinding,
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
+    _effective_bytecode_matches_source,
     _is_standard_path_hook,
     _meta_path_finder_resolution_identity,
     _path_hook_resolution_identity,
+    _source_candidate_fingerprint,
     find_startup_hook_write_call_graphs,
 )
 
@@ -4048,9 +4052,12 @@ def test_loaded_parent_package_path_controls_child_source_resolution(
 
     updated = package_api._with_call_graph_findings(report)
 
+    assert updated.status == ScanStatus.COMPLETE
     assert updated.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
-    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert source_fingerprints["loaded_package_paths"]["loaded_parent_pkg"] == (str(runtime_package.absolute()),)
 
 
 def test_valid_mismatched_source_bytecode_fails_closed(
@@ -4126,6 +4133,53 @@ def test_matching_source_bytecode_remains_analyzable(
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str(Path(cache_from_source(str(module_path))).absolute()) in source_fingerprints["fingerprints"]
+
+
+@pytest.mark.parametrize("oversized_file", ["source", "bytecode"])
+def test_effective_bytecode_validation_rejects_oversized_files_without_unbounded_reads(
+    oversized_file: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "bounded_source.py"
+    source_path.write_bytes(b"value = 1\n")
+    bytecode_path = tmp_path / "bounded_source.pyc"
+    bytecode_path.write_bytes(b"invalid-bytecode")
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._MAX_SOURCE_BYTES", 32)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._source_cache_path", lambda _path: bytecode_path)
+
+    if oversized_file == "source":
+        source_path.write_bytes(b"x" * 33)
+    else:
+        bytecode_path.write_bytes(b"x" * 65)
+
+    def fail_unbounded_read(_path: Path) -> bytes:
+        raise AssertionError("bytecode validation attempted Path.read_bytes()")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_unbounded_read)
+
+    assert not _effective_bytecode_matches_source(source_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO files are not supported on this platform")
+def test_source_candidate_fingerprint_rejects_fifo(tmp_path: Path) -> None:
+    source_path = tmp_path / "blocked_source.py"
+    os.mkfifo(source_path)
+
+    reusable, fingerprint = _source_candidate_fingerprint(source_path)
+
+    assert reusable is False
+    assert fingerprint is None
+
+
+def test_source_candidate_fingerprint_tracks_large_extension_by_presence(tmp_path: Path) -> None:
+    extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
+    extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    reusable, fingerprint = _source_candidate_fingerprint(extension_path)
+
+    assert reusable is True
+    assert fingerprint == _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
 
 
 def test_exact_trusted_path_hook_identity_survives_lazy_method_initialization(
