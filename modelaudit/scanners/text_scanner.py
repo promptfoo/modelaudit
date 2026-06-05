@@ -56,11 +56,16 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
-DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[rubfRUBF]*[\"']?$")
+DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
+)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_ENCLOSING_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}$")
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?\s*:\s*[\"']?$",
+    rb"(?:^|[\s{[(,;])(?:"
+    rb"[\"'](?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']"
+    rb"|(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?"
+    rb")\s*:\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
@@ -86,6 +91,20 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     rb"(?:\$\(|`)\s*(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"']|$)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
+    rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?(?:"
+    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
+    rb"|pipx\s+install"
+    rb"|uv\s+(?:pip\s+install|add)"
+    rb"|(?:conda|mamba|micromamba)\s+install"
+    rb"|poetry\s+add"
+    rb"|(?:npm|pnpm|bun)\s+(?:install|add)"
+    rb"|yarn\s+add"
+    rb"|cargo\s+install"
+    rb"|gem\s+install"
+    rb")\b",
     re.IGNORECASE,
 )
 DOCUMENTATION_IMPORT_STATEMENT_PATTERN = re.compile(
@@ -239,6 +258,7 @@ class TextScanner(BaseScanner):
         stripped = line.lstrip()
         return (
             DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
