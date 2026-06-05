@@ -1999,7 +1999,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
     hdf5_signature_offset = find_hdf5_signature_offset(path) if scanner_id == "keras_h5" else None
     hdf5_userblock_supplemental_scanner_id = (
-        _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext)
+        _select_hdf5_userblock_supplemental_scanner_id(path, header_format, ext)
         if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
         else None
     )
@@ -2283,7 +2283,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             context="strict content owner overlapping ambiguous Flax analysis",
         )
 
-    if hdf5_userblock_supplemental_scanner_id == "zip" and result.scanner_name != "zip":
+    if hdf5_userblock_supplemental_scanner_id == "zip":
         assert hdf5_signature_offset is not None
         merge_hdf5_userblock_zip_findings(
             path,

@@ -85,6 +85,7 @@ _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
+_MAX_HDF5_USERBLOCK_ZIP_SEGMENTS = 16
 
 
 def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
@@ -420,27 +421,27 @@ def merge_hdf5_userblock_zip_findings(
     """Merge ZIP findings from a complete HDF5 user block with a logical EOF."""
     try:
         if zipfile.is_zipfile(path):
-            merge_executable_zip_container_findings(path, result, config, context=context)
+            if result.scanner_name != "zip":
+                merge_executable_zip_container_findings(path, result, config, context=context)
             return
     except OSError:
+        # Fall back to manual user-block ZIP handling below.
         pass
 
     temp_path: str | None = None
     try:
         eocd_offsets: list[int] = []
         carry = b""
-        bytes_copied = 0
+        bytes_read = 0
         temp_suffix = Path(path).suffix or ".zip"
-        with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=temp_suffix, delete=False) as temp_file:
-            temp_path = temp_file.name
+        with open(path, "rb") as source:
             remaining = signature_offset
             while remaining > 0:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("HDF5 user block ended before its validated signature offset")
-                temp_file.write(chunk)
                 candidate_bytes = carry + chunk
-                candidate_base = bytes_copied - len(carry)
+                candidate_base = bytes_read - len(carry)
                 search_offset = 0
                 while True:
                     match_offset = candidate_bytes.find(b"PK\x05\x06", search_offset)
@@ -451,18 +452,54 @@ def merge_hdf5_userblock_zip_findings(
                         raise OSError("HDF5 user block contains too many ZIP end-record candidates")
                     search_offset = match_offset + 1
                 carry = candidate_bytes[-3:]
-                bytes_copied += len(chunk)
+                bytes_read += len(chunk)
                 remaining -= len(chunk)
 
-        logical_zip_end = _find_valid_zip_logical_end(temp_path, eocd_offsets, signature_offset)
-        if logical_zip_end is None:
-            return
-        os.truncate(temp_path, logical_zip_end)
+        logical_zip_ends = _find_valid_zip_logical_ends(path, eocd_offsets, signature_offset)
+        if not logical_zip_ends:
+            raise OSError("HDF5 user block has ZIP-like content without a valid ZIP end record")
+        if len(logical_zip_ends) > _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS:
+            raise OSError("HDF5 user block contains too many complete ZIP segments")
+        logical_zip_end = logical_zip_ends[-1]
 
-        supplemental_result = ScanResult(scanner_name="zip")
-        merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
-        _replace_scan_result_path(supplemental_result, temp_path, path)
-        _merge_composed_scan_result(result, supplemental_result)
+        has_trailing_content = False
+        with open(path, "rb") as source:
+            source.seek(logical_zip_end)
+            trailing_bytes = signature_offset - logical_zip_end
+            while trailing_bytes > 0:
+                chunk = source.read(min(1024 * 1024, trailing_bytes))
+                if not chunk:
+                    raise OSError("HDF5 user block ended before its validated signature offset")
+                if chunk.rstrip(b"\x00"):
+                    has_trailing_content = True
+                trailing_bytes -= len(chunk)
+
+        for logical_end in logical_zip_ends:
+            temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            supplemental_result = ScanResult(scanner_name="zip")
+            merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
+            _replace_scan_result_path(supplemental_result, temp_path, path)
+            _merge_composed_scan_result(result, supplemental_result)
+            with suppress(OSError):
+                os.unlink(temp_path)
+            temp_path = None
+        if has_trailing_content:
+            reason = "hdf5_userblock_zip_trailing_content_unanalyzed"
+            mark_inconclusive_scan_result(result, reason)
+            result.add_check(
+                name="HDF5 User Block Trailing Content",
+                passed=False,
+                message="Non-padding content after the ZIP end record could not be fully analyzed.",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                    "hdf5_signature_offset": signature_offset,
+                    "zip_logical_end": logical_zip_end,
+                },
+                rule_code="S902",
+            )
         _deduplicate_exact_merged_findings(result)
     except OSError as exc:
         reason = "hdf5_userblock_zip_scan_failed"
@@ -542,14 +579,15 @@ class _LogicalEOFReader:
         return True
 
 
-def _find_valid_zip_logical_end(
+def _find_valid_zip_logical_ends(
     temp_path: str,
     eocd_offsets: list[int],
     signature_offset: int,
-) -> int | None:
-    """Return the last complete ZIP end record before the HDF5 signature."""
+) -> list[int]:
+    """Return complete ZIP end records before the HDF5 signature."""
+    logical_ends: list[int] = []
     with open(temp_path, "rb") as handle:
-        for eocd_offset in reversed(eocd_offsets):
+        for eocd_offset in eocd_offsets:
             handle.seek(eocd_offset)
             end_record = handle.read(22)
             if len(end_record) != 22:
@@ -559,9 +597,30 @@ def _find_valid_zip_logical_end(
                 continue
             bounded_reader = _LogicalEOFReader(handle, logical_end)
             bounded_reader.seek(0)
-            if zipfile.is_zipfile(bounded_reader):
-                return logical_end
-    return None
+            if zipfile.is_zipfile(bounded_reader) and logical_end not in logical_ends:
+                logical_ends.append(logical_end)
+    return logical_ends
+
+
+def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
+    """Copy exactly one validated archive prefix to a temporary file."""
+    temp_path: str | None = None
+    try:
+        with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_path = temp_file.name
+            remaining = length
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError("HDF5 user-block ZIP ended before its validated logical EOF")
+                temp_file.write(chunk)
+                remaining -= len(chunk)
+        return temp_path
+    except BaseException:
+        if temp_path is not None:
+            with suppress(OSError):
+                os.unlink(temp_path)
+        raise
 
 
 def merge_flax_msgpack_overlap_findings(
