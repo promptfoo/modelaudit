@@ -2665,7 +2665,7 @@ class KerasZipScanner(BaseScanner):
     def _bounded_hdf5_reference_text(cls, value: Any) -> tuple[str, bool]:
         """Return redacted, bounded HDF5 path evidence and whether it was truncated."""
         text = os.fsdecode(value)
-        redacted_text = redact_evidence_string(text, max_chars=None)
+        redacted_text = redact_evidence_string(text, max_chars=cls.MAX_HDF5_REFERENCE_TEXT_CHARS)
         was_truncated = max(len(text), len(redacted_text)) > cls.MAX_HDF5_REFERENCE_TEXT_CHARS
         return redacted_text[: cls.MAX_HDF5_REFERENCE_TEXT_CHARS], was_truncated
 

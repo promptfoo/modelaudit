@@ -17,6 +17,10 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
+DANGEROUS_EVIDENCE_CALL_NAMES: Final[frozenset[str]] = frozenset({"compile", "eval", "exec"})
+PYTHON_STRING_QUOTE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)\A(?P<prefix>[rubf]{0,3})(?P<quote>\"\"\"|'''|[\"'])"
+)
 STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
@@ -821,7 +825,12 @@ def _colon_assignment_is_control_context(match: re.Match[str]) -> bool:
     statement_start = max(match.string.rfind("\n", 0, match.start()), match.string.rfind(";", 0, match.start())) + 1
     statement_prefix = match.string[statement_start : match.start()]
     return (
-        re.search(r"\b(?:if|elif|while|lambda|case)\b", statement_prefix) is not None
+        re.match(
+            r"\s*(?:(?:async\s+)?(?:class|def|for|with)|elif|else|except|finally|if|match|try|while)\b",
+            statement_prefix,
+        )
+        is not None
+        or re.search(r"\b(?:lambda|case)\b", statement_prefix) is not None
         or re.search(r"->\s*$", statement_prefix) is not None
         or any(operator in statement_prefix for operator in PYTHON_SENSITIVE_COMPARISON_OPERATORS)
     )
@@ -829,6 +838,8 @@ def _colon_assignment_is_control_context(match: re.Match[str]) -> bool:
 
 def _redact_unquoted_assignment(match: re.Match[str]) -> str:
     if _colon_assignment_is_control_context(match):
+        return match.group(0)
+    if _assignment_value_starts_redacted_dangerous_call(match):
         return match.group(0)
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
@@ -1066,7 +1077,27 @@ def _redact_scalar_unquoted_assignment(match: re.Match[str]) -> str:
     prefix = match.group("prefix")
     if _colon_assignment_is_control_context(match):
         return match.group(0)
+    if _auth_assignment_starts_call(match):
+        return match.group(0)
     return f"{prefix}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _auth_assignment_starts_call(match: re.Match[str]) -> bool:
+    if not _assignment_value_starts_redacted_dangerous_call(match):
+        return False
+    prefix = match.group("prefix")
+    target = re.split(r"(?<![=!<>])=(?!=)|:(?!=)", prefix, maxsplit=1)[0].strip()
+    return target.lower() in {"auth", "basic_auth", "cookie", "cookies"}
+
+
+def _assignment_value_starts_redacted_dangerous_call(match: re.Match[str]) -> bool:
+    if match.end() >= len(match.string) or match.string[match.end()] != "(":
+        return False
+    value_name = re.search(r"([A-Za-z_]\w*)\Z", match.group(0))
+    if value_name is None or value_name.group(1) not in DANGEROUS_EVIDENCE_CALL_NAMES:
+        return False
+    call_end = _find_balanced_container_end(match.string, match.end())
+    return call_end is not None and REDACTED_EVIDENCE_VALUE in match.string[match.end() : call_end]
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -1412,7 +1443,7 @@ def _delimited_item_ranges(
     depths: list[int],
     open_index: int,
 ) -> list[tuple[int, int]]:
-    closing_token = {"(": ")", "[": "]"}.get(tokens[open_index].string)
+    closing_token = {"(": ")", "[": "]", "{": "}"}.get(tokens[open_index].string)
     if closing_token is None:
         return []
     item_depth = depths[open_index] + 1
@@ -1468,6 +1499,18 @@ def _argument_keyword_and_value(
     return None, significant
 
 
+def _tokens_contain_dangerous_call(tokens: list[tokenize.TokenInfo]) -> bool:
+    significant = _significant_tokens(tokens)
+    return any(
+        token.type == tokenize.NAME
+        and token.string in DANGEROUS_EVIDENCE_CALL_NAMES
+        and index + 1 < len(significant)
+        and significant[index + 1].type == tokenize.OP
+        and significant[index + 1].string == "("
+        for index, token in enumerate(significant)
+    )
+
+
 def _is_sensitive_literal_key(key: object) -> bool:
     if isinstance(key, bytes):
         try:
@@ -1475,6 +1518,18 @@ def _is_sensitive_literal_key(key: object) -> bool:
         except UnicodeDecodeError:
             return False
     return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
+
+
+def _literal_sensitive_detail_key(tokens: list[tokenize.TokenInfo]) -> bool:
+    significant = _significant_tokens(tokens)
+    if not significant:
+        return False
+    try:
+        expression = ast.parse("".join(token.string for token in significant), mode="eval").body
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+    key = _static_text_literal_value(expression)
+    return key is not None and _is_sensitive_detail_key(key)
 
 
 def _static_string_literal_value(expression: ast.expr, depth: int = 0) -> str | bytes | None:
@@ -1583,6 +1638,101 @@ def _ast_position_offset(text: str, offsets: list[int], lineno: int, byte_column
     return line_start + character_column
 
 
+def _append_ast_node_replacement(
+    text: str,
+    offsets: list[int],
+    node: ast.AST,
+    replacements: list[tuple[int, int, str]],
+    replacement: str = REDACTED_EVIDENCE_VALUE,
+) -> None:
+    lineno = getattr(node, "lineno", None)
+    col_offset = getattr(node, "col_offset", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    end_col_offset = getattr(node, "end_col_offset", None)
+    if lineno is None or col_offset is None or end_lineno is None or end_col_offset is None:
+        return
+    replacements.append(
+        (
+            _ast_position_offset(text, offsets, lineno, col_offset),
+            _ast_position_offset(text, offsets, end_lineno, end_col_offset),
+            replacement,
+        )
+    )
+
+
+def _append_ast_literal_replacements(
+    text: str,
+    offsets: list[int],
+    node: ast.AST,
+    replacements: list[tuple[int, int, str]],
+) -> None:
+    if isinstance(node, ast.Constant) and not isinstance(node.value, (bool, type(None))):
+        source = ast.get_source_segment(text, node)
+        replacement = _redacted_python_string_source(source) if source is not None else None
+        if replacement is None:
+            replacement = (
+                repr(REDACTED_EVIDENCE_VALUE.encode())
+                if isinstance(node.value, bytes)
+                else repr(REDACTED_EVIDENCE_VALUE)
+            )
+        _append_ast_node_replacement(text, offsets, node, replacements, replacement)
+        return
+    if isinstance(node, ast.expr) and _static_string_literal_value(node) is not None:
+        _append_ast_node_replacement(text, offsets, node, replacements, repr(REDACTED_EVIDENCE_VALUE))
+        return
+    if isinstance(node, ast.JoinedStr):
+        return
+    for child in ast.iter_child_nodes(node):
+        _append_ast_literal_replacements(text, offsets, child, replacements)
+
+
+def _redacted_python_string_source(source: str) -> str | None:
+    match = PYTHON_STRING_QUOTE_RE.match(source)
+    if match is None:
+        return None
+    return f"{match.group('prefix')}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+
+
+def _ast_node_references_sensitive_value(text: str, node: ast.AST) -> bool:
+    if not isinstance(node, (ast.Attribute, ast.Name, ast.Subscript)):
+        return False
+    source = ast.get_source_segment(text, node)
+    if source is None:
+        return False
+    stripped = source.strip()
+    return bool(
+        SENSITIVE_ASSIGNMENT_TARGET_RE.search(stripped)
+        or _target_contains_sensitive_literal_key(stripped)
+        or (re.fullmatch(DETAIL_KEY_PATTERN, stripped) is not None and _is_sensitive_detail_key(stripped))
+    )
+
+
+def _append_sensitive_ast_value_replacement(
+    text: str,
+    offsets: list[int],
+    node: ast.AST,
+    replacements: list[tuple[int, int, str]],
+    *,
+    preserve_executable_calls: bool = False,
+) -> None:
+    static_literal = _static_string_literal_value(node) if isinstance(node, ast.expr) else None
+    if preserve_executable_calls and (static_literal is not None or _ast_contains_dangerous_call(node)):
+        _append_ast_literal_replacements(text, offsets, node, replacements)
+    else:
+        _append_ast_node_replacement(text, offsets, node, replacements)
+
+
+def _ast_contains_dangerous_call(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Call)
+        and (
+            (isinstance(child.func, ast.Name) and child.func.id in DANGEROUS_EVIDENCE_CALL_NAMES)
+            or (isinstance(child.func, ast.Attribute) and child.func.attr in DANGEROUS_EVIDENCE_CALL_NAMES)
+        )
+        for child in ast.walk(node)
+    )
+
+
 def _is_literal_container_open(tokens: list[tokenize.TokenInfo], open_index: int) -> bool:
     prefix_keywords = {
         "and",
@@ -1614,52 +1764,79 @@ def _is_literal_container_open(tokens: list[tokenize.TokenInfo], open_index: int
 def _redact_sensitive_literal_pairs(text: str) -> str:
     """Redact values in literal two-item containers headed by a credential key."""
     offsets = _line_offsets(text)
-    replacements: list[tuple[int, int]] = []
+    replacements: list[tuple[int, int, str]] = []
     try:
-        tree = ast.parse(text)
+        tree = ast.parse(text.replace("\x00", " "))
     except (RecursionError, SyntaxError, ValueError):
         tree = None
 
     if tree is not None:
         for node in ast.walk(tree):
             value_node: ast.expr | None = None
+            if isinstance(node, ast.Call):
+                call_name = (
+                    node.func.attr.lower()
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id.lower()
+                    if isinstance(node.func, ast.Name)
+                    else ""
+                )
+                sensitive_arguments = [_ast_node_references_sensitive_value(text, argument) for argument in node.args]
+                if call_name == "compare_digest" and any(sensitive_arguments):
+                    for argument, is_sensitive in zip(node.args, sensitive_arguments, strict=True):
+                        if not is_sensitive:
+                            _append_ast_literal_replacements(text, offsets, argument, replacements)
+                elif (
+                    call_name in {"endswith", "startswith"}
+                    and isinstance(node.func, ast.Attribute)
+                    and _ast_node_references_sensitive_value(text, node.func.value)
+                ):
+                    for argument in node.args:
+                        _append_ast_literal_replacements(text, offsets, argument, replacements)
+                for keyword in node.keywords:
+                    if keyword.arg in {"auth", "cookie", "cookies"} and _ast_contains_dangerous_call(keyword.value):
+                        _append_ast_literal_replacements(text, offsets, keyword.value, replacements)
+                continue
+            if isinstance(node, ast.Match) and _ast_node_references_sensitive_value(text, node.subject):
+                for case in node.cases:
+                    _append_ast_literal_replacements(text, offsets, case.pattern, replacements)
+                continue
             if isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) == 2:
                 key_node, candidate_value_node = node.elts
                 if _is_sensitive_literal_key(_static_string_literal_value(key_node)):
                     value_node = candidate_value_node
             elif isinstance(node, ast.Dict):
                 items = [
-                    (key.lower(), child)
+                    (key, child)
                     for key_node, child in zip(node.keys, node.values, strict=True)
                     if key_node is not None and (key := _static_text_literal_value(key_node)) is not None
                 ]
+                for key, child in items:
+                    if _is_sensitive_detail_key(key):
+                        _append_sensitive_ast_value_replacement(
+                            text,
+                            offsets,
+                            child,
+                            replacements,
+                            preserve_executable_calls=True,
+                        )
                 sensitive_descriptor = any(
-                    key in {"name", "key"}
+                    key.lower() in {"name", "key"}
                     and (name := _static_text_literal_value(child)) is not None
                     and _is_sensitive_detail_key(name)
                     for key, child in items
                 )
                 if sensitive_descriptor:
                     for key, child in items:
-                        if key != "value" or child.end_lineno is None or child.end_col_offset is None:
+                        if key.lower() != "value":
                             continue
-                        replacements.append(
-                            (
-                                _ast_position_offset(text, offsets, child.lineno, child.col_offset),
-                                _ast_position_offset(text, offsets, child.end_lineno, child.end_col_offset),
-                            )
-                        )
+                        _append_sensitive_ast_value_replacement(text, offsets, child, replacements)
                 continue
             if value_node is None:
                 continue
             if value_node.end_lineno is None or value_node.end_col_offset is None:
                 continue
-            replacements.append(
-                (
-                    _ast_position_offset(text, offsets, value_node.lineno, value_node.col_offset),
-                    _ast_position_offset(text, offsets, value_node.end_lineno, value_node.end_col_offset),
-                )
-            )
+            _append_ast_node_replacement(text, offsets, value_node, replacements)
     else:
         token_input = text.replace("\x00", " ")
         try:
@@ -1668,11 +1845,39 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
             return text
         depths = _token_depths(tokens)
         for open_index, token in enumerate(tokens):
-            if token.type != tokenize.OP or token.string not in {"(", "["}:
+            if token.type != tokenize.OP or token.string not in {"(", "[", "{"}:
                 continue
             if not _is_literal_container_open(tokens, open_index):
                 continue
             item_ranges = _delimited_item_ranges(tokens, depths, open_index)
+            if token.string == "{" and "\x00" in text:
+                item_depth = depths[open_index] + 1
+                for item_start, item_end in item_ranges:
+                    colon_index = next(
+                        (
+                            index
+                            for index in range(item_start, item_end)
+                            if tokens[index].type == tokenize.OP
+                            and tokens[index].string == ":"
+                            and depths[index] == item_depth
+                        ),
+                        None,
+                    )
+                    if colon_index is None or not _literal_sensitive_detail_key(tokens[item_start:colon_index]):
+                        continue
+                    value_tokens = _significant_tokens(tokens[colon_index + 1 : item_end])
+                    if value_tokens:
+                        replacement = REDACTED_EVIDENCE_VALUE
+                        if len(value_tokens) == 1 and value_tokens[0].type == tokenize.STRING:
+                            replacement = _redacted_python_string_source(value_tokens[0].string) or replacement
+                        replacements.append(
+                            (
+                                _position_offset(offsets, value_tokens[0].start, len(text)),
+                                _position_offset(offsets, value_tokens[-1].end, len(text)),
+                                replacement,
+                            )
+                        )
+                continue
             if len(item_ranges) != 2:
                 continue
             key_start, key_end = item_ranges[0]
@@ -1686,12 +1891,29 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
                 (
                     _position_offset(offsets, value_tokens[0].start, len(text)),
                     _position_offset(offsets, value_tokens[-1].end, len(text)),
+                    REDACTED_EVIDENCE_VALUE,
                 )
             )
 
-    for start, end in reversed(_merge_replacement_ranges(replacements)):
-        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    for start, end, replacement in reversed(_merge_ast_replacements(replacements)):
+        text = f"{text[:start]}{replacement}{text[end:]}"
     return text
+
+
+def _merge_ast_replacements(
+    replacements: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
+    merged: list[tuple[int, int, str]] = []
+    for replacement in sorted(replacements, key=lambda item: (item[0], -item[1])):
+        start, end, _value = replacement
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end, previous_value = merged[-1]
+            if end <= previous_end:
+                continue
+            merged[-1] = (previous_start, end, previous_value)
+            continue
+        merged.append(replacement)
+    return merged
 
 
 def _comparison_target_start(
@@ -1759,6 +1981,7 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
         if candidate.type not in ignored_tokens:
             previous_significant = candidate
     replacements: list[tuple[int, int]] = []
+    literal_replacements: list[tuple[int, int, str]] = []
     for index, token in enumerate(tokens):
         if token.type != tokenize.NAME:
             continue
@@ -1791,6 +2014,19 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
         ]
         for keyword, argument_value_tokens in arguments:
             if keyword in {"auth", "cookie", "cookies"} and argument_value_tokens:
+                significant_value_tokens = _significant_tokens(argument_value_tokens)
+                if _tokens_contain_dangerous_call(significant_value_tokens):
+                    for value_token in significant_value_tokens:
+                        if value_token.type == tokenize.STRING:
+                            replacement = _redacted_python_string_source(value_token.string)
+                            literal_replacements.append(
+                                (
+                                    _position_offset(offsets, value_token.start, len(text)),
+                                    _position_offset(offsets, value_token.end, len(text)),
+                                    replacement or repr(REDACTED_EVIDENCE_VALUE),
+                                )
+                            )
+                    continue
                 replacements.append(
                     (
                         _position_offset(offsets, argument_value_tokens[0].start, len(text)),
@@ -1849,8 +2085,12 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
         value_end = _position_offset(offsets, value_tokens[-1].end, len(text))
         replacements.append((value_start, value_end))
 
-    for start, end in reversed(_merge_replacement_ranges(replacements)):
-        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    combined_replacements = [
+        *((start, end, REDACTED_EVIDENCE_VALUE) for start, end in replacements),
+        *literal_replacements,
+    ]
+    for start, end, replacement in reversed(_merge_ast_replacements(combined_replacements)):
+        text = f"{text[:start]}{replacement}{text[end:]}"
     return text
 
 
@@ -1965,12 +2205,12 @@ def _redact_sensitive_comparisons(text: str) -> str:
 def _redact_python_expression_assignments(text: str) -> str:
     """Redact expression-valued sensitive assignments while preserving nearby code."""
     try:
-        ast.parse(textwrap.dedent(text))
+        ast.parse(textwrap.dedent(text.replace("\x00", " ")))
     except (RecursionError, SyntaxError, ValueError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        tokens = list(tokenize.generate_tokens(io.StringIO(text.replace("\x00", " ")).readline))
     except (IndentationError, tokenize.TokenError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
@@ -1997,7 +2237,12 @@ def _redact_python_expression_assignments(text: str) -> str:
         target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
         target_end = _position_offset(offsets, token.start, text_length)
         target = text[target_start:target_end]
-        source_target_is_sensitive = SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+        stripped_target = target.strip()
+        detail_target_is_sensitive = re.fullmatch(
+            DETAIL_KEY_PATTERN, stripped_target
+        ) is not None and _is_sensitive_detail_key(stripped_target)
+        regex_target_is_sensitive = SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+        source_target_is_sensitive = regex_target_is_sensitive or detail_target_is_sensitive
         literal_target_is_sensitive = _target_contains_sensitive_literal_key(target)
         if token.string == ":":
             source_target_is_sensitive = QUOTED_SENSITIVE_MAPPING_KEY_RE.fullmatch(target.strip()) is not None
@@ -2027,15 +2272,36 @@ def _redact_python_expression_assignments(text: str) -> str:
             is_lambda_default=is_lambda_default,
         )
         value_start = _position_offset(offsets, tokens[value_index].start, text_length)
+        preserves_executable_value = _tokens_contain_dangerous_call(significant) and (
+            stripped_target.lower() in {"auth", "basic_auth", "cookie", "cookies"} or literal_target_is_sensitive
+        )
+        if preserves_executable_value:
+            continue
         is_simple_value = _is_simple_sensitive_assignment_tokens(significant) or (
             SIMPLE_QUOTED_VALUE_RE.fullmatch(text[value_start:value_end].strip()) is not None
         )
+        generic_detail_container_value = (
+            detail_target_is_sensitive
+            and not regex_target_is_sensitive
+            and significant
+            and significant[0].type == tokenize.OP
+            and significant[0].string in {"(", "[", "{"}
+        )
+        if generic_detail_container_value:
+            continue
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
         requires_token_redaction = (
             token.string == ":="
             or "," in target
             or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
             or TOKEN_ONLY_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+            or (
+                detail_target_is_sensitive
+                and not regex_target_is_sensitive
+                and not (
+                    significant and significant[0].type == tokenize.OP and significant[0].string in {"(", "[", "{"}
+                )
+            )
             or (
                 literal_target_is_sensitive
                 and (not source_target_is_sensitive or not _target_supports_regex_redaction(target))
@@ -2073,14 +2339,19 @@ def _merge_replacement_ranges(replacements: list[tuple[int, int]]) -> list[tuple
 
 
 def _looks_like_python_evidence(text: str) -> bool:
+    if _is_parseable_python_evidence(text):
+        return True
+    return SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.search(text) is not None or (
+        UNPACKING_EXPRESSION_ASSIGNMENT_PREFIX_RE.search(text) is not None
+    )
+
+
+def _is_parseable_python_evidence(text: str) -> bool:
     try:
         ast.parse(textwrap.dedent(text.replace("\x00", " ")))
         return True
     except (RecursionError, SyntaxError, ValueError):
-        return (
-            SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.search(text) is not None
-            or UNPACKING_EXPRESSION_ASSIGNMENT_PREFIX_RE.search(text) is not None
-        )
+        return False
 
 
 def _looks_like_r_evidence(text: str) -> bool:
@@ -2130,6 +2401,7 @@ def _unfinished_value_call_sensitivity(text: str, lookahead_text: str) -> bool |
         for token in tokenize.generate_tokens(io.StringIO(lookahead_text.replace("\x00", " ")).readline):
             tokens.append(token)
     except (IndentationError, tokenize.TokenError):
+        # Incomplete bounded lookahead may end mid-token; partial tokens still support conservative classification.
         pass
     depths = _token_depths(tokens)
     offsets = _line_offsets(lookahead_text)
@@ -2227,6 +2499,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
         return quoted_structured_redaction
 
     python_evidence = _looks_like_python_evidence(text)
+    parseable_python_evidence = _is_parseable_python_evidence(text)
     r_evidence = _looks_like_r_evidence(text)
     dedented = textwrap.dedent(text) if python_evidence else text
     python_indent = _common_dedent_prefix(text, dedented) if python_evidence else ""
@@ -2248,20 +2521,42 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
-    redacted = QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
-    redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+
+    def redact_quoted_assignment(match: re.Match[str]) -> str:
+        if parseable_python_evidence and ":" in match.group("prefix") and "=" not in match.group("prefix"):
+            return match.group(0)
+        return _redact_quoted_assignment(match)
+
+    def redact_unterminated_assignment(match: re.Match[str]) -> str:
+        if parseable_python_evidence and ":" in match.group("prefix") and "=" not in match.group("prefix"):
+            return match.group(0)
+        return _redact_unterminated_quoted_assignment(match)
+
+    def redact_unquoted_assignment(match: re.Match[str]) -> str:
+        if parseable_python_evidence and ":" in match.group("prefix") and "=" not in match.group("prefix"):
+            return match.group(0)
+        return _redact_unquoted_assignment(match)
+
+    def redact_scalar_assignment(match: re.Match[str]) -> str:
+        if parseable_python_evidence and ":" in match.group("prefix") and "=" not in match.group("prefix"):
+            return match.group(0)
+        return _redact_scalar_unquoted_assignment(match)
+
+    redacted = QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_quoted_assignment, redacted)
+    redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_quoted_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
-    redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
-    redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
-    redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
+    if not parseable_python_evidence:
+        redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = INDEXED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
-    redacted = CREDENTIALS_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
-    redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_scalar_unquoted_assignment, redacted)
+    redacted = CREDENTIALS_ASSIGNMENT_RE.sub(redact_unquoted_assignment, redacted)
+    redacted = SENSITIVE_ASSIGNMENT_RE.sub(redact_scalar_assignment, redacted)
     if python_evidence:
         redacted = _redact_sensitive_comparisons(redacted)
         redacted = _redact_sensitive_keyed_calls(redacted)

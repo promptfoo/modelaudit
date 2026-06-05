@@ -1706,6 +1706,72 @@ def test_redacts_sensitive_comparison_literals_without_losing_context() -> None:
     assert "api_key_count == 1" in redacted
 
 
+def test_redacts_non_operator_sensitive_comparisons_without_losing_context() -> None:
+    """Comparison helpers and match patterns must not expose credential literals."""
+    text = (
+        'hmac.compare_digest(api_key, "DIGESTSECRET1234567890"); eval("1")\n'
+        'hmac.compare_digest("REVERSEDIGESTSECRET1234567890", client_secret); exec("2")\n'
+        'if api_key.startswith("PREFIXSECRET1234567890"): eval("3")\n'
+        'match api_key:\n    case "MATCHSECRET1234567890": eval("4")\n'
+        'hmac.compare_digest(tokenizer, "visible"); tokenizer.startswith("visible-prefix")\n'
+        'match tokenizer:\n    case "visible-match": print("ok")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (
+        "DIGESTSECRET1234567890",
+        "REVERSEDIGESTSECRET1234567890",
+        "PREFIXSECRET1234567890",
+        "MATCHSECRET1234567890",
+    ):
+        assert secret not in redacted
+    assert 'hmac.compare_digest(api_key, "<redacted>")' in redacted
+    assert 'hmac.compare_digest("<redacted>", client_secret)' in redacted
+    assert 'api_key.startswith("<redacted>")' in redacted
+    assert 'case "<redacted>":' in redacted
+    assert 'hmac.compare_digest(tokenizer, "visible")' in redacted
+    assert 'tokenizer.startswith("visible-prefix")' in redacted
+    assert 'case "visible-match":' in redacted
+    assert 'eval("4")' in redacted
+
+
+def test_python_annotations_and_block_headers_are_not_assignments() -> None:
+    """Credential-shaped Python targets must not erase annotations or block bodies."""
+    text = (
+        'api_key: str\ncredentials: "CredentialStore"\n'
+        'def handle(api_key: str, authorization: "Header"):\n    eval("1")\n'
+        'with open("visible") as api_key:\n    exec("2")\n'
+        'class credentials:\n    marker = "visible"\n'
+        'for api_key in values:\n    compile("3", "visible", "exec")'
+    )
+
+    assert redact_evidence_string(text, max_chars=None) == text
+
+
+def test_redacts_generic_python_credential_keys_and_framed_variants() -> None:
+    """Exact generic credential keys should redact without broad near-match false positives."""
+    secret = "GENERICSECRET1234567890"
+    framed_secret = "FRAMEDGENERICSECRET1234567890"
+    text = (
+        f'credentials = "{secret}"; headers = {{"API Key": "{secret}"}}; '
+        'credentials_manager = "visible"; headers["API Key Count"] = "visible"; eval("1")'
+    )
+    framed = f'\x00 credentials = "{framed_secret}"; headers = {{"API Key": "{framed_secret}"}}; exec("2")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+    framed_redacted = redact_evidence_string(framed, max_chars=None)
+
+    assert secret not in redacted
+    assert framed_secret not in framed_redacted
+    assert "credentials = <redacted>" in redacted
+    assert '"API Key": "<redacted>"' in redacted
+    assert 'credentials_manager = "visible"' in redacted
+    assert 'headers["API Key Count"] = "visible"' in redacted
+    assert 'eval("1")' in redacted
+    assert 'exec("2")' in framed_redacted
+
+
 def test_unparseable_sensitive_comparison_and_keyed_calls_fail_closed() -> None:
     """NUL framing must not reopen comparison, getter, or keyword-call gaps."""
     text = (
@@ -1750,6 +1816,30 @@ def test_redacts_http_auth_and_sensitive_option_defaults() -> None:
     assert 'parser.add_argument("--api-key-count", default=3)' in redacted
     assert 'click.option("--token-cache", default="enabled")' in redacted
     assert 'eval("1 + 1")' in redacted
+
+
+def test_auth_and_cookie_expressions_preserve_executable_call_context() -> None:
+    """Executable auth values should retain the operation while redacting literals."""
+    text = (
+        'requests.get(url, auth=eval("AUTHCALLSECRET1234567890")); '
+        'requests.get(url, cookie=exec("COOKIECALLSECRET1234567890")); '
+        'requests.get(url, cookies={"sessionid": compile("COOKIECOMPILESECRET1234567890", "x", "exec")}); '
+        'requests.get(url, auth=("user", "BASICAUTHSECRET1234567890"))'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (
+        "AUTHCALLSECRET1234567890",
+        "COOKIECALLSECRET1234567890",
+        "COOKIECOMPILESECRET1234567890",
+        "BASICAUTHSECRET1234567890",
+    ):
+        assert secret not in redacted
+    assert 'auth=eval("<redacted>")' in redacted
+    assert 'cookie=exec("<redacted>")' in redacted
+    assert 'compile("<redacted>", "<redacted>", "<redacted>")' in redacted
+    assert "auth=<redacted>" in redacted
 
 
 def test_redacts_parsed_python_literal_sensitive_keys() -> None:
