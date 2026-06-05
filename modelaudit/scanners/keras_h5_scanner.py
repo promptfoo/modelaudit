@@ -23,7 +23,6 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -767,6 +766,7 @@ class KerasH5Scanner(BaseScanner):
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
+        lambda_layer_count = 0
 
         # Check each layer
         for layer in layers:
@@ -808,13 +808,9 @@ class KerasH5Scanner(BaseScanner):
             if layer_class in self.suspicious_layer_types or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
                 if is_lambda_layer:
-                    raw_layer_name = layer.get("name")
-                    if not raw_layer_name and isinstance(layer_config, dict):
-                        raw_layer_name = layer_config.get("name")
-                    layer_name = redact_evidence_string(
-                        str(raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}")
-                    )
-                    self._check_lambda_layer(layer_config, result)
+                    lambda_layer_count += 1
+                    layer_name = f"lambda_{lambda_layer_count}"
+                    self._check_lambda_layer(layer_config, result, layer_name)
                     keras_version = result.metadata.get("keras_version")
 
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
@@ -1027,7 +1023,12 @@ class KerasH5Scanner(BaseScanner):
             details={"actual_type": type(nested_layer).__name__, "expected_type": "dict"},
         )
 
-    def _check_lambda_layer(self, layer_config: dict[str, Any], result: ScanResult) -> None:
+    def _check_lambda_layer(
+        self,
+        layer_config: dict[str, Any],
+        result: ScanResult,
+        layer_name: str,
+    ) -> None:
         """Check Lambda layer for executable Python code with validation"""
         # Lambda layers can contain Python code in several forms:
         # 1. As a string in 'function' field (serialized Python code)
@@ -1039,7 +1040,6 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
-        layer_name = layer_config.get("name", "lambda")
         encoded_function_handled = False
         if isinstance(function_str, dict):
             encoded_function_handled = check_lambda_dict_function(
@@ -1112,7 +1112,11 @@ class KerasH5Scanner(BaseScanner):
                 else:
                     # Not valid Python syntax - might be a configuration issue
                     # Only flag if it looks like attempted code execution
-                    if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
+                    if re.search(
+                        r"(?<![0-9A-Za-z_])(?:eval|exec|compile|__import__)(?![0-9A-Za-z_])",
+                        function_str,
+                        re.IGNORECASE,
+                    ):
                         result.add_check(
                             name="Lambda Layer Suspicious Keywords Check",
                             passed=False,
@@ -1136,21 +1140,16 @@ class KerasH5Scanner(BaseScanner):
         if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
             if self._is_lambda_module_reference_dangerous(module_name, function_name):
-                redacted_module_name = redact_evidence_value(module_name)
-                redacted_function_name = redact_evidence_value(function_name)
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
-                    message=(
-                        "Lambda layer references potentially dangerous module: "
-                        f"{redact_evidence_string(str(module_name))}"
-                    ),
+                    message="Lambda layer references a potentially dangerous module or function",
                     severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={
                         "layer_class": "Lambda",
-                        "module": redacted_module_name,
-                        "function": redacted_function_name,
+                        "module_omitted": "artifact_controlled_lambda_reference",
+                        "function_omitted": "artifact_controlled_lambda_reference",
                     },
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
@@ -1179,8 +1178,8 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "layer_class": "Lambda",
-                        "module": redact_evidence_value(module_name),
-                        "function": redact_evidence_value(function_name),
+                        "module_omitted": "artifact_controlled_lambda_reference",
+                        "function_omitted": "artifact_controlled_lambda_reference",
                     },
                     rule_code=None,  # Passing check
                 )

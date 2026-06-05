@@ -1354,14 +1354,12 @@ def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path:
     result = KerasH5Scanner().scan(str(model_path))
 
     bytecode_issues = [
-        issue for issue in result.issues if "embedded bytecode" in issue.message and "safe_dict_lambda" in issue.message
+        issue for issue in result.issues if "embedded bytecode" in issue.message and "lambda_1" in issue.message
     ]
     assert len(bytecode_issues) == 1
     assert bytecode_issues[0].severity == IssueSeverity.WARNING
     assert not [
-        issue
-        for issue in result.issues
-        if "safe_dict_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
+        issue for issue in result.issues if "lambda_1" in issue.message and issue.severity == IssueSeverity.CRITICAL
     ]
 
 
@@ -1395,7 +1393,7 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
         if check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "dangerous_dict_lambda"
+        and check.details.get("layer_name") == "lambda_1"
     ]
     assert len(dangerous_checks) == 1
     assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
@@ -1407,9 +1405,12 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     list_secret = "H5_LIST_SECRET"
     invalid_secret = "H5_INVALID_SECRET"
     pycompile_secret = "H5_PYCOMPILE_SECRET"
-    layer_name_secret = "H5_LAYER_NAME_SECRET"
-    dangerous_module_secret = "H5_DANGEROUS_MODULE_SECRET"
-    safe_module_secret = "H5_SAFE_MODULE_SECRET"
+    top_level_layer_name_secret = "UNLABELED_TOP_LEVEL_LAYER_VALUE_7F3A9"
+    layer_name_secret = "UNLABELED_CONFIG_LAYER_VALUE_7F3A9"
+    dangerous_module_secret = "UNLABELED_DANGEROUS_MODULE_VALUE_7F3A9"
+    dangerous_function_secret = "UNLABELED_DANGEROUS_FUNCTION_VALUE_7F3A9"
+    safe_module_secret = "UNLABELED_SAFE_MODULE_VALUE_7F3A9"
+    safe_function_secret = "UNLABELED_SAFE_FUNCTION_VALUE_7F3A9"
     variadic_identifier_secret = "H5_VARIADIC_IDENTIFIER_SECRET"
     variadic_identifier = f"aws_secret_access_key_{variadic_identifier_secret}"
 
@@ -1434,8 +1435,9 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                 "layers": [
                     {
                         "class_name": "Lambda",
+                        "name": top_level_layer_name_secret,
                         "config": {
-                            "name": f"direct_lambda?token={layer_name_secret}",
+                            "name": layer_name_secret,
                             "function": (
                                 f"lambda *{variadic_identifier}: "
                                 f"(eval('1'), '{direct_secret}', {variadic_identifier})[-1]"
@@ -1474,16 +1476,16 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                         "class_name": "Lambda",
                         "config": {
                             "name": "dangerous_module_lambda",
-                            "module": f"os?token={dangerous_module_secret}",
-                            "function_name": "system",
+                            "module": f"os.{dangerous_module_secret}",
+                            "function_name": dangerous_function_secret,
                         },
                     },
                     {
                         "class_name": "Lambda",
                         "config": {
                             "name": "safe_module_lambda",
-                            "module": f"math?token={safe_module_secret}",
-                            "function_name": "sqrt",
+                            "module": f"math.{safe_module_secret}",
+                            "function_name": safe_function_secret,
                         },
                     },
                 ],
@@ -1515,6 +1517,24 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         and "validation_error" not in check.details
         for check in scanner_result.checks
     )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
+        and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
+        and "module" not in check.details
+        and "function" not in check.details
+        for check in scanner_result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
+        and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
+        and "module" not in check.details
+        and "function" not in check.details
+        for check in scanner_result.checks
+    )
 
     audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
@@ -1526,13 +1546,42 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         list_secret,
         invalid_secret,
         pycompile_secret,
+        top_level_layer_name_secret,
         layer_name_secret,
         dangerous_module_secret,
+        dangerous_function_secret,
         safe_module_secret,
+        safe_function_secret,
         variadic_identifier_secret,
     ):
         assert secret not in json_output
         assert secret not in sarif_output
+
+
+def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "invalid_lambda_near_match_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "evaluation_layer",
+                            "description": "retrieval quality",
+                            "function": "not valid python!",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(check.name == "Lambda Layer Suspicious Keywords Check" for check in result.checks)
 
 
 def test_lambda_dict_bytecode_with_benign_module_fields_still_critical(tmp_path: Path) -> None:
@@ -1568,14 +1617,12 @@ def test_lambda_dict_bytecode_with_benign_module_fields_still_critical(tmp_path:
         if check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "mixed_dict_lambda"
+        and check.details.get("layer_name") == "lambda_1"
     ]
     assert len(dangerous_checks) == 1
     assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
     assert not any(
-        check.name == "Lambda Layer Module Reference Check"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("module") == "keras.ops"
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
 
@@ -1607,16 +1654,12 @@ def test_lambda_dict_bytecode_with_benign_module_fields_stays_warning(tmp_path: 
     result = KerasH5Scanner().scan(str(model_path))
 
     bytecode_issues = [
-        issue
-        for issue in result.issues
-        if "embedded bytecode" in issue.message and "mixed_safe_dict_lambda" in issue.message
+        issue for issue in result.issues if "embedded bytecode" in issue.message and "lambda_1" in issue.message
     ]
     assert len(bytecode_issues) == 1
     assert bytecode_issues[0].severity == IssueSeverity.WARNING
     assert not any(
-        check.name == "Lambda Layer Module Reference Check"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("module") == "keras.ops"
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
 
@@ -1688,7 +1731,7 @@ def test_lambda_list_bytecode_with_dangerous_pattern_is_critical(tmp_path: Path)
         if check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "dangerous_list_lambda"
+        and check.details.get("layer_name") == "lambda_1"
     ]
     assert len(dangerous_checks) == 1
     assert dangerous_checks[0].details["function_format"] == "list_bytecode"
@@ -1722,17 +1765,13 @@ def test_lambda_list_bytecode_with_benign_module_fields_stays_warning(tmp_path: 
     result = KerasH5Scanner().scan(str(model_path))
 
     bytecode_issues = [
-        issue
-        for issue in result.issues
-        if "embedded bytecode" in issue.message and "mixed_safe_list_lambda" in issue.message
+        issue for issue in result.issues if "embedded bytecode" in issue.message and "lambda_1" in issue.message
     ]
     assert len(bytecode_issues) == 1
     assert bytecode_issues[0].severity == IssueSeverity.WARNING
     assert bytecode_issues[0].details["function_format"] == "list_bytecode"
     assert not any(
-        check.name == "Lambda Layer Module Reference Check"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("module") == "keras.ops"
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
 
@@ -1801,8 +1840,8 @@ def test_unrecognized_lambda_function_dict_still_uses_module_reference_check(tmp
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("module") == "os"
-        and check.details.get("function") == "system"
+        and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
+        and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
         for check in result.checks
     )
 
@@ -1883,17 +1922,15 @@ def test_lambda_dict_bytecode_with_dangerous_module_fields_still_checks_module_r
     result = KerasH5Scanner().scan(str(model_path))
 
     assert any(
-        issue.severity == IssueSeverity.WARNING
-        and "embedded bytecode" in issue.message
-        and "mixed_dangerous_module" in issue.message
+        issue.severity == IssueSeverity.WARNING and "embedded bytecode" in issue.message and "lambda_1" in issue.message
         for issue in result.issues
     )
     assert any(
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("module") == "os"
-        and check.details.get("function") == "system"
+        and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
+        and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
         for check in result.checks
     )
 
@@ -1933,8 +1970,8 @@ def test_lambda_safe_string_with_dangerous_module_fields_still_checks_module_ref
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("module") == "os"
-        and check.details.get("function") == "system"
+        and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
+        and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
         for check in result.checks
     )
 
