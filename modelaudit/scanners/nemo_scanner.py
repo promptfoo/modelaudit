@@ -97,6 +97,8 @@ _DANGEROUS_TARGETS = {
     "os.execve",
     "os.execvp",
     "os.execvpe",
+    "posix.execv",
+    "posix.execve",
     "os.spawn",
     "os.spawnl",
     "os.spawnle",
@@ -108,6 +110,10 @@ _DANGEROUS_TARGETS = {
     "os.spawnvpe",
     "os.posix_spawn",
     "os.posix_spawnp",
+    "os.fork",
+    "posix.fork",
+    "os.forkpty",
+    "pty.fork",
     "posix.system",
     "posix.posix_spawn",
     "posix.posix_spawnp",
@@ -117,6 +123,9 @@ _DANGEROUS_TARGETS = {
     "runpy.run_module",
     "runpy.run_path",
     "operator.call",
+    "asyncio.run",
+    "threading.Thread.start",
+    "multiprocessing.Process.start",
     "subprocess.call",
     "subprocess.run",
     "subprocess.Popen",
@@ -176,12 +185,15 @@ _DANGEROUS_TARGETS = {
     "torch.package.PackageImporter",
     "torch.package.PackageImporter.load_pickle",
     "torch.serialization.load",
+    "torch.classes.load_library",
+    "torch.ops.load_library",
     "torch.utils.cpp_extension._import_module_from_library",
     "torch.utils.cpp_extension._jit_compile",
     "torch.utils.cpp_extension._run_ninja_build",
     "torch.utils.cpp_extension.load",
     "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
+    "tensorflow.load_op_library",
     "numpy.fromfile",
     "numpy.fromregex",
     "numpy.genfromtxt",
@@ -195,6 +207,7 @@ _DANGEROUS_TARGETS = {
     "numpy.lib._npyio_impl.genfromtxt",
     "numpy.lib._npyio_impl.load",
     "numpy.lib._npyio_impl.loadtxt",
+    "numpy.lib._npyio_impl.NpzFile",
     "numpy.lib._npyio_impl.save",
     "numpy.lib._npyio_impl.savez",
     "numpy.lib._npyio_impl.savez_compressed",
@@ -208,6 +221,7 @@ _DANGEROUS_TARGETS = {
     "numpy.lib.npyio.genfromtxt",
     "numpy.lib.npyio.load",
     "numpy.lib.npyio.loadtxt",
+    "numpy.lib.npyio.NpzFile",
     "numpy.lib.npyio.recfromcsv",
     "numpy.lib.npyio.recfromtxt",
     "numpy.lib.npyio.save",
@@ -216,6 +230,7 @@ _DANGEROUS_TARGETS = {
     "numpy.lib.npyio.savetxt",
     "numpy.load",
     "numpy.loadtxt",
+    "numpy.lib._npyio.NpzFile",
     "numpy.memmap",
     "numpy._core.memmap.memmap",
     "numpy._core.multiarray.fromfile",
@@ -379,6 +394,7 @@ _DANGEROUS_TARGETS = {
     "http.client.HTTPResponse.readlines",
     "http.client.HTTPResponse.peek",
     "socket.create_connection",
+    "socket.create_server",
     "socket.getaddrinfo",
     "socket.getfqdn",
     "socket.gethostbyaddr",
@@ -387,6 +403,8 @@ _DANGEROUS_TARGETS = {
     "socket.getnameinfo",
     "socket.socket.connect",
     "socket.socket.connect_ex",
+    "socket.socket.bind",
+    "socket.socket.listen",
     "socket.socket.accept",
     "socket.socket.send",
     "socket.socket.sendall",
@@ -401,6 +419,8 @@ _DANGEROUS_TARGETS = {
     "socket.socket.recvmsg_into",
     "socket.SocketType.connect",
     "socket.SocketType.connect_ex",
+    "socket.SocketType.bind",
+    "socket.SocketType.listen",
     "socket.SocketType.accept",
     "socket.SocketType.send",
     "socket.SocketType.sendall",
@@ -417,6 +437,8 @@ _DANGEROUS_TARGETS = {
     "socket.recv_fds",
     "_socket.socket.connect",
     "_socket.socket.connect_ex",
+    "_socket.socket.bind",
+    "_socket.socket.listen",
     "_socket.socket.accept",
     "_socket.socket.send",
     "_socket.socket.sendall",
@@ -430,6 +452,8 @@ _DANGEROUS_TARGETS = {
     "_socket.socket.recvmsg_into",
     "_socket.SocketType.connect",
     "_socket.SocketType.connect_ex",
+    "_socket.SocketType.bind",
+    "_socket.SocketType.listen",
     "_socket.SocketType.accept",
     "_socket.SocketType.send",
     "_socket.SocketType.sendall",
@@ -482,6 +506,11 @@ _DANGEROUS_TARGETS = {
     "os.scandir",
     "posix.scandir",
     "nt.scandir",
+    "os.chdir",
+    "posix.chdir",
+    "nt.chdir",
+    "os.fchdir",
+    "posix.fchdir",
     "os.stat",
     "os.access",
     "os.fstat",
@@ -735,6 +764,8 @@ _DANGEROUS_TARGETS = {
     "ctypes.oledll.LoadLibrary",
     "ctypes.pydll.LoadLibrary",
     "ctypes.windll.LoadLibrary",
+    "ctypes.pythonapi.PyRun_SimpleString",
+    "ctypes.pythonapi.PyRun_SimpleStringFlags",
     "ctypes.util.find_library",
     "numpy.ctypeslib.load_library",
     "code.interact",
@@ -2656,6 +2687,7 @@ class NemoScanner(BaseScanner):
     ) -> Iterator[tuple[str, Any, dict[Any, Any] | None, Any]]:
         """Yield parsed config nodes while bounding depth, work, and YAML alias cycles."""
         visited_nodes = 0
+        expanded_containers: set[int] = set()
 
         def walk(
             value: Any,
@@ -2689,9 +2721,26 @@ class NemoScanner(BaseScanner):
             yield config_path, value, parent, key
 
             if isinstance(value, dict | list):
+                # YAML aliases reuse container identities; expand each once to bound
+                # repeated work and duplicate diagnostics while retaining cycle checks.
+                if identity in expanded_containers:
+                    return
+                expanded_containers.add(identity)
                 child_ancestors = ancestors | {identity}
                 if isinstance(value, dict):
+                    if "_target_" in value:
+                        child_path = _append_config_path(config_path, "_target_")
+                        yield from walk(
+                            value["_target_"],
+                            child_path,
+                            depth + 1,
+                            child_ancestors,
+                            value,
+                            "_target_",
+                        )
                     for child_key, child_value in value.items():
+                        if child_key == "_target_":
+                            continue
                         child_path = _append_config_path(config_path, str(child_key))
                         yield from walk(child_value, child_path, depth + 1, child_ancestors, value, child_key)
                 else:

@@ -3403,6 +3403,7 @@ class TestCVE202523304HydraTarget:
             "numpy.lib._npyio_impl.genfromtxt",
             "numpy.lib._npyio_impl.load",
             "numpy.lib._npyio_impl.loadtxt",
+            "numpy.lib._npyio_impl.NpzFile",
             "numpy.lib._npyio_impl.save",
             "numpy.lib._npyio_impl.savez",
             "numpy.lib._npyio_impl.savez_compressed",
@@ -3416,6 +3417,7 @@ class TestCVE202523304HydraTarget:
             "numpy.lib.npyio.genfromtxt",
             "numpy.lib.npyio.load",
             "numpy.lib.npyio.loadtxt",
+            "numpy.lib.npyio.NpzFile",
             "numpy.lib.npyio.recfromcsv",
             "numpy.lib.npyio.recfromtxt",
             "numpy.lib.npyio.save",
@@ -3424,6 +3426,7 @@ class TestCVE202523304HydraTarget:
             "numpy.lib.npyio.savetxt",
             "numpy.load",
             "numpy.loadtxt",
+            "numpy.lib._npyio.NpzFile",
             "numpy.memmap",
             "numpy._core.memmap.memmap",
             "numpy._core.multiarray.fromfile",
@@ -4049,11 +4052,15 @@ class TestCVE202523304HydraTarget:
             "http.client.HTTPResponse.readlines",
             "http.client.HTTPResponse.peek",
             "socket.socket.accept",
+            "socket.socket.bind",
+            "socket.socket.listen",
             "socket.socket.sendfile",
             "socket.socket.recv_into",
             "socket.socket.recvfrom_into",
             "socket.socket.recvmsg_into",
             "socket.SocketType.accept",
+            "socket.SocketType.bind",
+            "socket.SocketType.listen",
             "socket.SocketType.sendfile",
             "socket.SocketType.recv_into",
             "socket.SocketType.recvfrom_into",
@@ -4061,10 +4068,14 @@ class TestCVE202523304HydraTarget:
             "socket.send_fds",
             "socket.recv_fds",
             "_socket.socket.accept",
+            "_socket.socket.bind",
+            "_socket.socket.listen",
             "_socket.socket.recv_into",
             "_socket.socket.recvfrom_into",
             "_socket.socket.recvmsg_into",
             "_socket.SocketType.accept",
+            "_socket.SocketType.bind",
+            "_socket.SocketType.listen",
             "_socket.SocketType.recv_into",
             "_socket.SocketType.recvfrom_into",
             "_socket.SocketType.recvmsg_into",
@@ -4078,6 +4089,11 @@ class TestCVE202523304HydraTarget:
             "posix.statvfs",
             "os.fstatvfs",
             "posix.fstatvfs",
+            "os.chdir",
+            "posix.chdir",
+            "nt.chdir",
+            "os.fchdir",
+            "posix.fchdir",
             "os.readv",
             "posix.readv",
             "os.pread",
@@ -4264,8 +4280,13 @@ class TestCVE202523304HydraTarget:
             "ctypes.pydll.LoadLibrary",
             "ctypes.windll.LoadLibrary",
             "ctypes.cdll.attacker_library",
+            "ctypes.pythonapi.PyRun_SimpleString",
+            "ctypes.pythonapi.PyRun_SimpleStringFlags",
             "ctypes.util.find_library",
             "numpy.ctypeslib.load_library",
+            "tensorflow.load_op_library",
+            "torch.classes.load_library",
+            "torch.ops.load_library",
         ],
     )
     def test_reviewed_constructor_and_loader_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
@@ -4289,6 +4310,7 @@ class TestCVE202523304HydraTarget:
         "target",
         [
             "tempfile.mktemp",
+            "socket.create_server",
             "nntplib.NNTP._create_socket",
             "nntplib.NNTP_SSL._create_socket",
             "poplib.POP3._create_socket",
@@ -4619,6 +4641,13 @@ class TestCVE202523304HydraTarget:
             "tarfile.open",
             "tempfile.NamedTemporaryFile",
             "ctypes.PyDLL",
+            "ctypes.pythonapi.PyRun_SimpleString",
+            "numpy.lib.npyio.NpzFile",
+            "socket.socket.bind",
+            "os.fork",
+            "os.chdir",
+            "asyncio.run",
+            "torch.ops.load_library",
             "os.path.realpath",
             "os.chmod",
             "pathlib.Path.iterdir",
@@ -4650,6 +4679,12 @@ class TestCVE202523304HydraTarget:
             "os.spawnvpe",
             "os.posix_spawn",
             "os.posix_spawnp",
+            "posix.execv",
+            "posix.execve",
+            "os.fork",
+            "posix.fork",
+            "os.forkpty",
+            "pty.fork",
             "posix.system",
             "posix.posix_spawn",
             "posix.posix_spawnp",
@@ -4659,6 +4694,9 @@ class TestCVE202523304HydraTarget:
             "runpy.run_module",
             "runpy.run_path",
             "operator.call",
+            "asyncio.run",
+            "threading.Thread.start",
+            "multiprocessing.Process.start",
         ],
     )
     def test_process_and_dynamic_execution_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
@@ -4987,14 +5025,12 @@ class TestCVE202523304HydraTarget:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Direct findings visited within the node budget must survive a wide-config limit."""
+        """Mapping-local targets must be checked before an earlier wide sibling exhausts the budget."""
         monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
-        path = _create_nemo_file(
+        wide_children = "".join(f"  child_{index}:\n    value: {index}\n" for index in range(32))
+        path = _create_nemo_file_from_bytes(
             tmp_path,
-            {
-                "_target_": "os.system",
-                **{f"child_{index}": {"value": index} for index in range(32)},
-            },
+            f"wide:\n{wide_children}_target_: os.system\n".encode(),
         )
 
         aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
@@ -5028,10 +5064,10 @@ class TestCVE202523304HydraTarget:
         assert determine_exit_code(aggregate_result) == 1
 
     def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
-        """Findings visited before an alias cycle should retain security precedence."""
+        """Mapping-local targets must be checked before an earlier recursive alias sibling."""
         path = _create_nemo_file_from_bytes(
             tmp_path,
-            b"_target_: os.system\nmodel: &loop\n  children:\n    - *loop\n",
+            b"model: &loop\n  children:\n    - *loop\n_target_: os.system\n",
         )
 
         aggregate_result = scan_model_directory_or_file(
@@ -5043,6 +5079,29 @@ class TestCVE202523304HydraTarget:
         assert "nemo_config_recursive_alias" in metadata["scan_outcome_reasons"]
         assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
         assert determine_exit_code(aggregate_result) == 1
+
+    def test_reused_yaml_alias_emits_one_target_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated aliases should not amplify identical Hydra target diagnostics."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 1_100)
+        aliases = b"  - *shared\n" * 1_000
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"shared: &shared\n  _target_: os.system\naliases:\n" + aliases,
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        target_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "os.system"
+        ]
+        assert len(target_checks) == 1
+        assert "nemo_config_traversal_node_limit" not in result.metadata.get("scan_outcome_reasons", [])
 
     @pytest.mark.parametrize(
         ("payload", "expected_reason", "expected_check"),
