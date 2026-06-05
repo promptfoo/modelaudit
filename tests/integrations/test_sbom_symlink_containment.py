@@ -116,11 +116,29 @@ def test_sbom_normalizes_top_level_component_metadata_path(tmp_path: Path) -> No
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
 @pytest.mark.parametrize("use_pydantic", [False, True])
-def test_sbom_rejects_fifo_without_blocking(tmp_path: Path, use_pydantic: bool) -> None:
+def test_sbom_rejects_fifo_without_opening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_pydantic: bool,
+) -> None:
     scan_root = tmp_path / "scan-root"
     scan_root.mkdir()
     fifo_path = scan_root / "model.bin"
     os.mkfifo(fifo_path)
+    real_open = os.open
+
+    def reject_fifo_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path in {str(fifo_path), fifo_path.name}:
+            raise AssertionError("SBOM hashing must reject a known FIFO before opening it")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", reject_fifo_open)
 
     if use_pydantic:
         sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
