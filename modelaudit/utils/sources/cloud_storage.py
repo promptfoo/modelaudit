@@ -59,6 +59,11 @@ _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
     r"(?P<scheme>[a-z][a-z0-9+.-]*)%(?:25)*3a%(?:25)*2f%(?:25)*2f",
     re.IGNORECASE,
 )
+_PERCENT_ENCODED_AUTHORITY_DELIMITER_RE = re.compile(
+    r"%(?:25)*(?P<delimiter>3a|40|5b|5d)",
+    re.IGNORECASE,
+)
+_PERCENT_ENCODED_SLASH_RE = re.compile(r"%(?:25)*2f", re.IGNORECASE)
 _SAFE_DISPLAY_QUERY_KEYS = frozenset(
     {
         "campaign",
@@ -145,6 +150,7 @@ def redact_url_for_display(url: str) -> str:
         normalized_url = _normalize_percent_encoded_url_delimiters_for_display(
             normalize_escaped_url_delimiters_for_display(url)
         )
+        normalized_url = _normalize_percent_encoded_url_authority_for_display(normalized_url)
         parts = urlsplit(normalized_url)
         if not parts.scheme:
             return url
@@ -213,10 +219,38 @@ def _normalize_percent_encoded_url_delimiters_for_display(url: str) -> str:
     return f"{url[: boundary.start()]}{encoded_suffix}"
 
 
+def _normalize_percent_encoded_url_authority_for_display(url: str) -> str:
+    """Expose encoded authority separators without decoding ordinary path escapes."""
+    scheme_end = url.find("://")
+    if scheme_end < 0:
+        return url
+
+    authority_start = scheme_end + 3
+    authority_end = len(url)
+    for delimiter in "/?#":
+        delimiter_index = url.find(delimiter, authority_start)
+        if delimiter_index >= 0:
+            authority_end = min(authority_end, delimiter_index)
+
+    authority = url[authority_start:authority_end]
+    replacements = {"3a": ":", "40": "@", "5b": "[", "5d": "]"}
+    normalized_authority = _PERCENT_ENCODED_AUTHORITY_DELIMITER_RE.sub(
+        lambda match: replacements[match.group("delimiter").lower()],
+        authority,
+    )
+    if "@" in normalized_authority:
+        userinfo, host_and_path = normalized_authority.rsplit("@", 1)
+        normalized_authority = f"{userinfo}@{_PERCENT_ENCODED_SLASH_RE.sub('/', host_and_path)}"
+    else:
+        normalized_authority = _PERCENT_ENCODED_SLASH_RE.sub("/", normalized_authority)
+    return f"{url[:authority_start]}{normalized_authority}{url[authority_end:]}"
+
+
 def _redact_embedded_url_for_display(url: str) -> str:
     if is_stream_url(url):
         return f"stream://{redact_stream_url_for_display(url[9:])}"
     url = _normalize_percent_encoded_url_delimiters_for_display(url)
+    url = _normalize_percent_encoded_url_authority_for_display(url)
     try:
         parts = urlsplit(url)
         safe_base = redact_url_for_display(url)

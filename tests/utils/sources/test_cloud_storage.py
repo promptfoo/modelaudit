@@ -200,6 +200,14 @@ class TestCloudURLRedaction:
         url = "https://bucket.s3.amazonaws.com/models/bert%20base%2Fmodel.pkl"
         assert redact_url_for_display(url) == url
 
+    def test_redact_url_for_display_strips_percent_encoded_userinfo(self) -> None:
+        url = "https://user%3Aencoded-password%40bucket.s3.amazonaws.com%2Fmodel.pkl%3Ftoken%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_preserves_path_when_encoded_password_contains_slash(self) -> None:
+        url = "https://user%3Ap%252Fass%40bucket.s3.amazonaws.com%2Fmodel.pkl%3Ftoken%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
     def test_redact_url_for_display_fails_closed_for_invalid_port(self) -> None:
         url = "https://user:password@example.com:not-a-port/model.bin?token=secret"
         assert redact_url_for_display(url) == "<cloud URL redacted>"
@@ -299,9 +307,21 @@ class TestCloudURLRedaction:
         redacted = redact_cloud_error_for_display(message)
 
         assert redacted == (
-            "provider failed: https://bucket.s3.amazonaws.com%252Fmodel.pkl?visible=yes&X-Amz-Signature=<redacted>"
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl?visible=yes&X-Amz-Signature=<redacted>"
         )
         assert "deadbeef" not in redacted
+
+    def test_redact_cloud_error_for_display_strips_fully_encoded_userinfo(self) -> None:
+        message = (
+            "provider failed: https%253A%252F%252Fuser%253Aencoded-password%2540"
+            "bucket.s3.amazonaws.com%252Fmodel.pkl%253Ftoken%253Dsecret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "provider failed: https://bucket.s3.amazonaws.com/model.pkl?token=<redacted>"
+        assert "encoded-password" not in redacted
+        assert "secret" not in redacted
 
     def test_redact_cloud_error_for_display_redacts_common_credential_aliases(self) -> None:
         message = (

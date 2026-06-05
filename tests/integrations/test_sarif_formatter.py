@@ -292,6 +292,29 @@ class TestFormatSarifOutput:
         assert "deadbeef" not in output
         assert "private-token-value" not in output
 
+    def test_percent_encoded_url_userinfo_cannot_hide_credentials(self) -> None:
+        raw_url = (
+            "https%3A%2F%2Fuser%3Aencoded-password%40bucket.s3.amazonaws.com%2Fmodel.pkl"
+            "%3Fvisible%3Dyes%26token%3Dprivate-token-value"
+        )
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Provider failed while opening {raw_url}",
+                severity=IssueSeverity.WARNING,
+                details={"source": raw_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, [raw_url])
+
+        assert "bucket.s3.amazonaws.com/model.pkl" in output
+        assert "visible=yes" in output
+        assert "encoded-password" not in output
+        assert "private-token-value" not in output
+
     def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
         """Opaque URL components must not bypass key/value redaction."""
         raw_url = "https://evil.example/c2?campaign=test&BARE-QUERY-SECRET#section=overview&BARE-FRAGMENT-SECRET"
