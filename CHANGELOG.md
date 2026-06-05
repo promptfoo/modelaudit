@@ -197,6 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
+- redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - bind cache reads and writes to complete file and pathname identities captured before scanning
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
