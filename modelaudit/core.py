@@ -2601,6 +2601,7 @@ def scan_model_streaming(
                     # Add asset
                     asset = asset_from_scan_result(report_path, scan_result, metadata=metadata_dict)
                     if asset:
+                        asset["is_streamed"] = True
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1
