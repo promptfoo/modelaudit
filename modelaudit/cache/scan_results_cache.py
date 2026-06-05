@@ -4,6 +4,9 @@ import hashlib
 import json
 import logging
 import os
+import stat
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -18,8 +21,182 @@ from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
 
-AncestorIdentity = tuple[tuple[str, int, int, int, int, int], ...]
+AncestorEntry = tuple[str, int, int, int, int, int]
+
+
+class _AncestorPathMonitor:
+    """Track replacements of path components without treating sibling churn as a change."""
+
+    _EVENT_STRUCT = struct.Struct("iIII")
+    _IN_ATTRIB = 0x00000004
+    _IN_MOVED_FROM = 0x00000040
+    _IN_MOVED_TO = 0x00000080
+    _IN_CREATE = 0x00000100
+    _IN_DELETE = 0x00000200
+    _IN_DELETE_SELF = 0x00000400
+    _IN_MOVE_SELF = 0x00000800
+    _IN_UNMOUNT = 0x00002000
+    _IN_Q_OVERFLOW = 0x00004000
+    _IN_IGNORED = 0x00008000
+    _CHILD_EVENT_MASK = _IN_ATTRIB | _IN_MOVED_FROM | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+    _SELF_EVENT_MASK = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_UNMOUNT | _IN_IGNORED
+    _WATCH_MASK = _CHILD_EVENT_MASK | _SELF_EVENT_MASK
+
+    def __init__(self, file_path: str, ancestor_identity: tuple[AncestorEntry, ...]) -> None:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        init.argtypes = [ctypes.c_int]
+        init.restype = ctypes.c_int
+        add_watch = libc.inotify_add_watch
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+
+        self._fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self._fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+
+        self._self_watches: set[int] = set()
+        self._child_names: dict[int, set[str]] = {}
+        watched_paths: dict[str, int] = {}
+
+        def watch(path: str) -> int:
+            existing = watched_paths.get(path)
+            if existing is not None:
+                return existing
+            descriptor = int(add_watch(self._fd, os.fsencode(path), self._WATCH_MASK))
+            if descriptor < 0:
+                raise OSError(ctypes.get_errno(), f"inotify_add_watch failed for {path}")
+            watched_paths[path] = descriptor
+            return descriptor
+
+        try:
+            direct_parent = Path(ancestor_identity[0][0])
+            self._child_names.setdefault(watch(str(direct_parent)), set()).add(Path(file_path).name)
+            for entry in ancestor_identity:
+                ancestor = Path(entry[0])
+                self._self_watches.add(watch(str(ancestor)))
+                self._child_names.setdefault(watch(str(ancestor.parent)), set()).add(ancestor.name)
+        except Exception:
+            self.close()
+            raise
+
+    def changed(self) -> bool:
+        if self._fd < 0:
+            return True
+        while True:
+            try:
+                data = os.read(self._fd, 64 * 1024)
+            except BlockingIOError:
+                return False
+            except OSError:
+                return True
+            if not data:
+                return True
+
+            offset = 0
+            while offset + self._EVENT_STRUCT.size <= len(data):
+                descriptor, mask, _cookie, name_length = self._EVENT_STRUCT.unpack_from(data, offset)
+                offset += self._EVENT_STRUCT.size
+                raw_name = data[offset : offset + name_length]
+                offset += name_length
+                name = os.fsdecode(raw_name.split(b"\0", 1)[0])
+                if mask & self._IN_Q_OVERFLOW:
+                    return True
+                if descriptor in self._self_watches and mask & self._SELF_EVENT_MASK:
+                    return True
+                if mask & self._CHILD_EVENT_MASK and name in self._child_names.get(descriptor, set()):
+                    return True
+
+    def close(self) -> None:
+        if getattr(self, "_fd", -1) >= 0:
+            with suppress(OSError):
+                os.close(self._fd)
+            self._fd = -1
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class _WindowsPathLockMonitor:
+    """Prevent file and ancestor replacement while a Windows scan is in flight."""
+
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+    def __init__(self, file_path: str, ancestor_identity: tuple[AncestorEntry, ...]) -> None:
+        import ctypes
+
+        kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+
+        self._close_handle = close_handle
+        self._handles: list[int] = []
+        invalid_handle = ctypes.c_void_p(-1).value
+        paths = [file_path, *(entry[0] for entry in ancestor_identity)]
+        try:
+            for path in dict.fromkeys(paths):
+                handle = create_file(
+                    os.path.abspath(path),
+                    0,
+                    self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+                    None,
+                    self._OPEN_EXISTING,
+                    self._FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+                if handle in {None, invalid_handle}:
+                    raise OSError(vars(ctypes)["get_last_error"](), f"CreateFileW failed for {path}")
+                self._handles.append(int(handle))
+        except Exception:
+            self.close()
+            raise
+
+    def changed(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        for handle in getattr(self, "_handles", []):
+            with suppress(OSError):
+                self._close_handle(handle)
+        self._handles = []
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class AncestorIdentity(tuple[AncestorEntry, ...]):
+    monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None
+
+    def __new__(
+        cls,
+        entries: tuple[AncestorEntry, ...] | list[AncestorEntry],
+        monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None,
+    ) -> "AncestorIdentity":
+        identity = super().__new__(cls, entries)
+        identity.monitor = monitor
+        return identity
+
+
 ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
+
+_MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS = 2.1
 
 
 def _is_sampled_fingerprint(value: object) -> bool:
@@ -272,7 +449,9 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
-            if not self._ancestor_identity_matches(
+            if self._ancestor_monitor_changed(
+                expected_ancestor_identity
+            ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
@@ -290,7 +469,9 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, post_hash_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file changed during verification", file_path)
                 return False
-            if not self._ancestor_identity_matches(
+            if self._ancestor_monitor_changed(
+                expected_ancestor_identity
+            ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
@@ -344,12 +525,28 @@ class ScanResultsCache:
             with open(cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(asdict(cache_entry), f, indent=2)
 
+            final_stat = os.stat(file_path)
+            if (
+                not self._stat_matches(final_stat, expected_file_stat)
+                or self._get_file_change_token(file_path, final_stat) != expected_change_token
+                or self._ancestor_monitor_changed(expected_ancestor_identity)
+                or not self._ancestor_identity_matches_for_store(
+                    expected_ancestor_identity,
+                    self._capture_ancestor_identity(file_path),
+                )
+            ):
+                cache_file_path.unlink(missing_ok=True)
+                logger.debug("Discarding cache store for %s: path changed during persistence", file_path)
+                return False
+
             logger.debug(f"Cached scan result for {os.path.basename(file_path)}")
             return True
 
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
             return False
+        finally:
+            self.release_ancestor_identity(expected_ancestor_identity)
 
     def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
         """Capture a stable stat, content hash, and platform change token before scanning."""
@@ -376,8 +573,18 @@ class ScanResultsCache:
         ):
             raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-        self._advance_change_clock(file_path, probe, verified_change_token, verified_ancestor_identity)
-        return verified_stat, content_hash, verified_change_token, verified_ancestor_identity
+        monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, verified_ancestor_identity)
+        try:
+            if not self._ancestor_identity_matches(
+                verified_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
+            self._advance_change_clock(file_path, probe, verified_change_token, verified_ancestor_identity)
+            return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
+        except Exception:
+            self.release_ancestor_identity(monitored_ancestor_identity)
+            raise
 
     def _get_change_clock_probe(self, file_path: str, file_device: int) -> BinaryIO:
         """Return a reusable probe whose inode lives on the scanned file's filesystem."""
@@ -444,7 +651,7 @@ class ScanResultsCache:
         captured_tokens = [file_change_token, *(entry[-1] for entry in ancestor_identity)]
         newest_captured_token = max(captured_tokens)
 
-        deadline = time.monotonic() + 0.05
+        deadline = time.monotonic() + _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS
         while time.monotonic() < deadline:
             probe_token = self._touch_change_clock_probe(probe)
             if probe_token > newest_captured_token:
@@ -473,7 +680,8 @@ class ScanResultsCache:
         """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
-        identity: list[tuple[str, int, int, int, int, int]] = []
+        identity: list[AncestorEntry] = []
+        direct_parent = True
         while True:
             ancestor_path = str(ancestor)
             if ancestor.is_symlink():
@@ -481,7 +689,8 @@ class ScanResultsCache:
             ancestor_stat = os.stat(ancestor_path)
             if ancestor_stat.st_dev != file_device:
                 break
-            if ancestor.parent == ancestor or os.stat(ancestor.parent).st_dev != file_device:
+            parent_on_same_device = ancestor.parent != ancestor and os.stat(ancestor.parent).st_dev == file_device
+            if not direct_parent and not parent_on_same_device:
                 break
             identity.append(
                 (
@@ -497,34 +706,71 @@ class ScanResultsCache:
                     self._get_file_change_token(ancestor_path, ancestor_stat),
                 )
             )
+            if not parent_on_same_device:
+                break
+            direct_parent = False
             ancestor = ancestor.parent
-        return tuple(identity)
+        return AncestorIdentity(identity)
 
     @staticmethod
     def _ancestor_identity_matches(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
-        if len(expected) != len(current):
-            return False
-        for index, (expected_entry, current_entry) in enumerate(zip(expected, current, strict=True)):
-            if expected_entry[:4] != current_entry[:4]:
-                return False
-            expected_mtime, expected_change_token = expected_entry[-2:]
-            current_mtime, current_change_token = current_entry[-2:]
-            if index == 0:
-                if (expected_mtime, expected_change_token) != (current_mtime, current_change_token):
-                    return False
-            elif expected_change_token != current_change_token and expected_mtime == current_mtime:
-                return False
-        return True
+        return len(expected) == len(current) and all(
+            expected_entry == current_entry for expected_entry, current_entry in zip(expected, current, strict=True)
+        )
+
+    @staticmethod
+    def _ancestor_identity_matches_for_store(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
+        if expected.monitor is None:
+            return ScanResultsCache._ancestor_identity_matches(expected, current)
+        return len(expected) == len(current) and all(
+            expected_entry[:4] == current_entry[:4]
+            for expected_entry, current_entry in zip(expected, current, strict=True)
+        )
+
+    @staticmethod
+    def _ancestor_monitor_changed(identity: AncestorIdentity) -> bool:
+        return identity.monitor is not None and identity.monitor.changed()
+
+    @staticmethod
+    def release_ancestor_identity(identity: AncestorIdentity | None) -> None:
+        if identity is not None and identity.monitor is not None:
+            identity.monitor.close()
+
+    @staticmethod
+    def _monitor_ancestor_identity(file_path: str, identity: AncestorIdentity) -> AncestorIdentity:
+        if not identity:
+            return identity
+        try:
+            if sys.platform.startswith("linux"):
+                monitor: _AncestorPathMonitor | _WindowsPathLockMonitor = _AncestorPathMonitor(
+                    file_path,
+                    tuple(identity),
+                )
+            elif sys.platform == "win32":
+                monitor = _WindowsPathLockMonitor(file_path, tuple(identity))
+            else:
+                return identity
+            return AncestorIdentity(tuple(identity), monitor)
+        except (AttributeError, OSError):
+            return identity
 
     @staticmethod
     def _path_has_symlink_component(file_path: str) -> bool:
-        path = Path(os.path.abspath(file_path))
-        while True:
-            if path.is_symlink():
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            if component in {"", "."}:
+                continue
+            if component == "..":
+                current = current.parent
+                continue
+            current /= component
+            component_stat = os.lstat(current)
+            if stat.S_ISLNK(component_stat.st_mode) or getattr(component_stat, "st_file_attributes", 0) & 0x400:
                 return True
-            if path.parent == path:
-                return False
-            path = path.parent
+        return False
 
     @staticmethod
     def _get_file_change_token(file_path: str, file_stat: os.stat_result) -> int:

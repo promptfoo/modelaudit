@@ -111,6 +111,35 @@ def test_windows_change_clock_probe_uses_existing_handle(
         assert observed_handles == [probe.fileno() + 100]
 
 
+def test_change_clock_probe_allows_coarse_filesystem_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    clock = {"now": 0.0}
+    ancestor_identity = cache._capture_ancestor_identity(str(file_path))
+    newest_token = max(1, *(entry[-1] for entry in ancestor_identity))
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    monkeypatch.setattr(
+        cache,
+        "_touch_change_clock_probe",
+        lambda _probe: newest_token + 1 if clock["now"] >= 0.1 else newest_token,
+    )
+
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        cache._advance_change_clock(
+            str(file_path),
+            probe,
+            1,
+            ancestor_identity,
+        )
+
+    assert clock["now"] >= 0.1
+
+
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -134,6 +163,88 @@ def test_capture_file_identity_excludes_same_filesystem_mount_root(tmp_path: Pat
 
     assert str(file_path.parent) in tracked_paths
     assert str(mount_root) not in tracked_paths
+
+
+def test_capture_ancestor_identity_includes_direct_parent_at_device_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_stat = os.stat
+    parent_of_parent = str(file_path.parent.parent)
+    file_device = file_path.stat().st_dev
+
+    def stat_with_device_boundary(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = original_stat(path, *args, **kwargs)
+        if os.fspath(path) != parent_of_parent:
+            return result
+        values = list(result)
+        values[2] = file_device + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(os, "stat", stat_with_device_boundary)
+
+    identity = cache._capture_ancestor_identity(str(file_path))
+
+    assert [entry[0] for entry in identity] == [str(file_path.parent)]
+
+
+def test_cache_identity_rejects_symlink_component_before_parent_traversal(tmp_path: Path) -> None:
+    target_parent = tmp_path / "target"
+    target_child = target_parent / "child"
+    target_child.mkdir(parents=True)
+    model_path = _make_cacheable_file(target_parent, name="model.dat")
+    link_path = tmp_path / "link"
+    try:
+        link_path.symlink_to(target_child, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    traversed_path = link_path / ".." / model_path.name
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+
+    with pytest.raises(ValueError, match="Symlinked paths are not cacheable"):
+        cache.capture_file_identity(str(traversed_path))
+
+
+def test_cache_path_component_rejects_windows_reparse_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_lstat = os.lstat
+
+    def lstat_with_reparse_point(path: os.PathLike[str] | str, *args: Any, **kwargs: Any) -> Any:
+        result = original_lstat(path, *args, **kwargs)
+        if Path(path) != file_path.parent:
+            return result
+
+        class ReparseStat:
+            st_mode = result.st_mode
+            st_file_attributes = 0x400
+
+        return ReparseStat()
+
+    monkeypatch.setattr(os, "lstat", lstat_with_reparse_point)
+
+    assert cache._path_has_symlink_component(str(file_path)) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows sharing semantics")
+def test_windows_cache_identity_blocks_path_replacement(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="locked-model.dat")
+    replacement = _make_cacheable_file(tmp_path, name="replacement.dat")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = cache.capture_file_identity(str(file_path))
+
+    try:
+        with pytest.raises(OSError):
+            replacement.replace(file_path)
+    finally:
+        cache.release_ancestor_identity(identity[-1])
+
+    replacement.replace(file_path)
 
 
 def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> None:
@@ -368,14 +479,16 @@ def test_cache_manager_cached_scan_does_not_cache_transient_path_replacement(tmp
     assert calls["count"] == 2
 
 
-def test_ancestor_identity_ignores_unrelated_grandparent_churn(tmp_path: Path) -> None:
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires inotify path monitoring")
+def test_ancestor_monitor_ignores_unrelated_grandparent_churn(tmp_path: Path) -> None:
     scan_dir = tmp_path / "scan"
     scan_dir.mkdir()
     model_path = _make_cacheable_file(scan_dir, name="model.dat")
     cache = ScanResultsCache(str(tmp_path / "cache"))
 
-    before = cache._capture_ancestor_identity(str(model_path))
-    after = before
+    expected = _identity_kwargs(cache, str(model_path))
+    before = expected["expected_ancestor_identity"]
+    after = cache._capture_ancestor_identity(str(model_path))
     deadline = time.monotonic() + 1.2
     attempt = 0
     while after == before and time.monotonic() < deadline:
@@ -387,7 +500,8 @@ def test_ancestor_identity_ignores_unrelated_grandparent_churn(tmp_path: Path) -
         time.sleep(0.01)
 
     assert before != after
-    assert cache._ancestor_identity_matches(before, after)
+    assert not cache._ancestor_identity_matches(before, after)
+    assert cache.store_result(str(model_path), {"success": True}, **expected) is True
 
 
 def test_cache_manager_cached_scan_does_not_cache_symlink_target_swap(tmp_path: Path) -> None:
@@ -514,6 +628,9 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
             prefix = Path(path).read_bytes()[:6].decode("utf-8")
             live_root.rename(decoy_root)
             held_root.rename(live_root)
+            churn = live_root / "unrelated"
+            churn.mkdir()
+            churn.rmdir()
             return {"payload_prefix": prefix}
         return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
 

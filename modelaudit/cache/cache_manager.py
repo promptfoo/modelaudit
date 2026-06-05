@@ -212,6 +212,9 @@ class CacheManager:
         except Exception as e:
             logger.error(f"Scan failed for {file_path}: {e}")
             raise
+        finally:
+            if self.cache is not None:
+                self.cache.release_ancestor_identity(pre_scan_ancestor_identity)
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
