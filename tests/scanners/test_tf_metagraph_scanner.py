@@ -660,6 +660,79 @@ def test_redact_metagraph_evidence_redacts_oversized_authority_before_encoded_pa
     assert redacted == f"curl https://{REDACTED_EVIDENCE_VALUE}"
 
 
+def test_redact_metagraph_evidence_redacts_urlsafe_encoded_payloads() -> None:
+    encoded_payload = ("A_" * 59) + "A-"
+    near_match = ("A_" * 59) + "A"
+
+    assert _redact_metagraph_evidence(encoded_payload, max_chars=200) == REDACTED_EVIDENCE_VALUE
+    assert _redact_metagraph_evidence(near_match, max_chars=200) == near_match
+
+
+def test_tf_metagraph_scanner_flags_urlsafe_encoded_payloads_without_near_match_noise(tmp_path: Path) -> None:
+    encoded_payload = ("A_" * 59) + "A-"
+    near_match = ("B_" * 59) + "B"
+    suspicious_meta = tmp_path / "urlsafe-encoded.meta"
+    benign_meta = tmp_path / "urlsafe-near-match.meta"
+    suspicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "encoded_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"base64.b64decode('{encoded_payload}')"},
+                }
+            ]
+        )
+    )
+    benign_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "near_match_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"base64.b64decode('{near_match}')"},
+                }
+            ]
+        )
+    )
+
+    suspicious_result = TensorFlowMetaGraphScanner().scan(str(suspicious_meta))
+    benign_result = TensorFlowMetaGraphScanner().scan(str(benign_meta))
+    encoded_check = next(check for check in suspicious_result.checks if check.name == "MetaGraph Encoded Payload Check")
+
+    assert encoded_check.details["value_preview"] == f"base64.b64decode('{REDACTED_EVIDENCE_VALUE}')"
+    assert encoded_payload not in suspicious_result.to_json()
+    assert not any(check.name == "MetaGraph Encoded Payload Check" for check in benign_result.checks)
+
+
+def test_tf_metagraph_scanner_normalizes_sensitive_collection_key_separators(tmp_path: Path) -> None:
+    secret = "REAL_UNICODE_COLLECTION_SECRET"
+    public_value = "PUBLIC_OAUTH_CONTEXT"
+    sensitive_key = "runtime\uff3fauth"
+    public_key = "runtime\uff3foauth"
+    collection_meta = tmp_path / "unicode-collection-key.meta"
+    collection_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[],
+            collection_bytes={
+                sensitive_key: [f"curl https://example.com/ {secret}".encode()],
+                public_key: [f"curl https://example.com/ {public_value}".encode()],
+            },
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(collection_meta))
+    collection_checks = {
+        check.details["collection_key"]: check
+        for check in result.checks
+        if check.name == "MetaGraph Collection Executable Pattern"
+    }
+
+    assert collection_checks[sensitive_key].details["value_preview"] == REDACTED_EVIDENCE_VALUE
+    assert public_value in collection_checks[public_key].details["value_preview"]
+    assert secret not in result.to_json()
+
+
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
     public_url = "https://example.com/p.sh?variant=public"
     public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"

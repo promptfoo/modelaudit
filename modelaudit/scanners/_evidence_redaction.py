@@ -3263,11 +3263,12 @@ def is_sensitive_evidence_key(key: str) -> bool:
     """Return whether a field name identifies a credential-bearing value."""
     if len(key) > MAX_SENSITIVE_EVIDENCE_KEY_CHARS:
         return True
-    normalized = _strip_bracket_suffixes(key).lower()
+    normalized = unicodedata.normalize("NFKC", _strip_bracket_suffixes(key)).casefold()
+    normalized_container = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
     return (
-        _is_sensitive_detail_key(key)
+        _is_sensitive_detail_key(normalized)
         or re.fullmatch(SENSITIVE_CONTAINER_KEY, normalized) is not None
-        or SENSITIVE_EVIDENCE_CONTAINER_KEY_RE.fullmatch(normalized) is not None
+        or SENSITIVE_EVIDENCE_CONTAINER_KEY_RE.fullmatch(normalized_container) is not None
     )
 
 

@@ -88,7 +88,7 @@ _COMMAND_RE = re.compile(
     r"\bpython\s+-c\b|/bin/(?:sh|bash))"
 )
 _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)")
-_ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
+_ENCODED_PAYLOAD_RE = re.compile(r"(?<![A-Za-z0-9+_-])[A-Za-z0-9+_-][A-Za-z0-9+/_-]{119,}={0,2}(?![A-Za-z0-9+/_=-])")
 _URL_AUTHORITY_PREFIX_RE = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^\s\"'<>]*\Z")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})

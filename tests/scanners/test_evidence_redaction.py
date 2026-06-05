@@ -49,6 +49,16 @@ def test_sensitive_evidence_key_preserves_benign_near_matches(key: str) -> None:
     assert not is_sensitive_evidence_key(key)
 
 
+@pytest.mark.parametrize("key", ["runtime\uff3fauth", "runtime\u200b auth", "runtime\u2027cookie header"])
+def test_sensitive_evidence_key_normalizes_unicode_separators(key: str) -> None:
+    assert is_sensitive_evidence_key(key)
+
+
+@pytest.mark.parametrize("key", ["runtime\uff3foauth", "cookie\uff3fcount", "session\u2027timeout"])
+def test_sensitive_evidence_key_preserves_unicode_near_matches(key: str) -> None:
+    assert not is_sensitive_evidence_key(key)
+
+
 def test_sensitive_evidence_key_fails_closed_before_long_key_regexes() -> None:
     long_near_match = ("a." * 10_000) + "oauthx"
 
