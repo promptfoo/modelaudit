@@ -37,6 +37,7 @@ from ..utils.file.hdf5 import (
     HDF5_SUPERBLOCK_PROBE_BYTES,
     has_plausible_hdf5_superblock,
     hdf5_signature_offsets,
+    is_hdf5_signature_probe_complete,
 )
 from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string, redact_evidence_value
@@ -308,6 +309,7 @@ class KerasZipScanner(BaseScanner):
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
         self._nested_layer_items_scanned = 0
+        self._content_route_embedded_weights = False
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -552,6 +554,7 @@ class KerasZipScanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._nested_layer_items_scanned = 0
+        self._content_route_embedded_weights = False
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -787,10 +790,11 @@ class KerasZipScanner(BaseScanner):
             return False
         return "keras_zip_embedded_weights_h5py_unavailable" in reasons
 
-    @staticmethod
-    def _should_content_route_owned_weights_entry(result: ScanResult) -> bool:
+    def _should_content_route_owned_weights_entry(self, result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
-        return isinstance(reasons, list) and "keras_zip_embedded_weights_hdf5_signature_probe_incomplete" in reasons
+        return self._content_route_embedded_weights or (
+            isinstance(reasons, list) and "keras_zip_embedded_weights_hdf5_signature_probe_incomplete" in reasons
+        )
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
@@ -1988,7 +1992,8 @@ class KerasZipScanner(BaseScanner):
         if not HAS_H5PY:
             hdf5_signature_offset = _zip_member_hdf5_signature_offset(archive, weights_info)
             if hdf5_signature_offset is None:
-                if weights_info.file_size > HDF5_SIGNATURE_SCAN_MAX_BYTES:
+                self._content_route_embedded_weights = True
+                if not is_hdf5_signature_probe_complete(weights_info.file_size):
                     self._mark_embedded_weights_hdf5_signature_probe_incomplete(weights_info, result)
                 return
 
