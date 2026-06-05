@@ -23,6 +23,8 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
+_TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
+
 
 def _create_nemo_file_from_bytes(
     tmp_path: Path,
@@ -60,6 +62,17 @@ def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(payload)
     tar.addfile(info, io.BytesIO(payload))
+
+
+def _materialize_tmp_paths(value: Any, tmp_path: Path) -> Any:
+    """Replace fixture path markers without relying on host-global temp paths."""
+    if isinstance(value, str) and value.startswith(_TMP_PATH_MARKER):
+        return str(tmp_path / value.removeprefix(_TMP_PATH_MARKER))
+    if isinstance(value, dict):
+        return {key: _materialize_tmp_paths(item, tmp_path) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_materialize_tmp_paths(item, tmp_path) for item in value]
+    return value
 
 
 def _build_malicious_pickle() -> bytes:
@@ -3515,7 +3528,7 @@ class TestCVE202523304HydraTarget:
                 {
                     "_target_": "urllib.request.urlretrieve",
                     "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-                    "filename": "/tmp/modelaudit-nemo-download",
+                    "filename": "__MODELAUDIT_TMP__/modelaudit-nemo-download",
                 },
             ),
             (
@@ -3644,7 +3657,7 @@ class TestCVE202523304HydraTarget:
                     "_target_": "urllib.request.URLopener.retrieve",
                     "_args_": [
                         "http://169.254.169.254/latest/meta-data/",
-                        "/tmp/modelaudit-nemo-download",
+                        "__MODELAUDIT_TMP__/modelaudit-nemo-download",
                     ],
                 },
             ),
@@ -3666,7 +3679,7 @@ class TestCVE202523304HydraTarget:
                 "urllib.request.URLopener.open_local_file",
                 {
                     "_target_": "urllib.request.URLopener.open_local_file",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
@@ -3765,28 +3778,28 @@ class TestCVE202523304HydraTarget:
                 "pathlib.Path.write_text",
                 {
                     "_target_": "pathlib.Path.write_text",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
                 },
             ),
             (
                 "pathlib.Path.read_text",
                 {
                     "_target_": "pathlib.Path.read_text",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.Path.read_bytes",
                 {
                     "_target_": "pathlib.Path.read_bytes",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "builtins.open",
                 {
                     "_target_": "builtins.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
@@ -3800,49 +3813,49 @@ class TestCVE202523304HydraTarget:
                 "_io.FileIO",
                 {
                     "_target_": "_io.FileIO",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
                 "io.FileIO",
                 {
                     "_target_": "io.FileIO",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
                 "_io.open",
                 {
                     "_target_": "_io.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
                 "io.open_code",
                 {
                     "_target_": "io.open_code",
-                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
                 },
             ),
             (
                 "_io.open_code",
                 {
                     "_target_": "_io.open_code",
-                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
                 },
             ),
             (
                 "os.open",
                 {
                     "_target_": "os.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
                 },
             ),
             (
                 "posix.open",
                 {
                     "_target_": "posix.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
                 },
             ),
             (
@@ -3877,28 +3890,28 @@ class TestCVE202523304HydraTarget:
                 "glob.glob",
                 {
                     "_target_": "glob.glob",
-                    "_args_": ["/tmp/*"],
+                    "_args_": ["__MODELAUDIT_TMP__/*"],
                 },
             ),
             (
                 "pathlib.Path.stat",
                 {
                     "_target_": "pathlib.Path.stat",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "os.path.exists",
                 {
                     "_target_": "os.path.exists",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "posixpath.isfile",
                 {
                     "_target_": "posixpath.isfile",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
@@ -3912,14 +3925,14 @@ class TestCVE202523304HydraTarget:
                 "pathlib.Path.exists",
                 {
                     "_target_": "pathlib.Path.exists",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.PosixPath.is_file",
                 {
                     "_target_": "pathlib.PosixPath.is_file",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
@@ -3933,21 +3946,21 @@ class TestCVE202523304HydraTarget:
                 "pathlib.PosixPath.write_text",
                 {
                     "_target_": "pathlib.PosixPath.write_text",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
                 },
             ),
             (
                 "pathlib.PosixPath.read_text",
                 {
                     "_target_": "pathlib.PosixPath.read_text",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.PosixPath.read_bytes",
                 {
                     "_target_": "pathlib.PosixPath.read_bytes",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
@@ -3961,42 +3974,42 @@ class TestCVE202523304HydraTarget:
                 "os.rename",
                 {
                     "_target_": "os.rename",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
             (
                 "os.replace",
                 {
                     "_target_": "os.replace",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
             (
                 "pathlib.Path.rename",
                 {
                     "_target_": "pathlib.Path.rename",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
             (
                 "pathlib.Path.touch",
                 {
                     "_target_": "pathlib.Path.touch",
-                    "_args_": ["/tmp/modelaudit-nemo-created"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-created"],
                 },
             ),
             (
                 "pathlib.Path.symlink_to",
                 {
                     "_target_": "pathlib.Path.symlink_to",
-                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
                 },
             ),
             (
                 "pathlib.PosixPath.hardlink_to",
                 {
                     "_target_": "pathlib.PosixPath.hardlink_to",
-                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
                 },
             ),
             (
@@ -4010,7 +4023,7 @@ class TestCVE202523304HydraTarget:
                 "shutil.copyfile",
                 {
                     "_target_": "shutil.copyfile",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
         ],
@@ -4022,7 +4035,8 @@ class TestCVE202523304HydraTarget:
         target_config: dict[str, Any],
     ) -> None:
         """Network and file-access callables must not fall through to INFO-only review."""
-        path = _create_nemo_file(tmp_path, {"model": target_config})
+        localized_target_config = _materialize_tmp_paths(target_config, tmp_path)
+        path = _create_nemo_file(tmp_path, {"model": localized_target_config})
 
         result = NemoScanner().scan(str(path))
 
@@ -4403,7 +4417,7 @@ class TestCVE202523304HydraTarget:
                 {
                     "_target_": "urllib.request.urlretrieve",
                     "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-                    "filename": "/tmp/modelaudit-nemo-download",
+                    "filename": "__MODELAUDIT_TMP__/modelaudit-nemo-download",
                 },
             ),
             (
@@ -4471,7 +4485,7 @@ class TestCVE202523304HydraTarget:
                     "_target_": "urllib.request.URLopener.retrieve",
                     "_args_": [
                         "http://169.254.169.254/latest/meta-data/",
-                        "/tmp/modelaudit-nemo-download",
+                        "__MODELAUDIT_TMP__/modelaudit-nemo-download",
                     ],
                 },
             ),
@@ -4514,21 +4528,21 @@ class TestCVE202523304HydraTarget:
                 "_io.FileIO",
                 {
                     "_target_": "_io.FileIO",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
                 "io.FileIO",
                 {
                     "_target_": "io.FileIO",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
                 "_io.open",
                 {
                     "_target_": "_io.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
                 },
             ),
             (
@@ -4542,14 +4556,14 @@ class TestCVE202523304HydraTarget:
                 "io.open_code",
                 {
                     "_target_": "io.open_code",
-                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
                 },
             ),
             (
                 "posix.open",
                 {
                     "_target_": "posix.open",
-                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
                 },
             ),
             (
@@ -4570,63 +4584,63 @@ class TestCVE202523304HydraTarget:
                 "glob.glob",
                 {
                     "_target_": "glob.glob",
-                    "_args_": ["/tmp/*"],
+                    "_args_": ["__MODELAUDIT_TMP__/*"],
                 },
             ),
             (
                 "os.path.exists",
                 {
                     "_target_": "os.path.exists",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.Path.exists",
                 {
                     "_target_": "pathlib.Path.exists",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.PosixPath.write_text",
                 {
                     "_target_": "pathlib.PosixPath.write_text",
-                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
                 },
             ),
             (
                 "pathlib.PosixPath.read_text",
                 {
                     "_target_": "pathlib.PosixPath.read_text",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "pathlib.PosixPath.read_bytes",
                 {
                     "_target_": "pathlib.PosixPath.read_bytes",
-                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
                 },
             ),
             (
                 "os.rename",
                 {
                     "_target_": "os.rename",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
             (
                 "os.replace",
                 {
                     "_target_": "os.replace",
-                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
                 },
             ),
             (
                 "pathlib.Path.symlink_to",
                 {
                     "_target_": "pathlib.Path.symlink_to",
-                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
                 },
             ),
         ],
@@ -4638,7 +4652,7 @@ class TestCVE202523304HydraTarget:
         target_config: dict[str, Any],
     ) -> None:
         """SSRF and file-access Hydra targets should produce aggregate exit 1."""
-        config = {"model": target_config}
+        config = {"model": _materialize_tmp_paths(target_config, tmp_path)}
         path = _create_nemo_file(tmp_path, config)
 
         result = scan_model_directory_or_file(
