@@ -348,6 +348,28 @@ def selected_scanner_extensions(
     return frozenset(extensions)
 
 
+def selected_scanner_filenames(
+    policy: ScannerSelectionPolicy,
+    *,
+    conservative: bool = False,
+) -> frozenset[str]:
+    """Return exact basenames routed by the policy's enabled scanners."""
+    metadata = _scanner_metadata()
+    filenames: set[str] = set()
+    for scanner_id in policy.enabled_scanner_ids:
+        scanner_info = metadata.get(scanner_id, {})
+        remote_excluded_extensions = (
+            {str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])}
+            if conservative
+            else set()
+        )
+        for filename in scanner_info.get("content_routed_filenames", []):
+            filename_text = str(filename).lower()
+            if os.path.splitext(filename_text)[1] not in remote_excluded_extensions:
+                filenames.add(filename_text)
+    return frozenset(filenames)
+
+
 SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"
 SCANNER_SELECTION_PREFERRED_KIND: ScannerSelectionSkipKind = "preferred"
 SCANNER_SELECTION_EMBEDDED_KIND: ScannerSelectionSkipKind = "embedded"
