@@ -34,7 +34,12 @@ from modelaudit.scanners.archive_dispatch import (
 from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_source
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
-from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
+from modelaudit.scanners.zip_scanner import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
+    ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
+    ZipScanner,
+)
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from modelaudit.whitelists import POPULAR_MODELS
@@ -582,6 +587,39 @@ def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: st
     assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
+@pytest.mark.parametrize(
+    ("source", "rule_code", "dangerous_name"),
+    [
+        ("import ctypes\nctypes.CDLL(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+        ("from ctypes import CDLL as load_library\nload_library(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+        ("import webbrowser\nwebbrowser.open('https://example.invalid')\n", "S109", "webbrowser.open"),
+        (
+            "from webbrowser import open_new_tab as launch\nlaunch('https://example.invalid')\n",
+            "S109",
+            "webbrowser.open_new_tab",
+        ),
+    ],
+)
+def test_scan_zip_flags_direct_imported_python_member_primitives(
+    tmp_path: Path, source: str, rule_code: str, dangerous_name: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = source.replace("LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")))
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == rule_code
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
 def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -895,6 +933,7 @@ def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_p
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )
@@ -3478,6 +3517,28 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from ctypes import CDLL as load\nload = len\nload([])\n",
+        "import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
+        "from webbrowser import open as launch\nlaunch = len\nlaunch([])\n",
+        "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
+    ],
+)
+def test_scan_zip_allows_shadowed_direct_python_member_primitives(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )
@@ -7604,6 +7665,107 @@ class TestZipScanner:
         )
         assert not any(path.endswith("_metadata.json") for path in nested_scan_paths)
         assert any(path.endswith("_payload.bin") for path in nested_scan_paths)
+
+    def test_security_only_entry_preserves_generic_security_scan_without_nested_dispatch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "security-only-executable.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.weights.h5", b"\x7fELF" + (b"\x00" * 64))
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["model.weights.h5"],
+            }
+        ).scan(str(archive_path))
+
+        assert nested_scan_paths == []
+        assert any(
+            check.name == "Executable Archive Member Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "model.weights.h5"
+            for check in result.checks
+        )
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:model.weights.h5",
+                "type": "security_only",
+                "size": 68,
+            }
+        ]
+
+    def test_security_only_benign_entry_stays_clean_without_nested_dispatch(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "security-only-benign.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.weights.h5", b"\x89HDF\r\n\x1a\n" + (b"\x00" * 64))
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["model.weights.h5"],
+            }
+        ).scan(str(archive_path))
+
+        assert nested_scan_paths == []
+        assert not any(
+            check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:model.weights.h5",
+                "type": "security_only",
+                "size": 72,
+            }
+        ]
+
+    def test_content_only_entry_dispatches_without_untrusted_suffix(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "content-only.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.weights.h5", b"content-routed payload")
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["model.weights.h5"],
+            }
+        ).scan(str(archive_path))
+
+        assert len(nested_scan_paths) == 1
+        assert Path(nested_scan_paths[0]).suffix == ""
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:model.weights.h5",
+                "type": "test",
+                "size": 22,
+            }
+        ]
 
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""

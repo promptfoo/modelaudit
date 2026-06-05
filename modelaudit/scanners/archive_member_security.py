@@ -2148,6 +2148,7 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.alias_scopes: _AliasScopes = [{}]
+        self._member_binding_roots: set[str] = set()
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._comprehension_unknown_side_effects: list[bool] = []
@@ -2300,13 +2301,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             if reset_to_canonical:
                 self.alias_scopes[-1][local_reference] = frozenset({reference})
+                self._record_member_binding_name(local_reference)
                 continue
             canonical_name = f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference}"
             canonical_binding, found = _lookup_bound_alias(canonical_name, self.alias_scopes)
             self.alias_scopes[-1][local_reference] = canonical_binding if found else frozenset({reference})
+            self._record_member_binding_name(local_reference)
+
+    def _record_member_binding_name(self, name: str) -> None:
+        if "." in name:
+            self._member_binding_roots.add(name.split(".", maxsplit=1)[0])
 
     def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
         if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+            return
+        if local_name not in self._member_binding_roots:
             return
         prefix = f"{local_name}."
         current_scope = self.alias_scopes[scope_index]
@@ -2373,6 +2382,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not preserves_module_binding:
             self._shadow_member_bindings(-1, name)
         self.alias_scopes[-1][name] = resolved_names
+        self._record_member_binding_name(name)
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
         previous_names, _found = _lookup_bound_alias(name, self.alias_scopes[: scope_index + 1])
@@ -2384,6 +2394,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not preserves_module_binding:
             self._shadow_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+        self._record_member_binding_name(name)
 
     def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
         root_name = syntactic_name.split(".", maxsplit=1)[0]
@@ -2511,8 +2522,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         for target_name in dynamic_target_names:
             current_scope[target_name] = frozenset({target_name})
+            self._record_member_binding_name(target_name)
         if syntactic_name is not None:
             current_scope[syntactic_name] = dynamic_target_names
+            self._record_member_binding_name(syntactic_name)
         return True
 
     def _resolve_binding_value_names(self, value: ast.AST | None) -> _AliasValue:
@@ -2571,7 +2584,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     current_scope[name] = frozenset(f"{instance_root}.{suffix}" for instance_root in instance_roots)
 
     def _push_alias_scope(self, scope: _AliasScope | None = None) -> None:
-        self.alias_scopes.append(scope if scope is not None else {})
+        new_scope = scope if scope is not None else {}
+        self.alias_scopes.append(new_scope)
+        for name in new_scope:
+            self._record_member_binding_name(name)
 
     def _pop_alias_scope(self) -> None:
         self.alias_scopes.pop()
