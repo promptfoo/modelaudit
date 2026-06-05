@@ -3,7 +3,7 @@ import pickle
 from collections.abc import Callable
 from pathlib import Path
 
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.utils.sources.dvc import resolve_dvc_file, resolve_dvc_file_with_metadata
 
 
@@ -192,7 +192,7 @@ class TestDvcSecurity:
             # If allowed, should still point to the resolved location
             assert len(resolved) <= 1
 
-    def test_resource_exhaustion_prevention(self, tmp_path):
+    def test_resource_exhaustion_prevention(self, tmp_path: Path) -> None:
         """Test prevention of resource exhaustion via too many outputs."""
         # Create DVC file with excessive outputs
         dvc_content = "outs:\n"
@@ -211,6 +211,7 @@ class TestDvcSecurity:
         assert resolution.omitted_output_count == 50
         assert resolution.analysis_incomplete is True
         assert resolution.omitted_targets == []
+        assert resolution.unresolved_omitted_output_count == 50
         assert resolution.unverified_omitted_output_count == 0
 
     def test_over_limit_dvc_scan_fails_closed_for_omitted_late_output(self, tmp_path: Path) -> None:
@@ -235,10 +236,12 @@ class TestDvcSecurity:
         assert result.files_scanned == 100
         assert result.success is False
         assert result.has_errors is True
+        assert determine_exit_code(result) == 2
         asset_paths = {asset.path for asset in result.assets}
         assert str(late_malicious) not in asset_paths
         output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
         assert len(output_limit_issues) == 1
+        assert output_limit_issues[0].message == "DVC output limit exceeded - not all declared outputs were scanned"
         details = output_limit_issues[0].details
         assert details["analysis_incomplete"] is True
         assert details["scan_outcome"] == "inconclusive"
@@ -246,7 +249,17 @@ class TestDvcSecurity:
         assert details["output_limit"] == 100
         assert details["resolved_output_count"] == 100
         assert details["omitted_output_count"] == 1
+        assert details["unresolved_omitted_output_count"] == 0
         assert details["unverified_omitted_output_count"] == 0
+
+        cached_result = scan_model_directory_or_file(
+            str(dvc_file),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+        )
+        assert cached_result.success is False
+        assert determine_exit_code(cached_result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in cached_result.issues)
 
     def test_directory_scan_accepts_over_limit_dvc_when_walk_covers_omitted_outputs(self, tmp_path: Path) -> None:
         """Directory traversal should discharge the cap when it scans the omitted in-tree output."""
@@ -265,6 +278,35 @@ class TestDvcSecurity:
         assert result.files_scanned == 101
         assert result.success is True
         assert result.has_errors is False
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_detects_malicious_omitted_output(self, tmp_path: Path) -> None:
+        """Discharging the DVC cap must still scan and report a malicious omitted output."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        dvc_lines.append(f"- path: {late_malicious.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_malicious.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(late_malicious) in issue.location
+            for issue in result.issues
+        )
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
     def test_directory_scan_over_limit_dvc_stays_incomplete_for_skipped_output(self, tmp_path: Path) -> None:
@@ -287,7 +329,30 @@ class TestDvcSecurity:
 
         assert result.success is False
         assert result.has_errors is True
+        assert determine_exit_code(result) == 2
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_stays_incomplete_for_unresolved_omitted_output(self, tmp_path: Path) -> None:
+        """An unsafe omitted output must not vacuously discharge the DVC cap."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_lines.append("- path: ../outside.pkl")
+        dvc_file = tmp_path / "directory_over_limit_unsafe.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
+        assert len(output_limit_issues) == 1
+        assert output_limit_issues[0].details["unresolved_omitted_output_count"] == 1
 
     def test_over_limit_dvc_coverage_verification_is_bounded(self, tmp_path: Path) -> None:
         """Directory coverage metadata must not resolve an unbounded omitted tail."""
@@ -299,6 +364,7 @@ class TestDvcSecurity:
         assert resolution.declared_output_count == 250
         assert resolution.omitted_output_count == 150
         assert resolution.omitted_targets == []
+        assert resolution.unresolved_omitted_output_count == 100
         assert resolution.unverified_omitted_output_count == 50
 
     def test_in_limit_dvc_scan_remains_complete_for_benign_outputs(self, tmp_path: Path) -> None:

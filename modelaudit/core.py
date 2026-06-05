@@ -165,6 +165,7 @@ def _record_dvc_output_limit_incomplete(
             "output_limit": resolution.output_limit,
             "resolved_output_count": len(resolution.targets),
             "omitted_output_count": resolution.omitted_output_count,
+            "unresolved_omitted_output_count": resolution.unresolved_omitted_output_count,
             "unverified_omitted_output_count": resolution.unverified_omitted_output_count,
         },
         issue_type="dvc_output_limit_exceeded",
@@ -176,8 +177,10 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
     directory_walk_covered_paths: set[str],
 ) -> bool:
     """Return whether a directory walk independently covers every bounded omitted DVC target."""
-    return resolution.unverified_omitted_output_count == 0 and all(
-        target in directory_walk_covered_paths for target in resolution.omitted_targets
+    return (
+        resolution.unresolved_omitted_output_count == 0
+        and resolution.unverified_omitted_output_count == 0
+        and all(target in directory_walk_covered_paths for target in resolution.omitted_targets)
     )
 
 

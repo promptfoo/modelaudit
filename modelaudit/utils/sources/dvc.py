@@ -16,6 +16,7 @@ class DvcResolution:
     output_limit: int = MAX_DVC_OUTPUTS
     omitted_output_count: int = 0
     omitted_targets: list[str] = field(default_factory=list)
+    unresolved_omitted_output_count: int = 0
     unverified_omitted_output_count: int = 0
 
     @property
@@ -70,16 +71,20 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
 
     resolved: list[str] = []
     omitted_targets: list[str] = []
+    unresolved_omitted_output_count = 0
     dvc_dir = path.parent.resolve()
 
     for index, out in enumerate(outs):
+        is_omitted = index >= MAX_DVC_OUTPUTS
         if not isinstance(out, dict) or "path" not in out:
             logger.debug("Invalid output entry in DVC file %s: %s", file_path, out)
+            unresolved_omitted_output_count += int(is_omitted)
             continue
 
         out_path = out["path"]
         if not isinstance(out_path, str):
             logger.debug("Invalid path type in DVC file %s: %s", file_path, type(out_path))
+            unresolved_omitted_output_count += int(is_omitted)
             continue
 
         # Security: Resolve target path and validate it's within safe boundaries
@@ -100,6 +105,7 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
 
             if not is_safe:
                 logger.warning(f"DVC target path outside safe boundaries: {file_path} -> {target}")
+                unresolved_omitted_output_count += int(is_omitted)
                 continue
 
             if target.exists():
@@ -107,9 +113,11 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
                 target_list.append(str(target))
             else:
                 logger.debug(f"DVC target missing: {target}")
+                unresolved_omitted_output_count += int(is_omitted)
 
         except (OSError, ValueError) as e:
             logger.warning(f"Error resolving DVC target path {out_path}: {e}")
+            unresolved_omitted_output_count += int(is_omitted)
             continue
 
     return DvcResolution(
@@ -118,5 +126,6 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         output_limit=MAX_DVC_OUTPUTS,
         omitted_output_count=omitted_output_count,
         omitted_targets=omitted_targets,
+        unresolved_omitted_output_count=unresolved_omitted_output_count,
         unverified_omitted_output_count=max(declared_output_count - MAX_DVC_OUTPUTS * 2, 0),
     )
