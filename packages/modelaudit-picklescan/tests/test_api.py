@@ -6342,7 +6342,7 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
     assert "call_graph_source_fingerprints" not in updated.metadata
-    assert isinstance(updated.private_metadata["call_graph_source_fingerprints"]["reusable"], bool)
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
 
 
 def test_scan_bytes_skips_call_graph_enrichment_without_references(
