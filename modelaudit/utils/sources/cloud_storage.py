@@ -22,8 +22,10 @@ from yaspin import yaspin
 from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_CONFIG_KEY,
+    ScannerSelectionPolicy,
     policy_from_config,
     scanner_ids_for_detected_format,
+    scanner_ids_for_extension,
 )
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
@@ -545,13 +547,20 @@ class GCSCache:
             if temp_file.exists():
                 temp_file.unlink()
 
-    def get_cache_key(self, url: str) -> str:
+    def get_cache_key(self, url: str, *, cache_scope: str | None = None) -> str:
         """Generate cache key for URL."""
-        return hashlib.sha256(url.encode()).hexdigest()
+        cache_identity = url if cache_scope is None else f"{url}\0{cache_scope}"
+        return hashlib.sha256(cache_identity.encode()).hexdigest()
 
-    def get_cached_path(self, url: str, etag: str | None = None) -> Path | None:
+    def get_cached_path(
+        self,
+        url: str,
+        etag: str | None = None,
+        *,
+        cache_scope: str | None = None,
+    ) -> Path | None:
         """Return cached file if still valid."""
-        cache_key = self.get_cache_key(url)
+        cache_key = self.get_cache_key(url, cache_scope=cache_scope)
 
         if cache_key in self.metadata:
             cached = self.metadata[cache_key]
@@ -590,9 +599,16 @@ class GCSCache:
 
         return None
 
-    def cache_file(self, url: str, local_path: Path, etag: str | None = None) -> None:
+    def cache_file(
+        self,
+        url: str,
+        local_path: Path,
+        etag: str | None = None,
+        *,
+        cache_scope: str | None = None,
+    ) -> None:
         """Cache downloaded file with metadata."""
-        cache_key = self.get_cache_key(url)
+        cache_key = self.get_cache_key(url, cache_scope=cache_scope)
 
         # Create cache subdirectory
         cache_subdir = _prepare_cache_subdirectory(self.cache_dir, cache_key)
@@ -663,13 +679,18 @@ class GCSCache:
 def filter_scannable_files(
     files: list[dict[str, Any]],
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
     extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
+    filenames = frozenset(str(filename).lower() for filename in (scannable_filenames or ()))
     scannable = []
     for file in files:
         file_path = str(file["path"])
         path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
+        if path.name.lower() in filenames:
+            scannable.append(file)
+            continue
         suffixes = [s.lower() for s in path.suffixes]
         if not suffixes and "" in extensions:
             scannable.append(file)
@@ -680,6 +701,73 @@ def filter_scannable_files(
                 break
 
     return scannable
+
+
+def _matching_scannable_extensions(file_path: str, extensions: Collection[str]) -> frozenset[str]:
+    path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    normalized_extensions = frozenset(str(extension).lower() for extension in extensions)
+    if not suffixes:
+        return frozenset({""}) if "" in normalized_extensions else frozenset()
+    return frozenset(
+        candidate
+        for index in range(1, len(suffixes) + 1)
+        if (candidate := "".join(suffixes[-index:])) in normalized_extensions
+    )
+
+
+def _selected_suffix_needs_content_validation(
+    file_path: str,
+    extensions: Collection[str] | None,
+    scanner_policy: ScannerSelectionPolicy | None,
+) -> bool:
+    if extensions is None or scanner_policy is None or not scanner_policy.active:
+        return False
+    owners = {
+        scanner_id
+        for extension in _matching_scannable_extensions(file_path, extensions)
+        for scanner_id in scanner_ids_for_extension(extension)
+    }
+    return (
+        bool(owners)
+        and any(scanner_policy.allows(scanner_id) for scanner_id in owners)
+        and any(not scanner_policy.allows(scanner_id) for scanner_id in owners)
+    )
+
+
+def _cloud_directory_cache_scope(
+    metadata: Mapping[str, Any],
+    *,
+    selective: bool,
+    scannable_extensions: Collection[str] | None,
+    scannable_filenames: Collection[str] | None,
+    scanner_selection: Mapping[str, Any] | None,
+) -> str | None:
+    """Return a stable cache scope for directory downloads."""
+    if metadata.get("type") != "directory":
+        return None
+    payload: dict[str, Any] = {"selective": selective}
+    if selective:
+        payload.update(
+            {
+                "extensions": (
+                    None
+                    if scannable_extensions is None
+                    else sorted(str(extension).lower() for extension in scannable_extensions)
+                ),
+                "filenames": (
+                    None
+                    if scannable_filenames is None
+                    else sorted(str(filename).lower() for filename in scannable_filenames)
+                ),
+                "scanner_selection": (
+                    None
+                    if scanner_selection is None
+                    else policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}).to_config()
+                ),
+            }
+        )
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _read_bounded_cloud_content(remote_file: Any, max_bytes: int) -> bytes:
@@ -1259,38 +1347,55 @@ def _filter_scannable_cloud_files(
     *,
     fs: Any,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
     max_sniff_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
-    scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
-    if scannable_extensions is not None and scanner_selection is None:
+    scannable = filter_scannable_files(
+        files,
+        scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+    )
+    if (scannable_extensions is not None or scannable_filenames is not None) and scanner_selection is None:
         return scannable
 
-    scannable_paths = {str(file["path"]) for file in scannable}
+    scannable_by_path = {str(file["path"]): file for file in scannable}
     sniff_budget = _CloudContentSniffBudget(max_sniff_bytes) if max_sniff_bytes else None
     scanner_policy = (
         policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}) if scanner_selection is not None else None
     )
     for file_info in files:
         file_path = str(file_info["path"])
-        if file_path in scannable_paths:
+        suffix_selected = file_path in scannable_by_path
+        if suffix_selected and not _selected_suffix_needs_content_validation(
+            file_path,
+            scannable_extensions,
+            scanner_policy,
+        ):
             continue
-        detected_format = _detect_cloud_content_route_format(fs, file_info, sniff_budget)
+        try:
+            detected_format = _detect_cloud_content_route_format(fs, file_info, sniff_budget)
+        except Exception as exc:
+            if suffix_selected:
+                logger.debug("Unable to validate shared cloud suffix for %s: %s", file_path, exc)
+                continue
+            raise
         if detected_format is None:
             continue
-        if (
+        allowed = not (
             scanner_policy is not None
             and scanner_policy.active
             and not any(
                 scanner_policy.allows(scanner_id) for scanner_id in scanner_ids_for_detected_format(detected_format)
             )
-        ):
+        )
+        if not allowed:
+            scannable_by_path.pop(file_path, None)
             continue
         routed_file_info = dict(file_info)
         routed_file_info["content_detected_format"] = detected_format
-        scannable.append(routed_file_info)
-        scannable_paths.add(file_path)
-    return scannable
+        scannable_by_path[file_path] = routed_file_info
+    return list(scannable_by_path.values())
 
 
 def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
@@ -1437,6 +1542,7 @@ def download_from_cloud(
     stream_analyze: bool = False,
     scannable_extensions: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
@@ -1465,8 +1571,15 @@ def download_from_cloud(
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     etag = _metadata_etag(metadata)
+    cache_scope = _cloud_directory_cache_scope(
+        metadata,
+        selective=selective,
+        scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        scanner_selection=scanner_selection,
+    )
     if cache:
-        cached_path = cache.get_cached_path(url, etag=etag)
+        cached_path = cache.get_cached_path(url, etag=etag, cache_scope=cache_scope)
         if cached_path:
             if max_size and not _cached_path_within_size_limit(cached_path, max_size):
                 logger.warning(
@@ -1513,7 +1626,7 @@ def download_from_cloud(
     # Create download directory
     if cache:
         # When using cache, download directly to cache location
-        cache_key = cache.get_cache_key(url)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
         download_path = _prepare_cache_subdirectory(cache.cache_dir, cache_key)
     elif cache_dir is None:
         download_path = Path(tempfile.mkdtemp(prefix="modelaudit_cloud_"))
@@ -1546,6 +1659,7 @@ def download_from_cloud(
                     files,
                     fs=fs,
                     scannable_extensions=scannable_extensions,
+                    scannable_filenames=scannable_filenames,
                     scanner_selection=scanner_selection,
                     max_sniff_bytes=max_size,
                 )
@@ -1659,7 +1773,7 @@ def download_from_cloud(
 
         # Cache the download (for directories)
         if cache:
-            cache.cache_file(url, download_path, etag=etag)
+            cache.cache_file(url, download_path, etag=etag, cache_scope=cache_scope)
 
         return download_path
     except Exception:
@@ -1676,6 +1790,7 @@ def download_from_cloud_streaming(
     selective: bool = True,
     scannable_extensions: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
@@ -1741,6 +1856,7 @@ def download_from_cloud_streaming(
                 files,
                 fs=fs,
                 scannable_extensions=scannable_extensions,
+                scannable_filenames=scannable_filenames,
                 scanner_selection=scanner_selection,
                 max_sniff_bytes=max_size,
             )

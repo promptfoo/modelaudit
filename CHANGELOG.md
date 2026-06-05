@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve content-routed cloud artifacts that match the active scanner selection, including renamed SafeTensors payloads
+- preserve selected content-routed and exact-name cloud/JFrog artifacts, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses

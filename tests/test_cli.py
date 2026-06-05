@@ -1989,6 +1989,7 @@ def test_scan_cloud_url_passes_scanner_selection_to_content_filter(
 
     assert result.exit_code == 0
     assert mock_download.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
+    assert mock_download.call_args.kwargs["scannable_filenames"] == frozenset()
     assert mock_download.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
 
 
@@ -2011,6 +2012,7 @@ def test_scan_cloud_url_streaming_passes_scanner_selection_to_content_filter(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
+    assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset()
     assert mock_download_streaming.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
 
 
@@ -2198,6 +2200,34 @@ def test_scan_jfrog_url_success(
         selective_download=True,
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_passes_selected_exact_filenames(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--scanners",
+            "metadata",
+            "--quiet",
+            "https://company.jfrog.io/artifactory/repo/models/",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_scan_jfrog.call_args.kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+    assert mock_scan_jfrog.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["metadata"]
 
 
 @patch("modelaudit.cli.is_jfrog_url")

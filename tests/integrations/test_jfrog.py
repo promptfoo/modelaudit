@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-from modelaudit.scanner_selection import scanner_selection_config_from_inputs
+from modelaudit.scanner_selection import (
+    resolve_scanner_selection_policy,
+    scanner_selection_config_from_inputs,
+    selected_scanner_extensions,
+    selected_scanner_filenames,
+)
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -28,6 +33,7 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.sources.jfrog import (
     JFROG_DOWNLOAD_CHUNK_SIZE,
+    _filter_scannable_jfrog_files,
     _scanner_ids_for_detected_jfrog_format,
     detect_jfrog_target_type,
     download_artifact,
@@ -64,6 +70,47 @@ class _FakeStreamingResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "detected_format", "expected"),
+    [
+        pytest.param("pickle", "zip", [], id="reject-unselected-pytorch-zip"),
+        pytest.param("pytorch_zip", "zip", "routed", id="retain-selected-pytorch-zip"),
+        pytest.param("pickle", None, "original", id="retain-inconclusive-shared-suffix"),
+    ],
+)
+@patch("modelaudit.utils.sources.jfrog._detect_jfrog_content_route_format")
+def test_filter_scannable_jfrog_files_validates_shared_suffix_ownership(
+    mock_detect: MagicMock,
+    selected_scanner: str,
+    detected_format: str | None,
+    expected: list[dict[str, object]] | str,
+) -> None:
+    url = "https://company.jfrog.io/artifactory/repo/models/model.pt"
+    files = [{"path": url, "name": "model.pt", "size": 8, "human_size": "8 B"}]
+    mock_detect.return_value = (detected_format, url)
+    policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+
+    actual = _filter_scannable_jfrog_files(
+        files,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    if expected == "routed":
+        assert actual == [
+            {
+                **files[0],
+                "content_detected_format": detected_format,
+                "content_probe_download_url": url,
+            }
+        ]
+    elif expected == "original":
+        assert actual == files
+    else:
+        assert actual == expected
+    mock_detect.assert_called_once()
 
 
 def _fake_json_response(payload: object, *, headers: dict[str, str] | None = None) -> _FakeStreamingResponse:
@@ -3301,6 +3348,39 @@ class TestJFrogFolderDownload:
         assert [call.args[0].rsplit("/", 1)[-1] for call in mock_download.call_args_list] == ["weights.jpg"]
         assert (tmp_path / "weights.jpg").exists()
         assert not (tmp_path / "pickle.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_scanner_selection_includes_exact_filename(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        readme_url = "https://company.jfrog.io/artifactory/repo/models/README"
+        mock_list.return_value = [
+            {"name": "README", "path": readme_url, "size": 8, "size_known": True, "human_size": "8 B"}
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_text("model docs", encoding="utf-8")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+        policy = resolve_scanner_selection_policy(scanners=["metadata"])
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+            scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+            scanner_selection=policy.to_config(),
+        )
+
+        mock_download.assert_called_once()
+        assert (tmp_path / "README").read_text(encoding="utf-8") == "model docs"
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")

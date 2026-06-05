@@ -12,7 +12,7 @@ import difflib
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any, Literal
 
 from .scanner_registry_metadata import get_scanner_registry_metadata
@@ -371,6 +371,19 @@ def selected_scanner_filenames(
             if os.path.splitext(filename_text)[1] not in remote_excluded_extensions:
                 filenames.add(filename_text)
     return frozenset(filenames)
+
+
+@cache
+def scanner_ids_for_extension(extension: str) -> frozenset[str]:
+    """Return scanners that claim a normalized filename extension."""
+    normalized_extension = extension.lower()
+    scanner_ids: set[str] = set()
+    for scanner_id, scanner_info in _scanner_metadata().items():
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            if normalized_extension in {str(value).lower() for value in scanner_info.get(key, ())}:
+                scanner_ids.add(scanner_id)
+                break
+    return frozenset(scanner_ids)
 
 
 def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:

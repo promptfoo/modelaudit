@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from modelaudit.scanner_selection import resolve_scanner_selection_policy, selected_scanner_extensions
+from modelaudit.scanner_selection import (
+    resolve_scanner_selection_policy,
+    selected_scanner_extensions,
+    selected_scanner_filenames,
+)
 from modelaudit.utils.file.detection import _XML_MODEL_SIGNATURE_READ_BYTES, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
@@ -471,6 +475,74 @@ def test_filter_scannable_cloud_files_honors_scanner_selection_for_content_route
 
     expected_files = [{**files[0], "content_detected_format": "safetensors"}] if expected else []
     assert actual == expected_files
+
+
+def test_filter_scannable_cloud_files_includes_selected_exact_filename() -> None:
+    policy = resolve_scanner_selection_policy(scanners=["metadata"])
+    url = "s3://bucket/models/README"
+    files = [{"path": url, "name": "README", "size": 8, "human_size": "8 B"}]
+    fs = make_fs_mock()
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
+    fs.open.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "expected"),
+    [
+        pytest.param("pickle", [], id="reject-unselected-pytorch-zip"),
+        pytest.param("pytorch_zip", "routed", id="retain-selected-pytorch-zip"),
+    ],
+)
+def test_filter_scannable_cloud_files_validates_shared_suffix_ownership(
+    selected_scanner: str,
+    expected: list[dict[str, object]] | str,
+) -> None:
+    url = "s3://bucket/models/model.pt"
+    payload = make_zip_payload({"archive/data.pkl": b"N.", "archive/version": b"3"})
+    files = [{"path": url, "name": "model.pt", "size": len(payload), "human_size": "Unknown"}]
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    if expected == "routed":
+        assert actual == [{**files[0], "content_detected_format": "zip"}]
+    else:
+        assert actual == expected
+    fs.open.assert_called()
+
+
+def test_filter_scannable_cloud_files_retains_inconclusive_shared_suffix() -> None:
+    url = "s3://bucket/models/model.pt"
+    payload = b"not a recognized model header"
+    files = [{"path": url, "name": "model.pt", "size": len(payload), "human_size": "Unknown"}]
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    policy = resolve_scanner_selection_policy(scanners=["pickle"])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
 
 
 def test_filter_scannable_cloud_files_keeps_custom_extensions_suffix_only_without_selection() -> None:
@@ -1102,6 +1174,80 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     assert first.read_bytes() == b"data"
     downloader.get.assert_called_once()
     assert mock_fs.call_count == 3
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_isolates_selective_directory_cache_by_scanner_selection(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    payloads = {
+        "s3://bucket/models/weights.safetensors": make_safetensors_payload(),
+        "s3://bucket/models/model.pkl": b"\x80\x04N.",
+    }
+    files = [
+        {
+            "path": file_url,
+            "name": Path(file_url).name,
+            "size": len(payload),
+            "human_size": f"{len(payload)} B",
+        }
+        for file_url, payload in payloads.items()
+    ]
+    mock_analyze.return_value = {
+        "type": "directory",
+        "etag": "directory-etag",
+        "file_count": len(files),
+        "total_size": sum(len(payload) for payload in payloads.values()),
+        "human_size": "small",
+        "estimated_time": "instant",
+        "files": files,
+    }
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    configure_remote_open_payloads(fs, payloads)
+    fs.get.side_effect = lambda src, dst: Path(dst).write_bytes(payloads[src])
+    mock_fs_class.return_value = fs
+
+    safetensors_policy = resolve_scanner_selection_policy(scanners=["safetensors"])
+    pickle_policy = resolve_scanner_selection_policy(scanners=["pickle"])
+    cache_dir = tmp_path / "cache"
+
+    safetensors_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(safetensors_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(safetensors_policy, conservative=True),
+        scanner_selection=safetensors_policy.to_config(),
+    )
+    pickle_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(pickle_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(pickle_policy, conservative=True),
+        scanner_selection=pickle_policy.to_config(),
+    )
+    cached_pickle_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(pickle_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(pickle_policy, conservative=True),
+        scanner_selection=pickle_policy.to_config(),
+    )
+
+    assert isinstance(safetensors_path, Path)
+    assert isinstance(pickle_path, Path)
+    assert safetensors_path != pickle_path
+    assert cached_pickle_path == pickle_path
+    assert {path.name for path in safetensors_path.iterdir()} == {"weights.safetensors"}
+    assert {path.name for path in pickle_path.iterdir()} == {"model.pkl"}
+    assert [call.args[0] for call in fs.get.call_args_list] == list(payloads)
 
 
 @patch("fsspec.filesystem")
