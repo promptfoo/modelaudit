@@ -457,6 +457,15 @@ def _detect_huggingface_torch7_route(
     return "torch7" if _is_torch7_signature(probe) else None
 
 
+def _detect_huggingface_rknn_route(filename: str, prefix: bytes) -> str | None:
+    """Return the RKNN route when renamed binary routing permits the remote filename."""
+    from modelaudit.utils.file.detection import _allows_renamed_binary_content_route
+
+    if prefix[:4] != b"RKNN" or not _allows_renamed_binary_content_route(Path(filename)):
+        return None
+    return "rknn"
+
+
 def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: bool) -> bool | None:
     """Validate bounded ExecuTorch FlatBuffers structure without a local file."""
     from modelaudit.utils.file.detection import _is_executorch_binary_signature
@@ -687,6 +696,10 @@ def _detect_huggingface_content_route_format(
     torch7_route = _detect_huggingface_torch7_route(repo_id, filename, revision, budget, prefix)
     if torch7_route is not None:
         return torch7_route
+
+    rknn_route = _detect_huggingface_rknn_route(filename, prefix)
+    if prefix[:4] == b"RKNN":
+        return rknn_route
 
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
