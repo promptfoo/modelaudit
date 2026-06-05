@@ -24,7 +24,7 @@ from modelaudit import core as core_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
-from modelaudit.core import scan_file, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner, safetensors_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
@@ -42,7 +42,7 @@ from modelaudit.utils.file.detection import (
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.helpers import cache_decorator
-from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
+from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
@@ -1173,11 +1173,9 @@ def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
 
     result = core_module.scan_model_directory_or_file(str(tmp_path), max_total_size=1)
 
-    all_file_hashes = [core_module._calculate_file_hash(str(model_path)) for model_path in model_files]
-    scanned_file_hashes = [core_module._calculate_file_hash(path) for path in calls]
     assert len(calls) == 1
-    assert result.content_hash == compute_aggregate_hash(scanned_file_hashes)
-    assert result.content_hash != compute_aggregate_hash(all_file_hashes)
+    assert result.content_hash is None
+    assert result.success is False
 
 
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
@@ -2443,6 +2441,45 @@ def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Pat
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_jinja_sandbox_budget_result_is_not_cached(tmp_path: Path) -> None:
+    pytest.importorskip("jinja2.sandbox")
+    template_file = tmp_path / "amplify.jinja"
+    template_file.write_text("{{ 'A' * 1000000 }}", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "sandbox_render_max_output_chars": 16,
+        "sandbox_render_timeout_seconds": 2,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(template_file), config=config)
+        second = scan_file(str(template_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in first.metadata["scan_outcome_reasons"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(
+        str(template_file),
+        config={
+            "cache_scan_results": False,
+            "sandbox_render_max_output_chars": 16,
+            "sandbox_render_timeout_seconds": 2,
+        },
+    )
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Path) -> None:
