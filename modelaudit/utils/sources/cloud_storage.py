@@ -1,11 +1,14 @@
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
 import re
 import shutil
+import struct
 import tempfile
+import zipfile
 from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -17,6 +20,13 @@ import click
 from yaspin import yaspin
 
 from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
+from modelaudit.scanner_selection import (
+    SCANNER_SELECTION_CONFIG_KEY,
+    ScannerSelectionPolicy,
+    policy_from_config,
+    scanner_ids_for_detected_format,
+    scanner_ids_for_extension,
+)
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
@@ -33,6 +43,10 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_BYTES = b"TFL3"
+_MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
 
@@ -90,6 +104,12 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
+def _redact_cloud_path_for_display(path: object) -> str:
+    """Redact credentials from cloud paths even when providers strip the protocol."""
+    path_text = str(path)
+    return redact_cloud_error_for_display(path_text, path_text)
+
+
 def _bound_cloud_metadata_error_display(message: str) -> str:
     """Limit model-controlled cloud metadata diagnostics retained in memory."""
     if len(message) <= _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS:
@@ -101,7 +121,7 @@ def _cloud_metadata_error_sample(path: object, error: object) -> dict[str, str]:
     """Return a bounded, credential-safe metadata failure sample."""
     path_text = str(path)
     return {
-        "path": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(path_text, path_text)),
+        "path": _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(path_text)),
         "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(error, path_text)),
     }
 
@@ -527,13 +547,20 @@ class GCSCache:
             if temp_file.exists():
                 temp_file.unlink()
 
-    def get_cache_key(self, url: str) -> str:
+    def get_cache_key(self, url: str, *, cache_scope: str | None = None) -> str:
         """Generate cache key for URL."""
-        return hashlib.sha256(url.encode()).hexdigest()
+        cache_identity = url if cache_scope is None else f"{url}\0{cache_scope}"
+        return hashlib.sha256(cache_identity.encode()).hexdigest()
 
-    def get_cached_path(self, url: str, etag: str | None = None) -> Path | None:
+    def get_cached_path(
+        self,
+        url: str,
+        etag: str | None = None,
+        *,
+        cache_scope: str | None = None,
+    ) -> Path | None:
         """Return cached file if still valid."""
-        cache_key = self.get_cache_key(url)
+        cache_key = self.get_cache_key(url, cache_scope=cache_scope)
 
         if cache_key in self.metadata:
             cached = self.metadata[cache_key]
@@ -572,9 +599,16 @@ class GCSCache:
 
         return None
 
-    def cache_file(self, url: str, local_path: Path, etag: str | None = None) -> None:
+    def cache_file(
+        self,
+        url: str,
+        local_path: Path,
+        etag: str | None = None,
+        *,
+        cache_scope: str | None = None,
+    ) -> None:
         """Cache downloaded file with metadata."""
-        cache_key = self.get_cache_key(url)
+        cache_key = self.get_cache_key(url, cache_scope=cache_scope)
 
         # Create cache subdirectory
         cache_subdir = _prepare_cache_subdirectory(self.cache_dir, cache_key)
@@ -645,13 +679,18 @@ class GCSCache:
 def filter_scannable_files(
     files: list[dict[str, Any]],
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
     extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
+    filenames = frozenset(str(filename).lower() for filename in (scannable_filenames or ()))
     scannable = []
     for file in files:
         file_path = str(file["path"])
         path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
+        if path.name.lower() in filenames:
+            scannable.append(file)
+            continue
         suffixes = [s.lower() for s in path.suffixes]
         if not suffixes and "" in extensions:
             scannable.append(file)
@@ -662,6 +701,703 @@ def filter_scannable_files(
                 break
 
     return scannable
+
+
+def _matching_scannable_extensions(file_path: str, extensions: Collection[str]) -> frozenset[str]:
+    path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    normalized_extensions = frozenset(str(extension).lower() for extension in extensions)
+    if not suffixes:
+        return frozenset({""}) if "" in normalized_extensions else frozenset()
+    return frozenset(
+        candidate
+        for index in range(1, len(suffixes) + 1)
+        if (candidate := "".join(suffixes[-index:])) in normalized_extensions
+    )
+
+
+def _selected_suffix_needs_content_validation(
+    file_path: str,
+    extensions: Collection[str] | None,
+    scanner_policy: ScannerSelectionPolicy | None,
+) -> bool:
+    if extensions is None or scanner_policy is None or not scanner_policy.active:
+        return False
+    owners = {
+        scanner_id
+        for extension in _matching_scannable_extensions(file_path, extensions)
+        for scanner_id in scanner_ids_for_extension(extension)
+    }
+    return (
+        bool(owners)
+        and any(scanner_policy.allows(scanner_id) for scanner_id in owners)
+        and any(not scanner_policy.allows(scanner_id) for scanner_id in owners)
+    )
+
+
+def _cloud_directory_cache_scope(
+    metadata: Mapping[str, Any],
+    *,
+    selective: bool,
+    scannable_extensions: Collection[str] | None,
+    scannable_filenames: Collection[str] | None,
+    scanner_selection: Mapping[str, Any] | None,
+) -> str | None:
+    """Return a stable cache scope for directory downloads."""
+    if metadata.get("type") != "directory":
+        return None
+    payload: dict[str, Any] = {"selective": selective}
+    if selective:
+        payload.update(
+            {
+                "extensions": (
+                    None
+                    if scannable_extensions is None
+                    else sorted(str(extension).lower() for extension in scannable_extensions)
+                ),
+                "filenames": (
+                    None
+                    if scannable_filenames is None
+                    else sorted(str(filename).lower() for filename in scannable_filenames)
+                ),
+                "scanner_selection": (
+                    None
+                    if scanner_selection is None
+                    else policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}).to_config()
+                ),
+            }
+        )
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _read_bounded_cloud_content(remote_file: Any, max_bytes: int) -> bytes:
+    """Read through short transport reads without exceeding the requested bound."""
+    payload = bytearray()
+    while len(payload) < max_bytes:
+        chunk = remote_file.read(max_bytes - len(payload))
+        if not isinstance(chunk, bytes):
+            raise TypeError("cloud filesystem returned non-bytes content")
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+class _CloudContentSniffBudgetExceeded(ValueError):
+    """Raised when a random-access classifier needs bytes beyond its sniff budget."""
+
+
+class _CloudContentSniffBudget:
+    """Bound aggregate reads used to route suffix-skipped cloud objects."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.remaining_bytes = max_bytes
+        self._prefixes: dict[str, bytes] = {}
+        self._complete_prefixes: set[str] = set()
+        self.incomplete_stream_reads = 0
+
+    def read_prefix(self, fs: Any, file_url: str, max_bytes: int) -> bytes:
+        """Return a cached prefix, extending it without rereading transferred bytes."""
+        prefix = self._prefixes.get(file_url, b"")
+        if len(prefix) >= max_bytes or file_url in self._complete_prefixes:
+            return prefix[:max_bytes]
+
+        read_size = min(max_bytes - len(prefix), self.remaining_bytes)
+        if read_size <= 0:
+            return prefix
+
+        with fs.open(file_url, "rb") as remote_file:
+            if prefix:
+                remote_file.seek(len(prefix))
+            chunk = _read_bounded_cloud_content(remote_file, read_size)
+
+        self.remaining_bytes -= len(chunk)
+        prefix += chunk
+        self._prefixes[file_url] = prefix
+        if len(chunk) < read_size:
+            self._complete_prefixes.add(file_url)
+        return prefix[:max_bytes]
+
+    def read_range(self, fs: Any, file_url: str, offset: int, max_bytes: int) -> bytes:
+        """Read a bounded range while reusing overlapping cached prefix bytes."""
+        prefix = self._prefixes.get(file_url, b"")
+        cached = prefix[offset : offset + max_bytes] if offset < len(prefix) else b""
+        if len(cached) >= max_bytes:
+            return cached
+
+        range_offset = offset + len(cached)
+        read_size = min(max_bytes - len(cached), self.remaining_bytes)
+        if read_size <= 0:
+            return cached
+
+        with fs.open(file_url, "rb") as remote_file:
+            remote_file.seek(range_offset)
+            chunk = _read_bounded_cloud_content(remote_file, read_size)
+
+        self.remaining_bytes -= len(chunk)
+        return cached + chunk
+
+    def read_stream(self, remote_file: Any, requested_bytes: int | None = -1) -> bytes:
+        """Read from a random-access stream without exceeding the shared budget."""
+        if requested_bytes == 0:
+            return b""
+        if self.remaining_bytes <= 0:
+            raise _CloudContentSniffBudgetExceeded
+
+        if requested_bytes is None or requested_bytes < 0:
+            read_size = self.remaining_bytes
+            was_capped = True
+        else:
+            read_size = min(requested_bytes, self.remaining_bytes)
+            was_capped = requested_bytes > self.remaining_bytes
+        chunk = remote_file.read(read_size)
+        if not isinstance(chunk, bytes):
+            raise TypeError("cloud filesystem returned non-bytes content")
+        self.remaining_bytes -= len(chunk)
+        if was_capped and len(chunk) == read_size:
+            self.incomplete_stream_reads += 1
+        return chunk
+
+    def prefix_is_complete(self, file_url: str) -> bool:
+        """Return whether a prefix read observed the end of the remote object."""
+        return file_url in self._complete_prefixes
+
+    def cached_prefix(self, file_url: str) -> bytes:
+        """Return bytes already transferred for a remote prefix."""
+        return self._prefixes.get(file_url, b"")
+
+    def classification_error(self, file_url: str) -> ValueError:
+        """Build a redacted error for an inconclusive budget-limited probe."""
+        return ValueError(
+            "Cloud directory selective filtering incomplete: maximum content inspection budget "
+            f"({format_size(self.max_bytes)}) exhausted while classifying skipped object "
+            f"{_redact_cloud_path_for_display(file_url)}"
+        )
+
+    def require_classification_capacity(self, file_url: str) -> None:
+        """Fail closed when an incomplete object consumed the shared sniff budget."""
+        if self.remaining_bytes > 0 or self.prefix_is_complete(file_url):
+            return
+        raise self.classification_error(file_url)
+
+
+class _BudgetedCloudContentReader:
+    """Expose a seekable cloud stream while charging reads to a sniff budget."""
+
+    def __init__(
+        self,
+        remote_file: Any,
+        budget: _CloudContentSniffBudget,
+        file_url: str,
+        file_size: int,
+    ):
+        self._remote_file = remote_file
+        self._budget = budget
+        self._file_size = file_size
+        prefix = budget.cached_prefix(file_url)
+        self._cached_ranges = [(0, prefix)] if prefix else []
+
+    def _cache_range(self, offset: int, data: bytes) -> None:
+        if not data:
+            return
+
+        new_start = offset
+        new_data = data
+        merged: list[tuple[int, bytes]] = []
+        inserted = False
+        for start, cached in self._cached_ranges:
+            end = start + len(cached)
+            new_end = new_start + len(new_data)
+            if end < new_start:
+                merged.append((start, cached))
+                continue
+            if new_end < start:
+                if not inserted:
+                    merged.append((new_start, new_data))
+                    inserted = True
+                merged.append((start, cached))
+                continue
+
+            merged_start = min(start, new_start)
+            merged_end = max(end, new_end)
+            combined = bytearray(merged_end - merged_start)
+            combined[start - merged_start : end - merged_start] = cached
+            combined[new_start - merged_start : new_end - merged_start] = new_data
+            new_start = merged_start
+            new_data = bytes(combined)
+
+        if not inserted:
+            merged.append((new_start, new_data))
+        self._cached_ranges = merged
+
+    def _read_cached(self, offset: int, max_bytes: int) -> bytes:
+        for start, cached in self._cached_ranges:
+            end = start + len(cached)
+            if start <= offset < end:
+                return cached[offset - start : offset - start + max_bytes]
+            if start > offset:
+                break
+        return b""
+
+    def _next_cached_offset(self, offset: int) -> int | None:
+        return next((start for start, _cached in self._cached_ranges if start > offset), None)
+
+    def read(self, size: int | None = -1) -> bytes:
+        if size == 0:
+            return b""
+
+        offset = self.tell()
+        available = max(self._file_size - offset, 0)
+        remaining = available if size is None or size < 0 else min(size, available)
+        result = bytearray()
+        while remaining > 0:
+            offset = self.tell()
+            cached = self._read_cached(offset, remaining)
+            if cached:
+                result.extend(cached)
+                self._remote_file.seek(offset + len(cached))
+                remaining -= len(cached)
+                continue
+
+            read_size = remaining
+            next_cached_offset = self._next_cached_offset(offset)
+            if next_cached_offset is not None:
+                read_size = min(read_size, next_cached_offset - offset)
+            chunk = self._budget.read_stream(self._remote_file, read_size)
+            if not chunk:
+                break
+            self._cache_range(offset, chunk)
+            result.extend(chunk)
+            remaining -= len(chunk)
+
+        return bytes(result)
+
+    def readinto(self, buffer: Any) -> int:
+        chunk = self.read(len(buffer))
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return int(self._remote_file.seek(offset, whence))
+
+    def tell(self) -> int:
+        return int(self._remote_file.tell())
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
+def _read_cloud_content_prefix(
+    fs: Any,
+    file_url: str,
+    max_bytes: int,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> bytes:
+    """Read a bounded remote prefix or fail closed with a redacted error."""
+    try:
+        if sniff_budget is not None:
+            return sniff_budget.read_prefix(fs, file_url, max_bytes)
+        with fs.open(file_url, "rb") as remote_file:
+            return _read_bounded_cloud_content(remote_file, max_bytes)
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _read_cloud_content_range(
+    fs: Any,
+    file_url: str,
+    offset: int,
+    max_bytes: int,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> bytes:
+    """Read a bounded remote byte range or fail closed with a redacted error."""
+    try:
+        if sniff_budget is not None:
+            return sniff_budget.read_range(fs, file_url, offset, max_bytes)
+        with fs.open(file_url, "rb") as remote_file:
+            remote_file.seek(offset)
+            return _read_bounded_cloud_content(remote_file, max_bytes)
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _get_cloud_content_size_for_routing(fs: Any, file_url: str) -> int:
+    """Read the remote object's actual size for tail-sensitive content routing."""
+    try:
+        with fs.open(file_url, "rb") as remote_file:
+            remote_file.seek(0, os.SEEK_END)
+            return _parse_size_value(remote_file.tell())
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _detect_cloud_shared_skip_filter_route(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> str | None:
+    """Route skipped cloud objects through the same bounded detector as local skips."""
+    from modelaudit.utils.file.detection import (
+        _COREML_PROTO_SIGNATURE_READ_BYTES,
+        _XML_MODEL_SIGNATURE_READ_BYTES,
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+        LLAMAFILE_ROUTE_SCAN_BYTES,
+        LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+        MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+        _could_be_xml_prefix,
+        _could_start_coreml_model_proto,
+        _is_executorch_binary_signature,
+        _is_supported_llamafile_executable_header,
+        detect_file_format_for_skip_filter,
+    )
+
+    probe_size = _CLOUD_CONTENT_SNIFF_BYTES
+    is_llamafile_candidate = _is_supported_llamafile_executable_header(prefix[:4])
+    normalized_prefix = prefix.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+    if normalized_prefix.startswith((b"{", b"[")):
+        probe_size = max(probe_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    if not normalized_prefix and not size_is_known:
+        probe_size = max(
+            probe_size,
+            JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1,
+            MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1,
+        )
+    if prefix and prefix[0] in _MSGPACK_CONTAINER_MARKERS:
+        probe_size = max(probe_size, FLAX_MSGPACK_STRUCTURE_READ_BYTES)
+    if _could_start_coreml_model_proto(prefix[:16]):
+        probe_size = max(probe_size, _COREML_PROTO_SIGNATURE_READ_BYTES)
+    if _is_executorch_binary_signature(prefix[:8]):
+        probe_size = max(probe_size, 64 * 1024)
+    if _could_be_xml_prefix(prefix):
+        probe_size = max(probe_size, _XML_MODEL_SIGNATURE_READ_BYTES)
+    if is_llamafile_candidate:
+        size = _get_cloud_content_size_for_routing(fs, file_url)
+        size_is_known = True
+        probe_size = max(probe_size, LLAMAFILE_ROUTE_SCAN_BYTES)
+
+    if size_is_known:
+        probe_size = min(size, probe_size)
+
+    probe_read_size = probe_size if size_is_known else probe_size + 1
+    probe = prefix
+    if len(probe) < probe_read_size:
+        probe = _read_cloud_content_prefix(fs, file_url, probe_read_size, sniff_budget)
+    if (
+        not size_is_known
+        and len(probe) < probe_read_size
+        and (sniff_budget is None or sniff_budget.prefix_is_complete(file_url))
+    ):
+        size = len(probe)
+        size_is_known = True
+
+    tail: bytes | None = None
+    tail_offset: int | None = None
+    if size_is_known and size > LLAMAFILE_ROUTE_SCAN_BYTES and is_llamafile_candidate:
+        tail_size = min(size, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES)
+        tail_offset = size - tail_size
+        tail = _read_cloud_content_range(fs, file_url, tail_offset, tail_size, sniff_budget)
+
+    basename = _cloud_url_basename(file_url) or "cloud-object"
+    with tempfile.TemporaryDirectory(prefix="modelaudit_cloud_probe_") as temp_dir:
+        probe_path = Path(temp_dir) / Path(basename).name
+        with probe_path.open("wb") as handle:
+            handle.write(probe)
+            if tail is not None and tail_offset is not None:
+                handle.seek(tail_offset)
+                handle.write(tail)
+            if size_is_known and size > probe_path.stat().st_size:
+                handle.truncate(size)
+
+        detected_format = detect_file_format_for_skip_filter(str(probe_path))
+        return None if detected_format == "unknown" else detected_format
+
+
+def _is_cloud_safetensors_routing_candidate(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> bool:
+    """Recognize bounded remote SafeTensors framing without downloading tensor data."""
+    if len(prefix) < 9:
+        return False
+    try:
+        header_len = struct.unpack("<Q", prefix[:8])[0]
+    except struct.error:
+        return False
+    if header_len <= 0 or (size_is_known and header_len > size - 8):
+        return False
+
+    from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+
+    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
+        return prefix[8:9] == b"{"
+
+    header_probe = _read_cloud_content_prefix(fs, file_url, 8 + header_len, sniff_budget)
+    if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
+        return False
+    try:
+        parsed_header = json.loads(header_probe[8:].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed_header, dict)
+
+
+def _detect_cloud_mxnet_symbol_route(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> str | None:
+    """Return a bounded MXNet JSON route for a suffix-skipped remote object."""
+    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
+
+    normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    if not normalized_prefix.lstrip().startswith(b"{"):
+        return None
+
+    max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
+    if size_is_known:
+        max_probe_size = min(size, max_probe_size)
+    mxnet_probe = _read_cloud_content_prefix(fs, file_url, max_probe_size, sniff_budget)
+    mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
+    if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return _detect_mxnet_symbol_prefix_route(
+            mxnet_probe[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
+    return _detect_mxnet_symbol_prefix_route(
+        mxnet_probe,
+        sample_is_prefix=(size_is_known and size > len(mxnet_probe))
+        or (
+            not size_is_known
+            and (
+                len(mxnet_probe) >= max_probe_size
+                or (sniff_budget is not None and not sniff_budget.prefix_is_complete(file_url))
+            )
+        ),
+        fail_closed_without_hint=True,
+    )
+
+
+def _detect_cloud_content_route_format(
+    fs: Any,
+    file_info: dict[str, Any],
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> str | None:
+    """Return a content-routed model format for a remote object, if cheaply identifiable."""
+    file_url = str(file_info["path"])
+    prefix_limit = _CLOUD_CONTENT_SNIFF_BYTES
+    prefix = _read_cloud_content_prefix(fs, file_url, prefix_limit, sniff_budget)
+    if not prefix:
+        if sniff_budget is not None:
+            sniff_budget.require_classification_capacity(file_url)
+        return None
+    size = len(prefix)
+    size_is_known = sniff_budget.prefix_is_complete(file_url) if sniff_budget is not None else size < prefix_limit
+
+    from modelaudit.utils.file.detection import (
+        PROTO0_1_MAX_PROBE_BYTES,
+        _could_start_proto0_or_1_pickle,
+        _is_cntk_signature,
+        _is_content_routed_lightgbm_signature,
+        _is_keras_zip_archive_content,
+        _looks_like_proto0_or_1_pickle,
+        _looks_like_uncompressed_tar_header,
+        detect_format_from_magic_bytes,
+    )
+    from modelaudit.utils.file.filtering import _zip_archive_has_scannable_content
+
+    if _looks_like_uncompressed_tar_header(prefix):
+        return "tar"
+
+    if _is_cntk_signature(prefix):
+        return "cntk"
+
+    if _is_content_routed_lightgbm_signature(prefix):
+        return "lightgbm"
+
+    mxnet_route = _detect_cloud_mxnet_symbol_route(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+        sniff_budget=sniff_budget,
+    )
+    if mxnet_route is not None:
+        return mxnet_route
+
+    if _is_cloud_safetensors_routing_candidate(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+        sniff_budget=sniff_budget,
+    ):
+        return "safetensors"
+
+    if _could_start_proto0_or_1_pickle(prefix):
+        max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES) if size_is_known else PROTO0_1_MAX_PROBE_BYTES
+        pickle_probe = _read_cloud_content_prefix(fs, file_url, max_probe_size, sniff_budget)
+        if _looks_like_proto0_or_1_pickle(
+            pickle_probe,
+            sample_is_prefix=(not size_is_known and len(pickle_probe) >= max_probe_size) or size > len(pickle_probe),
+        ):
+            return "pickle"
+
+    detected_format = detect_format_from_magic_bytes(
+        prefix[:4],
+        prefix[:8],
+        prefix[:16],
+        max(size, len(prefix)),
+        None,
+    )
+    if (
+        detected_format == "unknown"
+        and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
+    ):
+        return "tflite"
+    if detected_format == "zip":
+        incomplete_stream_reads = sniff_budget.incomplete_stream_reads if sniff_budget is not None else 0
+        try:
+            if sniff_budget is not None:
+                actual_size = _get_cloud_content_size_for_routing(fs, file_url)
+                cached_prefix = sniff_budget.cached_prefix(file_url)
+                if actual_size <= len(cached_prefix):
+                    with zipfile.ZipFile(io.BytesIO(cached_prefix[:actual_size]), "r") as archive:
+                        return (
+                            "zip"
+                            if _is_keras_zip_archive_content(archive) or _zip_archive_has_scannable_content(archive)
+                            else None
+                        )
+            with fs.open(file_url, "rb") as remote_file:
+                zip_source = (
+                    remote_file
+                    if sniff_budget is None
+                    else _BudgetedCloudContentReader(remote_file, sniff_budget, file_url, actual_size)
+                )
+                with zipfile.ZipFile(zip_source, "r") as archive:
+                    return (
+                        "zip"
+                        if _is_keras_zip_archive_content(archive) or _zip_archive_has_scannable_content(archive)
+                        else None
+                    )
+        except _CloudContentSniffBudgetExceeded as exc:
+            assert sniff_budget is not None
+            raise sniff_budget.classification_error(file_url) from exc
+        except Exception as exc:
+            if sniff_budget is not None and sniff_budget.incomplete_stream_reads > incomplete_stream_reads:
+                raise sniff_budget.classification_error(file_url) from exc
+            raise ValueError(
+                "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
+                f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            ) from exc
+    if detected_format != "unknown":
+        return detected_format
+
+    shared_detected_format = _detect_cloud_shared_skip_filter_route(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+        sniff_budget=sniff_budget,
+    )
+    if shared_detected_format is None and sniff_budget is not None:
+        if (
+            sniff_budget.remaining_bytes == 0
+            and not sniff_budget.prefix_is_complete(file_url)
+            and _get_cloud_content_size_for_routing(fs, file_url) == len(sniff_budget.cached_prefix(file_url))
+        ):
+            return None
+        sniff_budget.require_classification_capacity(file_url)
+    return shared_detected_format
+
+
+def _filter_scannable_cloud_files(
+    files: list[dict[str, Any]],
+    *,
+    fs: Any,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
+    max_sniff_bytes: int | None = None,
+    sniff_budget: _CloudContentSniffBudget | None = None,
+) -> list[dict[str, Any]]:
+    scannable = filter_scannable_files(
+        files,
+        scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+    )
+    if (scannable_extensions is not None or scannable_filenames is not None) and scanner_selection is None:
+        return scannable
+
+    scannable_by_path = {str(file["path"]): file for file in scannable}
+    if sniff_budget is None and max_sniff_bytes:
+        sniff_budget = _CloudContentSniffBudget(max_sniff_bytes)
+    scanner_policy = (
+        policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}) if scanner_selection is not None else None
+    )
+    for file_info in files:
+        file_path = str(file_info["path"])
+        suffix_selected = file_path in scannable_by_path
+        if suffix_selected and not _selected_suffix_needs_content_validation(
+            file_path,
+            scannable_extensions,
+            scanner_policy,
+        ):
+            continue
+        try:
+            detected_format = _detect_cloud_content_route_format(fs, file_info, sniff_budget)
+        except Exception as exc:
+            if suffix_selected:
+                logger.debug("Unable to validate shared cloud suffix for %s: %s", file_path, exc)
+                continue
+            raise
+        if detected_format is None:
+            continue
+        allowed = not (
+            scanner_policy is not None
+            and scanner_policy.active
+            and not any(
+                scanner_policy.allows(scanner_id) for scanner_id in scanner_ids_for_detected_format(detected_format)
+            )
+        )
+        if not allowed:
+            scannable_by_path.pop(file_path, None)
+            continue
+        routed_file_info = dict(file_info)
+        routed_file_info["content_detected_format"] = detected_format
+        scannable_by_path[file_path] = routed_file_info
+    return list(scannable_by_path.values())
 
 
 def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
@@ -726,9 +1462,15 @@ def _cached_path_within_size_limit(path: Path, max_size: int) -> bool:
         return False
 
 
-def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size: int) -> int:
+def _selected_cloud_download_size(
+    fs: Any,
+    files: list[dict[str, Any]],
+    max_size: int,
+    *,
+    acquired_bytes: int = 0,
+) -> int:
     """Return the late-bound size of selected objects, failing closed on unknown sizes."""
-    total_size = 0
+    selected_size = 0
     for file_info in files:
         file_url = str(file_info["path"])
         try:
@@ -743,12 +1485,13 @@ def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size
                 "Unable to enforce maximum cloud download size for selected object "
                 f"{redact_url_for_display(file_url)} because its size could not be determined"
             )
-        total_size += file_size
-        if total_size > max_size:
+        selected_size += file_size
+        if acquired_bytes + selected_size > max_size:
             raise ValueError(
-                f"File size ({format_size(total_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+                f"File size ({format_size(acquired_bytes + selected_size)}) exceeds maximum allowed size "
+                f"({format_size(max_size)})"
             )
-    return total_size
+    return selected_size
 
 
 class _CloudDownloadBudgetExceeded(ValueError):
@@ -807,6 +1550,8 @@ def download_from_cloud(
     selective: bool = True,
     stream_analyze: bool = False,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
@@ -835,8 +1580,15 @@ def download_from_cloud(
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     etag = _metadata_etag(metadata)
+    cache_scope = _cloud_directory_cache_scope(
+        metadata,
+        selective=selective,
+        scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        scanner_selection=scanner_selection,
+    )
     if cache:
-        cached_path = cache.get_cached_path(url, etag=etag)
+        cached_path = cache.get_cached_path(url, etag=etag, cache_scope=cache_scope)
         if cached_path:
             if max_size and not _cached_path_within_size_limit(cached_path, max_size):
                 logger.warning(
@@ -883,7 +1635,7 @@ def download_from_cloud(
     # Create download directory
     if cache:
         # When using cache, download directly to cache location
-        cache_key = cache.get_cache_key(url)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
         download_path = _prepare_cache_subdirectory(cache.cache_dir, cache_key)
     elif cache_dir is None:
         download_path = Path(tempfile.mkdtemp(prefix="modelaudit_cloud_"))
@@ -901,6 +1653,7 @@ def download_from_cloud(
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         files: list[dict[str, Any]] | None = None
+        content_sniff_budget = _CloudContentSniffBudget(max_size) if max_size else None
         if metadata["type"] == "directory":
             raw_files = metadata.get("files")
             if raw_files is None:
@@ -911,8 +1664,15 @@ def download_from_cloud(
                 raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
             if selective:
-                # Filter to only scannable files before enforcing acquisition budgets.
-                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+                # Content-route skipped objects before enforcing acquisition budgets.
+                files = _filter_scannable_cloud_files(
+                    files,
+                    fs=fs,
+                    scannable_extensions=scannable_extensions,
+                    scannable_filenames=scannable_filenames,
+                    scanner_selection=scanner_selection,
+                    sniff_budget=content_sniff_budget,
+                )
                 if show_progress:
                     total = metadata.get("file_count", 0)
                     if files:
@@ -925,8 +1685,18 @@ def download_from_cloud(
 
         # Check available disk space before downloading
         object_size: int | None
+        acquired_probe_bytes = (
+            content_sniff_budget.max_bytes - content_sniff_budget.remaining_bytes
+            if content_sniff_budget is not None
+            else 0
+        )
         if max_size and files is not None:
-            object_size = _selected_cloud_download_size(fs, files, max_size)
+            object_size = _selected_cloud_download_size(
+                fs,
+                files,
+                max_size,
+                acquired_bytes=acquired_probe_bytes,
+            )
         else:
             try:
                 object_size = get_cloud_object_size(fs, url, strict=True)
@@ -973,6 +1743,8 @@ def download_from_cloud(
 
             # Download files
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
+            if download_budget is not None:
+                download_budget.consume(acquired_probe_bytes)
             for file_info in files:
                 file_url = file_info["path"]
                 local_path = _build_safe_local_path(url, file_url, download_path)
@@ -1023,7 +1795,7 @@ def download_from_cloud(
 
         # Cache the download (for directories)
         if cache:
-            cache.cache_file(url, download_path, etag=etag)
+            cache.cache_file(url, download_path, etag=etag, cache_scope=cache_scope)
 
         return download_path
     except Exception:
@@ -1039,6 +1811,8 @@ def download_from_cloud_streaming(
     show_progress: bool = True,
     selective: bool = True,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
@@ -1090,6 +1864,7 @@ def download_from_cloud_streaming(
     fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     # Get list of files to download
+    content_sniff_budget = _CloudContentSniffBudget(max_size) if max_size else None
     if metadata["type"] == "directory":
         raw_files = metadata.get("files")
         if raw_files is None:
@@ -1100,7 +1875,14 @@ def download_from_cloud_streaming(
             raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
         if selective:
-            files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+            files = _filter_scannable_cloud_files(
+                files,
+                fs=fs,
+                scannable_extensions=scannable_extensions,
+                scannable_filenames=scannable_filenames,
+                scanner_selection=scanner_selection,
+                sniff_budget=content_sniff_budget,
+            )
             if show_progress and files:
                 click.echo(f"Found {len(files)} scannable files to stream")
 
@@ -1110,8 +1892,16 @@ def download_from_cloud_streaming(
         # Single file
         files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
+    acquired_probe_bytes = (
+        content_sniff_budget.max_bytes - content_sniff_budget.remaining_bytes if content_sniff_budget is not None else 0
+    )
     if max_size:
-        _selected_cloud_download_size(fs, files, max_size)
+        _selected_cloud_download_size(
+            fs,
+            files,
+            max_size,
+            acquired_bytes=acquired_probe_bytes,
+        )
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
@@ -1120,6 +1910,8 @@ def download_from_cloud_streaming(
         # Download files one at a time
         total_files = len(files)
         download_budget = _CloudDownloadBudget(max_size) if max_size else None
+        if download_budget is not None:
+            download_budget.consume(acquired_probe_bytes)
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
