@@ -460,6 +460,10 @@ class TestKerasZipScanner:
         result = KerasZipScanner().scan(str(keras_path))
 
         assert "keras_zip_embedded_weights_h5py_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        assert "keras_h5_h5py_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not any(
+            check.name in {"Embedded Weights H5PY Library Check", "H5PY Library Check"} for check in result.checks
+        )
         python_op_findings = [issue for issue in result.issues if issue.details.get("op_type") == "PythonOp"]
         assert bool(python_op_findings) is malicious
         assert (
@@ -831,7 +835,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Probe-incomplete weights must still report generic pickle findings before failing closed."""
         pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
-        payload_size = HDF5_SIGNATURE_SCAN_MAX_BYTES + 1
+        payload_size = (16 * 1024 * 1024) + 8
         weights_payload = pickle_payload + bytes(payload_size - len(pickle_payload))
         keras_path = tmp_path / "oversized_disguised_pickle.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
@@ -867,7 +871,7 @@ class TestKerasZipScanner:
         nested_zip_path = tmp_path / "disguised_weights.zip"
         with zipfile.ZipFile(nested_zip_path, "w") as nested_zip:
             nested_zip.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
-            nested_zip.writestr("padding.bin", bytes(HDF5_SIGNATURE_SCAN_MAX_BYTES))
+            nested_zip.writestr("padding.bin", bytes(16 * 1024 * 1024))
 
         assert nested_zip_path.stat().st_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
         keras_path = tmp_path / "oversized_disguised_zip.keras"
@@ -890,6 +894,30 @@ class TestKerasZipScanner:
             and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
             for issue in result.issues
         )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+    def test_non_hdf5_weights_before_next_legal_signature_offset_avoid_hdf5_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A size above the byte cap must not fail HDF5 checks when every legal offset was probed."""
+        weights_payload = bytes(HDF5_SIGNATURE_SCAN_MAX_BYTES + 1)
+        keras_path = tmp_path / "large_non_hdf5_weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", weights_payload)
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+        result = KerasZipScanner(config={"scanners": ["keras_zip"]}).scan(str(keras_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert not any(check.name == "Embedded Weights HDF5 Signature Probe" for check in result.checks)
+        assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
@@ -934,6 +962,7 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
         assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     @pytest.mark.parametrize(
         ("config", "reason", "expected_check_name"),

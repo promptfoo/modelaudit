@@ -28,6 +28,17 @@ def hdf5_signature_offsets(
     return offsets
 
 
+def is_hdf5_signature_probe_complete(
+    file_size: int,
+    max_signature_scan_bytes: int | None = HDF5_SIGNATURE_SCAN_MAX_BYTES,
+) -> bool:
+    """Return whether the bounded probe covers every legal signature offset."""
+    return hdf5_signature_offsets(file_size, max_signature_scan_bytes) == hdf5_signature_offsets(
+        file_size,
+        max_signature_scan_bytes=None,
+    )
+
+
 def has_plausible_hdf5_superblock(superblock: bytes, signature_offset: int, file_size: int) -> bool:
     """Validate bounded HDF5 superblock invariants after a candidate signature."""
     if superblock[: len(HDF5_MAGIC)] != HDF5_MAGIC:
