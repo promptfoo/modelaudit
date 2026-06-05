@@ -2,6 +2,7 @@
 
 import importlib
 import pickle
+import signal
 import struct
 import subprocess
 import tarfile
@@ -12,7 +13,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -25,6 +26,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_repo_files_with_timeout,
     _read_huggingface_prefix,
     _run_huggingface_download_with_deadline,
+    _terminate_huggingface_download_process,
     download_file_from_hf,
     download_model,
     download_model_streaming,
@@ -1426,6 +1428,33 @@ class TestModelDownload:
         assert result == "/tmp/model"
         assert mock_popen.call_args.kwargs["stderr"] is subprocess.PIPE
 
+    @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
+    def test_download_worker_redacts_signed_transport_error(self, mock_popen: MagicMock) -> None:
+        """Serialized worker failures must not expose signed CDN credentials."""
+        process = mock_popen.return_value
+        process.communicate.return_value = (
+            "MODELAUDIT_HF_DOWNLOAD_RESULT="
+            '{"ok": false, "error_type": "HTTPError", '
+            '"error": "denied https://user:pass@cas-bridge.xethub.hf.co/object?'
+            'X-Amz-Credential=secret&X-Amz-Signature=signed"}\n',
+            "",
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            _run_huggingface_download_with_deadline(
+                "snapshot_download",
+                {"repo_id": "test/model"},
+                time.monotonic() + 1,
+                "test/model",
+            )
+
+        error = str(exc_info.value)
+        assert "user:pass" not in error
+        assert "secret" not in error
+        assert "signed" not in error
+        assert "X-Amz-Credential=<redacted>" in error
+        assert "X-Amz-Signature=<redacted>" in error
+
     @patch("modelaudit.utils.sources.huggingface._terminate_huggingface_download_process")
     @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
     def test_download_worker_is_terminated_on_parent_interrupt(
@@ -1446,6 +1475,26 @@ class TestModelDownload:
             )
 
         mock_terminate.assert_called_once_with(process)
+
+    @patch("modelaudit.utils.sources.huggingface.os.killpg")
+    def test_download_worker_terminates_posix_process_group(self, mock_killpg: MagicMock) -> None:
+        """Timeout cleanup must stop transfer helpers launched by the worker."""
+        process = MagicMock()
+        process.pid = 1234
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["worker"], timeout=1),
+            ("", ""),
+        ]
+
+        with patch("modelaudit.utils.sources.huggingface.os.name", "posix"):
+            _terminate_huggingface_download_process(process)
+
+        assert mock_killpg.call_args_list == [
+            call(1234, signal.SIGTERM),
+            call(1234, signal.SIGKILL),
+        ]
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
     @patch(

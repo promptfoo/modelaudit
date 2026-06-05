@@ -11,6 +11,14 @@ HUGGINGFACE_URL_IN_TEXT_PATTERN = re.compile(
     r"(?i)\b(?:https?://(?:[^\s\"'<>/@]+(?::[^\s\"'<>/@]*)?@)?(?:huggingface\.co|hf\.co)|hf://)"
     r"[^\s\"'<>]*"
 )
+_SENSITIVE_URL_QUERY_PARAM_PATTERN = re.compile(
+    (
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+    ),
+    re.IGNORECASE,
+)
+_URL_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _HF_REPO_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
 
@@ -86,11 +94,13 @@ def redact_huggingface_url_for_display(url: str) -> str:
 
 
 def redact_huggingface_urls_in_text(text: str) -> str:
-    """Redact HuggingFace URLs embedded inside a larger display string."""
-    return HUGGINGFACE_URL_IN_TEXT_PATTERN.sub(
+    """Redact Hugging Face and signed transport URLs in display text."""
+    redacted = HUGGINGFACE_URL_IN_TEXT_PATTERN.sub(
         lambda match: redact_huggingface_url_for_display(match.group(0)),
         text,
     )
+    redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
+    return _SENSITIVE_URL_QUERY_PARAM_PATTERN.sub(r"\1<redacted>", redacted)
 
 
 def is_huggingface_file_url(url: str) -> bool:

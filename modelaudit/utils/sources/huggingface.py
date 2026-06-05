@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -1205,7 +1206,7 @@ def _run_huggingface_worker_with_deadline(
     result = cast(dict[str, Any], raw_result)
     if not result.get("ok"):
         error_type = result.get("error_type", "Exception")
-        error_message = result.get("error", "download failed")
+        error_message = redact_huggingface_urls_in_text(str(result.get("error", "download failed")))
         raise RuntimeError(f"{error_type}: {error_message}")
 
     return result
@@ -1245,13 +1246,21 @@ def _run_huggingface_download_with_deadline(
 
 def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> None:
     """Stop a timed-out download worker without waiting indefinitely for cleanup."""
-    with suppress(ProcessLookupError):
-        process.terminate()
+    if os.name == "nt":
+        with suppress(ProcessLookupError):
+            process.terminate()
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
     try:
         process.communicate(timeout=1.0)
     except subprocess.TimeoutExpired:
-        with suppress(ProcessLookupError):
-            process.kill()
+        if os.name == "nt":
+            with suppress(ProcessLookupError):
+                process.kill()
+        else:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
 
 
