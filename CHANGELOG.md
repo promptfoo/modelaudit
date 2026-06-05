@@ -9,7 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
+- validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
+- fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
+- omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
+- block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
+- add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
 - redact and detect secrets in R serialized executable samples across native assignment syntax
+- redact authorization aliases across structured, malformed, subscripted, and R scanner evidence
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
 - fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
@@ -23,10 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - preserve dangerous embedded-Python builtin detection across aliases, builtin namespaces, and control flow
+- bound Keras ZIP HDF5 external-reference inspection and evidence, preserve hard-link cycle traversal, and flag malformed Lambda metadata
 - fail closed on noncanonical Keras ZIP Lambda and external-reference versions
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
+- fail closed on malformed Keras version suffixes used for CVE boundary checks
 - fail closed when executable ZIP subtype scanners are unavailable
 - reject local, plaintext, and redirecting JFrog credential targets
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
@@ -87,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- stream Hugging Face files through case-insensitive suffix filtering with bounded extensionless coverage
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
 - classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
 - classify unavailable Joblib reads as inconclusive rather than security findings
@@ -95,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
+- enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
@@ -107,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
+- enforce `--max-size` while downloading PyTorch Hub models in normal acquisition mode
 - detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings

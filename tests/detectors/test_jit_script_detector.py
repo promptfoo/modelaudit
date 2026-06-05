@@ -5917,14 +5917,18 @@ class TestJITScriptDetector:
 
         assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
 
-    def test_single_window_prefix_context_is_extracted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_single_window_prefix_context_checks_are_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         original_is_priority_context = jit_script_module._is_priority_prefix_context_statement
         priority_context_checks = 0
 
-        def recording_is_priority_context(context: bytes, statement: bytes) -> bool:
+        def recording_is_priority_context(
+            context: bytes,
+            statement: bytes,
+            active_priority_names: set[str] | None = None,
+        ) -> bool:
             nonlocal priority_context_checks
             priority_context_checks += 1
-            return original_is_priority_context(context, statement)
+            return original_is_priority_context(context, statement, active_priority_names)
 
         monkeypatch.setattr(
             jit_script_module,
@@ -5938,7 +5942,25 @@ class TestJITScriptDetector:
         windows = jit_script_module._embedded_python_extraction_windows(data)
 
         assert windows
-        assert priority_context_checks == 1
+        assert priority_context_checks <= 1
+
+    def test_contextual_priority_windows_skip_binary_without_priority_import(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def unexpected_structural_scan(_line: bytes) -> bytes:
+            raise AssertionError("binary lines should not be structurally scanned without a priority import")
+
+        monkeypatch.setattr(jit_script_module, "_python_structural_line_bytes", unexpected_structural_scan)
+        data = b"header\n\x00" + (b"benign binary payload\n" * 4096)
+
+        assert jit_script_module._contextual_priority_framed_windows(data) == []
+
+    def test_source_like_start_rejects_binary_assignment_opcode(self) -> None:
+        binary_payload = b"\x80\x04K=\x94M:\x01M;\x01M<\x01M=\x01"
+
+        assert jit_script_module._has_source_like_embedded_python_start(binary_payload) is False
+        assert jit_script_module._has_source_like_embedded_python_start(b"\x00sink = eval\nsink('1+1')\n") is True
 
     def test_scan_model_does_not_flag_builtin_substring_inside_identifier(self) -> None:
         detector = JITScriptDetector()
@@ -6295,6 +6317,31 @@ class TestJITScriptDetector:
                 b"            callback('1+1')\n"
             ),
             (b"\x00\xffdef run(callbacks=[]):\n    callbacks.append(eval)\n    return callbacks[0]('1+1')\nrun()\n"),
+            (b"callbacks = {'run': eval}\nfor callback in callbacks.values():\n    callback('1+1')\n"),
+            (b"callbacks = {**{'run': eval}}\ncallbacks['run']('1+1')\n"),
+            (b"callbacks = [len, eval]\ncallbacks[1:][0]('1+1')\n"),
+            (b"callbacks = [len] + [eval]\ncallbacks[1]('1+1')\n"),
+            (b"callbacks = [] + [eval]\ncallbacks[0]('1+1')\n"),
+            (b"def run(callback):\n    callback('1+1')\ncallbacks = [] + [run]\ncallbacks[0](eval)\n"),
+            (b"class C:\n    def __call__(self, callback):\n        callback('1+1')\nC()(eval)\n"),
+            (b"class C:\n    def __new__(cls):\n        return eval\nC()('1+1')\n"),
+            (b"callbacks = {eval}\nfor callback in callbacks:\n    callback('1+1')\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'eval')('1+1')\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['eval']('1+1')\n"),
+            (b"def configure():\n    globals()['sink'] = eval\nconfigure()\nsink('1+1')\n"),
+            (b"import operator\noperator.call(eval, '1+1')\n"),
+            (b"from operator import call as invoke\ninvoke(eval, '1+1')\n"),
+            (b"name = f'eval'\ngetattr(__builtins__, name)('1+1')\n"),
+            (b"callbacks = {'run': eval}\ncallbacks.setdefault('run')('1+1')\n"),
+            (b"callbacks = {'run': eval}\ndict.get(callbacks, 'run')('1+1')\n"),
+            (b"callbacks = [eval]\nlist.__getitem__(callbacks, 0)('1+1')\n"),
+            (b"staticmethod(eval)('1+1')\n"),
+            (b"def run():\n    list(map(lambda callback: callback('1+1'), [eval]))\nrun()\n"),
+            (b"def callbacks():\n    yield eval\nfor callback in callbacks():\n    callback('1+1')\n"),
+            (b"from functools import reduce\nreduce(lambda _value, callback: callback('1+1'), [eval], None)\n"),
+            (b"try:\n    raise Exception(eval)\nexcept Exception as error:\n    error.args[0]('1+1')\n"),
+            (b"type(eval).__call__(eval, '1+1')\n"),
+            (b"def annotated(value: eval):\n    pass\nannotated.__annotations__['value']('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -6303,6 +6350,134 @@ class TestJITScriptDetector:
         findings = detector.scan_model(data, "pytorch", "payload.bin")
 
         assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [callback for callback in [eval]]\ncallbacks[0]('1+1')\n",
+            "callbacks = [callback for callback in [len, eval]]\ncallbacks[1]('1+1')\n",
+            "for _index, callback in zip([0], [eval]):\n    callback('1+1')\n",
+            (
+                "class Base:\n"
+                "    def run(self, callback):\n"
+                "        return callback('1+1')\n"
+                "class Child(Base):\n"
+                "    def execute(self):\n"
+                "        return super().run(eval)\n"
+                "Child().execute()\n"
+            ),
+            (
+                "class Dangerous:\n"
+                "    def run(self, callback):\n"
+                "        return callback('1+1')\n"
+                "class Safe:\n"
+                "    def run(self, callback):\n"
+                "        return len([])\n"
+                "class Child(Dangerous, Safe):\n"
+                "    def execute(self):\n"
+                "        return super().run(eval)\n"
+                "Child().execute()\n"
+            ),
+            "import operator\noperator.methodcaller('__call__', '1+1')(eval)\n",
+            ("import operator\ninvoke = operator.methodcaller\ninvoke('__call__', '1+1')(eval)\n"),
+            "from operator import attrgetter\nattrgetter('__call__')(eval)('1+1')\n",
+            "callbacks = []\ncallbacks.insert(0, eval)\ncallbacks[0]('1+1')\n",
+            "callbacks = [len]\nalias = callbacks\nalias.insert(1, eval)\ncallbacks[1]('1+1')\n",
+            "callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks['run']('1+1')\n",
+            "callbacks = {'run': len}\nalias = callbacks\nalias.update(run=eval)\ncallbacks['run']('1+1')\n",
+            "callbacks = {'run': eval}\nfor _name, callback in callbacks.items():\n    callback('1+1')\n",
+            "import operator\noperator.getitem([eval], 0)('1+1')\n",
+            "from operator import getitem\ngetitem([eval], 0)('1+1')\n",
+            "callbacks = [len]\ncallbacks.__setitem__(0, eval)\ncallbacks[0]('1+1')\n",
+            "callbacks = {'run': len}\ndict.__setitem__(callbacks, 'run', eval)\ncallbacks['run']('1+1')\n",
+            "callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[1]('1+1')\n",
+            "iter([eval]).__next__()('1+1')\n",
+            "[eval][::-1][0]('1+1')\n",
+            "([eval] * 2)[1]('1+1')\n",
+            "([eval] * 100)[99]('1+1')\n",
+            "next(iter({'run': eval}.values()))('1+1')\n",
+            "((callback := eval), callback)[1]('1+1')\n",
+        ],
+    )
+    def test_dangerous_builtin_alias_regressions(self, source: str) -> None:
+        tree = ast.parse(source)
+
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(tree)
+
+        assert "eval" in findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [callback for callback in [len]]\ncallbacks[0]([])\nunused = eval\n",
+            "callbacks = [callback for callback in [len, eval]]\ncallbacks[0]([])\n",
+            ("zip = lambda *_args: [(0, len)]\nfor _index, callback in zip([0], [eval]):\n    callback([])\n"),
+            (
+                "class Base:\n"
+                "    def run(self, callback):\n"
+                "        return callback('1+1')\n"
+                "class Helper:\n"
+                "    def run(self, callback):\n"
+                "        return len([])\n"
+                "class Child(Base):\n"
+                "    def execute(self):\n"
+                "        super = lambda: Helper()\n"
+                "        return super().run(eval)\n"
+                "Child().execute()\n"
+            ),
+            (
+                "class Dangerous:\n"
+                "    def run(self, callback):\n"
+                "        return callback('1+1')\n"
+                "class Safe:\n"
+                "    def run(self, callback):\n"
+                "        return len([])\n"
+                "class Child(Safe, Dangerous):\n"
+                "    def execute(self):\n"
+                "        return super().run(eval)\n"
+                "Child().execute()\n"
+            ),
+            (
+                "import operator\n"
+                "operator = type('Safe', (), {'methodcaller': lambda *_args: lambda callback: len})\n"
+                "operator.methodcaller('__call__', '1+1')(eval)\n"
+            ),
+            "import operator\noperator.attrgetter('__name__')(eval)\n",
+            (
+                "import operator\n"
+                "invoke = operator.methodcaller\n"
+                "invoke = lambda *_args: lambda callback: len\n"
+                "invoke('__call__', '1+1')(eval)\n"
+            ),
+            "callbacks = []\ncallbacks.insert(0, len)\ncallbacks[0]([])\nunused = eval\n",
+            "callbacks = [eval]\ncallbacks.insert(0, len)\ncallbacks[0]([])\n",
+            "callbacks = {}\ncallbacks.update({'run': len})\ncallbacks['run']([])\nunused = eval\n",
+            "callbacks = {'run': eval}\ncallbacks.update(run=len)\ncallbacks['run']([])\n",
+            "callbacks = {'run': len}\nfor _name, callback in callbacks.items():\n    callback([])\nunused = eval\n",
+            "import operator\noperator.getitem([len], 0)([])\nunused = eval\n",
+            (
+                "import operator\n"
+                "operator = type('Safe', (), {'getitem': lambda _items, _index: len})\n"
+                "operator.getitem([eval], 0)([])\n"
+            ),
+            "callbacks = [eval]\ncallbacks.__setitem__(0, len)\ncallbacks[0]([])\n",
+            "callbacks = {'run': eval}\ndict.__setitem__(callbacks, 'run', len)\ncallbacks['run']([])\n",
+            "callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[0]([])\n",
+            "callbacks = [eval]\ncallbacks.clear()\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            "iter([len]).__next__()([])\nunused = eval\n",
+            "[len][::-1][0]([])\nunused = eval\n",
+            "([len] * 2)[1]([])\nunused = eval\n",
+            "([len] * 100)[99]([])\nunused = eval\n",
+            "next(iter({'run': len}.values()))([])\nunused = eval\n",
+            "((callback := len), callback)[1]([])\nunused = eval\n",
+        ],
+    )
+    def test_dangerous_builtin_alias_regressions_avoid_false_positives(self, source: str) -> None:
+        tree = ast.parse(source)
+
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(tree)
+
+        assert "eval" not in findings
 
     @pytest.mark.parametrize(
         "data",
@@ -6595,6 +6770,62 @@ class TestJITScriptDetector:
                 b"    return callbacks[0]([])\n"
                 b"run()\n"
                 b"unused = eval\n"
+            ),
+            (b"callbacks = {'run': len}\nfor callback in callbacks.values():\n    callback([])\nunused = eval\n"),
+            (b"callbacks = {**{'run': len}}\ncallbacks['run']([])\nunused = eval\n"),
+            (b"callbacks = [eval, len]\ncallbacks[1:][0]([])\n"),
+            (b"callbacks = [eval] + [len]\ncallbacks[1]([])\n"),
+            (b"callbacks = {**{'run': {'inner': eval}}, 'run': len}\ncallbacks['run']([])\n"),
+            (
+                b"def run(callback):\n"
+                b"    callback('1+1')\n"
+                b"callbacks = {**{'run': run}, 'run': len}\n"
+                b"callbacks['run']([])\n"
+                b"unused = eval\n"
+            ),
+            (b"class C:\n    def __call__(self, callback):\n        callback([])\nC()(len)\nunused = eval\n"),
+            (b"class C:\n    def __new__(cls):\n        return len\nC()([])\nunused = eval\n"),
+            (
+                b"class C:\n"
+                b"    def __new__(cls):\n"
+                b"        return len\n"
+                b"    def __call__(self, callback):\n"
+                b"        callback('1+1')\n"
+                b"C()(eval)\n"
+            ),
+            (b"callbacks = {len}\nfor callback in callbacks:\n    callback([])\nunused = eval\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'len')([])\nunused = eval\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['len']([])\nunused = eval\n"),
+            (b"def configure():\n    globals()['sink'] = len\nconfigure()\nsink([])\nunused = eval\n"),
+            (b"import operator\noperator.call(len, [])\nunused = eval\n"),
+            (
+                b"import operator\n"
+                b"class Safe:\n"
+                b"    call = staticmethod(lambda callback, value: value)\n"
+                b"operator = Safe\n"
+                b"operator.call(eval, '1+1')\n"
+            ),
+            (b"name = f'len'\ngetattr(__builtins__, name)([])\nunused = eval\n"),
+            (b"callbacks = {'run': len}\ncallbacks.setdefault('run', eval)([])\n"),
+            (b"callbacks = {'run': len}\ndict.get(callbacks, 'run')([])\nunused = eval\n"),
+            (b"callbacks = [len]\nlist.__getitem__(callbacks, 0)([])\nunused = eval\n"),
+            (b"staticmethod(len)([])\nunused = eval\n"),
+            (b"callbacks = {-1: eval}\ncallbacks.pop()('1+1')\n"),
+            (b"callbacks = [eval]\nlist.get(callbacks, 0)('1+1')\n"),
+            (b"list(map(lambda callback: callback([]), [len]))\nunused = eval\n"),
+            (b"def callbacks():\n    yield len\nfor callback in callbacks():\n    callback([])\nunused = eval\n"),
+            (
+                b"from functools import reduce\n"
+                b"reduce(lambda _value, callback: callback([]), [len], None)\n"
+                b"unused = eval\n"
+            ),
+            (b"try:\n    raise Exception(len)\nexcept Exception as error:\n    error.args[0]([])\nunused = eval\n"),
+            (b"type(len).__call__(len, [])\nunused = eval\n"),
+            (
+                b"from __future__ import annotations\n"
+                b"def annotated(value: eval):\n"
+                b"    pass\n"
+                b"annotated.__annotations__['value']('1+1')\n"
             ),
         ],
     )
@@ -7832,6 +8063,16 @@ class TestJITScriptDetector:
             for candidate, _span, _real_ranges in priority_selected
         )
 
+    def test_candidate_extraction_bounds_dense_assignments_and_keeps_late_priority_import(self) -> None:
+        assignments = b"".join(f"value_{index} = {index}\n".encode() for index in range(1_000))
+        priority_source = b"import runpy as rp\nrp.run_path('payload.py')\n"
+        source = assignments + priority_source
+
+        candidates = jit_script_module._candidate_embedded_python_snippets(source)
+
+        assert len(candidates) <= jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
+        assert any(bytes(candidate).startswith(b"import runpy as rp\n") for candidate, _span, _ranges in candidates)
+
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
@@ -8687,6 +8928,120 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
             for finding in findings
         )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [f for f in [eval]]\ncallbacks[0]('1+1')",
+            "callbacks = {name: callback for name, callback in [('run', eval)]}\ncallbacks['run']('1+1')",
+            "for _x, callback in zip([0], [eval]):\n    callback('1+1')",
+            (
+                "class Base:\n"
+                "    def run(self, callback): callback('1+1')\n"
+                "class Child(Base):\n"
+                "    def go(self): super().run(eval)\n"
+                "Child().go()"
+            ),
+            "import operator\noperator.methodcaller('__call__', '1+1')(eval)",
+            "import operator\noperator.attrgetter('__call__')(eval)('1+1')",
+            "callbacks = []\ncallbacks.insert(0, eval)\ncallbacks[0]('1+1')",
+            "callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks['run']('1+1')",
+        ],
+    )
+    def test_dangerous_builtin_analysis_tracks_additional_alias_flows(self, source: str) -> None:
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(ast.parse(source))
+
+        assert "eval" in findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [f for f in [len]]\ncallbacks[0]([])\nunused = eval",
+            "callbacks = [f for f in [eval] if False]\ncallbacks[0]('1+1')",
+            (
+                "callbacks = {name: callback for name, callback in [('run', eval)]}\n"
+                "callbacks['run'] = len\ncallbacks['run']([])"
+            ),
+            "for _x, callback in zip([0], [len]):\n    callback([])\nunused = eval",
+            (
+                "class Base:\n"
+                "    def run(self, callback): callback([])\n"
+                "class Child(Base):\n"
+                "    def go(self): super().run(len)\n"
+                "Child().go()\nunused = eval"
+            ),
+            "import operator\noperator.methodcaller('__str__')(eval)",
+            "import operator\noperator.attrgetter('__name__')(eval)",
+            "callbacks = []\ncallbacks.insert(0, eval)\ncallbacks[0] = len\ncallbacks[0]([])",
+            ("callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks.update(run=len)\ncallbacks['run']([])"),
+        ],
+    )
+    def test_dangerous_builtin_analysis_ignores_safe_alias_near_matches(self, source: str) -> None:
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(ast.parse(source))
+
+        assert "eval" not in findings
+
+    def test_dangerous_builtin_analysis_handles_deep_folded_getattr_without_recursion(self) -> None:
+        member_expression = " + ".join(["'ev'", *(["''"] * 1_000), "'al'"])
+        tree = ast.parse(f"getattr(__builtins__, {member_expression})('1+1')")
+
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(tree)
+
+        assert "eval" in findings
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"callbacks = {'run': eval}\ncallbacks.popitem()[1]('1+1')\n",
+            b"callbacks = {'safe': len, 'run': eval}\ncallbacks.popitem()[1]('1+1')\n",
+            b"callbacks = {'run': eval}\ndict.popitem(callbacks)[1]('1+1')\n",
+            b"def identity(callback):\n    return callback\nidentity(eval)('1+1')\n",
+            b"def identity(callback):\n    return callback\nidentity(callback=eval)('1+1')\n",
+            b"identity = lambda callback: callback\nidentity(eval)('1+1')\n",
+            b"callbacks = {'run': eval}\nfor _name, callback in callbacks.items():\n    callback('1+1')\n",
+            b"import operator\noperator.getitem([eval], 0)('1+1')\n",
+            b"callbacks = [len]\ncallbacks.__setitem__(0, eval)\ncallbacks[0]('1+1')\n",
+            b"callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[1]('1+1')\n",
+            b"iter([eval]).__next__()('1+1')\n",
+            b"[eval][::-1][0]('1+1')\n",
+            b"([eval] * 2)[1]('1+1')\n",
+            b"([eval] * 100)[99]('1+1')\n",
+            b"next(iter({'run': eval}.values()))('1+1')\n",
+            b"((callback := eval), callback)[1]('1+1')\n",
+        ],
+    )
+    def test_scan_model_detects_dynamic_callbacks_from_returned_mapping_values(self, data: bytes) -> None:
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"callbacks = {'run': eval}\ndel callbacks['run']\ncallbacks['run']('1+1')\n",
+            b"callbacks = [eval]\ndel callbacks[0]\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            b"callbacks = {'run': eval}\ncallbacks.popitem()\ncallbacks['run']('1+1')\n",
+            b"callbacks = {'run': eval, 'safe': len}\ncallbacks.popitem()[1]([])\n",
+            b"def identity(callback):\n    return callback\nidentity(len)([])\nunused = eval\n",
+            b"def identity(callback):\n    callback = len\n    return callback\nidentity(eval)([])\n",
+            (b"def choose(callback, enabled):\n    return callback if enabled else len\nchoose(eval, False)([])\n"),
+            b"callbacks = {'run': len}\nfor _name, callback in callbacks.items():\n    callback([])\nunused = eval\n",
+            b"import operator\noperator.getitem([len], 0)([])\nunused = eval\n",
+            b"callbacks = [eval]\ncallbacks.__setitem__(0, len)\ncallbacks[0]([])\n",
+            b"callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[0]([])\n",
+            b"callbacks = [eval]\ncallbacks.clear()\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            b"iter([len]).__next__()([])\nunused = eval\n",
+            b"[len][::-1][0]([])\nunused = eval\n",
+            b"([len] * 2)[1]([])\nunused = eval\n",
+            b"([len] * 100)[99]([])\nunused = eval\n",
+            b"next(iter({'run': len}.values()))([])\nunused = eval\n",
+            b"((callback := len), callback)[1]([])\nunused = eval\n",
+        ],
+    )
+    def test_scan_model_ignores_removed_or_safe_dynamic_callbacks(self, data: bytes) -> None:
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
