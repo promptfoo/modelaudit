@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - classify text-sidecar prose, code references, placeholders, and standard package indexes without hiding executable indicators
+- bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
@@ -68,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound Jinja sandbox safety probes so render amplification fails closed instead of exhausting scanner resources
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact Flax/JAX MessagePack scanner samples, contexts, key paths, structured fields, metadata, and errors
 - redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
