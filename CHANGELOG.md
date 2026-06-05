@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- omit sensitive LightGBM model excerpts and network values from finding evidence
+- fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
+- restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
+- enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
 - omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
@@ -22,12 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5
 - fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
 - redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
+- report proven oversized pickle `FRAME` length mismatches as structural tampering without misclassifying incomplete frame reads
 - fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
 - classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
 - run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
+- preserve dangerous embedded-Python builtin detection across aliases, builtin namespaces, and control flow
+- bound Keras ZIP HDF5 external-reference inspection and evidence, preserve hard-link cycle traversal, and flag malformed Lambda metadata
 - fail closed on noncanonical Keras ZIP Lambda and external-reference versions
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
@@ -77,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - block weight distribution `torch.load` on PyTorch prerelease, dev, and unknown versions before deserialization while preserving final, local, and PEP 440 post-release patched builds
 - fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
+- treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
@@ -114,6 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
+- fail closed and cap downstream scanning and metadata listings when PyTorch ZIP archives exceed the configured entry limit, preserve parent structure attribution across nested limits, and retain deadline and prefixed-layout metadata handling
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - include supported non-PT artifacts linked from PyTorch Hub model pages while rejecting format-changing redirects and non-artifact responses
 - enforce `--max-size` while downloading PyTorch Hub models in normal acquisition mode
