@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import collections
@@ -4865,6 +4866,49 @@ def test_scan_bytes_warns_when_known_safe_reference_resolves_to_shadow_module(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "string.Template"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_allows_trusted_argparse_namespace() -> None:
+    payload = pickle.dumps(argparse.Namespace(value="safe"), protocol=4)
+
+    report = scan_bytes(payload, source="argparse-namespace.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_warns_when_argparse_namespace_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed_argparse_namespace_marker"
+    (tmp_path / "argparse.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Namespace:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = pickle.dumps(argparse.Namespace(value="safe"), protocol=4)
+
+    report = scan_bytes(payload, source="shadowed-argparse-namespace.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "argparse.Namespace"
+        for finding in report.findings
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})",
+        ],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
 
 
 def test_scan_bytes_warns_when_allowlisted_module_resolves_from_inactive_fake_environment(

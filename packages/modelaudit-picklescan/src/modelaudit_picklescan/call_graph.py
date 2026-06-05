@@ -177,6 +177,7 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("_sitebuiltins", "_Helper"),
         ("_xxsubinterpreters", "create"),
         ("aiobotocore.credentials", "AioProcessProvider"),
+        ("argparse", "Namespace"),
         ("botocore.credentials", "ProcessProvider"),
         ("configparser", "ConfigParser"),
         ("concurrent.futures", "Future"),
