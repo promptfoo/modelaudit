@@ -1645,13 +1645,11 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
         before = os.fstat(file_descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise OSError(f"source candidate is not a regular file: {path}")
-        if max_bytes is None:
-            return b"", before
-        if before.st_size > max_bytes:
+        if max_bytes is not None and before.st_size > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
 
         chunks: list[bytes] = []
-        remaining = max_bytes + 1
+        remaining = 0 if max_bytes is None else max_bytes + 1
         while remaining > 0:
             chunk = os.read(file_descriptor, min(64 * 1024, remaining))
             if not chunk:
@@ -1676,9 +1674,21 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
             after.st_mtime_ns,
             after.st_ctime_ns,
         )
-        if before_identity != after_identity:
+        try:
+            path_stat = path.stat()
+        except OSError as error:
+            raise OSError(f"source candidate path changed while being read: {path}") from error
+        path_identity = (
+            path_stat.st_dev,
+            path_stat.st_ino,
+            path_stat.st_mode,
+            path_stat.st_size,
+            path_stat.st_mtime_ns,
+            path_stat.st_ctime_ns,
+        )
+        if before_identity != after_identity or after_identity != path_identity:
             raise OSError(f"source candidate changed while being read: {path}")
-        if len(content) > max_bytes:
+        if max_bytes is not None and len(content) > max_bytes:
             raise _SourceReadTooLargeError(f"source candidate exceeds {max_bytes} bytes: {path}")
         return content, after
     finally:
@@ -1710,7 +1720,14 @@ def _read_candidate_fingerprint(
     read_limit: int = _MAX_SOURCE_BYTES,
     require_complete: bool = True,
 ) -> tuple[bool, bytes | None]:
-    if path.is_dir():
+    try:
+        before = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True, None
+    except OSError:
+        return False, None
+
+    if stat.S_ISDIR(before.st_mode):
         try:
             entries: list[bytes] = []
             total_bytes = 0
@@ -1722,15 +1739,89 @@ def _read_candidate_fingerprint(
                 if require_complete and total_bytes > read_limit:
                     return False, None
                 entries.append(entry_name)
+            after = path.stat()
         except OSError:
             return False, None
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            return False, None
         return True, hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).digest()
-    if not path.is_file():
+    if not stat.S_ISREG(before.st_mode):
         return True, None
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        with path.open("rb") as source_file:
-            source = source_file.read(read_limit + int(require_complete))
+        file_descriptor = os.open(path, flags)
+    except (FileNotFoundError, NotADirectoryError):
+        return False, None
+    try:
+        opened = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return False, None
+        chunks: list[bytes] = []
+        remaining = read_limit + int(require_complete)
+        while remaining > 0:
+            chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        source = b"".join(chunks)
+        after = os.fstat(file_descriptor)
+        path_after = path.stat()
     except OSError:
+        return False, None
+    finally:
+        os.close(file_descriptor)
+
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    opened_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mode,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    path_identity = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_mode,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+    )
+    if len({before_identity, opened_identity, after_identity, path_identity}) != 1:
         return False, None
     if require_complete and len(source) > read_limit:
         return False, None

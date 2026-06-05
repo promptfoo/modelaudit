@@ -42,6 +42,7 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -66,6 +67,7 @@ from modelaudit_picklescan.call_graph import (
     _is_standard_path_hook,
     _meta_path_finder_resolution_identity,
     _path_hook_resolution_identity,
+    _read_candidate_fingerprint,
     _resolution_candidate_fingerprint,
     find_startup_hook_write_call_graphs,
 )
@@ -4367,7 +4369,14 @@ def test_scan_bytes_warns_when_inert_source_imports_transitively_shadowable_stdl
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
         for finding in report.findings
     )
-    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    load_payload = (
+        "import importlib, pickle, sys; "
+        f"sys.path.insert(0, {str(tmp_path)!r}); "
+        f"sys.modules.pop({stdlib_module!r}, None); "
+        f"sys.modules.pop({shadow_module!r}, None); "
+        "importlib.invalidate_caches(); "
+        f"pickle.loads({payload!r})"
+    )
     subprocess.run([sys.executable, "-c", load_payload], check=True)
     assert marker.read_text(encoding="utf-8") == "owned"
 
@@ -4483,14 +4492,14 @@ def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     py_compile.compile(
         str(source_path),
         doraise=True,
         invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
     )
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -4523,7 +4532,7 @@ def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     py_compile.compile(
         str(source_path),
@@ -4531,7 +4540,7 @@ def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
         optimize=1,
         invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
     )
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -4562,12 +4571,12 @@ def test_scan_bytes_warns_when_higher_optimized_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     compile_module = f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import {module_name}"
     subprocess.run([sys.executable, "-OOO", "-c", compile_module], check=True)
     marker.unlink()
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -6123,6 +6132,88 @@ def test_resolution_candidate_fingerprint_tracks_large_extension_by_presence(tmp
 
     assert reusable is True
     assert fingerprint == _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+
+
+def test_resolution_candidate_fingerprint_rejects_path_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    replacement_path = tmp_path / "replacement.py"
+    malicious_source = b"import os\nos.system('id')\n"
+    replacement_path.write_bytes(malicious_source)
+    displaced_path = tmp_path / "displaced.py"
+    original_read = call_graph_module.os.read
+    replaced = False
+
+    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(file_descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            source_path.rename(displaced_path)
+            replacement_path.rename(source_path)
+        return chunk
+
+    monkeypatch.setattr(call_graph_module.os, "read", replace_after_first_read)
+
+    assert _resolution_candidate_fingerprint(source_path) == (False, None)
+    assert source_path.read_bytes() == malicious_source
+
+
+def test_read_candidate_fingerprint_rejects_path_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "helper.pyc"
+    source_path.write_bytes(b"safe bytecode")
+    replacement_path = tmp_path / "replacement.pyc"
+    malicious_source = b"malicious bytecode"
+    replacement_path.write_bytes(malicious_source)
+    displaced_path = tmp_path / "displaced.pyc"
+    original_read = call_graph_module.os.read
+    replaced = False
+
+    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(file_descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            source_path.rename(displaced_path)
+            replacement_path.rename(source_path)
+        return chunk
+
+    monkeypatch.setattr(call_graph_module.os, "read", replace_after_first_read)
+
+    assert _read_candidate_fingerprint(source_path) == (False, None)
+    assert source_path.read_bytes() == malicious_source
+
+
+def test_resolution_extension_fingerprint_rejects_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
+    extension_path.write_bytes(b"safe extension")
+    replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
+    replacement_path.write_bytes(b"malicious extension")
+    displaced_path = tmp_path / f"displaced{EXTENSION_SUFFIXES[0]}"
+    original_fstat = call_graph_module.os.fstat
+    fstat_calls = 0
+
+    def replace_after_second_fstat(file_descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        file_stat = original_fstat(file_descriptor)
+        fstat_calls += 1
+        if fstat_calls == 2:
+            extension_path.rename(displaced_path)
+            replacement_path.rename(extension_path)
+        return file_stat
+
+    monkeypatch.setattr(call_graph_module.os, "fstat", replace_after_second_fstat)
+
+    assert _resolution_candidate_fingerprint(extension_path) == (False, None)
 
 
 def test_exact_trusted_path_hook_identity_survives_lazy_method_initialization(
