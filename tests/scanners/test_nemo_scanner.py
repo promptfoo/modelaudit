@@ -4223,6 +4223,28 @@ class TestCVE202523304HydraTarget:
             "shutil.disk_usage",
             "shutil.make_archive",
             "shutil.unpack_archive",
+            "logging.config.dictConfig",
+            "logging.config.fileConfig",
+            "site.addpackage",
+            "site.addsitedir",
+            "site.execsitecustomize",
+            "site.execusercustomize",
+            "site.main",
+            "linecache.checkcache",
+            "linecache.getline",
+            "linecache.getlines",
+            "linecache.updatecache",
+            "logging.FileHandler",
+            "logging.handlers.BaseRotatingHandler",
+            "logging.handlers.RotatingFileHandler",
+            "logging.handlers.SysLogHandler",
+            "logging.handlers.TimedRotatingFileHandler",
+            "logging.handlers.WatchedFileHandler",
+            "omegaconf.OmegaConf.load",
+            "omegaconf.OmegaConf.save",
+            "omegaconf.omegaconf.OmegaConf.load",
+            "omegaconf.omegaconf.OmegaConf.save",
+            "tokenize.open",
             "pathlib.Path.chmod",
             "pathlib.PosixPath.chmod",
             "pathlib.WindowsPath.chmod",
@@ -4244,6 +4266,27 @@ class TestCVE202523304HydraTarget:
             check.name == "CVE-2025-23304: Dangerous Hydra _target_"
             and check.status == CheckStatus.FAILED
             and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "omegaconf.OmegaConf.create",
+            "omegaconf.omegaconf.OmegaConf.create",
+        ],
+    )
+    def test_non_io_omegaconf_targets_remain_safe(self, tmp_path: Path, target: str) -> None:
+        """Exact OmegaConf I/O overrides must not invalidate the broader safe namespace."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
             and check.details.get("target") == target
             for check in result.checks
         )
@@ -4393,6 +4436,12 @@ class TestCVE202523304HydraTarget:
             "custom.ssl.SSLContextFactory.SafeBuilder",
             "custom.configparser.ConfigParserFactory.SafeBuilder",
             "custom.shutil.which_factory.SafeBuilder",
+            "custom.logging.config.dictConfigFactory.SafeBuilder",
+            "custom.site.addsitedir_factory.SafeBuilder",
+            "custom.linecache.getline_factory.SafeBuilder",
+            "custom.logging.FileHandlerFactory.SafeBuilder",
+            "custom.omegaconf.OmegaConf.load_factory.SafeBuilder",
+            "custom.tokenize.open_factory.SafeBuilder",
         ],
     )
     def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
@@ -4708,6 +4757,11 @@ class TestCVE202523304HydraTarget:
             "pathlib.Path.resolve",
             "shutil.unpack_archive",
             "shutil.which",
+            "logging.config.dictConfig",
+            "omegaconf.OmegaConf.load",
+            "site.addsitedir",
+            "logging.FileHandler",
+            "linecache.getline",
         ],
     )
     def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
