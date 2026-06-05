@@ -1,3 +1,4 @@
+import errno
 import importlib
 import json
 import os
@@ -848,6 +849,236 @@ def test_cli_report_writers_allow_dotdot_without_links(tmp_path: Path) -> None:
     assert json.loads((output_dir / "scanners.json").read_text())["scanners"]
 
 
+def test_cli_report_writers_reject_dotdot_after_regular_file(tmp_path: Path) -> None:
+    """Pinned ``..`` handling must retain the kernel's intermediate-directory checks."""
+    regular_file = tmp_path / "not-a-directory"
+    regular_file.write_text("sentinel")
+    output_path = regular_file / ".." / "scanners.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert regular_file.read_text() == "sentinel"
+    assert not (tmp_path / "scanners.json").exists()
+
+
+def test_cli_report_writers_pin_dotdot_before_parent_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renamed child must not change the parent selected by a validated ``..``."""
+    safe_dir = tmp_path / "safe"
+    child_dir = safe_dir / "child"
+    child_dir.mkdir(parents=True)
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    output_path = child_dir / ".." / "scanners.json"
+    original_open = cli_module.os.open
+    original_supports_dir_fd = cli_module.os.supports_dir_fd
+    moved = False
+
+    def rename_child_after_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal moved
+        opened_fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "child" and not moved:
+            child_dir.rename(target_dir / "relocated")
+            moved = True
+        return opened_fd
+
+    monkeypatch.setattr(cli_module.os, "open", rename_child_after_open)
+    monkeypatch.setattr(
+        cli_module.os,
+        "supports_dir_fd",
+        {rename_child_after_open if function is original_open else function for function in original_supports_dir_fd},
+    )
+
+    cli_module._write_output_text_file(str(output_path), "secret")
+
+    assert (safe_dir / "scanners.json").read_text() == "secret"
+    assert not (target_dir / "scanners.json").exists()
+
+
+def test_cli_report_writers_normalize_unicode_encode_failure(
+    tmp_path: Path,
+) -> None:
+    """Unencodable rendered evidence must fail with exit code 2 and clean its temp file."""
+    output_path = tmp_path / "scanners.json"
+
+    with pytest.raises(cli_module._OutputWriteError) as exc_info:
+        cli_module._write_output_text_file(str(output_path), "unsafe\udcfftext")
+
+    assert exc_info.value.exit_code == 2
+    assert "Unable to encode output" in str(exc_info.value)
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+def test_cli_report_writers_preserve_existing_output_on_unicode_encode_failure(tmp_path: Path) -> None:
+    """Encoding validation must finish before an existing report is truncated."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("sentinel")
+
+    with pytest.raises(cli_module._OutputWriteError) as exc_info:
+        cli_module._write_output_text_file(str(output_path), "unsafe\udcfftext")
+
+    assert exc_info.value.exit_code == 2
+    assert "Unable to encode output" in str(exc_info.value)
+    assert output_path.read_text() == "sentinel"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+def test_cli_report_writers_preserve_existing_output_on_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged write failure must leave the existing report intact."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("sentinel")
+
+    def fail_fsync(_fd: int) -> None:
+        raise OSError(errno.EIO, "simulated fsync failure")
+
+    monkeypatch.setattr(cli_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(cli_module._OutputWriteError) as exc_info:
+        cli_module._write_output_text_file(str(output_path), "replacement")
+
+    assert exc_info.value.exit_code == 2
+    assert "simulated fsync failure" in str(exc_info.value)
+    assert output_path.read_text() == "sentinel"
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+def test_cli_report_writers_reject_missing_path_with_trailing_separator(tmp_path: Path) -> None:
+    """A directory-spelled output must not silently become a regular file."""
+    output_path = tmp_path / "new-output"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", f"{output_path}{os.sep}"],
+    )
+
+    assert result.exit_code == 2
+    assert "trailing separator" in result.output
+    assert not output_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+def test_cli_report_writers_stage_new_output_in_private_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed temp source must live in a private directory distinct from the output parent."""
+    output_path = tmp_path / "scanners.json"
+    original_link = cli_module.os.link
+    original_supports_dir_fd = cli_module.os.supports_dir_fd
+    observed_stage_modes: list[int] = []
+
+    def inspect_staging_then_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert src_dir_fd is not None
+        assert dst_dir_fd is not None
+        assert src_dir_fd != dst_dir_fd
+        observed_stage_modes.append(stat.S_IMODE(os.fstat(src_dir_fd).st_mode))
+        original_link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(cli_module.os, "link", inspect_staging_then_link)
+    monkeypatch.setattr(
+        cli_module.os,
+        "supports_dir_fd",
+        {inspect_staging_then_link if function is original_link else function for function in original_supports_dir_fd},
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert observed_stage_modes
+    assert all(mode & 0o077 == 0 for mode in observed_stage_modes)
+    assert json.loads(output_path.read_text())["scanners"]
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative installation is required")
+def test_cli_report_writers_do_not_replace_destination_created_during_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A destination created after validation must win instead of being overwritten."""
+    output_path = tmp_path / "scanners.json"
+    original_link = cli_module.os.link
+    original_supports_dir_fd = cli_module.os.supports_dir_fd
+
+    def create_destination_then_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert dst_dir_fd is not None
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dst_dir_fd)
+        with os.fdopen(destination_fd, "w") as destination_file:
+            destination_file.write("sentinel")
+        original_link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(cli_module.os, "link", create_destination_then_link)
+    monkeypatch.setattr(
+        cli_module.os,
+        "supports_dir_fd",
+        {
+            create_destination_then_link if function is original_link else function
+            for function in original_supports_dir_fd
+        },
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Unable to write output" in result.output
+    assert output_path.read_text() == "sentinel"
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+@pytest.mark.skipif(not hasattr(os, "setxattr"), reason="Extended attributes are unavailable")
+def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
+    """Overwriting an existing report must preserve its security metadata."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("stale")
+    attribute_name = b"user.modelaudit_test"
+    try:
+        os.setxattr(output_path, attribute_name, b"keep")
+    except OSError as exc:
+        pytest.skip(f"Extended attributes are unsupported: {exc}")
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert os.getxattr(output_path, attribute_name) == b"keep"
+
+
 def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
     """A report path must not truncate another name for the same inode."""
     victim_path = tmp_path / "victim.txt"
@@ -863,6 +1094,49 @@ def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "Refusing to overwrite hard-linked output" in result.output
     assert victim_path.read_text() == "sentinel"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+def test_cli_report_writers_do_not_disclose_output_through_late_hard_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hard link created after validation must retain only the old report content."""
+    output_path = tmp_path / "scanners.json"
+    alias_path = tmp_path / "late-alias.json"
+    output_path.write_text("stale")
+    original_rename = cli_module.os.rename
+    original_supports_dir_fd = cli_module.os.supports_dir_fd
+
+    def link_destination_then_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        alias_path.hardlink_to(output_path)
+        original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(cli_module.os, "rename", link_destination_then_rename)
+    monkeypatch.setattr(
+        cli_module.os,
+        "supports_dir_fd",
+        {
+            link_destination_then_rename if function is original_rename else function
+            for function in original_supports_dir_fd
+        },
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+    assert alias_path.read_text() == "stale"
+    assert not output_path.samefile(alias_path)
 
 
 @pytest.mark.skipif(os.access not in os.supports_dir_fd, reason="Descriptor-relative access checks are required")
@@ -1068,12 +1342,40 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
     output_path = output_dir / output_name
     original_replace = cli_module._replace_windows_output_file
 
-    def attempt_parent_swap(output: str, temp_fd: int, parent_handle: int, destination_name: str) -> None:
+    def attempt_parent_swap(
+        output: str,
+        temp_fd: int,
+        parent_handle: int,
+        destination_name: str,
+        *,
+        replace_existing: bool,
+    ) -> None:
         with pytest.raises(OSError):
             output_dir.rename(renamed_dir)
-        original_replace(output, temp_fd, parent_handle, destination_name)
+        original_replace(
+            output,
+            temp_fd,
+            parent_handle,
+            destination_name,
+            replace_existing=replace_existing,
+        )
 
     monkeypatch.setattr(cli_module, "_replace_windows_output_file", attempt_parent_swap)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native replacement semantics are required")
+def test_cli_report_writers_windows_atomically_overwrite_existing_output(tmp_path: Path) -> None:
+    """Windows must request replacement only for the validated existing destination."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("stale")
 
     result = CliRunner().invoke(
         cli,
@@ -1155,7 +1457,7 @@ def test_cli_report_writers_preserve_read_only_output(tmp_path: Path) -> None:
     reason="An unprivileged POSIX user is required",
 )
 def test_cli_report_writers_fail_closed_in_read_only_directory(tmp_path: Path) -> None:
-    """Atomic installation must not fall back to truncating the destination inode."""
+    """Atomic replacement must not fall back to writing through the destination inode."""
     output_dir = tmp_path / "read-only-directory"
     output_dir.mkdir()
     output_path = output_dir / "scanners.json"
@@ -1263,6 +1565,7 @@ def test_cli_report_writers_atomically_overwrite_regular_file_and_preserve_mode(
     output_path = tmp_path / "scanners.json"
     output_path.write_text("stale")
     output_path.chmod(0o640)
+    original_inode = output_path.stat().st_ino
 
     result = CliRunner().invoke(
         cli,
@@ -1271,6 +1574,7 @@ def test_cli_report_writers_atomically_overwrite_regular_file_and_preserve_mode(
 
     assert result.exit_code == 0, result.output
     assert json.loads(output_path.read_text())["scanners"]
+    assert output_path.stat().st_ino != original_inode
     assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
 
 
