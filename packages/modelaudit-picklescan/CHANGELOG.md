@@ -58,6 +58,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound native pickle state simulation for tracked dictionaries, memo clones,
   dotted globals, and recursive mappings
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
+- avoid custom meta-path finder calls during pickle call-graph source probing
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`
