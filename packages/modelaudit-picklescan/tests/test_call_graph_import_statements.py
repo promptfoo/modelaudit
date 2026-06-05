@@ -2048,6 +2048,58 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
     assert not marker.exists()
 
 
+def test_call_graph_fails_closed_for_meta_path_finder_installed_before_import(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_preimport_meta_path_probe"
+    (module_dir / f"{module_name}.py").write_text(
+        "def invoke(command):\n    return command\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "preimport_meta_path_called"
+    child_code = """
+import sys
+from importlib.machinery import ModuleSpec
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+module_name = sys.argv[3]
+
+class PreexistingMetaPathFinder:
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        del path, target
+        if fullname == module_name:
+            marker.write_text(fullname, encoding="utf-8")
+            return ModuleSpec(fullname, loader=None, origin="custom://module")
+        return None
+
+sys.path.insert(0, str(module_dir))
+sys.meta_path.insert(0, PreexistingMetaPathFinder())
+from modelaudit_picklescan.call_graph import _call_graph_source_unavailable_reason
+
+reason = _call_graph_source_unavailable_reason(module_name)
+if reason != "source_unavailable":
+    raise SystemExit(f"unexpected source reason: {reason!r}")
+if marker.exists():
+    raise SystemExit("pre-existing finder was invoked")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), module_name],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
 def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_finders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2303,6 +2355,84 @@ def test_call_graph_does_not_invoke_custom_path_hook(
         _clear_call_graph_caches()
 
     assert not marker.exists()
+
+
+def test_call_graph_rejects_path_hook_with_spoofed_standard_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_spoofed_path_hook_probe"
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / f"{module_name}.py").write_text("def invoke():\n    return None\n", encoding="utf-8")
+    marker = tmp_path / "spoofed_path_hook_called"
+
+    def spoofed_path_hook(path: str) -> object:
+        marker.write_text(path, encoding="utf-8")
+        raise ImportError
+
+    spoofed_path_hook.__module__ = "_frozen_importlib_external"
+    spoofed_path_hook.__qualname__ = "FileFinder.path_hook.<locals>.path_hook_for_FileFinder"
+    monkeypatch.syspath_prepend(str(module_dir))
+    monkeypatch.setattr(sys, "path_hooks", [spoofed_path_hook, *sys.path_hooks])
+    sys.path_importer_cache.pop(str(module_dir), None)
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) == "source_unavailable"
+    finally:
+        _clear_call_graph_caches()
+
+    assert not marker.exists()
+
+
+def test_call_graph_honors_zipimport_precedence_over_later_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_zip_shadowing_extension"
+    zip_path = tmp_path / "modules.zip"
+    extension_dir = tmp_path / "extension"
+    extension_dir.mkdir()
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(f"{module_name}.py", "def invoke(command):\n    return command\n")
+    (extension_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
+    monkeypatch.setattr(sys, "path", [str(zip_path), str(extension_dir), *sys.path])
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="zip-shadowing-extension.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_call_graph_keeps_extension_precedence_over_later_zipimport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_extension_shadowing_zip"
+    extension_dir = tmp_path / "extension"
+    extension_dir.mkdir()
+    zip_path = tmp_path / "modules.zip"
+    (extension_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(f"{module_name}.py", "def invoke(command):\n    return command\n")
+    monkeypatch.setattr(sys, "path", [str(extension_dir), str(zip_path), *sys.path])
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) is None
+    finally:
+        _clear_call_graph_caches()
 
 
 def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
@@ -2614,6 +2744,7 @@ def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
         "import os\n\ndef device(command):\n    os.system(command)\n    return command\n",
         encoding="utf-8",
     )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.syspath_prepend(str(module_dir))
     importlib.invalidate_caches()
     _clear_call_graph_caches()
@@ -2658,6 +2789,7 @@ else:
 """,
         encoding="utf-8",
     )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.syspath_prepend(str(module_dir))
     importlib.invalidate_caches()
     _clear_call_graph_caches()
@@ -2745,6 +2877,7 @@ def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
         "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
         encoding="utf-8",
     )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.syspath_prepend(str(module_dir))
     importlib.invalidate_caches()
     _clear_call_graph_caches()

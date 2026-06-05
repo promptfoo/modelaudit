@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
 import hashlib
 import os
 import sys
@@ -46,9 +47,7 @@ _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
-_TRUSTED_META_PATH_FINDERS = tuple(sys.meta_path)
 _TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
-_TRUSTED_PATH_IMPORTERS = tuple(finder for finder in sys.path_importer_cache.values() if finder is not None)
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
@@ -1047,17 +1046,17 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if isinstance(loaded_spec, ModuleSpec):
         return loaded_spec
 
-    if not _untrusted_meta_path_finder_precedes(BuiltinImporter):
+    if not _untrusted_meta_path_finder_precedes(BuiltinImporter, module_name):
         builtin_spec = BuiltinImporter.find_spec(module_name)
         if builtin_spec is not None:
             return builtin_spec
 
-    if not _untrusted_meta_path_finder_precedes(FrozenImporter):
+    if not _untrusted_meta_path_finder_precedes(FrozenImporter, module_name):
         frozen_spec = FrozenImporter.find_spec(module_name)
         if frozen_spec is not None:
             return frozen_spec
 
-    if _untrusted_meta_path_finder_precedes(PathFinder) or _has_untrusted_path_hook():
+    if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
     return _find_standard_filesystem_spec(module_name)
@@ -1084,40 +1083,58 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
     return spec
 
 
-def _untrusted_meta_path_finder_precedes(target: object) -> bool:
+def _matches_loaded_finder_type(finder: object, module_name: str, type_name: str) -> bool:
+    module = sys.modules.get(module_name)
+    finder_type = getattr(module, type_name, None) if module is not None else None
+    return isinstance(finder_type, type) and type(finder) is finder_type
+
+
+def _known_meta_path_finder_cannot_handle(finder: object, module_name: str) -> bool:
+    root_name = module_name.split(".", maxsplit=1)[0]
+    if _matches_loaded_finder_type(finder, "_distutils_hack", "DistutilsMetaFinder"):
+        return root_name not in {"distutils", "pip", "test"}
+
+    if _matches_loaded_finder_type(finder, "_virtualenv", "_Finder"):
+        virtualenv_module = sys.modules.get("_virtualenv")
+        patched_modules = getattr(virtualenv_module, "_DISTUTILS_PATCH", ()) if virtualenv_module is not None else ()
+        return module_name not in patched_modules
+
+    if _matches_loaded_finder_type(finder, "_pytest.assertion.rewrite", "AssertionRewritingHook"):
+        if module_name == "conftest":
+            return False
+        must_rewrite = getattr(finder, "_must_rewrite", ())
+        if any(module_name == name or module_name.startswith(f"{name}.") for name in must_rewrite):
+            return False
+        patterns = getattr(finder, "fnpats", ())
+        module_filename = f"{module_name.rsplit('.', maxsplit=1)[-1]}.py"
+        return all(not fnmatch.fnmatchcase(module_filename, pattern) for pattern in patterns)
+
+    return False
+
+
+def _untrusted_meta_path_finder_precedes(target: object, module_name: str) -> bool:
     for finder in sys.meta_path:
         if finder is target:
             return False
         if finder is BuiltinImporter or finder is FrozenImporter or finder is PathFinder:
             continue
-        if any(finder is trusted_finder for trusted_finder in _TRUSTED_META_PATH_FINDERS):
+        if _known_meta_path_finder_cannot_handle(finder, module_name):
             continue
         return True
     return True
 
 
 def _is_standard_path_hook(hook: object) -> bool:
-    if hook is zipimporter:
-        return True
-    return getattr(hook, "__module__", None) == "_frozen_importlib_external" and getattr(
-        hook, "__qualname__", ""
-    ).endswith("FileFinder.path_hook.<locals>.path_hook_for_FileFinder")
+    return hook is zipimporter or any(hook is trusted_hook for trusted_hook in _TRUSTED_PATH_HOOKS)
 
 
 def _has_untrusted_path_hook() -> bool:
-    if any(
-        not _is_standard_path_hook(hook) and not any(hook is trusted_hook for trusted_hook in _TRUSTED_PATH_HOOKS)
-        for hook in sys.path_hooks
-    ):
+    if any(not _is_standard_path_hook(hook) for hook in sys.path_hooks):
         return True
     for entry in sys.path:
         cache_key = entry or os.getcwd()
         finder = sys.path_importer_cache.get(cache_key)
-        if (
-            finder is not None
-            and not isinstance(finder, (FileFinder, zipimporter))
-            and not any(finder is trusted_finder for trusted_finder in _TRUSTED_PATH_IMPORTERS)
-        ):
+        if finder is not None and not isinstance(finder, (FileFinder, zipimporter)):
             return True
     return False
 
@@ -1130,6 +1147,13 @@ def _find_standard_path_spec(module_name: str, search_path: list[str]) -> Module
         (SourcelessFileLoader, BYTECODE_SUFFIXES),
     )
     for entry in search_path:
+        try:
+            zip_spec = zipimporter(entry).find_spec(module_name)
+        except ImportError:
+            zip_spec = None
+        if zip_spec is not None:
+            return zip_spec
+
         finder = FileFinder(entry, *loader_details)
         spec = finder.find_spec(module_name)
         if spec is None:
@@ -3577,7 +3601,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 return loaded_source_path
         if loaded_spec.origin not in {"built-in", "frozen"}:
             return None
-    elif _untrusted_meta_path_finder_precedes(PathFinder) or _has_untrusted_path_hook():
+    elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
     spec = _find_standard_filesystem_spec(module_name)
