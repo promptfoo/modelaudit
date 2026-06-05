@@ -310,7 +310,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
-- include bounded content-routed Hugging Face repository files in selective downloads, pin probes and downloads to one immutable revision, redact signed transport errors, enforce acquisition deadlines across transfer process groups, and fail closed when repository coverage cannot be completed safely
+- include bounded content-routed Hugging Face repository files in selective downloads, preserve local filename-based false-positive guards, pin probes and downloads to one immutable revision, redact signed transport errors, enforce acquisition deadlines across transfer process groups, and fail closed when repository coverage cannot be completed safely
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage

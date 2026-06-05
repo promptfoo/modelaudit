@@ -626,6 +626,7 @@ def _detect_huggingface_content_route_format(
     budget: _HuggingFaceProbeBudget,
 ) -> str | None:
     """Return a content-routed model format for a remote file, if cheaply identifiable."""
+    remote_path = Path(filename)
     prefix = _read_huggingface_prefix(repo_id, filename, revision, budget, _HF_CONTENT_SNIFF_BYTES)
     if not prefix:
         return None
@@ -650,7 +651,7 @@ def _detect_huggingface_content_route_format(
         return "safetensors"
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
-    if _is_cntk_signature(prefix):
+    if remote_path.suffix.lower() != ".model" and _is_cntk_signature(prefix):
         return "cntk"
     if _is_content_routed_lightgbm_signature(prefix):
         return "lightgbm"
@@ -685,7 +686,7 @@ def _detect_huggingface_content_route_format(
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
         ):
             return "pickle"
-    if _allows_renamed_binary_content_route(Path(filename)):
+    if _allows_renamed_binary_content_route(remote_path):
         executorch_state = _probe_huggingface_executorch_prefix(
             prefix,
             sample_is_prefix=_huggingface_sample_is_prefix(
@@ -713,7 +714,11 @@ def _detect_huggingface_content_route_format(
         max(len(prefix), 1),
         None,
     )
-    tflite_route_blocked = Path(filename).suffix.lower() in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS
+    if detected_format in {"rknn", "torch7"} and not _allows_renamed_binary_content_route(remote_path):
+        detected_format = "unknown"
+    if detected_format == "cntk" and remote_path.suffix.lower() == ".model":
+        detected_format = "unknown"
+    tflite_route_blocked = remote_path.suffix.lower() in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS
     if detected_format == "tflite" and tflite_route_blocked:
         detected_format = "unknown"
     if (

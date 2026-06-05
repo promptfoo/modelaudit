@@ -1200,6 +1200,41 @@ class TestModelDownload:
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
 
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("graph.pb", b"T7\x00\x00" + b"\x00" * 16),
+            ("weights.model", b"B\x00C\x00N\x00\x00\x00" + b"\x00" * 16),
+        ],
+        ids=["torch7", "cntk"],
+    )
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_preserves_magic_route_suffix_guards(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_get_extensions: MagicMock,
+        filename: str,
+        payload: bytes,
+        tmp_path: Path,
+    ) -> None:
+        """Remote magic probes must preserve local filename-dependent false-positive guards."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.safetensors").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["model.safetensors", filename], _HF_TEST_REVISION, None),
+        ):
+            download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
+
     @pytest.mark.parametrize("blocked_suffix", [".bin", ".meta", ".pb"])
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch("requests.get")
