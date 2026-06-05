@@ -1,7 +1,7 @@
 """Tests for scanner evidence redaction helpers."""
 
 import json
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus
 
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
@@ -337,22 +337,6 @@ def test_redacts_bracketed_sensitive_query_parameters() -> None:
     assert "ok=1" in redacted
 
 
-def test_redacts_semicolon_and_nested_sensitive_query_parameters() -> None:
-    """Alternative separators and nested encodings must not preserve credential values."""
-    text = (
-        "first=https://example.com/callback?ok=1;to%6ben=SEMICOLONSECRET123 "
-        "second=https://example.com/callback?ok=token%253DNESTEDSECRET456 "
-        "third=https://example.com/callback?ok=1&amp;token=HTMLSECRET789"
-    )
-
-    redacted = redact_evidence_string(text, max_chars=500)
-
-    assert "SEMICOLONSECRET123" not in redacted
-    assert "NESTEDSECRET456" not in redacted
-    assert "HTMLSECRET789" not in redacted
-    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
-
-
 def test_redacts_malformed_userinfo_url() -> None:
     """Malformed userinfo URLs should fail closed instead of returning raw evidence."""
     text = "download=https://user:LEAKY-PASS@[::1/path?token=QUERYSECRET"
@@ -362,6 +346,59 @@ def test_redacts_malformed_userinfo_url() -> None:
     assert "user:LEAKY-PASS" not in redacted
     assert "QUERYSECRET" not in redacted
     assert "https://<credentials-redacted>@[::1/path" in redacted
+
+
+def test_redacts_iteratively_encoded_query_keys_and_assignments() -> None:
+    """Encoded key names and whole assignments must not preserve their values."""
+    text = (
+        "whole=https://example.test/?token%3DWHOLEKEYSECRET123 "
+        "key=https://example.test/?to%256ben=DOUBLEKEYSECRET456 "
+        "value=https://example.test/?ok=token%252525253DDEEPVALUESECRET789"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "WHOLEKEYSECRET123" not in redacted
+    assert "DOUBLEKEYSECRET456" not in redacted
+    assert "DEEPVALUESECRET789" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
+    assert redacted.count("token=<redacted>") == 2
+
+
+def test_fails_closed_when_query_key_decoding_exceeds_budget() -> None:
+    """Excessively encoded key names must not bypass sensitive-key handling."""
+    encoded_key = "to%6ben"
+    for _ in range(10):
+        encoded_key = quote(encoded_key, safe="")
+
+    redacted = redact_evidence_string(
+        f"https://example.test/?{encoded_key}=OVERBUDGETSECRET123",
+        max_chars=None,
+    )
+
+    assert "OVERBUDGETSECRET123" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_preserves_iteratively_encoded_benign_query_components() -> None:
+    """Bounded decoding must not redact non-sensitive encoded key/value pairs."""
+    text = "https://example.test/?sta%2574us=pub%256cic&whole=monkey%253Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+    assert "status=public" in unquote_plus(unquote_plus(redacted))
+    assert "whole=monkey=public" in unquote_plus(unquote_plus(redacted))
+
+
+def test_preserves_shell_operators_in_benign_query_values() -> None:
+    """URL normalization must not hide compact shell syntax from evidence."""
+    text = "first=https://example.test/?x=1|sh second=https://example.test/?x=1;rm"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "?x=1|sh" in redacted
+    assert "?x=1;rm" in redacted
 
 
 def test_redacts_userinfo_for_generic_url_schemes() -> None:

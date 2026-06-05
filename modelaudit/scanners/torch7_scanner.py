@@ -20,8 +20,13 @@ CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
-EXEC_PRIMITIVE_CALL_PATTERN = re.compile(
-    r"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
+EXEC_PRIMITIVE_NAME_PATTERN = r"(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)"
+EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)\b{EXEC_PRIMITIVE_NAME_PATTERN}\s*\(")
+EXECUTION_WRAPPER_PREFIX_PATTERN = r"(?:\(\s*)*(?:[a-z_][\w.]*\s*\(\s*(?:\(\s*)*){0,4}"
+EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
+    rf"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*"
+    rf"(?:\s*\[\s*['\"][^'\"]{{1,120}}['\"]\s*\])?\s*=\s*)"
+    rf"(?={EXECUTION_WRAPPER_PREFIX_PATTERN}{EXEC_PRIMITIVE_NAME_PATTERN}\s*\()"
 )
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
@@ -214,7 +219,21 @@ class Torch7Scanner(BaseScanner):
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
-        return redact_evidence_string(text, max_chars=max_chars)
+        protected_targets: list[str] = []
+
+        def protect_execution_target(match: re.Match[str]) -> str:
+            protected_targets.append(match.group("target"))
+            return f"\x00{len(protected_targets) - 1}\x00"
+
+        protected = EXECUTION_ASSIGNMENT_TARGET_PATTERN.sub(protect_execution_target, text)
+        redacted = redact_evidence_string(protected, max_chars=None)
+        for index, target in enumerate(protected_targets):
+            redacted = redacted.replace(f"\x00{index}\x00", target)
+        if len(redacted) <= max_chars:
+            return redacted
+        if max_chars <= 3:
+            return redacted[:max_chars]
+        return f"{redacted[: max_chars - 3]}..."
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []

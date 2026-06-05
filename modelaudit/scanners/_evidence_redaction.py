@@ -582,8 +582,8 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
     raw_query_values = [segment.partition("=")[2] for segment in normalized_query.split("&")]
     for index, (key, value) in enumerate(parse_qsl(normalized_query, keep_blank_values=True)):
-        if _is_sensitive_detail_key(_normalize_query_key(key)):
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        if (redacted_key := _redacted_query_key(key)) is not None:
+            query_items.append((redacted_key, REDACTED_EVIDENCE_VALUE))
             continue
         redacted_value = _redact_url_query_value(value, url_depth=url_depth)
         encoded_nested_url = index < len(raw_query_values) and "%3a%2f%2f" in raw_query_values[index].lower()
@@ -599,7 +599,7 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
             parsed.scheme,
             netloc,
             path,
-            urlencode(query_items, doseq=True, safe="<>"),
+            urlencode(query_items, doseq=True, safe="<>|;"),
             "",
         )
     )
@@ -607,12 +607,9 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
 
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
     """Recognize credential assignments nested inside encoded query values."""
-    decoded = value
-    for _ in range(3):
-        next_decoded = unquote_plus(decoded)
-        if next_decoded == decoded:
-            break
-        decoded = next_decoded
+    decoded, decoding_complete = _decode_query_component(value)
+    if not decoding_complete:
+        return True
     return bool(
         NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
         or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
@@ -643,12 +640,44 @@ def _contains_nested_url_secret(value: str) -> bool:
             return True
         normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
         if any(
-            _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
-            or _contains_nested_sensitive_query_assignment(query_value)
+            _query_key_is_sensitive(key) or _contains_nested_sensitive_query_assignment(query_value)
             for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
         ):
             return True
     return False
+
+
+def _decode_query_component(value: str) -> tuple[str, bool]:
+    """Decode a query component within the URL redaction budget."""
+    decoded = value
+    for _ in range(MAX_URL_QUERY_REDACTION_DEPTH):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            return decoded, True
+        decoded = next_decoded
+    return decoded, unquote_plus(decoded) == decoded
+
+
+def _redacted_query_key(key: str) -> str | None:
+    """Return a safe key when an encoded query key must be redacted."""
+    decoded, decoding_complete = _decode_query_component(key)
+    if not decoding_complete:
+        return "credential"
+    if _is_sensitive_detail_key(_normalize_query_key(decoded)):
+        return decoded
+
+    assignment_match = NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+    if assignment_match is None:
+        return None
+    assignment = decoded[assignment_match.start() :].lstrip("?&;")
+    if assignment.lower().startswith("amp;"):
+        assignment = assignment[4:]
+    candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
+    return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
+
+
+def _query_key_is_sensitive(key: str) -> bool:
+    return _redacted_query_key(key) is not None
 
 
 def _normalize_query_key(key: str) -> str:
