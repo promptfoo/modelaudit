@@ -23,6 +23,7 @@ _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"AKIA[0-9A-Z]{16}|"
     r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"hf_[A-Za-z0-9]{30,}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"

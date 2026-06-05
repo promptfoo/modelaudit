@@ -32,6 +32,7 @@ STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
     r"glpat-[A-Za-z0-9_-]{20}|"
+    r"hf_[A-Za-z0-9]{30,}|"
     r"npm_[A-Za-z0-9]{36}|"
     r"sq0atp-[0-9A-Za-z_-]{22}|"
     r"sq0csp-[0-9A-Za-z_-]{43}|"

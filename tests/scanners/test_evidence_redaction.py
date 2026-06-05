@@ -1230,6 +1230,7 @@ def test_preserves_valid_azure_container_url_nested_in_query() -> None:
         "ghr_" + "a" * 36,
         "AIza" + "a" * 35,
         "glpat-" + "a" * 20,
+        "hf_" + "a" * 34,
         "npm_" + "a" * 36,
         "sq0atp-" + "a" * 22,
         "sq0csp-" + "a" * 43,
@@ -1266,6 +1267,7 @@ def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) ->
     "near_miss",
     [
         "ghp_" + "a" * 35,
+        "hf_" + "a" * 29,
         "sk_live_" + "a" * 23,
         "sk-proj-" + "abc_def-" * 2 + "abcdefg",
         "modelghp_" + "a" * 36,

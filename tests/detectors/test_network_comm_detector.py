@@ -719,6 +719,23 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://raw.githubusercontent.com/org/repo/<redacted>/model.py"
         assert github_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_huggingface_path_tokens_override_repository_preservation(self) -> None:
+        """Known tokens must be redacted even where public repository names are normally preserved."""
+        token = "hf_" + "a" * 34
+        url = f"https://huggingface.co/{token}/repo/resolve/main/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://huggingface.co/<redacted>/repo/resolve/main/model.bin"
+        assert token not in redacted
+
+    def test_huggingface_path_token_near_miss_is_preserved(self) -> None:
+        """Short hf_-prefixed repository names should remain actionable."""
+        repository_owner = "hf_" + "a" * 29
+        url = f"https://huggingface.co/{repository_owner}/repo/resolve/main/model.bin"
+
+        assert network_comm.redact_url_for_finding(url) == url
+
     def test_benign_short_url_paths_are_preserved(self) -> None:
         """Ordinary URL paths should remain readable after redaction."""
         detector = NetworkCommDetector()
