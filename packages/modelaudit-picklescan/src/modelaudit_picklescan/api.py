@@ -26,7 +26,6 @@ from .call_graph import (
     import_only_reference_is_proven_trusted,
     module_initialization_is_proven_inert,
     shared_source_sensitive_caches,
-    trusted_import_reference_requires_invocation_analysis,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -1399,10 +1398,7 @@ def _non_allowlisted_import_finding_is_proven_safe(
     )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
     trusted_reference_is_proven_safe = position is not None and (
-        not finding_is_invoked
-        or not trusted_import_reference_requires_invocation_analysis(module, name)
-        or invocation_is_analyzed
-        or invocation_is_trusted_reconstruction
+        not finding_is_invoked or invocation_is_analyzed or invocation_is_trusted_reconstruction
     )
     return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules

@@ -3337,7 +3337,23 @@ def test_scan_bytes_detects_copyreg_dispatch_table_erasure() -> None:
         copyreg.dispatch_table.update(original_dispatch_table)
 
 
-def test_scan_bytes_does_not_flag_trusted_dill_dump_as_dangerous(
+def test_scan_bytes_allows_trusted_dill_dump_import_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("dill", "dump"),
+    )
+
+    report = scan_bytes(b"cdill\ndump\n.", source="dill-dump-import-only.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_requires_source_analysis_for_invoked_trusted_dill_dump(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = b"\x80\x02cdill\ndump\n(tR."
@@ -3349,14 +3365,18 @@ def test_scan_bytes_does_not_flag_trusted_dill_dump_as_dangerous(
 
     report = scan_bytes(payload, source="dill-dump.pkl")
 
-    assert report.findings == ()
     source_reason = _call_graph_source_unavailable_reason("dill")
     if source_reason is None:
+        assert report.findings == ()
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.CLEAN
     else:
         assert report.status == ScanStatus.INCONCLUSIVE
-        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+            for finding in report.findings
+        )
         assert any(
             notice.code == "call_graph_source_unavailable"
             and notice.details.get("import_reference") == "dill.dump"

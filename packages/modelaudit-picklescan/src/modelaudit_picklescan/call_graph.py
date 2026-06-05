@@ -300,7 +300,6 @@ _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
     }
 )
 _TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
-_TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS = frozenset({("_xxsubinterpreters", "create")})
 _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
     frozenset(
         {
@@ -903,13 +902,8 @@ def find_unanalyzed_callable_call_graph_references(
         if not module or not name or (module, name) in seen:
             continue
         seen.add((module, name))
-        if (
-            _is_skippable_torch_extension_global_reference(module, name)
-            or _unresolved_trusted_import_reference_is_safe(module, name)
-            or (
-                (module, name) in _TRUSTED_IMPORT_ONLY_REFERENCES
-                and not trusted_import_reference_requires_invocation_analysis(module, name)
-            )
+        if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
+            module, name
         ):
             continue
         if (module, name) in incomplete_newobj_ex_references:
@@ -992,11 +986,6 @@ def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool
         origin_kind in {"stdlib", "site_packages"}
         or (origin_kind == "unresolved" and reference in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES)
     )
-
-
-def trusted_import_reference_requires_invocation_analysis(module_name: str, name: str) -> bool:
-    """Return whether invoking a trusted import still needs source-backed analysis."""
-    return (module_name, name) in _TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS
 
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:

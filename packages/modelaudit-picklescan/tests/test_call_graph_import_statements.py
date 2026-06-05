@@ -2905,6 +2905,8 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
 
 def test_scan_bytes_ignores_benign_torch_extension_metadata_globals() -> None:
     torch = pytest.importorskip("torch")
+    if not all(hasattr(torch, name) for name in ("device", "float32", "Size")):
+        pytest.skip("usable PyTorch API is unavailable")
     payload = pickle.dumps(
         {
             "device": torch.device("cpu"),
@@ -3313,6 +3315,8 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
 
 def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
     torch = pytest.importorskip("torch")
+    if not hasattr(torch, "strided"):
+        pytest.skip("usable PyTorch API is unavailable")
     payload = pickle.dumps(torch.strided, protocol=4)
 
     report = scan_bytes(payload, source="torch-layout-clean.pkl")
@@ -3323,6 +3327,8 @@ def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
 
 def test_scan_bytes_uses_torch_module_lifecycle_entrypoints_for_newobj() -> None:
     torch = pytest.importorskip("torch")
+    if not hasattr(torch, "save") or not hasattr(torch, "nn"):
+        pytest.skip("usable PyTorch API is unavailable")
     buffer = io.BytesIO()
     torch.save(torch.nn.Linear(2, 2), buffer)
     with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
