@@ -382,16 +382,6 @@ def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 
 
-def _env_with_current_picklescan_source() -> dict[str, str]:
-    env = dict(os.environ)
-    source_root = str(Path(__file__).resolve().parents[1] / "src")
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        source_root if existing_pythonpath is None else f"{source_root}{os.pathsep}{existing_pythonpath}"
-    )
-    return env
-
-
 def _pickle_exec_child_code(body: str) -> str:
     return f"""
 import pickle
@@ -2099,7 +2089,7 @@ if marker.exists():
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), module_name],
         cwd=str(tmp_path),
-        env=_env_with_current_picklescan_source(),
+        env=dict(os.environ),
         check=False,
         capture_output=True,
         text=True,

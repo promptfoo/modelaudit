@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
+- preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets

@@ -6865,6 +6865,216 @@ class TestJITScriptDetector:
             any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings) is expected
         )
 
+    def test_scan_model_keeps_late_full_source_candidates_after_priority_import(self) -> None:
+        """An early priority import must not hide an aliased dangerous call in the middle of a large source."""
+        detector = JITScriptDetector()
+        padding = b"padding = 0\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"padding = 0\n") + 1
+        )
+        data = (
+            b"import asyncio\n"
+            + padding
+            + b"def payload():\n    import os as alias\n    return alias.system('id')\n"
+            + padding
+        )
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "Generic Python",
+            "payload.py",
+            include_full_source=True,
+        )
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_unrelated_native_load_after_safe_runpy_overwrite(self) -> None:
+        """A safe runpy member overwrite must not suppress an unrelated ctypes call."""
+        detector = JITScriptDetector()
+        data = b"\x00\xffimport runpy\nrunpy.run_path = print\nimport ctypes\nctypes.CDLL('libpayload.so')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_other_runpy_member_after_safe_deferred_overwrite(self) -> None:
+        """Call-specific runpy suppression must not erase a different dangerous member."""
+        detector = JITScriptDetector()
+        data = (
+            b"from __future__ import annotations\n"
+            b"import runpy as alias\n"
+            b"alias.run_path = print\n"
+            b"alias.run_path('safe')\n"
+            b"alias.run_module('payload')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_does_not_decode_unbounded_binary_for_suppression(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Suppression analysis must not allocate character offsets for the full model blob."""
+        detector = JITScriptDetector()
+        original_decode = jit_script_module._decode_utf8_with_byte_offsets
+
+        def reject_unbounded_decode(data: bytes) -> tuple[str, list[int]]:
+            assert len(data) <= jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+            return original_decode(data)
+
+        monkeypatch.setattr(jit_script_module, "_decode_utf8_with_byte_offsets", reject_unbounded_decode)
+        data = b"import runpy\n" + b"\x00" * jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "Generic Python",
+            "payload.bin",
+            include_full_source=True,
+        )
+
+        assert not any(finding.type == "code_execution_pattern" for finding in findings)
+
+    def test_scan_model_keeps_late_dangerous_call_after_safe_middle_call(self) -> None:
+        """A safe middle call must not stop replay before a later dangerous member."""
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        data = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"original = rp.run_path\nrp.run_path = print\nimport builtins\n"
+            + b"builtins.delattr = lambda *args: None\n"
+            + b"delattr(rp, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n"
+            + b"rp.run_path('safe')\n"
+            + padding
+            + b"rp.run_module('payload')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"import webbrowser as wb\n"
+                b"try:\n    unknown()\n    wb.open = print\nexcept Exception:\n    pass\n"
+                b"wb.open('https://example.invalid')\n"
+            ),
+            (
+                b"import webbrowser as wb\n"
+                b"def print(*args):\n    return wb.open(*args)\n"
+                b"wb.open = print\nwb.open('https://example.invalid')\n"
+            ),
+        ],
+    )
+    def test_scan_model_keeps_dangerous_typed_call_when_safe_overwrite_is_unproven(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_cross_candidate_webbrowser_member_after_safe_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        data = (
+            b"\x00\xffimport webbrowser as wb\n"
+            + b"vars(wb).update(open=print)\nwb.open('safe')\n"
+            + padding
+            + b"wb.open_new('https://example.invalid')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_restored_runpy_member_after_safe_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        data = (
+            b"\x00\xffimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\nrp.run_path('safe')\n"
+            + padding
+            + b"rp.run_path = original\nrp.run_path('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_runpy_alias_captured_before_safe_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        data = (
+            b"\x00\xffimport runpy as rp\ncaptured = rp.run_path\n"
+            + padding
+            + b"rp.run_path = print\ndel rp.run_path\n"
+            + b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('safe')\n"
+            + padding
+            + b"captured('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"from __future__ import annotations\nimport runpy as rp\n"
+                b"setattr = print\nsetattr(rp, 'run_path', print)\nrp.run_path('payload.py')\n"
+            ),
+            (b"import runpy as rp\ncaptured = rp.run_path\nsetattr(rp, 'run_path', print)\ncaptured('payload.py')\n"),
+            (
+                b"import runpy as rp\noriginal = rp.run_path\ndef print(*args):\n    return original(*args)\n"
+                b"rp.run_path = print\nrp.run_path('payload.py')\n"
+            ),
+            (
+                b"import runpy as rp\noriginal = rp.run_path\ndef print(*args):\n    return original(*args)\n"
+                b"del rp.run_path\nrp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"
+            ),
+        ],
+    )
+    def test_scan_model_keeps_runpy_calls_when_safe_overwrite_helpers_are_shadowed(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         "data",
         [

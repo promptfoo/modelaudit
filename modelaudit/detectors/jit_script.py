@@ -472,8 +472,6 @@ def _candidate_embedded_python_snippets(
     if include_full_source:
         span = (0, len(bounded))
         candidates.append((bounded, span, (span,)))
-        if len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and priority_starts:
-            return candidates
 
     for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
         span = match.span()
@@ -655,6 +653,24 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
                         aliases.add((alias.asname or alias.name).encode("utf-8"))
     aliases.update(_priority_assignment_aliases(source, tree, {alias.decode("utf-8") for alias in aliases}))
     return frozenset(aliases)
+
+
+def _runpy_import_aliases(candidate: bytes) -> frozenset[str]:
+    prefix = candidate[:_MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES].lstrip(b"\x00\xff")
+    source = prefix.decode("utf-8", errors="ignore")
+    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
+    if parsed_snippet is None:
+        return frozenset()
+    tree, _parsed_chars = parsed_snippet
+    if not isinstance(tree, ast.Module):
+        return frozenset()
+    return frozenset(
+        alias.asname or "runpy"
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "runpy"
+    )
 
 
 def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
@@ -4066,6 +4082,7 @@ def _priority_alias_usage_lines(
             and has_priority_reference_syntax
             and (_line_uses_priority_alias(code_line, tracked_priority_aliases) or is_getattr_priority_call)
         ):
+            prior_usage_count = len(usage_lines)
             usage_span = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
             if (
                 is_parsed_priority_call
@@ -4104,7 +4121,10 @@ def _priority_alias_usage_lines(
                         if root_name in pending_shadow_spans
                     )
                     usage_lines.append(usage_span)
-                    return usage_lines, frozenset()
+                    del usage_lines[:prior_usage_count]
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
                 if not root_names.isdisjoint(fail_closed_dangerous_names):
                     usage_lines.append(usage_span)
                     return usage_lines, proof_rule_codes(root_names, conservative=True)
@@ -4141,10 +4161,12 @@ def _priority_alias_usage_lines(
                     )
                     or (reaches_retained_alias and has_inert_forwarding_state(state_spans))
                 )
-                return (
-                    usage_lines,
-                    proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
-                )
+                if needs_proof:
+                    return usage_lines, proof_rule_codes(root_names, conservative=True)
+                del usage_lines[:prior_usage_count]
+                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                line_start = line_end
+                continue
             member_load_line = line[code_start:]
             root_names = _member_load_root_names(member_load_line).intersection(
                 relevant_binding_names | definite_shadowed_names
@@ -4208,7 +4230,10 @@ def _priority_alias_usage_lines(
                         if root_name in pending_shadow_spans
                     )
                     usage_lines.append(usage_span)
-                    return usage_lines, frozenset()
+                    del usage_lines[:prior_usage_count]
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
                 if overflowed and not reaches_retained_alias:
                     multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                     line_start = line_end
@@ -4221,13 +4246,14 @@ def _priority_alias_usage_lines(
                 usage_lines.extend(state_spans)
                 usage_lines.extend(loader_protocol_spans)
                 usage_lines.append(usage_span)
-                return (
-                    usage_lines,
-                    replay_rule_codes
-                    if (overflowed and reaches_retained_alias) or loader_protocol_overflowed
-                    else frozenset(),
-                )
+                if (overflowed and reaches_retained_alias) or loader_protocol_overflowed:
+                    return usage_lines, replay_rule_codes
+                del usage_lines[:prior_usage_count]
+                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                line_start = line_end
+                continue
         elif line_end > search_start and b"(" in code_line:
+            prior_usage_count = len(usage_lines)
             potential_root_names = _potential_late_callable_root_names(code_line).intersection(
                 late_definitions.keys() | fail_closed_dangerous_names
             )
@@ -4256,7 +4282,10 @@ def _priority_alias_usage_lines(
                     usage_lines.append(
                         (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
                     )
-                    return usage_lines, frozenset()
+                    del usage_lines[:prior_usage_count]
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
                 if not root_names.isdisjoint(fail_closed_dangerous_names):
                     usage_lines.append(
                         (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
@@ -4272,10 +4301,12 @@ def _priority_alias_usage_lines(
                         (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
                     )
                     needs_proof = overflowed or has_inert_forwarding_state(state_spans)
-                    return (
-                        usage_lines,
-                        proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
-                    )
+                    if needs_proof:
+                        return usage_lines, proof_rule_codes(root_names, conservative=True)
+                    del usage_lines[:prior_usage_count]
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
     return usage_lines, frozenset()
@@ -4301,7 +4332,10 @@ def _parse_late_replay_tree(source: str) -> ast.Module | None:
 
 
 def _source_defers_annotations(candidate: bytes) -> bool:
-    source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate.lstrip(b"\x00\xff"))
+    stripped_candidate = candidate.lstrip(b"\x00\xff")
+    if b"__future__" not in stripped_candidate or b"annotations" not in stripped_candidate:
+        return False
+    source = stripped_candidate.decode("utf-8", errors="ignore")
     tree = _parse_late_replay_tree(source)
     return tree is not None and any(
         isinstance(statement, ast.ImportFrom)
@@ -9760,41 +9794,87 @@ def _parsed_real_spans(
     return parsed_spans
 
 
-def _compact_snippet_has_unshadowed_print_member_overwrite(code_str: str) -> bool:
-    """Return whether compacted code proves a priority member was overwritten with builtin print."""
-    if re.search(r"(?m)^\s*print\s*(?::[^=\n]+)?=", code_str) is not None:
-        return False
-    safe_member_names = _TYPED_PROOF_MEMBER_NAMES | _RUNPY_PRIORITY_MEMBER_NAMES
-    member_pattern = "|".join(re.escape(member) for member in sorted(safe_member_names, key=len, reverse=True))
-    mapping_owner = r"(?:[A-Za-z_]\w*\s*\.\s*__dict__|vars\s*\(\s*[A-Za-z_]\w*\s*\))"
-    descriptor_owner = r"(?:dict|[A-Za-z_]\w*\s*\.\s*dict|getattr\s*\(\s*[A-Za-z_]\w*\s*,\s*['\"]dict['\"]\s*\))"
-    return any(
-        re.search(pattern, code_str) is not None
-        for pattern in (
-            rf"(?m)^\s*[A-Za-z_]\w*\s*\.\s*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?m)\bsetattr\s*\(\s*[A-Za-z_]\w*\s*,\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?m){mapping_owner}\s*\.\s*(?:update|__ior__)\s*\([^\n)]*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?m){mapping_owner}\s*\|=\s*\{{[^\n}}]*['\"](?:{member_pattern})['\"]\s*:\s*print\b",
-            rf"(?m){mapping_owner}\s*\.\s*__setitem__\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?m){descriptor_owner}\s*\.\s*(?:update|__ior__)\s*\(\s*{mapping_owner}\s*,[^\n)]*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?m){descriptor_owner}\s*\.\s*(?:update|__ior__)\s*\(\s*{mapping_owner}\s*,\s*\{{[^\n}}]*['\"](?:{member_pattern})['\"]\s*:\s*print\b",
-            rf"(?m){descriptor_owner}\s*\.\s*__setitem__\s*\(\s*{mapping_owner}\s*,\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{descriptor_owner}\s*\.\s*__setitem__\s*$.*?^\s*\1\s*\(\s*{mapping_owner}\s*,\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms)\bdel\s+[A-Za-z_]\w*\s*\.\s*(?:{member_pattern})\b.*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms){mapping_owner}\s*\.\s*(?:pop|__delitem__)\s*\(\s*['\"](?:{member_pattern})['\"](?:\s*,[^\n)]*)?\).*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms){descriptor_owner}\s*\.\s*(?:pop|__delitem__)\s*\(\s*{mapping_owner}\s*,\s*['\"](?:{member_pattern})['\"](?:\s*,[^\n)]*)?\).*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms)\bdel\s+[A-Za-z_]\w*\s*\.\s*(?:{member_pattern})\b.*?^\s*([A-Za-z_]\w*)\s*=\s*{descriptor_owner}\s*\.\s*setdefault\s*$.*?^\s*\1\s*\(\s*{mapping_owner}\s*,\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{mapping_owner}\s*$.*?^\s*\1\s*\.\s*(?:update|__ior__)\s*\([^\n)]*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{mapping_owner}\s*$.*?^\s*\1\s*\|=\s*\{{[^\n}}]*['\"](?:{member_pattern})['\"]\s*:\s*print\b",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{mapping_owner}\s*$.*?^\s*\1\s*\.\s*__setitem__\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{mapping_owner}\s*$.*?^\s*\1\s*\[\s*['\"](?:{member_pattern})['\"]\s*\]\s*=\s*print\b",
-            rf"(?ms)^\s*([A-Za-z_]\w*)\s*=\s*{mapping_owner}\s*$.*?^\s*([A-Za-z_]\w*)\s*=\s*\1\s*\.\s*__setitem__\s*$.*?^\s*\2\s*\(\s*['\"](?:{member_pattern})['\"]\s*,\s*print\s*\)",
-            rf"(?m){mapping_owner}\s*\[\s*['\"](?:{member_pattern})['\"]\s*\]\s*=\s*print\b",
-        )
-    )
+def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = None) -> bool:
+    if tree is None:
+        try:
+            tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+        except (RecursionError, SyntaxError, ValueError):
+            return True
+    builtins_aliases = {
+        alias.asname or alias.name.split(".", maxsplit=1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "builtins"
+    } | {"builtins"}
+    if "print" in _late_mutated_truthy_builtin_names(code_str.encode("utf-8"), builtins_aliases, set()):
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+            argument.arg == "print"
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+                *([node.args.vararg] if node.args.vararg is not None else []),
+                *([node.args.kwarg] if node.args.kwarg is not None else []),
+            )
+        ):
+            return True
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in node.names
+        ):
+            return True
+    return False
+
+
+def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
+    builtins_aliases = {
+        alias.asname or alias.name.split(".", maxsplit=1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "builtins"
+    } | {"builtins"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "setattr":
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "setattr":
+            return True
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "setattr" for alias in node.names
+        ):
+            return True
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and node.attr == "setattr"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in builtins_aliases
+        ):
+            return True
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and _static_getattr_member_name(node.slice) == "setattr"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "__dict__"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in builtins_aliases
+        ):
+            return True
+    return False
 
 
 def _compact_snippet_deleted_print_setdefault_members(code_str: str) -> set[str]:
+    if "setdefault" not in code_str or "print" not in code_str:
+        return set()
+    if _compact_snippet_has_shadowed_print(code_str):
+        return set()
     safe_member_names = _TYPED_PROOF_MEMBER_NAMES | _RUNPY_PRIORITY_MEMBER_NAMES
     mapping_owner = r"(?:[A-Za-z_]\w*\s*\.\s*__dict__|vars\s*\(\s*[A-Za-z_]\w*\s*\))"
     descriptor_owner = r"(?:dict|[A-Za-z_]\w*\s*\.\s*dict|getattr\s*\(\s*[A-Za-z_]\w*\s*,\s*['\"]dict['\"]\s*\))"
@@ -9814,17 +9894,26 @@ def _compact_snippet_deleted_print_setdefault_members(code_str: str) -> set[str]
     return deleted_members
 
 
-def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
+def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    if "delattr" not in code_str or "setdefault" not in code_str or "print" not in code_str:
+        return set()
     source = textwrap.dedent(code_str)
     try:
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    runpy_aliases = {"rp"}
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
     builtins_aliases = {"builtins"}
     safe_members: set[str] = set()
     inactive_delattr_members: set[str] = set()
     preserved_members: set[str] = set()
+    captured_unsafe_members: dict[str, str] = {}
+    called_unsafe_members: set[str] = set()
     local_delattr_shadowed = False
     builtins_delattr_shadowed = False
 
@@ -9874,18 +9963,34 @@ def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(code_str: str)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 record_delattr_shadow(target, statement.value)
+                if isinstance(target, ast.Name):
+                    if (
+                        isinstance(statement.value, ast.Attribute)
+                        and isinstance(statement.value.value, ast.Name)
+                        and statement.value.value.id in runpy_aliases
+                        and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                        and statement.value.attr not in safe_members
+                    ):
+                        captured_unsafe_members[target.id] = statement.value.attr
+                    else:
+                        captured_unsafe_members.pop(target.id, None)
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
                     and target.value.id in runpy_aliases
                     and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
-                    and isinstance(statement.value, ast.Name)
-                    and statement.value.id == "print"
                 ):
-                    safe_members.add(target.attr)
+                    if isinstance(statement.value, ast.Name) and statement.value.id == "print":
+                        safe_members.add(target.attr)
+                    else:
+                        safe_members.discard(target.attr)
+                        preserved_members.discard(target.attr)
         for value in _deterministically_evaluated_statement_expressions(statement):
             for node in _deterministically_executed_expression_calls(value):
                 reference = _simple_reference_name(node.func)
+                if isinstance(node.func, ast.Name) and node.func.id in captured_unsafe_members:
+                    called_unsafe_members.add(captured_unsafe_members[node.func.id])
+                    continue
                 if (
                     not active_delattr_reference(reference)
                     and reference is not None
@@ -9915,18 +10020,22 @@ def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(code_str: str)
                     and node.func.attr in preserved_members
                 ):
                     preserved_members.add(node.func.attr)
-    return {(f"runpy.{member_name}", "S108") for member_name in preserved_members}
+    return {(f"runpy.{member_name}", "S108") for member_name in preserved_members - called_unsafe_members}
 
 
-def _compact_snippet_deferred_annotation_runpy_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
-    source_bytes = code_str.encode("utf-8", errors="ignore")
-    if not _source_defers_annotations(source_bytes):
-        return set()
+def _compact_snippet_runpy_print_overwrite_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
     try:
         tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    runpy_aliases = {"rp"}
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
+    if _compact_snippet_has_shadowed_setattr(tree):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
     safe_members: set[str] = set()
     suppressed_calls: set[tuple[str, str]] = set()
 
@@ -9972,6 +10081,79 @@ def _compact_snippet_deferred_annotation_runpy_print_overwrite_calls(code_str: s
     return suppressed_calls
 
 
+def _compact_snippet_captured_runpy_high_risk_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    """Return runpy calls reached through aliases captured before a safe member overwrite."""
+    if (not inherited_runpy_aliases and "runpy" not in code_str) or "print" not in code_str:
+        return set()
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases) | {
+        alias.asname or alias.name.split(".", maxsplit=1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "runpy"
+    }
+    if not runpy_aliases:
+        return set()
+    setattr_is_active = not _compact_snippet_has_shadowed_setattr(tree)
+    first_safe_write: dict[str, int] = {}
+    captured_members: dict[str, tuple[str, int]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "print"
+                ):
+                    first_safe_write.setdefault(target.attr, node.lineno)
+                elif (
+                    isinstance(target, ast.Name)
+                    and isinstance(node.value, ast.Attribute)
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id in runpy_aliases
+                    and node.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    captured_members[target.id] = (node.value.attr, node.lineno)
+                elif isinstance(target, ast.Name) and isinstance(node.value, ast.Name):
+                    captured = captured_members.get(node.value.id)
+                    if captured is not None:
+                        captured_members[target.id] = captured
+        elif (
+            setattr_is_active
+            and isinstance(node, ast.Call)
+            and _simple_reference_name(node.func) in {"setattr", "builtins.setattr"}
+            and len(node.args) >= 3
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in runpy_aliases
+            and (member_name := _runpy_static_member_key(node.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
+            and isinstance(node.args[2], ast.Name)
+            and node.args[2].id == "print"
+        ):
+            first_safe_write.setdefault(member_name, node.lineno)
+    dangerous_calls: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        captured = captured_members.get(node.func.id)
+        if captured is None:
+            continue
+        member_name, capture_line = captured
+        safe_line = first_safe_write.get(member_name)
+        if safe_line is not None and capture_line < safe_line < node.lineno:
+            dangerous_calls.add((f"runpy.{member_name}", "S108"))
+    return dangerous_calls
+
+
 def _typed_member_high_risk_call(member_name: str) -> tuple[str, str] | None:
     if member_name in {"get", "open", "open_new", "open_new_tab"}:
         return ("webbrowser.open", "S109")
@@ -9980,24 +10162,221 @@ def _typed_member_high_risk_call(member_name: str) -> tuple[str, str] | None:
     return None
 
 
+def _compact_deterministic_exception_name(
+    statement: ast.stmt,
+    exception_aliases: dict[str, str],
+) -> str | None:
+    if isinstance(statement, ast.Raise) and isinstance(statement.exc, ast.Call):
+        reference = _simple_reference_name(statement.exc.func)
+        if reference is not None:
+            return exception_aliases.get(reference, exception_aliases.get(reference.rsplit(".", 1)[-1]))
+    if (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.BinOp)
+        and isinstance(statement.value.op, (ast.Div, ast.FloorDiv, ast.Mod))
+    ):
+        try:
+            denominator = ast.literal_eval(statement.value.right)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+        if denominator == 0:
+            return "ZeroDivisionError"
+    return None
+
+
+def _compact_handler_catches_exception(
+    handler: ast.ExceptHandler,
+    exception_name: str,
+    exception_aliases: dict[str, str],
+) -> bool:
+    if handler.type is None:
+        return True
+    handled_nodes = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    raised_type = getattr(builtins, exception_name, None)
+    if not isinstance(raised_type, type) or not issubclass(raised_type, BaseException):
+        return False
+    for handled_node in handled_nodes:
+        reference = _simple_reference_name(handled_node)
+        if reference is None:
+            continue
+        handled_name = exception_aliases.get(reference, exception_aliases.get(reference.rsplit(".", 1)[-1]))
+        handled_type = getattr(builtins, handled_name or "", None)
+        if (
+            isinstance(handled_type, type)
+            and issubclass(handled_type, BaseException)
+            and issubclass(raised_type, handled_type)
+        ):
+            return True
+    return False
+
+
+def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -> list[ast.stmt]:
+    """Flatten the small, statically determined control-flow shapes used by compact replay proofs."""
+    executed: list[ast.stmt] = []
+    exception_aliases = {name: name for name in _BUILTIN_EXCEPTION_TYPE_NAMES}
+    builtins_aliases = {"builtins"}
+
+    def statement_is_non_raising(statement: ast.stmt) -> bool:
+        if isinstance(statement, ast.Pass):
+            return True
+        if isinstance(statement, ast.Assign):
+            return all(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and isinstance(statement.value, ast.Name)
+                and statement.value.id == "print"
+                for target in statement.targets
+            )
+        return bool(
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Attribute)
+            and isinstance(statement.target.value, ast.Name)
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == "print"
+        )
+
+    def update_exception_aliases(statement: ast.stmt) -> None:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "builtins":
+                    builtins_aliases.add(alias.asname or "builtins")
+            return
+        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            exception_aliases.pop(statement.name, None)
+            return
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            return
+        value_reference = _simple_reference_name(statement.value)
+        canonical = (
+            exception_aliases.get(value_reference, exception_aliases.get(value_reference.rsplit(".", 1)[-1]))
+            if value_reference is not None
+            else None
+        )
+        target = statement.targets[0]
+        if isinstance(target, ast.Name):
+            if canonical is None:
+                exception_aliases.pop(target.id, None)
+            else:
+                exception_aliases[target.id] = canonical
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            keys = {target.attr, *(f"{alias}.{target.attr}" for alias in builtins_aliases)}
+            if canonical is None:
+                for key in keys:
+                    exception_aliases.pop(key, None)
+            else:
+                for key in keys:
+                    exception_aliases[key] = canonical
+
+    def visit(block: list[ast.stmt]) -> str | None:
+        for statement in block:
+            executed.append(statement)
+            update_exception_aliases(statement)
+            if isinstance(statement, ast.Break):
+                return "break"
+            if isinstance(statement, ast.Continue):
+                return "continue"
+            if isinstance(statement, ast.Return):
+                return "return"
+            if isinstance(statement, ast.ClassDef):
+                visit(statement.body)
+            elif isinstance(statement, ast.If) and isinstance(statement.test, ast.Constant):
+                outcome = visit(statement.body if bool(statement.test.value) else statement.orelse)
+                if outcome is not None:
+                    return outcome
+            elif isinstance(statement, (ast.For, ast.AsyncFor)) and isinstance(statement.iter, (ast.List, ast.Tuple)):
+                if len(statement.iter.elts) == 1:
+                    executed.append(ast.Assign(targets=[statement.target], value=statement.iter.elts[0]))
+                    outcome = visit(statement.body)
+                    if outcome != "break":
+                        visit(statement.orelse)
+                    if outcome == "return":
+                        return outcome
+            elif isinstance(statement, ast.While) and _static_late_truth_value(statement.test) is False:
+                outcome = visit(statement.orelse)
+                if outcome is not None:
+                    return outcome
+            elif isinstance(statement, ast.Try):
+                exception_name: str | None = None
+                deterministic_body: list[ast.stmt] = []
+                body_is_deterministic = True
+                for body_statement in statement.body:
+                    exception_name = _compact_deterministic_exception_name(body_statement, exception_aliases)
+                    if exception_name is not None:
+                        deterministic_body.append(body_statement)
+                        break
+                    if not statement_is_non_raising(body_statement):
+                        body_is_deterministic = False
+                        break
+                    deterministic_body.append(body_statement)
+                if not body_is_deterministic:
+                    visit(statement.finalbody)
+                    continue
+                body_outcome = visit(deterministic_body)
+                if exception_name is None:
+                    if body_outcome is None:
+                        body_outcome = visit(statement.orelse)
+                else:
+                    handler = next(
+                        (
+                            candidate
+                            for candidate in statement.handlers
+                            if _compact_handler_catches_exception(candidate, exception_name, exception_aliases)
+                        ),
+                        None,
+                    )
+                    if handler is not None:
+                        body_outcome = visit(handler.body)
+                final_outcome = visit(statement.finalbody)
+                if final_outcome is not None:
+                    return final_outcome
+                if body_outcome is not None:
+                    return body_outcome
+        return None
+
+    visit(statements)
+    return executed
+
+
+def _compact_snippet_replay_proven_rule_codes(code_str: str) -> frozenset[str]:
+    source = code_str.encode("utf-8", errors="ignore")
+    aliases = _priority_import_aliases(source)
+    if not aliases:
+        return frozenset()
+    _usage_lines, proved_rule_codes = _priority_alias_usage_lines(
+        source,
+        aliases,
+        0,
+        deferred_annotations=_source_defers_annotations(source),
+    )
+    return proved_rule_codes
+
+
 def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
     source = textwrap.dedent(code_str)
+    if "print" not in source:
+        return set()
     if " if " in source and " else " in source:
         return set()
     try:
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
     typed_aliases: dict[str, str] = {}
     builtins_aliases = {"builtins"}
-    for statement in _deterministically_executed_statements(tree.body):
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    for statement in executed_statements:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
                 if alias.name == "builtins":
                     builtins_aliases.add(alias.asname or "builtins")
-    if _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set()).intersection(
-        _EAGER_LATE_GENERATOR_CONSUMERS
-    ):
+    mutated_truthy_builtins = _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set())
+    if "print" in mutated_truthy_builtins or mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
         return set()
     vars_helper_aliases: set[str] = set()
     setattr_helper_aliases: set[str] = set()
@@ -10008,7 +10387,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
     builtins_mapping_update_aliases: set[str] = set()
     builtins_mapping_setitem_aliases: set[str] = set()
     mapping_aliases: dict[str, str] = {}
-    safe_calls: set[tuple[str, str]] = set()
+    safe_members: set[str] = set()
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
     local_vars_shadowed = False
@@ -10112,10 +10491,19 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         )
 
     def record_member(member_name: str | None, value: ast.AST) -> None:
-        if member_name is None or not isinstance(value, ast.Name) or value.id != "print":
+        if member_name is None or _typed_member_high_risk_call(member_name) is None:
             return
-        if (call := _typed_member_high_risk_call(member_name)) is not None:
-            safe_calls.add(call)
+        if isinstance(value, ast.Name) and value.id == "print":
+            safe_members.add(member_name)
+        elif (
+            isinstance(value, ast.Attribute)
+            and value.attr == member_name
+            and isinstance(value.value, ast.Name)
+            and value.value.id in typed_aliases
+        ):
+            return
+        else:
+            safe_members.discard(member_name)
 
     def record_update(call: ast.Call) -> None:
         for argument in call.args:
@@ -10258,7 +10646,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             elif isinstance(node, ast.NamedExpr):
                 invalidate_target(node.target)
 
-    for statement in _deterministically_executed_statements(tree.body):
+    for statement in executed_statements:
         if isinstance(statement, ast.If) and not isinstance(statement.test, ast.Constant):
             invalidate_dynamic_helper_assignments(statement)
         if isinstance(statement, ast.Import):
@@ -10270,13 +10658,26 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     typed_aliases[local_name] = "ctypes"
                 elif alias.name == "builtins":
                     builtins_aliases.add(local_name)
+        elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            typed_aliases.pop(statement.name, None)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 record_setattr_shadow(target, statement.value)
                 record_vars_shadow(target, statement.value)
                 record_dict_shadow(target, statement.value)
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in typed_aliases
+                ):
+                    record_member(target.attr, statement.value)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
+                    canonical_module = typed_aliases.get(value_reference or "")
+                    if canonical_module is None:
+                        typed_aliases.pop(target.id, None)
+                    else:
+                        typed_aliases[target.id] = canonical_module
                     if active_vars_reference(value_reference):
                         vars_helper_aliases.add(target.id)
                     else:
@@ -10323,7 +10724,23 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             record_setattr_shadow(statement.target, statement.value)
             record_vars_shadow(statement.target, statement.value)
             record_dict_shadow(statement.target, statement.value)
+            if (
+                isinstance(statement.target, ast.Attribute)
+                and isinstance(statement.target.value, ast.Name)
+                and statement.target.value.id in typed_aliases
+            ):
+                record_member(statement.target.attr, statement.value)
+            if isinstance(statement.target, ast.Name):
+                canonical_module = typed_aliases.get(_simple_reference_name(statement.value) or "")
+                if canonical_module is None:
+                    typed_aliases.pop(statement.target.id, None)
+                else:
+                    typed_aliases[statement.target.id] = canonical_module
             bind_mapping_alias(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    typed_aliases.pop(target.id, None)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
             if is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
@@ -10406,111 +10823,20 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     and len(node.args) >= 2
                 ):
                     record_member(_static_getattr_member_name(node.args[0]), node.args[1])
-    return safe_calls
+    return {call for member_name in safe_members if (call := _typed_member_high_risk_call(member_name)) is not None}
 
 
-def _compact_snippet_has_inactive_builtins_dict_restore(code_str: str) -> bool:
-    safe_member_names = _TYPED_PROOF_MEMBER_NAMES | _RUNPY_PRIORITY_MEMBER_NAMES
-    member_pattern = "|".join(re.escape(member) for member in sorted(safe_member_names, key=len, reverse=True))
-    mapping_owner_pattern = r"(?:[A-Za-z_]\w*\s*\.\s*__dict__|vars\s*\(\s*[A-Za-z_]\w*\s*\))"
-    has_prior_safe_overwrite = any(
-        re.search(pattern, code_str) is not None
-        for pattern in (
-            rf"(?m)^\s*[A-Za-z_]\w*\s*\.\s*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?m){mapping_owner_pattern}\s*\.\s*update\s*\([^\n)]*(?:{member_pattern})\s*=\s*print\b",
-            rf"(?m){mapping_owner_pattern}\s*\[\s*['\"](?:{member_pattern})['\"]\s*\]\s*=\s*print\b",
-        )
-    )
-    if not has_prior_safe_overwrite:
-        return False
-    source = textwrap.dedent(code_str)
-    try:
-        tree = ast.parse(source)
-    except (RecursionError, SyntaxError, ValueError):
-        return False
-    builtins_aliases = {"builtins"}
-    canonical_dict_names = {"dict"}
-    builtins_dict_shadowed = False
-    getattr_shadowed = False
-
-    def restores_with_inactive_descriptor(call: ast.Call) -> bool:
-        if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"update", "__ior__"}:
-            return False
-        descriptor = call.func.value
-        if (
-            isinstance(descriptor, ast.Attribute)
-            and descriptor.attr == "dict"
-            and isinstance(descriptor.value, ast.Name)
-            and descriptor.value.id in builtins_aliases
-        ):
-            return builtins_dict_shadowed
-        if (
-            isinstance(descriptor, ast.Call)
-            and isinstance(descriptor.func, ast.Name)
-            and descriptor.func.id == "getattr"
-            and len(descriptor.args) >= 2
-            and isinstance(descriptor.args[0], ast.Name)
-            and descriptor.args[0].id in builtins_aliases
-            and _static_getattr_member_name(descriptor.args[1]) == "dict"
-        ):
-            return getattr_shadowed or builtins_dict_shadowed
-        return False
-
-    for statement in _deterministically_executed_statements(tree.body):
-        if isinstance(statement, ast.Import):
-            for alias in statement.names:
-                if alias.name == "builtins":
-                    builtins_aliases.add(alias.asname or "builtins")
-        elif isinstance(statement, ast.Assign):
-            for target in statement.targets:
-                if isinstance(target, ast.Name) and target.id == "getattr":
-                    getattr_shadowed = True
-                if isinstance(target, ast.Name):
-                    value_reference = _simple_reference_name(statement.value)
-                    if (
-                        value_reference is not None
-                        and value_reference.endswith(".dict")
-                        and value_reference.removesuffix(".dict") in builtins_aliases
-                        and not builtins_dict_shadowed
-                    ):
-                        canonical_dict_names.add(target.id)
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr == "dict"
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id in builtins_aliases
-                ):
-                    value_reference = _simple_reference_name(statement.value)
-                    builtins_dict_shadowed = value_reference not in canonical_dict_names
-        elif (
-            isinstance(statement, ast.AnnAssign)
-            and isinstance(statement.target, ast.Name)
-            and statement.value is not None
-        ):
-            if statement.target.id == "getattr":
-                getattr_shadowed = True
-            value_reference = _simple_reference_name(statement.value)
-            if (
-                value_reference is not None
-                and value_reference.endswith(".dict")
-                and value_reference.removesuffix(".dict") in builtins_aliases
-                and not builtins_dict_shadowed
-            ):
-                canonical_dict_names.add(statement.target.id)
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Call) and restores_with_inactive_descriptor(node):
-                return True
-    return False
-
-
-def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tuple[str, str]]:
+def _compact_snippet_inactive_restore_high_risk_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
     source = textwrap.dedent(code_str)
     try:
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
     builtins_aliases = {"builtins"}
-    runpy_aliases = {"rp"}
+    runpy_aliases = set(inherited_runpy_aliases)
     canonical_dict_names = {"dict"}
     builtins_mapping_names: set[str] = set()
     builtins_mapping_update_names: set[str] = set()
@@ -10541,33 +10867,9 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
     canonical_getattr_names = {"getattr", "builtins.getattr"}
     vars_helper_names = {"vars", "builtins.vars"}
     safe_runpy_members: set[str] = set()
-    replayed_runpy_update_members: set[str] = set()
-    inactive_runpy_update_members: set[str] = set()
     deleted_runpy_members: set[str] = set()
-    dangerous_runpy_value_names: set[str] = set()
+    dangerous_runpy_value_names: dict[str, str] = {}
     high_risk_calls: set[tuple[str, str]] = set()
-    has_runpy_state_marker = any(
-        marker in code_str
-        for marker in (
-            "rp.__dict__",
-            "vars(rp",
-            "dict.update(rp.__dict__",
-            "dict.__ior__(rp.__dict__",
-            "dict.__setitem__(rp.__dict__",
-        )
-    )
-    runpy_state_syntax_members = {
-        member_name
-        for member_name in _RUNPY_PRIORITY_MEMBER_NAMES
-        if (
-            f".{member_name} =" in code_str
-            or f".{member_name}:" in code_str
-            or (
-                has_runpy_state_marker
-                and any(token in code_str for token in (f"'{member_name}'", f'"{member_name}"', f"{member_name}="))
-            )
-        )
-    }
 
     def is_active_vars_reference(reference: str | None) -> bool:
         if reference not in vars_helper_names:
@@ -10667,9 +10969,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
     def record_runpy_member_value(member_name: str, value: ast.AST, *, inactive: bool) -> None:
         if member_name not in _RUNPY_PRIORITY_MEMBER_NAMES:
             return
-        replayed_runpy_update_members.add(member_name)
         if inactive:
-            inactive_runpy_update_members.add(member_name)
             if isinstance(value, ast.Name) and value.id == "print" and member_name not in safe_runpy_members:
                 high_risk_calls.add((f"runpy.{member_name}", "S108"))
             return
@@ -10718,9 +11018,24 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
             for alias in statement.names:
                 if alias.name == "builtins":
                     builtins_aliases.add(alias.asname or "builtins")
+                elif alias.name == "runpy":
+                    runpy_aliases.add(alias.asname or "runpy")
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 value_reference = _simple_reference_name(statement.value)
+                if isinstance(target, ast.Name):
+                    if (
+                        isinstance(statement.value, ast.Attribute)
+                        and isinstance(statement.value.value, ast.Name)
+                        and statement.value.value.id in runpy_aliases
+                        and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                        and statement.value.attr not in safe_runpy_members
+                    ):
+                        dangerous_runpy_value_names[target.id] = statement.value.attr
+                    elif isinstance(statement.value, ast.Name) and statement.value.id in dangerous_runpy_value_names:
+                        dangerous_runpy_value_names[target.id] = dangerous_runpy_value_names[statement.value.id]
+                    else:
+                        dangerous_runpy_value_names.pop(target.id, None)
                 if (
                     isinstance(target, ast.Name)
                     and value_reference is not None
@@ -10901,7 +11216,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
                     and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
                 ):
                     if statement.value.attr not in safe_runpy_members:
-                        dangerous_runpy_value_names.add(target.id)
+                        dangerous_runpy_value_names[target.id] = statement.value.attr
                 elif (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
@@ -10995,6 +11310,10 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
             continue
         for node in ast.walk(statement):
             if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in dangerous_runpy_value_names:
+                member_name = dangerous_runpy_value_names[node.func.id]
+                high_risk_calls.add((f"runpy.{member_name}", "S108"))
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_update_names:
                 apply_builtins_mapping_update(node)
@@ -11098,16 +11417,6 @@ def _compact_snippet_inactive_restore_high_risk_calls(code_str: str) -> set[tupl
                 continue
             if not isinstance(node.func, ast.Attribute):
                 continue
-            if (
-                node.func.attr in _RUNPY_PRIORITY_MEMBER_NAMES
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in runpy_aliases
-                and node.func.attr not in safe_runpy_members
-                and node.func.attr not in replayed_runpy_update_members
-                and node.func.attr not in inactive_runpy_update_members
-                and node.func.attr in runpy_state_syntax_members
-            ):
-                high_risk_calls.add((f"runpy.{node.func.attr}", "S108"))
             if node.func.attr == "__setitem__":
                 descriptor = node.func.value
                 if is_builtins_mapping(descriptor):
@@ -16682,40 +16991,6 @@ class JITScriptDetector:
                 )
             )
 
-        decoded_source, _decoded_offsets = _decode_utf8_with_byte_offsets(data)
-        typed_source = decoded_source.lstrip("\x00")
-        typed_safe_codes = {
-            rule_code for _call_name, rule_code in _compact_snippet_typed_print_overwrite_calls(typed_source)
-        }
-        typed_danger_codes: set[str] = set()
-        if typed_safe_codes:
-            try:
-                typed_tree = ast.parse(textwrap.dedent(typed_source))
-                typed_danger_codes.update(
-                    rule_code for _call_name, rule_code in _resolve_alias_aware_high_risk_calls(typed_tree)
-                )
-            except (RecursionError, SyntaxError, ValueError):
-                pass
-        typed_suppressed_patterns = {
-            _WEBBROWSER_LAUNCH_DESCRIPTION if rule_code == "S109" else _CTYPES_NATIVE_LOADING_DESCRIPTION
-            for rule_code in (typed_safe_codes - typed_danger_codes)
-        }
-        runpy_suppressed_patterns = {
-            _RUNPY_CODE_EXECUTION_DESCRIPTION
-            for _call_name, _rule_code in _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(typed_source)
-        }
-        runpy_suppressed_patterns.update(
-            _RUNPY_CODE_EXECUTION_DESCRIPTION
-            for _call_name, _rule_code in _compact_snippet_deferred_annotation_runpy_print_overwrite_calls(typed_source)
-        )
-        suppressed_patterns = typed_suppressed_patterns | runpy_suppressed_patterns
-        if suppressed_patterns:
-            findings = [
-                finding
-                for finding in findings
-                if not (finding.type == "code_execution_pattern" and finding.pattern in suppressed_patterns)
-            ]
-
         return findings
 
     def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
@@ -16943,11 +17218,10 @@ class JITScriptDetector:
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         bounded_builtin_calls: set[str] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
-        snippet_setdefault_suppressed_calls: set[tuple[str, str]] = set()
-        snippet_typed_suppressed_codes: set[str] = set()
-        snippet_typed_safe_codes: set[str] = set()
-        snippet_typed_danger_codes: set[str] = set()
+        snippet_suppressed_calls: set[tuple[str, str]] = set()
+        snippet_explicit_high_risk_calls: set[tuple[str, str]] = set()
         snippet_builtin_calls: set[str] = set()
+        inherited_runpy_aliases = _runpy_import_aliases(bounded)
         has_proven_priority_candidate = any(
             probe in match
             for match, _span, _real_ranges in prioritized_matches
@@ -16956,19 +17230,6 @@ class JITScriptDetector:
         contextual_builtin_sources = (
             {} if has_proven_priority_candidate else self._contextual_dangerous_builtin_sources(bounded)
         )
-        decoded_bounded_source, _decoded_bounded_offsets = _decode_utf8_with_byte_offsets(bounded)
-        bounded_typed_source = decoded_bounded_source.lstrip("\x00")
-        snippet_typed_safe_codes.update(
-            rule_code for _call_name, rule_code in _compact_snippet_typed_print_overwrite_calls(bounded_typed_source)
-        )
-        try:
-            bounded_typed_tree = ast.parse(textwrap.dedent(bounded_typed_source))
-            snippet_typed_danger_codes.update(
-                rule_code for _call_name, rule_code in _resolve_alias_aware_high_risk_calls(bounded_typed_tree)
-            )
-        except (RecursionError, SyntaxError, ValueError):
-            pass
-        snippet_typed_suppressed_codes = snippet_typed_safe_codes - snippet_typed_danger_codes
         parsed_snippet_spans: list[tuple[int, int]] = []
         skips_unbounded_ast_prepass = len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and (
             (include_full_source and _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(bounded.lower()) is not None)
@@ -16976,8 +17237,51 @@ class JITScriptDetector:
         )
         if not skips_unbounded_ast_prepass:
             try:
-                bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
+                bounded_source = bounded.decode("utf-8")
+                bounded_tree = ast.parse(textwrap.dedent(bounded_source))
                 bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
+                bounded_suppressed_calls = _compact_snippet_typed_print_overwrite_calls(bounded_source)
+                bounded_suppressed_calls.update(
+                    _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
+                        bounded_source,
+                        inherited_runpy_aliases,
+                    )
+                )
+                bounded_suppressed_calls.update(
+                    _compact_snippet_runpy_print_overwrite_calls(
+                        bounded_source,
+                        inherited_runpy_aliases,
+                    )
+                )
+                bounded_suppressed_calls.update(
+                    (f"runpy.{member_name}", "S108")
+                    for member_name in _compact_snippet_deleted_print_setdefault_members(bounded_source)
+                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
+                )
+                bounded_explicit_high_risk_calls: set[tuple[str, str]] = set()
+                if "runpy" in bounded_source and any(
+                    member_name in bounded_source for member_name in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    bounded_explicit_high_risk_calls.update(
+                        _compact_snippet_inactive_restore_high_risk_calls(
+                            bounded_source,
+                            inherited_runpy_aliases,
+                        )
+                    )
+                    bounded_explicit_high_risk_calls.update(
+                        _compact_snippet_captured_runpy_high_risk_calls(
+                            bounded_source,
+                            inherited_runpy_aliases,
+                        )
+                    )
+                bounded_suppressed_calls.difference_update(bounded_explicit_high_risk_calls)
+                if bounded_suppressed_calls:
+                    replay_proven_codes = _compact_snippet_replay_proven_rule_codes(bounded_source)
+                    bounded_suppressed_calls = {
+                        call for call in bounded_suppressed_calls if call[1] not in replay_proven_codes
+                    }
+                bounded_high_risk_calls.difference_update(bounded_suppressed_calls)
+                bounded_high_risk_calls.update(bounded_explicit_high_risk_calls)
                 bounded_builtin_calls = self._dangerous_builtin_calls_in_tree(bounded_tree)
             except (SyntaxError, UnicodeDecodeError, ValueError):
                 # Binary model blobs commonly contain non-Python framing bytes; keep
@@ -16991,6 +17295,7 @@ class JITScriptDetector:
                 if probe in match:
                     proven_high_risk_calls.add((call_name, rule_code))
             snippet_high_risk_calls.update(proven_high_risk_calls)
+            snippet_explicit_high_risk_calls.update(proven_high_risk_calls)
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
@@ -17089,50 +17394,49 @@ class JITScriptDetector:
                     if not has_proven_high_risk_probe and any(
                         member_name in code_str for member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                     ):
-                        inactive_restore_high_risk_calls = _compact_snippet_inactive_restore_high_risk_calls(code_str)
-                    source_has_deferred_annotations = (
-                        "__future__" in code_str
-                        and "annotations" in code_str
-                        and _source_defers_annotations(code_str.encode("utf-8"))
-                    )
-                    suppresses_high_risk_calls = (
-                        not has_proven_high_risk_probe
-                        and not source_has_deferred_annotations
-                        and (
-                            _compact_snippet_has_unshadowed_print_member_overwrite(code_str)
-                            or _compact_snippet_has_inactive_builtins_dict_restore(code_str)
+                        inactive_restore_high_risk_calls = _compact_snippet_inactive_restore_high_risk_calls(
+                            code_str,
+                            inherited_runpy_aliases,
                         )
-                    )
+                        inactive_restore_high_risk_calls.update(
+                            _compact_snippet_captured_runpy_high_risk_calls(
+                                code_str,
+                                inherited_runpy_aliases,
+                            )
+                        )
                     setdefault_suppressed_calls = {
                         (f"runpy.{member_name}", "S108")
                         for member_name in _compact_snippet_deleted_print_setdefault_members(code_str)
                         if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                     }
                     typed_suppressed_calls = _compact_snippet_typed_print_overwrite_calls(code_str)
-                    if not inactive_restore_high_risk_calls:
-                        snippet_setdefault_suppressed_calls.update(setdefault_suppressed_calls)
-                    truncated_setdefault_print = (
-                        not setdefault_suppressed_calls and "setdefault" in code_str and "print" in code_str
+                    runpy_suppressed_calls = setdefault_suppressed_calls
+                    runpy_suppressed_calls.update(
+                        _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
+                            code_str,
+                            inherited_runpy_aliases,
+                        )
                     )
-                    if not truncated_setdefault_print:
-                        snippet_setdefault_suppressed_calls.difference_update(inactive_restore_high_risk_calls)
-                    if typed_suppressed_calls:
-                        snippet_typed_safe_codes.update(rule_code for _call_name, rule_code in typed_suppressed_calls)
-                        snippet_typed_suppressed_codes = snippet_typed_safe_codes - snippet_typed_danger_codes
-                    if suppresses_high_risk_calls:
-                        ast_high_risk_calls = set()
+                    runpy_suppressed_calls.update(
+                        _compact_snippet_runpy_print_overwrite_calls(
+                            code_str,
+                            inherited_runpy_aliases,
+                        )
+                    )
+                    runpy_suppressed_calls.difference_update(inactive_restore_high_risk_calls)
+                    candidate_suppressed_calls = typed_suppressed_calls | runpy_suppressed_calls
+                    if candidate_suppressed_calls and not has_proven_high_risk_probe:
+                        replay_proven_codes = _compact_snippet_replay_proven_rule_codes(code_str)
+                        candidate_suppressed_calls = {
+                            call for call in candidate_suppressed_calls if call[1] not in replay_proven_codes
+                        }
+                    else:
+                        candidate_suppressed_calls = set()
                     ast_high_risk_calls.update(inactive_restore_high_risk_calls)
-                    snippet_high_risk_calls.difference_update(snippet_setdefault_suppressed_calls)
-                    snippet_high_risk_calls = {
-                        call for call in snippet_high_risk_calls if call[1] not in snippet_typed_suppressed_codes
-                    }
-                    suppressed_calls = snippet_setdefault_suppressed_calls
-                    snippet_high_risk_calls.difference_update(suppressed_calls)
-                    snippet_high_risk_calls.update(
-                        call
-                        for call in ast_high_risk_calls - suppressed_calls
-                        if call[1] not in snippet_typed_suppressed_codes
-                    )
+                    ast_high_risk_calls.difference_update(candidate_suppressed_calls)
+                    snippet_suppressed_calls.update(candidate_suppressed_calls)
+                    snippet_explicit_high_risk_calls.update(inactive_restore_high_risk_calls)
+                    snippet_high_risk_calls.update(ast_high_risk_calls)
                     snippet_builtin_calls.update(parsed_builtin_calls or set())
                     ast_findings = self._analyze_ast(
                         tree,
@@ -17188,12 +17492,8 @@ class JITScriptDetector:
             )
 
         # Check for common code execution patterns in binary
-        snippet_typed_suppressed_codes = snippet_typed_safe_codes - snippet_typed_danger_codes
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
-        if snippet_typed_suppressed_codes:
-            resolved_high_risk_calls = {
-                call for call in resolved_high_risk_calls if call[1] not in snippet_typed_suppressed_codes
-            }
+        resolved_high_risk_calls.difference_update(snippet_suppressed_calls - snippet_explicit_high_risk_calls)
         resolved_builtin_calls = (bounded_builtin_calls or set()) | snippet_builtin_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
             raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]
@@ -17710,40 +18010,6 @@ class JITScriptDetector:
                             prioritized_snippets=prioritized_snippets_by_window.get(window_index),
                         )
                     )
-
-        decoded_source, _decoded_offsets = _decode_utf8_with_byte_offsets(data)
-        typed_source = decoded_source.lstrip("\x00")
-        typed_safe_codes = {
-            rule_code for _call_name, rule_code in _compact_snippet_typed_print_overwrite_calls(typed_source)
-        }
-        typed_danger_codes: set[str] = set()
-        if typed_safe_codes:
-            try:
-                typed_tree = ast.parse(textwrap.dedent(typed_source))
-                typed_danger_codes.update(
-                    rule_code for _call_name, rule_code in _resolve_alias_aware_high_risk_calls(typed_tree)
-                )
-            except (RecursionError, SyntaxError, ValueError):
-                pass
-        typed_suppressed_patterns = {
-            _WEBBROWSER_LAUNCH_DESCRIPTION if rule_code == "S109" else _CTYPES_NATIVE_LOADING_DESCRIPTION
-            for rule_code in (typed_safe_codes - typed_danger_codes)
-        }
-        runpy_suppressed_patterns = {
-            _RUNPY_CODE_EXECUTION_DESCRIPTION
-            for _call_name, _rule_code in _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(typed_source)
-        }
-        runpy_suppressed_patterns.update(
-            _RUNPY_CODE_EXECUTION_DESCRIPTION
-            for _call_name, _rule_code in _compact_snippet_deferred_annotation_runpy_print_overwrite_calls(typed_source)
-        )
-        suppressed_patterns = typed_suppressed_patterns | runpy_suppressed_patterns
-        if suppressed_patterns:
-            findings = [
-                finding
-                for finding in findings
-                if not (finding.type == "code_execution_pattern" and finding.pattern in suppressed_patterns)
-            ]
 
         return findings
 
