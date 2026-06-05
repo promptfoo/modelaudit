@@ -27,7 +27,9 @@ _MAX_ARTIFACT_REDIRECTS = 5
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"\\|?*')
 _WINDOWS_RESERVED_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
 )
 
 
@@ -35,30 +37,56 @@ class _ModelURLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.candidates: list[tuple[str, bool, bool]] = []
+        self._raw_text_depth = 0
 
-    def _collect(self, value: str, *, prose: bool) -> None:
-        self.candidates.extend((match.group(0), prose, True) for match in _PYTORCH_MODEL_URL_PATTERN.finditer(value))
+    def _collect(self, value: str, *, prose: bool, entity_decoded: bool) -> None:
+        self.candidates.extend(
+            (match.group(0), prose, entity_decoded) for match in _PYTORCH_MODEL_URL_PATTERN.finditer(value)
+        )
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del tag
+        if tag.casefold() in {"script", "style"}:
+            self._raw_text_depth += 1
         for _, value in attrs:
             if value is not None:
-                self._collect(value, prose=False)
+                stripped_value = value.strip()
+                if _PYTORCH_MODEL_URL_PATTERN.fullmatch(stripped_value):
+                    self.candidates.append((stripped_value, False, True))
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
+        if tag.casefold() in {"script", "style"}:
+            self._raw_text_depth -= 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in {"script", "style"} and self._raw_text_depth:
+            self._raw_text_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        self._collect(data, prose=True)
+        self._collect(data, prose=True, entity_decoded=self._raw_text_depth == 0)
 
     def handle_comment(self, data: str) -> None:
-        self._collect(data, prose=True)
+        self._collect(data, prose=True, entity_decoded=False)
 
 
 def _get_model_extensions() -> set[str]:
     from ..model_extensions import get_model_extensions
 
     return get_model_extensions()
+
+
+def _display_model_url(url: str) -> str:
+    """Return an artifact URL without query credentials or fragments."""
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError:
+        return "<PyTorch Hub artifact URL redacted>"
+    return parsed_url._replace(query="", fragment="").geturl()
+
+
+def _redact_model_error(message: object) -> str:
+    """Remove query strings from artifact URLs embedded in an error."""
+    return _PYTORCH_MODEL_URL_PATTERN.sub(lambda match: _display_model_url(match.group(0)), str(message))
 
 
 def _normalized_model_path(url: str) -> str | None:
@@ -70,7 +98,10 @@ def _normalized_model_path(url: str) -> str | None:
     if parsed_url.scheme.casefold() != "https" or parsed_url.netloc.casefold() != "download.pytorch.org":
         return None
 
-    path = unquote(parsed_url.path)
+    try:
+        path = unquote(parsed_url.path, errors="strict")
+    except UnicodeDecodeError:
+        return None
     normalized_path: str | None = None
     for _ in range(_MAX_MODEL_URL_DECODE_ROUNDS):
         if "\\" in path or "\x00" in path:
@@ -81,7 +112,10 @@ def _normalized_model_path(url: str) -> str | None:
         if normalized_path is None:
             normalized_path = current_normalized_path
 
-        decoded_path = unquote(path)
+        try:
+            decoded_path = unquote(path, errors="strict")
+        except UnicodeDecodeError:
+            return None
         if decoded_path == path:
             return normalized_path
         path = decoded_path
@@ -115,7 +149,7 @@ def _weight_relative_path(url: str) -> Path:
     """Return a safe local relative path for an extracted PyTorch Hub weight URL."""
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
     relative_parts = PurePosixPath(normalized_path).relative_to("/models").parts
     return Path(*(_safe_local_component(part) for part in relative_parts))
 
@@ -177,7 +211,7 @@ def _model_url_candidates(html: str) -> list[tuple[str, bool, bool]]:
     parser = _ModelURLParser()
     parser.feed(html)
     parser.close()
-    parsed_urls = {url for url, _, _ in parser.candidates}
+    parsed_urls = {url if entity_decoded else html_lib.unescape(url) for url, _, entity_decoded in parser.candidates}
     # HTMLParser omits URLs inside malformed, unclosed attributes.
     parser.candidates.extend(
         (match.group(0), False, False)
@@ -244,6 +278,25 @@ def _open_binary_fd(fd: int) -> Iterator[BinaryIO]:
         yield handle
 
 
+def _artifact_format(
+    url: str,
+    model_extensions: set[str],
+    extension_format_map: dict[str, str],
+) -> str:
+    extension = _supported_model_extension(url, model_extensions)
+    if extension is None:
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
+    return extension_format_map.get(extension, extension)
+
+
+def _artifact_redirect_url(current_url: str, response: requests.Response) -> str:
+    location = response.headers.get("location")
+    if not isinstance(location, str) or not location:
+        response.raise_for_status()
+        raise ValueError(f"PyTorch Hub artifact redirect has no location: {_display_model_url(current_url)}")
+    return urljoin(current_url, location)
+
+
 @contextmanager
 def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
     """Open an artifact while keeping every redirect inside the trusted model path."""
@@ -251,21 +304,15 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
 
     model_extensions = {extension.lower() for extension in _get_model_extensions()}
     extension_format_map = get_extension_format_map()
-    expected_extension = _supported_model_extension(url, model_extensions)
-    if expected_extension is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
-    expected_format = extension_format_map.get(expected_extension, expected_extension)
+    expected_format = _artifact_format(url, model_extensions, extension_format_map)
 
     current_url = url
     for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
-        current_extension = _supported_model_extension(current_url, model_extensions)
-        if current_extension is None:
-            raise ValueError(f"Unsafe PyTorch Hub model URL: {current_url}")
-        current_format = extension_format_map.get(current_extension, current_extension)
+        current_format = _artifact_format(current_url, model_extensions, extension_format_map)
         if current_format != expected_format:
             raise ValueError(
                 "PyTorch Hub artifact redirect changed artifact format "
-                f"from {expected_format} to {current_format}: {current_url}"
+                f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
             )
 
         with requests.get(current_url, stream=True, timeout=30, allow_redirects=False) as response:
@@ -274,19 +321,16 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
                 response.raise_for_status()
                 if status_code != 200:
                     raise requests.HTTPError(
-                        f"Unexpected status code {status_code} for PyTorch Hub artifact: {current_url}",
+                        "Unexpected status code "
+                        f"{status_code} for PyTorch Hub artifact: {_display_model_url(current_url)}",
                         response=response,
                     )
                 yield response
                 return
 
-            location = response.headers.get("location")
-            if not isinstance(location, str) or not location:
-                response.raise_for_status()
-                raise ValueError(f"PyTorch Hub artifact redirect has no location: {current_url}")
-            current_url = urljoin(current_url, location)
+            current_url = _artifact_redirect_url(current_url, response)
 
-    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
+    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
 
 
 @contextmanager
@@ -361,12 +405,36 @@ def _extract_weight_urls(html: str) -> list[str]:
 
 
 def _get_total_size(urls: list[str]) -> int:
+    from ...scanner_registry_metadata import get_extension_format_map
+
+    model_extensions = {extension.lower() for extension in _get_model_extensions()}
+    extension_format_map = get_extension_format_map()
     total = 0
-    for u in urls:
+    for url in urls:
         try:
-            resp = requests.head(u, timeout=10)
-            if resp.ok and "content-length" in resp.headers:
-                total += int(resp.headers["content-length"])
+            expected_format = _artifact_format(url, model_extensions, extension_format_map)
+            current_url = url
+            for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
+                current_format = _artifact_format(current_url, model_extensions, extension_format_map)
+                if current_format != expected_format:
+                    raise ValueError(
+                        "PyTorch Hub artifact redirect changed artifact format "
+                        f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
+                    )
+
+                response = requests.head(current_url, timeout=10, allow_redirects=False)
+                try:
+                    status_code = response.status_code if isinstance(response.status_code, int) else 200
+                    if status_code in _REDIRECT_STATUS_CODES:
+                        current_url = _artifact_redirect_url(current_url, response)
+                        continue
+                    if response.ok and status_code == 200 and "content-length" in response.headers:
+                        total += int(response.headers["content-length"])
+                    break
+                finally:
+                    response.close()
+            else:
+                raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
         except Exception:
             continue
     return total
@@ -415,7 +483,9 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
         except Exception as e:
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+            raise Exception(
+                f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"
+            ) from e
 
     return dest_dir
 
@@ -470,7 +540,9 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
                         if chunk:
                             f.write(chunk)
             except Exception as e:
-                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+                raise Exception(
+                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"
+                ) from e
 
             yield (dest_file, is_last)
 

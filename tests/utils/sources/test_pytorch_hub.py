@@ -12,6 +12,7 @@ from modelaudit.utils.sources.pytorch_hub import (
     _append_owned_fd,
     _artifact_download_paths,
     _extract_weight_urls,
+    _get_total_size,
     _open_binary_fd,
     _open_destination_file,
     _open_trusted_artifact_response,
@@ -45,7 +46,12 @@ class TestPytorchHubURLDetection:
 @patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
-def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp_path):
+def test_download_pytorch_hub_model_success(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
     html_resp = MagicMock()
     html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
     html_resp.raise_for_status = lambda: None
@@ -189,6 +195,37 @@ def test_download_pytorch_hub_model_strips_query_from_local_filename(
     assert (tmp_path / "resnet50.onnx").read_bytes() == b"abc"
     assert not (tmp_path / "resnet50.onnx?download=1").exists()
     mock_get.assert_any_call(weight_url, stream=True, timeout=30, allow_redirects=False)
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_redacts_signed_query_from_errors(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/resnet50.onnx?token=top-secret"
+    mock_extensions.return_value = {".onnx"}
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">onnx</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.status_code = 403
+    file_resp.raise_for_status.side_effect = requests.HTTPError(f"403 for {weight_url}")
+    mock_get.side_effect = [html_resp, file_resp]
+    mock_head.return_value.ok = False
+
+    with pytest.raises(Exception) as exc_info:
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    assert "top-secret" not in str(exc_info.value)
+    assert "https://download.pytorch.org/models/resnet50.onnx" in str(exc_info.value)
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
@@ -524,6 +561,27 @@ def test_extract_weight_urls_canonicalizes_entities_case_and_fragments(mock_exte
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+def test_extract_weight_urls_decodes_entities_once_in_raw_text(mock_extensions: MagicMock) -> None:
+    mock_extensions.return_value = {".onnx"}
+    html = (
+        "<!-- https://download.pytorch.org/models/comment.onnx?x=1&amp;y=2 -->"
+        "<script>const model = 'https://download.pytorch.org/models/script.onnx?x=1&amp;y=2';</script>"
+    )
+
+    assert _extract_weight_urls(html) == [
+        "https://download.pytorch.org/models/comment.onnx?x=1&y=2",
+        "https://download.pytorch.org/models/script.onnx?x=1&y=2",
+    ]
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+def test_extract_weight_urls_does_not_invent_prefix_from_attribute(mock_extensions: MagicMock) -> None:
+    mock_extensions.return_value = {".onnx"}
+
+    assert _extract_weight_urls('<a href="https://download.pytorch.org/models/model.onnx&quot;.txt">model</a>') == []
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
 def test_extract_weight_urls_does_not_synthesize_truncated_links(mock_extensions: MagicMock) -> None:
     mock_extensions.return_value = {".onnx"}
     html = (
@@ -575,15 +633,47 @@ def test_extract_weight_urls_rejects_excessive_recursive_encoding(mock_extension
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+def test_extract_weight_urls_rejects_invalid_encoded_utf8(mock_extensions: MagicMock) -> None:
+    """Invalid encoded bytes must not collapse into a local artifact identity."""
+    mock_extensions.return_value = {".onnx"}
+
+    assert _extract_weight_urls("https://download.pytorch.org/models/%FF.onnx") == []
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
 def test_extract_weight_urls_does_not_invent_double_encoded_extensions(mock_extensions: MagicMock) -> None:
     mock_extensions.return_value = {".onnx"}
 
     assert _extract_weight_urls("https://download.pytorch.org/models/model%252Eonnx") == []
 
 
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+def test_get_total_size_follows_only_trusted_artifact_redirects(
+    mock_head: MagicMock,
+    mock_extensions: MagicMock,
+) -> None:
+    original_url = "https://download.pytorch.org/models/model.onnx"
+    redirected_url = "https://download.pytorch.org/models/releases/model.onnx"
+    mock_extensions.return_value = {".onnx"}
+    redirect_response = MagicMock(status_code=302, headers={"location": redirected_url})
+    artifact_response = MagicMock(status_code=200, ok=True, headers={"content-length": "123"})
+    mock_head.side_effect = [redirect_response, artifact_response]
+
+    assert _get_total_size([original_url]) == 123
+    assert mock_head.mock_calls == [
+        call(original_url, timeout=10, allow_redirects=False),
+        call(redirected_url, timeout=10, allow_redirects=False),
+    ]
+    redirect_response.close.assert_called_once_with()
+    artifact_response.close.assert_called_once_with()
+
+
 def test_artifact_download_paths_are_portable_and_do_not_conflict() -> None:
     urls = [
         "https://download.pytorch.org/models/CON.onnx",
+        "https://download.pytorch.org/models/COM%C2%B9.onnx",
+        "https://download.pytorch.org/models/LPT%C2%B3.onnx",
         "https://download.pytorch.org/models/file%3Astream.onnx",
         "https://download.pytorch.org/models/%1Bred.onnx",
         "https://download.pytorch.org/models/trailing%20/model.onnx",
@@ -599,6 +689,8 @@ def test_artifact_download_paths_are_portable_and_do_not_conflict() -> None:
 
     assert [path.as_posix() for _, path in _artifact_download_paths(urls)] == [
         "__modelaudit_CON.onnx",
+        "__modelaudit_COM¹.onnx",
+        "__modelaudit_LPT³.onnx",
         "file%3Astream.onnx",
         "%1Bred.onnx",
         "trailing%20/model.onnx",
