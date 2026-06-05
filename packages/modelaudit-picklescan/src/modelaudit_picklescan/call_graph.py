@@ -31,6 +31,7 @@ from importlib.machinery import (
     SourceFileLoader,
     SourcelessFileLoader,
 )
+from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
@@ -42,6 +43,8 @@ from zipimport import zipimporter
 # growth; raising it improves completeness at a runtime cost, lowering it can
 # reduce detection coverage.
 _MAX_IMPORT_REFERENCES = 32
+_MAX_MODULE_NAME_CHARS = 1024
+_MAX_MODULE_COMPONENTS = 32
 # Limit per-module source reads to 1 MiB so AST parsing remains bounded on large
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
@@ -52,6 +55,10 @@ _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
+_MAX_BYTECODE_CACHE_BYTES = 4 * _MAX_SOURCE_BYTES
+_MAX_BYTECODE_CACHE_DIRECTORY_BYTES = 64 * 1024
+_MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
+_BYTECODE_CACHE_OPTIMIZATIONS = (("", 0), ("1", 1), ("2", 2))
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
@@ -64,19 +71,271 @@ _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
+_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
+_MAX_TRUSTED_PTH_FILES = 64
+_MAX_TRUSTED_PTH_BYTES = 64 * 1024
+_MAX_TRUSTED_PTH_PATHS = 64
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
+# Only modules whose import cannot resolve additional shadowable Python modules
+# are safe here. pathlib and subprocess transitively import modules such as
+# fnmatch and selectors, so a sibling shadow can still execute during unpickling.
+_REVIEWED_INERT_STDLIB_IMPORTS = frozenset({"os"})
+_TRUSTED_STDLIB_PATHS = tuple(
+    Path(path).resolve() for name in ("stdlib", "platstdlib") if (path := sysconfig.get_path(name))
+)
+_TRUSTED_SITE_PACKAGE_PATHS = tuple(
+    Path(path).resolve() for name in ("purelib", "platlib") if (path := sysconfig.get_path(name))
+)
+
+
+def _site_package_root_from_pth_value(value: str, trusted_root: Path) -> Path | None:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = trusted_root / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved.name not in {"site-packages", "dist-packages"}:
+        return None
+    try:
+        return resolved if resolved.is_dir() else None
+    except OSError:
+        return None
+
+
+def _pth_delegated_site_package_paths(pth_path: Path, trusted_root: Path) -> tuple[Path, ...]:
+    try:
+        if pth_path.stat().st_size > _MAX_TRUSTED_PTH_BYTES:
+            return ()
+        content = pth_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ()
+
+    paths: list[Path] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values: list[str] = []
+        if line.startswith(("import ", "import\t")):
+            try:
+                tree = ast.parse(line, filename=str(pth_path))
+            except SyntaxError:
+                continue
+            for statement in tree.body:
+                if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+                    continue
+                node = statement.value
+                if len(node.args) != 1 or node.keywords:
+                    continue
+                function = node.func
+                argument = node.args[0]
+                if not (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "site"
+                    and function.attr == "addsitedir"
+                    and isinstance(argument, ast.Constant)
+                    and isinstance(argument.value, str)
+                ):
+                    continue
+                values.append(argument.value)
+        else:
+            values.append(line)
+
+        for value in values:
+            path = _site_package_root_from_pth_value(value, trusted_root)
+            if path is not None and path not in paths:
+                paths.append(path)
+                if len(paths) >= _MAX_TRUSTED_PTH_PATHS:
+                    return tuple(paths)
+    return tuple(paths)
+
+
+def _trusted_delegated_site_package_paths() -> tuple[Path, ...]:
+    paths: list[Path] = []
+    files_seen = 0
+    for trusted_root in _TRUSTED_SITE_PACKAGE_PATHS:
+        try:
+            pth_paths = trusted_root.glob("*.pth")
+            for pth_path in pth_paths:
+                if files_seen >= _MAX_TRUSTED_PTH_FILES:
+                    return tuple(paths)
+                files_seen += 1
+                for path in _pth_delegated_site_package_paths(pth_path, trusted_root):
+                    if path not in paths:
+                        paths.append(path)
+                        if len(paths) >= _MAX_TRUSTED_PTH_PATHS:
+                            return tuple(paths)
+        except OSError:
+            continue
+    return tuple(paths)
+
+
+# Active-environment .pth files are trusted startup configuration. They may
+# delegate additional installed-package roots without making every venv-shaped
+# directory on sys.path trusted.
+_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS = _trusted_delegated_site_package_paths()
+_IMPORT_AFFECTING_MODULE_NAMES = frozenset({"__loader__", "__package__", "__path__", "__spec__"})
+_TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
+    {
+        ("_frozen_importlib", "ModuleSpec"),
+        ("_sitebuiltins", "_Helper"),
+        ("_xxsubinterpreters", "create"),
+        ("aiobotocore.credentials", "AioProcessProvider"),
+        ("argparse", "Namespace"),
+        ("botocore.credentials", "ProcessProvider"),
+        ("configparser", "ConfigParser"),
+        ("concurrent.futures", "Future"),
+        ("concurrent.futures", "Future.add_done_callback"),
+        ("dill", "dump"),
+        ("ipaddress", "IPv4Address"),
+        ("string", "Formatter"),
+        ("string", "Formatter._vformat"),
+        ("string", "Formatter.vformat"),
+        ("string", "Template"),
+        ("string", "Template.safe_substitute"),
+        ("string", "Template.substitute"),
+        ("statistics", "mean"),
+        ("tarfile", "TarInfo"),
+        ("tempfile", "gettempdir"),
+        ("tokenize", "generate_tokens"),
+        ("weakref", "WeakMethod"),
+        ("weakref", "proxy"),
+        ("weakref", "ref"),
+        ("zipfile", "ZipInfo"),
+    }
+)
+_LEGACY_BUILTIN_EXCEPTION_NAMES = frozenset(
+    {
+        "ArithmeticError",
+        "AssertionError",
+        "AttributeError",
+        "BaseException",
+        "BufferError",
+        "BytesWarning",
+        "DeprecationWarning",
+        "EOFError",
+        "EnvironmentError",
+        "Exception",
+        "FloatingPointError",
+        "FutureWarning",
+        "GeneratorExit",
+        "IOError",
+        "ImportError",
+        "ImportWarning",
+        "IndentationError",
+        "IndexError",
+        "KeyError",
+        "KeyboardInterrupt",
+        "LookupError",
+        "MemoryError",
+        "NameError",
+        "NotImplementedError",
+        "OSError",
+        "OverflowError",
+        "PendingDeprecationWarning",
+        "ReferenceError",
+        "RuntimeError",
+        "RuntimeWarning",
+        "StandardError",
+        "StopIteration",
+        "SyntaxError",
+        "SyntaxWarning",
+        "SystemError",
+        "SystemExit",
+        "TabError",
+        "TypeError",
+        "UnboundLocalError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "UnicodeError",
+        "UnicodeTranslateError",
+        "UnicodeWarning",
+        "UserWarning",
+        "ValueError",
+        "VMSError",
+        "Warning",
+        "WindowsError",
+        "ZeroDivisionError",
+    }
+)
+_TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
+    {
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch", "Size"),
+        ("torch", "Storage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "_rebuild_tensor"),
+        ("torch", "_rebuild_tensor_v2"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_nested_tensor"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch.serialization", "_get_layout"),
+    }
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
+    frozenset(
+        {
+            ("pathlib._local", "PurePath"),
+            ("pathlib._local", "PurePosixPath"),
+            ("pathlib._local", "PureWindowsPath"),
+        }
+    )
+    | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
+_PICKLE_BUILD_ENTRYPOINT_METHODS = (
+    "__getattribute__",
+    "__getattr__",
+    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    "__setattr__",
+)
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
 _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
-    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
-    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
 _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
     "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
@@ -123,10 +382,11 @@ class _SourceReadTooLargeError(OSError):
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
     resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
-    fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
+    resolution_fingerprints: dict[str, bytes | str | None] = field(default_factory=dict)
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
     loaded_package_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    read_fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
     generation: int = 0
     stable: bool = True
     reusable: bool = True
@@ -136,6 +396,42 @@ class _SharedSourceSnapshot:
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
     _SOURCE_SENSITIVE_CACHED_FUNCTIONS.add(cast(_CacheClearable, function))
     return function
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=1)
+def _installed_package_distributions() -> Mapping[str, list[str]]:
+    try:
+        return packages_distributions()
+    except Exception:
+        return {}
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=256)
+def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    distribution_names = _installed_package_distributions().get(top_level_name, ())
+    for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
+        try:
+            installed_distribution = distribution(distribution_name)
+            metadata_location = getattr(installed_distribution, "_path", None)
+            if metadata_location is None:
+                continue
+            metadata_path = Path(str(metadata_location)).resolve()
+            root = Path(str(installed_distribution.locate_file(""))).resolve()
+        except Exception:
+            continue
+        if not _path_is_in_trusted_package_environment(metadata_path):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _path_is_in_trusted_package_environment(path: Path) -> bool:
+    trusted_paths = (*_TRUSTED_SITE_PACKAGE_PATHS, *_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS)
+    return any(path.is_relative_to(trusted_path) for trusted_path in trusted_paths)
 
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -148,6 +444,7 @@ _CLASS_ENTRYPOINT_METHODS = (
     "__exit__",
     "__new__",
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    "__setattr__",
     "__init__",
 )
 _CLASS_ENTRYPOINT_METHOD_SET = frozenset(_CLASS_ENTRYPOINT_METHODS)
@@ -379,7 +676,7 @@ def find_dangerous_call_graphs(
     _clear_source_sensitive_caches()
     findings: list[CallGraphFinding] = []
     seen_findings: set[tuple[str, str, tuple[str, ...]]] = set()
-    positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
+    argument_shapes = _callable_invocation_argument_shapes(callable_invocations)
     callable_references = _iter_callable_invocation_references(callable_invocations)
     invoked_references = {
         (str(reference.get("module", "")), str(reference.get("name", "")))
@@ -410,12 +707,30 @@ def find_dangerous_call_graphs(
                 analysis_limit_error = error
             sink_path = error.partial_path
         if sink_path is None:
-            for positional_arg_count in positional_arg_counts.get((module, name), ()):
+            for entrypoint in entrypoints:
+                entrypoint_arg_count = _pickle_entrypoint_positional_arg_count(reference, entrypoint)
+                if entrypoint_arg_count is None:
+                    continue
+                try:
+                    sink_path = _find_invoked_import_execution_path(
+                        entrypoint,
+                        entrypoint_arg_count,
+                        allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    sink_path = error.partial_path
+                if sink_path is not None:
+                    break
+        if sink_path is None:
+            for positional_arg_count, keyword_arg_names in argument_shapes.get((module, name), ()):
                 try:
                     sink_path = _first_matching_path(
                         entrypoints,
                         _invoked_import_execution_path_callback(
                             positional_arg_count,
+                            keyword_arg_names,
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
@@ -460,26 +775,46 @@ def find_startup_hook_write_call_graphs(
     callable_invocations_complete: bool = True,
 ) -> tuple[StartupHookWriteFinding, ...]:
     _clear_source_sensitive_caches()
+    if callable_invocations is not None and not callable_invocations_complete:
+        return ()
     openers: list[_ImportCallPath] = []
     writers: list[_ImportCallPath] = []
     seen: set[tuple[str, str]] = set()
-    invoked_references = {
-        (str(reference.get("module", "")), str(reference.get("name", "")))
-        for reference in _iter_callable_invocation_references(callable_invocations)
-    }
-    require_invocations = callable_invocations is not None and callable_invocations_complete
+    callable_references = _iter_callable_invocation_references(callable_invocations)
+    invocations_by_reference: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for reference in callable_references:
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if module and name:
+            invocations_by_reference.setdefault((module, name), []).append(reference)
+    require_invocations = callable_invocations is not None
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
-        if require_invocations and (module, name) not in invoked_references:
+        invocation_references = invocations_by_reference.get((module, name), ())
+        if require_invocations and not invocation_references:
             continue
         seen.add((module, name))
 
         try:
-            entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+            entrypoints = (
+                _dedupe_calls(
+                    tuple(
+                        entrypoint
+                        for invocation_reference in invocation_references
+                        for entrypoint in _call_graph_entrypoints_for_reference(
+                            module,
+                            name,
+                            invocation_reference,
+                        )
+                    )
+                )
+                if require_invocations
+                else _safe_call_graph_entrypoints(f"{module}.{name}")
+            )
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
@@ -574,14 +909,34 @@ def find_unanalyzed_callable_call_graph_references(
     _clear_source_sensitive_caches()
     references: list[UnanalyzedCallGraphReference] = []
     seen: set[tuple[str, str]] = set()
+    callable_references = _iter_callable_invocation_references(callable_invocations)
+    incomplete_newobj_ex_references = {
+        (str(reference.get("module", "")), str(reference.get("name", "")))
+        for reference in callable_references
+        if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None
+    }
 
-    for reference in _iter_callable_invocation_references(callable_invocations):
+    for reference in callable_references:
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
         seen.add((module, name))
-        if _is_skippable_torch_extension_global_reference(module, name):
+        if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
+            module, name
+        ):
+            continue
+        if (module, name) in incomplete_newobj_ex_references:
+            references.append(
+                UnanalyzedCallGraphReference(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    reason="invocation_metadata_incomplete",
+                )
+            )
+            if len(references) >= _MAX_IMPORT_REFERENCES:
+                break
             continue
         if _call_graph_entrypoints_for_reference(module, name, reference):
             continue
@@ -599,6 +954,142 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+def find_analyzed_callable_call_graph_global_positions(
+    callable_invocations: object | None,
+) -> frozenset[int]:
+    """Return invoked global positions with source-backed call-graph entrypoints."""
+    _clear_source_sensitive_caches()
+    positions: set[int] = set()
+    for reference in _iter_callable_invocation_references(callable_invocations):
+        global_position = reference.get("global_position")
+        if type(global_position) is not int:
+            continue
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if module and name and _call_graph_reference_is_analyzed(module, name, reference):
+            positions.add(global_position)
+    return frozenset(positions)
+
+
+def module_initialization_is_proven_inert(module_name: str) -> bool:
+    """Return whether importing a source-backed module has no executable initialization."""
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
+        return False
+    for index in range(1, len(parts) + 1):
+        context = _module_source_context(".".join(parts[:index]))
+        if context is None or (index < len(parts) and not context.is_package):
+            return False
+        if not _module_source_context_initialization_is_proven_inert(context):
+            return False
+    return True
+
+
+def _module_source_context_initialization_is_proven_inert(context: _ModuleSourceContext) -> bool:
+    guarded_names = {"__getattr__", *_IMPORT_AFFECTING_MODULE_NAMES}
+    return not any(
+        _module_statement_binds_name(statement, name)
+        for statement in context.module_statements
+        for name in guarded_names
+    ) and all(_module_initialization_statement_is_inert(statement) for statement in context.module_statements)
+
+
+def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
+    """Return whether a known-safe reference resolves from a trusted installation path."""
+    if _legacy_pickle_compat_reference_is_trusted(module_name, name):
+        return True
+    origin_kind = _trusted_module_origin_kind(module_name)
+    reference = (module_name, name)
+    return reference in _TRUSTED_IMPORT_ONLY_REFERENCES and (
+        origin_kind in {"stdlib", "site_packages"}
+        or (origin_kind == "unresolved" and reference in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES)
+    )
+
+
+def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
+    """Return whether a module resolves outside trusted install paths."""
+    if module_name == "__builtin__" or _legacy_pickle_compat_reference_is_trusted(module_name, name):
+        return False
+    origin_kind = _trusted_module_origin_kind(module_name)
+    return origin_kind not in {"stdlib", "site_packages"} and not (
+        origin_kind == "unresolved" and (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES
+    )
+
+
+def _legacy_pickle_compat_reference_is_trusted(module_name: str, name: str) -> bool:
+    return (module_name == "copy_reg" and name == "_reconstructor") or (
+        module_name == "exceptions" and name in _LEGACY_BUILTIN_EXCEPTION_NAMES
+    )
+
+
+def _unresolved_trusted_import_reference_is_safe(module_name: str, name: str) -> bool:
+    return (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES and _trusted_module_origin_kind(
+        module_name
+    ) == "unresolved"
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _trusted_module_origin_kind(module_name: str) -> str | None:
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
+        return None
+    _track_shared_source_candidates(parts)
+    try:
+        standard_spec = BuiltinImporter.find_spec(module_name)
+        if standard_spec is None:
+            standard_spec = FrozenImporter.find_spec(module_name)
+        if standard_spec is None:
+            standard_spec = _find_standard_filesystem_spec(module_name)
+    except Exception:
+        return None
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    spec: ModuleSpec | None
+    if isinstance(loaded_spec, ModuleSpec) and (standard_spec is None or loaded_spec.origin == standard_spec.origin):
+        spec = loaded_spec
+    else:
+        if not isinstance(loaded_spec, ModuleSpec) and (
+            _untrusted_meta_path_finder_precedes(BuiltinImporter, module_name)
+            or _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
+            or _untrusted_meta_path_finder_precedes(PathFinder, module_name)
+            or _has_untrusted_path_hook()
+        ):
+            return None
+        spec = standard_spec
+    if spec is None:
+        return "unresolved"
+    if _module_spec_uses_builtin_or_frozen_loader(spec):
+        return "stdlib"
+    if spec.origin is None:
+        return None
+    try:
+        origin = Path(spec.origin).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if _path_is_in_trusted_package_environment(origin):
+        return "site_packages"
+    top_level_name = parts[0]
+    if any(origin.is_relative_to(path) for path in _installed_distribution_roots(top_level_name)):
+        return "site_packages"
+    if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
+        return "stdlib"
+    return None
+
+
+def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
+    if len(module_name) > _MAX_MODULE_NAME_CHARS:
+        return None
+    parts = tuple(module_name.split("."))
+    if (
+        not parts
+        or len(parts) > _MAX_MODULE_COMPONENTS
+        or any(not part or "/" in part or "\\" in part for part in parts)
+    ):
+        return None
+    return parts
 
 
 @contextmanager
@@ -676,6 +1167,7 @@ def _first_matching_path(
 
 def _invoked_import_execution_path_callback(
     positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...] | None = (),
     *,
     allow_non_lifecycle_entrypoint: bool = False,
 ) -> Callable[[str], tuple[str, ...] | None]:
@@ -683,6 +1175,7 @@ def _invoked_import_execution_path_callback(
         return _find_invoked_import_execution_path(
             entrypoint,
             positional_arg_count,
+            keyword_arg_names,
             allow_non_lifecycle_entrypoint=allow_non_lifecycle_entrypoint,
         )
 
@@ -696,7 +1189,7 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None]] = set()
+    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -709,6 +1202,8 @@ def _iter_call_graph_references(
             name,
             opcode,
             positional_arg_count if isinstance(positional_arg_count, int) else None,
+            _optional_bool_reference_detail(item.get("build_uses_slot_state")),
+            _complete_keyword_arg_names(item),
         )
         if invocation_key in seen_invocations:
             continue
@@ -752,12 +1247,27 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
     return tuple(normalized)
 
 
+def _optional_bool_reference_detail(value: object) -> bool | None:
+    return value if type(value) is bool else None
+
+
+def _complete_keyword_arg_names(reference: Mapping[str, object]) -> tuple[str, ...] | None:
+    if str(reference.get("opcode", "")) != "NEWOBJ_EX":
+        return ()
+    if reference.get("keyword_args_complete") is not True:
+        return None
+    raw_names = reference.get("keyword_arg_names")
+    if not isinstance(raw_names, list | tuple) or any(not isinstance(name, str) for name in raw_names):
+        return None
+    return tuple(raw_names)
+
+
 def _iter_callable_invocation_references(callable_invocations: object | None) -> tuple[dict[str, object], ...]:
     if not isinstance(callable_invocations, list | tuple):
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None]] = set()
+    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -776,6 +1286,8 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 reference_name,
                 opcode,
                 positional_arg_count if isinstance(positional_arg_count, int) else None,
+                _optional_bool_reference_detail(item.get("build_uses_slot_state")),
+                _complete_keyword_arg_names(item),
             )
             if reference_key in seen:
                 continue
@@ -810,10 +1322,37 @@ def _call_graph_entrypoints_for_reference(
             return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
         return _filter_class_entrypoints(entrypoints, ("__new__",))
     if opcode in _BUILD_OPCODES:
-        return _filter_class_entrypoints(entrypoints, _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
+        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
+        if reference.get("build_uses_slot_state") is False:
+            methods = tuple(method for method in methods if method != "__setattr__")
+        return _filter_class_entrypoints(entrypoints, methods)
     if opcode in _CONSTRUCTOR_OPCODES:
         return _filter_class_entrypoints(entrypoints, _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS)
     return entrypoints
+
+
+def _pickle_entrypoint_positional_arg_count(
+    reference: Mapping[str, object],
+    entrypoint: str,
+) -> int | None:
+    if str(reference.get("opcode", "")) not in _BUILD_OPCODES:
+        return None
+    method_name = entrypoint.rpartition(".")[2]
+    if method_name in {"__getattribute__", "__getattr__", "__setstate__"}:
+        return 1
+    if method_name == "__setattr__":
+        return 2
+    return None
+
+
+def _call_graph_reference_is_analyzed(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None:
+        return False
+    return bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
 
 
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:
@@ -829,19 +1368,20 @@ def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, 
     )
 
 
-def _callable_invocation_positional_arg_counts(
+def _callable_invocation_argument_shapes(
     callable_invocations: object | None,
-) -> dict[tuple[str, str], tuple[int, ...]]:
+) -> dict[tuple[str, str], tuple[tuple[int, tuple[str, ...] | None], ...]]:
     if not isinstance(callable_invocations, list | tuple):
         return {}
 
-    counts: dict[tuple[str, str], set[int]] = {}
+    shapes: dict[tuple[str, str], set[tuple[int, tuple[str, ...] | None]]] = {}
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
         positional_arg_count = item.get("positional_arg_count")
+        keyword_arg_names = _complete_keyword_arg_names(item)
         if (
             not module
             or not name
@@ -851,10 +1391,25 @@ def _callable_invocation_positional_arg_counts(
         ):
             continue
         for reference in ((module, name), *_callable_singleton_aliases(module, name)):
-            counts.setdefault(reference, set()).add(positional_arg_count)
-            if len(counts) >= _MAX_IMPORT_REFERENCES:
-                return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
-    return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
+            shapes.setdefault(reference, set()).add((positional_arg_count, keyword_arg_names))
+            if len(shapes) >= _MAX_IMPORT_REFERENCES:
+                return _sorted_callable_invocation_argument_shapes(shapes)
+    return _sorted_callable_invocation_argument_shapes(shapes)
+
+
+def _sorted_callable_invocation_argument_shapes(
+    shapes: Mapping[tuple[str, str], set[tuple[int, tuple[str, ...] | None]]],
+) -> dict[tuple[str, str], tuple[tuple[int, tuple[str, ...] | None], ...]]:
+    return {
+        key: tuple(
+            sorted(
+                value,
+                key=lambda shape: (shape[0], shape[1] is not None, shape[1] or ()),
+                reverse=True,
+            )
+        )
+        for key, value in shapes.items()
+    }
 
 
 def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str], ...]:
@@ -1131,17 +1686,17 @@ def _read_bounded_regular_file(path: Path, max_bytes: int | None) -> tuple[bytes
 
 
 def _read_bounded_source_text(path: Path) -> str:
-    source, _source_stat = _read_bounded_regular_file(path, _MAX_SOURCE_BYTES)
+    source, _ = _read_bounded_regular_file(path, _MAX_SOURCE_BYTES)
     return source.decode("utf-8")
 
 
-def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | str | None]:
+def _resolution_candidate_fingerprint(path: Path) -> tuple[bool, bytes | str | None]:
     try:
         if str(path).endswith(tuple(EXTENSION_SUFFIXES)):
-            _content, _source_stat = _read_bounded_regular_file(path, None)
+            _read_bounded_regular_file(path, None)
             return True, _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
         max_bytes = _MAX_SOURCE_BYTES * 2 if str(path).endswith(tuple(BYTECODE_SUFFIXES)) else _MAX_SOURCE_BYTES
-        source, _source_stat = _read_bounded_regular_file(path, max_bytes)
+        source, _ = _read_bounded_regular_file(path, max_bytes)
     except (FileNotFoundError, NotADirectoryError):
         return True, None
     except OSError:
@@ -1149,10 +1704,44 @@ def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | str | None]
     return True, hashlib.sha256(source).digest()
 
 
+def _read_candidate_fingerprint(
+    path: Path,
+    *,
+    read_limit: int = _MAX_SOURCE_BYTES,
+    require_complete: bool = True,
+) -> tuple[bool, bytes | None]:
+    if path.is_dir():
+        try:
+            entries: list[bytes] = []
+            total_bytes = 0
+            for index, entry in enumerate(path.iterdir()):
+                if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                    return False, None
+                entry_name = os.fsencode(entry.name)
+                total_bytes += len(entry_name) + 1
+                if require_complete and total_bytes > read_limit:
+                    return False, None
+                entries.append(entry_name)
+        except OSError:
+            return False, None
+        return True, hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).digest()
+    if not path.is_file():
+        return True, None
+    try:
+        with path.open("rb") as source_file:
+            source = source_file.read(read_limit + int(require_complete))
+    except OSError:
+        return False, None
+    if require_complete and len(source) > read_limit:
+        return False, None
+    return True, hashlib.sha256(b"file\0" + source).digest()
+
+
 def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.search_context = _source_search_context()
     snapshot.resolution_context = _source_resolution_context()
-    snapshot.fingerprints.clear()
+    snapshot.resolution_fingerprints.clear()
+    snapshot.read_fingerprints.clear()
     snapshot.module_sources.clear()
     snapshot.loaded_module_sources.clear()
     snapshot.loaded_package_paths.clear()
@@ -1168,9 +1757,17 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
         or snapshot.resolution_context != _source_resolution_context()
     ):
         return False
-    for path, expected_fingerprint in snapshot.fingerprints.items():
-        reusable, fingerprint = _source_candidate_fingerprint(Path(path))
-        if not reusable or fingerprint != expected_fingerprint:
+    for path, (read_limit, require_complete, expected_read_fingerprint) in snapshot.read_fingerprints.items():
+        reusable, read_fingerprint = _read_candidate_fingerprint(
+            Path(path),
+            read_limit=read_limit,
+            require_complete=require_complete,
+        )
+        if not reusable or read_fingerprint != expected_read_fingerprint:
+            return False
+    for path, expected_resolution_fingerprint in snapshot.resolution_fingerprints.items():
+        reusable, resolution_fingerprint = _resolution_candidate_fingerprint(Path(path))
+        if not reusable or resolution_fingerprint != expected_resolution_fingerprint:
             return False
     for module_name, expected_source in snapshot.module_sources.items():
         if _current_module_source_path(module_name) != expected_source:
@@ -1228,6 +1825,7 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
                 "loaded_module_sources": {},
                 "loaded_package_paths": {},
                 "fingerprints": {},
+                "read_fingerprints": {},
             }
         return {
             "reusable": True,
@@ -1245,12 +1843,63 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
             },
             "fingerprints": {
                 path: fingerprint.hex() if isinstance(fingerprint, bytes) else fingerprint
-                for path, fingerprint in sorted(snapshot.fingerprints.items())
+                for path, fingerprint in sorted(snapshot.resolution_fingerprints.items())
+            },
+            "read_fingerprints": {
+                path: {
+                    "read_limit": read_limit,
+                    "require_complete": require_complete,
+                    "fingerprint": fingerprint.hex() if isinstance(fingerprint, bytes) else None,
+                }
+                for path, (read_limit, require_complete, fingerprint) in sorted(snapshot.read_fingerprints.items())
             },
         }
 
 
 def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
+    candidates: set[Path] = set()
+    import_suffixes = (*EXTENSION_SUFFIXES, *SOURCE_SUFFIXES, *BYTECODE_SUFFIXES)
+    for entry in sys.path:
+        root = Path(entry or os.getcwd())
+        for index in range(1, len(parts) + 1):
+            module_path = root.joinpath(*parts[:index])
+            for suffix in import_suffixes:
+                candidates.add(Path(f"{module_path}{suffix}").absolute())
+                candidates.add(module_path.joinpath(f"__init__{suffix}").absolute())
+    # Resolution only depends on candidate type and presence. The selected
+    # source is content-hashed separately, while native extensions can be large.
+    _track_shared_source_paths(candidates, read_limit=0, require_complete=False)
+    if not _track_resolution_candidate_paths(candidates):
+        return
+    _track_resolution_source_candidates(parts)
+
+
+def _track_resolution_candidate_paths(candidates: Iterable[Path]) -> bool:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return True
+    candidate_paths = {str(candidate): candidate for candidate in candidates}
+    with snapshot.lock:
+        if (
+            snapshot.search_context != _source_search_context()
+            or snapshot.resolution_context != _source_resolution_context()
+        ):
+            snapshot.stable = False
+            snapshot.reusable = False
+            return False
+        if len(snapshot.resolution_fingerprints.keys() | candidate_paths.keys()) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+            snapshot.reusable = False
+            return False
+        for candidate_key, candidate in candidate_paths.items():
+            reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
+            if not reusable:
+                snapshot.reusable = False
+                return False
+            snapshot.resolution_fingerprints[candidate_key] = fingerprint
+    return True
+
+
+def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:
         return
@@ -1297,17 +1946,17 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
             resolved_spec = ModuleSpec(qualified_name, loader=None, is_package=True)
             resolved_spec.submodule_search_locations = namespace_locations
 
-        candidates: set[Path] = set()
+        resolution_candidates: set[Path] = set()
         for entry in considered_entries:
             module_candidate = Path(entry).joinpath(part)
             package_candidate = module_candidate.joinpath("__init__")
             for suffix in _SOURCE_RESOLUTION_SUFFIXES:
-                candidates.add(module_candidate.with_suffix(suffix).absolute())
-                candidates.add(package_candidate.with_suffix(suffix).absolute())
+                resolution_candidates.add(module_candidate.with_suffix(suffix).absolute())
+                resolution_candidates.add(package_candidate.with_suffix(suffix).absolute())
             for source_candidate in (module_candidate.with_suffix(".py"), package_candidate.with_suffix(".py")):
                 cache_candidate = _source_cache_path(source_candidate)
                 if cache_candidate is not None:
-                    candidates.add(cache_candidate)
+                    resolution_candidates.add(cache_candidate)
 
         with snapshot.lock:
             if (
@@ -1318,23 +1967,67 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
                 snapshot.reusable = False
                 return
             if (
-                len(snapshot.fingerprints | {str(candidate): None for candidate in candidates})
+                len(snapshot.resolution_fingerprints | {str(candidate): None for candidate in resolution_candidates})
                 > _MAX_SOURCE_FINGERPRINT_CANDIDATES
             ):
                 snapshot.reusable = False
                 return
-            for candidate in candidates:
-                reusable, fingerprint = _source_candidate_fingerprint(candidate)
+            for candidate in resolution_candidates:
+                reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
                 if not reusable:
                     snapshot.reusable = False
                     return
-                snapshot.fingerprints[str(candidate)] = fingerprint
+                snapshot.resolution_fingerprints[str(candidate)] = fingerprint
 
         if index == len(parts) - 1:
             return
         if resolved_spec is None or resolved_spec.submodule_search_locations is None:
             return
         search_path = list(resolved_spec.submodule_search_locations)
+
+
+def _track_shared_source_paths(
+    candidates: Iterable[Path],
+    *,
+    read_limit: int = _MAX_SOURCE_BYTES,
+    require_complete: bool = True,
+) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return
+    with snapshot.lock:
+        if snapshot.search_context != _source_search_context():
+            snapshot.reusable = False
+            return
+        for candidate in candidates:
+            candidate_key = str(candidate)
+            existing = snapshot.read_fingerprints.get(candidate_key)
+            if existing is None and len(snapshot.read_fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+                snapshot.reusable = False
+                return
+            if existing is not None:
+                existing_read_limit, existing_require_complete, expected_fingerprint = existing
+                reusable, current_fingerprint = _read_candidate_fingerprint(
+                    candidate,
+                    read_limit=existing_read_limit,
+                    require_complete=existing_require_complete,
+                )
+                if not reusable or current_fingerprint != expected_fingerprint:
+                    snapshot.reusable = False
+                    return
+                if existing_require_complete and not require_complete:
+                    continue
+                if existing_require_complete == require_complete and existing_read_limit >= read_limit:
+                    continue
+            reusable, fingerprint = _read_candidate_fingerprint(
+                candidate,
+                read_limit=read_limit,
+                require_complete=require_complete,
+            )
+            if not reusable:
+                snapshot.reusable = False
+                return
+            snapshot.read_fingerprints[candidate_key] = (read_limit, require_complete, fingerprint)
 
 
 def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> None:
@@ -1351,7 +2044,7 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             snapshot.stable = False
             snapshot.reusable = False
             return
-        reusable, fingerprint = _source_candidate_fingerprint(candidate)
+        reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
         if not reusable:
             snapshot.stable = False
             snapshot.reusable = False
@@ -1365,13 +2058,13 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
         if loaded:
             snapshot.loaded_module_sources[module_name] = str(candidate)
         if (
-            str(candidate) not in snapshot.fingerprints
-            and len(snapshot.fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+            str(candidate) not in snapshot.resolution_fingerprints
+            and len(snapshot.resolution_fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
         ):
             snapshot.stable = False
             snapshot.reusable = False
             return
-        snapshot.fingerprints[str(candidate)] = fingerprint
+        snapshot.resolution_fingerprints[str(candidate)] = fingerprint
 
 
 def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
@@ -1385,6 +2078,15 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
             return "source_unreadable"
         except UnicodeError:
             return "source_unreadable"
+        if _trusted_module_origin_kind(module_name) not in {
+            "stdlib",
+            "site_packages",
+        } and _source_has_importable_untrusted_cache(source_path, source):
+            snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+            if snapshot is not None:
+                with snapshot.lock:
+                    snapshot.reusable = False
+            return "untrusted_bytecode_cache"
         try:
             ast.parse(source, filename=str(source_path))
         except SyntaxError:
@@ -1406,8 +2108,8 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
 
 
 def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
-    parts = module_name.split(".")
-    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
         return None
 
     loaded_module = sys.modules.get(module_name)
@@ -1649,6 +2351,7 @@ def _find_sink_path(start: str) -> tuple[str, ...] | None:
 def _find_invoked_import_execution_path(
     start: str,
     positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...] | None = (),
     *,
     allow_non_lifecycle_entrypoint: bool = False,
 ) -> tuple[str, ...] | None:
@@ -1661,7 +2364,12 @@ def _find_invoked_import_execution_path(
     module_name, is_package, function_node = context
     if not allow_non_lifecycle_entrypoint and not _is_pickle_entered_import_execution_entrypoint(resolved):
         return None
-    if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
+    can_enter = (
+        _can_enter_function_with_unknown_keyword_args(function_node, positional_arg_count)
+        if keyword_arg_names is None
+        else _can_enter_function_with_arguments(function_node, positional_arg_count, keyword_arg_names)
+    )
+    if not can_enter:
         return None
     if _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(function_node, module_name, is_package):
         return (resolved, _IMPORT_EXECUTION_SINK)
@@ -2070,6 +2778,15 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         return None
     try:
         source = _read_bounded_source_text(source_path)
+        if _trusted_module_origin_kind(module_name) not in {
+            "stdlib",
+            "site_packages",
+        } and _source_has_importable_untrusted_cache(source_path, source):
+            snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+            if snapshot is not None:
+                with snapshot.lock:
+                    snapshot.reusable = False
+            return None
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return None
@@ -2079,8 +2796,241 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
+def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
+    cache_paths: list[tuple[Path, int]] = []
+    for optimization, optimize_level in _BYTECODE_CACHE_OPTIMIZATIONS:
+        try:
+            cache_path = Path(cache_from_source(str(source_path), optimization=optimization))
+        except (NotImplementedError, ValueError):
+            return True
+        cache_paths.append((cache_path, optimize_level))
+
+    cache_tag = sys.implementation.cache_tag
+    source_local_cache_paths = [
+        (
+            source_path.parent
+            / "__pycache__"
+            / f"{source_path.stem}.{cache_tag}{f'.opt-{optimization}' if optimization else ''}.pyc",
+            optimize_level,
+        )
+        for optimization, optimize_level in _BYTECODE_CACHE_OPTIMIZATIONS
+    ]
+    for source_local_cache_path in source_local_cache_paths:
+        if source_local_cache_path not in cache_paths:
+            cache_paths.append(source_local_cache_path)
+
+    cache_paths_by_directory: dict[Path, list[Path]] = {}
+    for cache_path, _ in cache_paths:
+        cache_paths_by_directory.setdefault(cache_path.parent, []).append(cache_path)
+    for cache_directory, directory_cache_paths in cache_paths_by_directory.items():
+        _track_shared_source_paths(
+            (cache_directory,),
+            read_limit=_MAX_BYTECODE_CACHE_DIRECTORY_BYTES,
+        )
+        try:
+            if cache_directory.is_dir():
+                default_cache_name = directory_cache_paths[0].name
+                optimized_prefix = f"{default_cache_name[:-4]}.opt-"
+                expected_cache_names = {cache_path.name for cache_path in directory_cache_paths}
+                for index, candidate in enumerate(cache_directory.iterdir()):
+                    if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                        return True
+                    if not candidate.is_file():
+                        continue
+                    if _other_cpython_cache_targets_source(
+                        candidate.name,
+                        source_path,
+                        expected_cache_names,
+                    ):
+                        return True
+                    if candidate.name.startswith(optimized_prefix) and candidate.name.endswith(".pyc"):
+                        optimization = candidate.name[len(optimized_prefix) : -4]
+                        if optimization.isdecimal() and int(optimization) > 2:
+                            return True
+        except OSError:
+            return True
+    _track_shared_source_paths(
+        (cache_path for cache_path, _ in cache_paths),
+        read_limit=_MAX_BYTECODE_CACHE_BYTES,
+    )
+    return any(
+        _bytecode_cache_can_override_source(cache_path, source_path, source, optimize_level)
+        for cache_path, optimize_level in cache_paths
+    )
+
+
+def _other_cpython_cache_targets_source(
+    candidate_name: str,
+    source_path: Path,
+    expected_cache_names: set[str],
+) -> bool:
+    if candidate_name in expected_cache_names:
+        return False
+    prefix = f"{source_path.stem}.cpython-"
+    if not candidate_name.startswith(prefix) or not candidate_name.endswith(".pyc"):
+        return False
+    tag_and_optimization = candidate_name[len(prefix) : -4]
+    version, separator, optimization = tag_and_optimization.partition(".opt-")
+    if not version.isdecimal():
+        return False
+    return not separator or optimization.isdecimal()
+
+
+def _bytecode_cache_can_override_source(
+    cache_path: Path,
+    source_path: Path,
+    source: str,
+    optimize_level: int,
+) -> bool:
+    if not cache_path.is_file():
+        return False
+    try:
+        if cache_path.stat().st_size > _MAX_BYTECODE_CACHE_BYTES:
+            return True
+        cache_bytes = cache_path.read_bytes()
+    except OSError:
+        return True
+    header = cache_bytes[:16]
+    if len(header) < 8:
+        return False
+    if header[:4] != MAGIC_NUMBER:
+        return False
+    flags = int.from_bytes(header[4:8], "little")
+    if flags & ~0x03:
+        return False
+    if not flags & 0x01:
+        if len(header) < 16:
+            return False
+        source_stat = source_path.stat()
+        cached_mtime = int.from_bytes(header[8:12], "little")
+        cached_size = int.from_bytes(header[12:16], "little")
+        if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
+            return False
+    source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=optimize_level)
+    return cache_bytes[16:] != marshal.dumps(source_code)
+
+
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
     return _definition_scope_statements(tree.body)
+
+
+def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
+    if isinstance(statement, ast.Pass):
+        return True
+    if isinstance(statement, ast.Expr):
+        return isinstance(statement.value, ast.Constant)
+    if isinstance(statement, ast.Import):
+        return all(_stdlib_import_is_reviewed_inert(alias.name) for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        if statement.level == 0 and statement.module == "__future__":
+            return all(alias.name != "*" for alias in statement.names)
+        return (
+            statement.level == 0
+            and statement.module is not None
+            and all(alias.name != "*" for alias in statement.names)
+            and _stdlib_import_is_reviewed_inert(statement.module)
+        )
+    if isinstance(statement, ast.Assign):
+        return all(_inert_assignment_target(target) for target in statement.targets) and _inert_definition_expression(
+            statement.value
+        )
+    if isinstance(statement, ast.AnnAssign):
+        return (
+            _inert_assignment_target(statement.target)
+            and _inert_definition_expression(statement.annotation)
+            and (statement.value is None or _inert_definition_expression(statement.value))
+        )
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+        return _inert_function_definition(statement)
+    if isinstance(statement, ast.ClassDef):
+        return (
+            not statement.bases
+            and not statement.keywords
+            and not statement.decorator_list
+            and not getattr(statement, "type_params", [])
+            and all(_module_initialization_statement_is_inert(item) for item in statement.body)
+        )
+    return False
+
+
+def _stdlib_import_is_reviewed_inert(module_name: str) -> bool:
+    return module_name in _REVIEWED_INERT_STDLIB_IMPORTS and _trusted_module_origin_kind(module_name) == "stdlib"
+
+
+def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return statement.name == name
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in statement.names)
+    if isinstance(statement, ast.Assign):
+        return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign):
+        return _assignment_target_binds_name(statement.target, name)
+    return False
+
+
+def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, ast.Tuple | ast.List):
+        return any(_assignment_target_binds_name(item, name) for item in target.elts)
+    return False
+
+
+def _inert_assignment_target(target: ast.expr) -> bool:
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, ast.Tuple | ast.List):
+        return all(_inert_assignment_target(item) for item in target.elts)
+    return False
+
+
+def _inert_function_definition(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    if node.decorator_list or getattr(node, "type_params", []):
+        return False
+    argument_annotations = (
+        *(argument.annotation for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)),
+        node.args.vararg.annotation if node.args.vararg is not None else None,
+        node.args.kwarg.annotation if node.args.kwarg is not None else None,
+        node.returns,
+    )
+    return all(
+        _inert_definition_expression(expression)
+        for expression in (
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+            *(annotation for annotation in argument_annotations if annotation is not None),
+        )
+    )
+
+
+def _inert_definition_expression(expression: ast.expr) -> bool:
+    if isinstance(expression, ast.Constant | ast.Name):
+        return True
+    if isinstance(expression, ast.Attribute):
+        return _inert_definition_expression(expression.value)
+    if isinstance(expression, ast.Tuple | ast.List | ast.Set):
+        return all(_inert_definition_expression(item) for item in expression.elts)
+    if isinstance(expression, ast.Dict):
+        return all(
+            key is not None and _inert_definition_expression(key) and _inert_definition_expression(value)
+            for key, value in zip(expression.keys, expression.values, strict=True)
+        )
+    if isinstance(expression, ast.UnaryOp):
+        return isinstance(expression.op, ast.UAdd | ast.USub | ast.Not | ast.Invert) and _inert_definition_expression(
+            expression.operand
+        )
+    if isinstance(expression, ast.Lambda):
+        return all(
+            _inert_definition_expression(default)
+            for default in (
+                *expression.args.defaults,
+                *(item for item in expression.args.kw_defaults if item is not None),
+            )
+        )
+    return False
 
 
 def _definition_scope_statements(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, ...]:
@@ -3523,7 +4473,7 @@ def _can_invoke_function_with_positional_args(function_name: str, positional_arg
     if context is None:
         return False
     _module_name, _is_package, function_node = context
-    return _can_enter_function_with_positional_args(function_node, positional_arg_count)
+    return _can_enter_function_with_arguments(function_node, positional_arg_count, ())
 
 
 @_register_source_sensitive_cache
@@ -3555,10 +4505,84 @@ def _can_enter_function_with_positional_args(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     positional_arg_count: int,
 ) -> bool:
-    required_count, maximum_count, has_required_keyword_only = _user_positional_argument_range(function_node)
-    if has_required_keyword_only or positional_arg_count < required_count:
+    return _can_enter_function_with_arguments(function_node, positional_arg_count, ())
+
+
+def _can_enter_function_with_arguments(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...],
+) -> bool:
+    positional_parameters = tuple(
+        argument
+        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
+        if argument.arg not in {"self", "cls"}
+    )
+    positional_only_names = {
+        argument.arg for argument in function_node.args.posonlyargs if argument.arg not in {"self", "cls"}
+    }
+    positional_or_keyword_names = {
+        argument.arg for argument in function_node.args.args if argument.arg not in {"self", "cls"}
+    }
+    keyword_only_names = {
+        argument.arg for argument in function_node.args.kwonlyargs if argument.arg not in {"self", "cls"}
+    }
+    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
         return False
-    return maximum_count is None or positional_arg_count <= maximum_count
+    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
+    keyword_names = set(keyword_arg_names)
+    if bound_positionally & keyword_names:
+        return False
+    for keyword_name in keyword_names:
+        if keyword_name in positional_only_names:
+            if function_node.args.kwarg is None:
+                return False
+            continue
+        if (
+            keyword_name not in positional_or_keyword_names
+            and keyword_name not in keyword_only_names
+            and function_node.args.kwarg is None
+        ):
+            return False
+
+    all_positional = (*function_node.args.posonlyargs, *function_node.args.args)
+    required_positional = all_positional[: max(len(all_positional) - len(function_node.args.defaults), 0)]
+    for argument in required_positional:
+        if argument.arg in {"self", "cls"}:
+            continue
+        if argument.arg in positional_only_names:
+            if argument.arg not in bound_positionally:
+                return False
+            continue
+        if argument.arg not in bound_positionally and argument.arg not in keyword_names:
+            return False
+    return all(
+        argument.arg in keyword_names
+        for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
+        if argument.arg not in {"self", "cls"} and default is None
+    )
+
+
+def _can_enter_function_with_unknown_keyword_args(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    positional_arg_count: int,
+) -> bool:
+    positional_parameters = tuple(
+        argument
+        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
+        if argument.arg not in {"self", "cls"}
+    )
+    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
+        return False
+    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
+    required_count = max(
+        len(function_node.args.posonlyargs) + len(function_node.args.args) - len(function_node.args.defaults),
+        0,
+    )
+    return all(
+        argument.arg in {"self", "cls"} or argument.arg in bound_positionally
+        for argument in function_node.args.posonlyargs[:required_count]
+    )
 
 
 def _user_positional_argument_range(
@@ -3580,8 +4604,19 @@ def _user_positional_argument_range(
 
 
 def _import_module_can_execute_user_code(module_name: str) -> bool:
-    top_level_module = module_name.partition(".")[0]
-    return bool(top_level_module) and top_level_module not in _IMPORT_EXECUTION_SAFE_MODULES
+    if not module_name or module_name in _IMPORT_EXECUTION_SAFE_MODULES:
+        return False
+    try:
+        standard_spec = FrozenImporter.find_spec(module_name)
+    except Exception:
+        return True
+    if standard_spec is None or not _module_spec_uses_builtin_or_frozen_loader(standard_spec):
+        return True
+    loaded_module = sys.modules.get(module_name)
+    if loaded_module is not None:
+        loaded_spec = getattr(loaded_module, "__spec__", None)
+        return not (isinstance(loaded_spec, ModuleSpec) and _module_spec_uses_builtin_or_frozen_loader(loaded_spec))
+    return _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
 
 
 def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
@@ -4044,44 +5079,49 @@ def _resolve_import_from_module(module_name: str, is_package: bool, level: int, 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=1024)
 def _resolve_module_source(module_name: str) -> Path | None:
-    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None or len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
         if snapshot is not None:
             with snapshot.lock:
                 snapshot.stable = False
                 snapshot.reusable = False
         return None
-    parts = module_name.split(".")
-    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
-        return None
-    _track_shared_source_candidates(tuple(parts))
+    _track_shared_source_candidates(parts)
+    spec = _find_standard_filesystem_spec(module_name)
     loaded_module = sys.modules.get(module_name)
     loaded_spec = getattr(loaded_module, "__spec__", None)
     if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
         if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
             loaded_source_path = Path(loaded_spec.origin)
-            if loaded_source_path.is_file():
+            current_origin = spec.origin if spec is not None else None
+            try:
+                origin_matches = (
+                    isinstance(current_origin, str) and loaded_source_path.resolve() == Path(current_origin).resolve()
+                )
+            except (OSError, RuntimeError, ValueError):
+                origin_matches = False
+            if origin_matches and loaded_source_path.is_file():
+                _track_shared_source_paths((loaded_source_path,))
                 _track_shared_source_path(module_name, loaded_source_path, loaded=True)
                 return loaded_source_path
-        if loaded_spec.origin not in {"built-in", "frozen"}:
+        elif loaded_spec.origin not in {"built-in", "frozen"}:
             return None
     elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
-    spec = _find_standard_filesystem_spec(module_name)
     if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
         source_path = Path(spec.origin)
+        _track_shared_source_paths((source_path,))
         if source_path.is_file():
-            if not _effective_bytecode_matches_source(source_path):
-                snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-                if snapshot is not None:
-                    with snapshot.lock:
-                        snapshot.stable = False
-                        snapshot.reusable = False
-                return None
             _track_shared_source_path(module_name, source_path, loaded=False)
             return source_path
     return None
+
+
+def _module_spec_uses_builtin_or_frozen_loader(spec: ModuleSpec) -> bool:
+    loader = cast(Any, spec.loader)
+    return (loader is BuiltinImporter or loader is FrozenImporter) and spec.origin in {"built-in", "frozen"}
 
 
 def _rce_sink(call_name: str) -> str | None:

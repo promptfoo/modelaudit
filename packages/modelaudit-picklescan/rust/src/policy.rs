@@ -17,6 +17,20 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
     global_severity(module, name).or_else(|| pathlib_callable_severity(module, name))
 }
 
+pub(crate) fn global_import_requires_review(module: &str, name: &str) -> bool {
+    !global_import_is_allowlisted(module, name) && global_severity(module, name).is_none()
+}
+
+pub(crate) fn global_import_is_allowlisted(module: &str, name: &str) -> bool {
+    IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
+        || legacy_pickle_compat_reference_is_allowlisted(module, name)
+}
+
+fn legacy_pickle_compat_reference_is_allowlisted(module: &str, name: &str) -> bool {
+    (module == "copy_reg" && name == "_reconstructor")
+        || (module == "exceptions" && LEGACY_BUILTIN_EXCEPTION_NAMES.contains(&name))
+}
+
 fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
     let mut candidate = name;
     loop {
@@ -246,6 +260,96 @@ fn name_contains_component(name: &str, blocked_components: &[&str]) -> bool {
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
+const IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES: &[&str] = &[
+    "__builtin__",
+    "__builtins__",
+    "_operator",
+    "_pytest",
+    "_pytest._py.path",
+    "_tkinter",
+    "array",
+    "builtins",
+    "click",
+    "collections",
+    "collections.abc",
+    "copyreg",
+    "datetime",
+    "decimal",
+    "enum",
+    "fractions",
+    "functools",
+    "heapq",
+    "itertools",
+    "joblib",
+    "joblib.numpy_pickle",
+    "logging",
+    "mailbox",
+    "math",
+    "numpy",
+    "numpy._core.multiarray",
+    "numpy.core.multiarray",
+    "operator",
+    "pathlib",
+    "pathlib._local",
+    "random",
+    "re",
+    "torch",
+    "torch._utils",
+    "types",
+    "uuid",
+];
+const LEGACY_BUILTIN_EXCEPTION_NAMES: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BufferError",
+    "BytesWarning",
+    "DeprecationWarning",
+    "EOFError",
+    "EnvironmentError",
+    "Exception",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "NameError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "ReferenceError",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StandardError",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "VMSError",
+    "Warning",
+    "WindowsError",
+    "ZeroDivisionError",
+];
 const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "__import__",
     "breakpoint",
@@ -1176,6 +1280,55 @@ mod tests {
         assert_eq!(global_severity("configparser", "ConfigParser.get"), None);
         assert_eq!(global_severity("logging", "getLogger"), None);
         assert_eq!(global_severity("tempfile", "gettempdir"), None);
+    }
+
+    #[test]
+    fn import_only_global_review_policy_preserves_allowlisted_modules() {
+        for module in [
+            "builtins",
+            "click",
+            "collections",
+            "collections.abc",
+            "numpy._core.multiarray",
+            "numpy.core.multiarray",
+            "pathlib._local",
+            "joblib.numpy_pickle",
+            "torch._utils",
+            "logging",
+            "mailbox",
+            "_pytest._py.path",
+            "_tkinter",
+            "random",
+        ] {
+            assert!(!global_import_requires_review(module, "KnownSafe"));
+        }
+        assert!(!global_import_requires_review(
+            "_xxsubinterpreters",
+            "run_string"
+        ));
+        assert!(!global_import_requires_review("dotenv.main", "set_key"));
+        assert!(global_import_requires_review(
+            "_xxsubinterpreters",
+            "create"
+        ));
+        assert!(global_import_requires_review(
+            "_xxsubinterpreters",
+            "Gadget"
+        ));
+        assert!(global_import_requires_review("dotenv.main", "Gadget"));
+        assert!(global_import_requires_review(
+            "modelaudit_custom_payload",
+            "Gadget"
+        ));
+        assert!(global_import_requires_review("numpy.evil", "Gadget"));
+        assert!(global_import_requires_review("torch.evil", "Gadget"));
+        assert!(global_import_requires_review("vendor.package", "Gadget"));
+        assert!(!global_import_requires_review("copy_reg", "_reconstructor"));
+        assert!(global_import_requires_review("copy_reg", "Gadget"));
+        assert!(!global_import_requires_review("exceptions", "ValueError"));
+        assert!(global_import_requires_review("exceptions", "Gadget"));
+        assert_eq!(global_severity("commands", "getoutput"), Some("critical"));
+        assert_eq!(global_severity("urllib2", "urlopen"), Some("critical"));
     }
 
     #[test]

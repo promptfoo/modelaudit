@@ -48,6 +48,20 @@ def _merge_call_graph_source_fingerprints_metadata(
             fingerprints[path] = _deep_mutable_copy(fingerprint)
     merged["fingerprints"] = fingerprints
 
+    existing_read_fingerprints = existing.get("read_fingerprints")
+    incoming_read_fingerprints = incoming.get("read_fingerprints")
+    read_fingerprints = (
+        _deep_mutable_copy(existing_read_fingerprints) if isinstance(existing_read_fingerprints, Mapping) else {}
+    )
+    read_fingerprint_conflict = False
+    if isinstance(incoming_read_fingerprints, Mapping):
+        for path, fingerprint_record in incoming_read_fingerprints.items():
+            if path in read_fingerprints and read_fingerprints[path] != fingerprint_record:
+                read_fingerprint_conflict = True
+                continue
+            read_fingerprints[path] = _deep_mutable_copy(fingerprint_record)
+    merged["read_fingerprints"] = read_fingerprints
+
     existing_module_sources = existing.get("module_sources")
     incoming_module_sources = incoming.get("module_sources")
     module_sources = _deep_mutable_copy(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
@@ -97,13 +111,20 @@ def _merge_call_graph_source_fingerprints_metadata(
             existing.get("reusable") is True
             and incoming.get("reusable") is True
             and not fingerprint_conflict
+            and not read_fingerprint_conflict
             and not module_source_conflict
             and not loaded_source_conflict
             and not loaded_package_path_conflict
         )
         merged["search_context"] = existing_search_context
         merged["resolution_context"] = _deep_mutable_copy(existing_resolution_context)
-    if fingerprint_conflict or module_source_conflict or loaded_source_conflict or loaded_package_path_conflict:
+    if (
+        fingerprint_conflict
+        or read_fingerprint_conflict
+        or module_source_conflict
+        or loaded_source_conflict
+        or loaded_package_path_conflict
+    ):
         merged["reusable"] = False
 
     return merged

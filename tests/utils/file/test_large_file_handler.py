@@ -139,6 +139,7 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
         "loaded_module_sources": {},
         "loaded_package_paths": {},
         "fingerprints": {},
+        "read_fingerprints": {},
     }
 
     class CachedScanner:

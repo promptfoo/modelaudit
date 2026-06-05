@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
 _CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
+_CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
+_MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
+_MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
@@ -804,6 +807,69 @@ class ScanResultsCache:
         finally:
             os.close(file_descriptor)
 
+    @staticmethod
+    def _bounded_read_fingerprint(path: Path, read_limit: int, require_complete: bool) -> str | None:
+        if read_limit < 0 or read_limit > _CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES:
+            raise ValueError("read fingerprint budget is invalid")
+        try:
+            if path.is_dir():
+                entries: list[bytes] = []
+                total_bytes = 0
+                for index, entry in enumerate(path.iterdir()):
+                    if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                        raise ValueError("read fingerprint directory entry budget exceeded")
+                    entry_name = os.fsencode(entry.name)
+                    total_bytes += len(entry_name) + 1
+                    if require_complete and total_bytes > read_limit:
+                        raise ValueError("read fingerprint directory budget exceeded")
+                    entries.append(entry_name)
+                return hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).hexdigest()
+        except OSError as error:
+            raise ValueError("read fingerprint directory is unavailable") from error
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_descriptor = os.open(path, flags)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        try:
+            before = os.fstat(file_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            chunks: list[bytes] = []
+            remaining = read_limit + int(require_complete)
+            while remaining > 0:
+                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            source = b"".join(chunks)
+            after = os.fstat(file_descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_identity != after_identity:
+                raise ValueError("read fingerprint candidate changed while being read")
+            if require_complete and len(source) > read_limit:
+                raise ValueError("read fingerprint budget exceeded")
+            return hashlib.sha256(b"file\0" + source).hexdigest()
+        finally:
+            os.close(file_descriptor)
+
     def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
         scan_result = cache_entry.get("scan_result")
         metadata = scan_result.get("metadata") if isinstance(scan_result, dict) else None
@@ -859,7 +925,7 @@ class ScanResultsCache:
             ):
                 return False
         fingerprints = fingerprint_metadata.get("fingerprints")
-        if not isinstance(fingerprints, dict):
+        if not isinstance(fingerprints, dict) or len(fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
             return False
         try:
             for raw_path, expected_fingerprint in fingerprints.items():
@@ -870,6 +936,31 @@ class ScanResultsCache:
                     if current_fingerprint is not None:
                         return False
                 elif not isinstance(expected_fingerprint, str) or current_fingerprint != expected_fingerprint:
+                    return False
+        except (OSError, ValueError):
+            return False
+        read_fingerprints = fingerprint_metadata.get("read_fingerprints")
+        if not isinstance(read_fingerprints, dict) or len(read_fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+            return False
+        try:
+            for raw_path, raw_record in read_fingerprints.items():
+                if not isinstance(raw_path, str) or not isinstance(raw_record, dict):
+                    return False
+                read_limit = raw_record.get("read_limit")
+                require_complete = raw_record.get("require_complete")
+                expected_fingerprint = raw_record.get("fingerprint")
+                if isinstance(read_limit, bool) or not isinstance(read_limit, int):
+                    return False
+                if not isinstance(require_complete, bool):
+                    return False
+                if expected_fingerprint is not None and not isinstance(expected_fingerprint, str):
+                    return False
+                current_fingerprint = self._bounded_read_fingerprint(
+                    Path(raw_path),
+                    read_limit,
+                    require_complete,
+                )
+                if current_fingerprint != expected_fingerprint:
                     return False
         except (OSError, ValueError):
             return False

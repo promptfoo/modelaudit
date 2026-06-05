@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from importlib.abc import MetaPathFinder
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
     FileFinder,
     ModuleSpec,
@@ -69,6 +70,7 @@ def _call_graph_fingerprint_metadata(
     module_sources: dict[str, str] | None = None,
     loaded_module_sources: dict[str, str] | None = None,
     loaded_package_paths: dict[str, list[str]] | None = None,
+    read_fingerprints: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "reusable": True,
@@ -78,6 +80,7 @@ def _call_graph_fingerprint_metadata(
         "loaded_module_sources": loaded_module_sources or {},
         "loaded_package_paths": loaded_package_paths or {},
         "fingerprints": fingerprints or {},
+        "read_fingerprints": read_fingerprints or {},
     }
 
 
@@ -502,7 +505,7 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
 
 
 def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: Path) -> None:
-    extension_path = tmp_path / "native_module.so"
+    extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
     extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -522,6 +525,69 @@ def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: P
 
     extension_path.unlink()
 
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path: Path) -> None:
+    bytecode_dir = tmp_path / "__pycache__"
+    bytecode_dir.mkdir()
+    (bytecode_dir / "helper.cpython-312.pyc").write_bytes(b"first")
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    expected_fingerprint = cache._bounded_read_fingerprint(bytecode_dir, 64 * 1024, True)
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                read_fingerprints={
+                    str(bytecode_dir): {
+                        "read_limit": 64 * 1024,
+                        "require_complete": True,
+                        "fingerprint": expected_fingerprint,
+                    }
+                }
+            )
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    (bytecode_dir / "helper.cpython-312.opt-1.pyc").write_bytes(b"second")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_rejects_legacy_fingerprint_metadata_without_read_records(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprint_metadata = _call_graph_fingerprint_metadata()
+    fingerprint_metadata.pop("read_fingerprints")
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_rejects_oversized_source_fingerprint_sets(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprints: dict[str, str | None] = {str(tmp_path / f"candidate-{index}.py"): None for index in range(4097)}
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": _call_graph_fingerprint_metadata(fingerprints)},
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
