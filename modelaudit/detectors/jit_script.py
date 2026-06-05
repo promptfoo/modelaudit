@@ -528,7 +528,8 @@ def _priority_import_offsets(
             offset = match.start()
             if multiline_quote is None:
                 prefix = bounded[line_start:offset].rstrip(b" \t\r")
-                source_like_prefix = not prefix or not 0x20 <= prefix[-1] < 0x7F
+                structural_prefix = _python_structural_line_bytes(prefix).rstrip()
+                source_like_prefix = not prefix or not 0x20 <= prefix[-1] < 0x7F or structural_prefix.endswith(b";")
                 if not source_like_prefix or (allowed_offsets is not None and offset not in allowed_offsets):
                     match = next(matches, None)
                     continue
@@ -10014,10 +10015,15 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
         if isinstance(node, ast.Import)
         for alias in node.names
         if alias.name == "builtins"
-    } | {"builtins"}
+    } | {"builtins", "__builtins__"}
     if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "print"):
         return True
-    if "print" in _late_mutated_truthy_builtin_names(code_str.encode("utf-8"), builtins_aliases, set()):
+    if "print" in _late_mutated_truthy_builtin_names(
+        code_str.encode("utf-8"),
+        builtins_aliases,
+        set(),
+        builtin_dict_mapping_aliases={"__builtins__"},
+    ):
         return True
     parents, executed_statement_ids = _compact_module_scope_context(tree)
     for node in ast.walk(tree):
@@ -10045,7 +10051,7 @@ def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
         if isinstance(node, ast.Import)
         for alias in node.names
         if alias.name == "builtins"
-    } | {"builtins"}
+    } | {"builtins", "__builtins__"}
     for node in ast.walk(tree):
         if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
             continue
@@ -10069,10 +10075,15 @@ def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
             isinstance(node, ast.Subscript)
             and isinstance(node.ctx, ast.Store)
             and _static_getattr_member_name(node.slice) == "setattr"
-            and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "__dict__"
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id in builtins_aliases
+            and (
+                (isinstance(node.value, ast.Name) and node.value.id == "__builtins__")
+                or (
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "__dict__"
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id in builtins_aliases
+                )
+            )
         ):
             return True
     return False
@@ -10393,6 +10404,69 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 ):
                     suppressed_calls.add((f"runpy.{node.func.attr}", "S108"))
     return suppressed_calls
+
+
+def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    print_is_shadowed = _compact_snippet_has_shadowed_print(code_str, tree)
+    setattr_is_shadowed = _compact_snippet_has_shadowed_setattr(tree)
+    if not print_is_shadowed and not setattr_is_shadowed:
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    dangerous_members: set[str] = set()
+    high_risk_calls: set[tuple[str, str]] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "runpy":
+                    runpy_aliases.add(alias.asname or "runpy")
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(statement.value, ast.Name)
+                    and statement.value.id == "print"
+                ):
+                    if print_is_shadowed:
+                        dangerous_members.add(target.attr)
+                    else:
+                        dangerous_members.discard(target.attr)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for call in _deterministically_executed_expression_calls(value):
+                if (
+                    _simple_reference_name(call.func) in {"setattr", "builtins.setattr"}
+                    and len(call.args) >= 3
+                    and isinstance(call.args[0], ast.Name)
+                    and call.args[0].id in runpy_aliases
+                    and (member_name := _runpy_static_member_key(call.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(call.args[2], ast.Name)
+                    and call.args[2].id == "print"
+                ):
+                    if print_is_shadowed or setattr_is_shadowed:
+                        dangerous_members.add(member_name)
+                    else:
+                        dangerous_members.discard(member_name)
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id in runpy_aliases
+                    and call.func.attr in dangerous_members
+                ):
+                    high_risk_calls.add((f"runpy.{call.func.attr}", "S108"))
+    return high_risk_calls
 
 
 def _compact_snippet_captured_runpy_high_risk_calls(
@@ -17604,6 +17678,12 @@ class JITScriptDetector:
                             inherited_runpy_aliases,
                         )
                     )
+                    bounded_explicit_high_risk_calls.update(
+                        _compact_snippet_shadowed_helper_runpy_high_risk_calls(
+                            bounded_source,
+                            inherited_runpy_aliases,
+                        )
+                    )
                 bounded_suppressed_calls.difference_update(bounded_explicit_high_risk_calls)
                 if bounded_suppressed_calls:
                     replay_proven_codes = _compact_snippet_replay_proven_rule_codes(bounded_source)
@@ -17730,6 +17810,12 @@ class JITScriptDetector:
                         )
                         inactive_restore_high_risk_calls.update(
                             _compact_snippet_captured_runpy_high_risk_calls(
+                                code_str,
+                                inherited_runpy_aliases,
+                            )
+                        )
+                        inactive_restore_high_risk_calls.update(
+                            _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                                 code_str,
                                 inherited_runpy_aliases,
                             )

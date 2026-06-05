@@ -1333,17 +1333,37 @@ class TestJITScriptDetector:
             b"# import runpy\n"
             b'text = """\nimport subprocess\n"""\n'
             b"if True:\n    import ctypes as c\n"
+            b"value = 1; import webbrowser as browser\n"
             b"\x00\xffimport os as alias\n"
         )
 
         offsets = jit_script_module._priority_import_offsets(source)
 
-        assert offsets == [source.index(b"import ctypes"), source.index(b"import os as alias")]
+        assert offsets == [
+            source.index(b"import ctypes"),
+            source.index(b"import webbrowser"),
+            source.index(b"import os as alias"),
+        ]
 
     def test_scan_model_ignores_priority_import_decoys_before_late_dangerous_import(self) -> None:
         detector = JITScriptDetector()
         import_decoys = b"# import os\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 2)
         source = b"\x00\xff" + import_decoys + b"import os as alias\nalias.system('payload')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_late_semicolon_priority_import(self) -> None:
+        detector = JITScriptDetector()
+        leading_starts = b"".join(
+            f"value_{index} = {index}\n".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2)
+        )
+        source = b"\x00\xff" + leading_starts + b"value = 1; import os as alias\nalias.system('payload')\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
@@ -7184,11 +7204,17 @@ class TestJITScriptDetector:
             b"globals()['setattr'] = lambda *args: None\n",
             b"globals().update(setattr=lambda *args: None)\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
+            b"__builtins__.setattr = lambda *args: None\n",
+            b"__builtins__['setattr'] = lambda *args: None\n",
         ],
     )
     def test_scan_model_keeps_runpy_call_after_module_setattr_shadow(self, setattr_shadow: bytes) -> None:
         detector = JITScriptDetector()
-        data = b"import runpy as rp\n" + setattr_shadow + b"setattr(rp, 'run_path', print)\nrp.run_path('payload.py')\n"
+        data = (
+            b"import runpy as rp\n"
+            + setattr_shadow
+            + b"setattr(rp, 'run_path', print)\n((rp).run_path)('payload.py')\n"
+        )
 
         findings = detector.scan_model(data, "pytorch", "payload.py")
 
@@ -7315,6 +7341,8 @@ class TestJITScriptDetector:
             b"put = globals().__setitem__\nput('print', eval)\n",
             b"update = globals().update\nupdate(print=eval)\n",
             b"if enabled:\n    globals()['print'] = eval\n",
+            b"__builtins__.print = eval\n",
+            b"__builtins__['print'] = eval\n",
         ],
     )
     def test_scan_model_keeps_runpy_call_after_module_print_mutation(
