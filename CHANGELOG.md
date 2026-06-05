@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, and compiler-error evidence, and avoid substring-only malformed-source warnings
+- omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence

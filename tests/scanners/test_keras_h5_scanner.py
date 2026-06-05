@@ -1584,6 +1584,136 @@ def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_
     assert not any(check.name == "Lambda Layer Suspicious Keywords Check" for check in result.checks)
 
 
+def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_layers(tmp_path: Path) -> None:
+    nested_key_secret = "NESTED_LAMBDA_KEY_SECRET_7F3A9"
+    nested_class_secret = "NESTED_LAMBDA_CLASS_SECRET_7F3A9"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "nested_lambda_metadata_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "lambda x: x",
+                            "metadata": {nested_key_secret: {"payload": "eval"}},
+                            "layer": {
+                                "class_name": nested_class_secret,
+                                "config": {"units": 1},
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    scanner_result = KerasH5Scanner().scan(str(model_path))
+    suspicious_checks = [
+        check
+        for check in scanner_result.checks
+        if check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "eval"
+    ]
+    assert len(suspicious_checks) == 1
+    assert suspicious_checks[0].details.get("context") == "Lambda.<mapping>.<mapping>"
+    assert not any(check.name == "Custom Layer Class Detection" for check in scanner_result.checks)
+
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
+    sarif_output = format_sarif_output(audit_result, [str(model_path)])
+
+    for secret in (nested_key_secret, nested_class_secret):
+        assert secret not in json_output
+        assert secret not in sarif_output
+
+
+def test_lambda_nested_metadata_ignores_suspicious_term_near_matches(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "nested_lambda_near_match_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "lambda x: x",
+                            "metadata": {"arbitrary": {"payload": "evaluation"}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "eval"
+        for check in result.checks
+    )
+
+
+def test_lambda_scalar_function_metadata_fails_closed_without_echoing_value(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "scalar_lambda_function_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": 7}}],
+            },
+        },
+        keras_version="3.11.3",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    malformed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("function_type") == "int"
+    ]
+    assert len(malformed_checks) == 1
+    assert malformed_checks[0].severity == IssueSeverity.WARNING
+    assert (
+        malformed_checks[0].details.get("function_payload_omitted")
+        == "malformed_lambda_function_may_contain_sensitive_payload"
+    )
+    assert "function" not in malformed_checks[0].details
+    assert result.success is True
+
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert determine_exit_code(audit_result) == 1
+
+
+def test_lambda_null_function_placeholder_is_not_treated_as_malformed(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "null_lambda_function_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": None}}],
+            },
+        },
+        keras_version="3.11.3",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Lambda Layer Detection"
+        and check.details.get("function_payload_omitted") == "malformed_lambda_function_may_contain_sensitive_payload"
+        for check in result.checks
+    )
+
+
 def test_lambda_dict_bytecode_with_benign_module_fields_still_critical(tmp_path: Path) -> None:
     """Dict-format Lambda bytecode must not be skipped by benign module/function metadata."""
     code = compile("import os\nos.system('id')\neval('__import__(\"os\")')", "<lambda>", "exec")

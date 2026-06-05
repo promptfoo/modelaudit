@@ -973,7 +973,8 @@ class KerasH5Scanner(BaseScanner):
             self._check_config_for_suspicious_strings(
                 layer_config,
                 result,
-                layer_class,
+                "Lambda" if is_lambda_layer else layer_class,
+                include_keys_in_context=not is_lambda_layer,
             )
 
             # If there are nested models, scan them recursively
@@ -993,7 +994,8 @@ class KerasH5Scanner(BaseScanner):
                         details={"layer_class": layer_class, "expected_key": "config.layers"},
                     )
 
-            self._scan_wrapped_layer_config(layer_config, result)
+            if not is_lambda_layer:
+                self._scan_wrapped_layer_config(layer_config, result)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
@@ -1054,6 +1056,21 @@ class KerasH5Scanner(BaseScanner):
                 result,
                 self.current_file_path,
                 layer_name,
+            )
+        elif function_str is not None and not isinstance(function_str, str):
+            result.add_check(
+                name="Lambda Layer Detection",
+                passed=False,
+                message="Lambda layer uses malformed function metadata",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details={
+                    "layer_class": "Lambda",
+                    "function_type": type(function_str).__name__,
+                    "function_payload_omitted": "malformed_lambda_function_may_contain_sensitive_payload",
+                },
+                why="Malformed Lambda function metadata cannot be safely classified.",
+                rule_code="S1103",
             )
 
         # Check if there's actual Python code to validate
@@ -1296,6 +1313,8 @@ class KerasH5Scanner(BaseScanner):
         config: Any,
         result: ScanResult,
         context: str = "",
+        *,
+        include_keys_in_context: bool = True,
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
 
@@ -1326,7 +1345,8 @@ class KerasH5Scanner(BaseScanner):
                 self._check_config_for_suspicious_strings(
                     value,
                     result,
-                    f"{context}.{key}",
+                    f"{context}.{key}" if include_keys_in_context else f"{context}.<mapping>",
+                    include_keys_in_context=include_keys_in_context,
                 )
             elif isinstance(value, list):
                 # Check each item in the list
@@ -1335,7 +1355,8 @@ class KerasH5Scanner(BaseScanner):
                         self._check_config_for_suspicious_strings(
                             item,
                             result,
-                            f"{context}.{key}[{i}]",
+                            (f"{context}.{key}[{i}]" if include_keys_in_context else f"{context}.<list>[{i}]"),
+                            include_keys_in_context=include_keys_in_context,
                         )
 
     @staticmethod
