@@ -2,10 +2,12 @@
 
 import json
 import os
+import tempfile
 import zipfile
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
@@ -405,6 +407,161 @@ def merge_executable_zip_container_findings(
         )
 
     _deduplicate_exact_merged_findings(result)
+
+
+def merge_hdf5_userblock_zip_findings(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    signature_offset: int,
+    *,
+    context: str,
+) -> None:
+    """Merge ZIP findings from a complete HDF5 user block with a logical EOF."""
+    try:
+        if zipfile.is_zipfile(path):
+            merge_executable_zip_container_findings(path, result, config, context=context)
+            return
+    except OSError:
+        pass
+
+    temp_path: str | None = None
+    try:
+        eocd_offsets: list[int] = []
+        carry = b""
+        bytes_copied = 0
+        temp_suffix = Path(path).suffix or ".zip"
+        with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=temp_suffix, delete=False) as temp_file:
+            temp_path = temp_file.name
+            remaining = signature_offset
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError("HDF5 user block ended before its validated signature offset")
+                temp_file.write(chunk)
+                candidate_bytes = carry + chunk
+                candidate_base = bytes_copied - len(carry)
+                search_offset = 0
+                while True:
+                    match_offset = candidate_bytes.find(b"PK\x05\x06", search_offset)
+                    if match_offset < 0:
+                        break
+                    eocd_offsets.append(candidate_base + match_offset)
+                    if len(eocd_offsets) > 4096:
+                        raise OSError("HDF5 user block contains too many ZIP end-record candidates")
+                    search_offset = match_offset + 1
+                carry = candidate_bytes[-3:]
+                bytes_copied += len(chunk)
+                remaining -= len(chunk)
+
+        logical_zip_end = _find_valid_zip_logical_end(temp_path, eocd_offsets, signature_offset)
+        if logical_zip_end is None:
+            return
+        os.truncate(temp_path, logical_zip_end)
+
+        supplemental_result = ScanResult(scanner_name="zip")
+        merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
+        _replace_scan_result_path(supplemental_result, temp_path, path)
+        _merge_composed_scan_result(result, supplemental_result)
+        _deduplicate_exact_merged_findings(result)
+    except OSError as exc:
+        reason = "hdf5_userblock_zip_scan_failed"
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="HDF5 User Block ZIP Analysis",
+            passed=False,
+            message=f"Unable to scan ZIP content in the HDF5 user block: {exc}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                "hdf5_signature_offset": signature_offset,
+            },
+            rule_code="S902",
+        )
+    finally:
+        if temp_path is not None:
+            with suppress(OSError):
+                os.unlink(temp_path)
+
+
+def _replace_scan_result_path(result: ScanResult, old_path: str, new_path: str) -> None:
+    """Replace a temporary archive path in user-visible supplemental evidence."""
+    for issue in result.issues:
+        if isinstance(issue.location, str):
+            issue.location = issue.location.replace(old_path, new_path)
+        issue.details = _replace_nested_path(issue.details, old_path, new_path)
+    for check in result.checks:
+        if isinstance(check.location, str):
+            check.location = check.location.replace(old_path, new_path)
+        check.details = _replace_nested_path(check.details, old_path, new_path)
+    result.metadata = _replace_nested_path(result.metadata, old_path, new_path)
+
+
+def _replace_nested_path(value: Any, old_path: str, new_path: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old_path, new_path)
+    if isinstance(value, list):
+        return [_replace_nested_path(item, old_path, new_path) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_nested_path(item, old_path, new_path) for item in value)
+    if isinstance(value, dict):
+        return {key: _replace_nested_path(item, old_path, new_path) for key, item in value.items()}
+    return value
+
+
+class _LogicalEOFReader:
+    """Expose a bounded logical EOF for ZIP validation without copying again."""
+
+    def __init__(self, handle: BinaryIO, logical_size: int) -> None:
+        self._handle = handle
+        self._logical_size = logical_size
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self.tell() + offset
+        elif whence == os.SEEK_END:
+            target = self._logical_size + offset
+        else:
+            raise ValueError(f"Unsupported seek mode: {whence}")
+        if target < 0:
+            raise OSError("Cannot seek before the bounded archive start")
+        return self._handle.seek(min(target, self._logical_size), os.SEEK_SET)
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = max(0, self._logical_size - self.tell())
+        return self._handle.read(remaining if size < 0 else min(size, remaining))
+
+    def seekable(self) -> bool:
+        return True
+
+
+def _find_valid_zip_logical_end(
+    temp_path: str,
+    eocd_offsets: list[int],
+    signature_offset: int,
+) -> int | None:
+    """Return the last complete ZIP end record before the HDF5 signature."""
+    with open(temp_path, "rb") as handle:
+        for eocd_offset in reversed(eocd_offsets):
+            handle.seek(eocd_offset)
+            end_record = handle.read(22)
+            if len(end_record) != 22:
+                continue
+            logical_end = eocd_offset + 22 + int.from_bytes(end_record[20:22], "little")
+            if logical_end > signature_offset:
+                continue
+            bounded_reader = _LogicalEOFReader(handle, logical_end)
+            bounded_reader.seek(0)
+            if zipfile.is_zipfile(bounded_reader):
+                return logical_end
+    return None
 
 
 def merge_flax_msgpack_overlap_findings(

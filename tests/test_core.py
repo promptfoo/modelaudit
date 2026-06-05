@@ -446,10 +446,15 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
-def _append_hdf5_userblock_candidate(path: Path, *, plausible: bool) -> int:
+def _append_hdf5_userblock_candidate(
+    path: Path,
+    *,
+    plausible: bool,
+    minimum_signature_offset: int = 512,
+) -> int:
     """Append an HDF5 signature candidate after a complete ZIP user block."""
     payload = bytearray(path.read_bytes())
-    signature_offset = 512
+    signature_offset = minimum_signature_offset
     while signature_offset < len(payload):
         signature_offset *= 2
 
@@ -2656,6 +2661,64 @@ def test_scan_file_prefers_hdf5_and_preserves_executable_zip_userblock(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_preserves_large_zip_userblock_outside_eocd_tail_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "large-zip-userblock.h5"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "data.pkl": _build_malicious_pickle(),
+            "version": b"1.6",
+            "schema.json": _build_malicious_skops_schema(),
+        },
+    )
+    signature_offset = _append_hdf5_userblock_candidate(
+        polyglot,
+        plausible=True,
+        minimum_signature_offset=128 * 1024,
+    )
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    assert zipfile.is_zipfile(polyglot) is False
+    assert find_hdf5_signature_offset(str(polyglot)) == signature_offset
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+    _assert_system_pickle_detected(result, "data.pkl")
+    assert any(check.name == "CVE-2025-54412 Detection" for check in result.checks)
+    pickle_issue = next(issue for issue in result.issues if issue.rule_code == "S201")
+    assert str(polyglot) in (pickle_issue.location or "")
+
+
+def test_scan_file_honors_zip_only_selection_for_hdf5_userblock(tmp_path: Path) -> None:
+    polyglot = tmp_path / "selected-zip-userblock.h5"
+    _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["zip"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert any(check.name == "ZIP Aggregate Size Limit Check" for check in result.checks)
+    assert result.metadata["contents"] == [
+        {
+            "path": f"{polyglot}:payload.pkl",
+            "type": "scanner_selection",
+            "size": len(_build_malicious_pickle()),
+        }
+    ]
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "keras_h5"
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
