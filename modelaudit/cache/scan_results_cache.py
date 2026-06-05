@@ -854,14 +854,15 @@ class ScanResultsCache:
         if not identity:
             return identity
         try:
+            monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None
             if sys.platform.startswith("linux"):
-                monitor: _AncestorPathMonitor | _WindowsPathLockMonitor = _AncestorPathMonitor(
+                monitor = _AncestorPathMonitor(
                     file_path,
                     tuple(identity),
                 )
             elif sys.platform == "win32":
                 monitor = _WindowsPathLockMonitor(file_path, tuple(identity))
-            else:
+            if monitor is None:
                 return identity
             return AncestorIdentity(tuple(identity), monitor)
         except (AttributeError, OSError):
@@ -1034,6 +1035,10 @@ class ScanResultsCache:
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
+            if self._path_has_symlink_component(file_path):
+                logger.debug("Skipping scan-result cache key for symlinked path %s", file_path)
+                return None, None
+
             if file_stat is None:
                 file_stat = os.stat(file_path)
 

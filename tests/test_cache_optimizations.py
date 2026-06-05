@@ -103,77 +103,76 @@ class TestCacheOptimizationPerformance:
             # Stat reuse should reduce syscalls even when timings are noisy.
             assert stat_calls["traditional"] >= stat_calls["adaptive"] * 2
 
-    def test_batch_cache_operations_performance(self):
+    def test_batch_cache_operations_performance(self, tmp_path: Path) -> None:
         """Test batch cache operations functionality and basic performance."""
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_dir = Path(temp_dir) / "cache"
-            cache_manager = CacheManager(str(cache_dir), enabled=True)
-            batch_ops = BatchCacheOperations(cache_manager)
+        cache_dir = tmp_path / "cache"
+        cache_manager = CacheManager(str(cache_dir), enabled=True)
+        batch_ops = BatchCacheOperations(cache_manager)
 
-            # Create test files
-            test_files = []
-            test_results: list[tuple[str, dict[str, Any], int | None]] = []
-            expected_file_identities: dict[str, ScannedFileIdentity] = {}
-            assert cache_manager.cache is not None
+        # Create test files
+        test_files = []
+        test_results: list[tuple[str, dict[str, Any], int | None]] = []
+        expected_file_identities: dict[str, ScannedFileIdentity] = {}
+        assert cache_manager.cache is not None
 
-            for i in range(10):  # Reduced number for faster test
-                file_path = Path(temp_dir) / f"test_file_{i}.bin"
-                content = f"test content {i}" * 100  # ~1.3KB each
-                file_path.write_text(content)
-                test_files.append(str(file_path))
-                expected_file_identities[str(file_path)] = cache_manager.cache.capture_file_identity(str(file_path))
+        for i in range(10):  # Reduced number for faster test
+            file_path = tmp_path / f"test_file_{i}.bin"
+            content = f"test content {i}" * 100  # ~1.3KB each
+            file_path.write_text(content)
+            test_files.append(str(file_path))
+            expected_file_identities[str(file_path)] = cache_manager.cache.capture_file_identity(str(file_path))
 
-                # Create mock scan result
-                scan_result = {
-                    "scanner": "test",
-                    "success": True,
-                    "issues": [],
-                    "checks": [],
-                    "metadata": {"test": True},
-                }
-                test_results.append((str(file_path), scan_result, 100))  # 100ms scan time
+            # Create mock scan result
+            scan_result = {
+                "scanner": "test",
+                "success": True,
+                "issues": [],
+                "checks": [],
+                "metadata": {"test": True},
+            }
+            test_results.append((str(file_path), scan_result, 100))  # 100ms scan time
 
-            # Test batch store operations
-            stored_count = batch_ops.batch_store(test_results, expected_file_identities=expected_file_identities)
-            print(f"Stored {stored_count} results out of {len(test_results)}")
-            assert stored_count > 0  # Should store some results
+        # Test batch store operations
+        stored_count = batch_ops.batch_store(test_results, expected_file_identities=expected_file_identities)
+        print(f"Stored {stored_count} results out of {len(test_results)}")
+        assert stored_count > 0  # Should store some results
 
-            # Test batch lookup operations
-            batch_result = batch_ops.batch_lookup(test_files)
-            assert len(batch_result) == len(test_files)
+        # Test batch lookup operations
+        batch_result = batch_ops.batch_lookup(test_files)
+        assert len(batch_result) == len(test_files)
 
-            # Test that batch operations complete without errors
-            def batch_lookup():
-                return batch_ops.batch_lookup(test_files)
+        # Test that batch operations complete without errors
+        def batch_lookup() -> dict[str, dict[str, Any] | None]:
+            return batch_ops.batch_lookup(test_files)
 
-            def individual_lookup():
-                results = {}
-                for file_path in test_files:
-                    result = cache_manager.get_cached_result(file_path)
-                    results[file_path] = result
-                return results
+        def individual_lookup() -> dict[str, dict[str, Any] | None]:
+            results = {}
+            for file_path in test_files:
+                result = cache_manager.get_cached_result(file_path)
+                results[file_path] = result
+            return results
 
-            # Basic timing test (reduced iterations)
-            iterations = 10
-            start_time = time.perf_counter()
-            for _ in range(iterations):
-                batch_result = batch_lookup()
-            batch_time = time.perf_counter() - start_time
+        # Basic timing test (reduced iterations)
+        iterations = 10
+        start_time = time.perf_counter()
+        for _ in range(iterations):
+            batch_result = batch_lookup()
+        batch_time = time.perf_counter() - start_time
 
-            start_time = time.perf_counter()
-            for _ in range(iterations):
-                individual_result = individual_lookup()
-            individual_time = time.perf_counter() - start_time
+        start_time = time.perf_counter()
+        for _ in range(iterations):
+            individual_result = individual_lookup()
+        individual_time = time.perf_counter() - start_time
 
-            print(f"\nBatch lookup: {batch_time:.4f}s")
-            print(f"Individual lookup: {individual_time:.4f}s")
+        print(f"\nBatch lookup: {batch_time:.4f}s")
+        print(f"Individual lookup: {individual_time:.4f}s")
 
-            # Basic functionality test
-            assert len(batch_result) == len(test_files)
-            assert len(individual_result) == len(test_files)
+        # Basic functionality test
+        assert len(batch_result) == len(test_files)
+        assert len(individual_result) == len(test_files)
 
-            print("Batch cache operations test completed successfully")
+        print("Batch cache operations test completed successfully")
 
     def test_configuration_extraction_performance(self) -> None:
         """Test optimized configuration extraction."""
