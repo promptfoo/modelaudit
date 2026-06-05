@@ -13,13 +13,20 @@ from modelaudit.integrations.jfrog import scan_jfrog_artifact
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_artifact")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock_mkdtemp, mock_rmtree):
+def test_scan_jfrog_artifact_success(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test successful JFrog artifact scanning."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
 
     # Mock file detection
-    mock_detect.return_value = {"type": "file", "repo": "test-repo"}
+    mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 512, "size_known": True}
 
     mock_download.return_value = Path(f"{temp_dir}/model.pt")
 
@@ -55,6 +62,7 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
         api_token="token",
         access_token=None,
         timeout=200,
+        max_size=1000,
     )
     # Check that scan was called with adjusted timeout (should be slightly less than 200 due to download time)
     scan_call = mock_scan.call_args
@@ -86,6 +94,98 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_artifact")
 @patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_artifact_rejects_oversized_file_before_download(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Storage API metadata should cap direct artifact transfer before body download."""
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 6, "size_known": True}
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        scan_jfrog_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.pt",
+            max_download_size=5,
+        )
+
+    mock_download.assert_not_called()
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_artifact_rejects_huge_declared_size_without_format_overflow(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Attacker-controlled size metadata must not overflow error formatting."""
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {
+        "type": "file",
+        "repo": "test-repo",
+        "size": 10**400,
+        "size_known": True,
+    }
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        scan_jfrog_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.pt",
+            max_download_size=5,
+        )
+
+    mock_download.assert_not_called()
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_artifact_rejects_unknown_file_size_when_capped(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Unknown Storage API sizes should fail closed when a download budget is active."""
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 0, "size_known": False}
+
+    with pytest.raises(ValueError, match="Cannot verify JFrog artifact size"):
+        scan_jfrog_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.pt",
+            max_download_size=5,
+        )
+
+    mock_download.assert_not_called()
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_artifact_redacts_source_url(
     mock_scan: MagicMock,
     mock_download: MagicMock,
@@ -93,11 +193,12 @@ def test_scan_jfrog_artifact_redacts_source_url(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     """JFrog scan logs and metadata should not store URL credentials."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
-    mock_detect.return_value = {"type": "file", "repo": "test-repo"}
+    mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 512, "size_known": True}
     mock_download.return_value = Path(f"{temp_dir}/model.pt")
 
     from modelaudit.models import create_initial_audit_result
@@ -123,6 +224,7 @@ def test_scan_jfrog_artifact_redacts_source_url(
         api_token="token",
         access_token=None,
         timeout=3600,
+        max_size=None,
     )
     mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
@@ -148,7 +250,7 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
     expected_download_dir = expected_download_root / f"{cache_key}-run"
     mock_mkdtemp.return_value = str(expected_download_dir)
 
-    mock_detect.return_value = {"type": "file", "repo": "test-repo"}
+    mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 512, "size_known": True}
     mock_download.return_value = expected_download_dir / "model.pt"
 
     from modelaudit.models import create_initial_audit_result
@@ -168,6 +270,7 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
         api_token="token",
         access_token=None,
         timeout=3600,
+        max_size=None,
     )
     mock_scan.assert_called_once()
     scan_call = mock_scan.call_args
@@ -186,9 +289,15 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
 @patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_artifact")
-def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkdtemp, mock_rmtree):
+def test_scan_jfrog_artifact_download_error(
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test error handling when JFrog download fails."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
 
     # Mock file detection (successful)
@@ -208,9 +317,16 @@ def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkd
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_jfrog_folder")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree):
+def test_scan_jfrog_folder_success(
+    mock_scan: MagicMock,
+    mock_download_folder: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test successful JFrog folder scanning."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
 
     # Mock folder detection
@@ -254,6 +370,9 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
         timeout=200,
         selective=True,
         show_progress=True,
+        max_size=None,
+        max_file_size=1000,
+        max_total_size=2000,
     )
 
     # Verify scan was called on the folder with adjusted timeout
@@ -292,9 +411,10 @@ def test_scan_jfrog_folder_download_error_aborts_scan(
     mock_detect: MagicMock,
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Test that folder download failures stop before scanning."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
     mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
     mock_download_folder.side_effect = Exception("JFrog folder download failed after 1 of 2 file(s) completed")
@@ -311,10 +431,15 @@ def test_scan_jfrog_folder_download_error_aborts_scan(
 @patch("modelaudit.integrations.jfrog.download_jfrog_folder")
 @patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_folder_respects_selective_download(
-    mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree
-):
+    mock_scan: MagicMock,
+    mock_download_folder: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Explicit selective_download should flow through to folder downloads."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
     mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
     mock_download_folder.return_value = Path(f"{temp_dir}/models")
@@ -332,6 +457,7 @@ def test_scan_jfrog_folder_respects_selective_download(
         api_token="token",
         timeout=200,
         selective_download=False,
+        max_download_size=4096,
     )
 
     mock_download_folder.assert_called_once_with(
@@ -342,6 +468,9 @@ def test_scan_jfrog_folder_respects_selective_download(
         timeout=200,
         selective=False,
         show_progress=True,
+        max_size=4096,
+        max_file_size=0,
+        max_total_size=0,
     )
     mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
@@ -349,9 +478,14 @@ def test_scan_jfrog_folder_respects_selective_download(
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
 @patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
-def test_scan_jfrog_artifact_detection_error(mock_detect, mock_mkdtemp, mock_rmtree):
+def test_scan_jfrog_artifact_detection_error(
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test error handling when JFrog target detection fails."""
-    temp_dir = "/tmp/modelaudit_jfrog_test"
+    temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
     mock_detect.side_effect = Exception("Authentication failed")
 
