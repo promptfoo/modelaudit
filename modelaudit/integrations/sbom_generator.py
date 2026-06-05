@@ -129,6 +129,8 @@ def _resolve_component_size_and_sha256(
     path: str,
     metadata: FileMetadataModel | dict[str, Any] | None,
     scan_root: str | None = None,
+    *,
+    allow_metadata_fallback: bool = True,
 ) -> tuple[int, str]:
     """Resolve component size/hash from disk, falling back to recorded metadata."""
     if scan_root is not None and not _is_path_within_directory(path, scan_root):
@@ -139,6 +141,8 @@ def _resolve_component_size_and_sha256(
         return opened_file
     if os.path.lexists(path):
         return _lstat_size(path), ""
+    if not allow_metadata_fallback:
+        return 0, ""
 
     file_size = 0
     sha256 = ""
@@ -276,9 +280,16 @@ def _component_for_file_pydantic(
     metadata: FileMetadataModel | None,
     issues: list[Issue],
     scan_root: str | None = None,
+    *,
+    allow_metadata_fallback: bool = True,
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
-    size, sha256 = _resolve_component_size_and_sha256(path, metadata, scan_root)
+    size, sha256 = _resolve_component_size_and_sha256(
+        path,
+        metadata,
+        scan_root,
+        allow_metadata_fallback=allow_metadata_fallback,
+    )
 
     # Start with basic properties
     props = [Property(name="size", value=str(size))]
@@ -317,8 +328,15 @@ def _component_for_file(
     metadata: dict[str, Any],
     issues: Iterable[dict[str, Any]],
     scan_root: str | None = None,
+    *,
+    allow_metadata_fallback: bool = True,
 ) -> Component:
-    size, sha256 = _resolve_component_size_and_sha256(path, metadata, scan_root)
+    size, sha256 = _resolve_component_size_and_sha256(
+        path,
+        metadata,
+        scan_root,
+        allow_metadata_fallback=allow_metadata_fallback,
+    )
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
@@ -457,9 +475,16 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                         meta = meta_model.model_dump()
                     else:
                         meta = meta_model or {}
-                    component = _component_for_file(fp, meta, issues_dicts, scan_root)
+                    component = _component_for_file(
+                        fp,
+                        meta,
+                        issues_dicts,
+                        scan_root,
+                        allow_metadata_fallback=False,
+                    )
                     bom.components.add(component)
         else:
+            allow_metadata_fallback = not os.path.lexists(input_path)
             scan_root = os.path.realpath(os.path.dirname(input_path) or ".")
             meta_model = file_meta.get(input_path)
             # Convert Pydantic model to dict if needed
@@ -467,7 +492,13 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                 meta = meta_model.model_dump()
             else:
                 meta = meta_model or {}
-            component = _component_for_file(input_path, meta, issues_dicts, scan_root)
+            component = _component_for_file(
+                input_path,
+                meta,
+                issues_dicts,
+                scan_root,
+                allow_metadata_fallback=allow_metadata_fallback,
+            )
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
@@ -496,12 +527,25 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                     if _should_skip_sbom_file(fp):
                         continue
                     metadata = file_metadata.get(fp)
-                    component = _component_for_file_pydantic(fp, metadata, issues, scan_root)
+                    component = _component_for_file_pydantic(
+                        fp,
+                        metadata,
+                        issues,
+                        scan_root,
+                        allow_metadata_fallback=False,
+                    )
                     bom.components.add(component)
         else:
+            allow_metadata_fallback = not os.path.lexists(input_path)
             scan_root = os.path.realpath(os.path.dirname(input_path) or ".")
             metadata = file_metadata.get(input_path)
-            component = _component_for_file_pydantic(input_path, metadata, issues, scan_root)
+            component = _component_for_file_pydantic(
+                input_path,
+                metadata,
+                issues,
+                scan_root,
+                allow_metadata_fallback=allow_metadata_fallback,
+            )
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)

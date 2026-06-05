@@ -184,3 +184,62 @@ def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_o
     assert _sha256_values(component) == []
     assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
     assert _property_value(component, "size") == str(os.lstat(model_file).st_size)
+
+
+def test_sbom_omits_recorded_hash_when_listed_symlink_disappears_after_containment_check(
+    tmp_path: Path,
+    requires_symlinks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    inside_file = scan_root / "inside.bin"
+    inside_file.write_bytes(b"contained target selected before deletion")
+    outside_content = b"recorded outside digest must not survive a lost binding"
+    outside_hash = hashlib.sha256(outside_content).hexdigest()
+
+    link = scan_root / "disappearing.bin"
+    link.symlink_to(inside_file)
+    real_realpath = os.path.realpath
+    removed = False
+
+    def _remove_link_after_resolution(path: str) -> str:
+        nonlocal removed
+        resolved = real_realpath(path)
+        if path == str(link) and not removed:
+            removed = True
+            link.unlink()
+        return resolved
+
+    monkeypatch.setattr(os.path, "realpath", _remove_link_after_resolution)
+    fake_metadata = {
+        "file_size": len(outside_content),
+        "file_hashes": {"sha256": outside_hash},
+    }
+
+    sbom_data: dict[str, Any] = json.loads(
+        generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {str(link): fake_metadata}})
+    )
+    component = _component_named(sbom_data, "disappearing.bin")
+
+    assert _sha256_values(component) == []
+    assert outside_hash not in _sha256_values(component)
+    assert _property_value(component, "size") == "0"
+
+
+def test_sbom_preserves_recorded_hash_for_input_missing_before_generation(tmp_path: Path) -> None:
+    missing_file = tmp_path / "missing.bin"
+    recorded_content = b"metadata-only component"
+    recorded_hash = hashlib.sha256(recorded_content).hexdigest()
+    metadata = {
+        "file_size": len(recorded_content),
+        "file_hashes": {"sha256": recorded_hash},
+    }
+
+    sbom_data: dict[str, Any] = json.loads(
+        generate_sbom([str(missing_file)], {"issues": [], "file_metadata": {str(missing_file): metadata}})
+    )
+    component = _component_named(sbom_data, "missing.bin")
+
+    assert _sha256_values(component) == [recorded_hash]
+    assert _property_value(component, "size") == str(len(recorded_content))
