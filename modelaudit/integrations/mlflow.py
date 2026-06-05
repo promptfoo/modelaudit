@@ -7,7 +7,7 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -36,6 +36,13 @@ _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
 class _MlflowArtifact:
     path: str
     size: int
+
+
+@dataclass(frozen=True)
+class _MlflowArtifactInfo:
+    path: str
+    is_dir: bool
+    file_size: int | None
 
 
 @dataclass(frozen=True)
@@ -138,22 +145,36 @@ def _redact_mlflow_error_for_display(error: object) -> str:
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
 
 
-def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
-    """Return a trusted local source root that ModelAudit can copy itself."""
+def _terminal_mlflow_artifact_repository(artifact_repository: Any) -> Any | None:
+    """Unwrap MLflow's transparent model and run repository adapters."""
     try:
-        from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
         from mlflow.store.artifact.models_artifact_repo import ModelsArtifactRepository
+        from mlflow.store.artifact.runs_artifact_repo import RunsArtifactRepository
     except Exception:
-        return None
+        return artifact_repository
 
     repository = artifact_repository
     seen: set[int] = set()
-    while isinstance(repository, ModelsArtifactRepository):
+    while isinstance(repository, (ModelsArtifactRepository, RunsArtifactRepository)):
         repository_id = id(repository)
         if repository_id in seen:
             return None
         seen.add(repository_id)
-        repository = repository.repo
+        repository = getattr(repository, "repo", None)
+        if repository is None:
+            return None
+
+    return repository
+
+
+def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
+    """Return a trusted local source root that ModelAudit can copy itself."""
+    try:
+        from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
+    except Exception:
+        return None
+
+    repository = _terminal_mlflow_artifact_repository(artifact_repository)
 
     if not isinstance(repository, LocalArtifactRepository):
         return None
@@ -163,6 +184,53 @@ def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
     except (OSError, TypeError, ValueError):
         return None
     return artifact_root if artifact_root.is_dir() else None
+
+
+def _is_local_mlflow_artifact_repository(artifact_repository: Any) -> bool:
+    try:
+        from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
+    except Exception:
+        return False
+    return isinstance(artifact_repository, LocalArtifactRepository)
+
+
+def _iter_local_mlflow_artifacts(
+    source_root: Path,
+    artifact_path: str | None,
+) -> Iterator[_MlflowArtifactInfo]:
+    """Yield local artifact metadata without materializing a whole directory."""
+    source_path = source_root
+    if artifact_path is not None:
+        for part in PurePosixPath(artifact_path).parts:
+            source_path /= part
+            if source_path.is_symlink():
+                raise ValueError("artifact source path contains a symbolic link")
+
+    if not source_path.exists():
+        return
+
+    resolved_source = source_path.resolve(strict=True)
+    if not resolved_source.is_relative_to(source_root):
+        raise ValueError("artifact source path escaped the repository root")
+    if not resolved_source.is_dir():
+        return
+
+    with os.scandir(resolved_source) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise ValueError("artifact source path contains a symbolic link")
+            entry_path = posixpath.join(artifact_path, entry.name) if artifact_path else entry.name
+            normalized_path = _normalize_mlflow_artifact_path(entry_path)
+            if entry.is_dir(follow_symlinks=False):
+                yield _MlflowArtifactInfo(path=normalized_path, is_dir=True, file_size=None)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"Artifact entry is not a regular file: {normalized_path}")
+            yield _MlflowArtifactInfo(
+                path=normalized_path,
+                is_dir=False,
+                file_size=entry.stat(follow_symlinks=False).st_size,
+            )
 
 
 def _copy_local_mlflow_artifact(
@@ -294,7 +362,9 @@ def _preflight_mlflow_download_budget(
     }
     try:
         artifact_repository = mlflow_module.artifacts.get_artifact_repository(root_uri)
-        list_artifacts = artifact_repository.list_artifacts
+        artifact_repository = _terminal_mlflow_artifact_repository(artifact_repository)
+        if artifact_repository is None:
+            raise ValueError("Artifact repository wrapper chain could not be resolved")
     except Exception as e:
         details["reason"] = "artifact_size_unavailable"
         details["error"] = _redact_mlflow_error_for_display(e)
@@ -304,6 +374,21 @@ def _preflight_mlflow_download_budget(
             details,
         )
 
+    local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
+    if local_artifact_root is None:
+        details["reason"] = "artifact_streaming_budget_unavailable"
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "MLflow artifact repository cannot enforce the configured download budget",
+            details,
+        )
+
+    if _is_local_mlflow_artifact_repository(artifact_repository):
+
+        def list_artifacts(path: str | None) -> Iterator[_MlflowArtifactInfo]:
+            return _iter_local_mlflow_artifacts(local_artifact_root, path)
+    else:
+        list_artifacts = artifact_repository.list_artifacts
     total_size = 0
     file_count = 0
     entry_count = 0
@@ -441,15 +526,6 @@ def _preflight_mlflow_download_budget(
         return _mlflow_budget_failure_result(
             model_uri,
             "Unable to determine MLflow artifact size before download",
-            details,
-        )
-
-    local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
-    if local_artifact_root is None:
-        details["reason"] = "artifact_streaming_budget_unavailable"
-        return _mlflow_budget_failure_result(
-            model_uri,
-            "MLflow artifact repository cannot enforce the configured download budget",
             details,
         )
 
