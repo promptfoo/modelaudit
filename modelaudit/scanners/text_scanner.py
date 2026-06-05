@@ -108,10 +108,31 @@ DOCUMENTATION_PRIVILEGE_OPTION = (
     + DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT
     + rb"(?:=[^\s]+|\s+[^\s]+)|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?)"
 )
+DOCUMENTATION_ENV_OPTION_ARGUMENT = rb"(?:[^\s\"']+|\"[^\"\r\n]{0,4096}\"|'[^'\r\n]{0,4096}')"
+DOCUMENTATION_ENV_OPTION_WITH_ARGUMENT = rb"(?:-(?:C|u)|--(?:chdir|unset))"
+DOCUMENTATION_ENV_OPTION_WITHOUT_ARGUMENT = (
+    rb"(?:-[0iv]{1,3}|--(?:debug|ignore-environment|list-signal-handling|null)"
+    rb"|--(?:block-signal|default-signal|ignore-signal)(?:=[^\s]+)?)"
+)
+DOCUMENTATION_ENV_OPTION = (
+    rb"(?:"
+    + DOCUMENTATION_ENV_OPTION_WITH_ARGUMENT
+    + rb"(?:="
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb"|\s+"
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb")|"
+    + DOCUMENTATION_ENV_OPTION_WITHOUT_ARGUMENT
+    + rb")"
+)
 DOCUMENTATION_ENV_ASSIGNMENT = rb"[A-Za-z_][A-Za-z0-9_]{0,127}=(?:[^\s\"']+|\"[^\"\r\n]{0,4096}\"|'[^'\r\n]{0,4096}')"
+DOCUMENTATION_ENV_SPLIT_STRING_WRAPPER = (
+    rb"env(?:\s+" + DOCUMENTATION_ENV_OPTION + rb"){0,8}\s+(?:-S|--split-string)(?:=|\s+)[\"']?\s*"
+)
 DOCUMENTATION_ENV_WRAPPER = (
-    rb"(?:(?:env(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+)?"
-    rb"(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){1,16})?"
+    rb"(?:(?:" + DOCUMENTATION_ENV_SPLIT_STRING_WRAPPER + rb")|(?:env(?:\s+" + DOCUMENTATION_ENV_OPTION + rb"){0,8}\s+"
+    rb"(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){0,16})"
+    rb"|(?:(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){1,16}))?"
 )
 DOCUMENTATION_PRIVILEGE_WRAPPER = (
     rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
@@ -123,8 +144,15 @@ DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
 )
 DOCUMENTATION_SHELL_PROMPT = rb"(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])\s*)?"
 DOCUMENTATION_INLINE_CODE_OPEN = rb"(?:`{1,3}\s*)?"
+DOCUMENTATION_COMMAND_LABEL = rb"(?:[A-Za-z][A-Za-z0-9 _-]{0,31}\s*:\s*)?"
+DOCUMENTATION_DOCKER_RUN_OPTION = rb"--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
+DOCUMENTATION_DOCKER_RUN = rb"(?:RUN(?:\s+" + DOCUMENTATION_DOCKER_RUN_OPTION + rb"){0,8}\s+)?"
+DOCUMENTATION_COMMAND_CONTEXT = DOCUMENTATION_COMMAND_LABEL + DOCUMENTATION_DOCKER_RUN
 DOCUMENTATION_SHELL_LINE_PREFIX = (
-    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?" + DOCUMENTATION_INLINE_CODE_OPEN + DOCUMENTATION_SHELL_PROMPT
+    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?"
+    + DOCUMENTATION_INLINE_CODE_OPEN
+    + DOCUMENTATION_SHELL_PROMPT
+    + DOCUMENTATION_COMMAND_CONTEXT
 )
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
@@ -137,6 +165,7 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     rb"(?:^|[;&|]\s*)"
     + DOCUMENTATION_INLINE_CODE_OPEN
     + DOCUMENTATION_SHELL_PROMPT
+    + DOCUMENTATION_COMMAND_CONTEXT
     + DOCUMENTATION_SHELL_WRAPPED_COMMAND
     + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
