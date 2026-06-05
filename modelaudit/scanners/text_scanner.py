@@ -1,8 +1,12 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
+import io
+import keyword
 import os
 import re
+import token
+import tokenize
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit
 
@@ -71,7 +75,6 @@ DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
-DOCUMENTATION_ENCLOSING_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}$")
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:"
@@ -205,7 +208,15 @@ DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
     rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
-    rb"(?:[_ -]+(?:address|destination|endpoint|host|server|target|url|uri)){0,2}\s*(?:=|:)\s*$",
+    rb"(?P<suffix>[^\n:]{0,32}):\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PASSIVE_NETWORK_LABEL_SUFFIX_PATTERN = re.compile(
+    rb"\b(?:analysis|article|discussion|docs?|documentation|example|guide|overview|paper|reference|research)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN = re.compile(
+    rb"\b(?:address|destination|endpoint|host|receiver|server|sink|target|uri|url)\b",
     re.IGNORECASE,
 )
 GENERIC_CC_BENIGN_TERM_PATTERN = rb"(?:malwares?|backdoors?|trojans?|botnets?|zombies?)"
@@ -395,6 +406,85 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
+        """Return whether a bounded Python prefix leaves a function call open at the finding."""
+        source = prefix.strip()
+        markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
+        if markdown_prefix is not None:
+            source = source[markdown_prefix.end() :].lstrip()
+        for fence_length in (3, 2, 1):
+            fence = b"`" * fence_length
+            if source.startswith(fence):
+                source = source[fence_length:].lstrip()
+                break
+        if source.startswith((b">>>", b"...")):
+            source = source[3:].lstrip()
+        source = source.rstrip()
+        if source.endswith((b"'", b'"')):
+            source = source[:-1].rstrip()
+        try:
+            decoded = source.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        stack: list[tuple[str, bool]] = []
+        previous: tokenize.TokenInfo | None = None
+        before_previous: tokenize.TokenInfo | None = None
+        expression_keywords = {
+            "and",
+            "await",
+            "elif",
+            "if",
+            "in",
+            "is",
+            "lambda",
+            "not",
+            "or",
+            "return",
+            "while",
+            "yield",
+        }
+        ignored_token_types = {
+            token.COMMENT,
+            token.DEDENT,
+            token.ENDMARKER,
+            token.INDENT,
+            token.NEWLINE,
+            tokenize.ENCODING,
+            tokenize.NL,
+        }
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(decoded).readline)
+            for current in tokens:
+                if current.type in ignored_token_types:
+                    continue
+                if current.type == token.OP and current.string in "([{":
+                    name_starts_call = (
+                        previous is not None
+                        and previous.type == token.NAME
+                        and not keyword.iskeyword(previous.string)
+                        and (
+                            before_previous is None
+                            or before_previous.type == token.OP
+                            or (before_previous.type == token.NAME and before_previous.string in expression_keywords)
+                        )
+                    )
+                    is_call = current.string == "(" and (
+                        name_starts_call
+                        or (previous is not None and previous.type == token.OP and previous.string in {")", "]"})
+                    )
+                    stack.append((current.string, is_call))
+                elif current.type == token.OP and current.string in ")]}":
+                    expected = {")": "(", "]": "[", "}": "{"}[current.string]
+                    if stack and stack[-1][0] == expected:
+                        stack.pop()
+                before_previous = previous
+                previous = current
+        except (IndentationError, tokenize.TokenError):
+            pass
+        return any(opening == "(" and is_call for opening, is_call in stack)
+
+    @staticmethod
     def _documentation_shell_comment_before_position(line: bytes, position: int) -> bool:
         quote: int | None = None
         escaped = False
@@ -440,6 +530,16 @@ class TextScanner(BaseScanner):
             and DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
         )
 
+    @staticmethod
+    def _documentation_suspicious_label_is_actionable(prefix: bytes) -> bool:
+        for match in DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.finditer(prefix):
+            suffix = match.group("suffix")
+            if DOCUMENTATION_ACTIONABLE_NETWORK_LABEL_SUFFIX_PATTERN.search(suffix) is not None:
+                return True
+            if DOCUMENTATION_PASSIVE_NETWORK_LABEL_SUFFIX_PATTERN.search(suffix) is None:
+                return True
+        return False
+
     @classmethod
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
@@ -451,12 +551,13 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
+            or cls._documentation_suspicious_label_is_actionable(prefix)
             or (
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
                 and cls._documentation_assignment_is_actionable(prefix)
             )
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            or cls._documentation_prefix_has_enclosing_call(prefix)
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
@@ -524,6 +625,7 @@ class TextScanner(BaseScanner):
         return (
             cls._documentation_assignment_is_actionable(prefix)
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            or cls._documentation_prefix_has_enclosing_call(prefix)
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
@@ -632,6 +734,8 @@ class TextScanner(BaseScanner):
         ):
             return False
         line, position = line_parts
+        if cls._documentation_shell_comment_before_position(line, position):
+            return True
         cursor = position + len(function.encode())
         while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
             cursor += 1
@@ -654,7 +758,7 @@ class TextScanner(BaseScanner):
                 line,
                 position,
             )
-            and DOCUMENTATION_ENCLOSING_CALL_PATTERN.search(line[:position]) is None
+            and not cls._documentation_prefix_has_enclosing_call(line[:position])
         )
 
     @classmethod
@@ -668,6 +772,8 @@ class TextScanner(BaseScanner):
         ):
             return False
         line, position = line_parts
+        if cls._documentation_shell_comment_before_position(line, position):
+            return True
         pattern_bytes = pattern.encode()
         cursor = position + len(pattern_bytes)
         while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
@@ -684,7 +790,7 @@ class TextScanner(BaseScanner):
         return (
             not import_is_executable
             and not cls._documentation_line_is_code_shaped(line, position)
-            and DOCUMENTATION_ENCLOSING_CALL_PATTERN.search(prefix) is None
+            and not cls._documentation_prefix_has_enclosing_call(prefix)
         )
 
     @classmethod
@@ -698,6 +804,8 @@ class TextScanner(BaseScanner):
         ):
             return False
         line, position = line_parts
+        if cls._documentation_shell_comment_before_position(line, position):
+            return True
         return not cls._documentation_line_is_code_shaped(line, position) and any(
             match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)
         )
