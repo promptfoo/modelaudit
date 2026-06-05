@@ -2748,13 +2748,27 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if hdf5_signature_offset not in (None, 0):
         assert hdf5_signature_offset is not None
-        merge_hdf5_userblock_zip_findings(
-            path,
-            result,
-            config,
-            hdf5_signature_offset,
-            context="HDF5 user-block ZIP",
+        userblock_zip_allowed = (
+            not scanner_selection.active
+            or scanner_selection.allows("zip")
+            or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
         )
+        if userblock_zip_allowed:
+            merge_hdf5_userblock_zip_findings(
+                path,
+                result,
+                config,
+                hdf5_signature_offset,
+                context="HDF5 user-block ZIP",
+            )
+        elif hdf5_userblock_supplemental_scanner_id is not None:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                hdf5_userblock_supplemental_scanner_id,
+                scanner_selection,
+                context="HDF5 user-block content analysis",
+            )
     if (
         hdf5_userblock_supplemental_scanner_id not in (None, "zip")
         and result.scanner_name != hdf5_userblock_supplemental_scanner_id

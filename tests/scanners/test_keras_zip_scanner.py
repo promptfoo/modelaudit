@@ -8,7 +8,6 @@ The new .keras format is a ZIP archive containing:
 """
 
 import base64
-import io
 import json
 import marshal
 import stat
@@ -1177,11 +1176,7 @@ class TestKerasZipScanner:
                 original_bypass,
             )
 
-            original_h5py_file = keras_zip_scanner_module.h5py.File
-
-            def fail_h5py_open(file_path: Any, *args: Any, **kwargs: Any) -> Any:
-                if isinstance(file_path, io.BytesIO):
-                    return original_h5py_file(file_path, *args, **kwargs)
+            def fail_h5py_open(*args: Any, **kwargs: Any) -> Any:
                 raise RuntimeError("simulated h5py runtime failure")
 
             monkeypatch.setattr(keras_zip_scanner_module.h5py, "File", fail_h5py_open)

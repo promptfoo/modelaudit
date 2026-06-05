@@ -2830,6 +2830,51 @@ def test_scan_file_honors_zip_only_selection_for_large_hdf5_userblock(tmp_path: 
     assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_scan_file_honors_keras_only_selection_for_hdf5_zip_userblock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "selected-keras-userblock.h5"
+    _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["keras_h5"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "keras_h5"
+    assert not any(issue.rule_code == "S201" for issue in result.issues)
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "zip"
+        and check.details.get("context") == "HDF5 user-block content analysis"
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_report_zip_skip_for_benign_hdf5_userblock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "selected-benign-userblock.h5"
+    model_path.write_bytes(b"benign user block")
+    _append_hdf5_userblock_candidate(model_path, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    result = scan_file(
+        str(model_path),
+        config={"scanners": ["keras_h5"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "keras_h5"
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "zip_signature",
     [b"PK\x03\x04", b"PK\x01\x02", b"PK\x06\x06", b"PK\x06\x07", b"PK\x07\x08"],
