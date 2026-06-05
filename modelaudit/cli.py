@@ -412,12 +412,11 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
 def _replace_windows_output_file(
     output_path: str,
     temp_fd: int,
-    parent_handle: int,
     destination_name: str,
     *,
     replace_existing: bool,
 ) -> None:
-    """Atomically install an open Windows temp file relative to the pinned parent handle."""
+    """Atomically rename an open Windows temp file within its pinned parent."""
     import ctypes
     import ctypes.wintypes as wintypes
     import msvcrt
@@ -436,7 +435,7 @@ def _replace_windows_output_file(
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
     rename_info.replace_if_exists = replace_existing
-    rename_info.root_directory = parent_handle
+    rename_info.root_directory = None
     rename_info.file_name_length = len(encoded_name)
     ctypes.memmove(ctypes.addressof(rename_buffer) + file_name_offset, encoded_name, len(encoded_name))
 
@@ -494,8 +493,10 @@ def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None, i
         raise _OutputWriteError(f"Secure output writes are unsupported on this platform: {_display_path(output_path)}")
 
     directory_flags = directory_access | directory | nofollow
-    directory_fds = [os.open(absolute_path.anchor, directory_flags)]
+    directory_fds: list[int] = []
     try:
+        root_fd = os.open(absolute_path.anchor, directory_flags)
+        directory_fds.append(root_fd)
         for part in absolute_path.parts[1:-1]:
             if part == "..":
                 if len(directory_fds) > 1:
@@ -503,7 +504,8 @@ def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None, i
                 continue
             if part in {"", "."}:
                 continue
-            directory_fds.append(os.open(part, directory_flags, dir_fd=directory_fds[-1]))
+            child_fd = os.open(part, directory_flags, dir_fd=directory_fds[-1])
+            directory_fds.append(child_fd)
         output_parent_fd = directory_fds.pop()
         for directory_fd in directory_fds:
             os.close(directory_fd)
@@ -752,7 +754,6 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
             _replace_windows_output_file(
                 output_path,
                 temp_fd,
-                parent_guard,
                 absolute_path.name,
                 replace_existing=initial_stat is not None,
             )

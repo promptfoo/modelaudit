@@ -1,3 +1,4 @@
+import ctypes
 import errno
 import importlib
 import json
@@ -6,6 +7,7 @@ import re
 import stat
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1309,6 +1311,56 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     assert json.loads(output_path.read_text())["scanners"]
 
 
+def test_windows_output_rename_uses_same_directory_filename(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same-directory handle renames must leave FILE_RENAME_INFO.RootDirectory null."""
+    import ctypes.wintypes as wintypes
+
+    captured: dict[str, int | None] = {}
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", wintypes.BOOLEAN),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    class SetFileInformationByHandle:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            _handle: int,
+            _information_class: int,
+            buffer: ctypes.c_void_p,
+            _buffer_size: int,
+        ) -> bool:
+            rename_info = ctypes.cast(buffer, ctypes.POINTER(FileRenameInfo)).contents
+            captured["root_directory"] = rename_info.root_directory
+            captured["replace_if_exists"] = rename_info.replace_if_exists
+            captured["file_name_length"] = rename_info.file_name_length
+            return True
+
+    set_file_information = SetFileInformationByHandle()
+    kernel32 = types.SimpleNamespace(SetFileInformationByHandle=set_file_information)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: fd))
+
+    cli_module._replace_windows_output_file(
+        "output.txt",
+        123,
+        "output.txt",
+        replace_existing=False,
+    )
+
+    assert captured == {
+        "root_directory": None,
+        "replace_if_exists": 0,
+        "file_name_length": len("output.txt".encode("utf-16-le")),
+    }
+
+
 def test_cli_report_writers_fail_closed_without_secure_parent_primitive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1345,7 +1397,6 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
     def attempt_parent_swap(
         output: str,
         temp_fd: int,
-        parent_handle: int,
         destination_name: str,
         *,
         replace_existing: bool,
@@ -1355,7 +1406,6 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
         original_replace(
             output,
             temp_fd,
-            parent_handle,
             destination_name,
             replace_existing=replace_existing,
         )
