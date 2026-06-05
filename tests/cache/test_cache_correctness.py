@@ -200,6 +200,17 @@ def test_capture_file_identity_ignores_unrelated_ancestor_churn_during_hash(
     assert identity[1].startswith("secure:")
 
 
+def test_missing_file_cache_lookups_return_misses(tmp_path: Path) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    missing_path = tmp_path / "missing.cache"
+
+    assert cache.get_cached_result(str(missing_path)) is None
+    assert cache.get_cached_result_with_identity(str(missing_path)) == (None, None)
+    assert cache.get_cached_result_by_key("missing-key", file_path=str(missing_path)) is None
+    assert cache._get_cached_result_by_key("missing-key", file_path=str(missing_path)) is None
+    assert cache.get_cache_stats()["cache_misses"] == 4
+
+
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))

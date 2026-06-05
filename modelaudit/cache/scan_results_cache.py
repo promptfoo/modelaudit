@@ -298,12 +298,12 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup plus the monitored identity reusable by a miss scan."""
-        if self._path_has_symlink_component(file_path):
-            logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
-            return None, None
-
         file_identity: ScannedFileIdentity | None = None
         try:
+            if self._path_has_symlink_component(file_path):
+                logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
+                return None, None
+
             file_identity = self.capture_file_identity(file_path)
             file_stat, file_hash, _change_token, _ancestor_identity = file_identity
             cache_key, _content_hash = self._generate_cache_key_material(
@@ -386,6 +386,10 @@ class ScanResultsCache:
                 verified_content_hash=file_identity[1] if file_identity is not None else None,
                 expected_file_identity=file_identity,
             )
+        except Exception as e:
+            logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
+            self._record_cache_miss("error")
+            return None
         finally:
             if file_identity is not None:
                 self.release_ancestor_identity(file_identity[-1])
@@ -399,11 +403,11 @@ class ScanResultsCache:
         expected_file_identity: ScannedFileIdentity | None = None,
     ) -> dict[str, Any] | None:
         """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
-        if file_path is not None and self._path_has_symlink_component(file_path):
-            logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
-            return None
-
         try:
+            if file_path is not None and self._path_has_symlink_component(file_path):
+                logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
+                return None
+
             cache_file_path = self._get_cache_file_path(cache_key)
 
             if not cache_file_path.exists():
