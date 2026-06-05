@@ -2515,3 +2515,39 @@ def test_network_finding_limit_keeps_lazy_url_cache_bounded() -> None:
     detector.scan(data, "tokens.txt")
 
     assert len(detector._url_contexts) <= 2
+
+
+def test_sensitive_hint_near_match_skips_shared_evidence_redactor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Benign key suffixes must not trigger expensive endpoint classification."""
+    monkeypatch.setattr(
+        network_comm,
+        "_redact_network_evidence",
+        lambda _text: (_ for _ in ()).throw(AssertionError("shared redactor should not run")),
+    )
+    ip = "45.33.32.156"
+    data = (f"api_key_hint=public endpoint={ip} ".encode()) * 100
+
+    findings = NetworkCommDetector().scan(data, "tokens.txt")
+
+    assert sum(finding.get("ip") == ip for finding in findings) == 100
+
+
+def test_shared_evidence_redaction_classification_budget_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dense ambiguous endpoint values must have bounded redaction work."""
+    calls = 0
+
+    def preserve_marked_evidence(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        return text
+
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", preserve_marked_evidence)
+    ip = "45.33.32.156"
+    data = b"".join(f"api_key=value-{index} endpoint={ip}\n".encode() for index in range(100))
+
+    findings = NetworkCommDetector().scan(data, "tokens.txt")
+
+    assert calls == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
+    assert sum(finding.get("ip") == ip for finding in findings) == calls

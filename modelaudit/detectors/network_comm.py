@@ -92,7 +92,8 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
-    rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)",
+    rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
+    rb"(?![_-](?:cache|count|hint)\b)",
     re.IGNORECASE,
 )
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
@@ -101,6 +102,7 @@ _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
 _MAX_PATH_TOKEN_DECODE_PASSES = 8
+_MAX_EVIDENCE_REDACTION_CLASSIFICATIONS = 32
 _PATH_TOKEN_DECODE_LIMIT_SENTINEL = "\0path-decode-limit"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
@@ -1477,6 +1479,7 @@ class NetworkCommDetector:
         self._url_context_iterator: Iterator[tuple[int, int, str]] | None = None
         self._pending_url_context: tuple[int, int, str] | None = None
         self._url_context_scan_complete = False
+        self._evidence_redaction_classifications = 0
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -1505,6 +1508,7 @@ class NetworkCommDetector:
         self.findings_truncated = False
         self.truncated_finding_type = None
         self.truncated_finding = None
+        self._evidence_redaction_classifications = 0
         if self.max_findings is None:
             self._url_contexts = self._index_url_contexts(data)
             self._url_context_starts = [start for start, _end, _url in self._url_contexts]
@@ -1608,7 +1612,7 @@ class NetworkCommDetector:
                 if lazy_url_context is not None:
                     url_start, _url_end, url = lazy_url_context
                     return _is_match_redacted_from_url_context(url, url_start, match_start, value)
-            return _is_split_sensitive_url_value(data, match_start) or _is_redacted_evidence_value(
+            return _is_split_sensitive_url_value(data, match_start) or self._is_redacted_evidence_value(
                 data, match_start, value
             )
         context_index = bisect_right(self._url_context_starts, match_start) - 1
@@ -1619,8 +1623,20 @@ class NetworkCommDetector:
         return (
             _is_match_redacted_from_url(data, match_start, value)
             or _is_split_sensitive_url_value(data, match_start)
-            or _is_redacted_evidence_value(data, match_start, value)
+            or self._is_redacted_evidence_value(data, match_start, value)
         )
+
+    def _is_redacted_evidence_value(self, data: bytes, match_start: int, value: str) -> bool:
+        """Bound expensive shared-redactor classifications and fail closed on exhaustion."""
+        before = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
+        match_end = match_start + len(value.encode("utf-8"))
+        after = min(len(data), match_end + _MAX_URL_TEXT_LOOKUP_BYTES)
+        if _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data[before:after]) is None:
+            return False
+        if self._evidence_redaction_classifications >= _MAX_EVIDENCE_REDACTION_CLASSIFICATIONS:
+            return True
+        self._evidence_redaction_classifications += 1
+        return _is_redacted_evidence_value(data, match_start, value)
 
     def _lazy_url_context_containing(self, match_start: int) -> tuple[int, int, str] | None:
         """Advance the bounded lazy URL index only far enough to classify one match."""
