@@ -2650,6 +2650,99 @@ class TestModelDownloadStreaming:
     )
     @patch(
         "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+        return_value="safetensors",
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_combines_extension_and_filename_route_filters(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_detect_content: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Exact filename filters must not disable renamed routes from selected suffixes."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".safetensors"},
+                scannable_filenames={"readme"},
+            )
+        )
+
+        assert results == [(tmp_path / "model.safetensors", False), (tmp_path / "renamed.jpg", True)]
+        mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
+
+    @pytest.mark.parametrize(
+        ("hidden_payload", "expected_filenames"),
+        [
+            (
+                b"\x80\x04\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                ["known.msgpack", "hidden.payload"],
+            ),
+            (
+                b"(d.\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                ["known.msgpack", "hidden.payload"],
+            ),
+            (pickle.dumps({"ordinary": "pickle"}, protocol=4), ["known.msgpack"]),
+            (pickle.dumps({"ordinary": "pickle"}, protocol=0), ["known.msgpack"]),
+        ],
+        ids=[
+            "flax-binary-pickle-overlap",
+            "flax-proto0-pickle-overlap",
+            "ordinary-binary-pickle",
+            "ordinary-proto0-pickle",
+        ],
+    )
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["known.msgpack", "hidden.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_flax_preserves_pickle_overlap(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        hidden_payload: bytes,
+        expected_filenames: list[str],
+        tmp_path: Path,
+    ) -> None:
+        """Remote Flax selection must preserve structural overlap without widening to pickle."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(hidden_payload if filename == "hidden.payload" else b"\x81\xa6params\x80")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_requests_get.return_value = _FakeRangeResponse(hidden_payload)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == expected_filenames
+        assert results[-1][1] is True
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model.safetensors", "renamed.jpg"], _HF_TEST_REVISION, None),
+    )
+    @patch(
+        "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
         return_value="pickle",
     )
     @patch("huggingface_hub.hf_hub_download")

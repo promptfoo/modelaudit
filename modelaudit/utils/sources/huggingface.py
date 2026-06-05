@@ -685,6 +685,9 @@ def _detect_huggingface_content_route_format(
             pickle_probe,
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
         ):
+            flax_route = _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
+            if flax_route is not None:
+                return flax_route
             return "pickle"
     if _allows_renamed_binary_content_route(remote_path):
         executorch_state = _probe_huggingface_executorch_prefix(
@@ -718,6 +721,10 @@ def _detect_huggingface_content_route_format(
         detected_format = "unknown"
     if detected_format == "cntk" and remote_path.suffix.lower() == ".model":
         detected_format = "unknown"
+    if detected_format == "pickle":
+        flax_route = _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
+        if flax_route is not None:
+            return flax_route
     tflite_route_blocked = remote_path.suffix.lower() in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS
     if detected_format == "tflite" and tflite_route_blocked:
         detected_format = "unknown"
@@ -958,7 +965,18 @@ def _select_streamable_hf_files(
             _get_hf_content_route_scanner_ids()
         )
     elif scannable_filenames:
-        selected_route_formats = set()
+        from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
+
+        authoritative_extensions = (
+            set()
+            if scannable_extensions is None
+            else {
+                str(extension).lower()
+                for extension in scannable_extensions
+                if str(extension).lower() in EXTENSION_FORMAT_MAP
+            }
+        )
+        selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
     sniff_renamed_files = not include_all_files and (
