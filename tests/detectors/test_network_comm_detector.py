@@ -650,6 +650,15 @@ class TestNetworkCommDetector:
         assert cloud_finding["url"] == "wasbs://account.blob.core.windows.net/model.bin"
         assert "user%3ASECRET" not in json.dumps(cloud_finding, sort_keys=True)
 
+    def test_wasb_container_shaped_userinfo_on_non_azure_host_is_stripped(self) -> None:
+        """Azure schemes must not preserve userinfo on unrelated hosts."""
+        url = "wasbs://accesskey@example.com/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "wasbs://example.com/model.bin"
+        assert "accesskey" not in redacted
+
     def test_gcs_api_bucket_names_are_preserved(self) -> None:
         """GCS JSON/download API bucket segments live after /b/ rather than at path index 1."""
         detector = NetworkCommDetector()

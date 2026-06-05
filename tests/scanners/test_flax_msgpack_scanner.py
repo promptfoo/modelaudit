@@ -1064,6 +1064,45 @@ def test_flax_msgpack_detects_suspicious_bytes_keys(tmp_path: Path) -> None:
     )
 
 
+def test_flax_msgpack_detects_short_suspicious_binary_value(tmp_path: Path) -> None:
+    path = tmp_path / "short_binary_code.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "payload": b"eval('x')"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert any(
+        check.name == "Code Pattern Security Check" and check.details.get("sample") == "eval('x')"
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_detects_suspicious_binary_key(tmp_path: Path) -> None:
+    path = tmp_path / "binary_code_key.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"eval('x')": "safe"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert any(
+        check.name == "Code Pattern Security Check" and check.details.get("sample") == "eval('x')"
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_preserves_benign_short_binary_near_matches(tmp_path: Path) -> None:
+    path = tmp_path / "benign_binary_text.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {"w": [1, 2, 3]},
+            b"evaluation_metric": b"evaluation_result",
+        },
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert not any(check.name == "Code Pattern Security Check" for check in result.checks)
+
+
 def test_flax_msgpack_redaction_preserves_non_secret_suspicious_evidence(tmp_path: Path) -> None:
     path = tmp_path / "non_secret_evidence.msgpack"
     data = {
@@ -1078,6 +1117,24 @@ def test_flax_msgpack_redaction_preserves_non_secret_suspicious_evidence(tmp_pat
     assert "eval(" in sample
     assert "evil.example" in sample
     assert "mode=test" in sample
+
+
+def test_flax_msgpack_fails_closed_for_oversized_evidence_sample(tmp_path: Path) -> None:
+    path = tmp_path / "oversized_evidence.msgpack"
+    secret = "OVERSIZED_EVIDENCE_SECRET"
+    create_msgpack_file(
+        path,
+        {
+            "params": {"w": [1, 2, 3]},
+            "code": f"eval('{secret}')" + "x" * 5000,
+        },
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    samples = [check.details["sample"] for check in result.checks if check.name == "Code Pattern Security Check"]
+
+    assert samples == ["<redacted>"]
+    assert secret not in result.to_json()
 
 
 def test_flax_msgpack_redacts_function_metadata_value_sample(tmp_path: Path) -> None:

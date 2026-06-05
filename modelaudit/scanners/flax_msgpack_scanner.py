@@ -17,12 +17,13 @@ try:
 except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK = False
 
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 _DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval")
 _EVIDENCE_SAMPLE_CHARS = 200
 _EVIDENCE_LOCATION_CHARS = 300
+_EVIDENCE_REDACTION_INPUT_CHARS = 4096
 
 
 def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
@@ -41,12 +42,19 @@ def _join_evidence_path(path: str, key: Any) -> str:
     return f"{path}/{key_str}" if path else key_str
 
 
+def _redact_evidence_fragment(value: Any, max_chars: int) -> str:
+    text = _stringify_evidence_fragment(value)
+    if len(text) > _EVIDENCE_REDACTION_INPUT_CHARS:
+        return REDACTED_EVIDENCE_VALUE
+    return redact_evidence_string(text, max_chars=max_chars)
+
+
 def _redact_evidence_location(location: Any) -> str:
-    return redact_evidence_string(_stringify_evidence_fragment(location), max_chars=_EVIDENCE_LOCATION_CHARS)
+    return _redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS)
 
 
 def _redact_evidence_sample(value: Any) -> str:
-    return redact_evidence_string(_stringify_evidence_fragment(value), max_chars=_EVIDENCE_SAMPLE_CHARS)
+    return _redact_evidence_fragment(value, _EVIDENCE_SAMPLE_CHARS)
 
 
 def _redact_evidence_key(key: Any) -> Any:
@@ -743,12 +751,11 @@ class FlaxMsgpackScanner(BaseScanner):
                 decoded = value.decode("utf-8", errors="ignore")
                 if check_string_jax_transform:
                     self._check_jax_transform("", decoded, location, result)
-                if len(decoded) > 50:  # Only check substantial text
-                    self._check_suspicious_strings(
-                        decoded,
-                        f"{location}[decoded_binary]",
-                        result,
-                    )
+                self._check_suspicious_strings(
+                    decoded,
+                    f"{location}[decoded_binary]",
+                    result,
+                )
             except Exception:  # pragma: no cover - encoding edge cases
                 pass
 
@@ -810,8 +817,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._check_suspicious_keys(key_str, v, f"{location}/{key_str}", result)
 
                 # Check if key itself contains suspicious patterns
-                if isinstance(k, str):
-                    self._check_suspicious_strings(k, f"{location}[key:{k}]", result)
+                self._check_suspicious_strings(key_str, f"{location}[key:{key_str}]", result)
 
                 self._analyze_content(
                     v,

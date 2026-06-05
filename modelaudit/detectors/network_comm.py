@@ -334,6 +334,14 @@ def _is_azure_authority_container(container: str) -> bool:
     return decoded == container and _AZURE_CONTAINER_NAME_PATTERN.fullmatch(container) is not None
 
 
+def _is_azure_container_authority(scheme: str, hostname: str, authority: str) -> bool:
+    return (
+        scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES
+        and hostname.lower().endswith(_AZURE_STORAGE_HOST_SUFFIXES)
+        and _is_azure_authority_container(authority)
+    )
+
+
 def _redact_path_parameter_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
@@ -445,9 +453,9 @@ def redact_url_for_finding(url: str) -> str:
     netloc_host = f"{hostname}:{port}" if port is not None else hostname
     netloc = netloc_host
     scheme = parsed.scheme.lower()
-    if scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES and "@" in parsed.netloc:
+    if "@" in parsed.netloc:
         container, _separator, _host = parsed.netloc.rpartition("@")
-        if _is_azure_authority_container(container):
+        if _is_azure_container_authority(scheme, hostname, container):
             netloc = f"{container}@{netloc_host}"
 
     safe_path = _redact_url_path_tokens(scheme, hostname.lower(), parsed.path)
