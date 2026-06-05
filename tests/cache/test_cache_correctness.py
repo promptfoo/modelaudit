@@ -168,6 +168,38 @@ def test_capture_file_identity_advances_clock_before_hashing(
         cache.capture_file_identity(str(file_path))
 
 
+def test_capture_file_identity_ignores_unrelated_ancestor_churn_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_hash = cache.hasher.hash_file_with_stat
+
+    class StableMonitor:
+        def changed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            return None
+
+    def monitor_identity(_file_path: str, identity: AncestorIdentity) -> AncestorIdentity:
+        monitored = AncestorIdentity(tuple(identity))
+        monitored.monitor = StableMonitor()  # type: ignore[assignment]
+        return monitored
+
+    def hash_with_sibling_churn(path: str, file_stat: os.stat_result) -> str:
+        (file_path.parent / "unrelated.cache").write_bytes(b"unrelated")
+        return original_hash(path, file_stat)
+
+    monkeypatch.setattr(cache, "_monitor_ancestor_identity", monitor_identity)
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_with_sibling_churn)
+
+    identity = cache.capture_file_identity(str(file_path))
+
+    assert identity[1].startswith("secure:")
+
+
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))

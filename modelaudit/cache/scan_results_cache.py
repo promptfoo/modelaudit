@@ -649,25 +649,35 @@ class ScanResultsCache:
         else:
             raise ValueError(f"File kept changing while capturing cache identity: {file_path}")
 
-        content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
-        verified_stat = os.stat(file_path)
-        verified_change_token = self._get_file_change_token(file_path, verified_stat)
-        verified_ancestor_identity = self._capture_ancestor_identity(file_path)
-
-        if (
-            not self._stat_matches(initial_stat, verified_stat)
-            or initial_change_token != verified_change_token
-            or not self._ancestor_identity_matches(initial_ancestor_identity, verified_ancestor_identity)
-        ):
-            raise ValueError(f"File changed while capturing cache identity: {file_path}")
-
-        monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, verified_ancestor_identity)
+        monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, initial_ancestor_identity)
         try:
-            if not self._ancestor_identity_matches(
-                verified_ancestor_identity,
-                self._capture_ancestor_identity(file_path),
+            monitored_stat = os.stat(file_path)
+            if (
+                not self._stat_matches(initial_stat, monitored_stat)
+                or initial_change_token != self._get_file_change_token(file_path, monitored_stat)
+                or not self._ancestor_identity_matches(
+                    initial_ancestor_identity,
+                    self._capture_ancestor_identity(file_path),
+                )
             ):
                 raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
+
+            content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
+            verified_stat = os.stat(file_path)
+            verified_change_token = self._get_file_change_token(file_path, verified_stat)
+            verified_ancestor_identity = self._capture_ancestor_identity(file_path)
+
+            if (
+                not self._stat_matches(initial_stat, verified_stat)
+                or initial_change_token != verified_change_token
+                or self._ancestor_monitor_changed(monitored_ancestor_identity)
+                or not self._ancestor_identity_matches_for_store(
+                    monitored_ancestor_identity,
+                    verified_ancestor_identity,
+                )
+            ):
+                raise ValueError(f"File changed while capturing cache identity: {file_path}")
+
             return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
         except Exception:
             self.release_ancestor_identity(monitored_ancestor_identity)
