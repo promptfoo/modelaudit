@@ -11853,7 +11853,10 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
                     return outcome
             elif isinstance(statement, (ast.For, ast.AsyncFor)) and isinstance(statement.iter, (ast.List, ast.Tuple)):
                 if len(statement.iter.elts) == 1:
-                    executed.append(ast.Assign(targets=[statement.target], value=statement.iter.elts[0]))
+                    loop_binding = ast.Assign(targets=[statement.target], value=statement.iter.elts[0])
+                    ast.copy_location(loop_binding, statement)
+                    ast.fix_missing_locations(loop_binding)
+                    executed.append(loop_binding)
                     outcome = visit(statement.body)
                     if outcome != "break":
                         visit(statement.orelse)
@@ -11929,6 +11932,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
     typed_aliases: dict[str, tuple[str, int]] = {}
     cached_typed_identities: dict[str, tuple[str, int]] = {
         "webbrowser": ("webbrowser", 0),
@@ -12213,6 +12217,23 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             return
         record_member(owner, member_name, value, conditional=conditional)
 
+    def record_assignment_target(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: Mapping[str, tuple[str, int]],
+    ) -> None:
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            record_attribute(aliases_before.get(target.value.id), target.attr, value)
+        elif isinstance(target, ast.Starred):
+            record_assignment_target(target.value, ast.Constant(value=None), aliases_before)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    record_assignment_target(target_item, value_item, aliases_before)
+            else:
+                for target_item in target.elts:
+                    record_assignment_target(target_item, ast.Constant(value=None), aliases_before)
+
     def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
         def invalidate_owner() -> None:
             safe_members.difference_update({member for member in safe_members if member[0] == owner})
@@ -12493,12 +12514,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                 record_setattr_shadow(target, statement.value)
                 record_vars_shadow(target, statement.value)
                 record_dict_shadow(target, statement.value)
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id in typed_aliases
-                ):
-                    record_attribute(typed_aliases[target.value.id], target.attr, statement.value)
+                record_assignment_target(target, statement.value, typed_aliases_before)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
                     if active_vars_reference(value_reference):
@@ -12538,12 +12554,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             record_setattr_shadow(statement.target, statement.value)
             record_vars_shadow(statement.target, statement.value)
             record_dict_shadow(statement.target, statement.value)
-            if (
-                isinstance(statement.target, ast.Attribute)
-                and isinstance(statement.target.value, ast.Name)
-                and statement.target.value.id in typed_aliases
-            ):
-                record_attribute(typed_aliases[statement.target.value.id], statement.target.attr, statement.value)
+            record_assignment_target(statement.target, statement.value, typed_aliases_before)
             if isinstance(statement.target, ast.Name):
                 bind_builtins_mapping_alias(statement.target.id, statement.value)
             bind_module_helper_target(
@@ -12606,7 +12617,10 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                 if item.optional_vars is not None:
                     clear_reload_target(item.optional_vars)
                     clear_module_helper_target(item.optional_vars)
-        for value in _deterministically_evaluated_statement_expressions(statement):
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
             expression_typed_aliases = (
                 typed_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else typed_aliases
             )
@@ -13482,6 +13496,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
         for node in ast.walk(statement):
             if not isinstance(node, ast.Call):
                 continue
+            conditionally_evaluated = _is_conditionally_evaluated_expression(node, parents)
             active_runpy_aliases = _name_aliases_before_call(
                 statement,
                 node,
@@ -13527,7 +13542,11 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     record_runpy_setdefault(member_name, node.args[1], inactive=False)
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in runpy_mapping_delete_names:
-                if node.args and (member_name := _runpy_static_member_key(node.args[0])) is not None:
+                if (
+                    not conditionally_evaluated
+                    and node.args
+                    and (member_name := _runpy_static_member_key(node.args[0])) is not None
+                ):
                     record_runpy_delete(member_name)
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in dict_descriptor_update_names:
@@ -13552,7 +13571,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in dict_descriptor_delete_names:
                 if (
-                    len(node.args) >= 2
+                    not conditionally_evaluated
+                    and len(node.args) >= 2
                     and mapping_owner_name(node.args[0]) in runpy_aliases
                     and (member_name := _runpy_static_member_key(node.args[1])) is not None
                 ):
@@ -13580,7 +13600,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in builtins_dict_descriptor_delete_names:
                 if (
-                    len(node.args) >= 2
+                    not conditionally_evaluated
+                    and len(node.args) >= 2
                     and mapping_owner_name(node.args[0]) in runpy_aliases
                     and (member_name := _runpy_static_member_key(node.args[1])) is not None
                 ):
@@ -13671,11 +13692,16 @@ def _compact_snippet_inactive_restore_high_risk_calls(
             if node.func.attr in {"pop", "__delitem__"}:
                 descriptor = node.func.value
                 if is_runpy_mapping(descriptor):
-                    if node.args and (member_name := _runpy_static_member_key(node.args[0])) is not None:
+                    if (
+                        not conditionally_evaluated
+                        and node.args
+                        and (member_name := _runpy_static_member_key(node.args[0])) is not None
+                    ):
                         record_runpy_delete(member_name)
                     continue
                 if (
-                    isinstance(descriptor, ast.Name)
+                    not conditionally_evaluated
+                    and isinstance(descriptor, ast.Name)
                     and descriptor.id == "dict"
                     and len(node.args) >= 2
                     and mapping_owner_name(node.args[0]) in runpy_aliases

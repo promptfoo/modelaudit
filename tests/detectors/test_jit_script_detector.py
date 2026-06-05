@@ -8046,6 +8046,112 @@ class TestJITScriptDetector:
         )
 
     @pytest.mark.parametrize(
+        ("future_import", "should_detect"),
+        [
+            (b"from __future__ import annotations\n", True),
+            (b"", False),
+        ],
+    )
+    def test_scan_model_respects_deferred_annotation_side_effects(
+        self,
+        future_import: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            future_import
+            + b"import webbrowser as wb\n"
+            + b"marker: wb.__dict__.update(open=print)\n"
+            + b"wb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("restored_value", "should_detect"),
+        [
+            (b"original", True),
+            (b"print", False),
+        ],
+    )
+    @pytest.mark.parametrize("target", [b"(wb.open,)", b"[wb.open]"])
+    def test_scan_model_tracks_destructured_typed_member_assignment(
+        self,
+        target: bytes,
+        restored_value: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            + target
+            + b" = ("
+            + restored_value
+            + b",)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("deletion", "should_detect"),
+        [
+            (b"flag and rp.__dict__.pop('run_path', None)\n", True),
+            (b"flag and rp.__dict__.__delitem__('run_path')\n", True),
+            (b"remove = rp.__dict__.pop\nflag and remove('run_path', None)\n", True),
+            (b"flag and dict.pop(rp.__dict__, 'run_path', None)\n", True),
+            (b"remove = dict.pop\nflag and remove(rp.__dict__, 'run_path', None)\n", True),
+            (
+                b"import builtins\nremove = builtins.dict.pop\nflag and remove(rp.__dict__, 'run_path', None)\n",
+                True,
+            ),
+            (b"rp.__dict__.pop('run_path', None)\n", False),
+        ],
+    )
+    def test_scan_model_requires_unconditional_delete_before_safe_setdefault(
+        self,
+        deletion: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import runpy as rp\nflag = False\n"
+            + deletion
+            + b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    def test_scan_model_ignores_conditional_safe_setdefault_after_unconditional_delete(self) -> None:
+        source = (
+            b"import runpy as rp\nflag = False\n"
+            b"rp.__dict__.pop('run_path', None)\n"
+            b"flag and rp.__dict__.setdefault('run_path', print)\n"
+            b"rp.run_path('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
         "source",
         [
             (b"import runpy as rp\nif False:\n    rp = object()\nrp.run_path = print\nrp.run_path('safe')\n"),
