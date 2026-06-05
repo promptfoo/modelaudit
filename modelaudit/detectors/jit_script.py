@@ -9822,7 +9822,7 @@ def _parsed_real_spans(
     return parsed_spans
 
 
-def _compact_snippet_mutates_module_print(tree: ast.Module) -> bool:
+def _compact_snippet_mutates_module_name(tree: ast.Module, target_name: str) -> bool:
     namespace_helper_aliases = {"globals", "locals"}
     dict_descriptor_aliases = {"dict"}
     module_mapping_aliases: set[str] = set()
@@ -9838,14 +9838,14 @@ def _compact_snippet_mutates_module_print(tree: ast.Module) -> bool:
             and not node.keywords
         )
 
-    def static_print_key(node: ast.AST) -> bool:
-        return _static_getattr_member_name(node) == "print"
+    def static_target_key(node: ast.AST) -> bool:
+        return _static_getattr_member_name(node) == target_name
 
-    def update_writes_print(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
-        if any(keyword.arg == "print" for keyword in keywords):
+    def update_writes_target(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
+        if any(keyword.arg == target_name for keyword in keywords):
             return True
         return any(
-            isinstance(argument, ast.Dict) and any(key is not None and static_print_key(key) for key in argument.keys)
+            isinstance(argument, ast.Dict) and any(key is not None and static_target_key(key) for key in argument.keys)
             for argument in arguments
         )
 
@@ -9869,11 +9869,11 @@ def _compact_snippet_mutates_module_print(tree: ast.Module) -> bool:
             method = call.func.attr
             arguments = call.args[1:]
         if method == "update":
-            return update_writes_print(arguments, call.keywords)
-        return method in {"__setitem__", "setdefault"} and bool(arguments) and static_print_key(arguments[0])
+            return update_writes_target(arguments, call.keywords)
+        return method in {"__setitem__", "setdefault"} and bool(arguments) and static_target_key(arguments[0])
 
     def target_writes_print(target: ast.AST) -> bool:
-        return isinstance(target, ast.Subscript) and is_module_mapping(target.value) and static_print_key(target.slice)
+        return isinstance(target, ast.Subscript) and is_module_mapping(target.value) and static_target_key(target.slice)
 
     def clear_alias(name: str) -> None:
         namespace_helper_aliases.discard(name)
@@ -9972,6 +9972,29 @@ def _compact_snippet_mutates_module_print(tree: ast.Module) -> bool:
     return scan_statements(_compact_deterministically_executed_statements(tree.body))
 
 
+def _compact_module_scope_context(tree: ast.Module) -> tuple[dict[ast.AST, ast.AST], set[int]]:
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    executed_statement_ids = {id(statement) for statement in _compact_deterministically_executed_statements(tree.body)}
+    return parents, executed_statement_ids
+
+
+def _is_compact_module_scope_node(
+    node: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+    executed_statement_ids: set[int],
+) -> bool:
+    statement = node if isinstance(node, ast.stmt) else None
+    current = node
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False
+        if statement is None and isinstance(parent, ast.stmt):
+            statement = parent
+        current = parent
+    return statement is not None and id(statement) in executed_statement_ids
+
+
 def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = None) -> bool:
     if tree is None:
         try:
@@ -9985,25 +10008,17 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
         for alias in node.names
         if alias.name == "builtins"
     } | {"builtins"}
-    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_print(tree):
+    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "print"):
         return True
     if "print" in _late_mutated_truthy_builtin_names(code_str.encode("utf-8"), builtins_aliases, set()):
         return True
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
     for node in ast.walk(tree):
+        if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
+            continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
             return True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
-            return True
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
-            argument.arg == "print"
-            for argument in (
-                *node.args.posonlyargs,
-                *node.args.args,
-                *node.args.kwonlyargs,
-                *([node.args.vararg] if node.args.vararg is not None else []),
-                *([node.args.kwarg] if node.args.kwarg is not None else []),
-            )
-        ):
             return True
         if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
             (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in node.names
@@ -10013,14 +10028,20 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
 
 
 def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
+    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "setattr"):
+        return True
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
     builtins_aliases = {
         alias.asname or alias.name.split(".", maxsplit=1)[0]
         for node in ast.walk(tree)
+        if _is_compact_module_scope_node(node, parents, executed_statement_ids)
         if isinstance(node, ast.Import)
         for alias in node.names
         if alias.name == "builtins"
     } | {"builtins"}
     for node in ast.walk(tree):
+        if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
+            continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "setattr":
             return True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "setattr":
@@ -10050,28 +10071,134 @@ def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
     return False
 
 
-def _compact_snippet_deleted_print_setdefault_members(code_str: str) -> set[str]:
+def _compact_snippet_deleted_print_setdefault_members(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[str]:
     if "setdefault" not in code_str or "print" not in code_str:
         return set()
-    if _compact_snippet_has_shadowed_print(code_str):
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
         return set()
-    safe_member_names = _TYPED_PROOF_MEMBER_NAMES | _RUNPY_PRIORITY_MEMBER_NAMES
-    mapping_owner = r"(?:[A-Za-z_]\w*\s*\.\s*__dict__|vars\s*\(\s*[A-Za-z_]\w*\s*\))"
-    descriptor_owner = r"(?:dict|[A-Za-z_]\w*\s*\.\s*dict|getattr\s*\(\s*[A-Za-z_]\w*\s*,\s*['\"]dict['\"]\s*\))"
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    mapping_aliases: set[str] = set()
+    descriptor_aliases: dict[str, str] = {}
+    bound_method_aliases: dict[str, str] = {}
     deleted_members: set[str] = set()
-    for member_name in safe_member_names:
-        escaped_member = re.escape(member_name)
-        if any(
-            re.search(pattern, code_str) is not None
-            for pattern in (
-                rf"(?ms)\bdel\s+[A-Za-z_]\w*\s*\.\s*{escaped_member}\b.*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"]{escaped_member}['\"]\s*,\s*print\s*\)",
-                rf"(?ms){mapping_owner}\s*\.\s*(?:pop|__delitem__)\s*\(\s*['\"]{escaped_member}['\"](?:\s*,[^\n)]*)?\).*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"]{escaped_member}['\"]\s*,\s*print\s*\)",
-                rf"(?ms){descriptor_owner}\s*\.\s*(?:pop|__delitem__)\s*\(\s*{mapping_owner}\s*,\s*['\"]{escaped_member}['\"](?:\s*,[^\n)]*)?\).*?{mapping_owner}\s*\.\s*setdefault\s*\(\s*['\"]{escaped_member}['\"]\s*,\s*print\s*\)",
-                rf"(?ms)\bdel\s+[A-Za-z_]\w*\s*\.\s*{escaped_member}\b.*?^\s*([A-Za-z_]\w*)\s*=\s*{descriptor_owner}\s*\.\s*setdefault\s*$.*?^\s*\1\s*\(\s*{mapping_owner}\s*,\s*['\"]{escaped_member}['\"]\s*,\s*print\s*\)",
+    safe_members: set[str] = set()
+
+    def mapping_targets_runpy(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in runpy_aliases
             )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in {"vars", "builtins.vars"}
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in runpy_aliases
+            )
+        )
+
+    def record_call(call: ast.Call) -> None:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and mapping_targets_runpy(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name) and call.func.id in bound_method_aliases:
+            method = bound_method_aliases[call.func.id]
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "dict"
+            and call.args
+            and mapping_targets_runpy(call.args[0])
         ):
-            deleted_members.add(member_name)
-    return deleted_members
+            method = call.func.attr
+            arguments = call.args[1:]
+        elif (
+            isinstance(call.func, ast.Name)
+            and call.func.id in descriptor_aliases
+            and call.args
+            and mapping_targets_runpy(call.args[0])
+        ):
+            method = descriptor_aliases[call.func.id]
+            arguments = call.args[1:]
+        if method in {"pop", "__delitem__"} and arguments:
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                deleted_members.add(member_name)
+        elif (
+            method == "setdefault"
+            and len(arguments) >= 2
+            and isinstance(arguments[1], ast.Name)
+            and arguments[1].id == "print"
+        ):
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name in deleted_members:
+                safe_members.add(member_name)
+
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "runpy":
+                    runpy_aliases.add(alias.asname or "runpy")
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    mapping_aliases.discard(target.id)
+                    descriptor_aliases.pop(target.id, None)
+                    bound_method_aliases.pop(target.id, None)
+                    if mapping_targets_runpy(statement.value):
+                        mapping_aliases.add(target.id)
+                    elif isinstance(statement.value, ast.Attribute):
+                        if mapping_targets_runpy(statement.value.value) and statement.value.attr in {
+                            "pop",
+                            "__delitem__",
+                            "setdefault",
+                        }:
+                            bound_method_aliases[target.id] = statement.value.attr
+                        elif (
+                            isinstance(statement.value.value, ast.Name)
+                            and statement.value.value.id == "dict"
+                            and statement.value.attr in {"pop", "__delitem__", "setdefault"}
+                        ):
+                            descriptor_aliases[target.id] = statement.value.attr
+                elif (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    deleted_members.discard(target.attr)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    deleted_members.add(target.attr)
+                elif isinstance(target, ast.Subscript) and mapping_targets_runpy(target.value):
+                    member_name = _runpy_static_member_key(target.slice)
+                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.add(member_name)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for call in _deterministically_executed_expression_calls(value):
+                record_call(call)
+    return safe_members
 
 
 def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
@@ -10272,72 +10399,72 @@ def _compact_snippet_captured_runpy_high_risk_calls(
         tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    runpy_aliases = set(inherited_runpy_aliases) | {
-        alias.asname or alias.name.split(".", maxsplit=1)[0]
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name == "runpy"
-    }
-    if not runpy_aliases:
-        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
     setattr_is_active = not _compact_snippet_has_shadowed_setattr(tree)
     first_safe_write: dict[str, int] = {}
     captured_members: dict[str, tuple[str, int]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
+    dangerous_calls: set[tuple[str, str]] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "runpy":
+                    runpy_aliases.add(alias.asname or "runpy")
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
                     and target.value.id in runpy_aliases
                     and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id == "print"
+                    and isinstance(statement.value, ast.Name)
+                    and statement.value.id == "print"
                 ):
-                    first_safe_write.setdefault(target.attr, node.lineno)
+                    first_safe_write.setdefault(target.attr, statement.lineno)
                 elif (
                     isinstance(target, ast.Name)
-                    and isinstance(node.value, ast.Attribute)
-                    and isinstance(node.value.value, ast.Name)
-                    and node.value.value.id in runpy_aliases
-                    and node.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(statement.value, ast.Attribute)
+                    and isinstance(statement.value.value, ast.Name)
+                    and statement.value.value.id in runpy_aliases
+                    and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
                 ):
-                    captured_members[target.id] = (node.value.attr, node.lineno)
-                elif isinstance(target, ast.Name) and isinstance(node.value, ast.Name):
-                    captured = captured_members.get(node.value.id)
+                    captured_members[target.id] = (statement.value.attr, statement.lineno)
+                elif isinstance(target, ast.Name) and isinstance(statement.value, ast.Name):
+                    captured = captured_members.get(statement.value.id)
                     if captured is not None:
                         captured_members[target.id] = captured
-        elif (
-            setattr_is_active
-            and isinstance(node, ast.Call)
-            and _simple_reference_name(node.func) in {"setattr", "builtins.setattr"}
-            and len(node.args) >= 3
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in runpy_aliases
-            and (member_name := _runpy_static_member_key(node.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
-            and isinstance(node.args[2], ast.Name)
-            and node.args[2].id == "print"
-        ):
-            first_safe_write.setdefault(member_name, node.lineno)
-    dangerous_calls: set[tuple[str, str]] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-            continue
-        captured = captured_members.get(node.func.id)
-        if captured is None:
-            continue
-        member_name, capture_line = captured
-        safe_line = first_safe_write.get(member_name)
-        if safe_line is not None and capture_line < safe_line < node.lineno:
-            dangerous_calls.add((f"runpy.{member_name}", "S108"))
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for node in _deterministically_executed_expression_calls(value):
+                if (
+                    setattr_is_active
+                    and _simple_reference_name(node.func) in {"setattr", "builtins.setattr"}
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in runpy_aliases
+                    and (member_name := _runpy_static_member_key(node.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(node.args[2], ast.Name)
+                    and node.args[2].id == "print"
+                ):
+                    first_safe_write.setdefault(member_name, node.lineno)
+                    continue
+                if not isinstance(node.func, ast.Name):
+                    continue
+                captured = captured_members.get(node.func.id)
+                if captured is None:
+                    continue
+                member_name, capture_line = captured
+                safe_line = first_safe_write.get(member_name)
+                if safe_line is not None and capture_line < safe_line < node.lineno:
+                    dangerous_calls.add((f"runpy.{member_name}", "S108"))
     return dangerous_calls
 
 
-def _typed_member_high_risk_call(member_name: str) -> tuple[str, str] | None:
-    if member_name in {"get", "open", "open_new", "open_new_tab"}:
+def _typed_member_high_risk_call(owner_name: str, member_name: str) -> tuple[str, str] | None:
+    if owner_name == "webbrowser" and member_name in {"get", "open", "open_new", "open_new_tab"}:
         return ("webbrowser.open", "S109")
-    if member_name in _TYPED_PROOF_MEMBER_NAMES:
+    if owner_name == "ctypes" and member_name in _TYPED_PROOF_MEMBER_NAMES:
         return ("ctypes.CDLL", "S110")
     return None
 
@@ -10567,7 +10694,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
     builtins_mapping_update_aliases: set[str] = set()
     builtins_mapping_setitem_aliases: set[str] = set()
     mapping_aliases: dict[str, str] = {}
-    safe_members: set[str] = set()
+    safe_members: set[tuple[str, str]] = set()
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
     local_vars_shadowed = False
@@ -10670,32 +10797,33 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             and node.args[0].id in builtins_aliases
         )
 
-    def record_member(member_name: str | None, value: ast.AST) -> None:
-        if member_name is None or _typed_member_high_risk_call(member_name) is None:
+    def record_member(owner: str | None, member_name: str | None, value: ast.AST) -> None:
+        if owner is None or member_name is None or _typed_member_high_risk_call(owner, member_name) is None:
             return
+        member_key = (owner, member_name)
         if isinstance(value, ast.Name) and value.id == "print":
-            safe_members.add(member_name)
+            safe_members.add(member_key)
         elif (
             isinstance(value, ast.Attribute)
             and value.attr == member_name
             and isinstance(value.value, ast.Name)
-            and value.value.id in typed_aliases
+            and typed_aliases.get(value.value.id) == owner
         ):
             return
         else:
-            safe_members.discard(member_name)
+            safe_members.discard(member_key)
 
-    def record_update(call: ast.Call) -> None:
+    def record_update(owner: str, call: ast.Call) -> None:
         for argument in call.args:
             for key_node, value_node in _runpy_static_update_items(argument) or []:
-                record_member(_static_getattr_member_name(key_node), value_node)
+                record_member(owner, _static_getattr_member_name(key_node), value_node)
         for keyword in call.keywords:
             if keyword.arg is not None:
-                record_member(keyword.arg, keyword.value)
+                record_member(owner, keyword.arg, keyword.value)
             elif isinstance(keyword.value, ast.Dict):
                 for dict_key_node, dict_value_node in zip(keyword.value.keys, keyword.value.values, strict=True):
                     if dict_key_node is not None:
-                        record_member(_static_getattr_member_name(dict_key_node), dict_value_node)
+                        record_member(owner, _static_getattr_member_name(dict_key_node), dict_value_node)
 
     def record_builtins_helper_assignment(member_name: str | None, value: ast.AST) -> None:
         nonlocal builtins_setattr_shadowed, builtins_vars_shadowed
@@ -10850,7 +10978,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     and isinstance(target.value, ast.Name)
                     and target.value.id in typed_aliases
                 ):
-                    record_member(target.attr, statement.value)
+                    record_member(typed_aliases[target.value.id], target.attr, statement.value)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
                     canonical_module = typed_aliases.get(value_reference or "")
@@ -10909,7 +11037,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                 and isinstance(statement.target.value, ast.Name)
                 and statement.target.value.id in typed_aliases
             ):
-                record_member(statement.target.attr, statement.value)
+                record_member(typed_aliases[statement.target.value.id], statement.target.attr, statement.value)
             if isinstance(statement.target, ast.Name):
                 canonical_module = typed_aliases.get(_simple_reference_name(statement.value) or "")
                 if canonical_module is None:
@@ -10925,9 +11053,9 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             if is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
                     record_builtins_helper_assignment(_static_getattr_member_name(key_node), value_node)
-            elif owner_name(statement.target) is not None:
+            elif (target_owner := owner_name(statement.target)) is not None:
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
-                    record_member(_static_getattr_member_name(key_node), value_node)
+                    record_member(target_owner, _static_getattr_member_name(key_node), value_node)
         for value in _deterministically_evaluated_statement_expressions(statement):
             for node in _deterministically_executed_expression_calls(value):
                 reference = _simple_reference_name(node.func)
@@ -10980,30 +11108,42 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     and isinstance(node.args[0], ast.Name)
                     and node.args[0].id in typed_aliases
                 ):
-                    record_member(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_member(
+                        typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                    )
                     continue
-                if active_dict_update_reference(reference) and node.args and owner_name(node.args[0]) is not None:
-                    record_update(node)
+                if (
+                    active_dict_update_reference(reference)
+                    and node.args
+                    and (update_owner := owner_name(node.args[0])) is not None
+                ):
+                    record_update(update_owner, node)
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
-                    if owner_name(node.args[0]) is not None:
-                        record_member(_static_getattr_member_name(node.args[1]), node.args[2])
+                    if (setitem_owner := owner_name(node.args[0])) is not None:
+                        record_member(setitem_owner, _static_getattr_member_name(node.args[1]), node.args[2])
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
                     and node.func.attr in {"update", "__ior__"}
-                    and owner_name(node.func.value) is not None
+                    and (update_owner := owner_name(node.func.value)) is not None
                 ):
-                    record_update(node)
+                    record_update(update_owner, node)
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
                     and node.func.attr == "__setitem__"
-                    and owner_name(node.func.value) is not None
+                    and (setitem_owner := owner_name(node.func.value)) is not None
                     and len(node.args) >= 2
                 ):
-                    record_member(_static_getattr_member_name(node.args[0]), node.args[1])
-    return {call for member_name in safe_members if (call := _typed_member_high_risk_call(member_name)) is not None}
+                    record_member(setitem_owner, _static_getattr_member_name(node.args[0]), node.args[1])
+    return {
+        call
+        for owner, member_name in safe_members
+        if (call := _typed_member_high_risk_call(owner, member_name)) is not None
+    }
 
 
 def _compact_snippet_inactive_restore_high_risk_calls(
@@ -17435,7 +17575,10 @@ class JITScriptDetector:
                 )
                 bounded_suppressed_calls.update(
                     (f"runpy.{member_name}", "S108")
-                    for member_name in _compact_snippet_deleted_print_setdefault_members(bounded_source)
+                    for member_name in _compact_snippet_deleted_print_setdefault_members(
+                        bounded_source,
+                        inherited_runpy_aliases,
+                    )
                     if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                 )
                 bounded_explicit_high_risk_calls: set[tuple[str, str]] = set()
@@ -17586,7 +17729,10 @@ class JITScriptDetector:
                         )
                     setdefault_suppressed_calls = {
                         (f"runpy.{member_name}", "S108")
-                        for member_name in _compact_snippet_deleted_print_setdefault_members(code_str)
+                        for member_name in _compact_snippet_deleted_print_setdefault_members(
+                            code_str,
+                            inherited_runpy_aliases,
+                        )
                         if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                     }
                     typed_suppressed_calls = _compact_snippet_typed_print_overwrite_calls(code_str)

@@ -7130,6 +7130,131 @@ class TestJITScriptDetector:
         )
 
     @pytest.mark.parametrize(
+        "setattr_shadow",
+        [
+            b"globals()['setattr'] = lambda *args: None\n",
+            b"globals().update(setattr=lambda *args: None)\n",
+            b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
+        ],
+    )
+    def test_scan_model_keeps_runpy_call_after_module_setattr_shadow(self, setattr_shadow: bytes) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\n" + setattr_shadow + b"setattr(rp, 'run_path', print)\nrp.run_path('payload.py')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "inactive_shadow",
+        [
+            "if False:\n    globals()['setattr'] = lambda *args: None\n",
+            "globals = lambda: {}\nglobals()['setattr'] = lambda *args: None\n",
+            "def helper():\n    setattr = lambda *args: None\n",
+        ],
+    )
+    def test_inactive_setattr_shadow_keeps_safe_runpy_overwrite(self, inactive_shadow: str) -> None:
+        source = "import runpy as rp\n" + inactive_shadow + "setattr(rp, 'run_path', print)\nrp.run_path('safe')\n"
+        tree = ast.parse(source)
+
+        assert not jit_script_module._compact_snippet_has_shadowed_setattr(tree)
+        assert jit_script_module._compact_snippet_runpy_print_overwrite_calls(source) == {("runpy.run_path", "S108")}
+
+    @pytest.mark.parametrize(
+        "capture_block",
+        [
+            b"def helper():\n    captured = rp.run_path\n",
+            b"if False:\n    captured = rp.run_path\n",
+            b"class Holder:\n    captured = rp.run_path\n",
+        ],
+    )
+    def test_scan_model_ignores_nested_or_inactive_runpy_capture(self, capture_block: bytes) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\n" + capture_block + b"rp.run_path = print\ncaptured('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_constant_active_runpy_capture(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\nif True:\n    captured = rp.run_path\nrp.run_path = print\ncaptured('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_nested_print_parameter_does_not_shadow_module_builtin(self) -> None:
+        source = "import runpy as rp\ndef helper(print):\n    pass\nrp.run_path = print\nrp.run_path('safe')\n"
+
+        assert not jit_script_module._compact_snippet_has_shadowed_print(source)
+        assert jit_script_module._compact_snippet_runpy_print_overwrite_calls(source) == {("runpy.run_path", "S108")}
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import ctypes, webbrowser\nctypes.open = print\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes, webbrowser\nwebbrowser.CDLL = print\nctypes.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_typed_call_after_other_owner_safe_overwrite(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "unrelated_delete",
+        [
+            b"del other.run_path\n",
+            b"other.__dict__.pop('run_path')\n",
+            b"dict.pop(other.__dict__, 'run_path')\n",
+        ],
+    )
+    def test_scan_model_keeps_runpy_call_after_unrelated_delete_before_setdefault(
+        self,
+        unrelated_delete: bytes,
+    ) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\nclass Other:\n    pass\n"
+            b"other = Other()\nother.run_path = print\n"
+            + unrelated_delete
+            + b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
         "module_print_mutation",
         [
             b"globals()['print'] = eval\n",
