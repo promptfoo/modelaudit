@@ -468,6 +468,35 @@ def _append_hdf5_userblock_candidate(path: Path, *, plausible: bool) -> int:
     return signature_offset
 
 
+def _write_safetensors_hdf5_userblock_candidate(path: Path, *, plausible: bool) -> int:
+    """Write a SafeTensors payload whose tensor bytes contain an HDF5 candidate."""
+    signature_offset = 512
+    file_size = signature_offset + 64
+    header_size = signature_offset - 8
+    header = {
+        "weights": {
+            "dtype": "U8",
+            "shape": [file_size - signature_offset],
+            "data_offsets": [0, file_size - signature_offset],
+        }
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    payload = bytearray(struct.pack("<Q", header_size) + header_bytes.ljust(header_size, b" ") + bytes(64))
+
+    if plausible:
+        superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
+        superblock.extend(signature_offset.to_bytes(8, "little"))
+        superblock.extend(b"\xff" * 8)
+        superblock.extend(file_size.to_bytes(8, "little"))
+        superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+        superblock.extend(bytes(4))
+    else:
+        superblock = bytearray(HDF5_MAGIC + b"\x03\x01\x01\x00")
+    payload[signature_offset : signature_offset + len(superblock)] = superblock
+    path.write_bytes(payload)
+    return signature_offset
+
+
 def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
     prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
     structure = b" CompositeFunction primitive_functions " if include_structure else b""
@@ -2576,6 +2605,62 @@ def test_scan_file_keeps_malformed_hdf5_zip_near_match_on_zip_route(tmp_path: Pa
 
     assert result.scanner_name == "zip"
     assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+
+def test_scan_file_prefers_hdf5_and_preserves_safetensors_userblock_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "safetensors-userblock.safetensors"
+    signature_offset = _write_safetensors_hdf5_userblock_candidate(polyglot, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert find_hdf5_signature_offset(str(polyglot)) == signature_offset
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert result.success is False
+    assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["supplemental_scanners"] == ["safetensors"]
+    assert any(check.name == "H5PY Library Check" for check in result.checks)
+    assert any(
+        check.name == "Header Length Validation" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
+def test_scan_file_keeps_malformed_hdf5_safetensors_near_match_on_safetensors_route(tmp_path: Path) -> None:
+    near_match = tmp_path / "safetensors-near-match.safetensors"
+    _write_safetensors_hdf5_userblock_candidate(near_match, plausible=False)
+
+    assert file_detection.detect_file_format(str(near_match)) == "safetensors"
+    assert find_hdf5_signature_offset(str(near_match)) is None
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert "supplemental_scanners" not in result.metadata
+    assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+
+def test_scan_file_does_not_repeat_safetensors_analysis_when_hdf5_scanner_is_suppressed(tmp_path: Path) -> None:
+    polyglot = tmp_path / "selected-safetensors-userblock.safetensors"
+    _write_safetensors_hdf5_userblock_candidate(polyglot, plausible=True)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["safetensors"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "safetensors"
+    assert "supplemental_scanners" not in result.metadata
+    assert sum(check.name == "Header Length Validation" for check in result.checks) == 1
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "keras_h5"
+        for check in result.checks
+    )
 
 
 def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:

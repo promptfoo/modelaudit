@@ -81,16 +81,21 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
     )
 
 
-def _hdf5_h5py_availability(file_path: str) -> bool | None:
-    """Return h5py availability for validated HDF5 files."""
-    if find_hdf5_signature_offset(file_path) is None:
-        return None
+def _h5py_availability() -> bool:
+    """Return whether Keras HDF5 analysis is available in this process."""
     try:
         from ...scanners.keras_h5_scanner import HAS_H5PY
     except Exception:
         return False
 
     return HAS_H5PY
+
+
+def _hdf5_h5py_availability(file_path: str) -> bool | None:
+    """Return h5py availability for validated HDF5 files."""
+    if find_hdf5_signature_offset(file_path) is None:
+        return None
+    return _h5py_availability()
 
 
 def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
@@ -191,7 +196,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 return func(*args, **kwargs)
 
             # Check if file should be cached based on characteristics
-            hdf5_h5py_available: bool | None = None
+            h5py_available = _h5py_availability()
             try:
                 file_stat = os.stat(file_path)
                 file_ext = os.path.splitext(file_path)[1]
@@ -202,11 +207,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
-                    return func(*args, **kwargs)
-
-                hdf5_h5py_available = _hdf5_h5py_availability(file_path)
-                if hdf5_h5py_available is False:
-                    logger.debug(f"Bypassing cache for unavailable Keras H5 analysis: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
@@ -232,12 +232,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
-                version_context = cache_config.get_version_context()
-                if hdf5_h5py_available is not None:
-                    version_context = {
-                        **version_context,
-                        "optional_dependency_availability": {"h5py": hdf5_h5py_available},
-                    }
+                version_context = {
+                    **cache_config.get_version_context(),
+                    "optional_dependency_availability": {"h5py": h5py_available},
+                }
 
                 def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""

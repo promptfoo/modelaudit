@@ -968,6 +968,48 @@ class TestKerasZipScanner:
         finally:
             reset_cache_manager()
 
+    def test_embedded_weights_missing_h5py_invalidates_stale_cache_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A clean cached Keras ZIP must not hide newly unavailable HDF5 analysis."""
+        reason = "keras_zip_embedded_weights_h5py_unavailable"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+        cache_dir = tmp_path / "stale-missing-h5py-cache"
+
+        reset_cache_manager()
+        try:
+            first_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(first_result) == 0
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+            monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+            monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+            second_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = second_result.file_metadata[str(keras_path)]
+
+            assert determine_exit_code(second_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+        finally:
+            reset_cache_manager()
+
     @pytest.mark.parametrize("libver", [None, "latest"])
     def test_userblock_embedded_weights_missing_h5py_returns_exit2(
         self,
