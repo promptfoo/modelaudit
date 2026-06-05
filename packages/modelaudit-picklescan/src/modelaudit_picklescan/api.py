@@ -709,7 +709,12 @@ def _combine_pytorch_zip_reports(
             for report in member_reports
         ],
     }
-    for metadata_key in ("analysis_incomplete", "import_references_truncated", "callable_invocations_truncated"):
+    for metadata_key in (
+        "analysis_incomplete",
+        "import_references_truncated",
+        "callable_invocations_truncated",
+        "non_allowlisted_global_imports_truncated",
+    ):
         if any(report.metadata.get(metadata_key) is True for report in member_reports):
             metadata[metadata_key] = True
     return PickleReport(
@@ -1021,7 +1026,14 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 
 
 def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
-    if report.metadata.get("import_references_truncated") or report.metadata.get("callable_invocations_truncated"):
+    if any(
+        report.metadata.get(key)
+        for key in (
+            "import_references_truncated",
+            "callable_invocations_truncated",
+            "non_allowlisted_global_imports_truncated",
+        )
+    ):
         return False
 
     references = {
@@ -1055,6 +1067,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
+    non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
     try:
         invoked_global_positions = _invoked_global_positions(callable_invocations)
         trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
@@ -1084,6 +1097,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             startup_hook_write_findings = find_startup_hook_write_call_graphs(
                 import_references,
                 callable_invocations,
+                callable_invocations_complete=callable_invocations_complete,
             )
         except _CallGraphAnalysisLimitError as error:
             startup_hook_write_findings = error.partial_startup_hook_write_findings
@@ -1123,6 +1137,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     if (
         source_snapshot_stable
         and callable_invocations_complete
+        and non_allowlisted_global_imports_complete
         and (inert_initialization_modules or trusted_import_references)
     ):
         report = _without_proven_safe_import_findings(
@@ -1373,11 +1388,15 @@ def _non_allowlisted_import_finding_is_proven_safe(
         invoked_global_positions,
     )
     invocation_is_analyzed = (
-        position is not None and position in analyzed_invocation_global_positions
-    ) or reference in analyzed_invocation_references
+        position in analyzed_invocation_global_positions
+        if position is not None
+        else reference in analyzed_invocation_references
+    )
     invocation_is_trusted_reconstruction = (
-        position is not None and position in trusted_reconstruction_global_positions
-    ) or reference in trusted_reconstruction_references
+        position in trusted_reconstruction_global_positions
+        if position is not None
+        else reference in trusted_reconstruction_references
+    )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
     trusted_reference_is_proven_safe = position is not None and (
         not finding_is_invoked

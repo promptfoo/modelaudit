@@ -173,6 +173,7 @@ _TRUSTED_DELEGATED_SITE_PACKAGE_PATHS = _trusted_delegated_site_package_paths()
 _IMPORT_AFFECTING_MODULE_NAMES = frozenset({"__loader__", "__package__", "__path__", "__spec__"})
 _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
     {
+        ("_frozen_importlib", "ModuleSpec"),
         ("_sitebuiltins", "_Helper"),
         ("_xxsubinterpreters", "create"),
         ("aiobotocore.credentials", "AioProcessProvider"),
@@ -188,6 +189,7 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("string", "Template"),
         ("string", "Template.safe_substitute"),
         ("string", "Template.substitute"),
+        ("statistics", "mean"),
         ("tarfile", "TarInfo"),
         ("tempfile", "gettempdir"),
         ("tokenize", "generate_tokens"),
@@ -195,6 +197,60 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("weakref", "proxy"),
         ("weakref", "ref"),
         ("zipfile", "ZipInfo"),
+    }
+)
+_LEGACY_BUILTIN_EXCEPTION_NAMES = frozenset(
+    {
+        "ArithmeticError",
+        "AssertionError",
+        "AttributeError",
+        "BaseException",
+        "BufferError",
+        "BytesWarning",
+        "DeprecationWarning",
+        "EOFError",
+        "EnvironmentError",
+        "Exception",
+        "FloatingPointError",
+        "FutureWarning",
+        "GeneratorExit",
+        "IOError",
+        "ImportError",
+        "ImportWarning",
+        "IndentationError",
+        "IndexError",
+        "KeyError",
+        "KeyboardInterrupt",
+        "LookupError",
+        "MemoryError",
+        "NameError",
+        "NotImplementedError",
+        "OSError",
+        "OverflowError",
+        "PendingDeprecationWarning",
+        "ReferenceError",
+        "RuntimeError",
+        "RuntimeWarning",
+        "StandardError",
+        "StopIteration",
+        "SyntaxError",
+        "SyntaxWarning",
+        "SystemError",
+        "SystemExit",
+        "TabError",
+        "TypeError",
+        "UnboundLocalError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "UnicodeError",
+        "UnicodeTranslateError",
+        "UnicodeWarning",
+        "UserWarning",
+        "ValueError",
+        "VMSError",
+        "Warning",
+        "WindowsError",
+        "ZeroDivisionError",
     }
 )
 _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
@@ -601,7 +657,7 @@ def find_dangerous_call_graphs(
     _clear_source_sensitive_caches()
     findings: list[CallGraphFinding] = []
     seen_findings: set[tuple[str, str, tuple[str, ...]]] = set()
-    positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
+    argument_shapes = _callable_invocation_argument_shapes(callable_invocations)
     callable_references = _iter_callable_invocation_references(callable_invocations)
     invoked_references = {
         (str(reference.get("module", "")), str(reference.get("name", "")))
@@ -649,12 +705,13 @@ def find_dangerous_call_graphs(
                 if sink_path is not None:
                     break
         if sink_path is None:
-            for positional_arg_count in positional_arg_counts.get((module, name), ()):
+            for positional_arg_count, keyword_arg_names in argument_shapes.get((module, name), ()):
                 try:
                     sink_path = _first_matching_path(
                         entrypoints,
                         _invoked_import_execution_path_callback(
                             positional_arg_count,
+                            keyword_arg_names,
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
@@ -699,6 +756,8 @@ def find_startup_hook_write_call_graphs(
     callable_invocations_complete: bool = True,
 ) -> tuple[StartupHookWriteFinding, ...]:
     _clear_source_sensitive_caches()
+    if callable_invocations is not None and not callable_invocations_complete:
+        return ()
     openers: list[_ImportCallPath] = []
     writers: list[_ImportCallPath] = []
     seen: set[tuple[str, str]] = set()
@@ -709,7 +768,7 @@ def find_startup_hook_write_call_graphs(
         name = str(reference.get("name", ""))
         if module and name:
             invocations_by_reference.setdefault((module, name), []).append(reference)
-    require_invocations = callable_invocations is not None and callable_invocations_complete
+    require_invocations = callable_invocations is not None
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
@@ -831,8 +890,14 @@ def find_unanalyzed_callable_call_graph_references(
     _clear_source_sensitive_caches()
     references: list[UnanalyzedCallGraphReference] = []
     seen: set[tuple[str, str]] = set()
+    callable_references = _iter_callable_invocation_references(callable_invocations)
+    incomplete_newobj_ex_references = {
+        (str(reference.get("module", "")), str(reference.get("name", "")))
+        for reference in callable_references
+        if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None
+    }
 
-    for reference in _iter_callable_invocation_references(callable_invocations):
+    for reference in callable_references:
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
@@ -841,6 +906,18 @@ def find_unanalyzed_callable_call_graph_references(
         if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
             module, name
         ):
+            continue
+        if (module, name) in incomplete_newobj_ex_references:
+            references.append(
+                UnanalyzedCallGraphReference(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    reason="invocation_metadata_incomplete",
+                )
+            )
+            if len(references) >= _MAX_IMPORT_REFERENCES:
+                break
             continue
         if _call_graph_entrypoints_for_reference(module, name, reference):
             continue
@@ -902,6 +979,8 @@ def _module_source_context_initialization_is_proven_inert(context: _ModuleSource
 
 def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
     """Return whether a known-safe reference resolves from a trusted installation path."""
+    if _legacy_pickle_compat_reference_is_trusted(module_name, name):
+        return True
     origin_kind = _trusted_module_origin_kind(module_name)
     reference = (module_name, name)
     return reference in _TRUSTED_IMPORT_ONLY_REFERENCES and (
@@ -917,11 +996,17 @@ def trusted_import_reference_requires_invocation_analysis(module_name: str, name
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
-    if module_name == "__builtin__":
+    if module_name == "__builtin__" or _legacy_pickle_compat_reference_is_trusted(module_name, name):
         return False
     origin_kind = _trusted_module_origin_kind(module_name)
     return origin_kind not in {"stdlib", "site_packages"} and not (
         origin_kind == "unresolved" and (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES
+    )
+
+
+def _legacy_pickle_compat_reference_is_trusted(module_name: str, name: str) -> bool:
+    return (module_name == "copy_reg" and name == "_reconstructor") or (
+        module_name == "exceptions" and name in _LEGACY_BUILTIN_EXCEPTION_NAMES
     )
 
 
@@ -1047,6 +1132,7 @@ def _first_matching_path(
 
 def _invoked_import_execution_path_callback(
     positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...] | None = (),
     *,
     allow_non_lifecycle_entrypoint: bool = False,
 ) -> Callable[[str], tuple[str, ...] | None]:
@@ -1054,6 +1140,7 @@ def _invoked_import_execution_path_callback(
         return _find_invoked_import_execution_path(
             entrypoint,
             positional_arg_count,
+            keyword_arg_names,
             allow_non_lifecycle_entrypoint=allow_non_lifecycle_entrypoint,
         )
 
@@ -1067,7 +1154,7 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None, bool | None]] = set()
+    seen_invocations: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -1081,6 +1168,7 @@ def _iter_call_graph_references(
             opcode,
             positional_arg_count if isinstance(positional_arg_count, int) else None,
             _optional_bool_reference_detail(item.get("build_uses_slot_state")),
+            _complete_keyword_arg_names(item),
         )
         if invocation_key in seen_invocations:
             continue
@@ -1128,12 +1216,23 @@ def _optional_bool_reference_detail(value: object) -> bool | None:
     return value if type(value) is bool else None
 
 
+def _complete_keyword_arg_names(reference: Mapping[str, object]) -> tuple[str, ...] | None:
+    if str(reference.get("opcode", "")) != "NEWOBJ_EX":
+        return ()
+    if reference.get("keyword_args_complete") is not True:
+        return None
+    raw_names = reference.get("keyword_arg_names")
+    if not isinstance(raw_names, list | tuple) or any(not isinstance(name, str) for name in raw_names):
+        return None
+    return tuple(raw_names)
+
+
 def _iter_callable_invocation_references(callable_invocations: object | None) -> tuple[dict[str, object], ...]:
     if not isinstance(callable_invocations, list | tuple):
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None, bool | None]] = set()
+    seen: set[tuple[str, str, str, int | None, bool | None, tuple[str, ...] | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -1153,6 +1252,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 opcode,
                 positional_arg_count if isinstance(positional_arg_count, int) else None,
                 _optional_bool_reference_detail(item.get("build_uses_slot_state")),
+                _complete_keyword_arg_names(item),
             )
             if reference_key in seen:
                 continue
@@ -1213,8 +1313,10 @@ def _pickle_entrypoint_positional_arg_count(
 def _call_graph_reference_is_analyzed(
     module: str,
     name: str,
-    _reference: Mapping[str, object],
+    reference: Mapping[str, object],
 ) -> bool:
+    if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None:
+        return False
     return bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
 
 
@@ -1231,19 +1333,20 @@ def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, 
     )
 
 
-def _callable_invocation_positional_arg_counts(
+def _callable_invocation_argument_shapes(
     callable_invocations: object | None,
-) -> dict[tuple[str, str], tuple[int, ...]]:
+) -> dict[tuple[str, str], tuple[tuple[int, tuple[str, ...] | None], ...]]:
     if not isinstance(callable_invocations, list | tuple):
         return {}
 
-    counts: dict[tuple[str, str], set[int]] = {}
+    shapes: dict[tuple[str, str], set[tuple[int, tuple[str, ...] | None]]] = {}
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
         positional_arg_count = item.get("positional_arg_count")
+        keyword_arg_names = _complete_keyword_arg_names(item)
         if (
             not module
             or not name
@@ -1253,10 +1356,25 @@ def _callable_invocation_positional_arg_counts(
         ):
             continue
         for reference in ((module, name), *_callable_singleton_aliases(module, name)):
-            counts.setdefault(reference, set()).add(positional_arg_count)
-            if len(counts) >= _MAX_IMPORT_REFERENCES:
-                return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
-    return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
+            shapes.setdefault(reference, set()).add((positional_arg_count, keyword_arg_names))
+            if len(shapes) >= _MAX_IMPORT_REFERENCES:
+                return _sorted_callable_invocation_argument_shapes(shapes)
+    return _sorted_callable_invocation_argument_shapes(shapes)
+
+
+def _sorted_callable_invocation_argument_shapes(
+    shapes: Mapping[tuple[str, str], set[tuple[int, tuple[str, ...] | None]]],
+) -> dict[tuple[str, str], tuple[tuple[int, tuple[str, ...] | None], ...]]:
+    return {
+        key: tuple(
+            sorted(
+                value,
+                key=lambda shape: (shape[0], shape[1] is not None, shape[1] or ()),
+                reverse=True,
+            )
+        )
+        for key, value in shapes.items()
+    }
 
 
 def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str], ...]:
@@ -1374,7 +1492,7 @@ def _source_candidate_fingerprint(
                 entries.append(entry_name)
         except OSError:
             return False, None
-        return True, hashlib.sha256(b"\0".join(sorted(entries))).digest()
+        return True, hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).digest()
     if not path.is_file():
         return True, None
     try:
@@ -1384,7 +1502,7 @@ def _source_candidate_fingerprint(
         return False, None
     if require_complete and len(source) > read_limit:
         return False, None
-    return True, hashlib.sha256(source).digest()
+    return True, hashlib.sha256(b"file\0" + source).digest()
 
 
 def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
@@ -1443,7 +1561,9 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
             for suffix in import_suffixes:
                 candidates.add(Path(f"{module_path}{suffix}").absolute())
                 candidates.add(module_path.joinpath(f"__init__{suffix}").absolute())
-    _track_shared_source_paths(candidates)
+    # Resolution only depends on candidate type and presence. The selected
+    # source is content-hashed separately, while native extensions can be large.
+    _track_shared_source_paths(candidates, read_limit=0, require_complete=False)
 
 
 def _track_shared_source_paths(
@@ -1460,6 +1580,22 @@ def _track_shared_source_paths(
             snapshot.reusable = False
             return
         for candidate in candidates:
+            candidate_key = str(candidate)
+            existing = snapshot.fingerprints.get(candidate_key)
+            if existing is not None:
+                existing_read_limit, existing_require_complete, expected_fingerprint = existing
+                reusable, current_fingerprint = _source_candidate_fingerprint(
+                    candidate,
+                    read_limit=existing_read_limit,
+                    require_complete=existing_require_complete,
+                )
+                if not reusable or current_fingerprint != expected_fingerprint:
+                    snapshot.reusable = False
+                    return
+                if existing_require_complete and not require_complete:
+                    continue
+                if existing_require_complete == require_complete and existing_read_limit >= read_limit:
+                    continue
             reusable, fingerprint = _source_candidate_fingerprint(
                 candidate,
                 read_limit=read_limit,
@@ -1468,7 +1604,7 @@ def _track_shared_source_paths(
             if not reusable:
                 snapshot.reusable = False
                 return
-            snapshot.fingerprints[str(candidate)] = (read_limit, require_complete, fingerprint)
+            snapshot.fingerprints[candidate_key] = (read_limit, require_complete, fingerprint)
 
 
 def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
@@ -1651,6 +1787,7 @@ def _find_sink_path(start: str) -> tuple[str, ...] | None:
 def _find_invoked_import_execution_path(
     start: str,
     positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...] | None = (),
     *,
     allow_non_lifecycle_entrypoint: bool = False,
 ) -> tuple[str, ...] | None:
@@ -1663,7 +1800,12 @@ def _find_invoked_import_execution_path(
     module_name, is_package, function_node = context
     if not allow_non_lifecycle_entrypoint and not _is_pickle_entered_import_execution_entrypoint(resolved):
         return None
-    if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
+    can_enter = (
+        _can_enter_function_with_unknown_keyword_args(function_node, positional_arg_count)
+        if keyword_arg_names is None
+        else _can_enter_function_with_arguments(function_node, positional_arg_count, keyword_arg_names)
+    )
+    if not can_enter:
         return None
     if _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(function_node, module_name, is_package):
         return (resolved, _IMPORT_EXECUTION_SINK)
@@ -3753,7 +3895,7 @@ def _can_invoke_function_with_positional_args(function_name: str, positional_arg
     if context is None:
         return False
     _module_name, _is_package, function_node = context
-    return _can_enter_function_with_positional_args(function_node, positional_arg_count)
+    return _can_enter_function_with_arguments(function_node, positional_arg_count, ())
 
 
 @_register_source_sensitive_cache
@@ -3785,10 +3927,84 @@ def _can_enter_function_with_positional_args(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     positional_arg_count: int,
 ) -> bool:
-    required_count, maximum_count, has_required_keyword_only = _user_positional_argument_range(function_node)
-    if has_required_keyword_only or positional_arg_count < required_count:
+    return _can_enter_function_with_arguments(function_node, positional_arg_count, ())
+
+
+def _can_enter_function_with_arguments(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    positional_arg_count: int,
+    keyword_arg_names: tuple[str, ...],
+) -> bool:
+    positional_parameters = tuple(
+        argument
+        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
+        if argument.arg not in {"self", "cls"}
+    )
+    positional_only_names = {
+        argument.arg for argument in function_node.args.posonlyargs if argument.arg not in {"self", "cls"}
+    }
+    positional_or_keyword_names = {
+        argument.arg for argument in function_node.args.args if argument.arg not in {"self", "cls"}
+    }
+    keyword_only_names = {
+        argument.arg for argument in function_node.args.kwonlyargs if argument.arg not in {"self", "cls"}
+    }
+    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
         return False
-    return maximum_count is None or positional_arg_count <= maximum_count
+    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
+    keyword_names = set(keyword_arg_names)
+    if bound_positionally & keyword_names:
+        return False
+    for keyword_name in keyword_names:
+        if keyword_name in positional_only_names:
+            if function_node.args.kwarg is None:
+                return False
+            continue
+        if (
+            keyword_name not in positional_or_keyword_names
+            and keyword_name not in keyword_only_names
+            and function_node.args.kwarg is None
+        ):
+            return False
+
+    all_positional = (*function_node.args.posonlyargs, *function_node.args.args)
+    required_positional = all_positional[: max(len(all_positional) - len(function_node.args.defaults), 0)]
+    for argument in required_positional:
+        if argument.arg in {"self", "cls"}:
+            continue
+        if argument.arg in positional_only_names:
+            if argument.arg not in bound_positionally:
+                return False
+            continue
+        if argument.arg not in bound_positionally and argument.arg not in keyword_names:
+            return False
+    return all(
+        argument.arg in keyword_names
+        for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
+        if argument.arg not in {"self", "cls"} and default is None
+    )
+
+
+def _can_enter_function_with_unknown_keyword_args(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    positional_arg_count: int,
+) -> bool:
+    positional_parameters = tuple(
+        argument
+        for argument in (*function_node.args.posonlyargs, *function_node.args.args)
+        if argument.arg not in {"self", "cls"}
+    )
+    if function_node.args.vararg is None and positional_arg_count > len(positional_parameters):
+        return False
+    bound_positionally = {argument.arg for argument in positional_parameters[:positional_arg_count]}
+    required_count = max(
+        len(function_node.args.posonlyargs) + len(function_node.args.args) - len(function_node.args.defaults),
+        0,
+    )
+    return all(
+        argument.arg in {"self", "cls"} or argument.arg in bound_positionally
+        for argument in function_node.args.posonlyargs[:required_count]
+    )
 
 
 def _user_positional_argument_range(

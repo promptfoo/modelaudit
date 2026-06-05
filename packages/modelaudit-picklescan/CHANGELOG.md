@@ -62,6 +62,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - warn on import-only pickle globals that reference non-allowlisted custom modules,
   shadow trusted modules or transitive standard-library imports, rewrite package
   import paths, or rely on unchecked bytecode caches
+- preserve `NEWOBJ_EX` keyword arguments when analyzing constructor import execution
+- avoid import-only false positives for legacy Python 2 aliases and large native
+  extension source candidates
 - detect `BUILD` slot-state execution through custom attribute hooks without
   flagging ordinary dictionary state
 - preserve reviewed safe callable references in dependency-minimal environments and

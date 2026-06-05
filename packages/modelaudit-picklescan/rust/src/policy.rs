@@ -18,11 +18,17 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
 }
 
 pub(crate) fn global_import_requires_review(module: &str, name: &str) -> bool {
-    !global_import_is_allowlisted(module) && global_severity(module, name).is_none()
+    !global_import_is_allowlisted(module, name) && global_severity(module, name).is_none()
 }
 
-pub(crate) fn global_import_is_allowlisted(module: &str) -> bool {
+pub(crate) fn global_import_is_allowlisted(module: &str, name: &str) -> bool {
     IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
+        || legacy_pickle_compat_reference_is_allowlisted(module, name)
+}
+
+fn legacy_pickle_compat_reference_is_allowlisted(module: &str, name: &str) -> bool {
+    (module == "copy_reg" && name == "_reconstructor")
+        || (module == "exceptions" && LEGACY_BUILTIN_EXCEPTION_NAMES.contains(&name))
 }
 
 fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -291,6 +297,58 @@ const IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES: &[&str] = &[
     "torch._utils",
     "types",
     "uuid",
+];
+const LEGACY_BUILTIN_EXCEPTION_NAMES: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BufferError",
+    "BytesWarning",
+    "DeprecationWarning",
+    "EOFError",
+    "EnvironmentError",
+    "Exception",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "NameError",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "ReferenceError",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StandardError",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "VMSError",
+    "Warning",
+    "WindowsError",
+    "ZeroDivisionError",
 ];
 const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "__import__",
@@ -1265,6 +1323,12 @@ mod tests {
         assert!(global_import_requires_review("numpy.evil", "Gadget"));
         assert!(global_import_requires_review("torch.evil", "Gadget"));
         assert!(global_import_requires_review("vendor.package", "Gadget"));
+        assert!(!global_import_requires_review("copy_reg", "_reconstructor"));
+        assert!(global_import_requires_review("copy_reg", "Gadget"));
+        assert!(!global_import_requires_review("exceptions", "ValueError"));
+        assert!(global_import_requires_review("exceptions", "Gadget"));
+        assert_eq!(global_severity("commands", "getoutput"), Some("critical"));
+        assert_eq!(global_severity("urllib2", "urlopen"), Some("critical"));
     }
 
     #[test]

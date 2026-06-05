@@ -122,6 +122,25 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
     assert clear_count == 2
 
 
+def test_shared_source_snapshot_tracks_large_extension_candidates_by_presence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_large_extension_candidate"
+    extension_path = tmp_path / f"{module_name}{EXTENSION_SUFFIXES[0]}"
+    extension_path.write_bytes(b"x" * (call_graph._MAX_SOURCE_BYTES + 1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with call_graph.shared_source_sensitive_caches():
+        report_generation = call_graph._begin_shared_source_report()
+        call_graph._track_shared_source_candidates((module_name,))
+        call_graph._ensure_shared_source_snapshot_stable(report_generation)
+
+        extension_path.unlink()
+        with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="source changed"):
+            call_graph._ensure_shared_source_snapshot_stable(report_generation)
+
+
 def test_module_initialization_inert_proof_rejects_unbounded_module_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -161,6 +180,7 @@ def test_trusted_origin_rejects_local_distribution_metadata_outside_trusted_inst
     (dist_info / "METADATA").write_text("Name: pytest\nVersion: 1.0\n", encoding="utf-8")
     (dist_info / "top_level.txt").write_text("_pytest\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(overlay))
+    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
@@ -201,6 +221,7 @@ def test_trusted_origin_rejects_inactive_lookalike_environment(
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(site_packages))
+    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
@@ -229,6 +250,7 @@ def test_trusted_origin_recognizes_active_environment_delegated_overlay(
         call_graph._trusted_delegated_site_package_paths(),
     )
     monkeypatch.syspath_prepend(str(overlay_site_packages))
+    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
@@ -257,6 +279,7 @@ def test_trusted_origin_ignores_nonexecuted_pth_addsitedir(
         call_graph._trusted_delegated_site_package_paths(),
     )
     monkeypatch.syspath_prepend(str(overlay_site_packages))
+    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
@@ -2201,7 +2224,8 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
     assert not marker.exists()
 
@@ -2459,7 +2483,8 @@ def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoki
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
     assert not marker.exists()
 
@@ -2568,7 +2593,8 @@ def test_call_graph_honors_zipimport_precedence_over_later_extension(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
@@ -2892,6 +2918,187 @@ def test_scan_bytes_ignores_benign_torch_extension_metadata_globals() -> None:
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_scan_bytes_detects_newobj_ex_required_keyword_only_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "newobj-ex-keyword-marker"
+    (tmp_path / "modelaudit_tp_newobj_ex_helper.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "modelaudit_tp_newobj_ex_target.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls, *, token):\n"
+        "        import modelaudit_tp_newobj_ex_helper\n"
+        "        return super().__new__(cls)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = b"\x80\x04cmodelaudit_tp_newobj_ex_target\nGadget\n)}\x8c\x05token\x8c\x01xs\x92."
+
+    try:
+        report = scan_bytes(payload, source="newobj-ex-required-keyword.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "modelaudit_tp_newobj_ex_target.Gadget"
+        and finding.details.get("sink") == "builtins.__import__"
+        for finding in report.findings
+    )
+    assert not marker.exists()
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})",
+        ],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_does_not_enter_newobj_ex_body_when_required_keyword_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "modelaudit_tp_newobj_ex_missing_keyword.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls, *, token):\n"
+        "        import modelaudit_tp_newobj_ex_missing_helper\n"
+        "        return super().__new__(cls)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = b"\x80\x04cmodelaudit_tp_newobj_ex_missing_keyword\nGadget\n)}\x92."
+
+    try:
+        report = scan_bytes(payload, source="newobj-ex-missing-keyword.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.verdict != SafetyVerdict.MALICIOUS
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("sink") == "builtins.__import__"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_on_opaque_newobj_ex_keyword_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "opaque-newobj-ex-keyword-marker"
+    (tmp_path / "modelaudit_tp_opaque_newobj_ex_helper.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "modelaudit_tp_opaque_newobj_ex_target.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls, **kwargs):\n"
+        "        import modelaudit_tp_opaque_newobj_ex_helper\n"
+        "        return super().__new__(cls)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "modelaudit_tp_opaque_newobj_ex_factory.py").write_text(
+        "def make_kwargs():\n    return {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = (
+        b"\x80\x04cmodelaudit_tp_opaque_newobj_ex_target\nGadget\n)"
+        b"cmodelaudit_tp_opaque_newobj_ex_factory\nmake_kwargs\n)R\x92."
+    )
+
+    try:
+        report = scan_bytes(payload, source="opaque-newobj-ex-keywords.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "modelaudit_tp_opaque_newobj_ex_target.Gadget"
+        and finding.details.get("sink") == "builtins.__import__"
+        for finding in report.findings
+    )
+    assert _has_call_graph_source_unavailable_notice(
+        report,
+        "modelaudit_tp_opaque_newobj_ex_target",
+        "Gadget",
+        "invocation_metadata_incomplete",
+    )
+    assert not marker.exists()
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})",
+        ],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_incomplete_newobj_ex_invocation_is_not_hidden_by_complete_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_duplicate_newobj_ex_metadata"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n    def __new__(cls, **kwargs):\n        return super().__new__(cls)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    invocations = (
+        {
+            "opcode": "NEWOBJ_EX",
+            "module": module_name,
+            "name": "Gadget",
+            "positional_arg_count": 0,
+            "keyword_args_complete": True,
+            "keyword_arg_names": (),
+            "global_position": 1,
+        },
+        {
+            "opcode": "NEWOBJ_EX",
+            "module": module_name,
+            "name": "Gadget",
+            "positional_arg_count": 0,
+            "keyword_args_complete": False,
+            "global_position": 2,
+        },
+    )
+
+    try:
+        references = call_graph.find_unanalyzed_callable_call_graph_references(invocations)
+    finally:
+        _clear_call_graph_caches()
+
+    assert references == (
+        call_graph.UnanalyzedCallGraphReference(
+            module=module_name,
+            name="Gadget",
+            import_reference=f"{module_name}.Gadget",
+            reason="invocation_metadata_incomplete",
+        ),
+    )
 
 
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(

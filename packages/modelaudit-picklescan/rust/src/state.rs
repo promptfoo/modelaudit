@@ -86,6 +86,8 @@ const MAX_TRACKED_MEMO_VALUES: usize = 65_536;
 const MAX_TRACKED_STACK_VALUES: usize = 65_536;
 const MAX_TRACKED_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES: usize = MAX_TRACKED_STATE_BYTES;
+const MAX_CALLABLE_KEYWORD_ARGUMENTS: usize = 256;
+const MAX_CALLABLE_KEYWORD_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_TRACKED_VALUE_DEPTH: usize = 64;
 const MAX_MAPPING_TRAVERSAL_NODES: usize = 2048;
 const MAX_TRACKED_STR_JOIN_RESULT_BYTES: usize = 4096;
@@ -457,7 +459,14 @@ fn global_ref_details(
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 type ImportReferenceDedupeKey = (String, String, String);
-type CallableInvocationDedupeKey = (String, String, String, Option<usize>, Option<bool>);
+type CallableInvocationDedupeKey = (
+    String,
+    String,
+    String,
+    Option<usize>,
+    Option<bool>,
+    Option<Vec<String>>,
+);
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
 fn detail_value_content_bytes(value: &DetailValue) -> usize {
@@ -497,6 +506,7 @@ struct CallableInvocation {
     opcode_position: usize,
     positional_arg_count: Option<usize>,
     build_uses_slot_state: Option<bool>,
+    keyword_arg_names: Option<Vec<String>>,
     args: Vec<StackValue>,
 }
 
@@ -2062,66 +2072,80 @@ impl<'a> ScanState<'a> {
         opcode: &ParsedOpcode,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        let (callable_value, positional_arg_count, argument_values, build_uses_slot_state) =
-            match opcode.name {
-                "REDUCE" | "NEWOBJ" => {
-                    let Some(values) = self.consume_top_operand_values(2) else {
-                        return Vec::new();
-                    };
-                    (
-                        values.first().cloned(),
-                        Self::tuple_positional_arg_count(values.get(1)),
-                        Self::tuple_argument_values(values.get(1)),
-                        None,
-                    )
-                }
-                "NEWOBJ_EX" => {
-                    let Some(values) = self.consume_top_operand_values(3) else {
-                        return Vec::new();
-                    };
-                    (
-                        values.first().cloned(),
-                        Self::tuple_positional_arg_count(values.get(1)),
-                        Self::tuple_argument_values(values.get(1)),
-                        None,
-                    )
-                }
-                "OBJ" => {
-                    let values = self.pop_to_mark();
-                    let positional_arg_count = values.len().checked_sub(1);
-                    let callable_value = values.first().cloned();
-                    let argument_values = values.get(1..).map(|items| items.to_vec());
-                    self.push_constructed_result(callable_value.as_ref());
-                    (callable_value, positional_arg_count, argument_values, None)
-                }
-                "INST" => {
-                    let values = self.pop_to_mark();
-                    let (module, name) = opcode.arg.global_parts(self.payload);
-                    let reference = GlobalRef {
-                        module,
-                        name,
-                        position,
-                        malformed: false,
-                    };
-                    self.record_global_ref(&reference, opcode.name);
-                    self.push_stack_value(StackValue::Constructed(reference.clone()));
-                    (
-                        Some(StackValue::Global(reference)),
-                        Some(values.len()),
-                        Some(values),
-                        None,
-                    )
-                }
-                "BUILD" => {
-                    let values = self.consume_top_operand_values(2);
-                    let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
-                    let build_uses_slot_state = values
-                        .as_ref()
-                        .and_then(|items| Self::build_uses_slot_state(items.get(1)));
-                    (callable_value, None, None, build_uses_slot_state)
-                }
-                _ => (None, None, None, None),
-            };
+        let (
+            callable_value,
+            positional_arg_count,
+            argument_values,
+            build_uses_slot_state,
+            keyword_arg_names,
+        ) = match opcode.name {
+            "REDUCE" | "NEWOBJ" => {
+                let Some(values) = self.consume_top_operand_values(2) else {
+                    return Vec::new();
+                };
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
+                    None,
+                    None,
+                )
+            }
+            "NEWOBJ_EX" => {
+                let Some(values) = self.consume_top_operand_values(3) else {
+                    return Vec::new();
+                };
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
+                    None,
+                    self.tracked_keyword_arg_names(values.get(2)),
+                )
+            }
+            "OBJ" => {
+                let values = self.pop_to_mark();
+                let positional_arg_count = values.len().checked_sub(1);
+                let callable_value = values.first().cloned();
+                let argument_values = values.get(1..).map(|items| items.to_vec());
+                self.push_constructed_result(callable_value.as_ref());
+                (
+                    callable_value,
+                    positional_arg_count,
+                    argument_values,
+                    None,
+                    None,
+                )
+            }
+            "INST" => {
+                let values = self.pop_to_mark();
+                let (module, name) = opcode.arg.global_parts(self.payload);
+                let reference = GlobalRef {
+                    module,
+                    name,
+                    position,
+                    malformed: false,
+                };
+                self.record_global_ref(&reference, opcode.name);
+                self.push_stack_value(StackValue::Constructed(reference.clone()));
+                (
+                    Some(StackValue::Global(reference)),
+                    Some(values.len()),
+                    Some(values),
+                    None,
+                    None,
+                )
+            }
+            "BUILD" => {
+                let values = self.consume_top_operand_values(2);
+                let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
+                let build_uses_slot_state = values
+                    .as_ref()
+                    .and_then(|items| Self::build_uses_slot_state(items.get(1)));
+                (callable_value, None, None, build_uses_slot_state, None)
+            }
+            _ => (None, None, None, None, None),
+        };
 
         self.record_dynamic_type_callable_attribute_finding(
             callable_value.as_ref(),
@@ -2149,6 +2173,7 @@ impl<'a> ScanState<'a> {
             argument_values.as_deref(),
         ) {
             invocation.build_uses_slot_state = build_uses_slot_state;
+            invocation.keyword_arg_names = keyword_arg_names;
             invocations.push(invocation);
         }
         invocations.extend(self.protocol_dispatch_invocations(
@@ -2202,6 +2227,7 @@ impl<'a> ScanState<'a> {
                     opcode_position: position,
                     positional_arg_count,
                     build_uses_slot_state: None,
+                    keyword_arg_names: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2216,6 +2242,7 @@ impl<'a> ScanState<'a> {
                     opcode_position: position,
                     positional_arg_count,
                     build_uses_slot_state: None,
+                    keyword_arg_names: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2228,6 +2255,7 @@ impl<'a> ScanState<'a> {
                     opcode_position: position,
                     positional_arg_count,
                     build_uses_slot_state: None,
+                    keyword_arg_names: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2259,6 +2287,42 @@ impl<'a> ScanState<'a> {
             },
             _ => None,
         }
+    }
+
+    fn tracked_keyword_arg_names(&self, value: Option<&StackValue>) -> Option<Vec<String>> {
+        let StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            memo_index,
+        } = value?
+        else {
+            return None;
+        };
+        if !self
+            .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
+            .is_empty()
+            || self.current_tracked_dict_unknown_key_values_overflowed(
+                *unknown_key_values_overflowed,
+                *memo_index,
+            )
+        {
+            return None;
+        }
+
+        let mut names = Vec::new();
+        let mut total_bytes = 0usize;
+        for (name, _) in self.current_tracked_dict_entries(entries, *memo_index) {
+            total_bytes = total_bytes.checked_add(name.len())?;
+            if names.len() >= MAX_CALLABLE_KEYWORD_ARGUMENTS
+                || total_bytes > MAX_CALLABLE_KEYWORD_ARGUMENT_BYTES
+            {
+                return None;
+            }
+            names.push(name.clone());
+        }
+        names.sort_unstable();
+        Some(names)
     }
 
     fn record_dynamic_type_callable_attribute_finding(
@@ -4250,6 +4314,7 @@ impl<'a> ScanState<'a> {
             opcode_position: position,
             positional_arg_count: Some(1),
             build_uses_slot_state: None,
+            keyword_arg_names: None,
             args: Vec::new(),
         })
     }
@@ -4725,6 +4790,7 @@ impl<'a> ScanState<'a> {
             opcode_position: position,
             positional_arg_count,
             build_uses_slot_state: None,
+            keyword_arg_names: None,
             args: Vec::new(),
         }
     }
@@ -6193,7 +6259,7 @@ impl<'a> ScanState<'a> {
             let mut import_reference_details = details.clone();
             import_reference_details
                 .push(("is_dangerous".to_string(), DetailValue::Bool(is_dangerous)));
-            if !is_dangerous && global_import_is_allowlisted(&reference.module) {
+            if !is_dangerous && global_import_is_allowlisted(&reference.module, &reference.name) {
                 import_reference_details.push((
                     "requires_origin_verification".to_string(),
                     DetailValue::Bool(true),
@@ -6457,6 +6523,7 @@ impl<'a> ScanState<'a> {
             invocation.op_name.to_string(),
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
+            invocation.keyword_arg_names.clone(),
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
             return;
@@ -6502,6 +6569,24 @@ impl<'a> ScanState<'a> {
                 "build_uses_slot_state".to_string(),
                 DetailValue::Bool(build_uses_slot_state),
             ));
+        }
+        if invocation.op_name == "NEWOBJ_EX" {
+            details.push((
+                "keyword_args_complete".to_string(),
+                DetailValue::Bool(invocation.keyword_arg_names.is_some()),
+            ));
+            if let Some(keyword_arg_names) = &invocation.keyword_arg_names {
+                details.push((
+                    "keyword_arg_names".to_string(),
+                    DetailValue::List(
+                        keyword_arg_names
+                            .iter()
+                            .cloned()
+                            .map(DetailValue::String)
+                            .collect(),
+                    ),
+                ));
+            }
         }
         self.callable_invocations.push(details);
     }
@@ -7206,12 +7291,28 @@ impl<'a> ScanState<'a> {
                 _ => None,
             }
         });
+        let keyword_arg_names = details.iter().find_map(|(key, value)| {
+            if key != "keyword_arg_names" {
+                return None;
+            }
+            let DetailValue::List(values) = value else {
+                return None;
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    DetailValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        });
         Some((
             module,
             name,
             opcode,
             positional_arg_count,
             build_uses_slot_state,
+            keyword_arg_names,
         ))
     }
 
@@ -7342,7 +7443,14 @@ impl<'a> ScanState<'a> {
             "callable_invocations_truncated",
             self.callable_invocations_truncated,
         )?;
-        if self.import_references_truncated || self.callable_invocations_truncated {
+        metadata.set_item(
+            "non_allowlisted_global_imports_truncated",
+            self.non_allowlisted_global_imports_truncated,
+        )?;
+        if self.import_references_truncated
+            || self.callable_invocations_truncated
+            || self.non_allowlisted_global_imports_truncated
+        {
             metadata.set_item("analysis_incomplete", true)?;
         }
         if !self.protocols.is_empty() {
@@ -8736,6 +8844,47 @@ mod tests {
     }
 
     #[test]
+    fn newobj_ex_records_complete_bounded_keyword_argument_names() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04cprivate_payload\nGadget\n)}\x8c\x05token\x8c\x01xs\x92.";
+        let mut scan = ScanState::new(
+            "newobj-ex-keywords.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let invocation = scan
+            .callable_invocations
+            .iter()
+            .find(|details| detail_string(details, "opcode").as_deref() == Some("NEWOBJ_EX"))
+            .expect("NEWOBJ_EX should emit callable metadata");
+        assert!(invocation.iter().any(|(key, value)| {
+            key == "keyword_args_complete" && matches!(value, DetailValue::Bool(true))
+        }));
+        assert!(invocation.iter().any(|(key, value)| {
+            key == "keyword_arg_names"
+                && matches!(
+                    value,
+                    DetailValue::List(values)
+                        if matches!(values.as_slice(), [DetailValue::String(name)] if name == "token")
+                )
+        }));
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
@@ -9300,6 +9449,7 @@ mod tests {
         assert!(scan.non_allowlisted_global_imports.is_empty());
         assert_eq!(scan.non_allowlisted_global_import_bytes, 0);
         assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(scan.non_allowlisted_global_imports_truncated);
         let notice = scan
             .notices
             .iter()

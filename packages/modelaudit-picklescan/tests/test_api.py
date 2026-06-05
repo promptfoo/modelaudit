@@ -1439,7 +1439,14 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
-@pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
+@pytest.mark.parametrize(
+    "metadata_key",
+    [
+        "import_references_truncated",
+        "callable_invocations_truncated",
+        "non_allowlisted_global_imports_truncated",
+    ],
+)
 def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metadata_key: str) -> None:
     pickle_entry = zipfile.ZipInfo("archive/data.pkl")
     member_report = PickleReport(
@@ -5089,7 +5096,7 @@ def test_scan_bytes_warns_on_unresolved_reviewed_optional_global(monkeypatch: py
 def test_scan_bytes_warns_on_invoked_non_allowlisted_custom_global() -> None:
     report = scan_bytes(b"cprivate_payload\nGadget\n)R.", source="invoked-custom-global.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
@@ -5097,6 +5104,7 @@ def test_scan_bytes_warns_on_invoked_non_allowlisted_custom_global() -> None:
         for finding in report.findings
     )
     assert all(finding.rule_code != "DANGEROUS_CALL" for finding in report.findings)
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
 
 def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_analysis() -> None:
@@ -5148,6 +5156,38 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
     assert any(
         ref["import_reference"] == "collections.OrderedDict" and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "import_reference"),
+    [
+        (b"ccopy_reg\n_reconstructor\n.", "copy_reg._reconstructor"),
+        (b"cexceptions\nValueError\n.", "exceptions.ValueError"),
+        (b"cexceptions\nWindowsError\n.", "exceptions.WindowsError"),
+    ],
+)
+def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
+    report = scan_bytes(payload, source="legacy-python-two-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert any(
+        ref["import_reference"] == import_reference and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
+
+
+@pytest.mark.parametrize("module", ["copy_reg", "exceptions"])
+def test_scan_bytes_warns_on_unknown_legacy_compat_global(module: str) -> None:
+    report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="unknown-legacy-compat-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.Gadget"
+        for finding in report.findings
     )
 
 
@@ -5541,9 +5581,14 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocati
     assert updated.findings == ()
 
 
-def test_with_call_graph_findings_keeps_import_warning_when_invocations_truncated(
+@pytest.mark.parametrize(
+    "metadata_key",
+    ["callable_invocations_truncated", "non_allowlisted_global_imports_truncated"],
+)
+def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_key: str,
 ) -> None:
     module_name = f"modelaudit_c095_truncated_invocation_{uuid.uuid4().hex}"
     (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
@@ -5567,7 +5612,7 @@ def test_with_call_graph_findings_keeps_import_warning_when_invocations_truncate
         findings=(finding,),
         metadata={
             "callable_invocations": (),
-            "callable_invocations_truncated": True,
+            metadata_key: True,
         },
     )
 
@@ -5575,6 +5620,62 @@ def test_with_call_graph_findings_keeps_import_warning_when_invocations_truncate
 
     assert updated is report
     assert updated.findings == (finding,)
+
+
+def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
+    reference = ("_xxsubinterpreters", "create")
+    finding = Finding(
+        message="separate incomplete invocation",
+        severity=Severity.WARNING,
+        location="multiple-invocations.pkl (pos 100)",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": reference[0],
+            "name": reference[1],
+            "import_reference": ".".join(reference),
+            "position": 100,
+            "invoked": True,
+        },
+    )
+
+    proven_safe = package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset({reference}),
+        invoked_global_positions=frozenset({100}),
+        analyzed_invocation_global_positions=frozenset({0}),
+        analyzed_invocation_references=frozenset({reference}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+    )
+
+    assert proven_safe is False
+
+
+def test_with_call_graph_findings_detects_startup_hook_when_only_import_findings_truncated() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-truncated-import-findings.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "non_allowlisted_global_imports_truncated": True,
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
 
 
 def test_with_call_graph_findings_keeps_late_click_startup_hook_invocations() -> None:
