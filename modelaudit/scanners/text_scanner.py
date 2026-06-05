@@ -12,6 +12,7 @@ from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, Sc
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
 TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON = "text_content_security_finding_limit"
+TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON = "text_content_security_classification_limit"
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
 DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
@@ -54,31 +55,55 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
+MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[rubfRUBF]*[\"']?$")
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_ENCLOSING_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}$")
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])(?:url|uri|endpoint|host|server|callback|webhook)(?:[_-][A-Za-z0-9_.-]+)*\s*:\s*[\"']?$",
+    rb"(?:^|[\s{[(,;])(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?\s*:\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
-    rb"<(?:url|uri|endpoint|host|server|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+)*>\s*$",
+    rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
     re.IGNORECASE,
 )
 DOCUMENTATION_LAMBDA_PATTERN = re.compile(rb"\blambda\b[^:\n]{0,256}:\s*[^\n]*$", re.IGNORECASE)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
     rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+    rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
-    rb"(?:^|[;&|]\s*)(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:^|[;&|]\s*)(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
+)
+DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
+    rb"(?:\$\(|`)\s*(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"']|$)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_IMPORT_STATEMENT_PATTERN = re.compile(
+    rb"^\s*(?:from\s+[A-Za-z_][A-Za-z0-9_.]*\s+import\s+|import\s+)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
+    rb"^\s*(?:(?:if|elif|else|for|while|with|try|except|finally|match|case|def|class)\b"
+    rb"|async\s+(?:for|with|def)\b)[^#\n]{0,4096}:\s*$"
+)
+DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
+    rb"(?:^|;)\s*(?:"
+    rb"[A-Za-z_][A-Za-z0-9_.]*\s*=[^;\n]*"
+    rb"|[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}\)"
+    rb"|(?:from\s+[A-Za-z_][A-Za-z0-9_.]*\s+import|import\s+)[^;\n]*"
+    rb"|(?:(?:if|elif|else|for|while|with|try|except|finally|match|case|def|class)\b"
+    rb"|async\s+(?:for|with|def)\b)[^;\n]{0,4096}:[^;\n]*"
+    rb");\s*$",
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
     rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
@@ -215,6 +240,7 @@ class TextScanner(BaseScanner):
         return (
             DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
@@ -242,33 +268,86 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
         )
 
+    @staticmethod
+    def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
+        finding_type = finding.get("type")
+        if finding_type == "network_function":
+            function = finding.get("function")
+            return (function.encode().lower(),) if isinstance(function, str) and function else ()
+        if finding_type == "cc_pattern":
+            pattern = finding.get("pattern")
+            return (pattern.encode().lower(),) if isinstance(pattern, str) and pattern else ()
+        if finding_type != "network_library":
+            return ()
+
+        library = finding.get("library")
+        pattern = finding.get("pattern")
+        if not isinstance(library, str) or not library:
+            return (pattern.encode().lower(),) if isinstance(pattern, str) and pattern else ()
+        tokens = (
+            pattern,
+            f"import {library}",
+            f"from {library}",
+            f"{library}.connect",
+            f"{library}.request",
+            f"{library}.__init__",
+        )
+        return tuple(token.encode().lower() for token in dict.fromkeys(tokens) if isinstance(token, str) and token)
+
     @classmethod
     def _retarget_documentation_finding(
         cls,
         payload: bytes,
         lowered_payload: bytes,
         finding: dict[str, Any],
-    ) -> dict[str, Any]:
+        remaining_occurrences: int,
+        allow_exhaustion_probe: bool,
+    ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
-        token = finding.get("function") if finding_type == "network_function" else finding.get("pattern")
-        if finding_type not in {"network_function", "cc_pattern"} or not isinstance(token, str) or not token:
-            return finding
+        token_bytes_options = cls._documentation_finding_tokens(finding)
+        if not token_bytes_options:
+            return finding, False, remaining_occurrences
 
-        token_bytes = token.encode().lower()
-        search_start = 0
+        original_position = finding.get("position")
+        search_start = (
+            0
+            if finding_type == "network_library"
+            else original_position
+            if isinstance(original_position, int) and original_position >= 0
+            else 0
+        )
         while True:
-            position = lowered_payload.find(token_bytes, search_start)
-            if position < 0:
-                return finding
+            if remaining_occurrences <= 0:
+                return {**finding, "position": None, "severity": "INFO"}, True, 0
+            matches = (
+                (position, token_bytes)
+                for token_bytes in token_bytes_options
+                if (position := lowered_payload.find(token_bytes, search_start)) >= 0
+            )
+            next_match = min(matches, default=None, key=lambda match: match[0])
+            if next_match is None:
+                return finding, False, remaining_occurrences
+            position, token_bytes = next_match
+            remaining_occurrences -= 1
             candidate = {**finding, "position": position}
+            if finding_type == "network_library":
+                candidate["pattern"] = token_bytes.decode()
             if finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
+            elif finding_type == "network_library":
+                actionable = not cls._documentation_network_library_is_prose(payload, candidate)
             else:
                 actionable = not cls._documentation_cc_finding_is_benign_prose(payload, candidate)
             if actionable:
                 candidate.pop("snippet", None)
-                return candidate
+                return candidate, False, remaining_occurrences
             search_start = position + len(token_bytes)
+            if remaining_occurrences <= 0:
+                if allow_exhaustion_probe and not any(
+                    lowered_payload.find(option, search_start) >= 0 for option in token_bytes_options
+                ):
+                    return candidate, False, 0
+                return {**finding, "position": None, "severity": "INFO"}, True, 0
 
     @classmethod
     def _documentation_network_function_is_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -291,6 +370,36 @@ class TextScanner(BaseScanner):
                 position,
             )
             and DOCUMENTATION_ENCLOSING_CALL_PATTERN.search(line[:position]) is None
+        )
+
+    @classmethod
+    def _documentation_network_library_is_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line_parts = cls._finding_line_parts(payload, finding)
+        pattern = finding.get("pattern")
+        if (
+            line_parts is None
+            or not isinstance(pattern, str)
+            or cls._finding_line_prefix_is_truncated(payload, finding)
+        ):
+            return False
+        line, position = line_parts
+        pattern_bytes = pattern.encode()
+        cursor = position + len(pattern_bytes)
+        while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
+            cursor += 1
+        if not pattern.casefold().startswith(("import ", "from ")) and line[cursor : cursor + 1] == b"(":
+            return False
+
+        prefix = line[:position]
+        import_is_executable = (
+            DOCUMENTATION_IMPORT_STATEMENT_PATTERN.match(line) is not None
+            or DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN.fullmatch(prefix) is not None
+        )
+        return (
+            not import_is_executable
+            and not cls._documentation_line_is_code_shaped(line, position)
+            and DOCUMENTATION_ENCLOSING_CALL_PATTERN.search(prefix) is None
         )
 
     @classmethod
@@ -328,6 +437,8 @@ class TextScanner(BaseScanner):
         if parsed_url is not None and (parsed_url.scheme.casefold() != "https" or url_port not in {None, 443}):
             return False
         stripped = line.strip()
+        if stripped.startswith(b"#"):
+            return True
         return (
             REQUIREMENTS_URL_DIRECTIVE_PATTERN.match(stripped) is not None
             or REQUIREMENTS_DIRECT_REFERENCE_PATTERN.match(stripped) is not None
@@ -407,6 +518,7 @@ class TextScanner(BaseScanner):
                     finding_type == "network_function"
                     and cls._documentation_network_function_is_prose(payload, finding)
                 )
+                or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
             )
         if cls._is_passive_data_sidecar(path):
@@ -426,17 +538,31 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         classified_findings: list[dict[str, Any]] = []
+        classification_incomplete = False
+        remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        for finding in findings:
+        last_retargetable_index = max(
+            (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
+            default=-1,
+        )
+        for index, finding in enumerate(findings):
+            retarget_incomplete = False
             if documentation_sidecar:
-                finding = cls._retarget_documentation_finding(payload, lowered_payload, finding)
-            if cls._sidecar_network_finding_is_informational(path, payload, finding):
+                finding, retarget_incomplete, remaining_occurrences = cls._retarget_documentation_finding(
+                    payload,
+                    lowered_payload,
+                    finding,
+                    remaining_occurrences,
+                    index == last_retargetable_index,
+                )
+                classification_incomplete = classification_incomplete or retarget_incomplete
+            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
-        return classified_findings
+        return classified_findings, classification_incomplete
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -564,9 +690,24 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                network_findings = self._downgrade_sidecar_network_findings(path, inspected_payload, network_findings)
+                network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
+                    path,
+                    inspected_payload,
+                    network_findings,
+                )
                 if network_findings or not truncated:
                     self.add_network_communication_findings(network_findings, result, context=path)
+                if classification_incomplete:
+                    detector_incomplete = True
+                    self._mark_content_security_scan_incomplete(
+                        result,
+                        path,
+                        reason=TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON,
+                        message="Documentation network finding classification exceeded the work limit",
+                        details={
+                            "max_classification_occurrences": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
+                        },
+                    )
                 if finding_limit is not None:
                     if self._passive_network_reporting_limit(
                         path,

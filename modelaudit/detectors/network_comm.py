@@ -1386,6 +1386,7 @@ class NetworkCommDetector:
                             "message": f"Network library detected: {lib.decode()}",
                             "library": lib.decode(),
                             "pattern": pattern.decode("utf-8", errors="ignore"),
+                            "position": match_index,
                             "context": context,
                         }
                     ):

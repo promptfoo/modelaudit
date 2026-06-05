@@ -831,6 +831,7 @@ class TestNetworkCommDetector:
         assert "socket" in libs
         assert "urllib" in libs
         assert "requests" in libs
+        assert all(finding.get("position") == data.find(finding["pattern"].encode()) for finding in lib_findings)
         assert "paramiko" in libs
 
         # Check severity levels

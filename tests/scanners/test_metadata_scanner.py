@@ -127,7 +127,7 @@ class TestMetadataScanner:
             reset_cache_manager()
 
     def test_metadata_invalid_utf8_is_operational_not_security_finding(self, tmp_path: Path) -> None:
-        readme_path = tmp_path / "README.md"
+        readme_path = tmp_path / "README"
         readme_path.write_bytes(b"# Model Card\n\ninvalid text: \xff\n")
 
         direct = MetadataScanner().scan(str(readme_path))
@@ -148,7 +148,7 @@ class TestMetadataScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        readme_path = tmp_path / "README.md"
+        readme_path = tmp_path / "README"
         readme_path.write_text("# Model Card\n", encoding="utf-8")
         real_access = os.access
 

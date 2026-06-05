@@ -7754,18 +7754,18 @@ def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None
         reset_cache_manager()
 
 
-def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:
+def test_scan_file_routes_readme_documentation_to_text_scanner(tmp_path: Path) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text("# Model Card\n\nThis README is benign.\n")
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
+    assert result.scanner_name == "text"
     assert result.success is True
 
 
 @pytest.mark.parametrize("leading_line", ["tree model notes", "tree=implementation notes"])
-def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path, leading_line: str) -> None:
+def test_scan_file_keeps_tree_prefixed_readme_on_text_scanner(tmp_path: Path, leading_line: str) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text(
         f"{leading_line}\n"
@@ -7777,8 +7777,8 @@ def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
-    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
+    assert result.scanner_name == "text"
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) -> None:

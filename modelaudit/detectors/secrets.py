@@ -135,15 +135,120 @@ COMMON_ML_WORDS = frozenset(
 FALSE_POSITIVE_SECRET_CONTEXTS = ("key", "token", "secret", "password", "auth")
 UUID_LIKE_PATTERN = re.compile(r"^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}$")
 ML_PARAMETER_VALUE_PATTERN = re.compile(r"^[\d\.\-e]+$")
-OBVIOUS_PLACEHOLDER_SECRET_PATTERN = re.compile(
-    r"^(?:"
-    r"<[^<>]+>"
-    r"|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"
-    r"|(?:your|example|sample|placeholder|dummy|fake|changeme|replace_me|redacted)(?:[_-][A-Za-z0-9]+)*"
-    r"|[x*]{8,}"
-    r")$",
+PLACEHOLDER_SECRET_TERM_PATTERN = re.compile(
+    r"(?:(?:^|[_-])(?:api|auth|client|credential|key|password|secret|token)(?=$|[_-])"
+    r"|^(?:apikey|clientsecret|credentialkey|passwordvalue|secrettoken)$)",
     re.IGNORECASE,
 )
+PLACEHOLDER_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+PLACEHOLDER_IDENTIFIER_TERMS = frozenset(
+    {
+        "access",
+        "account",
+        "anthropic",
+        "api",
+        "auth",
+        "aws",
+        "azure",
+        "bearer",
+        "bot",
+        "changeme",
+        "client",
+        "cohere",
+        "credential",
+        "db",
+        "discord",
+        "dummy",
+        "example",
+        "fake",
+        "gcp",
+        "github",
+        "gitlab",
+        "google",
+        "here",
+        "hf",
+        "huggingface",
+        "id",
+        "insert",
+        "key",
+        "mailgun",
+        "me",
+        "mongodb",
+        "mysql",
+        "name",
+        "npm",
+        "oauth",
+        "openai",
+        "password",
+        "placeholder",
+        "postgres",
+        "private",
+        "public",
+        "rabbitmq",
+        "redacted",
+        "redis",
+        "replace",
+        "rollbar",
+        "sample",
+        "secret",
+        "sendgrid",
+        "service",
+        "signing",
+        "slack",
+        "square",
+        "stripe",
+        "telegram",
+        "token",
+        "twilio",
+        "value",
+        "var",
+        "variable",
+        "webhook",
+        "with",
+        "your",
+    }
+)
+PLACEHOLDER_MARKER_PATTERN = re.compile(
+    r"(?:^|[_-])(?:your|example|sample|placeholder|dummy|fake|changeme|replace(?:_me|_with)?|insert|redacted|here)"
+    r"(?=$|[_-])",
+    re.IGNORECASE,
+)
+
+
+def _is_obvious_placeholder_secret(text: str) -> bool:
+    candidate = text.strip()
+    if re.fullmatch(r"[x*]{8,}", candidate, re.IGNORECASE):
+        return True
+
+    wrappers = (("{{", "}}"), ("${", "}"), ("<", ">"), ("[", "]"), ("%", "%"))
+    was_wrapped = False
+    was_environment_reference = False
+    for opening, closing in wrappers:
+        if candidate.startswith(opening) and candidate.endswith(closing):
+            candidate = candidate[len(opening) : -len(closing)]
+            was_wrapped = True
+            break
+
+    for prefix in ("process.env.", "$env:", "$"):
+        if candidate.casefold().startswith(prefix):
+            candidate = candidate[len(prefix) :]
+            was_environment_reference = True
+            break
+
+    if PLACEHOLDER_IDENTIFIER_PATTERN.fullmatch(candidate) is None:
+        return False
+    if PLACEHOLDER_SECRET_TERM_PATTERN.search(candidate) is None:
+        return False
+
+    identifier_terms = {term.casefold() for term in re.split(r"[_-]+", candidate)}
+    has_placeholder_grammar = identifier_terms <= PLACEHOLDER_IDENTIFIER_TERMS
+    return has_placeholder_grammar and (
+        PLACEHOLDER_MARKER_PATTERN.search(candidate) is not None
+        or was_wrapped
+        or was_environment_reference
+        or candidate.isupper()
+    )
+
 
 HIGH_CONFIDENCE_PATTERN_HINTS = (
     "AWS Access Key",
@@ -312,7 +417,7 @@ class SecretsDetector:
 
         # Check if it's a common word or phrase (not a secret)
         text_lower = text.lower()
-        if OBVIOUS_PLACEHOLDER_SECRET_PATTERN.fullmatch(text):
+        if _is_obvious_placeholder_secret(text):
             return True
         if text_lower in COMMON_ML_WORDS:
             return True
