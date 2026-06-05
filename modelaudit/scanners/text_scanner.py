@@ -67,10 +67,16 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
+    rb"(?:^|[\r\n{[(,;])[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
+    rb"<(?:iframe\b[^<>]{0,4096}\bsrc|link\b[^<>]{0,4096}\bhref|script\b[^<>]{0,4096}\bsrc)"
+    rb"\s*=\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
@@ -86,7 +92,7 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[\"']?(?:endpoint|callback|webhook)"
     rb"(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*(?:=|:)\s*"
-    rb"\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
+    rb"\{[^{}]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
@@ -140,9 +146,22 @@ DOCUMENTATION_PRIVILEGE_WRAPPER = (
     rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
-DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+DOCUMENTATION_POSIX_LAUNCHER_WRAPPER = rb"(?:(?:(?:command|exec|nohup)\s+){0,2})"
+DOCUMENTATION_SHELL_OPTION = rb"--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
+DOCUMENTATION_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
+DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = (
+    rb"(?:(?:(?:bash|sh|zsh)(?:\s+"
+    + DOCUMENTATION_SHELL_OPTION
+    + rb"){0,7}\s+"
+    + DOCUMENTATION_SHELL_COMMAND_OPTION
+    + rb"|cmd(?:\.exe)?\s+/c|eval)\s+[\"']?\s*)?"
+)
 DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
-    DOCUMENTATION_SHELL_WRAPPERS + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER + DOCUMENTATION_SHELL_WRAPPERS
+    DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
+    + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER
+    + DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
 )
 DOCUMENTATION_SHELL_PROMPT = rb"(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])\s*)?"
 DOCUMENTATION_INLINE_CODE_OPEN = rb"(?:`{1,3}\s*)?"
@@ -156,9 +175,37 @@ DOCUMENTATION_SHELL_LINE_PREFIX = (
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
 )
+DOCUMENTATION_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?"
+DOCUMENTATION_DOWNLOADER_COMMAND = (
+    DOCUMENTATION_COMMAND_PATH_PREFIX + rb"(?:curl|fetch|invoke-restmethod|invoke-webrequest|irm|iwr|wget)(?:\.exe)?"
+)
+DOCUMENTATION_COMMAND_ARRAY_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"(?:RUN|CMD|ENTRYPOINT|command)\s*(?::|=)?\s*\[\s*[\"']?"
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b[\"']?\s*,\s*[\"']?"
+    + rb"(?:$|--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\\])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"(?:RUN|CMD|ENTRYPOINT|command)\s*(?::|=)?\s*\[\s*[\"']?"
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"(?:bash|sh|zsh)[\"']?\s*,\s*[\"']?"
+    + DOCUMENTATION_SHELL_COMMAND_OPTION
+    + rb"[\"']?\s*,\s*[\"']?"
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+",
+    re.IGNORECASE,
+)
+DOCUMENTATION_XARGS_DOWNLOADER_PATTERN = re.compile(
+    rb"\|\s*xargs(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
+    re.IGNORECASE,
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
-    rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
@@ -169,13 +216,15 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
     + DOCUMENTATION_SHELL_WRAPPED_COMMAND
-    + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    + rb"(?:(?:\$\(|`)\s*)?(?:"
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
-    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
@@ -287,10 +336,17 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _is_model_card_documentation_filename(cls, filename: str) -> bool:
+        return filename == "model_card" or any(
+            filename.startswith(f"{stem}.") and os.path.splitext(filename)[1].lower() in cls.supported_extensions
+            for stem in ("model_card", "modelcard")
+        )
+
+    @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if filename == "model_card" or cls._is_readme_documentation_filename(filename):
+        if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
 
         ext = os.path.splitext(path)[1].lower()
@@ -341,7 +397,11 @@ class TextScanner(BaseScanner):
     @classmethod
     def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return filename in DOCUMENTATION_TEXT_FILENAMES or cls._is_readme_documentation_filename(filename)
+        return (
+            filename in DOCUMENTATION_TEXT_FILENAMES
+            or cls._is_readme_documentation_filename(filename)
+            or cls._is_model_card_documentation_filename(filename)
+        )
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -481,8 +541,86 @@ class TextScanner(BaseScanner):
                 before_previous = previous
                 previous = current
         except (IndentationError, tokenize.TokenError):
-            pass
+            # Incomplete prefixes are expected; the partial stack still identifies an open call.
+            return any(opening == "(" and is_call for opening, is_call in stack)
         return any(opening == "(" and is_call for opening, is_call in stack)
+
+    @classmethod
+    def _documentation_python_block_is_actionable(cls, payload: bytes, position: int) -> bool:
+        """Return whether the finding is inside an indented Python definition block."""
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_prefix = payload[line_start:position]
+        current_indent = len(current_prefix) - len(current_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_lines = payload[context_start:line_start].splitlines()
+        parent_indent = current_indent
+        for line in reversed(previous_lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(b"#"):
+                continue
+            indent = len(line) - len(line.lstrip(b" \t"))
+            if indent >= parent_indent:
+                continue
+            try:
+                statements = ast.parse((stripped + b"\n    pass\n").decode("utf-8")).body
+            except (SyntaxError, UnicodeDecodeError, ValueError):
+                statements = []
+            if any(
+                isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef)) for statement in statements
+            ):
+                return True
+            if stripped.endswith(b":"):
+                parent_indent = indent
+                continue
+            return False
+        return context_start > 0
+
+    @staticmethod
+    def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
+        """Return whether a bounded finding position is inside an HTML or C-style block comment."""
+        context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if context_start > 0 and payload[context_start - 1 : context_start] not in {b"\n", b"\r"}:
+            return False
+        prefix = payload[context_start:position]
+        comment_close: bytes | None = None
+        quote: int | None = None
+        escaped = False
+        cursor = 0
+        while cursor < len(prefix):
+            if comment_close is not None:
+                if prefix.startswith(comment_close, cursor):
+                    cursor += len(comment_close)
+                    comment_close = None
+                else:
+                    cursor += 1
+                continue
+            value = prefix[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if quote is not None:
+                if value == ord("\\") and quote != ord("'"):
+                    escaped = True
+                elif value == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if value in {ord("'"), ord('"'), ord("`")}:
+                quote = value
+                cursor += 1
+            elif prefix.startswith(b"<!--", cursor):
+                comment_close = b"-->"
+                cursor += 4
+            elif prefix.startswith(b"/*", cursor):
+                comment_close = b"*/"
+                cursor += 2
+            else:
+                cursor += 1
+        return comment_close is not None
 
     @staticmethod
     def _documentation_shell_comment_before_position(line: bytes, position: int) -> bool:
@@ -549,8 +687,12 @@ class TextScanner(BaseScanner):
         if (
             DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
             or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_COMMAND_ARRAY_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
+            or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
             or cls._documentation_suspicious_label_is_actionable(prefix)
             or (
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
@@ -566,7 +708,9 @@ class TextScanner(BaseScanner):
 
         statements = cls._documentation_python_statements(line)
         return any(
-            isinstance(node, (ast.Call, ast.Lambda)) for statement in statements for node in ast.walk(statement)
+            isinstance(node, (ast.AnnAssign, ast.Assign, ast.AugAssign, ast.Call, ast.Lambda, ast.NamedExpr))
+            for statement in statements
+            for node in ast.walk(statement)
         ) or any(
             isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Import, ast.ImportFrom))
             for statement in statements
@@ -607,6 +751,11 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0 or position > len(payload):
+            return False
+        if cls._documentation_comment_contains_position(payload, position):
+            return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
@@ -616,10 +765,9 @@ class TextScanner(BaseScanner):
                 return False
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
-        position = finding.get("position")
-        if not isinstance(position, int) or position < 0 or position > len(payload):
-            return False
         if cls._documentation_previous_line_continues_command(payload, position):
+            return True
+        if cls._documentation_python_block_is_actionable(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         return (
@@ -663,6 +811,10 @@ class TextScanner(BaseScanner):
         )
         return tuple(token.encode().lower() for token in dict.fromkeys(tokens) if isinstance(token, str) and token)
 
+    @staticmethod
+    def _find_documentation_token(payload: bytes, token_bytes: bytes, start: int) -> int:
+        return payload.find(token_bytes, start)
+
     @classmethod
     def _retarget_documentation_finding(
         cls,
@@ -685,13 +837,15 @@ class TextScanner(BaseScanner):
             if isinstance(original_position, int) and original_position >= 0
             else 0
         )
+        next_positions = {
+            token_bytes: cls._find_documentation_token(lowered_payload, token_bytes, search_start)
+            for token_bytes in token_bytes_options
+        }
         while True:
             if remaining_occurrences <= 0:
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
             matches = (
-                (position, token_bytes)
-                for token_bytes in token_bytes_options
-                if (position := lowered_payload.find(token_bytes, search_start)) >= 0
+                (position, token_bytes) for token_bytes, position in next_positions.items() if position >= search_start
             )
             next_match = min(matches, default=None, key=lambda match: match[0])
             if next_match is None:
@@ -704,7 +858,9 @@ class TextScanner(BaseScanner):
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
-            if finding_type == "network_function":
+            if cls._documentation_comment_contains_position(payload, position):
+                actionable = False
+            elif finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
             elif finding_type == "network_library":
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
@@ -716,10 +872,11 @@ class TextScanner(BaseScanner):
                 candidate.pop("snippet", None)
                 return candidate, False, remaining_occurrences
             search_start = match_position + len(token_bytes)
+            for option, next_position in next_positions.items():
+                if 0 <= next_position < search_start:
+                    next_positions[option] = cls._find_documentation_token(lowered_payload, option, search_start)
             if remaining_occurrences <= 0:
-                if allow_exhaustion_probe and not any(
-                    lowered_payload.find(option, search_start) >= 0 for option in token_bytes_options
-                ):
+                if allow_exhaustion_probe and not any(position >= search_start for position in next_positions.values()):
                     return candidate, False, 0
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
 
@@ -934,6 +1091,9 @@ class TextScanner(BaseScanner):
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
+            position = finding.get("position")
+            if isinstance(position, int) and cls._documentation_comment_contains_position(payload, position):
+                return True
             return (
                 (
                     finding_type in PASSIVE_NETWORK_FINDING_TYPES
