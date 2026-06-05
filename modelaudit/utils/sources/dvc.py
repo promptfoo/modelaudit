@@ -1,11 +1,14 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 DVC_ANALYSIS_INCOMPLETE_REASON = "dvc_outputs_unresolved"
 DVC_OUTPUT_LIMIT_EXCEEDED_REASON = "dvc_output_limit_exceeded"
+DVC_POINTER_TOO_LARGE_REASON = "dvc_pointer_too_large"
+MAX_DVC_POINTER_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -36,8 +39,10 @@ def resolve_dvc_file(file_path: str) -> list[str]:
 def resolve_dvc_file_status(file_path: str) -> DvcResolution:
     """Return resolved DVC outputs and unresolved coverage state."""
     path = Path(file_path)
-    if not path.is_file() or path.suffix != ".dvc":
+    if not path.is_file() or path.suffix.lower() != ".dvc":
         return DvcResolution()
+    pointer_location = path.absolute()
+    resolved_pointer = path.resolve()
 
     try:
         import yaml
@@ -46,7 +51,31 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
         return DvcResolution(incomplete_reason="dvc_yaml_unavailable")
 
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        with path.open("rb") as pointer_file:
+            pointer_bytes = pointer_file.read(MAX_DVC_POINTER_BYTES + 1)
+        if len(pointer_bytes) > MAX_DVC_POINTER_BYTES:
+            logger.warning(f"DVC pointer exceeds maximum size: {file_path}")
+            return DvcResolution(incomplete_reason=DVC_POINTER_TOO_LARGE_REASON)
+
+        class UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def construct_unique_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key {key!r}",
+                        key_node.start_mark,
+                    )
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_unique_mapping)
+        data = yaml.load(pointer_bytes, Loader=UniqueKeyLoader) or {}
     except Exception as exc:  # pragma: no cover - YAML errors are rare
         logger.warning(f"Failed to parse DVC file {file_path}: {exc}")
         return DvcResolution(incomplete_reason="dvc_parse_failed")
@@ -68,6 +97,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
         outs = outs[:MAX_OUTPUTS]
 
     resolved: list[str] = []
+    resolved_seen: set[str] = set()
     unresolved: list[str] = []
     dvc_dir = path.parent.resolve()
 
@@ -108,13 +138,32 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
                 unresolved.append(out_path)
                 continue
 
-            if target.is_dir() and path.is_relative_to(target):
+            if target == resolved_pointer or target.suffix.lower() == ".dvc":
+                logger.warning(f"DVC output resolves to a pointer instead of an artifact: {file_path} -> {target}")
+                unresolved.append(out_path)
+                continue
+
+            if target.is_dir() and (pointer_location.is_relative_to(target) or resolved_pointer.is_relative_to(target)):
                 logger.warning(f"DVC target directory contains its own pointer: {file_path} -> {target}")
                 unresolved.append(out_path)
                 continue
 
-            if target.exists():
-                resolved.append(str(target))
+            target_exists = target.exists()
+            if target_exists and target.samefile(resolved_pointer):
+                logger.warning(f"DVC output is a hardlink to its own pointer: {file_path} -> {target}")
+                unresolved.append(out_path)
+                continue
+
+            if target_exists and not target.is_file() and not target.is_dir():
+                logger.warning(f"DVC output is not a regular file or directory: {file_path} -> {target}")
+                unresolved.append(out_path)
+                continue
+
+            if target_exists:
+                target_str = str(target)
+                if target_str not in resolved_seen:
+                    resolved.append(target_str)
+                    resolved_seen.add(target_str)
             else:
                 logger.debug(f"DVC target missing: {target}")
                 unresolved.append(str(target))

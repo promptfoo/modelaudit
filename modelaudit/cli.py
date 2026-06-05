@@ -55,7 +55,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import resolve_dvc_file_status, should_skip_file
+from .utils import should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -353,21 +353,8 @@ def is_mlflow_uri(path: str) -> bool:
 
 
 def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
-    """Expand user paths, resolve DVC pointers, warn on unmatched globs, and fail fast if empty."""
+    """Expand user paths, warn on unmatched globs, and fail fast if empty."""
     expanded_paths, missing_globs = expand_paths(paths)
-
-    dvc_expanded_paths: list[str] = []
-    for path in expanded_paths:
-        if os.path.isfile(path) and path.endswith(".dvc"):
-            resolution = resolve_dvc_file_status(path)
-            if resolution.resolved_paths and not resolution.analysis_incomplete:
-                dvc_expanded_paths.extend(resolution.resolved_paths)
-            else:
-                # Preserve the pointer for core routing so unresolved outputs become
-                # explicit incomplete coverage instead of clean pointer-text scans.
-                dvc_expanded_paths.append(path)
-        else:
-            dvc_expanded_paths.append(path)
 
     if missing_globs:
         click.echo(
@@ -379,7 +366,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
         )
         click.echo("Note: glob expansion is only applied to local paths.", err=True)
 
-    if not dvc_expanded_paths:
+    if not expanded_paths:
         click.echo(
             style_text(
                 "No matching paths found. Check your paths or glob patterns.",
@@ -392,7 +379,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
         flush_telemetry()
         sys.exit(2)
 
-    return dvc_expanded_paths
+    return expanded_paths
 
 
 def _build_user_scan_overrides(
@@ -1076,7 +1063,10 @@ def _scan_local_or_downloaded_path(
             **config_overrides,
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
-        path_state.scanned_paths.append(actual_path)
+        if actual_path.lower().endswith(".dvc"):
+            path_state.track_streaming_paths_for_sbom(scan_results, actual_path)
+        else:
+            path_state.scanned_paths.append(actual_path)
 
         visible_issues = [
             issue for issue in list(scan_results.issues) if verbose or issue.severity != IssueSeverity.DEBUG

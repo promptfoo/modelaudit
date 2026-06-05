@@ -1047,7 +1047,7 @@ def scan_model_directory_or_file(
 
                     # Handle DVC files and get target paths
                     target_paths = [scan_source]
-                    if file.endswith(".dvc"):
+                    if file.lower().endswith(".dvc"):
                         dvc_resolution = resolve_dvc_file_status(file_path)
                         _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
                         if dvc_resolution.resolved_paths:
@@ -1389,7 +1389,7 @@ def scan_model_directory_or_file(
         else:
             # Scan a single file or DVC pointer
             target_files = [path]
-            is_dvc_pointer = path.endswith(".dvc")
+            is_dvc_pointer = path.lower().endswith(".dvc")
             if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
                 _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
@@ -1416,7 +1416,16 @@ def scan_model_directory_or_file(
 
                     if max_total_size > 0:
                         target_max_total_size = max_total_size - results.bytes_scanned
-                        if target_max_total_size <= 0:
+                        can_probe_zero_byte_target = False
+                        if target_max_total_size == 0:
+                            if os.path.isdir(target):
+                                can_probe_zero_byte_target = True
+                            elif os.path.isfile(target):
+                                try:
+                                    can_probe_zero_byte_target = os.path.getsize(target) == 0
+                                except OSError:
+                                    can_probe_zero_byte_target = False
+                        if target_max_total_size < 0 or (target_max_total_size == 0 and not can_probe_zero_byte_target):
                             _record_incomplete_dvc_scan_budget(
                                 results,
                                 scan_metadata,
@@ -1425,6 +1434,10 @@ def scan_model_directory_or_file(
                                 limit=max_total_size,
                             )
                             break
+                        if can_probe_zero_byte_target:
+                            # A zero max means unlimited to nested scanners. Allow a
+                            # one-byte bounded probe and verify the parent total below.
+                            target_max_total_size = 1
 
                     target_config = dict(config)
                     target_config["timeout"] = target_timeout
@@ -1463,6 +1476,21 @@ def scan_model_directory_or_file(
                         )
                         break
                     continue
+
+                if is_dvc_pointer and max_total_size > 0:
+                    try:
+                        target_size = os.path.getsize(target)
+                    except OSError:
+                        target_size = 0
+                    if target_size > target_max_total_size:
+                        _record_incomplete_dvc_scan_budget(
+                            results,
+                            scan_metadata,
+                            path,
+                            budget_type="total_size",
+                            limit=max_total_size,
+                        )
+                        break
 
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
