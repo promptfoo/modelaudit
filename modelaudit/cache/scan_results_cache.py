@@ -427,6 +427,7 @@ class ScanResultsCache:
         Returns:
             True when a cache entry was persisted, False when storage was skipped or failed.
         """
+        temporary_cache_path: Path | None = None
         try:
             if self._path_has_symlink_component(file_path):
                 logger.debug("Skipping cache store for symlinked path %s", file_path)
@@ -518,11 +519,19 @@ class ScanResultsCache:
                 },
             )
 
-            # Save cache entry
+            # Serialize privately so readers cannot observe an entry before the
+            # final source-identity verification succeeds.
             cache_file_path = self._get_cache_file_path(cache_key)
             cache_file_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(cache_file_path, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cache_file_path.parent,
+                prefix=f".{cache_file_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                temporary_cache_path = Path(f.name)
                 json.dump(asdict(cache_entry), f, indent=2)
 
             final_stat = os.stat(file_path)
@@ -535,9 +544,12 @@ class ScanResultsCache:
                     self._capture_ancestor_identity(file_path),
                 )
             ):
-                cache_file_path.unlink(missing_ok=True)
                 logger.debug("Discarding cache store for %s: path changed during persistence", file_path)
                 return False
+
+            assert temporary_cache_path is not None
+            os.replace(temporary_cache_path, cache_file_path)
+            temporary_cache_path = None
 
             logger.debug(f"Cached scan result for {os.path.basename(file_path)}")
             return True
@@ -546,6 +558,8 @@ class ScanResultsCache:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
             return False
         finally:
+            if temporary_cache_path is not None:
+                temporary_cache_path.unlink(missing_ok=True)
             self.release_ancestor_identity(expected_ancestor_identity)
 
     def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:

@@ -20,7 +20,7 @@ from modelaudit.cache.optimized_config import (
     get_config_extractor,
     normalize_material_scan_config,
 )
-from modelaudit.cache.scan_results_cache import ScanResultsCache
+from modelaudit.cache.scan_results_cache import AncestorIdentity, ScanResultsCache
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
@@ -897,10 +897,24 @@ def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_resu
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
-def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(tmp_path: Path) -> None:
+def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    assert cache_manager.cache is not None
+    release_calls = 0
+    original_release = cache_manager.cache.release_ancestor_identity
+
+    def release_identity(identity: AncestorIdentity | None) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(identity)
+
+    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
 
     class UnserializableFailedResult(ScanResult):
         def to_dict(self) -> dict[str, Any]:
@@ -916,14 +930,29 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(tmp_path: 
 
     assert isinstance(result, ScanResult)
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert cache_manager.get_stats()["total_entries"] == 0
+    assert release_calls == 1
 
 
-def test_cached_scan_skips_persisting_scan_timed_out_messages(tmp_path: Path) -> None:
+def test_cached_scan_skips_persisting_scan_timed_out_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
     calls = {"count": 0}
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    assert cache_manager.cache is not None
+    release_calls = 0
+    original_release = cache_manager.cache.release_ancestor_identity
+
+    def release_identity(identity: AncestorIdentity | None) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(identity)
+
+    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
 
     @cached_scan()
     def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -940,7 +969,8 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(tmp_path: Path) ->
     assert first["timeout_count"] == 1
     assert second["timeout_count"] == 2
     assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    assert cache_manager.get_stats()["total_entries"] == 0
+    assert release_calls == 2
 
 
 def test_cached_scan_skips_persisting_package_not_installed_messages(tmp_path: Path) -> None:
@@ -1166,10 +1196,21 @@ def test_batch_lookup_rejects_stale_cache_entries(tmp_path: Path) -> None:
     assert not cache_file_path.exists()
 
 
-def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
+def test_batch_store_skips_operational_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    assert cache_manager.cache is not None
+    file_identity = cache_manager.cache.capture_file_identity(str(file_path))
+    release_calls = 0
+    original_release = cache_manager.cache.release_ancestor_identity
+
+    def release_identity(identity: AncestorIdentity | None) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(identity)
+
+    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
     batch_ops = BatchCacheOperations(cache_manager)
 
     stored_count = batch_ops.batch_store(
@@ -1185,11 +1226,13 @@ def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
                 },
                 10,
             )
-        ]
+        ],
+        expected_file_identities={str(file_path): file_identity},
     )
 
     assert stored_count == 0
     assert cache_manager.get_stats()["total_entries"] == 0
+    assert release_calls == 1
 
 
 def test_batch_store_skips_results_without_scanned_identity(tmp_path: Path) -> None:
@@ -1437,6 +1480,90 @@ def test_store_result_rechecks_identity_after_verification_hash(
 
     assert stored is False
     assert cache.get_cache_stats()["total_entries"] == 0
+
+
+def test_store_result_publishes_atomically_after_final_identity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="atomic-publish.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    replace_calls: list[tuple[Path, Path]] = []
+    original_replace = os.replace
+
+    def checked_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        assert source_path.suffix == ".tmp"
+        assert source_path.is_file()
+        assert not destination_path.exists()
+        assert json.loads(source_path.read_text(encoding="utf-8"))["scan_result"] == expected
+        replace_calls.append((source_path, destination_path))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", checked_replace)
+
+    assert cache.store_result(str(file_path), expected, 10, **_identity_kwargs(cache, str(file_path))) is True
+    assert len(replace_calls) == 1
+    assert not replace_calls[0][0].exists()
+    assert replace_calls[0][1].is_file()
+
+
+def test_store_result_discards_private_entry_when_final_identity_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="rejected-publish.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    expected_stat, expected_hash, expected_change_token, expected_ancestor_identity = cache.capture_file_identity(
+        str(file_path)
+    )
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    token_calls = 0
+    private_entry_observed = False
+
+    def changed_on_final_check(_path: str, _stat: os.stat_result | None = None) -> int:
+        nonlocal private_entry_observed, token_calls
+        token_calls += 1
+        private_entry_observed = bool(list(cache.cache_dir.rglob("*.tmp")))
+        return expected_change_token + int(private_entry_observed)
+
+    monkeypatch.setattr(cache, "_get_file_change_token", changed_on_final_check)
+    monkeypatch.setattr(os, "replace", lambda *_args: pytest.fail("rejected entry must not be published"))
+
+    stored = cache.store_result(
+        str(file_path),
+        expected,
+        10,
+        expected_file_stat=expected_stat,
+        expected_file_hash=expected_hash,
+        expected_change_token=expected_change_token,
+        expected_ancestor_identity=expected_ancestor_identity,
+    )
+
+    assert stored is False
+    assert token_calls >= 3
+    assert private_entry_observed is True
+    assert cache.get_cache_stats()["total_entries"] == 0
+    assert not list(cache.cache_dir.rglob("*.tmp"))
+
+
+def test_store_result_cleans_private_entry_when_serialization_fails(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="serialization-failure.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    unserializable_result = {"value": object()}
+
+    stored = cache.store_result(
+        str(file_path),
+        unserializable_result,
+        10,
+        **_identity_kwargs(cache, str(file_path)),
+    )
+
+    assert stored is False
+    assert cache.get_cache_stats()["total_entries"] == 0
+    assert not list(cache.cache_dir.rglob("*.tmp"))
 
 
 def test_sampled_large_file_fingerprint_result_is_not_cached(tmp_path: Path) -> None:

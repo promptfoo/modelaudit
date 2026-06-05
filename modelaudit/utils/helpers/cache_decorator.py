@@ -259,26 +259,31 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     except Exception as e:
                         logger.debug(f"Bypassing cache store for {file_path}: pre-scan hashing failed: {e}")
                         return func(*args, **kwargs)
-                    result_dict = cached_func_wrapper(file_path)
-                    if not isinstance(result_dict, dict):
-                        logger.debug(
-                            f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
-                        )
-                        return result_dict
-                    if should_cache_scan_result(result_dict):
-                        scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
-                        cache_manager.store_result(
-                            file_path,
-                            result_dict,
-                            scan_duration_ms,
-                            version_context=version_context,
-                            expected_file_stat=pre_scan_stat,
-                            expected_file_hash=pre_scan_hash,
-                            expected_change_token=pre_scan_change_token,
-                            expected_ancestor_identity=pre_scan_ancestor_identity,
-                        )
-                    else:
-                        logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
+                    try:
+                        result_dict = cached_func_wrapper(file_path)
+                        if not isinstance(result_dict, dict):
+                            logger.debug(
+                                f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
+                            )
+                            return result_dict
+                        if should_cache_scan_result(result_dict):
+                            scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
+                            cache_manager.store_result(
+                                file_path,
+                                result_dict,
+                                scan_duration_ms,
+                                version_context=version_context,
+                                expected_file_stat=pre_scan_stat,
+                                expected_file_hash=pre_scan_hash,
+                                expected_change_token=pre_scan_change_token,
+                                expected_ancestor_identity=pre_scan_ancestor_identity,
+                            )
+                        else:
+                            logger.debug(
+                                f"Skipping cache store for operational result from {os.path.basename(file_path)}"
+                            )
+                    finally:
+                        cache_manager.cache.release_ancestor_identity(pre_scan_ancestor_identity)
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:

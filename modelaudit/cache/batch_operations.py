@@ -9,7 +9,7 @@ from typing import Any
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_manager import CacheManager
 from .cache_policy import should_cache_scan_result
-from .scan_results_cache import ScannedFileIdentity
+from .scan_results_cache import ScannedFileIdentity, ScanResultsCache
 
 logger = logging.getLogger(__name__)
 
@@ -160,39 +160,48 @@ class BatchCacheOperations:
         Returns:
             Number of successfully stored results
         """
-        if not self.cache_manager.enabled or not self.cache_manager.cache:
-            return 0
+        cache = self.cache_manager.cache
+        try:
+            if not self.cache_manager.enabled or cache is None:
+                return 0
 
-        stored_count = 0
+            stored_count = 0
 
-        # Use moderate concurrency for write operations (less than reads)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_path = {
-                executor.submit(
-                    self._store_single_result,
-                    file_path,
-                    scan_result,
-                    scan_duration_ms,
-                    version_context,
-                    expected_file_identities.get(file_path) if expected_file_identities is not None else None,
-                ): file_path
-                for file_path, scan_result, scan_duration_ms in scan_results
-            }
+            # Use moderate concurrency for write operations (less than reads)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {
+                    executor.submit(
+                        self._store_single_result,
+                        file_path,
+                        scan_result,
+                        scan_duration_ms,
+                        version_context,
+                        expected_file_identities.get(file_path) if expected_file_identities is not None else None,
+                    ): file_path
+                    for file_path, scan_result, scan_duration_ms in scan_results
+                }
 
-            for future in as_completed(future_to_path):
-                file_path = future_to_path[future]
-                try:
-                    success = future.result()
-                    if success:
-                        stored_count += 1
-                        logger.debug(f"Batch stored: {os.path.basename(file_path)}")
+                for future in as_completed(future_to_path):
+                    file_path = future_to_path[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            stored_count += 1
+                            logger.debug(f"Batch stored: {os.path.basename(file_path)}")
+                        else:
+                            logger.debug(f"Batch store failed: {os.path.basename(file_path)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to store cache result for {file_path}: {e}")
+
+            logger.debug(f"Batch store complete: {stored_count}/{len(scan_results)} results stored")
+            return stored_count
+        finally:
+            if expected_file_identities is not None:
+                for identity in expected_file_identities.values():
+                    if cache is not None:
+                        cache.release_ancestor_identity(identity[-1])
                     else:
-                        logger.debug(f"Batch store failed: {os.path.basename(file_path)}")
-                except Exception as e:
-                    logger.warning(f"Failed to store cache result for {file_path}: {e}")
-
-        logger.debug(f"Batch store complete: {stored_count}/{len(scan_results)} results stored")
-        return stored_count
+                        ScanResultsCache.release_ancestor_identity(identity[-1])
 
     def _store_single_result(
         self,
