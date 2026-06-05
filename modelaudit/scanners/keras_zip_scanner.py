@@ -156,7 +156,7 @@ _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
 )
-_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.*+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
     r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
     r"([A-Za-z+_-][A-Za-z0-9.+_-]*|\.[A-Za-z][A-Za-z0-9.+_-]*)?\s*$"
@@ -2216,6 +2216,7 @@ class KerasZipScanner(BaseScanner):
             ),
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
+            "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
         }
         if (
             external_reference_analysis.get("external_references_truncated")
@@ -2253,6 +2254,10 @@ class KerasZipScanner(BaseScanner):
             return
 
         if cve_2026_1669_status is False:
+            details["keras_version"] = keras_version
+            details["metadata_only_assessment"] = True
+            details["parse_status"] = "untrusted_artifact_version"
+            details["version_source"] = "keras_archive_metadata"
             result.add_check(
                 name="HDF5 External Weight Reference Metadata Check",
                 passed=False,
@@ -2688,7 +2693,7 @@ class KerasZipScanner(BaseScanner):
     def _bounded_hdf5_reference_text(cls, value: Any) -> tuple[str, bool]:
         """Return redacted, bounded HDF5 path evidence and whether it was truncated."""
         text = os.fsdecode(value)
-        redacted_text = redact_evidence_string(text, max_chars=None)
+        redacted_text = redact_evidence_string(text, max_chars=cls.MAX_HDF5_REFERENCE_TEXT_CHARS)
         was_truncated = max(len(text), len(redacted_text)) > cls.MAX_HDF5_REFERENCE_TEXT_CHARS
         return redacted_text[: cls.MAX_HDF5_REFERENCE_TEXT_CHARS], was_truncated
 
@@ -3162,13 +3167,20 @@ class KerasZipScanner(BaseScanner):
             return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
-        if suffix_status is None:
-            return None
+        if version_match.group(3) is None and suffix in {"x", ".x", "-x", "_x", "*", ".*", "-*", "_*"}:
+            if (3, 0) <= (major, minor) < (3, 12):
+                return True
+            if (major, minor) in {(3, 12), (3, 13)}:
+                return None
+            return False
 
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True
+
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
+        if suffix_status is None:
+            return None
         if parsed in {(3, 12, 1), (3, 13, 2)}:
             return suffix_status
         return False

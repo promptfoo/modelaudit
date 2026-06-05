@@ -55,9 +55,20 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan raw nested pickle payloads carried inside Unicode string literals
 - fail closed on protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
 - detect dynamic `type()` namespaces that can hide callable protocol hooks
+- preserve exact framework reconstruction globals when optional dependencies are not installed
 - bound native pickle state simulation for tracked dictionaries, memo clones,
   dotted globals, and recursive mappings
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
+- warn on import-only pickle globals that reference non-allowlisted custom modules,
+  shadow trusted modules or transitive standard-library imports, rewrite package
+  import paths, or rely on unchecked bytecode caches
+- preserve `NEWOBJ_EX` keyword arguments when analyzing constructor import execution
+- avoid import-only false positives for legacy Python 2 aliases and large native
+  extension source candidates
+- detect `BUILD` slot-state execution through custom attribute hooks without
+  flagging ordinary dictionary state
+- preserve reviewed safe callable references in dependency-minimal environments and
+  recognize active-environment package overlays without trusting project-local shadows
 - avoid custom meta-path finder calls during pickle call-graph source probing
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
@@ -73,6 +84,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance Improvements
 
 - expose a bounded, source-validated analysis cache scope for multi-artifact scan operations
+- skip Python call-graph enrichment when native analysis has no references or
+  has already classified every reference as critical
 
 ## [0.1.3](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.2...modelaudit-picklescan-v0.1.3) (2026-04-27)
 
