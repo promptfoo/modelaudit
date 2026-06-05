@@ -99,6 +99,40 @@ class TestNetworkCommDetector:
         assert encoded_label not in serialized
         assert "https://<redacted>.example.com/path" in serialized
 
+    @pytest.mark.parametrize("key", ["token", "api_key"])
+    def test_detect_urls_redacts_hostname_key_value_labels(self, key: str) -> None:
+        """Sensitive hostname key labels must redact the following value label."""
+        secret = "SECRET123"
+        findings = NetworkCommDetector().scan(f"https://{key}.{secret}.example.com/path".encode(), "model.bin")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret.lower() not in serialized.lower()
+        assert f"https://{key}.<redacted>.example.com/path" in serialized
+
+    def test_detect_urls_preserves_sensitive_word_as_registrable_subdomain(self) -> None:
+        """A sensitive word without a separate value label should remain useful hostname context."""
+        url = "https://token.example.com/path"
+
+        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
+
+        assert any(finding["type"] == "url_detected" and finding["url"] == url for finding in findings)
+
+    def test_detect_urls_redacts_value_after_over_encoded_hostname_key(self) -> None:
+        """Decode-depth exhaustion on a hostname key must also redact its following value."""
+        encoded_key = "".join(f"%{ord(character):02X}" for character in "api_key")
+        for _ in range(8):
+            encoded_key = encoded_key.replace("%", "%25")
+        secret = "SECRET123"
+
+        findings = NetworkCommDetector().scan(
+            f"https://{encoded_key}.{secret}.example.com/path".encode(),
+            "model.bin",
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret.lower() not in serialized.lower()
+        assert "https://<redacted>.<redacted>.example.com/path" in serialized
+
     def test_detect_urls_preserves_port_zero_and_rejects_hostless_netloc(self) -> None:
         """URL redaction should preserve explicit port 0 and avoid hostless netloc output."""
         detector = NetworkCommDetector()
@@ -1021,6 +1055,21 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(url.encode(), "hook.py")
 
         assert any(finding["type"] == "url_detected" and finding["url"] == nested_url for finding in findings)
+
+    def test_encoded_nested_endpoint_in_cloud_url_remains_finding(self) -> None:
+        """Nested endpoints must be decoded before generic URL-scheme filtering."""
+        url = "s3://model-bucket/model?next=https%3A%2F%2F45.33.32.156%2Fpayload"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert any(
+            finding["type"] == "url_detected" and finding["url"] == "https://45.33.32.156/payload"
+            for finding in findings
+        )
+        assert any(
+            finding["type"] == "cloud_storage_url" and finding["url"] == "s3://model-bucket/model"
+            for finding in findings
+        )
 
     @pytest.mark.parametrize(
         ("url", "secret"),
@@ -2104,3 +2153,41 @@ def test_network_finding_limit_stops_lazy_url_index_after_budget(monkeypatch: py
 
     assert findings[0]["type"] == "url_detected"
     assert findings[-1]["type"] == "detector_finding_limit"
+
+
+def test_network_finding_limit_does_not_index_url_prefix_before_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-URL scanners must not consume an unbounded URL prefix for redaction context."""
+    detector = NetworkCommDetector({"max_findings": 1})
+
+    monkeypatch.setattr(detector, "_scan_urls", lambda _data, _context: None)
+    data = (b"https://docs.example.com/reference " * 10_000) + b"port=4444"
+
+    findings = detector.scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "suspicious_port"
+    assert detector._url_contexts == []
+
+
+def test_network_finding_limit_does_not_reexpose_value_in_long_url() -> None:
+    """A bounded local lookup must fail closed when a URL starts before its window."""
+    secret = "45.33.32.156"
+    data = b"https://example.com/" + (b"a" * 5_000) + f"?token={secret}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+    serialized = json.dumps(findings, sort_keys=True)
+
+    assert secret not in serialized
+    assert findings[0]["type"] == "url_detected"
+
+
+def test_network_finding_limit_preserves_ip_in_long_non_url_token() -> None:
+    """The bounded URL fallback must not suppress a standalone IP after opaque data."""
+    ip = "45.33.32.156"
+    data = (b"a" * 5_000) + f"+{ip}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "ipv4_address"
+    assert findings[0]["ip"] == ip

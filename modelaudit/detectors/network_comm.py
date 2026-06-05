@@ -473,13 +473,21 @@ def _redact_hostname_tokens(hostname: str) -> str:
         return hostname
 
     labels = hostname.split(".")
+    redact_next_value = False
     for index, label in enumerate(labels):
         decoded = _decode_path_token(label)
-        if (
-            decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL
-            or _redact_sensitive_path_assignment(label) is not None
-            or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded)
-        ):
+        if redact_next_value:
+            labels[index] = _REDACTED_PATH_TOKEN
+            redact_next_value = False
+            continue
+        if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+            labels[index] = _REDACTED_PATH_TOKEN
+            redact_next_value = len(labels) - index >= 4
+            continue
+        if _is_sensitive_path_key(decoded) and len(labels) - index >= 4:
+            redact_next_value = True
+            continue
+        if _redact_sensitive_path_assignment(label) is not None or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
             labels[index] = _REDACTED_PATH_TOKEN
     return ".".join(labels)
 
@@ -785,10 +793,22 @@ def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
     return url_context[0] if url_context is not None else None
 
 
+def _bounded_url_lookup_starts_mid_token(data: bytes, offset: int) -> bool:
+    """Fail closed when the URL lookup window begins inside one long token."""
+    scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
+    bounded_prefix = data[scan_start:offset]
+    return (
+        scan_start > 0
+        and data[scan_start - 1] not in _URL_TEXT_BOUNDARY_BYTES
+        and not any(byte in _URL_TEXT_BOUNDARY_BYTES for byte in bounded_prefix)
+        and any(byte in b"/?#&;@" for byte in bounded_prefix)
+    )
+
+
 def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
     url_context = _url_text_bounds_containing_offset(data, match_start)
     if url_context is None:
-        return False
+        return _bounded_url_lookup_starts_mid_token(data, match_start)
     url, url_start = url_context
 
     return _is_match_redacted_from_url_context(url, url_start, match_start, value)
@@ -1415,35 +1435,14 @@ class NetworkCommDetector:
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
-        self._extend_url_context_index(match_start)
+        if self.max_findings is not None:
+            return _is_match_redacted_from_url(data, match_start, value)
         context_index = bisect_right(self._url_context_starts, match_start) - 1
         if context_index >= 0:
             url_start, url_end, url = self._url_contexts[context_index]
             if match_start < url_end:
                 return _is_match_redacted_from_url_context(url, url_start, match_start, value)
         return _is_match_redacted_from_url(data, match_start, value)
-
-    def _extend_url_context_index(self, match_start: int) -> None:
-        """Index URL contexts only through the offset needed by a pre-URL scanner."""
-        while not self._url_context_scan_complete:
-            if self._pending_url_context is None:
-                if self._url_context_iterator is None:
-                    self._url_context_scan_complete = True
-                    return
-                try:
-                    self._pending_url_context = next(self._url_context_iterator)
-                except StopIteration:
-                    self._url_context_iterator = None
-                    self._url_context_scan_complete = True
-                    return
-
-            if self._pending_url_context[0] > match_start:
-                return
-
-            context = self._pending_url_context
-            self._pending_url_context = None
-            self._url_contexts.append(context)
-            self._url_context_starts.append(context[0])
 
     def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
         """Yield cached URL contexts followed by the remaining lazy index."""
@@ -1470,9 +1469,9 @@ class NetworkCommDetector:
         """Scan for URL patterns."""
         url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_indexed_url_contexts()
         for url_start, _url_end, url in url_contexts:
-            if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is None:
-                continue
-            if not self._record_url_finding(url, url_start, context):
+            if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None and not self._record_url_finding(
+                url, url_start, context
+            ):
                 return
             for nested_url in _decoded_nested_urls(url):
                 if not self._record_url_finding(nested_url, url_start, context):
