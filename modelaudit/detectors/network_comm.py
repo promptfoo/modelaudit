@@ -18,6 +18,20 @@ _URL_IN_TEXT_PATTERN = re.compile(
     r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
     re.IGNORECASE,
 )
+_URL_IN_BYTES_PATTERN = re.compile(_URL_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
+_SOURCE_LITERAL_URL_END_PATTERN = re.compile(r"'(?=$|[^A-Za-z0-9])")
+_SENSITIVE_PATH_KEY_PATTERN = re.compile(
+    r"^(?:"
+    r"api_?key|x_?api_?key|(?:aws_?)?access_?key(?:_?id)?|(?:aws_?)?secret_?access_?key|"
+    r"aws_?session_?token|"
+    r"access_?token|auth|auth_?token|authorization|proxy_?authorization|bearer|"
+    r"client_?secret|credential|private_?key|password|passwd|pwd|refresh_?token|sas|"
+    r"secret|secret_?key|session|session_?id|cookie|set_?cookie|token|signature|sig|"
+    r"x_?amz_?(?:credential|signature|security_?token)|x_?goog_?(?:credential|signature)"
+    r")$",
+    re.IGNORECASE,
+)
+_URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(rb"[\"']?\s*[:=]\s*(?:[rRuUbBfF]{0,3})?[\"']?\s*")
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
@@ -70,6 +84,8 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
+_MAX_PATH_TOKEN_DECODE_PASSES = 8
+_PATH_TOKEN_DECODE_LIMIT_SENTINEL = "\0path-decode-limit"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
@@ -96,6 +112,18 @@ def _split_path_token_boundary(decoded: str) -> tuple[str, str] | None:
     return decoded[: match.start()], decoded[match.start() :]
 
 
+def _decode_path_token(value: str) -> str:
+    """Decode nested path escaping with a small fixed work bound."""
+    for _ in range(_MAX_PATH_TOKEN_DECODE_PASSES):
+        decoded = unquote(value)
+        if decoded == value:
+            return value
+        value = decoded
+    if unquote(value) != value:
+        return _PATH_TOKEN_DECODE_LIMIT_SENTINEL
+    return value
+
+
 def _shannon_entropy_per_char(value: str) -> float:
     counts = Counter(value)
     length = len(value)
@@ -115,7 +143,7 @@ def _looks_like_high_entropy_filename_stem(stem: str) -> bool:
 
 def _redact_known_token_filename(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
     if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
         return None
 
@@ -138,7 +166,9 @@ def _looks_like_known_artifact_filename(decoded: str) -> bool:
 
 def _looks_like_capability_path_token(segment: str) -> bool:
     token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
+    if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+        return True
     if "/" in decoded:
         return any(_looks_like_capability_path_token(part) for part in decoded.split("/") if part)
     if ":" in decoded:
@@ -169,7 +199,7 @@ def _looks_like_capability_path_token(segment: str) -> bool:
 
 def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
     if "/" not in decoded:
         return None
 
@@ -184,8 +214,11 @@ def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
 
     changed = False
     for index, part in enumerate(parts):
-        if part and _looks_like_capability_path_token(part):
-            parts[index] = _REDACTED_PATH_TOKEN
+        if not part:
+            continue
+        redacted_part, part_changed = _redact_boundary_component(part)
+        if part_changed:
+            parts[index] = redacted_part
             changed = True
 
     if not changed:
@@ -197,15 +230,18 @@ def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
 
 def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
     if ":" not in decoded:
         return None
 
     parts = decoded.split(":")
     changed = False
     for index, part in enumerate(parts):
-        if part and _looks_like_capability_path_token(part):
-            parts[index] = _REDACTED_PATH_TOKEN
+        if not part:
+            continue
+        redacted_part, part_changed = _redact_boundary_component(part)
+        if part_changed:
+            parts[index] = redacted_part
             changed = True
 
     if not changed:
@@ -219,6 +255,8 @@ def _redact_boundary_component(component: str) -> tuple[str, bool]:
 
     key, separator, value = component.partition("=")
     if separator:
+        if _is_sensitive_path_key(key):
+            return f"{key}{separator}{_REDACTED_PATH_TOKEN}", True
         changed = False
         if key and _looks_like_capability_path_token(key):
             key = _REDACTED_PATH_TOKEN
@@ -236,7 +274,7 @@ def _redact_boundary_component(component: str) -> tuple[str, bool]:
 
 def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
     if _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded) is None:
         return None
 
@@ -337,7 +375,7 @@ def _is_azure_authority_container(container: str) -> bool:
 
 def _redact_path_parameter_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = unquote(token_candidate)
+    decoded = _decode_path_token(token_candidate)
     if _MATRIX_PARAMETER_SEPARATOR_PATTERN.search(decoded) is None:
         return None
 
@@ -356,6 +394,10 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
                 changed = True
             continue
         key, value = part.split("=", 1)
+        if _is_sensitive_path_key(key):
+            parts[index] = f"{key}={_REDACTED_PATH_TOKEN}"
+            changed = True
+            continue
         if _looks_like_capability_path_token(key):
             key = _REDACTED_PATH_TOKEN
             changed = True
@@ -367,6 +409,22 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
     if changed:
         return f"{';'.join(parts)}{trailing_delimiters}"
     return None
+
+
+def _is_sensitive_path_key(key: str) -> bool:
+    normalized = _decode_path_token(key).strip().replace("-", "_")
+    if normalized == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+        return True
+    return _SENSITIVE_PATH_KEY_PATTERN.fullmatch(normalized) is not None
+
+
+def _redact_sensitive_path_assignment(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = _decode_path_token(token_candidate)
+    key, separator, _value = decoded.partition("=")
+    if not separator or not _is_sensitive_path_key(key):
+        return None
+    return f"{key}{separator}{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
 
 
 def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
@@ -381,9 +439,13 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         if filename_redaction is not None:
             segments[index] = filename_redaction
             continue
-        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(unquote(_split_trailing_path_delimiters(segment)[0])):
+        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(_decode_path_token(_split_trailing_path_delimiters(segment)[0])):
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            continue
+        sensitive_assignment_redaction = _redact_sensitive_path_assignment(segment)
+        if sensitive_assignment_redaction is not None:
+            segments[index] = sensitive_assignment_redaction
             continue
         encoded_separator_redaction = _redact_encoded_path_separator_tokens(segment)
         if encoded_separator_redaction is not None:
@@ -422,8 +484,18 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     return "/".join(segments)
 
 
+def _trim_source_literal_url(url: str) -> str:
+    """Remove source-code syntax accidentally consumed after a single-quoted URL."""
+    source_literal_end = _SOURCE_LITERAL_URL_END_PATTERN.search(url)
+    if source_literal_end is not None:
+        return url[: source_literal_end.start()]
+    return url
+
+
 def redact_url_for_finding(url: str) -> str:
     """Return a URL safe for findings by removing credentials and sensitive tokens."""
+    url = _trim_source_literal_url(url)
+
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -470,6 +542,77 @@ def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: i
     return url_start
 
 
+def _url_is_likely_call_endpoint(data: bytes, match_end: int, url_start: int) -> bool:
+    cursor = match_end
+    while cursor < url_start and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
+        cursor += 1
+    if cursor >= url_start or data[cursor : cursor + 1] != b"(":
+        return False
+
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    quote: int | None = None
+    escaped = False
+    current_argument_start = cursor + 1
+    for index in range(cursor, url_start):
+        byte = data[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == quote:
+                quote = None
+            continue
+        if byte in {ord("'"), ord('"')}:
+            quote = byte
+        elif byte == ord("("):
+            paren_depth += 1
+        elif byte == ord(")"):
+            paren_depth -= 1
+            if paren_depth <= 0:
+                return False
+        elif byte == ord("["):
+            bracket_depth += 1
+        elif byte == ord("]"):
+            bracket_depth -= 1
+        elif byte == ord("{"):
+            brace_depth += 1
+        elif byte == ord("}"):
+            brace_depth -= 1
+        elif byte == ord(",") and paren_depth == 1 and bracket_depth == 0 and brace_depth == 0:
+            current_argument_start = index + 1
+
+    if paren_depth != 1 or bracket_depth != 0 or brace_depth != 0:
+        return False
+
+    argument_prefix = data[current_argument_start:url_start].strip()
+    if b"#" in argument_prefix:
+        return False
+    string_prefix = rb"(?:[rRuUbBfF]{0,3})?[\"']"
+    if re.fullmatch(string_prefix, argument_prefix) is not None:
+        return True
+    return re.fullmatch(rb"(?i:(?:url|uri|endpoint))\s*=\s*" + string_prefix, argument_prefix) is not None
+
+
+def _is_url_associated_with_match(
+    data: bytes,
+    *,
+    match_start: int,
+    match_end: int,
+    url_start: int,
+    url_end: int,
+) -> bool:
+    if url_start <= match_start and match_end <= url_end:
+        return True
+    if url_start < match_end:
+        return False
+    if _url_is_likely_call_endpoint(data, match_end, url_start):
+        return True
+    return _URL_ASSIGNMENT_PREFIX_PATTERN.fullmatch(data[match_end:url_start]) is not None
+
+
 def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
     start = max(0, match_start - before)
     end = min(len(data), match_end + after)
@@ -495,11 +638,21 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
             start = min(start, url_start)
             end = max(end, url_end)
 
-    context = data[start:end].decode("utf-8", errors="ignore")
     match_text = data[match_start:match_end].decode("utf-8", errors="ignore")
     snippet_parts = [match_text]
-    for url_match in _URL_IN_TEXT_PATTERN.finditer(context):
-        redacted_url = redact_url_for_finding(url_match.group())
+    for url_match in _URL_IN_BYTES_PATTERN.finditer(data, start, end):
+        raw_url = url_match.group().decode("utf-8", errors="ignore")
+        trimmed_url = _trim_source_literal_url(raw_url)
+        trimmed_url_end = url_match.start() + len(trimmed_url.encode("utf-8"))
+        if not _is_url_associated_with_match(
+            data,
+            match_start=match_start,
+            match_end=match_end,
+            url_start=url_match.start(),
+            url_end=trimmed_url_end,
+        ):
+            continue
+        redacted_url = redact_url_for_finding(trimmed_url)
         if redacted_url not in snippet_parts:
             snippet_parts.append(redacted_url)
 
