@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import gzip
 import importlib
 import io
@@ -25,6 +26,7 @@ from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner, safetensors_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
@@ -726,6 +728,60 @@ def test_directory_scan_does_not_reresolve_trusted_hf_alias(
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_continues_when_hf_shard_alias_retargets_after_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changing HF alias must not abort discovery before later malicious files."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-shard")
+    alias = snapshot / "model-00001-of-00001.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+    malicious_payload = snapshot / "z-malicious.pkl"
+    malicious_payload.write_bytes(_build_malicious_pickle())
+    original_resolve_target = core_module._resolve_directory_scan_target
+    retargeted = False
+
+    def retarget_after_resolution(
+        file_path: Path,
+        base_dir: Path,
+        *,
+        is_hf_cache: bool,
+        hf_cache_root: Path | None,
+        results: ModelAuditResultModel,
+        reported_traversal_targets: set[str] | None = None,
+    ) -> tuple[Path | None, bool, bool]:
+        nonlocal retargeted
+        resolved = original_resolve_target(
+            file_path,
+            base_dir,
+            is_hf_cache=is_hf_cache,
+            hf_cache_root=hf_cache_root,
+            results=results,
+            reported_traversal_targets=reported_traversal_targets,
+        )
+        if file_path == alias and resolved[0] is not None:
+            alias.unlink()
+            alias.symlink_to(alias.name)
+            retargeted = True
+        return resolved
+
+    monkeypatch.setattr(core_module, "_resolve_directory_scan_target", retarget_after_resolution)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert retargeted is True
+    assert any(issue.rule_code == "S201" for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_directory_scan_does_not_require_strict_hf_alias_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1274,6 +1330,83 @@ def test_resolve_discovered_shard_path_handles_concurrent_symlink_loop(tmp_path:
         and issue.location == str(shard_path)
         and issue.details["scan_outcome_reason"] == "shard_path_changed"
         for issue in results.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_classifies_symlink_loop_as_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Platform-specific ELOOP errors should not be mislabeled as missing targets."""
+    cyclic_path = tmp_path / "cycle.pt"
+    cyclic_path.symlink_to(cyclic_path.name)
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_resolve = Path.resolve
+
+    def raise_loop_error(path: Path, strict: bool = False) -> Path:
+        if path == cyclic_path:
+            raise OSError(errno.ELOOP, "too many symbolic links")
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", raise_loop_error)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        cyclic_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved is None
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is True
+    assert any(issue.message == "Directory entry unavailable during discovery" for issue in results.issues)
+    assert all(issue.message != "Broken symlink encountered" for issue in results.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_unclassified_symlink_names_recovers_omitted_broken_link(tmp_path: Path) -> None:
+    """Directory discovery should recover dangling links omitted by ``os.walk``."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+
+    assert core_module._unclassified_symlink_names(str(tmp_path), [], []) == [broken_path.name]
+    assert core_module._unclassified_symlink_names(str(tmp_path), [], [broken_path.name]) == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_reports_broken_symlink_omitted_by_walk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform may omit a dangling file link from both ``dirs`` and ``files``."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+    original_walk = os.walk
+
+    def walk_without_broken_link(
+        top: str,
+        topdown: bool = True,
+        onerror: Callable[[OSError], object] | None = None,
+        followlinks: bool = False,
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        for root, dirs, files in original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks):
+            yield root, dirs, [name for name in files if name != broken_path.name]
+
+    monkeypatch.setattr(core_module.os, "walk", walk_without_broken_link)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert any(
+        issue.message == "Broken symlink encountered"
+        and issue.location == str(broken_path)
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in result.issues
     )
 
 

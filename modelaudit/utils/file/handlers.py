@@ -716,6 +716,8 @@ class ParallelShardHandler:
             else self.scanner_class()
         )
         scan_path = shard_path
+        target_validator: Callable[[str], os.stat_result] | None = None
+        validated_stat: os.stat_result | None = None
         shard_targets = self.shard_info.get("shard_targets")
         if isinstance(shard_targets, dict):
             target = shard_targets.get(shard_path)
@@ -723,25 +725,41 @@ class ParallelShardHandler:
                 resolved_path = target.get("resolved_path")
                 expected_device = target.get("device")
                 expected_inode = target.get("inode")
+                expected_size = target.get("size")
                 if not isinstance(resolved_path, str):
                     raise OSError(f"Missing validated target for shard {Path(shard_path).name}")
-                try:
-                    current_resolved = str(Path(shard_path).resolve(strict=True))
-                    current_stat = os.stat(resolved_path, follow_symlinks=False)
-                except (OSError, RuntimeError) as e:
-                    raise OSError(f"Validated shard target is no longer available: {Path(shard_path).name}") from e
-                if current_resolved != resolved_path or not stat.S_ISREG(current_stat.st_mode):
-                    raise OSError(f"Validated shard target changed before scanning: {Path(shard_path).name}")
-                if (
-                    isinstance(expected_device, int)
-                    and isinstance(expected_inode, int)
-                    and expected_inode
-                    and (current_stat.st_dev, current_stat.st_ino) != (expected_device, expected_inode)
-                ):
-                    raise OSError(f"Validated shard identity changed before scanning: {Path(shard_path).name}")
+
+                def _validate_target(phase: str) -> os.stat_result:
+                    try:
+                        current_resolved = str(Path(shard_path).resolve(strict=True))
+                        current_stat = os.stat(resolved_path, follow_symlinks=False)
+                    except (OSError, RuntimeError) as e:
+                        raise OSError(
+                            f"Validated shard target is no longer available {phase}: {Path(shard_path).name}"
+                        ) from e
+                    if current_resolved != resolved_path or not stat.S_ISREG(current_stat.st_mode):
+                        raise OSError(f"Validated shard target changed {phase}: {Path(shard_path).name}")
+                    if (
+                        isinstance(expected_device, int)
+                        and isinstance(expected_inode, int)
+                        and expected_inode
+                        and (current_stat.st_dev, current_stat.st_ino) != (expected_device, expected_inode)
+                    ):
+                        raise OSError(f"Validated shard identity changed {phase}: {Path(shard_path).name}")
+                    if isinstance(expected_size, int) and current_stat.st_size != expected_size:
+                        raise OSError(f"Validated shard size changed {phase}: {Path(shard_path).name}")
+                    return current_stat
+
+                target_validator = _validate_target
+                validated_stat = target_validator("before scanning")
                 scan_path = resolved_path
 
         result: ScanResult = scanner.scan(scan_path)
+        if target_validator is not None and validated_stat is not None:
+            post_scan_stat = target_validator("during scanning")
+            identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(validated_stat, field) != getattr(post_scan_stat, field) for field in identity_fields):
+                raise OSError(f"Validated shard target changed during scanning: {Path(shard_path).name}")
         return result
 
 

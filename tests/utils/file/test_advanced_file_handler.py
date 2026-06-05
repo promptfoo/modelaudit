@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.cache.cache_manager import reset_cache_manager
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
@@ -498,6 +498,49 @@ class TestShardedModelDetector:
         assert result.success is False
         assert b"outside" not in scanned_payloads
         assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+
+    def test_shard_target_swap_during_scan_discards_clean_result(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A clean result cannot be trusted when its validated target changed mid-scan."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        original_target = tmp_path / "malicious.pt"
+        replacement_target = tmp_path / "safe.pt"
+        shard_one.write_bytes(b"first")
+        original_target.write_bytes(b"malicious")
+        replacement_target.write_bytes(b"safe")
+        shard_two.symlink_to(original_target)
+        scanned_payloads: list[bytes] = []
+
+        class SwappingScanner:
+            name = "swapping_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                path = Path(shard_path)
+                result = ScanResult(scanner_name=self.name)
+                if path == original_target:
+                    path.unlink()
+                    path.symlink_to(replacement_target)
+                    result.add_check(
+                        name="Clean Replacement Accepted",
+                        passed=True,
+                        message=path.name,
+                        severity=IssueSeverity.INFO,
+                    )
+                scanned_payloads.append(path.read_bytes())
+                result.finish(success=True)
+                return result
+
+        result = AdvancedFileHandler(str(shard_one), SwappingScanner()).scan()
+
+        assert b"safe" in scanned_payloads
+        assert result.success is False
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "Shard Scan" and check.status == CheckStatus.FAILED for check in result.checks)
+        assert not any(check.name == "Clean Replacement Accepted" for check in result.checks)
 
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""

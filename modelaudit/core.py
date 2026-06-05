@@ -931,7 +931,7 @@ def _resolve_directory_scan_target(
         resolved_file = file_path.resolve()
         resolved_file.stat()
     except (OSError, RuntimeError) as e:
-        if is_symlink and isinstance(e, OSError):
+        if is_symlink and isinstance(e, FileNotFoundError):
             _add_issue_to_model(
                 results,
                 "Broken symlink encountered",
@@ -983,6 +983,26 @@ def _resolve_directory_scan_target(
         return None, False, False
 
     return resolved_file, is_hf_cache_symlink, False
+
+
+def _unclassified_symlink_names(root: str, dirs: list[str], files: list[str]) -> list[str]:
+    """Return symlink entries omitted by platform-specific ``os.walk`` classification."""
+    classified_names = set(dirs).union(files)
+    unclassified_symlinks: list[str] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name in classified_names:
+                    continue
+                try:
+                    is_symlink = entry.is_symlink()
+                except OSError:
+                    is_symlink = True
+                if is_symlink:
+                    unclassified_symlinks.append(entry.name)
+    except OSError:
+        return []
+    return sorted(unclassified_symlinks)
 
 
 def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
@@ -1180,7 +1200,8 @@ def scan_model_directory_or_file(
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, dirs, files in os.walk(path, followlinks=False):
                 dirs.sort()
-                for file in sorted(files):
+                candidate_files = sorted([*files, *_unclassified_symlink_names(root, dirs, files)])
+                for file in candidate_files:
                     file_path = os.path.join(root, file)
 
                     # HuggingFace cache bookkeeping files should never surface as
@@ -1249,7 +1270,7 @@ def scan_model_directory_or_file(
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         if is_hf_shard_alias:
-                            hf_shard_blob_paths.add(str(target_path.resolve()))
+                            hf_shard_blob_paths.add(str(resolved_file))
                         dedupe_target_str = (
                             str(target_path.resolve())
                             if is_hf_cache_symlink and shard_family_key is None
