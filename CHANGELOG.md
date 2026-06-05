@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
+
+### Bug Fixes
+
+- bind cache reads and writes to scanned file identity ([#1458](https://github.com/promptfoo/modelaudit/issues/1458)) ([860adab](https://github.com/promptfoo/modelaudit/commit/860adabe039437fcee6811a9cef561816ba25e74))
+- redact MetaGraph evidence previews ([#1473](https://github.com/promptfoo/modelaudit/issues/1473)) ([58139d9](https://github.com/promptfoo/modelaudit/commit/58139d98cd6c20ddadc379ee476f2e51aa4b798e))
+- redact Torch7 evidence examples ([#1467](https://github.com/promptfoo/modelaudit/issues/1467)) ([646857b](https://github.com/promptfoo/modelaudit/commit/646857bdd54f78334e79eb38896d3e0991810fca))
+
 ## [0.2.46](https://github.com/promptfoo/modelaudit/compare/v0.2.45...v0.2.46) (2026-06-05)
 
 ### Bug Fixes
@@ -197,6 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - classify text-sidecar prose, code references, placeholders, and standard package indexes without hiding executable indicators
+- redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
+- redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - bind cache reads and writes to complete file and pathname identities captured before scanning
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
