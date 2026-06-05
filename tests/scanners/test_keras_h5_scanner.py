@@ -264,7 +264,28 @@ def test_keras_h5_scanner_flags_external_references_despite_fixed_file_version(
     )
 
 
-@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu"])
+def test_keras_h5_scanner_fixed_metadata_without_external_refs_stays_quiet(tmp_path: Path) -> None:
+    """Fixed-looking metadata alone should not produce external-reference noise."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version="3.13.2",
+        file_name="fixed_no_external_refs.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(check.name.startswith("HDF5 External Weight Reference") for check in result.checks)
+
+
+@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu", "3.13.2rc1junk", "3.13.2+"])
 def test_keras_h5_scanner_unparseable_external_reference_versions_mark_unknown_risk(
     tmp_path: Path,
     keras_version: str,
@@ -2182,7 +2203,19 @@ def test_wrapped_layer_config_layer_is_scanned_for_custom_inner_layers(tmp_path:
     )
 
 
-@pytest.mark.parametrize("keras_version", ["3.12.1rc1", "3.13.2rc1"])
+@pytest.mark.parametrize(
+    "keras_version",
+    [
+        "3.12.1rc1",
+        "3.12.1-rc.1",
+        "3.12.1_rc_1",
+        "3.12.1-preview.1",
+        "3.12.1.dev.1",
+        "3.13.2rc1",
+        "3.13.2rc.",
+        "3.13.2_c1",
+    ],
+)
 def test_keras_h5_scanner_treats_cve_2026_1669_fix_prereleases_as_vulnerable(
     tmp_path: Path,
     keras_version: str,
@@ -2634,9 +2667,13 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) == 0, "No Lambda = no CVE-2025-9905"
 
-    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.11.3", "3.11.3.post1", "3.11.3.post_", "3.11.3-1", "3.11.3+vendor.1"],
+    )
+    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path, keras_version: str) -> None:
         """Lambda layer with fixed Keras version should not be CVE-attributed."""
-        h5_path = tmp_path / "model.h5"
+        h5_path = tmp_path / f"model_{keras_version.replace('.', '_').replace('+', '_')}.h5"
         with h5py.File(h5_path, "w") as f:
             model_config = {
                 "class_name": "Sequential",
@@ -2651,7 +2688,7 @@ class TestCVE20259905H5SafeMode:
                 },
             }
             f.attrs["model_config"] = json.dumps(model_config)
-            f.attrs["keras_version"] = "3.11.3"
+            f.attrs["keras_version"] = keras_version
 
         scanner = KerasH5Scanner()
         result = scanner.scan(str(h5_path))
@@ -2659,7 +2696,15 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) == 0, "Fixed Keras versions should not trigger CVE-2025-9905 attribution"
 
-    def test_cve_fix_prerelease_still_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.11.3rc1", "3.11.3rc.", "3.11.3-rc.1", "3.11.3_rc_1", "3.11.3.dev.1"],
+    )
+    def test_cve_fix_prerelease_still_triggers_cve_2025_9905(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
         """3.11.3 prereleases are still pre-fix builds and should remain CVE-attributed."""
         model_path = create_custom_h5_file(
             tmp_path,
@@ -2670,8 +2715,8 @@ class TestCVE20259905H5SafeMode:
                     "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x"}}],
                 },
             },
-            keras_version="3.11.3rc1",
-            file_name="model_prerelease.h5",
+            keras_version=keras_version,
+            file_name=f"model_{keras_version.replace('.', '_').replace('-', '_')}.h5",
         )
 
         result = KerasH5Scanner().scan(str(model_path))
@@ -2679,12 +2724,12 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
-        assert cve_issues[0].details["keras_version"] == "3.11.3rc1"
+        assert cve_issues[0].details["keras_version"] == keras_version
 
     def test_unparseable_keras_versions_mark_unknown_risk(self, tmp_path: Path) -> None:
         """Unparseable versions must not be treated as safely non-vulnerable."""
         scanner = KerasH5Scanner()
-        versions = ["3.11.x", "2.12.0-gpu", "not-a-version"]
+        versions = ["3.11.x", "2.12.0-gpu", "3.11.3+", "3.11.3rc1junk", "not-a-version"]
 
         for version in versions:
             h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
