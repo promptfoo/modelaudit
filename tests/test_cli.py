@@ -73,6 +73,7 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
                 path=asset_dict.get("path", "/test/path"),
                 type=asset_dict.get("type", "test"),
                 size=asset_dict.get("size", 0),
+                is_streamed=asset_dict.get("is_streamed"),
                 tensors=asset_dict.get("tensors"),
                 keys=asset_dict.get("keys"),
                 contents=asset_dict.get("contents"),
@@ -1816,7 +1817,8 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "safetensors",
+                "is_streamed": True,
                 "size": file_sizes[str(file_path)],
             }
             for file_path in streamed_files
@@ -1889,7 +1891,7 @@ def test_scan_huggingface_sbom_excludes_download_cache_files(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "streaming",
                 "size": len(content),
             }
             for file_path, content in real_files.items()
