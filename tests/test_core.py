@@ -7030,8 +7030,8 @@ def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_
     ("filename", "scanner_name", "failure_reason"),
     [
         ("README.md", "text", "text_content_read_failed"),
-        ("README", "metadata", "metadata_read_failed"),
-        ("model_card", "metadata", "metadata_read_failed"),
+        ("README", "text", "text_content_read_failed"),
+        ("model_card", "text", "text_content_read_failed"),
     ],
 )
 def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
@@ -7785,6 +7785,17 @@ def test_scan_file_routes_readme_documentation_to_text_scanner(tmp_path: Path) -
     readme_path.write_text("# Model Card\n\nThis README is benign.\n")
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
+    assert result.success is True
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_scan_file_routes_extensionless_documentation_to_text_scanner(tmp_path: Path, filename: str) -> None:
+    documentation_path = tmp_path / filename
+    documentation_path.write_text("# Model Card\n\nThis documentation is benign.\n")
+
+    result = scan_file(str(documentation_path), config={"cache_scan_results": False})
 
     assert result.scanner_name == "text"
     assert result.success is True

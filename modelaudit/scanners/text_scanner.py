@@ -1,5 +1,6 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
+import ast
 import os
 import re
 from typing import Any, ClassVar
@@ -21,10 +22,12 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "license.md",
         "license.rst",
         "license.txt",
+        "model_card",
         "model_card.md",
         "model_card.rst",
         "model_card.txt",
         "modelcard.md",
+        "readme",
         "readme.md",
         "readme.markdown",
         "readme.rst",
@@ -68,7 +71,7 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:"
     rb"[\"'](?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']"
     rb"|(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?"
-    rb")\s*:\s*[\"']?$",
+    rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
@@ -78,7 +81,7 @@ DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
 DOCUMENTATION_LAMBDA_PATTERN = re.compile(rb"\blambda\b[^:\n]{0,256}:\s*[^\n]*$", re.IGNORECASE)
 DOCUMENTATION_PRIVILEGE_WRAPPER = rb"(?:(?:sudo|doas)(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+)?"
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
-    rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
+    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
     + DOCUMENTATION_PRIVILEGE_WRAPPER
     + rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
     rb"(?:(?:\$\(|`)\s*)?"
@@ -101,7 +104,9 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
-    rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?" + DOCUMENTATION_PRIVILEGE_WRAPPER + rb"(?:"
+    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
+    + DOCUMENTATION_PRIVILEGE_WRAPPER
+    + rb"(?:"
     rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
     rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
@@ -112,10 +117,6 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"|cargo\s+install"
     rb"|gem\s+install"
     rb")\b",
-    re.IGNORECASE,
-)
-DOCUMENTATION_IMPORT_STATEMENT_PATTERN = re.compile(
-    rb"^\s*(?:from\s+[A-Za-z_][A-Za-z0-9_.]*\s+import\s+|import\s+)",
     re.IGNORECASE,
 )
 DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
@@ -198,12 +199,15 @@ class TextScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
+        filename = os.path.basename(path).lower()
+        if filename in {"readme", "model_card"}:
+            return True
+
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
 
         # Check for ML-related text files
-        filename = os.path.basename(path).lower()
         ml_text_files = {
             "readme.md",
             "readme.rst",
@@ -279,7 +283,15 @@ class TextScanner(BaseScanner):
         return position - (payload.rfind(b"\n", 0, position) + 1) > MAX_TEXT_FINDING_CONTEXT_BYTES
 
     @staticmethod
-    def _documentation_line_is_code_shaped(line: bytes, position: int) -> bool:
+    def _documentation_line_has_import_statement(line: bytes) -> bool:
+        try:
+            parsed = ast.parse(line.decode("utf-8"))
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            return False
+        return any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in parsed.body)
+
+    @classmethod
+    def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
         return (
@@ -293,7 +305,8 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
             or DOCUMENTATION_LAMBDA_PATTERN.search(prefix) is not None
-            or stripped.startswith((b"import ", b"from ", b"def ", b"class "))
+            or cls._documentation_line_has_import_statement(line)
+            or stripped.startswith((b"def ", b"class "))
         )
 
     @classmethod
@@ -409,8 +422,21 @@ class TextScanner(BaseScanner):
         cursor = position + len(function.encode())
         while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
             cursor += 1
+        has_call_syntax = line[cursor : cursor + 1] == b"("
+        if not has_call_syntax and line[cursor : cursor + 1] == b"\\" and not line[cursor + 1 :].strip():
+            finding_position = finding.get("position")
+            if isinstance(finding_position, int):
+                line_end = payload.find(b"\n", finding_position)
+                if line_end >= 0:
+                    next_line_end = payload.find(b"\n", line_end + 1)
+                    if next_line_end < 0:
+                        next_line_end = len(payload)
+                    next_line = payload[
+                        line_end + 1 : min(next_line_end, line_end + 1 + MAX_TEXT_FINDING_CONTEXT_BYTES)
+                    ]
+                    has_call_syntax = next_line.lstrip().startswith(b"(")
         return (
-            (cursor >= len(line) or line[cursor : cursor + 1] != b"(")
+            not has_call_syntax
             and not cls._documentation_line_is_code_shaped(
                 line,
                 position,
@@ -438,7 +464,7 @@ class TextScanner(BaseScanner):
 
         prefix = line[:position]
         import_is_executable = (
-            DOCUMENTATION_IMPORT_STATEMENT_PATTERN.match(line) is not None
+            cls._documentation_line_has_import_statement(line)
             or DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN.search(prefix) is not None
             or DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN.fullmatch(prefix) is not None
         )
@@ -886,7 +912,7 @@ class TextScanner(BaseScanner):
             filename = os.path.basename(path).lower()
 
             # Identify file type - these are informational checks, not security issues
-            if filename in ["readme.md", "readme.txt", "readme.markdown", "model_card.md"]:
+            if filename in DOCUMENTATION_TEXT_FILENAMES:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,

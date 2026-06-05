@@ -667,11 +667,15 @@ def test_get_scanner_for_path_routes_suffixed_documentation_to_text_scanner(
     _assert_scanner_for_path(readme_path, "text")
 
 
-def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tmp_path: Path) -> None:
-    readme_path = tmp_path / "README"
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_get_scanner_for_path_routes_extensionless_documentation_to_text_scanner(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    readme_path = tmp_path / filename
     readme_path.write_text("# Model Card\n\nSafe documentation.\n")
 
-    _assert_scanner_for_path(readme_path, "metadata")
+    _assert_scanner_for_path(readme_path, "text")
 
 
 def test_get_scanner_for_path_routes_misnamed_torch7_by_content(tmp_path: Path) -> None:
@@ -900,9 +904,9 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
 @pytest.mark.parametrize(
     ("filename", "scanner_name"),
     [
-        ("README", "metadata"),
+        ("README", "text"),
         ("README.md", "text"),
-        ("model_card", "metadata"),
+        ("model_card", "text"),
         ("unreadable.npy", "numpy"),
         ("unreadable.pdmodel", "paddle"),
         ("unreadable.bin", "pytorch_binary"),

