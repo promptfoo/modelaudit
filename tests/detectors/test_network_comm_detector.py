@@ -1275,6 +1275,35 @@ class TestNetworkCommDetector:
         assert any(finding.get("url") == url for finding in findings)
 
     @pytest.mark.parametrize(
+        "path",
+        [
+            "path%20api_key/SECRET123/model.bin",
+            "path%09token/SECRET123/model.bin",
+            "api_key=/SECRET123/model.bin",
+            "api_key%3D/SECRET123/model.bin",
+            "authorization=/Bearer/SECRET123/model.bin",
+        ],
+    )
+    def test_path_credentials_split_across_segments_are_redacted(self, path: str) -> None:
+        findings = NetworkCommDetector().scan(f"https://evil.example/{path}".encode(), "hook.py")
+
+        assert "SECRET123" not in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "path%20api_keyboard/SECRET123/model.bin",
+            "algorithm=/SECRET123/model.bin",
+        ],
+    )
+    def test_path_near_matches_split_across_segments_are_preserved(self, path: str) -> None:
+        url = f"https://evil.example/{path}"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert any(finding.get("url") == url for finding in findings)
+
+    @pytest.mark.parametrize(
         ("url", "secret"),
         [
             ("https://benign.example/download?token=45.33.32.156", "45.33.32.156"),
@@ -2452,6 +2481,36 @@ def test_network_finding_limit_preserves_colon_query_near_match() -> None:
     """An ordinary colon-style query field must not suppress an endpoint signal."""
     ip = "45.33.32.156"
     data = f"https://benign.example/download?algorithm:{ip}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
+
+    assert any(finding.get("ip") == ip for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("delimiter", "secret"),
+    [
+        ("/", "45.33.32.156"),
+        (",", "secret-value.example.com"),
+        ("%2F", "45.33.32.156"),
+        ("%2C", "secret-value.example.com"),
+    ],
+)
+def test_network_finding_limit_suppresses_delimited_query_credentials(
+    delimiter: str,
+    secret: str,
+) -> None:
+    data = f"https://benign.example/download?api_key{delimiter}{secret}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+@pytest.mark.parametrize("delimiter", ["/", ","])
+def test_network_finding_limit_preserves_delimited_query_near_match(delimiter: str) -> None:
+    ip = "45.33.32.156"
+    data = f"https://benign.example/download?algorithm{delimiter}{ip}".encode()
 
     findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
 
