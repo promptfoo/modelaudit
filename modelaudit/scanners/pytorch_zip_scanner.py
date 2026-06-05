@@ -1792,20 +1792,21 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Collect findings for this file without creating individual checks
                 if file_data:  # Only process if we have data
-                    jit_findings = self.collect_jit_script_findings(
-                        file_data,
-                        model_type="pytorch",
-                        context=f"{path}:{name}",
-                        result=result,
-                    )
-                    network_findings = self.collect_network_communication_findings(
-                        file_data,
-                        context=f"{path}:{name}",
-                        result=result,
-                    )
-
-                    all_jit_findings.extend(jit_findings)
-                    all_network_findings.extend(network_findings)
+                    if check_jit:
+                        jit_findings = self.collect_jit_script_findings(
+                            file_data,
+                            model_type="pytorch",
+                            context=f"{path}:{name}",
+                            result=result,
+                        )
+                        all_jit_findings.extend(jit_findings)
+                    if check_net:
+                        network_findings = self.collect_network_communication_findings(
+                            file_data,
+                            context=f"{path}:{name}",
+                            result=result,
+                        )
+                        all_network_findings.extend(network_findings)
 
             except Exception as e:
                 logger.debug(f"Exception reading {name}: {e}")
