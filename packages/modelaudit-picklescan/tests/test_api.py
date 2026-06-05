@@ -1890,6 +1890,43 @@ def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     assert report.coverage.opcode_scan_complete is False
 
 
+def test_scan_stream_short_read_does_not_report_unproven_oversized_frame_tamper() -> None:
+    prefix = b"HEADER"
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+    stream = io.BytesIO(prefix + payload[:11])
+    stream.seek(len(prefix))
+
+    report = PickleScanner().scan_stream(
+        stream,
+        source="short-read-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(error.category == "short_read" for error in report.errors)
+
+
+def test_scan_stream_short_read_preserves_proven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner().scan_stream(
+        io.BytesIO(payload[:11]),
+        source="short-read-proven-oversized-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 3
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(error.category == "short_read" for error in report.errors)
+
+
 def test_scan_stream_scans_partial_bytes_on_short_read() -> None:
     payload = pickle.dumps(MaliciousPayload(), protocol=4)
     expected_size = len(payload) + 8
@@ -2020,6 +2057,107 @@ def test_scan_stream_known_size_cap_does_not_report_native_short_read() -> None:
     assert report.coverage.bytes_total == len(payload)
 
 
+def test_scan_stream_known_size_cap_does_not_report_unproven_oversized_frame_tamper() -> None:
+    prefix = b"HEADER"
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+    stream = io.BytesIO(prefix + payload)
+    stream.seek(len(prefix))
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=11)).scan_stream(
+        stream,
+        source="known-size-capped-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_known_size_cap_preserves_proven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=11)).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-capped-oversized-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_known_size_cap_preserves_multistream_oversized_frame_tamper() -> None:
+    first_stream = pickle.dumps({"safe": True}, protocol=4)
+    declared_remaining_after_frame = 11
+    frame_length = declared_remaining_after_frame + 1
+    second_stream = b"\x80\x04\x95" + frame_length.to_bytes(8, "little") + (b"." * declared_remaining_after_frame)
+    payload = first_stream + second_stream
+    max_known_read_bytes = len(payload) - 1
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=max_known_read_bytes)).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-capped-multistream-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["position"] == len(first_stream) + 2
+    assert finding.details["stream_offset"] == len(first_stream)
+    assert finding.details["frame_length"] == frame_length
+    assert finding.details["remaining_bytes"] == 1
+    assert finding.details["overrun_boundary"] == "stop"
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_known_size_cap_preserves_frame_crossing_stop_tamper() -> None:
+    payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}.\x80\x04N."
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=13)).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-capped-frame-crossing-stop.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(
+        finding
+        for finding in report.findings
+        if finding.rule_code == "STRUCTURAL_TAMPER" and finding.details.get("overrun_boundary") == "stop"
+    )
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 5
+    assert finding.details["remaining_bytes"] == 2
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_unknown_size_cap_does_not_report_unproven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=11)).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-capped-frame.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
+
+
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
     stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
 
@@ -2083,6 +2221,19 @@ def test_scan_bytes_post_budget_tail_starts_at_budget_boundary() -> None:
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert any(finding.rule_code == "POST_BUDGET_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_post_budget_tail_records_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = scan_bytes(payload, source="budget-frame.pkl", options=ScanOptions(max_opcodes=2))
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 3
+    assert finding.details["remaining_bytes"] == 2
 
 
 def test_scan_bytes_post_budget_tail_handles_stack_global_at_boundary() -> None:
@@ -4864,10 +5015,98 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
     report = scan_bytes(b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.", source="oversized-frame.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
+    assert finding.details["remaining_bytes"] == 2
     notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
     assert notice.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
     assert notice.details["remaining_bytes"] == 2
+
+
+def test_scan_bytes_records_slightly_oversized_frame_notice() -> None:
+    report = scan_bytes(b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.", source="slightly-oversized-frame.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 3
+    assert finding.details["remaining_bytes"] == 2
+    notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
+    assert notice.details["frame_length"] == 3
+    assert notice.details["remaining_bytes"] == 2
+
+
+def test_scan_bytes_accepts_exact_frame_length() -> None:
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = scan_bytes(payload, source="exact-frame.pkl")
+
+    assert pickle.loads(payload) == {}
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.details.get("tamper_type") == "oversized_frame" for finding in report.findings)
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+
+
+def test_scan_bytes_flags_frame_crossing_stop_before_follow_on_stream() -> None:
+    payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}.\x80\x04N."
+
+    report = scan_bytes(payload, source="frame-crossing-stop.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(
+        finding
+        for finding in report.findings
+        if finding.rule_code == "STRUCTURAL_TAMPER" and finding.details.get("overrun_boundary") == "stop"
+    )
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 5
+    assert finding.details["remaining_bytes"] == 2
+
+
+def test_scan_bytes_accepts_frame_ending_before_stop() -> None:
+    payload = b"\x80\x04\x95\x01\x00\x00\x00\x00\x00\x00\x00}."
+
+    assert pickle.loads(payload) == {}
+    report = scan_bytes(payload, source="frame-ending-before-stop.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.details.get("tamper_type") == "oversized_frame" for finding in report.findings)
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+
+
+def test_scan_bytes_flags_frame_crossing_next_frame() -> None:
+    payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}\x95\x01\x00\x00\x00\x00\x00\x00\x00."
+
+    report = scan_bytes(payload, source="frame-crossing-next-frame.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(
+        finding
+        for finding in report.findings
+        if finding.rule_code == "STRUCTURAL_TAMPER" and finding.details.get("overrun_boundary") == "next_frame"
+    )
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 5
+    assert finding.details["remaining_bytes"] == 1
+
+
+def test_scan_bytes_accepts_exact_adjacent_frames() -> None:
+    payload = b"\x80\x04\x95\x01\x00\x00\x00\x00\x00\x00\x00}\x95\x01\x00\x00\x00\x00\x00\x00\x00."
+
+    assert pickle.loads(payload) == {}
+    report = scan_bytes(payload, source="exact-adjacent-frames.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.details.get("tamper_type") == "oversized_frame" for finding in report.findings)
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
 
 
 def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:

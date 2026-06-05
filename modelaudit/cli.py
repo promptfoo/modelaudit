@@ -1940,6 +1940,7 @@ def _resolve_scan_source_for_path(
                     path,
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
+                    timeout=runtime.timeout,
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
@@ -2040,6 +2041,7 @@ def _resolve_scan_source_for_path(
                         scannable = filter_scannable_files(
                             metadata.get("files", []),
                             scannable_extensions=runtime.scannable_extensions,
+                            scannable_filenames=runtime.scannable_filenames,
                         )
                         click.echo(f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}")
 
@@ -2065,6 +2067,10 @@ def _resolve_scan_source_for_path(
                 cloud_stream_kwargs: dict[str, Any] = {}
                 if runtime.scannable_extensions is not None:
                     cloud_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scannable_filenames is not None:
+                    cloud_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.scanner_selection is not None:
+                    cloud_stream_kwargs["scanner_selection"] = runtime.scanner_selection
                 file_generator = download_from_cloud_streaming(
                     path,
                     cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
@@ -2106,6 +2112,10 @@ def _resolve_scan_source_for_path(
             cloud_download_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 cloud_download_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                cloud_download_kwargs["scannable_filenames"] = runtime.scannable_filenames
+            if runtime.scanner_selection is not None:
+                cloud_download_kwargs["scanner_selection"] = runtime.scanner_selection
             download_path = download_from_cloud(  # type: ignore[assignment]
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
@@ -2225,6 +2235,8 @@ def _resolve_scan_source_for_path(
             jfrog_scan_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 jfrog_scan_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                jfrog_scan_kwargs["scannable_filenames"] = runtime.scannable_filenames
             if runtime.explicit_max_download_bytes is not None:
                 jfrog_scan_kwargs["max_download_size"] = runtime.explicit_max_download_bytes
             jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(

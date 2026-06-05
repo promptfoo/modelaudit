@@ -40,6 +40,7 @@ _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
 )
+_PICKLE_FRAME_OPCODE_BYTES = 9
 _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
     {
         "MARK",
@@ -153,6 +154,7 @@ class PickleScanner:
                     partial_report,
                     source=source,
                     error=error,
+                    stream_start_offset=position_offset,
                 )
             return _io_error_report(
                 source=source,
@@ -194,6 +196,7 @@ class PickleScanner:
                 bytes_scanned=len(payload),
                 bytes_total=normalized_size,
                 max_known_read_bytes=self.options.max_known_stream_read_bytes,
+                stream_start_offset=position_offset,
             )
         return report
 
@@ -750,6 +753,68 @@ def _combine_verdict(
     return SafetyVerdict.UNKNOWN
 
 
+def _without_unproven_oversized_frame_tamper(
+    report: PickleReport,
+    *,
+    bytes_total: int | None,
+    stream_start_offset: int,
+) -> PickleReport:
+    normalized_stream_start_offset = max(stream_start_offset, 0)
+
+    def oversized_frame_is_proven(details: Mapping[str, Any]) -> bool:
+        if details.get("overrun_boundary") in {"stop", "next_frame"}:
+            return True
+        if bytes_total is None:
+            return False
+        position = details.get("position")
+        stream_offset = details.get("stream_offset")
+        frame_length = details.get("frame_length")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or isinstance(stream_offset, bool)
+            or not isinstance(stream_offset, int)
+            or isinstance(frame_length, bool)
+            or not isinstance(frame_length, int)
+        ):
+            return True
+        frame_payload_offset = position - normalized_stream_start_offset + _PICKLE_FRAME_OPCODE_BYTES
+        if frame_payload_offset < 0:
+            return True
+        return frame_length > max(bytes_total - frame_payload_offset, 0)
+
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if not (
+            finding.rule_code == "STRUCTURAL_TAMPER"
+            and finding.details.get("tamper_type") == "oversized_frame"
+            and not oversized_frame_is_proven(finding.details)
+        )
+    )
+    notices = tuple(
+        notice
+        for notice in report.notices
+        if not (notice.code == "oversized_frame" and not oversized_frame_is_proven(notice.details))
+    )
+    if findings == report.findings and notices == report.notices:
+        return report
+    verdict = report.verdict
+    if verdict == SafetyVerdict.SUSPICIOUS and not findings:
+        verdict = SafetyVerdict.CLEAN
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=verdict,
+        findings=findings,
+        notices=notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
 def _with_unbounded_stream_notice(
     report: PickleReport,
     *,
@@ -757,6 +822,7 @@ def _with_unbounded_stream_notice(
     bytes_scanned: int,
     max_unbounded_read_bytes: int,
 ) -> PickleReport:
+    report = _without_unproven_oversized_frame_tamper(report, bytes_total=None, stream_start_offset=0)
     notices = (
         *report.notices,
         Notice(
@@ -800,7 +866,13 @@ def _with_known_stream_notice(
     bytes_scanned: int,
     bytes_total: int,
     max_known_read_bytes: int,
+    stream_start_offset: int,
 ) -> PickleReport:
+    report = _without_unproven_oversized_frame_tamper(
+        report,
+        bytes_total=bytes_total,
+        stream_start_offset=stream_start_offset,
+    )
     notices = (
         *report.notices,
         Notice(
@@ -843,7 +915,13 @@ def _with_short_read_error(
     *,
     source: str,
     error: _StreamShortReadError,
+    stream_start_offset: int,
 ) -> PickleReport:
+    report = _without_unproven_oversized_frame_tamper(
+        report,
+        bytes_total=error.expected_size,
+        stream_start_offset=stream_start_offset,
+    )
     errors = (
         *report.errors,
         ScanError(
