@@ -37,6 +37,19 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_SAFE_DISPLAY_QUERY_KEYS = frozenset(
+    {
+        "campaign",
+        "download",
+        "lang",
+        "language",
+        "locale",
+        "page",
+        "section",
+        "tokenizer",
+        "visible",
+    }
+)
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -99,47 +112,15 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
 
 
 def _redact_sensitive_query_param(match: re.Match[str]) -> str:
-    if not _is_sensitive_query_param(match.group("key")):
+    if _is_safe_display_query_param(match.group("key")):
         return match.group(0)
     return f"{match.group('prefix')}{match.group('key')}=<redacted>"
 
 
-def _is_sensitive_query_param(key: str) -> bool:
+def _is_safe_display_query_param(key: str) -> bool:
     decoded_key = unquote_plus(key).lower()
     normalized_key = re.sub(r"[^a-z0-9]", "", decoded_key)
-    exact_sensitive_keys = {
-        "auth",
-        "authorization",
-        "awsaccesskeyid",
-        "bearer",
-        "googleaccessid",
-        "password",
-        "passwd",
-        "pwd",
-        "sas",
-        "session",
-        "sessionid",
-        "sig",
-        "token",
-    }
-    sensitive_suffixes = (
-        "accesstoken",
-        "apikey",
-        "accesskey",
-        "clientsecret",
-        "credential",
-        "idtoken",
-        "password",
-        "privatekey",
-        "refreshtoken",
-        "secret",
-        "secretkey",
-        "securitytoken",
-        "signature",
-        "sessiontoken",
-        "token",
-    )
-    return normalized_key in exact_sensitive_keys or normalized_key.endswith(sensitive_suffixes)
+    return normalized_key in _SAFE_DISPLAY_QUERY_KEYS
 
 
 def redact_stream_url_for_display(url: str) -> str:

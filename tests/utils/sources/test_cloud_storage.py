@@ -241,6 +241,15 @@ class TestCloudURLRedaction:
         assert "secret-session" not in redacted
         assert "secret-password" not in redacted
 
+    def test_redact_cloud_error_for_display_redacts_unknown_query_values(self) -> None:
+        message = "request failed: https://example.test/c2?campaign=test&opaque=SUPERSECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "campaign=test" in redacted
+        assert "opaque=<redacted>" in redacted
+        assert "SUPERSECRET" not in redacted
+
     def test_redact_cloud_error_for_display_redacts_semicolon_query_credentials(self) -> None:
         message = "provider failed: https://example.com/model.bin?visible=yes;token=secret-value"
 

@@ -167,7 +167,10 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
     )
     safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret&password=password-secret"
+    related_url = (
+        "https://collector.example/upload?"
+        "visible=yes&token=secondary-secret&password=password-secret&opaque=unknown-secret"
+    )
     fragment_url = "https://collector.example/callback#access_token=fragment-secret"
     legacy_signed_url = (
         "https://bucket.s3.amazonaws.com/related.pkl?"
@@ -239,6 +242,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "secret-token",
         "secondary-secret",
         "password-secret",
+        "unknown-secret",
         "fragment-secret",
         "AKIARELATED",
         "related-signature",
@@ -253,6 +257,8 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     assert "visible=yes" in json_text
     assert "visible=yes" in sarif_text
     assert "token=<redacted>" in sarif_text
+    assert "opaque=<redacted>" in json_text
+    assert "opaque=<redacted>" in sarif_text
     assert "https://collector.example/upload<redacted>" not in sarif_text
     assert safe_url in result.file_metadata
     assert all(asset.path != stream_url for asset in result.assets)

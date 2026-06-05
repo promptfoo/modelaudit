@@ -196,6 +196,25 @@ class TestFormatSarifOutput:
         assert "secret-session" not in output
         assert "secret-token" not in output
 
+    def test_raw_url_redacts_unknown_query_values(self) -> None:
+        """Unknown evidence parameters must fail closed even without a credential-like key."""
+        raw_url = "https://evil.example/c2?campaign=test&opaque=SUPERSECRET"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Detected callback {raw_url}",
+                severity=IssueSeverity.WARNING,
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "campaign=test" in output
+        assert "opaque=" not in output
+        assert "SUPERSECRET" not in output
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()
