@@ -67,7 +67,7 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
-    rb"(?:^|[\r\n{[(,;])[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
@@ -82,21 +82,22 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
+DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])(?:"
-    rb"[\"'](?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']"
-    rb"|(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?"
-    rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])[\"']?(?:endpoint|callback|webhook)"
-    rb"(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*(?:=|:)\s*"
+    rb"(?:^|[\s{[(,;])[\"']?" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"[\"']?\s*(?:=|:)\s*"
     rb"\{[^{}]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
-    rb"[ \t]*[\"']?(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*:\s*",
+    rb"[ \t]*[\"']?" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"[\"']?\s*:\s*",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
@@ -373,6 +374,11 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"|cargo\s+install"
     rb"|gem\s+install"
     rb")\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN = re.compile(
+    rb"(?:\b(?:is|are|was|were)\s+(?:covered|described|documented|explained)\s+(?:at|in|on)"
+    rb"|\b(?:docs?|documentation|guide|reference)\s+(?:at|in|on))\s*$",
     re.IGNORECASE,
 )
 DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
@@ -805,6 +811,41 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _documentation_package_install_is_actionable(line: bytes, position: int) -> bool:
+        stripped = line.lstrip()
+        leading_bytes = len(line) - len(stripped)
+        match = DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped)
+        if match is None:
+            return False
+        for url_match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+            if url_match.start() <= position < url_match.end():
+                position = url_match.start()
+                break
+        relative_position = max(0, position - leading_bytes)
+        if relative_position < match.end():
+            return True
+        return (
+            DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN.search(stripped[match.end() : relative_position]) is None
+        )
+
+    @staticmethod
+    def _documentation_python_string_contains_position(line: bytes, position: int) -> bool:
+        text = line.decode("utf-8", errors="replace")
+        character_position = len(line[:position].decode("utf-8", errors="replace"))
+        try:
+            for current in tokenize.generate_tokens(io.StringIO(text).readline):
+                if (
+                    current.type == token.STRING
+                    and current.start[0] == 1
+                    and current.end[0] == 1
+                    and current.start[1] <= character_position < current.end[1]
+                ):
+                    return True
+        except (IndentationError, tokenize.TokenError):
+            return False
+        return False
+
+    @staticmethod
     def _documentation_anchored_network_command_is_actionable(line: bytes) -> bool:
         return any(
             pattern.match(line) is not None
@@ -833,7 +874,7 @@ class TextScanner(BaseScanner):
         stripped = line.lstrip()
         shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
-            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            or cls._documentation_package_install_is_actionable(line, position)
             or DOCUMENTATION_INLINE_NETCAT_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
@@ -1081,6 +1122,8 @@ class TextScanner(BaseScanner):
             return False
         line, position = line_parts
         if cls._documentation_shell_comment_before_position(line, position):
+            return True
+        if cls._documentation_python_string_contains_position(line, position):
             return True
         cursor = position + len(function.encode())
         while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:

