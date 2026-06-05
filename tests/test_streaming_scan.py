@@ -297,6 +297,28 @@ def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
     assert "visible=yes" in json_text
 
 
+def test_streaming_related_url_safe_key_cannot_hide_encoded_nested_credentials() -> None:
+    """Scanner metadata must redact nested credentials hidden under an allowlisted key."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = "https://collector.example/upload?lang=en%26token%3Dsecondary-secret"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata["related_url"] = related_url
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
+    assert "secondary-secret" not in json_text
+    assert "secondary-secret" not in sarif_text
+    assert "lang=<redacted>" in json_text
+
+
 def test_streaming_invalid_utf8_metadata_is_replaced_before_reporting() -> None:
     """Opaque binary metadata must not retain signed URLs or break JSON output."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?token=secret-token"

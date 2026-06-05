@@ -259,6 +259,38 @@ class TestCloudURLRedaction:
         assert "camp%61ign=test" in redacted
         assert "SUPERSECRET" not in redacted
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "en%26token%3DSECRET",
+            "yes%2526access_token%253DSECRET",
+            "yes%25252526access_token%2525253DSECRET",
+            "token=SECRET",
+            "en,token=SECRET",
+            "en%0D%0AAuthorization%3A%20Bearer%20SECRET",
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_nested_query_structure_in_safe_values(self, value: str) -> None:
+        message = f"request failed: https://example.test/c2?lang={value}"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "request failed: https://example.test/c2?lang=<redacted>"
+        assert "SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_handles_separate_safe_and_sensitive_params(self) -> None:
+        message = "request failed: https://example.test/c2?lang=en&token=SECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "request failed: https://example.test/c2?lang=en&token=<redacted>"
+        assert "SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_preserves_encoded_safe_value_characters(self) -> None:
+        message = "request failed: https://example.test/c2?tokenizer=org%2Fbert-base&lang=en-US"
+
+        assert redact_cloud_error_for_display(message) == message
+
     def test_redact_cloud_error_for_display_redacts_semicolon_query_credentials(self) -> None:
         message = "provider failed: https://example.com/model.bin?visible=yes;token=secret-value"
 

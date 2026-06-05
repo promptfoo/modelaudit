@@ -50,6 +50,7 @@ _SAFE_DISPLAY_QUERY_KEYS = frozenset(
         "visible",
     }
 )
+_MAX_QUERY_VALUE_DECODE_PASSES = 4
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -112,14 +113,34 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
 
 
 def _redact_sensitive_query_param(match: re.Match[str]) -> str:
-    if _is_safe_display_query_param(match.group("key")):
+    if _is_safe_display_query_param(match.group("key"), match.group("value")):
         return match.group(0)
     return f"{match.group('prefix')}{match.group('key')}=<redacted>"
 
 
-def _is_safe_display_query_param(key: str) -> bool:
+def _is_safe_display_query_param(key: str, value: str) -> bool:
     decoded_key = unquote_plus(key).lower()
-    return decoded_key in _SAFE_DISPLAY_QUERY_KEYS
+    if decoded_key not in _SAFE_DISPLAY_QUERY_KEYS:
+        return False
+
+    decoded_value = value
+    for _ in range(_MAX_QUERY_VALUE_DECODE_PASSES):
+        if _has_unsafe_display_query_value_structure(decoded_value):
+            return False
+        next_value = unquote_plus(decoded_value)
+        if next_value == decoded_value:
+            return True
+        decoded_value = next_value
+
+    # Values that remain encoded after the bounded pass may conceal nested
+    # query structure under additional encoding layers.
+    return not _has_unsafe_display_query_value_structure(decoded_value) and unquote_plus(decoded_value) == decoded_value
+
+
+def _has_unsafe_display_query_value_structure(value: str) -> bool:
+    return any(delimiter in value for delimiter in "?&#;=") or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in value
+    )
 
 
 def redact_stream_url_for_display(url: str) -> str:

@@ -215,6 +215,26 @@ class TestFormatSarifOutput:
         assert "opaque=" not in output
         assert "SUPERSECRET" not in output
 
+    def test_safe_query_key_cannot_hide_encoded_nested_credentials(self) -> None:
+        """Allowlisted evidence keys must not preserve encoded nested credentials."""
+        raw_url = "https://evil.example/c2?lang=en%26access_token%3DSUPERSECRET"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Detected callback {raw_url}",
+                severity=IssueSeverity.WARNING,
+                details={"callback": raw_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "lang=" not in output
+        assert "access_token" not in output
+        assert "SUPERSECRET" not in output
+
     def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
         """Opaque URL components must not bypass key/value redaction."""
         raw_url = "https://evil.example/c2?campaign=test&BARE-QUERY-SECRET#section=overview&BARE-FRAGMENT-SECRET"
