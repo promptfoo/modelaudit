@@ -26,8 +26,8 @@ def _write_local_artifacts(source_root: Path, artifact_sizes: dict[str, int]) ->
         source_path.write_bytes(b"x" * artifact_size)
 
 
-def test_local_mlflow_artifact_root_unwraps_models_repository(tmp_path: Path) -> None:
-    """Only MLflow's local repository type should expose a bounded-copy source root."""
+def test_local_mlflow_artifact_root_preserves_runs_repository(tmp_path: Path) -> None:
+    """Run adapters must retain their logged-model overlay semantics."""
 
     class LocalArtifactRepository:
         def __init__(self, artifact_dir: Path) -> None:
@@ -65,10 +65,13 @@ def test_local_mlflow_artifact_root_unwraps_models_repository(tmp_path: Path) ->
         },
     ):
         assert (
+            _local_mlflow_artifact_root(ModelsArtifactRepository(LocalArtifactRepository(source_root))) == source_root
+        )
+        assert (
             _local_mlflow_artifact_root(
                 ModelsArtifactRepository(RunsArtifactRepository(LocalArtifactRepository(source_root)))
             )
-            == source_root
+            is None
         )
         assert _local_mlflow_artifact_root(object()) is None
 
@@ -141,6 +144,156 @@ def test_scan_mlflow_model_unwraps_local_run_repository(
     assert result == scan_result
     assert (download_dir / "model.pkl").read_bytes() == b"xxxx"
     mock_scan.assert_called_once()
+
+
+def test_scan_mlflow_model_preserves_local_logged_model_overlay(
+    tmp_path: Path,
+) -> None:
+    """MLflow 3 logged-model artifacts must overlay, not replace, run artifacts."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1"
+
+        def __init__(self, run_repository: object, logged_model_repository: object) -> None:
+            self.repo = run_repository
+            self.logged_model_repository = logged_model_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1"
+            return "run-1", None
+
+        def _get_logged_model_artifact_repo(self, run_id: str, name: str) -> object:
+            assert (run_id, name) == ("run-1", "model")
+            return self.logged_model_repository
+
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    run_root = tmp_path / "run-artifacts"
+    logged_model_root = tmp_path / "logged-model-artifacts"
+    _write_local_artifacts(run_root, {"model/run-only.bin": 3, "model/shared.bin": 4})
+    _write_local_artifacts(logged_model_root, {"logged-only.bin": 2, "shared.bin": 5})
+    repository = RunsArtifactRepository(
+        LocalArtifactRepository(run_root),
+        LocalArtifactRepository(logged_model_root),
+    )
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "runs:/run-1",
+        "model",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 10, "issues": []}
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+                "mlflow.store.artifact.runs_artifact_repo": runs_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model(
+            "runs:/run-1/model",
+            max_file_size=5,
+            max_total_size=10,
+        )
+
+    assert result == scan_result
+    assert (download_dir / "model" / "run-only.bin").read_bytes() == b"xxx"
+    assert (download_dir / "model" / "logged-only.bin").read_bytes() == b"xx"
+    assert (download_dir / "model" / "shared.bin").read_bytes() == b"xxxxx"
+    mock_scan.assert_called_once()
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_scan_mlflow_model_rejects_nonlocal_logged_model_overlay(tmp_path: Path) -> None:
+    """A local run half must not hide an unbounded logged-model repository."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1"
+
+        def __init__(self, run_repository: object) -> None:
+            self.repo = run_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1"
+            return "run-1", None
+
+        @staticmethod
+        def _get_logged_model_artifact_repo(run_id: str, name: str) -> object:
+            assert (run_id, name) == ("run-1", "model")
+            return object()
+
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    run_root = tmp_path / "run-artifacts"
+    _write_local_artifacts(run_root, {"model/model.pkl": 4})
+    repository = RunsArtifactRepository(LocalArtifactRepository(run_root))
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "runs:/run-1",
+        "model",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow": mlflow_module,
+            "mlflow.store": store_module,
+            "mlflow.store.artifact": artifact_module,
+            "mlflow.store.artifact.local_artifact_repo": local_module,
+            "mlflow.store.artifact.models_artifact_repo": models_module,
+            "mlflow.store.artifact.runs_artifact_repo": runs_module,
+        },
+    ):
+        result = scan_mlflow_model("runs:/run-1/model", max_file_size=10)
+
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_streaming_budget_unavailable"
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
 def test_copy_local_mlflow_artifact_removes_partial_file_when_source_grows(

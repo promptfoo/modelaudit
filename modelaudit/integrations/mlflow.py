@@ -38,6 +38,8 @@ _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
 class _MlflowArtifact:
     path: str
     size: int
+    source_root: Path | None = None
+    source_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,12 +50,20 @@ class _MlflowArtifactInfo:
 
 
 @dataclass(frozen=True)
+class _MlflowLocalSource:
+    root: Path
+    artifact_path: str | None
+    destination_path: str | None
+
+
+@dataclass(frozen=True)
 class _MlflowDownloadPlan:
     artifacts: tuple[_MlflowArtifact, ...]
     root_uri: str
     local_artifact_root: Path
     artifact_path: str | None
     max_artifact_entries: int
+    local_sources: tuple[_MlflowLocalSource, ...] = ()
 
 
 class _MlflowArtifactSizeChangedError(Exception):
@@ -170,16 +180,15 @@ def _redact_mlflow_error_for_display(error: object) -> str:
 
 
 def _terminal_mlflow_artifact_repository(artifact_repository: Any) -> Any | None:
-    """Unwrap MLflow's transparent model and run repository adapters."""
+    """Unwrap transparent model adapters without discarding run overlay semantics."""
     try:
         from mlflow.store.artifact.models_artifact_repo import ModelsArtifactRepository
-        from mlflow.store.artifact.runs_artifact_repo import RunsArtifactRepository
     except Exception:
         return artifact_repository
 
     repository = artifact_repository
     seen: set[int] = set()
-    while isinstance(repository, (ModelsArtifactRepository, RunsArtifactRepository)):
+    while isinstance(repository, ModelsArtifactRepository):
         repository_id = id(repository)
         if repository_id in seen:
             return None
@@ -189,6 +198,14 @@ def _terminal_mlflow_artifact_repository(artifact_repository: Any) -> Any | None
             return None
 
     return repository
+
+
+def _is_runs_mlflow_artifact_repository(artifact_repository: Any) -> bool:
+    try:
+        from mlflow.store.artifact.runs_artifact_repo import RunsArtifactRepository
+    except Exception:
+        return False
+    return isinstance(artifact_repository, RunsArtifactRepository)
 
 
 def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
@@ -208,6 +225,50 @@ def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
     except (OSError, TypeError, ValueError):
         return None
     return artifact_root if artifact_root.is_dir() else None
+
+
+def _local_runs_mlflow_sources(
+    artifact_repository: Any,
+    artifact_path: str | None,
+) -> tuple[_MlflowLocalSource, ...] | None:
+    """Resolve the local repositories that a runs:/ adapter overlays."""
+    run_root = _local_mlflow_artifact_root(getattr(artifact_repository, "repo", None))
+    if run_root is None:
+        return None
+
+    sources = [_MlflowLocalSource(run_root, artifact_path, artifact_path)]
+    get_logged_model_repository = getattr(artifact_repository, "_get_logged_model_artifact_repo", None)
+    parse_runs_uri = getattr(artifact_repository, "parse_runs_uri", None)
+    wrapper_uri = getattr(artifact_repository, "artifact_uri", None)
+    if not artifact_path and not wrapper_uri:
+        return tuple(sources)
+    if not callable(get_logged_model_repository) or not callable(parse_runs_uri) or not isinstance(wrapper_uri, str):
+        return tuple(sources)
+
+    run_id, wrapper_path = parse_runs_uri(wrapper_uri)
+    effective_path = (
+        posixpath.join(wrapper_path, artifact_path) if wrapper_path and artifact_path else wrapper_path or artifact_path
+    )
+    if not effective_path:
+        return tuple(sources)
+
+    model_name, separator, model_artifact_path = effective_path.partition("/")
+    logged_model_repository = get_logged_model_repository(run_id=run_id, name=model_name)
+    if logged_model_repository is None:
+        return tuple(sources)
+
+    logged_model_root = _local_mlflow_artifact_root(logged_model_repository)
+    if logged_model_root is None:
+        return None
+
+    sources.append(
+        _MlflowLocalSource(
+            logged_model_root,
+            model_artifact_path if separator and model_artifact_path else None,
+            artifact_path,
+        )
+    )
+    return tuple(sources)
 
 
 def _is_local_mlflow_artifact_repository(artifact_repository: Any) -> bool:
@@ -267,7 +328,7 @@ def _copy_local_mlflow_artifact(
     copied_size = 0
     source_fd: int | None = None
     try:
-        source_fd = _open_local_mlflow_artifact(source_root, artifact.path)
+        source_fd = _open_local_mlflow_artifact(source_root, artifact.source_path or artifact.path)
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
             raise ValueError("artifact source path is not a regular file")
@@ -346,7 +407,7 @@ def _snapshot_local_mlflow_artifacts(
     source_root: Path,
     artifact_path: str | None,
     max_artifact_entries: int,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], int]:
     """Return the regular files currently present under the requested local artifact."""
     requested_parts = PurePosixPath(artifact_path).parts if artifact_path else ()
     requested_path = source_root.joinpath(*requested_parts)
@@ -360,7 +421,9 @@ def _snapshot_local_mlflow_artifacts(
     if stat.S_ISREG(requested_stat.st_mode):
         if artifact_path is None:
             raise ValueError("artifact repository root is not a directory")
-        return {artifact_path: requested_stat.st_size}
+        if max_artifact_entries < 1:
+            raise _MlflowArtifactListingExceededError
+        return {artifact_path: requested_stat.st_size}, 1
     if not stat.S_ISDIR(requested_stat.st_mode):
         raise ValueError("artifact source path is not a regular file or directory")
 
@@ -385,15 +448,69 @@ def _snapshot_local_mlflow_artifacts(
                     snapshot[relative_path] = entry_stat.st_size
                 else:
                     raise ValueError(f"artifact source path is not a regular file: {relative_path}")
-    return snapshot
+    return snapshot, entry_count
+
+
+def _map_local_source_path(source: _MlflowLocalSource, source_path: str) -> str:
+    if source.artifact_path is None:
+        suffix = source_path
+    elif source_path == source.artifact_path:
+        suffix = ""
+    elif source_path.startswith(f"{source.artifact_path}/"):
+        suffix = source_path[len(source.artifact_path) + 1 :]
+    else:
+        raise ValueError(f"Artifact entry path escaped requested source: {source_path}")
+
+    if source.destination_path:
+        return posixpath.join(source.destination_path, suffix) if suffix else source.destination_path
+    if suffix:
+        return suffix
+    return posixpath.basename(source_path)
+
+
+def _snapshot_local_mlflow_sources(
+    sources: tuple[_MlflowLocalSource, ...],
+    max_artifact_entries: int,
+) -> tuple[dict[str, _MlflowArtifact], int]:
+    """Snapshot local sources using MLflow's model-over-run overlay order."""
+    artifacts: dict[str, _MlflowArtifact] = {}
+    entry_count = 0
+    for source in sources:
+        snapshot, source_entry_count = _snapshot_local_mlflow_artifacts(
+            source.root,
+            source.artifact_path,
+            max_artifact_entries - entry_count,
+        )
+        entry_count += source_entry_count
+        for source_path, size in snapshot.items():
+            artifact_path = _normalize_mlflow_artifact_path(_map_local_source_path(source, source_path))
+            artifacts[artifact_path] = _MlflowArtifact(
+                path=artifact_path,
+                size=size,
+                source_root=source.root,
+                source_path=source_path,
+            )
+
+    artifact_paths = set(artifacts)
+    for artifact_path in artifact_paths:
+        parent = posixpath.dirname(artifact_path)
+        while parent:
+            if parent in artifact_paths:
+                raise ValueError(f"Artifact overlay contains a file and directory at {parent}")
+            parent = posixpath.dirname(parent)
+    return artifacts, entry_count
 
 
 def _verify_local_mlflow_artifact_set(plan: _MlflowDownloadPlan) -> None:
-    current_artifacts = _snapshot_local_mlflow_artifacts(
-        plan.local_artifact_root,
-        plan.artifact_path,
-        plan.max_artifact_entries,
-    )
+    if plan.local_sources:
+        current_plan, _ = _snapshot_local_mlflow_sources(plan.local_sources, plan.max_artifact_entries)
+        current_artifacts = {artifact.path: artifact.size for artifact in current_plan.values()}
+    else:
+        current_artifacts, _ = _snapshot_local_mlflow_artifacts(
+            plan.local_artifact_root,
+            plan.artifact_path,
+            plan.max_artifact_entries,
+        )
     expected_artifacts = {artifact.path: artifact.size for artifact in plan.artifacts}
     added_paths = current_artifacts.keys() - expected_artifacts.keys()
     removed_paths = expected_artifacts.keys() - current_artifacts.keys()
@@ -468,6 +585,85 @@ def _find_single_file_artifact_info(
     return None, len(artifact_infos), listing_exceeded
 
 
+def _preflight_local_mlflow_sources(
+    model_uri: str,
+    root_uri: str,
+    sources: tuple[_MlflowLocalSource, ...],
+    details: dict[str, Any],
+    *,
+    max_file_size: int,
+    max_total_size: int,
+    max_artifact_entries: int,
+) -> _MlflowDownloadPlan | ModelAuditResultModel:
+    try:
+        planned_artifacts, entry_count = _snapshot_local_mlflow_sources(sources, max_artifact_entries)
+    except _MlflowArtifactListingExceededError:
+        details.update(
+            {
+                "reason": "artifact_listing_budget_exceeded",
+                "artifact_entry_count": max_artifact_entries + 1,
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
+            details,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        details.update(
+            {
+                "reason": "artifact_size_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to determine MLflow artifact size before download",
+            details,
+        )
+
+    total_size = 0
+    for artifact in planned_artifacts.values():
+        total_size += artifact.size
+        if max_file_size > 0 and artifact.size > max_file_size:
+            details.update(
+                {
+                    "reason": "artifact_file_size_exceeded",
+                    "artifact_path": artifact.path,
+                    "artifact_file_size": artifact.size,
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                f"MLflow artifact file too large to download: {artifact.size} bytes (max: {max_file_size})",
+                details,
+            )
+        if max_total_size > 0 and total_size > max_total_size:
+            details.update(
+                {
+                    "reason": "artifact_total_size_exceeded",
+                    "artifact_total_size": total_size,
+                    "artifact_file_count": len(planned_artifacts),
+                    "artifact_entry_count": entry_count,
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                f"MLflow artifact total size too large to download: {total_size} bytes (max: {max_total_size})",
+                details,
+            )
+
+    primary_source = sources[0]
+    return _MlflowDownloadPlan(
+        artifacts=tuple(planned_artifacts.values()),
+        root_uri=root_uri,
+        local_artifact_root=primary_source.root,
+        artifact_path=primary_source.artifact_path,
+        max_artifact_entries=max_artifact_entries,
+        local_sources=sources,
+    )
+
+
 def _preflight_mlflow_download_budget(
     mlflow_module: Any,
     model_uri: str,
@@ -500,6 +696,38 @@ def _preflight_mlflow_download_budget(
             model_uri,
             "Unable to determine MLflow artifact size before download",
             details,
+        )
+
+    if _is_runs_mlflow_artifact_repository(artifact_repository):
+        try:
+            local_sources = _local_runs_mlflow_sources(artifact_repository, initial_artifact_path)
+        except Exception as exc:
+            details.update(
+                {
+                    "reason": "artifact_size_unavailable",
+                    "error": _redact_mlflow_error_for_display(exc),
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                "Unable to determine MLflow artifact size before download",
+                details,
+            )
+        if local_sources is None:
+            details["reason"] = "artifact_streaming_budget_unavailable"
+            return _mlflow_budget_failure_result(
+                model_uri,
+                "MLflow artifact repository cannot enforce the configured download budget",
+                details,
+            )
+        return _preflight_local_mlflow_sources(
+            model_uri,
+            root_uri,
+            local_sources,
+            details,
+            max_file_size=max_file_size,
+            max_total_size=max_total_size,
+            max_artifact_entries=max_artifact_entries,
         )
 
     local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
@@ -650,7 +878,7 @@ def _preflight_mlflow_download_budget(
 
     if file_count == 0:
         try:
-            current_artifacts = _snapshot_local_mlflow_artifacts(
+            current_artifacts, _ = _snapshot_local_mlflow_artifacts(
                 local_artifact_root,
                 normalized_initial_path,
                 max_artifact_entries,
@@ -788,7 +1016,11 @@ def _download_preflighted_mlflow_artifacts(
             )
 
         try:
-            actual_size = _copy_local_mlflow_artifact(plan.local_artifact_root, artifact, local_path)
+            actual_size = _copy_local_mlflow_artifact(
+                artifact.source_root or plan.local_artifact_root,
+                artifact,
+                local_path,
+            )
             if local_path.is_symlink() or not local_path.is_file():
                 raise ValueError("downloaded path is not a regular file")
             if not local_path.resolve().is_relative_to(download_root):
