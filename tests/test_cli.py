@@ -814,6 +814,7 @@ def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_
 
     assert runtime.max_file_size == 50 * 1024 * 1024 * 1024
     assert runtime.max_download_bytes == runtime.max_file_size
+    assert runtime.explicit_max_download_bytes is None
 
 
 def test_format_text_output():
@@ -1417,6 +1418,64 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
     mock_scan.assert_called_once()
     # With automatic defaults, PyTorch Hub URLs enable caching by default, so no cleanup
     mock_rmtree.assert_not_called()
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_passes_max_download_bytes(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    (test_dir / "model.pt").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=1,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/", "--max-size", "5KB"])
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["max_size"] == 5 * 1024
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_pytorchhub_stream_passes_max_download_bytes(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_ph_url: MagicMock,
+) -> None:
+    mock_is_ph_url.return_value = True
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=1,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/", "--stream", "--max-size", "5KB"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
@@ -2092,6 +2151,75 @@ def test_scan_jfrog_url_success(
         selective_download=True,
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_with_max_size_forwards_download_budget(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI --max-size should cap JFrog acquisition before scan-time limits run."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=5, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--max-size", "5B", "https://company.jfrog.io/artifactory/repo/model.bin"])
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once()
+    call_kwargs = mock_scan_jfrog.call_args.kwargs
+    assert call_kwargs["max_download_size"] == 5
+    assert call_kwargs["max_file_size"] == 5
+    assert call_kwargs["max_total_size"] == 5
+
+
+@patch("modelaudit.cli.generate_auto_defaults")
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_does_not_forward_implicit_file_limit_as_total_budget(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    mock_auto_defaults: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Implicit per-file defaults must not become cumulative JFrog folder limits."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_auto_defaults.return_value = {
+        "format": "json",
+        "max_file_size": 10,
+        "max_total_size": 0,
+        "selective_download": True,
+        "skip_non_model_files": True,
+        "timeout": 3600,
+        "use_cache": False,
+        "use_hf_whitelist": True,
+    }
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=16,
+        issues=[],
+        files_scanned=2,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/models/"])
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once()
+    call_kwargs = mock_scan_jfrog.call_args.kwargs
+    assert call_kwargs["max_file_size"] == 10
+    assert call_kwargs["max_total_size"] == 0
+    assert "max_download_size" not in call_kwargs
 
 
 @patch("modelaudit.cli.is_jfrog_url")
