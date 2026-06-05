@@ -15,7 +15,7 @@ import tempfile
 import zipfile
 from collections.abc import Iterator
 from pathlib import PurePosixPath
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, Protocol, TypeVar
 from urllib.parse import urlparse, urlunparse
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -161,6 +161,13 @@ _DynamicAliasState = tuple[
     _DynamicLiteralIterableAliases,
     _DynamicFunctionAliases,
 ]
+
+
+class _DynamicTryNode(Protocol):
+    body: list[ast.stmt]
+    handlers: list[ast.ExceptHandler]
+    orelse: list[ast.stmt]
+    finalbody: list[ast.stmt]
 
 
 def _canonical_dynamic_helper_name(name: str) -> str:
@@ -2356,6 +2363,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.class_attribute_states: dict[str, _DynamicAliasState] = {}
                 self.function_binding_state_stack: list[_DynamicAliasState] = []
                 self.loop_break_state_stack: list[list[_DynamicAliasState]] = []
+                self.try_exception_state_stack: list[list[_DynamicAliasState]] = []
                 self.active_generator_ids: set[int] = set()
                 self.active_lambda_ids: set[int] = set()
                 self.active_function_ids: set[int] = set()
@@ -4058,6 +4066,14 @@ class TorchServeMarScanner(BaseScanner):
                 for target in node.targets:
                     self._invalidate_target(target)
 
+            def visit_Raise(self, node: ast.Raise) -> None:
+                if node.exc is not None:
+                    self.visit(node.exc)
+                if node.cause is not None:
+                    self.visit(node.cause)
+                if self.try_exception_state_stack:
+                    self.try_exception_state_stack[-1].append(self._snapshot_state())
+
             def visit_Break(self, node: ast.Break) -> None:
                 if self.loop_break_state_stack:
                     self.loop_break_state_stack[-1].append(self._snapshot_state())
@@ -4228,11 +4244,56 @@ class TorchServeMarScanner(BaseScanner):
                 return False
 
             def _statements_definitely_do_not_raise(self, statements: list[ast.stmt]) -> bool:
-                return all(
-                    isinstance(statement, ast.Pass)
-                    or (isinstance(statement, ast.Expr) and self._expression_definitely_does_not_raise(statement.value))
-                    for statement in statements
-                )
+                return all(self._statement_definitely_does_not_raise(statement) for statement in statements)
+
+            def _statement_definitely_does_not_raise(self, statement: ast.stmt) -> bool:
+                if isinstance(statement, ast.Pass | ast.Break | ast.Continue):
+                    return True
+                if isinstance(statement, ast.Expr):
+                    return self._expression_definitely_does_not_raise(statement.value)
+                if isinstance(statement, ast.Assign):
+                    return all(isinstance(target, ast.Name) for target in statement.targets) and (
+                        self._expression_definitely_does_not_raise(statement.value)
+                    )
+                if isinstance(statement, ast.Return):
+                    return statement.value is None or self._expression_definitely_does_not_raise(statement.value)
+                if isinstance(statement, ast.Delete):
+                    return all(
+                        isinstance(target, ast.Name)
+                        and any(
+                            target.id in aliases
+                            for aliases in (
+                                self.module_aliases,
+                                self.callable_aliases,
+                                self.import_loader_aliases,
+                                self.import_aliases,
+                                self.lazy_generator_aliases,
+                                self.static_truthiness_aliases,
+                                self.lambda_aliases,
+                                self.literal_iterable_aliases,
+                                self.function_definitions,
+                            )
+                        )
+                        for target in statement.targets
+                    )
+                return False
+
+            def _visit_try_body(self, statements: list[ast.stmt]) -> list[_DynamicAliasState]:
+                exception_states: list[_DynamicAliasState] = []
+                self.try_exception_state_stack.append(exception_states)
+                try:
+                    for statement in statements:
+                        statement_cannot_raise = self._statement_definitely_does_not_raise(statement)
+                        state_before_statement = self._snapshot_state()
+                        self.visit(statement)
+                        state_after_statement = self._snapshot_state()
+                        if not statement_cannot_raise:
+                            exception_states.extend((state_before_statement, state_after_statement))
+                        if self._statement_definitely_terminates(statement):
+                            break
+                finally:
+                    self.try_exception_state_stack.pop()
+                return exception_states
 
             def _visit_statement_block(self, statements: list[ast.stmt]) -> None:
                 for statement in statements:
@@ -4648,12 +4709,12 @@ class TorchServeMarScanner(BaseScanner):
                     normal_exit_state = self._merge_states(normal_exit_state, self._merge_state_list(break_states))
                 self._restore_state(normal_exit_state)
 
-            def visit_Try(self, node: ast.Try) -> None:
+            def _visit_try(self, node: _DynamicTryNode, *, sequential_handlers: bool) -> None:
                 break_state_start = len(self.loop_break_state_stack[-1]) if self.loop_break_state_stack else None
                 initial_state = self._snapshot_state()
                 body_exits_without_exception = self._statements_definitely_exit_without_exception(node.body)
                 body_cannot_raise = self._statements_definitely_do_not_raise(node.body)
-                self._visit_statement_block(node.body)
+                exception_states = self._visit_try_body(node.body)
                 body_state = self._snapshot_state()
                 body_terminates = self._statements_definitely_terminate(node.body)
                 possible_states = []
@@ -4661,10 +4722,15 @@ class TorchServeMarScanner(BaseScanner):
                     self._visit_statement_block(node.orelse)
                     possible_states.append(self._snapshot_state())
 
-                handler_initial_state = self._merge_states(initial_state, body_state)
+                handler_initial_state = (
+                    self._merge_state_list(exception_states)
+                    if exception_states
+                    else self._merge_states(initial_state, body_state)
+                )
                 if not body_exits_without_exception and not body_cannot_raise:
+                    handler_state = handler_initial_state
                     for handler in node.handlers:
-                        self._restore_state(handler_initial_state)
+                        self._restore_state(handler_state if sequential_handlers else handler_initial_state)
                         if handler.type is not None:
                             self.visit(handler.type)
                         if handler.name is not None:
@@ -4672,7 +4738,13 @@ class TorchServeMarScanner(BaseScanner):
                         self._visit_statement_block(handler.body)
                         if handler.name is not None:
                             self._invalidate_name(handler.name)
-                        possible_states.append(self._snapshot_state())
+                        handled_state = self._snapshot_state()
+                        if sequential_handlers:
+                            handler_state = self._merge_states(handler_state, handled_state)
+                        else:
+                            possible_states.append(handled_state)
+                    if sequential_handlers:
+                        possible_states.append(handler_state)
 
                 if possible_states:
                     merged_state = possible_states[0]
@@ -4703,6 +4775,12 @@ class TorchServeMarScanner(BaseScanner):
                 self._visit_statement_block(node.finalbody)
                 if self.loop_break_state_stack:
                     self.loop_break_state_stack[-1].extend(transformed_break_states)
+
+            def visit_Try(self, node: _DynamicTryNode) -> None:
+                self._visit_try(node, sequential_handlers=False)
+
+            def visit_TryStar(self, node: _DynamicTryNode) -> None:
+                self._visit_try(node, sequential_handlers=True)
 
             def visit_Match(self, node: ast.Match) -> None:
                 self.visit(node.subject)

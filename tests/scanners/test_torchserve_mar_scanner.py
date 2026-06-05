@@ -6,6 +6,7 @@ import ast
 import json
 import pickle
 import stat
+import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -2065,6 +2066,154 @@ def test_dynamic_import_handler_analysis_replaces_state_in_failed_match_guards()
         b"            pass\n"
         b"        case _:\n"
         b"            return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_uses_rebound_state_at_explicit_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    try:\n"
+        b"        module = None\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_explicit_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        module = __import__('os')\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_nested_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        if context:\n"
+        b"            module = __import__('os')\n"
+        b"            raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_restore_deleted_alias_at_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    try:\n"
+        b"        del module\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_merges_exception_group_handler_states() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    try:\n"
+        b"        raise ExceptionGroup('group', [ValueError()])\n"
+        b"    except* ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except* TypeError:\n"
+        b"        module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_chains_exception_group_handler_states() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        raise ExceptionGroup('group', [ValueError(), TypeError()])\n"
+        b"    except* ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except* TypeError:\n"
+        b"        module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_regular_exception_handlers_exclusive() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        might_fail()\n"
+        b"    except ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except TypeError:\n"
+        b"        module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_skips_unreachable_exception_group_handler() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    try:\n"
+        b"        pass\n"
+        b"    except* Exception:\n"
+        b"        module = __import__('os')\n"
+        b"    return module.system('id')\n"
     )
 
     risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
