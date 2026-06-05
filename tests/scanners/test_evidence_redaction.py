@@ -1264,6 +1264,29 @@ def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) ->
 
 
 @pytest.mark.parametrize(
+    ("encoded_value", "expected"),
+    [
+        ("api_key%3Dhunter2", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        ("api_key%3DENCODEDSECRET123456", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        ("api_key%253DENCODEDSECRET123456", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        (
+            "https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb",
+            f"https://{REDACTED_URL_CREDENTIALS}@evil.example/cb",
+        ),
+    ],
+)
+def test_redacts_percent_encoded_credential_evidence(encoded_value: str, expected: str) -> None:
+    redacted = redact_evidence_string(encoded_value, max_chars=500)
+
+    assert redacted == expected
+
+
+def test_preserves_benign_percent_encoded_evidence() -> None:
+    for text in ("version%3D1", "metadata%20label%20value"):
+        assert redact_evidence_string(text, max_chars=500) == text
+
+
+@pytest.mark.parametrize(
     "near_miss",
     [
         "ghp_" + "a" * 35,

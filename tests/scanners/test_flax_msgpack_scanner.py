@@ -1081,6 +1081,31 @@ def test_flax_msgpack_redacts_deeply_percent_encoded_secret_metadata_key(tmp_pat
 
 
 @pytest.mark.parametrize(
+    ("encoded_evidence", "expected_marker"),
+    [
+        ("api_key%3Dhunter2", "<redacted>"),
+        ("api_key%3DENCODEDSECRET123456", "<redacted>"),
+        ("https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb", "<credentials-redacted>"),
+    ],
+)
+def test_flax_msgpack_redacts_percent_encoded_credential_metadata_key(
+    tmp_path: Path,
+    encoded_evidence: str,
+    expected_marker: str,
+) -> None:
+    path = tmp_path / "encoded_credential_key.msgpack"
+    create_msgpack_file(path, {encoded_evidence: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert encoded_evidence not in serialized
+    assert "ENCODEDSECRET123456" not in serialized
+    assert "user:pass" not in serialized
+    assert expected_marker in serialized
+
+
+@pytest.mark.parametrize(
     ("metadata_key", "expected_key"),
     [
         (b"token\xff=INVALIDUTF8SECRET123456789", "<redacted>"),

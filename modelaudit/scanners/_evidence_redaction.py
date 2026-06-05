@@ -42,7 +42,7 @@ STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")(?![A-Za-z0-9])"
 )
-PERCENT_ENCODED_SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.+/=-]){20,}")
+PERCENT_ENCODED_SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.+/=-]){7,}")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -644,10 +644,9 @@ def _redact_percent_encoded_secret_candidate(match: re.Match[str], *, url_depth:
         if STANDALONE_SECRET_RE.search(decoded):
             return REDACTED_EVIDENCE_VALUE
         normalized_decoded = _remove_unsafe_evidence_characters(decoded)
-        if normalized_decoded != decoded:
-            redacted_decoded = redact_evidence_string(normalized_decoded, max_chars=None, _url_depth=url_depth)
-            if redacted_decoded != normalized_decoded:
-                return redacted_decoded
+        redacted_decoded = redact_evidence_string(normalized_decoded, max_chars=None, _url_depth=url_depth)
+        if redacted_decoded != normalized_decoded:
+            return redacted_decoded
     else:
         # Excessively nested encoding is attacker-controlled and too opaque to
         # preserve safely in evidence.
