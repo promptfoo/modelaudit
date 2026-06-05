@@ -251,7 +251,7 @@ class PyTorchZipScanner(BaseScanner):
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
-    MAX_VERSION_JSON_BYTES: ClassVar[int] = 1024 * 1024
+    MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
@@ -260,6 +260,7 @@ class PyTorchZipScanner(BaseScanner):
     ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
     LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_size_limit"
+    VERSION_METADATA_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_read_failed"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -2430,11 +2431,34 @@ class PyTorchZipScanner(BaseScanner):
                 },
             )
             return None
+        except Exception as exc:
+            mark_inconclusive_scan_result(result, self.VERSION_METADATA_READ_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="PyTorch Version Metadata Read",
+                passed=False,
+                message=f"Could not read version metadata in {name}: {exc!s}",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:{name}",
+                details={
+                    "zip_entry": name,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.VERSION_METADATA_READ_INCONCLUSIVE_REASON,
+                },
+            )
+            return None
 
     @classmethod
     def _version_metadata_analysis_incomplete(cls, result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
-        return isinstance(reasons, list) and cls.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON in reasons
+        return isinstance(reasons, list) and any(
+            reason in reasons
+            for reason in (
+                cls.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON,
+                cls.VERSION_METADATA_READ_INCONCLUSIVE_REASON,
+            )
+        )
 
     def _extract_pytorch_version_info(
         self,
