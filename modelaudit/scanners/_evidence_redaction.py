@@ -20,6 +20,23 @@ MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"AIza[0-9A-Za-z_-]{35}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[opsur]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"glpat-[A-Za-z0-9_-]{20}|"
+    r"npm_[A-Za-z0-9]{36}|"
+    r"sq0atp-[0-9A-Za-z_-]{22}|"
+    r"sq0csp-[0-9A-Za-z_-]{43}|"
+    r"(?:stripe|[sr]k)_live_[A-Za-z0-9]{24}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")(?![A-Za-z0-9])"
+)
+PERCENT_ENCODED_SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.+/=-]){20,}")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -636,6 +653,72 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
     )
 
 
+def _decode_percent_layer_with_spans(
+    value: str,
+    source_spans: list[tuple[int, int]],
+) -> tuple[str, list[tuple[int, int]]]:
+    decoded_chars: list[str] = []
+    decoded_spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(value):
+        if (
+            index + 2 < len(value)
+            and value[index] == "%"
+            and all(char in "0123456789abcdefABCDEF" for char in value[index + 1 : index + 3])
+        ):
+            decoded_chars.append(chr(int(value[index + 1 : index + 3], 16)))
+            decoded_spans.append((source_spans[index][0], source_spans[index + 2][1]))
+            index += 3
+            continue
+
+        decoded_chars.append(value[index])
+        decoded_spans.append(source_spans[index])
+        index += 1
+
+    return "".join(decoded_chars), decoded_spans
+
+
+def _redact_percent_encoded_secret_candidate(match: re.Match[str]) -> str:
+    raw_value = match.group(0)
+    if "%" not in raw_value:
+        return raw_value
+
+    decoded = raw_value
+    source_spans = [(index, index + 1) for index in range(len(raw_value))]
+    secret_spans: list[tuple[int, int]] = []
+    for _ in range(3):
+        next_decoded, next_source_spans = _decode_percent_layer_with_spans(decoded, source_spans)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+        source_spans = next_source_spans
+        for secret_match in STANDALONE_SECRET_RE.finditer(decoded):
+            secret_spans.append(
+                (
+                    source_spans[secret_match.start()][0],
+                    source_spans[secret_match.end() - 1][1],
+                )
+            )
+
+    if not secret_spans:
+        return raw_value
+
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in sorted(secret_spans):
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(end, merged_spans[-1][1]))
+        else:
+            merged_spans.append((start, end))
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in merged_spans:
+        parts.extend((raw_value[cursor:start], REDACTED_EVIDENCE_VALUE))
+        cursor = end
+    parts.append(raw_value[cursor:])
+    return "".join(parts)
+
+
 def _contains_nested_url_secret(value: str) -> bool:
     """Detect credential-bearing URLs embedded inside decoded query values."""
     for match in URL_RE.finditer(value):
@@ -991,6 +1074,8 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = _redact_leftward_assignment_expressions(redacted)
     redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), redacted)
+    redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
+    redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(_redact_percent_encoded_secret_candidate, redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)

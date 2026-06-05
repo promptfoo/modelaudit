@@ -82,10 +82,6 @@ _COMMAND_RE = re.compile(
 )
 _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)")
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
-_HIGH_CONFIDENCE_SECRET_RE = re.compile(
-    r"(?:AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9]{48}|"
-    r"gh[ps]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|glpat-[A-Za-z0-9_-]{20})"
-)
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
 
@@ -93,7 +89,6 @@ _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
     sanitized = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, text)
-    sanitized = _HIGH_CONFIDENCE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, sanitized)
     return redact_evidence_string(sanitized, max_chars=max_chars)
 
 

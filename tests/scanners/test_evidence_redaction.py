@@ -3,6 +3,8 @@
 import json
 from urllib.parse import quote
 
+import pytest
+
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
@@ -416,6 +418,86 @@ def test_redacts_legacy_access_identifier_assignments() -> None:
     assert "service-account" not in redacted
     assert "AWSAccessKeyId=<redacted>" in redacted
     assert "google_access_id=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gho_" + ("a" * 36),
+        "ghu_" + ("a" * 36),
+        "ghr_" + ("a" * 36),
+        "sk-proj-" + ("a" * 32),
+        "npm_" + ("a" * 36),
+        "xoxb-" + ("a" * 24),
+    ],
+)
+def test_redacts_standalone_secret_tokens(secret: str) -> None:
+    redacted = redact_evidence_string(f"prefix {secret} suffix", max_chars=None)
+
+    assert redacted == f"prefix {REDACTED_EVIDENCE_VALUE} suffix"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gho%5F" + ("a" * 36),
+        "gho%255F" + ("a" * 36),
+        "".join(f"%{ord(char):02X}" for char in ("gho_" + ("a" * 36))),
+    ],
+)
+def test_redacts_percent_encoded_standalone_secret_tokens(secret: str) -> None:
+
+    redacted = redact_evidence_string(f"prefix {secret} suffix", max_chars=None)
+
+    assert redacted == f"prefix {REDACTED_EVIDENCE_VALUE} suffix"
+
+
+def test_redacts_multiple_percent_encoded_secrets_without_losing_context() -> None:
+    github_token = "gho%5F" + ("a" * 36)
+    npm_token = "npm%5F" + ("b" * 36)
+    text = f"left-{github_token}-middle-{npm_token}-right"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert redacted == f"left-{REDACTED_EVIDENCE_VALUE}-middle-{REDACTED_EVIDENCE_VALUE}-right"
+
+
+@pytest.mark.parametrize(
+    ("text_template", "expected_template"),
+    [
+        ("prefix-{secret}-suffix", "prefix-{redacted}-suffix"),
+        ("id={secret}.log", "id={redacted}.log"),
+        ("left/{secret}/right", "left/{redacted}/right"),
+    ],
+)
+def test_percent_encoded_secret_redaction_preserves_surrounding_context(
+    text_template: str,
+    expected_template: str,
+) -> None:
+    secret = "gho%5F" + ("a" * 36)
+    text = text_template.format(secret=secret)
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert redacted == expected_template.format(redacted=REDACTED_EVIDENCE_VALUE)
+
+
+@pytest.mark.parametrize(
+    "near_match",
+    [
+        "gho_" + ("a" * 35),
+        "prefixgho_" + ("a" * 36),
+        "sk-" + ("a" * 23),
+        "sk-proj-example",
+        "npm_" + ("a" * 35),
+        "xoxb-" + ("a" * 19),
+        "gho%5F" + ("a" * 35),
+    ],
+)
+def test_preserves_standalone_secret_near_matches(near_match: str) -> None:
+    text = f"prefix {near_match} suffix"
+
+    assert redact_evidence_string(text, max_chars=None) == text
 
 
 def test_existing_token_assignment_redaction_still_applies() -> None:
