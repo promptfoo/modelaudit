@@ -28,7 +28,9 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     (
         r"([?&;][^=\s&;]*(?:signature|credential|security-token|access-key|access_key|accesskey|token|"
-        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&;]*=)[^\s&#;]+"
+        r"secret|api-key|api_key|apikey|password|passwd|pwd|authorization|auth|bearer|private-key|"
+        r"private_key|privatekey|refresh-token|refresh_token|refreshtoken|client-secret|client_secret|"
+        r"clientsecret|session|sig|sas)[^=\s&;]*=)[^\s&#;]+"
     ),
     re.IGNORECASE,
 )
@@ -98,6 +100,17 @@ def redact_stream_url_for_display(url: str) -> str:
     except Exception:
         return "<cloud URL redacted>"
     return redact_url_for_display(url)
+
+
+def redact_stream_error_for_display(message: object, source_url: str) -> str:
+    """Remove a stream source URL from exception text, including malformed identifiers."""
+    safe_url = redact_stream_url_for_display(source_url)
+    redacted = str(message)
+    if not source_url:
+        return redact_cloud_error_for_display(redacted.replace("stream://", f"stream://{safe_url}"))
+    redacted = redacted.replace(f"stream://{source_url}", f"stream://{safe_url}")
+    redacted = redacted.replace(source_url, safe_url)
+    return redact_cloud_error_for_display(redacted)
 
 
 def _bound_cloud_metadata_error_display(message: str) -> str:

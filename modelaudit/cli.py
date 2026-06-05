@@ -68,6 +68,7 @@ from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cloud_url,
     redact_cloud_error_for_display,
+    redact_stream_error_for_display,
     redact_stream_url_for_display,
     redact_url_for_display,
 )
@@ -110,7 +111,7 @@ def _display_scan_path(path: str) -> str:
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
     if path.startswith("stream://"):
-        return redact_cloud_error_for_display(error, path[9:])
+        return redact_stream_error_for_display(error, path[9:])
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 

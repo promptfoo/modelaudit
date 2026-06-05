@@ -21,6 +21,7 @@ from modelaudit.utils.sources.cloud_storage import (
     get_cloud_object_size,
     is_cloud_url,
     redact_cloud_error_for_display,
+    redact_stream_error_for_display,
     redact_stream_url_for_display,
     redact_url_for_display,
 )
@@ -118,6 +119,20 @@ class TestCloudURLRedaction:
         url = "bucket/model.bin?redirect=https://safe.example&token=secret"
         assert redact_stream_url_for_display(url) == "<cloud URL redacted>"
 
+    def test_redact_stream_error_for_display_removes_unknown_malformed_query(self) -> None:
+        url = "bucket/model.bin?session=secret-value"
+        message = f"failed to open stream://{url}"
+
+        redacted = redact_stream_error_for_display(message, url)
+
+        assert redacted == "failed to open stream://<cloud URL redacted>"
+        assert "secret-value" not in redacted
+
+    def test_redact_stream_error_for_display_handles_empty_source(self) -> None:
+        assert redact_stream_error_for_display("failed to open stream://", "") == (
+            "failed to open stream://<cloud URL redacted>"
+        )
+
     def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
         url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
         message = f"Forbidden while opening {url}"
@@ -140,6 +155,19 @@ class TestCloudURLRedaction:
         assert "token=<redacted>" in redacted
         assert "secret" not in redacted
         assert "abc123" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_common_credential_aliases(self) -> None:
+        message = (
+            "request failed: https://example.test/c2?campaign=test&session=secret-session&password=secret-password"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "campaign=test" in redacted
+        assert "session=<redacted>" in redacted
+        assert "password=<redacted>" in redacted
+        assert "secret-session" not in redacted
+        assert "secret-password" not in redacted
 
     def test_redact_cloud_error_for_display_redacts_semicolon_query_credentials(self) -> None:
         message = "provider failed: https://example.com/model.bin?visible=yes;token=secret-value"

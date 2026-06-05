@@ -466,10 +466,10 @@ def _redact_text_for_sarif(text: str) -> str:
 
 
 def _redact_url_token_for_sarif(url: str) -> str:
-    """Keep already-sanitized query context without weakening raw URL redaction."""
-    if "<redacted>" in url:
-        return _redact_cloud_error_for_display(url)
-    return _redact_path_for_sarif(url)
+    """Redact credentials while preserving benign query context in evidence text."""
+    if url.startswith("stream://"):
+        return _redact_path_for_sarif(url)
+    return _redact_cloud_error_for_display(url)
 
 
 def _redact_value_for_sarif(value: Any) -> Any:

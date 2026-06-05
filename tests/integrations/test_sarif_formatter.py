@@ -137,6 +137,27 @@ class TestFormatSarifOutput:
         assert "remaining-secret" not in output
         assert "https://collector.example/upload<redacted>" not in output
 
+    def test_raw_url_preserves_benign_query_context_while_redacting_credentials(self) -> None:
+        """Finding evidence keeps useful query context without retaining credentials."""
+        raw_url = "https://evil.example/c2?campaign=test&session=secret-session&token=secret-token"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Detected callback {raw_url}",
+                severity=IssueSeverity.WARNING,
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "campaign=test" in output
+        assert "session=<redacted>" in output
+        assert "token=<redacted>" in output
+        assert "secret-session" not in output
+        assert "secret-token" not in output
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()

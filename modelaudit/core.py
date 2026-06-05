@@ -111,6 +111,9 @@ from modelaudit.utils.sources.cloud_storage import (
     redact_cloud_error_for_display as _redact_cloud_error_for_display,
 )
 from modelaudit.utils.sources.cloud_storage import (
+    redact_stream_error_for_display as _redact_stream_error_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
     redact_stream_url_for_display as _redact_stream_url_for_display,
 )
 
@@ -177,7 +180,7 @@ def _redacted_scan_path_for_reporting(path: str) -> str:
 
 def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
     if path.startswith("stream://"):
-        return _redact_cloud_error_for_display(error, path[9:])
+        return _redact_stream_error_for_display(error, path[9:])
     return str(error)
 
 
