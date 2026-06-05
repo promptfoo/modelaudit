@@ -312,6 +312,31 @@ class TestJFrogDownload:
         )
 
         assert result.read_bytes() == b"12345"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_interrupt_removes_partial_file_and_preserves_cache(
+        self,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Interrupts must not leak partial files or replace existing cache entries."""
+        existing_file = tmp_path / "model.bin"
+        existing_file.write_bytes(b"old")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {}
+        mock_response.iter_content.side_effect = KeyboardInterrupt
+        mock_get.return_value = mock_response
+
+        with pytest.raises(KeyboardInterrupt):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                max_size=5,
+            )
+
+        assert existing_file.read_bytes() == b"old"
+        assert not list(tmp_path.glob(".model.bin.*.tmp"))
         mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
@@ -1384,6 +1409,118 @@ class TestJFrogFolderListing:
                 selective=False,
             )
 
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_rejects_encoded_traversal(self, mock_detect: MagicMock) -> None:
+        """Prepared URL normalization must not escape the requested folder."""
+        mock_detect.return_value = {
+            "type": "folder",
+            "children": [{"uri": "/%2e%2e/secret.pt", "folder": False, "size": 4}],
+        }
+
+        with pytest.raises(ValueError, match="Unsafe JFrog child path"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                recursive=False,
+                selective=False,
+            )
+
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_allows_encoded_filename(self, mock_detect: MagicMock) -> None:
+        """Benign percent-encoded filename characters should remain supported."""
+        mock_detect.return_value = {
+            "type": "folder",
+            "children": [{"uri": "/model%20v1.pt", "folder": False, "size": 4}],
+        }
+
+        files = list_jfrog_folder_contents(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            recursive=False,
+            selective=False,
+        )
+
+        assert files[0]["path"].endswith("/model%20v1.pt")
+
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_rejects_invalid_encoded_utf8(self, mock_detect: MagicMock) -> None:
+        """Invalid encoded bytes must not collapse into a shared canonical path."""
+        mock_detect.return_value = {
+            "type": "folder",
+            "children": [{"uri": "/%FF/model.pt", "folder": False, "size": 4}],
+        }
+
+        with pytest.raises(ValueError, match="Unsafe JFrog child path"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                recursive=False,
+                selective=False,
+            )
+
+    @patch("modelaudit.utils.sources.jfrog._MAX_JFROG_LISTING_ENTRIES", 1)
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_caps_entries(self, mock_detect: MagicMock) -> None:
+        """Wide listings must fail closed before accumulating unbounded metadata."""
+        mock_detect.return_value = {
+            "type": "folder",
+            "children": [
+                {"uri": "/first.pt", "folder": False, "size": 4},
+                {"uri": "/second.pt", "folder": False, "size": 4},
+            ],
+        }
+
+        with pytest.raises(Exception, match="maximum of 1 entries"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                recursive=False,
+                selective=False,
+            )
+
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_skips_repeated_folder(self, mock_detect: MagicMock) -> None:
+        """Canonical duplicate folder references should be traversed only once."""
+
+        def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict[str, object]:
+            if url.rstrip("/").endswith("models"):
+                return {
+                    "type": "folder",
+                    "children": [
+                        {"uri": "/subdir", "folder": True},
+                        {"uri": "/%73ubdir", "folder": True},
+                    ],
+                }
+            return {
+                "type": "folder",
+                "children": [{"uri": "/model.pt", "folder": False, "size": 4}],
+            }
+
+        mock_detect.side_effect = mock_detect_side_effect
+
+        files = list_jfrog_folder_contents(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            recursive=True,
+            selective=False,
+        )
+
+        assert [file_info["name"] for file_info in files] == ["model.pt"]
+        assert mock_detect.call_count == 3
+
+    @patch("modelaudit.utils.sources.jfrog._MAX_JFROG_LISTED_FOLDERS", 1)
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_caps_folders(self, mock_detect: MagicMock) -> None:
+        """Folder traversal should stop before fetching beyond the configured cap."""
+        mock_detect.return_value = {
+            "type": "folder",
+            "children": [{"uri": "/subdir", "folder": True}],
+        }
+
+        with pytest.raises(Exception, match="maximum of 1 folders"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                recursive=True,
+                selective=False,
+            )
+
+        assert mock_detect.call_count == 2
+
 
 class TestJFrogFolderDownload:
     """Test JFrog folder download functionality."""
@@ -1638,7 +1775,7 @@ class TestJFrogFolderDownload:
         ]
         mock_get.return_value = _FakeStreamingResponse(b"not-a-model")
 
-        with pytest.raises(ValueError, match="content probe download budget exhausted"):
+        with pytest.raises(ValueError, match=r"content probe .*download budget"):
             download_jfrog_folder(
                 "https://company.jfrog.io/artifactory/repo/models/",
                 cache_dir=tmp_path,
@@ -1648,6 +1785,48 @@ class TestJFrogFolderDownload:
             )
 
         mock_get.assert_called_once()
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog._detect_jfrog_content_route_format")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_caps_each_content_probe_with_file_limit(
+        self,
+        mock_list: MagicMock,
+        mock_detect_format: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A per-file limit must also bound selective content-sniff downloads."""
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/model.payload"
+        mock_list.return_value = [
+            {
+                "name": "model.payload",
+                "path": payload_url,
+                "size": 10,
+                "size_known": True,
+                "human_size": "10.0 B",
+            }
+        ]
+
+        def detect_side_effect(*_args: object, **kwargs: object) -> tuple[None, str]:
+            probe_bytes_counter = kwargs["probe_bytes_counter"]
+            assert isinstance(probe_bytes_counter, list)
+            probe_bytes_counter[0] += 5
+            return None, payload_url
+
+        mock_detect_format.side_effect = detect_side_effect
+
+        with pytest.raises(ValueError, match="content probe was truncated by the download budget"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+                max_file_size=5,
+            )
+
+        assert mock_detect_format.call_args.kwargs["max_probe_bytes"] == 5
         mock_download.assert_not_called()
         assert not any(tmp_path.iterdir())
 
@@ -1862,6 +2041,101 @@ class TestJFrogFolderDownload:
         backup_files = list(backup_dir.glob("*.bak"))
         assert len(backup_files) == 1
         assert backup_files[0].read_bytes() == b"original"
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_interrupt_restores_existing_file(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Interrupts must restore caller-owned files before propagating."""
+        existing_file = tmp_path / "model1.pt"
+        existing_file.write_bytes(b"original")
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 3,
+                "size_known": True,
+                "human_size": "3.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 3,
+                "size_known": True,
+                "human_size": "3.0 B",
+            },
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            path = cache_dir / Path(url).name
+            if path.name == "model2.pt":
+                raise KeyboardInterrupt
+            path.write_bytes(b"new")
+            return path
+
+        mock_download.side_effect = download_side_effect
+        with pytest.raises(KeyboardInterrupt):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+                max_size=6,
+            )
+
+        assert existing_file.read_bytes() == b"original"
+        assert not (tmp_path / "model2.pt").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_failure_restores_existing_symlink(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Rollback must preserve an existing cache symlink as a symlink."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        target = cache_dir / "target.pt"
+        target.write_bytes(b"target")
+        existing_link = cache_dir / "model1.pt"
+        existing_link.symlink_to(target)
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 3,
+                "size_known": True,
+                "human_size": "3.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 3,
+                "size_known": True,
+                "human_size": "3.0 B",
+            },
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            path = cache_dir / Path(url).name
+            if path.name == "model2.pt":
+                raise OSError("second download failed")
+            path.unlink()
+            path.write_bytes(b"new")
+            return path
+
+        mock_download.side_effect = download_side_effect
+        with pytest.raises(Exception, match="JFrog folder download failed"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=cache_dir,
+                show_progress=False,
+                max_size=6,
+            )
+
+        assert existing_link.is_symlink()
+        assert existing_link.readlink() == target
+        assert target.read_bytes() == b"target"
+        assert mock_download.call_count == 2
 
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_no_files(self, mock_list):
@@ -3026,7 +3300,12 @@ class TestJFrogFolderDownload:
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
-    def test_download_jfrog_folder_rejects_traversal_paths(self, mock_list, mock_download, tmp_path):
+    def test_download_jfrog_folder_rejects_traversal_paths(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test that traversal paths from JFrog metadata are rejected."""
         mock_list.return_value = [
             {
@@ -3037,7 +3316,7 @@ class TestJFrogFolderDownload:
             }
         ]
 
-        with pytest.raises(Exception, match="JFrog folder download failed"):
+        with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
             download_jfrog_folder(
                 "https://company.jfrog.io/artifactory/repo/models/",
                 cache_dir=tmp_path,

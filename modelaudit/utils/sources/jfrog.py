@@ -15,7 +15,7 @@ from http.cookiejar import CookieJar
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import ParseResult, urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, unquote, urljoin, urlparse, urlunparse
 
 import click
 import requests
@@ -30,6 +30,8 @@ JFROG_DOWNLOAD_CHUNK_SIZE = 8192
 _MAX_JFROG_PROBE_REDIRECTS = 5
 _MAX_JFROG_CONTENT_PROBES = 256
 _MAX_JFROG_REDIRECTS = 5
+_MAX_JFROG_LISTING_ENTRIES = 100_000
+_MAX_JFROG_LISTED_FOLDERS = 10_000
 _JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
@@ -280,6 +282,90 @@ def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
         return None
 
     return parsed_origin if parsed_origin == prepared_origin and parsed_origin[1] else None
+
+
+def _canonical_jfrog_path(url: str) -> tuple[tuple[str, str, int | None], PurePosixPath]:
+    """Return an unambiguous origin and decoded path for a JFrog URL."""
+    origin = _get_jfrog_probe_origin(url)
+    try:
+        prepared_url = requests.Request("GET", url).prepare().url
+    except requests.exceptions.RequestException as exc:
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}") from exc
+    if origin is None or not prepared_url:
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+
+    decoded_path = urlparse(prepared_url).path
+    for _ in range(3):
+        if re.search(r"%(?:2f|5c)", decoded_path, re.IGNORECASE):
+            raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+        try:
+            next_path = unquote(decoded_path, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}") from exc
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    else:
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+
+    path = PurePosixPath(decoded_path)
+    if "\x00" in decoded_path or "\\" in decoded_path or any(part in {".", ".."} for part in path.parts):
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+    return origin, path
+
+
+def _safe_jfrog_child_name(uri: object, folder_url: str) -> str:
+    """Validate one Storage API child URI before following it."""
+    if not isinstance(uri, str) or not uri:
+        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+    parsed = urlparse(uri)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+
+    child_name = uri.lstrip("/")
+    decoded_name = child_name
+    for _ in range(3):
+        if re.search(r"%(?:2f|5c)", decoded_name, re.IGNORECASE):
+            raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+        try:
+            next_name = unquote(decoded_name, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}") from exc
+        if next_name == decoded_name:
+            break
+        decoded_name = next_name
+    else:
+        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+
+    parts = decoded_name.split("/")
+    if not decoded_name or "\\" in decoded_name or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+    return child_name
+
+
+def _safe_jfrog_relative_path(base_url: str, artifact_url: str) -> str:
+    """Return an artifact path only when it remains below the requested folder."""
+    base_origin, base_path = _canonical_jfrog_path(base_url)
+    artifact_origin, artifact_path = _canonical_jfrog_path(artifact_url)
+    if artifact_origin != base_origin:
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(artifact_url)}")
+
+    base_parts = base_path.parts
+    artifact_parts = artifact_path.parts
+    if len(artifact_parts) <= len(base_parts) or artifact_parts[: len(base_parts)] != base_parts:
+        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(artifact_url)}")
+
+    prepared_base_url = requests.Request("GET", base_url).prepare().url
+    prepared_artifact_url = requests.Request("GET", artifact_url).prepare().url
+    if prepared_base_url and prepared_artifact_url:
+        raw_base_parts = PurePosixPath(urlparse(prepared_base_url).path).parts
+        raw_artifact_parts = PurePosixPath(urlparse(prepared_artifact_url).path).parts
+        if (
+            len(raw_artifact_parts) > len(raw_base_parts)
+            and raw_artifact_parts[: len(raw_base_parts)] == raw_base_parts
+        ):
+            return PurePosixPath(*raw_artifact_parts[len(raw_base_parts) :]).as_posix()
+    return PurePosixPath(*artifact_parts[len(base_parts) :]).as_posix()
 
 
 def _is_safe_jfrog_download_target(url: str) -> bool:
@@ -602,6 +688,9 @@ def download_artifact(
         _cleanup_failed_artifact_download(temp_dir, partial_path)
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
+    except BaseException:
+        _cleanup_failed_artifact_download(temp_dir, partial_path)
+        raise
     finally:
         if response is not None:
             response.close()
@@ -639,12 +728,13 @@ def get_storage_api_url(url: str) -> str:
 
 def format_size(size_bytes: int) -> str:
     """Format size in human-readable format."""
-    size = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    absolute_size = abs(size_bytes)
+    for index, unit in enumerate(units):
+        divisor = 1024**index
+        if absolute_size < divisor * 1024:
+            return f"{size_bytes / divisor:.1f} {unit}"
+    return f"{size_bytes} B"
 
 
 def filter_scannable_files(
@@ -1136,6 +1226,7 @@ def _filter_scannable_jfrog_files(
     timeout: int = 30,
     scannable_extensions: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
+    max_probe_bytes_per_file: int | None = None,
     max_total_probe_bytes: int | None = None,
     probe_bytes_counter: list[int] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1163,19 +1254,27 @@ def _filter_scannable_jfrog_files(
         )
         if remaining_probe_bytes is not None and remaining_probe_bytes <= 0:
             raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
+        probe_limits = [
+            limit
+            for limit in (max_probe_bytes_per_file, remaining_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES)
+            if limit is not None
+        ]
+        max_probe_bytes = min(probe_limits)
+        probe_bytes_before = probe_bytes_counter[0]
         detected_format, probe_download_url = _detect_jfrog_content_route_format(
             file_info,
             api_token=api_token,
             access_token=access_token,
             timeout=timeout,
-            max_probe_bytes=(
-                min(_JFROG_CONTENT_SNIFF_BYTES, remaining_probe_bytes)
-                if remaining_probe_bytes is not None
-                else _JFROG_CONTENT_SNIFF_BYTES
-            ),
+            max_probe_bytes=max_probe_bytes,
             probe_bytes_counter=probe_bytes_counter,
         )
         if detected_format is None:
+            probe_bytes_read = probe_bytes_counter[0] - probe_bytes_before
+            if max_probe_bytes < _JFROG_CONTENT_SNIFF_BYTES and probe_bytes_read >= max_probe_bytes:
+                raise ValueError(
+                    "JFrog folder selective filtering incomplete: content probe was truncated by the download budget"
+                )
             continue
         if not _jfrog_detected_format_allowed(detected_format, scanner_selection):
             continue
@@ -1292,6 +1391,8 @@ def list_jfrog_folder_contents(
 
     files = []
     base_url = url.rstrip("/")
+    visited_folders: set[tuple[tuple[str, str, int | None], PurePosixPath]] = set()
+    listing_entry_count = 0
 
     def _collect_files(folder_url: str, depth: int = 0) -> None:
         """Recursively collect files from folder.
@@ -1306,6 +1407,17 @@ def list_jfrog_folder_contents(
                 "Aborting to avoid incomplete file listing."
             )
 
+        nonlocal listing_entry_count
+        folder_identity = _canonical_jfrog_path(folder_url)
+        if folder_identity in visited_folders:
+            return
+        if len(visited_folders) >= _MAX_JFROG_LISTED_FOLDERS:
+            raise Exception(
+                f"JFrog folder listing exceeded the maximum of {_MAX_JFROG_LISTED_FOLDERS} folders. "
+                "Aborting to avoid incomplete or resource-intensive traversal."
+            )
+        visited_folders.add(folder_identity)
+
         folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
 
         if folder_info["type"] != "folder":
@@ -1316,8 +1428,15 @@ def list_jfrog_folder_contents(
             )
 
         for child in folder_info["children"]:
-            child_name = child["uri"].lstrip("/")
+            listing_entry_count += 1
+            if listing_entry_count > _MAX_JFROG_LISTING_ENTRIES:
+                raise Exception(
+                    f"JFrog folder listing exceeded the maximum of {_MAX_JFROG_LISTING_ENTRIES} entries. "
+                    "Aborting to avoid incomplete or resource-intensive traversal."
+                )
+            child_name = _safe_jfrog_child_name(child.get("uri"), folder_url)
             child_url = f"{folder_url.rstrip('/')}/{child_name}"
+            _safe_jfrog_relative_path(base_url, child_url)
 
             if child["folder"]:
                 # It's a subfolder
@@ -1421,6 +1540,8 @@ def download_jfrog_folder(
         fetch_sizes=fetch_sizes or total_limit is not None or per_file_limit is not None,
         **list_kwargs,
     )
+    for file_info in files:
+        _safe_jfrog_relative_path(url, str(file_info["path"]))
     probe_bytes_counter = [0]
     if selective:
         files = _filter_scannable_jfrog_files(
@@ -1430,6 +1551,7 @@ def download_jfrog_folder(
             timeout=timeout,
             scannable_extensions=scannable_extensions,
             scanner_selection=scanner_selection,
+            max_probe_bytes_per_file=per_file_limit,
             max_total_probe_bytes=total_limit,
             probe_bytes_counter=probe_bytes_counter,
         )
@@ -1478,15 +1600,6 @@ def download_jfrog_folder(
         click.echo(f"Found {len(files)} scannable files ({size_info}) in JFrog folder")
 
     # Download each file
-    base_url_parsed = urlparse(url)
-    base_path_parts = base_url_parsed.path.strip("/").split("/")
-
-    try:
-        artifactory_index = base_path_parts.index("artifactory")
-        base_repo_path = "/".join(base_path_parts[artifactory_index + 1 :])
-    except (ValueError, IndexError):
-        base_repo_path = ""
-
     completed_downloads = 0
     downloaded_files: list[Path] = []
     actual_downloaded_size = probe_bytes_counter[0]
@@ -1497,13 +1610,18 @@ def download_jfrog_folder(
 
     def _backup_existing_file(path: Path) -> None:
         nonlocal backup_dir
-        if owns_download_dir or path in backup_paths or not path.exists() or not path.is_file():
+        path_exists = path.exists() or path.is_symlink()
+        if owns_download_dir or path in backup_paths or not path_exists:
             return
+        if path.is_dir() and not path.is_symlink():
+            return
+        if not path.is_file() and not path.is_symlink():
+            raise ValueError(f"Unsupported JFrog cache entry type: {path}")
         protected_existing_paths.add(path)
         if backup_dir is None:
             backup_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_folder_backup_"))
         backup_path = backup_dir / f"{len(backup_paths)}.bak"
-        shutil.copy2(path, backup_path)
+        shutil.copy2(path, backup_path, follow_symlinks=False)
         backup_paths[path] = backup_path
 
     def _restore_backups() -> None:
@@ -1511,7 +1629,13 @@ def download_jfrog_folder(
         for original_path, backup_path in backup_paths.items():
             try:
                 original_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(backup_path, original_path)
+                if original_path.is_dir() and not original_path.is_symlink():
+                    raise IsADirectoryError(f"Cannot restore JFrog cache entry over directory: {original_path}")
+                if (original_path.is_symlink() or backup_path.is_symlink()) and (
+                    original_path.exists() or original_path.is_symlink()
+                ):
+                    original_path.unlink()
+                shutil.copy2(backup_path, original_path, follow_symlinks=False)
             except OSError as exc:
                 backup_restore_failed = True
                 raise Exception(
@@ -1533,20 +1657,7 @@ def download_jfrog_folder(
 
                 # Calculate relative path for local storage
                 file_url_parsed = urlparse(file_info["path"])
-                file_path_parts = file_url_parsed.path.strip("/").split("/")
-
-                try:
-                    file_artifactory_index = file_path_parts.index("artifactory")
-                    file_repo_path = "/".join(file_path_parts[file_artifactory_index + 1 :])
-
-                    if base_repo_path and file_repo_path.startswith(base_repo_path + "/"):
-                        relative_path = file_repo_path[len(base_repo_path) + 1 :]
-                    elif base_repo_path and file_repo_path == base_repo_path:
-                        relative_path = Path(file_info["name"]).name
-                    else:
-                        relative_path = Path(file_info["name"]).name
-                except (ValueError, IndexError):
-                    relative_path = Path(file_info["name"]).name
+                relative_path = _safe_jfrog_relative_path(url, str(file_info["path"]))
 
                 local_file = _safe_download_path(download_dir, relative_path)
                 local_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1592,7 +1703,7 @@ def download_jfrog_folder(
                 completed_downloads += 1
                 downloaded_files.append(downloaded_file)
 
-            except Exception as e:
+            except BaseException as e:
                 redacted_error = redact_jfrog_error_for_display(e)
                 error_msg = f"Failed to download {file_info['name']}: {redacted_error}"
                 logger.warning(error_msg)
@@ -1614,6 +1725,8 @@ def download_jfrog_folder(
                     current_file_candidates=current_file_candidates,
                 )
                 _restore_backups()
+                if not isinstance(e, Exception):
+                    raise
                 raise Exception(
                     "JFrog folder download failed after "
                     f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {redacted_error}"
