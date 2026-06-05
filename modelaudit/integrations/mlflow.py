@@ -343,8 +343,8 @@ def _opened_local_mlflow_path(source_fd: int) -> Path | None:
     if _IS_WINDOWS:
         try:
             import ctypes
+            import ctypes.wintypes
             import msvcrt
-            from ctypes import wintypes
 
             win_dll = getattr(ctypes, "WinDLL", None)
             get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
@@ -353,17 +353,17 @@ def _opened_local_mlflow_path(source_fd: int) -> Path | None:
             kernel32: Any = win_dll("kernel32", use_last_error=True)
             get_final_path = kernel32.GetFinalPathNameByHandleW
             get_final_path.argtypes = (
-                wintypes.HANDLE,
-                wintypes.LPWSTR,
-                wintypes.DWORD,
-                wintypes.DWORD,
+                ctypes.wintypes.HANDLE,
+                ctypes.wintypes.LPWSTR,
+                ctypes.wintypes.DWORD,
+                ctypes.wintypes.DWORD,
             )
-            get_final_path.restype = wintypes.DWORD
+            get_final_path.restype = ctypes.wintypes.DWORD
             buffer = ctypes.create_unicode_buffer(32768)
             handle_value = get_osfhandle(source_fd)
             if handle_value == -1:
                 return None
-            length = int(get_final_path(wintypes.HANDLE(handle_value), buffer, len(buffer), 0))
+            length = int(get_final_path(ctypes.wintypes.HANDLE(handle_value), buffer, len(buffer), 0))
             if length <= 0 or length >= len(buffer):
                 return None
             opened_path = buffer.value

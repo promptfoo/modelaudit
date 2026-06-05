@@ -1,4 +1,5 @@
 import ctypes
+import ctypes.wintypes
 import hashlib
 import os
 import sys
@@ -49,8 +50,6 @@ def test_normalize_mlflow_artifact_path_allows_posix_colons(monkeypatch: pytest.
 
 
 def test_opened_local_mlflow_path_preserves_windows_handle_width(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ctypes import wintypes
-
     handle_value = 1 << 40
 
     class FakeGetFinalPath:
@@ -78,12 +77,12 @@ def test_opened_local_mlflow_path_preserves_windows_handle_width(monkeypatch: py
 
     assert str(_opened_local_mlflow_path(7)) == r"C:\artifacts\model.pkl"
     assert get_final_path.argtypes == (
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
+        ctypes.wintypes.HANDLE,
+        ctypes.wintypes.LPWSTR,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
     )
-    assert get_final_path.restype is wintypes.DWORD
+    assert get_final_path.restype is ctypes.wintypes.DWORD
 
 
 def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path: Path) -> None:
