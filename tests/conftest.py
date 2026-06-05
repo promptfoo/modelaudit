@@ -126,6 +126,7 @@ def pytest_runtest_setup(item):
             "test_license_checker.py",  # License metadata and nearby-license caching tests
             "test_license_integration.py",  # End-to-end license metadata integration tests
             "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
+            "tests/utils/sources/test_dvc_integration.py",  # DVC fail-closed resolution tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
             "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
             "test_flax_msgpack_scanner.py",  # Flax msgpack scanner performance and safety tests
