@@ -2,11 +2,53 @@ import os
 import stat
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 import yaml
 
+from modelaudit.auth import client as auth_client_module
 from modelaudit.auth import config as auth_config
+
+
+class _FakeResponse:
+    ok = True
+    status_code = 200
+    reason = "OK"
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "user": {"email": "user@example.com"},
+            "organization": {"id": "org-1"},
+            "app": {"url": "https://www.promptfoo.app"},
+        }
+
+
+class _FakeCloudConfig:
+    def __init__(self, api_host: str = "https://api.promptfoo.app", api_key: str | None = "secret-token"):
+        self.api_host = api_host
+        self.api_key = api_key
+        self.app_url = ""
+
+    def get_api_host(self) -> str:
+        return self.api_host
+
+    def set_api_host(self, api_host: str) -> None:
+        self.api_host = api_host
+
+    def get_api_key(self) -> str | None:
+        return self.api_key
+
+    def set_api_key(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+        self.api_host = api_host
+        self.api_key = api_key
+        self.app_url = app_url
+
+    def set_app_url(self, app_url: str) -> None:
+        self.app_url = app_url
 
 
 def _patch_config_paths(
@@ -187,3 +229,342 @@ def test_write_global_config_uses_private_file_permissions(
 
     if os.name != "nt":
         assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("api_host", "expected"),
+    [
+        ("https://api.promptfoo.app", "https://api.promptfoo.app"),
+        (" https://API.PROMPTFOO.APP/ ", "https://api.promptfoo.app"),
+        ("https://api.promptfoo.app:443", "https://api.promptfoo.app"),
+        ("https://your-company.promptfoo.app", "https://your-company.promptfoo.app"),
+        ("https://enterprise.example:8443", "https://enterprise.example:8443"),
+        ("https://[::1]:8443", "https://[::1]:8443"),
+    ],
+)
+def test_validate_api_host_for_bearer_auth_accepts_configured_https_hosts(api_host: str, expected: str) -> None:
+    assert auth_config.validate_api_host_for_bearer_auth(api_host) == expected
+
+
+@pytest.mark.parametrize(
+    "api_host",
+    [
+        "http://api.promptfoo.app",
+        "api.promptfoo.app",
+        "http://127.0.0.1:3000",
+        "https://user:pass@api.promptfoo.app",
+        "https://@api.promptfoo.app",
+        "https://api.promptfoo.app/path",
+        "https://api.promptfoo.app?token=leak",
+        "https://api.promptfoo.app\\@attacker.example",
+        "https://api.promptfoo.app%5c@attacker.example",
+        "https://api.promptfoo.app\n.attacker.example",
+        "https://api.promptfoo.app\x7f.attacker.example",
+        "https://api.promptfoo.app:0",
+        "https://api.promptfoo.app:65536",
+    ],
+)
+def test_validate_api_host_for_bearer_auth_rejects_unsafe_hosts(api_host: str) -> None:
+    with pytest.raises(ValueError, match="API host for bearer-token authentication"):
+        auth_config.validate_api_host_for_bearer_auth(api_host)
+
+
+def test_cloud_config_set_api_host_rejects_non_https_hosts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    cloud_config = auth_config.CloudConfig()
+
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        cloud_config.set_api_host("http://attacker.example")
+
+
+def test_cloud_config_set_api_host_accepts_enterprise_https_hosts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    cloud_config = auth_config.CloudConfig()
+    cloud_config.set_api_host("https://ENTERPRISE.EXAMPLE:8443/")
+
+    assert cloud_config.get_api_host() == "https://enterprise.example:8443"
+
+
+def test_cloud_config_set_api_host_rolls_back_in_memory_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def fail_save() -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cloud_config, "_save_config", fail_save)
+
+    with pytest.raises(OSError, match="disk full"):
+        cloud_config.set_api_host("https://new-api.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_cloud_config_set_api_host_detects_silent_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def silently_restore_old_config() -> None:
+        cloud_config.config = dict(old_config)
+
+    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
+
+    with pytest.raises(OSError, match="Unable to persist cloud API host"):
+        cloud_config.set_api_host("https://new-api.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_validate_and_set_api_token_rejects_untrusted_host_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
+        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
+
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
+
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        auth_client_module.AuthClient().validate_and_set_api_token("secret-token", "http://api.promptfoo.app")
+
+
+def test_auth_login_rejects_untrusted_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
+        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
+
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["auth", "login", "--api-key", "secret-token", "--host", "http://api.promptfoo.app"],
+    )
+
+    assert result.exit_code == 1
+    assert "Authentication failed: API host for bearer-token authentication must use HTTPS" in result.output
+
+
+def test_auth_login_accepts_explicit_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    fake_config = _FakeCloudConfig()
+    requested_urls: list[str] = []
+
+    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
+    monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["auth", "login", "--api-key", "secret-token", "--host", "https://ENTERPRISE.EXAMPLE:8443/"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Successfully logged in" in result.output
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert fake_config.api_host == "https://enterprise.example:8443"
+
+
+def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalized_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_config = _FakeCloudConfig()
+    requested_urls: list[str] = []
+    requested_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        requested_kwargs.append(kwargs)
+        return _FakeResponse()
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+
+    result = auth_client_module.AuthClient().validate_and_set_api_token(
+        "secret-token",
+        "https://ENTERPRISE.EXAMPLE:8443/",
+    )
+
+    assert result["user"].email == "user@example.com"
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert requested_kwargs[0]["allow_redirects"] is False
+    assert fake_config.api_host == "https://enterprise.example:8443"
+    assert fake_config.api_key == "secret-token"
+
+
+def test_validate_and_set_api_token_does_not_change_credentials_when_atomic_persistence_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingCredentialsConfig(_FakeCloudConfig):
+        def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+            raise OSError(f"cannot persist {api_host}, {api_key}, {app_url}")
+
+    fake_config = FailingCredentialsConfig(api_host="https://old.example", api_key="old-token")
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", lambda _url, **_kwargs: _FakeResponse())
+
+    with pytest.raises(OSError, match="cannot persist"):
+        auth_client_module.AuthClient().validate_and_set_api_token(
+            "new-token",
+            "https://safe.example",
+        )
+
+    assert fake_config.api_host == "https://old.example"
+    assert fake_config.api_key == "old-token"
+
+
+def test_cloud_config_set_credentials_uses_one_cloud_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    cloud_config.config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    writes: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(auth_config, "write_global_config_partial", lambda partial: writes.append(partial))
+    monkeypatch.setattr(cloud_config, "_reload", lambda: None)
+
+    cloud_config.set_credentials("https://NEW-API.EXAMPLE:443/", "new-token", "https://new-app.example")
+
+    expected_cloud_config = {
+        "appUrl": "https://new-app.example",
+        "apiHost": "https://new-api.example",
+        "apiKey": "new-token",
+    }
+    assert cloud_config.config == expected_cloud_config
+    assert writes == [{"cloud": expected_cloud_config}]
+
+
+def test_cloud_config_set_credentials_rolls_back_in_memory_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def fail_write(_partial: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(auth_config, "write_global_config_partial", fail_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        cloud_config.set_credentials("https://new-api.example", "new-token", "https://new-app.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_cloud_config_set_credentials_detects_silent_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def silently_restore_old_config() -> None:
+        cloud_config.config = dict(old_config)
+
+    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
+
+    with pytest.raises(OSError, match="Unable to persist cloud authentication credentials"):
+        cloud_config.set_credentials("https://new-api.example", "new-token", "https://new-app.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_validate_and_set_api_token_rejects_redirect_response_without_persisting_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RedirectResponse(_FakeResponse):
+        status_code = 302
+        reason = "Found"
+
+    fake_config = _FakeCloudConfig(api_host="https://old.example", api_key="old-token")
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", lambda _url, **_kwargs: RedirectResponse())
+
+    with pytest.raises(Exception, match="Failed to validate API token: Found"):
+        auth_client_module.AuthClient().validate_and_set_api_token(
+            "new-token",
+            "https://safe.example",
+        )
+
+    assert fake_config.api_host == "https://old.example"
+    assert fake_config.api_key == "old-token"
+
+
+def test_get_user_info_rejects_non_https_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_config = _FakeCloudConfig(api_host="http://attacker.example", api_key="secret-token")
+
+    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
+        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
+
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        auth_client_module.AuthClient().get_user_info()
+
+
+def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_config = _FakeCloudConfig(api_host="https://enterprise.example:8443", api_key="secret-token")
+    requested_urls: list[str] = []
+    requested_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        requested_kwargs.append(kwargs)
+        return _FakeResponse()
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+
+    auth_client_module.AuthClient().get_user_info()
+
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert requested_kwargs[0]["allow_redirects"] is False

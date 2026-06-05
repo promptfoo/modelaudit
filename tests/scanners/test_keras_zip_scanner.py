@@ -23,6 +23,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
+from modelaudit.scanners import keras_utils as keras_utils_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import (
@@ -132,6 +133,66 @@ def create_external_link_weights_h5(tmp_path: Path) -> Path:
     return weights_path
 
 
+def create_external_storage_weights_h5(tmp_path: Path) -> Path:
+    """Create a weights H5 file containing an HDF5 external-storage dataset."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    weights_path = tmp_path / "external_storage.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return weights_path
+
+
+def create_cyclic_external_link_weights_h5(tmp_path: Path) -> Path:
+    """Create weights with an ExternalLink plus a hard-link cycle."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+
+    weights_path = tmp_path / "cyclic_external_link.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        loop = f.create_group("loop")
+        loop["self"] = loop
+        f["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    return weights_path
+
+
+def create_cyclic_external_storage_weights_h5(tmp_path: Path) -> Path:
+    """Create weights with external storage plus a hard-link cycle."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    weights_path = tmp_path / "cyclic_external_storage.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        loop = f.create_group("loop")
+        loop["self"] = loop
+        f.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return weights_path
+
+
 def create_regular_weights_h5(tmp_path: Path) -> Path:
     """Create a benign embedded weights H5 file."""
     if h5py is None:
@@ -140,6 +201,19 @@ def create_regular_weights_h5(tmp_path: Path) -> Path:
     weights_path = tmp_path / "model.weights.h5"
     with h5py.File(weights_path, "w") as f:
         f.create_dataset("kernel", data=[1.0, 2.0])
+    return weights_path
+
+
+def create_virtual_dataset_weights_h5(tmp_path: Path) -> Path:
+    """Create weights containing a virtual dataset backed by another HDF5 file."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    layout = h5py.VirtualLayout(shape=(2,), dtype="float32")
+    layout[:] = h5py.VirtualSource("virtual_source.h5", "payload", shape=(2,))
+    weights_path = tmp_path / "virtual_dataset.weights.h5"
+    with h5py.File(weights_path, "w", libver="latest") as f:
+        f.create_virtual_dataset("virtual_kernel", layout)
     return weights_path
 
 
@@ -195,32 +269,519 @@ class TestKerasZipScanner:
             },
         ]
 
-    def test_embedded_hdf5_external_references_warn_on_fixed_archive_metadata(self, tmp_path: Path) -> None:
-        """Archive-claimed fixed metadata should not suppress embedded external-reference evidence."""
+    @pytest.mark.parametrize(
+        "weights_factory",
+        [create_external_link_weights_h5, create_external_storage_weights_h5],
+    )
+    def test_embedded_hdf5_external_references_warn_despite_fixed_metadata(
+        self,
+        tmp_path: Path,
+        weights_factory: Any,
+    ) -> None:
+        """Archive-controlled fixed-version metadata must not suppress embedded HDF5 references."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
             {"class_name": "Sequential", "config": {"layers": []}},
             keras_version="3.12.1",
-            weights_h5_path=create_external_link_weights_h5(tmp_path),
+            weights_h5_path=weights_factory(tmp_path),
         )
 
         result = scanner.scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == "3.12.1"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
         assert cve_issues[0].details["metadata_only_assessment"] is True
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
-        assert cve_issues[0].details["version_source"] == "keras_archive_metadata"
-        metadata_checks = [
-            check
+        assert any(
+            check.name == "HDF5 External Weight Reference Metadata Check" and check.status == CheckStatus.FAILED
             for check in result.checks
-            if check.name == "HDF5 External Weight Reference Risk (Untrusted Version Metadata)"
+        )
+        assert not any(
+            check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+            for check in result.checks
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_hdf5_link_traversal_detects_nested_external_link_without_following(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Compatibility traversal must see ExternalLink entries without relying on h5py 3.11 APIs."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        external_source = tmp_path / "external_source.h5"
+        with h5py.File(external_source, "w") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+
+        weights_path = tmp_path / "nested_external.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            dense_group = f.create_group("layers").create_group("dense")
+            dense_group["kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/layers/dense/kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
         ]
-        assert len(metadata_checks) == 1
-        assert metadata_checks[0].status == CheckStatus.FAILED
+
+    def test_detects_hdf5_virtual_dataset_external_source(self, tmp_path: Path) -> None:
+        """Virtual datasets must be treated as external HDF5 references."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=create_virtual_dataset_weights_h5(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["external_references"] == [
+            {
+                "kind": "virtual_dataset",
+                "hdf5_path": "/virtual_kernel",
+                "sources": [{"filename": "virtual_source.h5", "dataset_path": "payload"}],
+            }
+        ]
+
+    def test_same_file_hdf5_virtual_dataset_is_not_external(self, tmp_path: Path) -> None:
+        """The HDF5 '.' VDS filename references the current file and must remain benign."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "same_file_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0])
+            layout = h5py.VirtualLayout(shape=(1,), dtype="float64")
+            layout[:] = h5py.VirtualSource(".", "payload", shape=(1,))
+            f.create_virtual_dataset("virtual_kernel", layout)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == []
+
+    def test_same_file_virtual_source_does_not_hide_later_external_source(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Evidence caps must not stop inspection before a later external VDS source."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "mixed_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            layout[0] = h5py.VirtualSource(".", "payload", shape=(2,))[0]
+            layout[1] = h5py.VirtualSource("external_source.h5", "payload", shape=(2,))[1]
+            f.create_virtual_dataset("virtual_kernel", layout)
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 1)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "virtual_dataset",
+                "hdf5_path": "/virtual_kernel",
+                "sources": [{"filename": "external_source.h5", "dataset_path": "payload"}],
+            }
+        ]
+
+    def test_hdf5_virtual_source_visit_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A same-file VDS prefix must not hide an external source beyond the visit budget."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "bounded_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            layout[0] = h5py.VirtualSource(".", "payload", shape=(2,))[0]
+            layout[1] = h5py.VirtualSource("external_source.h5", "payload", shape=(2,))[1]
+            f.create_virtual_dataset("virtual_kernel", layout)
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_VIRTUAL_SOURCE_VISITS", 1)
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            reason,
+            "Embedded HDF5 External Reference Analysis Limit",
+        )
+
+    @pytest.mark.parametrize(
+        ("weights_factory", "expected_kind"),
+        [
+            (create_cyclic_external_link_weights_h5, "ExternalLink"),
+            (create_cyclic_external_storage_weights_h5, "external_storage"),
+        ],
+    )
+    def test_embedded_hdf5_external_references_warn_despite_hard_link_cycle(
+        self,
+        tmp_path: Path,
+        weights_factory: Any,
+        expected_kind: str,
+    ) -> None:
+        """Hard-link cycles must not turn embedded HDF5 external references into exit-2 scans."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.1",
+            weights_h5_path=weights_factory(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert cve_issues[0].details["external_references"][0]["kind"] == expected_kind
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_hdf5_link_traversal_fallback_identity_handles_hard_link_cycle(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Low-level HDF5 metadata failures must not break cycle-safe traversal."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = create_cyclic_external_link_weights_h5(tmp_path)
+        monkeypatch.setattr(
+            h5py.h5o,
+            "get_info",
+            lambda _object_id: (_ for _ in ()).throw(RuntimeError("object info unavailable")),
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_LINK_VISITS", 8)
+        analysis: dict[str, Any] = {}
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file, analysis=analysis)
+
+        assert findings == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/linked_kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+        assert analysis["link_visits_truncated"] is False
+        assert analysis["visited_link_count"] == 3
+
+    def test_hdf5_link_traversal_does_not_resolve_soft_links(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SoftLink aliases must not be dereferenced while collecting external-reference metadata."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        external_source = tmp_path / "external_source.h5"
+        with h5py.File(external_source, "w") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+
+        weights_path = tmp_path / "soft_alias.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f["external_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+            f["soft_alias"] = h5py.SoftLink("/external_kernel")
+
+        original_get = h5py.Group.get
+
+        def guarded_get(
+            self: Any,
+            name: Any,
+            default: Any = None,
+            getclass: bool = False,
+            getlink: bool = False,
+        ) -> Any:
+            if name == "soft_alias" and not getlink:
+                raise AssertionError("SoftLink target was followed")
+            return original_get(self, name, default=default, getclass=getclass, getlink=getlink)
+
+        monkeypatch.setattr(h5py.Group, "get", guarded_get)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/external_kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+
+    def test_hdf5_external_reference_text_evidence_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Long HDF5 paths and link values must not create oversized finding evidence."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "long_reference_text.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            nested_group = f.create_group("long_group_name")
+            nested_group["long_external_link_name"] = h5py.ExternalLink(
+                "long_external_filename.h5",
+                "/long_external_target_path",
+            )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_REFERENCE_TEXT_CHARS", 12)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert len(findings) == 1
+        assert findings[0]["hdf5_path"] == "/long_group_n"
+        assert findings[0]["hdf5_path_truncated"] is True
+        assert findings[0]["filename"] == "long_externa"
+        assert findings[0]["filename_truncated"] is True
+        assert findings[0]["path"] == "/long_extern"
+        assert findings[0]["path_truncated"] is True
+
+    def test_hdf5_external_reference_evidence_is_redacted(self, tmp_path: Path) -> None:
+        """External-reference paths must not leak embedded credentials or tokens."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        password_secret = "HDF5_PASSWORD_SECRET"
+        query_secret = "HDF5_QUERY_SECRET"
+        link_name_secret = "HDF5_LINK_NAME_SECRET"
+        target_secret = "HDF5_TARGET_SECRET"
+        storage_secret = "HDF5_STORAGE_SECRET"
+        virtual_secret = "HDF5_VIRTUAL_SECRET"
+        weights_path = tmp_path / "secret_reference.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f[f"token={link_name_secret}"] = h5py.ExternalLink(
+                f"https://alice:{password_secret}@example.test/data?token={query_secret}",
+                f"/token={target_secret}",
+            )
+            f.create_dataset(
+                "external_storage",
+                shape=(1,),
+                dtype="float32",
+                external=[(f"token={storage_secret}.raw", 0, 4)],
+            )
+            virtual_layout = h5py.VirtualLayout(shape=(1,), dtype="float32")
+            virtual_layout[:] = h5py.VirtualSource(f"token={virtual_secret}.h5", "payload", shape=(1,))
+            f.create_virtual_dataset("virtual_dataset", virtual_layout)
+
+        model_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        scanner_result = KerasZipScanner().scan(str(model_path))
+        audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        rendered_outputs = [
+            json.dumps([check.details for check in scanner_result.checks], default=str),
+            audit_result.model_dump_json(indent=2, exclude_none=True),
+            format_sarif_output(audit_result, [str(model_path)]),
+        ]
+
+        for output in rendered_outputs:
+            assert password_secret not in output
+            assert query_secret not in output
+            assert link_name_secret not in output
+            assert target_secret not in output
+            assert storage_secret not in output
+            assert virtual_secret not in output
+            assert "<redacted>" in output
+
+    def test_hdf5_url_credentials_are_redacted_before_evidence_truncation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Truncation inside URL userinfo must not expose a credential prefix."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        credential_secret = "SUPER_SECRET_PASSWORD"
+        weights_path = tmp_path / "truncated_secret_reference.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f["external_kernel"] = h5py.ExternalLink(
+                f"https://alice:{credential_secret}@example.test/data",
+                "/payload",
+            )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_REFERENCE_TEXT_CHARS", 24)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert len(findings) == 1
+        assert credential_secret not in findings[0]["filename"]
+        assert "SUPER_SECRET" not in findings[0]["filename"]
+        assert findings[0]["filename_truncated"] is True
+
+    def test_embedded_hdf5_external_reference_traversal_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bounded embedded HDF5 traversal must return exit 2 when no finding precedes the limit."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "nested_regular.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f.create_group("layers").create_group("dense").create_group("vars")
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_LINK_VISITS", 2)
+
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            reason,
+            "Embedded HDF5 External Reference Analysis Limit",
+        )
+        _assert_inconclusive_keras_zip_scan_not_cached(keras_path, reason, tmp_path / "traversal-limit-cache")
+
+    def test_embedded_hdf5_external_reference_reports_are_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reference evidence must stay bounded while preserving the security finding."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "many_external_links.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            for index in range(3):
+                f[f"linked_{index}"] = h5py.ExternalLink("missing_external_source.h5", f"/payload/{index}")
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_REFERENCE_REPORTS", 2)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        assert reason not in result.metadata.get("scan_outcome_reasons", [])
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert len(cve_issues[0].details["external_references"]) == 2
+        assert cve_issues[0].details["external_reference_count"] == 3
+        assert cve_issues[0].details["external_references_truncated"] is True
+
+        audit_result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        assert determine_exit_code(audit_result) == 1
+
+    def test_embedded_hdf5_external_storage_segment_reports_are_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """External-storage segment evidence must be capped without hiding the security risk."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "many_external_segments.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f.create_dataset(
+                "external_kernel",
+                shape=(3,),
+                dtype="float32",
+                external=[(f"weights-{index}.raw", 0, 4) for index in range(3)],
+            )
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 2)
+        monkeypatch.setattr(
+            h5py.Dataset,
+            "external",
+            property(lambda _dataset: (_ for _ in ()).throw(AssertionError("unbounded external segment read"))),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        assert reason not in result.metadata.get("scan_outcome_reasons", [])
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        external_reference = cve_issues[0].details["external_references"][0]
+        assert len(external_reference["segments"]) == 2
+        assert external_reference["segment_count"] == 3
+        assert external_reference["segments_truncated"] is True
+
+        audit_result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        assert determine_exit_code(audit_result) == 1
+
+    def test_hdf5_external_storage_filename_evidence_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """External-storage filenames must be bounded without weakening detection."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        raw_storage = tmp_path / "long_external_storage_filename.raw"
+        raw_storage.write_bytes(b"\x00" * 4)
+        weights_path = tmp_path / "long_external_storage.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f.create_dataset(
+                "external_kernel",
+                shape=(1,),
+                dtype="float32",
+                external=[(raw_storage.name, 0, 4)],
+            )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_REFERENCE_TEXT_CHARS", 12)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert len(findings) == 1
+        assert findings[0]["segments"][0]["filename"] == "long_externa"
+        assert findings[0]["segments"][0]["filename_truncated"] is True
 
     @pytest.mark.parametrize(
         "keras_version",
@@ -260,6 +821,46 @@ class TestKerasZipScanner:
     @pytest.mark.parametrize(
         "keras_version",
         [
+            "3.12.1",
+            "3.12.1+cpu",
+            "3.12.1+rc1",
+            "3.12.1.post",
+            "3.12.1rev",
+            "3.12.1-r",
+            "3.12.1.post.dev",
+            "3.13.2",
+            "3.13.2.post1",
+            "3.13.2+dev0",
+        ],
+    )
+    def test_embedded_hdf5_external_references_fixed_metadata_still_warn(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Metadata.json version text is archive-controlled context, not a suppression guard."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert any(
+            check.name == "HDF5 External Weight Reference Metadata Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
             "3.12.1rc1evil",
             "3.12.1rc1.evil",
             "3.12.1rc1+cpu+cuda",
@@ -269,12 +870,14 @@ class TestKerasZipScanner:
             "3.12.1+cpu+cuda",
             "3.13.2.postevil",
             "keras-3.12.1",
+            "keras-3.13.2",
+            "3.13.x",
         ],
     )
-    def test_cve_2026_1669_noncanonical_versions_fail_closed(self, tmp_path: Path, keras_version: str) -> None:
-        """Unknown versions must warn without emitting a passing or falsely attributed CVE check."""
-        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is None
-
+    def test_embedded_hdf5_external_references_unparseable_metadata_warns_unknown(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Malformed archive metadata must not claim vulnerable or fixed runtime behavior."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
@@ -288,14 +891,12 @@ class TestKerasZipScanner:
         unknown_checks = [
             check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
         ]
-        passed_version_checks = [
-            check for check in result.checks if check.name == "HDF5 External Weight Reference Version Check"
-        ]
         assert len(unknown_checks) == 1
         assert unknown_checks[0].status == CheckStatus.FAILED
+        assert unknown_checks[0].severity == IssueSeverity.WARNING
         assert unknown_checks[0].details["keras_version"] == keras_version
         assert unknown_checks[0].details["parse_status"] == "unknown"
-        assert passed_version_checks == []
+        assert "is non-canonical" in unknown_checks[0].message
 
     @pytest.mark.parametrize(
         "keras_version",
@@ -327,62 +928,6 @@ class TestKerasZipScanner:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].details["keras_version"] == keras_version
         assert unknown_checks == []
-
-    @pytest.mark.parametrize(
-        "keras_version",
-        [
-            "3.12.1",
-            "3.12.1+cpu",
-            "3.12.1+rc1",
-            "3.12.1.post",
-            "3.12.1rev",
-            "3.12.1-r",
-            "3.12.1.post.dev",
-            "3.13.2",
-            "3.13.2.post1",
-            "3.13.2+dev0",
-        ],
-    )
-    def test_embedded_hdf5_external_references_stable_fixed_versions_warn_metadata_only(
-        self, tmp_path: Path, keras_version: str
-    ) -> None:
-        """Stable fixed metadata still cannot suppress structural external-reference evidence."""
-        scanner = KerasZipScanner()
-        keras_path = create_configured_keras_zip(
-            tmp_path,
-            {"class_name": "Sequential", "config": {"layers": []}},
-            keras_version=keras_version,
-            weights_h5_path=create_external_link_weights_h5(tmp_path),
-        )
-
-        result = scanner.scan(str(keras_path))
-
-        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
-        assert len(cve_issues) == 1
-        assert cve_issues[0].severity == IssueSeverity.WARNING
-        assert cve_issues[0].details["keras_version"] == keras_version
-        assert cve_issues[0].details["metadata_only_assessment"] is True
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
-        assert cve_issues[0].details["version_source"] == "keras_archive_metadata"
-
-    def test_embedded_hdf5_external_references_noncanonical_version_warns_unknown(self, tmp_path: Path) -> None:
-        """Malformed archive version metadata must not claim a confidently fixed runtime."""
-        scanner = KerasZipScanner()
-        keras_path = create_configured_keras_zip(
-            tmp_path,
-            {"class_name": "Sequential", "config": {"layers": []}},
-            keras_version="3.13.x",
-            weights_h5_path=create_external_link_weights_h5(tmp_path),
-        )
-
-        result = scanner.scan(str(keras_path))
-
-        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
-        assert len(cve_issues) == 1
-        assert cve_issues[0].severity == IssueSeverity.WARNING
-        assert cve_issues[0].details["keras_version"] == "3.13.x"
-        assert cve_issues[0].details["parse_status"] == "unknown"
-        assert "is non-canonical" in cve_issues[0].message
 
     @pytest.mark.parametrize("keras_version", ["3.0.x", "3.11.x", "3.11-X"])
     def test_cve_2026_1669_wildcard_line_entirely_in_vulnerable_range(self, keras_version: str) -> None:
@@ -1123,11 +1668,8 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert determine_exit_code(aggregate_result) == 1
 
-    def test_invalid_config_json_list_fixed_keras_weights_still_reports_external_reference(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        """Fixed-version metadata should not suppress independent embedded-weight findings."""
+    def test_invalid_config_json_list_fixed_keras_weights_preserves_external_ref_warning(self, tmp_path: Path) -> None:
+        """Independent embedded-weight findings should survive invalid config and fixed-looking metadata."""
         keras_path = create_configured_keras_zip(
             tmp_path,
             [],
@@ -1149,9 +1691,11 @@ class TestKerasZipScanner:
         ]
         assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_config_invalid_type" in metadata.get("scan_outcome_reasons")
-        assert len(security_issues) == 1
-        assert security_issues[0].details.get("cve_id") == "CVE-2026-1669"
-        assert security_issues[0].details["metadata_only_assessment"] is True
+        cve_issues = [issue for issue in security_issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["keras_version"] == "3.12.1"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
         assert determine_exit_code(aggregate_result) == 1
 
     def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
@@ -2216,7 +2760,8 @@ __import__('pickle').loads(data)
         opaque_issues = [
             issue
             for issue in result.issues
-            if "opaque encoded bytecode" in issue.message and "opaque_lambda" in issue.message
+            if issue.details.get("layer_name") == "opaque_lambda"
+            and issue.details.get("analysis_status") == "opaque_bytecode"
         ]
         assert len(opaque_issues) == 1
         assert opaque_issues[0].severity == IssueSeverity.WARNING
@@ -2225,6 +2770,504 @@ __import__('pickle').loads(data)
             for issue in result.issues
             if "opaque_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
         ]
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    @pytest.mark.parametrize("module_name", ["os", "socket", "OS.Path"])
+    def test_encoded_lambda_still_checks_dangerous_sibling_module(
+        self,
+        tmp_path: Path,
+        function_format: str,
+        module_name: str,
+    ) -> None:
+        """Encoded Lambda payloads must not suppress dangerous sibling metadata."""
+        encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "mixed_module_lambda",
+                        "config": {
+                            "function": function_data,
+                            "module": module_name,
+                            "function_name": "system",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            check.name == "Lambda Layer Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("module") == module_name
+            and check.details.get("function") == "system"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "module_name",
+        ["custom_package.systematic_math", "company.os.metrics", "company.operator.layers"],
+    )
+    def test_lambda_module_reference_uses_import_root_for_benign_module(
+        self,
+        tmp_path: Path,
+        module_name: str,
+    ) -> None:
+        """Benign module identifiers containing suspicious substrings should remain quiet."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_module_lambda",
+                        "config": {
+                            "module": module_name,
+                            "function_name": "normalize",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(check.name == "Lambda Layer Module Reference Check" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        ("module_name", "function_name"),
+        [("os", "system"), ("operator", "attrgetter")],
+    )
+    def test_nested_named_lambda_function_reference_is_detected(
+        self,
+        tmp_path: Path,
+        module_name: str,
+        function_name: str,
+    ) -> None:
+        """Keras 3 named-function Lambda metadata must not bypass module checks."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "nested_named_function",
+                        "config": {
+                            "function": {
+                                "module": module_name,
+                                "class_name": "function",
+                                "config": function_name,
+                                "registered_name": function_name,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            check.name == "Lambda Layer Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("module") == module_name
+            and check.details.get("function") == function_name
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("module_name", "function_name"),
+        [("operator", "add"), ("keras.ops", "absolute")],
+    )
+    def test_benign_nested_named_lambda_function_is_not_critical(
+        self,
+        tmp_path: Path,
+        module_name: str,
+        function_name: str,
+    ) -> None:
+        """Benign named functions must not inherit module-wide critical severity."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_named_function",
+                        "config": {
+                            "function": {
+                                "module": module_name,
+                                "class_name": "function",
+                                "config": function_name,
+                                "registered_name": function_name,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(
+            check.name == "Lambda Layer Module Reference Check" and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+
+    def test_lambda_function_name_does_not_escalate_with_benign_module(self, tmp_path: Path) -> None:
+        """A custom function sharing a gadget name must not be treated as a stdlib gadget."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "dangerous_function_lambda",
+                        "config": {
+                            "module": "custom_package.math",
+                            "function_name": "system",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(
+            check.name == "Lambda Layer Module Reference Check" and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+
+    def test_lambda_function_name_without_module_is_warning(self, tmp_path: Path) -> None:
+        """Sensitive function names without provenance should remain visible without critical attribution."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "unattributed_function_lambda",
+                        "config": {"function_name": "system"},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Module Reference Check"
+            and check.details.get("parse_status") == "module_unavailable"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+
+    def test_malformed_nested_named_lambda_function_is_warning(self, tmp_path: Path) -> None:
+        """Malformed nested callable metadata must fail closed without retaining its payload."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_nested_function",
+                        "config": {
+                            "function": {
+                                "module": None,
+                                "class_name": "function",
+                                "config": ["system"],
+                                "registered_name": None,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Module Reference Check"
+            and check.details.get("function_format") == "nested_named_function"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+        assert matching_checks[0].details["module_type"] == "NoneType"
+        assert matching_checks[0].details["function_type"] == "list"
+        assert "system" not in json.dumps(matching_checks[0].details)
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    @pytest.mark.parametrize("benign_identifier", ["opened", "executor", "osésystem"])
+    def test_lambda_bytecode_pattern_matching_uses_token_boundaries(
+        self,
+        tmp_path: Path,
+        function_format: str,
+        benign_identifier: str,
+    ) -> None:
+        """Benign identifiers containing dangerous substrings must not escalate Lambda findings."""
+        encoded_code = base64.b64encode(benign_identifier.encode()).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "substring_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(
+            issue.severity == IssueSeverity.CRITICAL and "substring_lambda" in issue.message for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    @pytest.mark.parametrize("network_reference", ["https://evil.example/payload", "urllib3.PoolManager"])
+    def test_lambda_bytecode_token_boundaries_preserve_network_signals(
+        self,
+        tmp_path: Path,
+        network_reference: str,
+        function_format: str,
+    ) -> None:
+        """Boundary-aware Lambda matching must retain explicit network indicators."""
+        encoded_code = base64.b64encode(network_reference.encode()).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {
+                "class_name": "__lambda__",
+                "config": {"code": encoded_code},
+            }
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "network_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "network_lambda" in issue.message for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    def test_marshaled_lambda_dotted_name_is_detected(
+        self,
+        tmp_path: Path,
+        function_format: str,
+    ) -> None:
+        """Real marshalled code must retain dotted dangerous-name detection."""
+        encoded_code = base64.b64encode(
+            marshal.dumps(compile("import os\nos.system('payload')", "<lambda>", "exec"))
+        ).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "marshalled_dotted_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "marshalled_dotted_lambda" in issue.message
+            and "os.system" in issue.details.get("dangerous_patterns", [])
+            for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    def test_oversized_lambda_bytecode_is_not_decoded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        function_format: str,
+    ) -> None:
+        """Oversized Lambda bytecode must produce a bounded warning without base64 allocation."""
+        oversized_code = "A" * (1024 * 1024 + 1)
+        function_data: Any = [oversized_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": oversized_code}}
+
+        def fail_decode(_value: Any) -> bytes:
+            raise AssertionError("oversized Lambda bytecode was decoded")
+
+        monkeypatch.setattr(keras_utils_module.base64, "b64decode", fail_decode)
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "oversized_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Detection"
+            and check.details.get("layer_name") == "oversized_lambda"
+            and check.details.get("analysis_status") == "code_size_limit_exceeded"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+
+    def test_malformed_dict_lambda_diagnostic_does_not_echo_payload(self, tmp_path: Path) -> None:
+        """Malformed Lambda metadata diagnostics must not retain attacker-controlled payloads."""
+        payload = "do-not-echo-this-payload"
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": payload,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Detection" and check.details.get("layer_name") == "malformed_lambda"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].details["config_type"] == "str"
+        assert payload not in str(matching_checks[0].details)
+
+    @pytest.mark.parametrize(
+        ("function_data", "expected_code_type"),
+        [
+            ([], None),
+            ([None, None, None], "NoneType"),
+            (["", None, None], "str"),
+        ],
+    )
+    def test_malformed_list_lambda_metadata_stays_warning(
+        self,
+        tmp_path: Path,
+        function_data: list[Any],
+        expected_code_type: str | None,
+    ) -> None:
+        """Malformed list-format Lambda metadata must remain a security finding."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_list_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Detection"
+            and check.details.get("layer_name") == "malformed_list_lambda"
+            and check.details.get("function_format") == "list"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+        assert matching_checks[0].details.get("code_type") == expected_code_type
+
+    @pytest.mark.parametrize(
+        ("module_name", "function_name"),
+        [
+            ({"unexpected": "module"}, "normalize"),
+            ("custom_package.math", ["normalize"]),
+        ],
+    )
+    def test_malformed_lambda_module_reference_stays_warning(
+        self,
+        tmp_path: Path,
+        module_name: Any,
+        function_name: Any,
+    ) -> None:
+        """Malformed mixed module/function metadata must not be silently accepted."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_module_lambda",
+                        "config": {
+                            "module": module_name,
+                            "function_name": function_name,
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Module Reference Check"
+            and check.details.get("layer_name") == "malformed_module_lambda"
+            and check.details.get("module_type") == type(module_name).__name__
+            and check.details.get("function_type") == type(function_name).__name__
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
 
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""
@@ -2762,7 +3805,11 @@ __import__('pickle').loads(data)
         audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
-        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        dangerous_lambda = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Code Analysis" and check.severity == IssueSeverity.CRITICAL
+        ]
         assert len(cve_issues) == 1
         assert cve_issues[0].details["layer_name"] == "inner_lambda"
         assert dangerous_lambda
@@ -3792,7 +4839,6 @@ __import__('pickle').loads(data)
         details_json = json.dumps([check.details for check in scanner_result.checks], default=str)
         assert all(secret not in details_json for secret in raw_secrets)
         assert "<redacted>" in details_json
-        assert "encoded_lambda_may_contain_sensitive_constants" in details_json
         assert "opaque_bytecode_may_contain_sensitive_constants" in details_json
 
         audit_result = scan_model_directory_or_file(str(model_path))
@@ -4330,8 +5376,30 @@ class TestCVE202549655TorchModuleWrapper:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper in nested model"
 
-    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
-        """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.11a0",
+            "3.11rc1",
+            "3.11.dev0",
+            "3.11.0a0",
+            "3.11.0rc1",
+            "3.11.0.dev999",
+            "3.11.0.0rc1",
+            "3.11.3",
+            "3.11.3+local",
+            "3.11.3.post1",
+            "3.11.3.post1.dev0",
+            "3.11.3-post1.dev0",
+            "3.11.3-1.dev0",
+            "3.11.3_post1.dev0",
+            "3.11.3-r1.dev0",
+            "3.11.3rev1.dev0",
+            "3.11.4.dev0",
+        ],
+    )
+    def test_no_cve_outside_affected_keras_range(self, tmp_path: Path, keras_version: str) -> None:
+        """Keras builds outside >= 3.11.0 and < 3.11.3 should not be CVE-attributed."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -4345,9 +5413,9 @@ class TestCVE202549655TorchModuleWrapper:
                 ]
             },
         }
-        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11.3"))
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
-        assert len(cve_issues) == 0, "Fixed Keras versions should not get CVE-2025-49655 attribution"
+        assert len(cve_issues) == 0, "Versions outside the affected range should not get CVE attribution"
         risk_checks = [c for c in result.checks if c.name == "TorchModuleWrapper Version Risk Check"]
         assert len(risk_checks) >= 1
         assert risk_checks[0].severity == IssueSeverity.WARNING
@@ -4372,11 +5440,155 @@ class TestCVE202549655TorchModuleWrapper:
             "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
         }
 
-        for prerelease_version in ["3.11.0a0", "3.11.1rc1", "3.11.2.dev0"]:
+        for prerelease_version in ["3.11.1rc1", "3.11.2.dev0"]:
             result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
             cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
             assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
             assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.11.3a0",
+            "3.11.3-alpha.1",
+            "3.11.3b1",
+            "3.11.3c1",
+            "3.11.3rc1",
+            "3.11.3rc1.post1.dev0+local",
+            "3.11.3.dev0",
+            "3.11.3_dev0",
+        ],
+    )
+    def test_fixed_boundary_prerelease_versions_treated_as_vulnerable(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Prereleases of the fixed boundary sort before final 3.11.3 and remain vulnerable."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["affected_versions"] == "Keras >= 3.11.0 and < 3.11.3"
+        assert cve_issues[0].why is not None
+        assert "Keras >= 3.11.0 and < 3.11.3" in cve_issues[0].why
+
+    @pytest.mark.parametrize(
+        ("keras_version", "expected_critical"),
+        [
+            ("3.11.2+" + ("a" * 256), True),
+            ("3.11.3+" + ("a" * 256), False),
+        ],
+    )
+    def test_long_local_version_classified_before_evidence_truncation(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+        expected_critical: bool,
+    ) -> None:
+        """Long valid local labels must not change public-version CVE attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        assert result.metadata["keras_version"].endswith("...")
+        cve_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("cve_id") == "CVE-2025-49655" and issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert bool(cve_issues) is expected_critical
+        if not expected_critical:
+            risk_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Version Risk Check"]
+            assert len(risk_checks) == 1
+            assert risk_checks[0].details["parse_status"] == "metadata_non_vulnerable"
+
+    @pytest.mark.parametrize(
+        ("keras_version", "expected"),
+        [
+            ("3", False),
+            ("4rc1", False),
+            ("3.11a0", False),
+            ("3.11rc1", False),
+            ("3.11.dev0", False),
+            ("3.11.0a0", False),
+            ("3.11.0rc1", False),
+            ("3.11.0.dev999", False),
+            ("3.11.0.0rc1", False),
+            ("3.11", True),
+            ("3.11.0", True),
+            ("3.11.0+local", True),
+            ("3.11.0.post1", True),
+            ("3.11.0.post1.dev0", True),
+            ("3.11.3rc1", True),
+            ("3.11.3c1", True),
+            ("3.11.3.dev0", True),
+            ("3.11.3_dev0", True),
+            ("3.11.3rc1.post1", True),
+            ("3.11.3rc1.post1.dev0+local", True),
+            ("v3.11.3rc1", True),
+            ("V3.11.3.dev0", True),
+            ("0!3.11.3rc1", True),
+            ("3.11.3.0rc1", True),
+            ("3.11.3.0.dev0", True),
+            ("3.11.3.post1.dev0", False),
+            ("3.11.3-post1.dev0", False),
+            ("3.11.3-1.dev0", False),
+            ("3.11.3_post1.dev0", False),
+            ("3.11.3-r1.dev0", False),
+            ("3.11.3rev1.dev0", False),
+            ("v3.11.3", False),
+            ("1!3.11.0", False),
+            ("3.11.3.0", False),
+            ("3.11.3.1.dev0", False),
+            ("3.11.3+rc1", False),
+            ("3.11.3.0rcpu", None),
+            ("3.11.3rcpu", None),
+            ("3.11.3devops", None),
+            ("3.11.3alphafoo", None),
+            ("3.11.3previewbuild", None),
+            ("3.11.\u0663rc1", None),
+            ("3.11.3rc\u0661", None),
+        ],
+    )
+    def test_version_parser_requires_bounded_prerelease_qualifiers(
+        self,
+        keras_version: str,
+        expected: bool | None,
+    ) -> None:
+        """Malformed qualifier lookalikes should not receive critical CVE attribution."""
+        assert KerasZipScanner._is_vulnerable_keras_3_11_x(keras_version) is expected
+
+    @pytest.mark.parametrize("keras_version", ["3.11.3rcpu", "3.11.\u0663rc1", "3.11.3rc\u0661"])
+    def test_malformed_boundary_qualifier_is_warning_only(self, tmp_path: Path, keras_version: str) -> None:
+        """Malformed prerelease lookalikes must not receive critical CVE attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues
+        assert all(issue.severity == IssueSeverity.WARNING for issue in cve_issues)
+        unknown_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Risk (Version Unknown)"]
+        assert len(unknown_checks) == 1
+        assert unknown_checks[0].details["parse_status"] == "unknown"
+        assert result.success is True
 
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
@@ -5487,7 +6699,7 @@ class TestCVE20243660LambdaAttribution:
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
-        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Lambda Layer Code Analysis"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert len(dangerous_lambda) == 1
@@ -5512,7 +6724,7 @@ class TestCVE20243660LambdaAttribution:
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
-        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Lambda Layer Code Analysis"]
         custom_layer_checks = [
             check
             for check in result.checks
