@@ -824,8 +824,11 @@ def _get_hf_content_route_formats() -> set[str]:
     from modelaudit.utils.file.detection import (
         EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
+        XML_MODEL_INCONCLUSIVE_FORMAT,
     )
 
     from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
@@ -835,8 +838,11 @@ def _get_hf_content_route_formats() -> set[str]:
         {
             EXECUTABLE_ZIP_POLYGLOT_FORMAT,
             LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
             PROTOBUF_MODEL_CANDIDATE_FORMAT,
             TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+            XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
+            XML_MODEL_INCONCLUSIVE_FORMAT,
             "coreml",
             "flax_msgpack",
             "jax_checkpoint",
@@ -850,6 +856,16 @@ def _get_hf_content_route_formats() -> set[str]:
         }
     )
     return content_route_formats
+
+
+def _get_hf_content_route_scanner_ids() -> set[str]:
+    """Return scanners that can consume a bounded Hugging Face content route."""
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    scanner_ids: set[str] = set()
+    for format_name in _get_hf_content_route_formats():
+        scanner_ids.update(scanner_ids_for_detected_format(format_name))
+    return scanner_ids
 
 
 def _get_selected_hf_content_route_formats(
@@ -906,22 +922,27 @@ def _select_streamable_hf_files(
     revision: str,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
-    scannable_formats: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
     *,
     include_all_files: bool = False,
     deadline: float | None = None,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
-    selected_route_formats: set[str] | None
-    if scannable_formats is not None:
-        selected_route_formats = {str(format_name).lower() for format_name in scannable_formats}.intersection(
-            _get_hf_content_route_formats()
+    selected_route_formats: set[str] | None = None
+    selected_route_scanner_ids: set[str] | None = None
+    if scannable_scanner_ids is not None:
+        selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
+            _get_hf_content_route_scanner_ids()
         )
     elif scannable_filenames:
         selected_route_formats = set()
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    sniff_renamed_files = not include_all_files and (selected_route_formats is None or bool(selected_route_formats))
+    sniff_renamed_files = not include_all_files and (
+        bool(selected_route_scanner_ids)
+        if selected_route_scanner_ids is not None
+        else selected_route_formats is None or bool(selected_route_formats)
+    )
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -992,9 +1013,14 @@ def _select_streamable_hf_files(
                 )
             inspected_files += 1
             detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
-            if detected_format is None or (
-                selected_route_formats is not None and detected_format not in selected_route_formats
-            ):
+            if detected_format is None:
+                continue
+            if selected_route_scanner_ids is not None:
+                from ...scanner_selection import scanner_ids_for_detected_format
+
+                if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                    continue
+            elif selected_route_formats is not None and detected_format not in selected_route_formats:
                 continue
             model_files.append(file_name)
             selected_files.add(file_name)
@@ -1640,7 +1666,7 @@ def download_model_streaming(
     timeout_seconds: float | None = None,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
-    scannable_formats: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
@@ -1656,7 +1682,7 @@ def download_model_streaming(
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
-        scannable_formats: Optional content formats from scanner selection policy
+        scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
 
     Yields:
@@ -1717,7 +1743,7 @@ def download_model_streaming(
             repo_revision,
             scannable_extensions,
             scannable_filenames,
-            scannable_formats,
+            scannable_scanner_ids,
             include_all_files=include_all_files,
             deadline=deadline,
         )

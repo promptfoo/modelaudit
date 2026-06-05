@@ -23,7 +23,6 @@ from modelaudit.scanner_selection import (
     resolve_scanner_ids,
     resolve_scanner_selection_policy,
     scanner_catalog,
-    selected_scanner_content_formats,
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
@@ -690,16 +689,6 @@ def test_remote_prefilters_use_selected_scanner_extensions() -> None:
     assert filter_jfrog_scannable_files(files, scannable_extensions=extensions) == [{"path": "weights.safetensors"}]
 
 
-def test_remote_prefilters_preserve_selected_content_format_identity() -> None:
-    policy = resolve_scanner_selection_policy(scanners=["safetensors", "metadata"])
-
-    formats = selected_scanner_content_formats(policy)
-
-    assert "safetensors" in formats
-    assert "metadata" in formats
-    assert "lightgbm" not in formats
-
-
 def test_remote_prefilters_fail_open_for_header_routed_scanners() -> None:
     policy = resolve_scanner_selection_policy(scanners=["zip"])
 
@@ -744,6 +733,28 @@ def test_remote_prefilters_preserve_selected_extensionless_content_routed_filena
     assert "" not in extensions
     assert ".md" in extensions
     assert filenames == frozenset({"readme", "model_card"})
+    files = [
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/model_card"},
+        {"path": "s3://bucket/LICENSE"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:

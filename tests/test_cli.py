@@ -1461,6 +1461,68 @@ def test_scan_pytorchhub_url_passes_max_download_bytes(
     assert mock_download.call_args.kwargs["max_size"] == 5 * 1024
 
 
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--scanners", "pickle"],
+        ["--exclude-scanner", "onnx", "--exclude-scanner", "weight_distribution"],
+    ],
+)
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_passes_selected_scanner_extensions(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    selection_args: list[str],
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", *selection_args, "--quiet", "https://pytorch.org/hub/pytorch_vision_resnet/"],
+    )
+
+    assert result.exit_code == 0
+    extensions = mock_download.call_args.kwargs["scannable_extensions"]
+    assert ".pkl" in extensions
+    assert ".onnx" not in extensions
+
+
+@pytest.mark.parametrize("scanner_id", ["keras_h5", "zip"])
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_preserves_header_routed_artifacts(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    scanner_id: str,
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--scanners", scanner_id, "--quiet", "https://pytorch.org/hub/pytorch_vision_resnet/"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["scannable_extensions"] is None
+
+
 @patch("modelaudit.cli.is_pytorch_hub_url")
 @patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
@@ -1487,6 +1549,45 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
+    assert mock_download_streaming.call_args.kwargs["timeout"] > 0
+
+
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--scanners", "pickle"],
+        ["--exclude-scanner", "onnx", "--exclude-scanner", "weight_distribution"],
+    ],
+)
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_pytorchhub_stream_passes_selected_scanner_extensions(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_ph_url: MagicMock,
+    selection_args: list[str],
+) -> None:
+    mock_is_ph_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            *selection_args,
+            "--quiet",
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+        ],
+    )
+
+    assert result.exit_code == 0
+    extensions = mock_download_streaming.call_args.kwargs["scannable_extensions"]
+    assert ".pkl" in extensions
+    assert ".onnx" not in extensions
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
@@ -1570,7 +1671,7 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({"", ".exe", ".llamafile"})
-    assert "llamafile" in mock_download_streaming.call_args.kwargs["scannable_formats"]
+    assert "llamafile" in mock_download_streaming.call_args.kwargs["scannable_scanner_ids"]
     assert "include_all_files" not in mock_download_streaming.call_args.kwargs
 
 
@@ -1992,6 +2093,55 @@ def test_scan_cloud_url_success(
     mock_rmtree.assert_called()
 
 
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_url_passes_scanner_selection_to_content_filter(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_is_cloud.return_value = True
+    downloaded_file = tmp_path / "weights.payload"
+    downloaded_file.write_bytes(b"weights")
+    mock_download.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--no-cache", "--scanners", "safetensors", "--quiet", "s3://bucket/models/"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
+    assert mock_download.call_args.kwargs["scannable_filenames"] == frozenset()
+    assert mock_download.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.utils.sources.cloud_storage.download_from_cloud_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_cloud_url_streaming_passes_scanner_selection_to_content_filter(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_cloud: MagicMock,
+) -> None:
+    mock_is_cloud.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--scanners", "safetensors", "--quiet", "s3://bucket/models/"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
+    assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset()
+    assert mock_download_streaming.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
+
+
 @patch("os.remove")
 @patch("shutil.rmtree")
 @patch("modelaudit.cli.is_cloud_url")
@@ -2176,6 +2326,34 @@ def test_scan_jfrog_url_success(
         selective_download=True,
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_passes_selected_exact_filenames(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--scanners",
+            "metadata",
+            "--quiet",
+            "https://company.jfrog.io/artifactory/repo/models/",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_scan_jfrog.call_args.kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+    assert mock_scan_jfrog.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["metadata"]
 
 
 @patch("modelaudit.cli.is_jfrog_url")

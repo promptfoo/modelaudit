@@ -2398,7 +2398,7 @@ class TestModelDownloadStreaming:
                 "https://huggingface.co/test/model",
                 scannable_extensions={".safetensors"},
                 scannable_filenames={"readme"},
-                scannable_formats={"safetensors", "metadata"},
+                scannable_scanner_ids={"safetensors", "metadata"},
             )
         )
 
@@ -2434,7 +2434,7 @@ class TestModelDownloadStreaming:
             download_model_streaming(
                 "https://huggingface.co/test/model",
                 scannable_extensions={".safetensors"},
-                scannable_formats={"safetensors"},
+                scannable_scanner_ids={"safetensors"},
             )
         )
 
