@@ -31,6 +31,7 @@ MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
 MAX_PERCENT_DECODE_PASSES: Final[int] = 32
+MAX_SENSITIVE_EVIDENCE_KEY_CHARS: Final[int] = 512
 REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 UNRESOLVED_VALUE_CALL_LOOKAHEAD_CHARS: Final[int] = 512
 UNSAFE_ASCII_EVIDENCE_TRANSLATION: Final[dict[int, None]] = dict.fromkeys((*range(9), 11, 12, *range(14, 32), 127))
@@ -271,6 +272,11 @@ SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "secret",
     "sig",
     "token",
+)
+SENSITIVE_EVIDENCE_CONTAINER_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\A(?:[a-z0-9]+[._-])*(?:{SENSITIVE_CONTAINER_KEY}|authentication)"
+    rf"(?:[._-](?:headers?|values?))?\Z",
+    re.IGNORECASE,
 )
 QUOTED_AUTHORIZATION_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(?P<prefix>authorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
@@ -1448,8 +1454,8 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
         return True
 
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(value).readline))
-    except (IndentationError, tokenize.TokenError):
+        tokens = list(tokenize.generate_tokens(io.StringIO(value.replace("\r", " ")).readline))
+    except (IndentationError, UnicodeError, tokenize.TokenError):
         return False
     significant = [
         token
@@ -2221,9 +2227,11 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
             else:
                 _append_ast_node_replacement(text, offsets, value_node, replacements)
     else:
-        token_input = text.replace("\x00", " ")
+        token_input = text.replace("\x00", " ").replace("\r", " ")
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+        except UnicodeError:
+            return REDACTED_EVIDENCE_VALUE
         except (IndentationError, tokenize.TokenError):
             return text
         depths = _token_depths(tokens)
@@ -2380,9 +2388,11 @@ def _append_token_value_replacement(
 
 def _redact_sensitive_keyed_calls(text: str) -> str:
     """Redact credential values/defaults in bounded key/value call patterns."""
-    token_input = text.replace("\x00", " ")
+    token_input = text.replace("\x00", " ").replace("\r", " ")
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return text
 
@@ -2557,9 +2567,11 @@ def _comparison_value_end(
 
 def _redact_sensitive_comparisons(text: str) -> str:
     """Redact literal comparison operands for sensitive code targets."""
-    token_input = text.replace("\x00", " ")
+    token_input = text.replace("\x00", " ").replace("\r", " ")
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return text
 
@@ -2647,7 +2659,10 @@ def _redact_python_expression_assignments(text: str) -> str:
         return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text.replace("\x00", " ")).readline))
+        token_input = text.replace("\x00", " ").replace("\r", " ")
+        tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
@@ -2843,8 +2858,11 @@ def _unfinished_value_call_sensitivity(
 
     tokens: list[tokenize.TokenInfo] = []
     try:
-        for token in tokenize.generate_tokens(io.StringIO(lookahead_text.replace("\x00", " ")).readline):
+        token_input = lookahead_text.replace("\x00", " ").replace("\r", " ")
+        for token in tokenize.generate_tokens(io.StringIO(token_input).readline):
             tokens.append(token)
+    except UnicodeError:
+        return True
     except (IndentationError, tokenize.TokenError):
         # Incomplete bounded lookahead may end mid-token; partial tokens still support conservative classification.
         pass
@@ -3000,8 +3018,9 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
             value_start = match.start() + len(match.group("prefix"))
             value_end, _continued = _unparseable_assignment_value_end(match.string, value_start)
             try:
-                value_tokens = list(tokenize.generate_tokens(io.StringIO(match.string[value_start:value_end]).readline))
-            except (IndentationError, tokenize.TokenError):
+                token_input = match.string[value_start:value_end].replace("\r", " ")
+                value_tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+            except (IndentationError, UnicodeError, tokenize.TokenError):
                 value_tokens = []
             if _tokens_contain_dangerous_call(value_tokens):
                 return match.group(0)
@@ -3242,7 +3261,14 @@ def _is_sensitive_detail_key(key: str) -> bool:
 
 def is_sensitive_evidence_key(key: str) -> bool:
     """Return whether a field name identifies a credential-bearing value."""
-    return _is_sensitive_detail_key(key)
+    if len(key) > MAX_SENSITIVE_EVIDENCE_KEY_CHARS:
+        return True
+    normalized = _strip_bracket_suffixes(key).lower()
+    return (
+        _is_sensitive_detail_key(key)
+        or re.fullmatch(SENSITIVE_CONTAINER_KEY, normalized) is not None
+        or SENSITIVE_EVIDENCE_CONTAINER_KEY_RE.fullmatch(normalized) is not None
+    )
 
 
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:
