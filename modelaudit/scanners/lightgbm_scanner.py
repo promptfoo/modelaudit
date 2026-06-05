@@ -6,7 +6,7 @@ import ipaddress
 import os
 import re
 from typing import Any, ClassVar
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urlparse
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -91,61 +91,6 @@ _BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _DEDICATED_LIGHTGBM_EXTENSIONS = {".lgb", ".lightgbm"}
 _EXCERPT_OMITTED_REASON = "model_text_may_contain_sensitive_literals"
-_SENSITIVE_HOST_LABEL_PATTERN = re.compile(
-    r"(?i)^(?:"
-    r"aiza[0-9a-z_-]{35}|"
-    r"akia[0-9a-z]{16}|"
-    r"gh[opusr]_[a-z0-9]{36}|"
-    r"github_pat_[a-z0-9]{22}_[a-z0-9]{59}|"
-    r"glpat-[a-z0-9_-]{20}|"
-    r"hf_[a-z0-9_-]{20,}|"
-    r"npm_[a-z0-9]{36}|"
-    r"rg_[a-z0-9]{32}|"
-    r"sk-(?:proj-)?[a-z0-9_-]{24,}|"
-    r"sq0atp-[a-z0-9_-]{22}|"
-    r"sq0csp-[a-z0-9_-]{43}|"
-    r"(?:stripe_live|[rs]k_live)_[a-z0-9]{24}|"
-    r"xox[baprs]-[0-9a-z-]{20,}|"
-    r"az[a-z0-9]{34}|"
-    r"[a-f0-9]{32,}"
-    r")$"
-)
-_SENSITIVE_MULTILABEL_HOST_PATTERN = re.compile(
-    r"(?i)(?<![a-z0-9_-])(?:"
-    r"sg\.[a-z0-9_-]{22}\.[a-z0-9_-]{43}|"
-    r"eyj[a-z0-9_-]{8,}\.eyj[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}|"
-    r"[0-9]{17,19}\.[a-z0-9_-]{6}\.[a-z0-9_-]{27}"
-    r")(?![a-z0-9_-])"
-)
-
-
-def _redact_sensitive_hostname_labels(hostname: str) -> str:
-    """Redact credential-shaped hostname labels while preserving endpoint context."""
-    hostname = _SENSITIVE_MULTILABEL_HOST_PATTERN.sub(
-        "<redacted>",
-        hostname,
-    )
-    return ".".join(
-        "<redacted>" if _SENSITIVE_HOST_LABEL_PATTERN.fullmatch(label) else label for label in hostname.split(".")
-    )
-
-
-def _redact_url_for_display(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return "[invalid-url]"
-
-    if not parsed.scheme or not parsed.hostname:
-        return "[invalid-url]"
-
-    hostname = _redact_sensitive_hostname_labels(parsed.hostname)
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, "", "", ""))
 
 
 class LightGBMScanner(BaseScanner):
@@ -273,9 +218,11 @@ class LightGBMScanner(BaseScanner):
             lowered = line.lower()
             is_comment = lowered.startswith("#")
             safe_prefix = any(lowered.startswith(prefix) for prefix in _SAFE_LINE_PREFIXES)
+            has_command_indicator = False
 
             for pattern, reason in _COMMAND_PATTERNS:
                 if pattern.search(line):
+                    has_command_indicator = True
                     hit = {
                         "line": str(line_number),
                         "reason": reason,
@@ -288,9 +235,13 @@ class LightGBMScanner(BaseScanner):
                     break
 
             for url in _URL_PATTERN.findall(line):
-                if not self._is_trusted_url(url):
+                if not self._is_trusted_url(url) or has_command_indicator:
                     network_hits.append(
-                        {"line": str(line_number), "type": "url", "value": _redact_url_for_display(url)}
+                        {
+                            "line": str(line_number),
+                            "type": "url",
+                            "value_omitted": _EXCERPT_OMITTED_REASON,
+                        }
                     )
 
             for candidate_ip in _IP_PATTERN.findall(line):
