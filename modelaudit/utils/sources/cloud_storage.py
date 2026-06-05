@@ -27,8 +27,8 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     (
-        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|accesskey|token|"
-        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+        r"([?&;][^=\s&;]*(?:signature|credential|security-token|access-key|access_key|accesskey|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&;]*=)[^\s&#;]+"
     ),
     re.IGNORECASE,
 )
@@ -68,17 +68,17 @@ def redact_url_for_display(url: str) -> str:
     """Remove credentials, query strings, and fragments from a URL for display."""
     try:
         parts = urlsplit(url)
+        if not parts.scheme:
+            return url
+
+        hostname = parts.hostname or ""
+        netloc = f"[{hostname}]" if ":" in hostname else hostname
+        if parts.port is not None:
+            netloc = f"{netloc}:{parts.port}"
+
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
     except Exception:
         return "<cloud URL redacted>"
-
-    if not parts.scheme:
-        return url
-
-    netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
@@ -88,6 +88,16 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
         redacted = redacted.replace(source_url, redact_url_for_display(source_url))
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+
+
+def redact_stream_url_for_display(url: str) -> str:
+    """Return a fail-closed display identifier for a stream source URL."""
+    try:
+        if not urlsplit(url).scheme:
+            return "<cloud URL redacted>"
+    except Exception:
+        return "<cloud URL redacted>"
+    return redact_url_for_display(url)
 
 
 def _bound_cloud_metadata_error_display(message: str) -> str:

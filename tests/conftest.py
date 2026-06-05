@@ -104,6 +104,7 @@ def pytest_runtest_setup(item):
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
+            "test_sarif_formatter.py",  # SARIF output and credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_bug1_confidence_exploit.py",  # Security bug test

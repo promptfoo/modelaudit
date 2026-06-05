@@ -111,7 +111,7 @@ from modelaudit.utils.sources.cloud_storage import (
     redact_cloud_error_for_display as _redact_cloud_error_for_display,
 )
 from modelaudit.utils.sources.cloud_storage import (
-    redact_url_for_display as _redact_url_for_display,
+    redact_stream_url_for_display as _redact_stream_url_for_display,
 )
 
 logger = logging.getLogger("modelaudit.core")
@@ -166,7 +166,7 @@ _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
 
 def _redacted_stream_url_for_reporting(stream_url: str) -> str:
     """Return a stream source identifier safe for persisted scan output."""
-    return _redact_url_for_display(stream_url)
+    return _redact_stream_url_for_display(stream_url)
 
 
 def _redacted_scan_path_for_reporting(path: str) -> str:
