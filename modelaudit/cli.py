@@ -43,6 +43,7 @@ from .scanner_selection import (
     scanner_catalog,
     scanner_selection_config_from_inputs,
     selected_scanner_extensions,
+    selected_scanner_filenames,
 )
 from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
@@ -129,6 +130,8 @@ class _ScanRuntimeConfig:
     scanner_selection: dict[str, Any] | None
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
+    scannable_filenames: frozenset[str] | None
+    hf_stream_include_all_files: bool
 
 
 @dataclass
@@ -545,6 +548,10 @@ def _resolve_scan_runtime_config(
     scannable_extensions = (
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_filenames = (
+        selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
+    )
+    hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
         config=config_values,
@@ -569,6 +576,8 @@ def _resolve_scan_runtime_config(
         scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
 
@@ -1257,10 +1266,19 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                hf_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scannable_filenames is not None:
+                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.hf_stream_include_all_files:
+                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
+                    max_size=runtime.max_download_bytes,
+                    **hf_stream_kwargs,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -1305,7 +1323,12 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
-            download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
+            download_path = download_model(
+                path,
+                cache_dir=hf_cache_dir,
+                show_progress=show_progress,
+                max_size=runtime.max_download_bytes,
+            )
             download_duration = time.time() - download_start
             try:
                 download_size = sum(
@@ -2988,6 +3011,20 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
                 output.append(f"  {file_name} (error: {error})")
             else:
                 output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                for key in (
+                    "has_custom_metadata",
+                    "custom_metadata_entry_count",
+                    "custom_metadata_valid",
+                    "custom_metadata_type",
+                    "custom_metadata_invalid_value_count",
+                    "custom_metadata_security_flags",
+                ):
+                    if key not in file_meta:
+                        continue
+                    value = file_meta[key]
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value)) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:

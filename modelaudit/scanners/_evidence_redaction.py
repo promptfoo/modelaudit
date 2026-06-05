@@ -80,8 +80,13 @@ CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
     r"(?:[A-Z][A-Za-z0-9]*)?"
 )
+AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
+AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
+    r"[a-z0-9\s._-]*authorization(?:s|[\s._-]*(?:headers?|values?))?"
+)
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY})|"
+    rf"{AUTHORIZATION_ALIAS_ASSIGNMENT_KEY})"
     r"(?:\[[a-z0-9_-]{0,32}\])*"
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
@@ -93,7 +98,8 @@ SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[._-][a-z0-9]+)*"
 )
 SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
-    rf"(?:{SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+    rf"(?:{SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY})|"
+    rf"{AUTHORIZATION_ALIAS_ASSIGNMENT_KEY})"
 )
 SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
     r"(?:[a-z0-9]+[\s._-]+)*"
@@ -103,7 +109,8 @@ SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
     r"(?:[\s._-]+[a-z0-9]+)*"
 )
 SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
-    rf"(?:{SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+    rf"(?:{SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY})|"
+    rf"{AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY})"
 )
 SENSITIVE_R_ASSIGNMENT_IDENTIFIER: Final[str] = (
     rf"""(?:`{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}`|"{SENSITIVE_R_QUOTED_IDENTIFIER_KEY}"|"""
@@ -188,6 +195,7 @@ SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesstoken",
     "apikey",
     "authtoken",
+    "authorization",
     "clientsecret",
     "credential",
     "password",
