@@ -87,15 +87,30 @@ _COMMAND_RE = re.compile(
 )
 _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)")
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
+_URL_AUTHORITY_PREFIX_RE = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^\s\"'<>]*\Z")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
 _FUNCTION_ATTRIBUTE_SUFFIX = ".func.name"
 
 
+def _redact_encoded_payload_match(match: re.Match[str]) -> str:
+    raw_value = match.group(0)
+    url_prefix_match = _URL_AUTHORITY_PREFIX_RE.search(match.string[: match.start()])
+    if url_prefix_match is not None:
+        authority_prefix = url_prefix_match.group(0).partition("://")[2]
+        authority_tail, separator, _path = raw_value.partition("/")
+        if separator and "/" not in authority_prefix:
+            trailing_separator = "/" if raw_value.endswith("/") else ""
+            return f"{authority_tail}/{REDACTED_EVIDENCE_VALUE}{trailing_separator}"
+    return REDACTED_EVIDENCE_VALUE
+
+
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
     secret_redacted = redact_evidence_string(text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
-    payload_redacted = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, secret_redacted)
+    payload_redacted = _ENCODED_PAYLOAD_RE.sub(_redact_encoded_payload_match, secret_redacted)
+    if payload_redacted == f"{REDACTED_EVIDENCE_VALUE}...":
+        return REDACTED_EVIDENCE_VALUE
     if len(payload_redacted) <= max_chars:
         return payload_redacted
     if max_chars <= 3:
