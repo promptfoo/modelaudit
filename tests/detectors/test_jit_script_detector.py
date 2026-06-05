@@ -1756,7 +1756,515 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    def test_scan_model_detects_late_getattr_priority_alias_call(self) -> None:
+    @pytest.mark.parametrize(
+        "call_line",
+        [
+            b"getattr(rp, 'run_path')('payload.py')\n",
+            b"getattr(\n    rp, 'run_' + 'path'\n)('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_late_getattr_priority_alias_call(self, call_line: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + call_line + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("import_line", "call_line"),
+        [
+            (b"from runpy import run_path as runner\n", b"(runner)('payload.py')\n"),
+            (b"from runpy import run_path as runner\n", b"(\n runner\n)('payload.py')\n"),
+            (b"from runpy import run_path as runner\n", b"(\n runner\n) \\\n('payload.py')\n"),
+            (b"from runpy import run_path as runner\n", b"runner \\\n('payload.py')\n"),
+            (b"import runpy as rp\n", b"((rp).run_path)('payload.py')\n"),
+            (b"import runpy as rp\n", b"(\n rp.run_path\n)('payload.py')\n"),
+            (b"import runpy as rp\n", b"(\n rp.run_path\n) \\\n('payload.py')\n"),
+            (b"import runpy as rp\n", b"rp.run_path \\\n('payload.py')\n"),
+            (b"import runpy as rp\n", b"rp \\\n    .run_path('payload.py')\n"),
+        ],
+    )
+    def test_scan_model_detects_late_parenthesized_priority_alias_call(
+        self, import_line: bytes, call_line: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = b"\x00\xff" + leading_blocks + import_line + padding + call_line + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("late_bindings", "call_line"),
+        [
+            (b"runner = rp.run_path\n", b"runner('payload.py')\n"),
+            (b"runner = rp.run_path\n", b"(runner)('payload.py')\n"),
+            (b"runner = rp.run_path\n", b"(\n runner\n)('payload.py')\n"),
+            (b"runner = rp.run_path\n", b"runner \\\n('payload.py')\n"),
+            (b"first = rp.run_path\nrunner = first\n", b"(runner)('payload.py')\n"),
+            (b"enabled = True\nrunner = rp.run_path if enabled else print\n", b"(runner)('payload.py')\n"),
+            (b"runner = rp.run_path or print\n", b"(runner)('payload.py')\n"),
+            (b"runner = False or rp.run_path\n", b"(runner)('payload.py')\n"),
+            (
+                b"enabled = True\nrunner = (\n    rp.run_path\n    if enabled\n    else print\n)\n",
+                b"(runner)('payload.py')\n",
+            ),
+            (b"mod = rp\n", b"getattr(mod, 'run_path')('payload.py')\n"),
+            (b"\x00\xffmod = rp\n", b"getattr(mod, 'run_path')('payload.py')\n"),
+        ],
+    )
+    def test_scan_model_detects_late_derived_priority_alias_call(self, late_bindings: bytes, call_line: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + late_bindings + call_line + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_long_late_derived_alias_chain_with_bounded_replay(self) -> None:
+        detector = JITScriptDetector()
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        bindings = b"value_0 = rp.run_path\n" + b"".join(
+            f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 40_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_39999)('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("priority_import", "call_line", "expected_pattern"),
+        [
+            (b"import runpy as rp\n", b"rp.run_path.__call__('payload.py')\n", "Dynamic module execution detected"),
+            (
+                b"import webbrowser as wb\n",
+                b"wb.open.__call__('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (b"import ctypes as c\n", b"c.CDLL.__call__('payload.so')\n", "Native library loading detected"),
+            (
+                b"import runpy as rp\n",
+                b"(rp.run_path).__call__('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"(wb.open).__call__('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (b"import ctypes as c\n", b"(c.CDLL).__call__('payload.so')\n", "Native library loading detected"),
+            (
+                b"import runpy as rp\n",
+                b"(\n rp.run_path\n).__call__('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"(\n wb.open\n).__call__('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"(\n c.CDLL\n).__call__('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"rp.run_path.__call__(\n    'payload.py'\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"(\n    rp.run_path\n) \\\n.__call__('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"rp.run_path.\\\n__call__('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"(\n    rp.run_path  # callable\n    .__call__('payload.py')\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"(\n    rp.run_path.__call__  # invoke\n    ('payload.py')\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"(\n    (rp.run_path)  # callable\n    .__call__('payload.py')\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"from runpy import run_path as runner\n",
+                b"runner.__call__.__call__(\n    'payload.py'\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"getattr(rp.run_path, '__call__')('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\n",
+                b"getattr(\n    rp.run_path,\n    '__call__'\n)(\n    'payload.py'\n)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"getattr(c, 'CDLL').__call__('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c)['CDLL'].__call__('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"object.__getattribute__(c, 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"type(c).__getattribute__(c, 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c).get('CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"dict.get(vars(c), 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_detects_long_explicit_dunder_call_with_bounded_replay(
+        self, priority_import: bytes, call_line: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + priority_import + padding + call_line + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == expected_pattern for f in findings)
+
+    def test_scan_model_ignores_long_passive_reference_chain_with_bounded_replay(self) -> None:
+        detector = JITScriptDetector()
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        bindings = b"value_0 = print(rp.run_path)\n" + b"".join(
+            f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 40_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_39999)('safe')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_forwarded_conditional_alias_beyond_replay_budget(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = b"enabled = True\nvalue_0 = rp.run_path if enabled else print\n" + b"".join(
+            f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_conditional_expression_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n" + padding + b"(rp.run_path if True else print)('payload.py')\n" + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_late_statically_safe_conditional_expression_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + b"(rp.run_path if False else print)('safe')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_member_load_invoked_by_local_target(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + b"for f in [rp.run_path]: f('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_compound_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"try:\n    pass\nfinally:\n    rp.run_path('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_same_line_assignment_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + b"x = 0; rp.run_path('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_vars_alias_lookup_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport ctypes as c\n" + padding + b"vars(c)['CDLL']('payload')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    def test_scan_model_ignores_long_chain_after_safe_module_rebind(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = b"rp = object()\nvalue_0 = rp.run_path\n" + b"".join(
+            f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('safe')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "line_suffix",
+        [
+            b"",
+            b"  # inert",
+            b";",
+            b"; pass",
+            b"; None",
+            b"; ...",
+            b"; ()",
+            b"; []",
+            b"; {}",
+            b"; not None",
+            b"; b''",
+            b"; r''",
+            b"; 1j",
+            b"; 1e3",
+            b"; 1_000",
+            b"; 0x10",
+            b"; 0b1",
+            b"; b''; [1]",
+            b"  # ; b''",
+            b"  # ; 0x10",
+            b"  # ; []",
+        ],
+    )
+    def test_scan_model_detects_long_parenthesized_forwarding_chain_with_bounded_replay(
+        self, line_suffix: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = b"value_0 = rp.run_path\n" + b"".join(
+            f"value_{index} = (value_{index - 1})".encode() + line_suffix + b"\n" for index in range(1, 40_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_39999)('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_long_varying_literal_forwarding_suffixes_with_bounded_replay(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = b"value_0 = rp.run_path\n" + b"".join(
+            f"value_{index} = (value_{index - 1}); [{index}]\n".encode() for index in range(1, 10_000)
+        )
+        source = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_9999)('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_deep_nested_inert_forwarding_suffix_without_recursion(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        nested_literal = b"[" * 1_200 + b"0" + b"]" * 1_200
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"runner = rp.run_path; "
+            + nested_literal
+            + b"\n(runner)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_parenthesized_priority_alias_across_retained_boundary(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        import_line = b"from runpy import run_path as runner\n"
+        boundary_padding_length = (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES - len(import_line) - len(b"(\n")
+        )
+        boundary_padding = b"#" + b"x" * (boundary_padding_length - 2) + b"\n"
+        trailing_padding = b"# pad\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + import_line
+            + boundary_padding
+            + b"(\n runner\n)('payload.py')\n"
+            + trailing_padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert (
+            len(import_line + boundary_padding + b"(\n")
+            == jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+        )
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_late_parenthesized_priority_alias_argument(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + b"print((rp))\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize("call", [b"(\n runner\n)('safe')\n", b"runner \\\n('safe')\n"])
+    def test_scan_model_preserves_visible_safe_rebind_before_late_continued_alias_call(self, call: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"from runpy import run_path as runner\n"
+            + padding
+            + b"runner = print\n"
+            + call
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_visible_safe_module_rebind_before_late_parenthesized_call(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
             f"def benign_{index}():\n    return {index}\n}}\x00".encode()
@@ -1771,8 +2279,3564 @@ class TestJITScriptDetector:
             + leading_blocks
             + b"import runpy as rp\n"
             + padding
-            + b"getattr(rp, 'run_path')('payload.py')\n"
+            + b"rp = object()\n"
+            + b"((rp).run_path)('safe')\n"
             + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize("safe_rebind", [b"runner = (\n    print\n)\n", b"runner = \\\n    print\n"])
+    def test_scan_model_preserves_multiline_safe_rebind_before_late_parenthesized_call(
+        self, safe_rebind: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"from runpy import run_path as runner\n"
+            + padding
+            + safe_rebind
+            + b"(runner)('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_parenthesized_alias_restored_after_visible_safe_rebind(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"from runpy import run_path as runner\n"
+            + padding
+            + b"original = runner\n"
+            + b"runner = print\n"
+            + b"runner = original\n"
+            + b"(runner)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("late_state", "expect_finding"),
+        [
+            (
+                b"original = runner\nrunner = original\noriginal = print\n(runner)('payload.py')\n",
+                True,
+            ),
+            (
+                b"original = print\nrunner = original\noriginal = runner\n(runner)('safe')\n",
+                False,
+            ),
+        ],
+    )
+    def test_scan_model_resolves_late_parenthesized_alias_dependencies_at_rebind_time(
+        self, late_state: bytes, expect_finding: bool
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding + late_state + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+        has_dynamic_finding = any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+        assert has_dynamic_finding is expect_finding
+
+    def test_scan_model_ignores_passive_alias_members_before_late_parenthesized_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        passive_members = b"".join(f"rp.mark_{index} = {index}\n".encode() for index in range(8))
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\n"
+            + padding
+            + passive_members
+            + b"((rp).run_path)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_safe_member_overwrite_after_passive_alias_members(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        passive_members = b"".join(f"rp.mark_{index} = {index}\n".encode() for index in range(8))
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\n"
+            + padding
+            + passive_members
+            + b"rp.run_path = print\n"
+            + passive_members
+            + b"((rp).run_path)('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("late_state", "expect_finding"),
+        [
+            (b"if False:\n    runner = print\n(runner)('payload.py')\n", True),
+            (b"if False:\n    # inert\n    runner = print\n(runner)('payload.py')\n", True),
+            (b"if True:\n    runner = print\n(runner)('safe')\n", False),
+            (b"if True:\n    # inert\n    runner = print\n(runner)('safe')\n", False),
+        ],
+    )
+    def test_scan_model_handles_constant_guarded_late_alias_rebindings(
+        self, late_state: bytes, expect_finding: bool
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding + late_state + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+        has_dynamic_finding = any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+        assert has_dynamic_finding is expect_finding
+
+    def test_scan_model_detects_constant_guarded_late_alias_restore(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"from runpy import run_path as runner\n"
+            + b"original = runner\n"
+            + b"runner = print\n"
+            + padding
+            + b"if True:\n    runner = original\n(runner)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "restore",
+        [
+            b"if False:\n    pass\nelse:\n    runner = original\n",
+            b"if True:\n    if True:\n        runner = original\n",
+        ],
+    )
+    def test_scan_model_detects_compound_late_alias_restore(self, restore: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"from runpy import run_path as runner\n"
+            + b"original = runner\nrunner = print\n"
+            + padding
+            + restore
+            + b"(runner)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "late_state",
+        [
+            b"runner = rp.run_path if False else print\n(runner)('safe')\n",
+            b"runner = print if 1 else rp.run_path\n(runner)('safe')\n",
+            b"runner = rp.run_path and print\n(runner)('safe')\n",
+            b"runner = True or rp.run_path\n(runner)('safe')\n",
+            b"runner = print or rp.run_path\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif False:\n    if True:\n"
+            b"        runner = original\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif True:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif 1:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif False:\n    pass\nelif True:\n    pass\nelse:\n"
+            b"    runner = original\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif 'enabled':\n    pass\nelse:\n"
+            b"    runner = original\n(runner)('safe')\n",
+            b"original = runner\nrunner = print\nif True:\n    pass\nelif False:\n    pass\nelse:\n"
+            b"    runner = original\n(runner)('safe')\n",
+            b"if globals().get('enabled'):\n    runner = print\nelif True:\n    runner = print\n(runner)('safe')\n",
+            b"getattr(object=rp, name='run_path')('safe')\n",
+        ],
+    )
+    def test_scan_model_preserves_definitely_safe_late_conditional_alias_state(self, late_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\nfrom runpy import run_path as runner\n" + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "late_state",
+        [
+            b"enabled = True\nrunner = rp.run_path if enabled else print\n"
+            b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
+            b"from runpy import run_path as runner\nif globals().get('enabled'):\n    pass\n"
+            b"elif True:\n    runner = print\n(runner)('payload.py')\n",
+            b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
+            b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
+            b"else:\n    runner = print\n(runner)('payload.py')\n",
+            b"from runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
+            b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+            b"\x00\xfffrom runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
+            b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_late_alias_after_uncertain_safe_overwrite(self, late_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "late_state",
+        [
+            b"import builtins\nbuiltins.print = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
+            b"import builtins\nvars(builtins)['print'] = False\n"
+            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            b"import builtins\nvars(builtins).update({'print': False})\n"
+            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            b"import builtins\nvars(builtins).update(**{'print': False})\n"
+            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            b"from runpy import run_path as runner\nFalse and (runner := print)\n(runner)('payload.py')\n",
+            (
+                b"from runpy import run_path as runner\nclass Broken:\n"
+                b"    def __enter__(self):\n        raise RuntimeError()\n"
+                b"    def __exit__(self, *args):\n        return False\n"
+                b"try:\n    with Broken() as runner:\n        pass\n"
+                b"except RuntimeError:\n    pass\n(runner)('payload.py')\n"
+            ),
+        ],
+    )
+    def test_scan_model_detects_late_alias_after_non_executed_safe_shadow(self, late_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_retained_alias_after_raising_late_with_shadow(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        late_state = (
+            b"class Broken:\n    def __enter__(self):\n        raise RuntimeError()\n"
+            b"    def __exit__(self, *args):\n        return False\n"
+            b"try:\n    with Broken() as runner:\n        pass\n"
+            b"except RuntimeError:\n    pass\n(runner)('payload.py')\n"
+        )
+        source = b"\x00\xfffrom runpy import run_path as runner\n" + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_forwarded_late_ctypes_attribute_load(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport ctypes as c\n" + padding + b"loader = c.cdll\nloader.msvcrt\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "late_state", "expected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+                b"opener = print or wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\nvars(builtins).update(**{'print': False})\n"
+                b"opener = print or wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+                b"loader = print or c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins\nvars(builtins).update(**{'print': False})\n"
+                b"loader = print or c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nfor b.print in [False]:\n    pass\n"
+                b"loader = print or c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
+                b"update({'print': False})\nloader = print or c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_detects_boolean_fallback_after_static_builtin_mapping_mutation(
+        self, prefix: bytes, late_state: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + prefix + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "late_state", "unexpected_pattern"),
+        [
+            (
+                b"import runpy as rp\n",
+                b"runner = print or rp.run_path\nrunner('safe')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"opener = print or wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"loader = print or c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_safe_boolean_fallback_after_builtin_restore(
+        self, prefix: bytes, late_state: bytes, unexpected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        state = (
+            b"import builtins\noriginal = builtins.print\n"
+            b"vars(builtins)['print'] = False\nvars(builtins).update({'print': original})\n"
+        )
+        source = b"\x00\xff" + prefix + padding + state + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == unexpected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "late_state", "unexpected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\n",
+                b"wb.open = print\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.cdll = print\nloader = c.cdll\nloader.msvcrt\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"vars(wb).update(open=print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.__dict__['CDLL'] = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nb.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nfor b.setattr in []:\n    pass\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nfor b.list in ():\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"wb.__dict__.update({'open': print})\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"vars(wb).update(**{'open': print})\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.__dict__.__setitem__('CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"dict.update(c.__dict__, CDLL=print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"dict.update(c.__dict__, [('CDLL', print)])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.__dict__.update([('CDLL', print)])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.__dict__.__ior__({'CDLL': print})\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"dict.__ior__(c.__dict__, {'CDLL': print})\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\ndel c.CDLL\nc.__dict__.setdefault('CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\ndel c.CDLL\ndict.setdefault(c.__dict__, 'CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\ndel c.__dict__['CDLL']\nc.__dict__.setdefault('CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\nc.__dict__.pop('CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL; c.__dict__.setdefault('CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
+                b"dict.__setitem__(c.__dict__, 'CDLL', print)\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"c.CDLL = print\ndelattr(c, 'CDLL')\nc.__dict__.setdefault('CDLL', print)\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\nbuiltins.setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"wb.__dict__['op' + 'en'] = print\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c).update(**{'CD' + 'LL': print})\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = original\noriginal = print\nwb.open = original\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"wb.open: object = print\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"namespace = wb.__dict__\nnamespace.update(open=print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"namespace, unused = wb.__dict__, None\nnamespace.update(open=print)\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\ntry:\n    pass\nfinally:\n    wb.open = print\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"wb.open = print\nwb.open = wb.open\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"changed = setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nnamespace = wb.__dict__\nnamespace |= {'open': print}\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\ntry:\n    wb.open = print\nexcept Exception:\n    pass\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nfor _ in [0]:\n    wb.open = print\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nimport builtins\n",
+                b"False and setattr(builtins, 'setattr', print)\nbuiltins.setattr(wb, 'open', print)\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"changed = (setattr(wb, 'open', print) is None)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"noop = lambda arg=setattr(wb, 'open', print): arg\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"def noop(arg: wb.__dict__.update(open=print)):\n    pass\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nFalse and (print := original)\nwb.open = print\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"False and (setattr := print)\nsetattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    raise RuntimeError()\n"
+                b"    wb.open = original\nexcept RuntimeError:\n    pass\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"try:\n    raise RuntimeError()\nexcept RuntimeError:\n    wb.open = print\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    1 / 0\n    wb.open = original\n"
+                b"except ZeroDivisionError:\n    pass\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"for _ in [0]:\n    pass\nelse:\n    wb.open = print\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nwhile False:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"try:\n    raise FileNotFoundError()\nexcept OSError:\n    wb.open = print\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    raise PermissionError()\nexcept OSError:\n    c.CDLL = print\n"
+                b"loader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"list(wb.__dict__.update(open=print) for _ in [0])\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"sorted(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"for _ in [0]:\n    try:\n        raise RuntimeError()\n    except RuntimeError:\n        pass\n"
+                b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"if c.__dict__.update(CDLL=print) is None:\n    pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"builtins.list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\n",
+                b"b.list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"RuntimeError = ValueError\ntry:\n    raise RuntimeError()\nexcept ValueError:\n"
+                b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"ValueError = RuntimeError\ntry:\n    raise RuntimeError()\nexcept ValueError:\n"
+                b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    raise RuntimeError(c.__dict__.update(CDLL=print))\nexcept RuntimeError:\n"
+                b"    pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"with (c.__dict__.update(CDLL=print) or contextlib.nullcontext()):\n"
+                b"    pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"match c.__dict__.update(CDLL=print):\n    case _:\n        pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"for c.CDLL in [print]:\n    pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"match 0:\n    case 0 if c.__dict__.update(CDLL=print) is None:\n"
+                b"        pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"subject = 0\nmatch subject:\n    case _ if c.__dict__.update(CDLL=print) is None:\n"
+                b"        pass\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"builtins.ValueError = RuntimeError\ntry:\n    raise RuntimeError()\nexcept ValueError:\n"
+                b"    c.CDLL = print\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"list = lambda iterable: None\nlist = builtins.list\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"for list in [builtins.list]:\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"else:\n    real_vars = lambda obj: {}\n"
+                b"real_vars(b).update({'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    continue\n"
+                b"    wb.open = original\nopener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"for _ in [0]:\n    if False:\n        continue\n    wb.open = print\n"
+                b"opener = wb.open\nopener('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\nclass Safe:\n"
+                b"    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"builtins.dict = Safe\nfrom builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nclass Safe:\n"
+                b"    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\n    real_dict = Safe\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\n    real_dict = Safe\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = True\nglobals()['enabled'] = False\nif enabled:\n"
+                b"    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = False\nglobals = lambda: {}\n"
+                b"globals()['enabled'] = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = True\nglobals = lambda: {}\ndel globals\n"
+                b"globals()['enabled'] = False\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"class Safe:\n    @staticmethod\n    def pop(*args, **kwargs):\n        pass\n"
+                b"real_dict = Safe\nenabled = True\nglobals()['globals'] = lambda: {}\ndel globals\n"
+                b"globals()['enabled'] = False\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('safe')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_safe_late_typed_member_overwrite(
+        self, prefix: bytes, late_state: bytes, unexpected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + prefix + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == unexpected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "late_state", "expected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\n",
+                b"opener = wb.open\nwb.open = print\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"loader = c.CDLL\nc.CDLL = print\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"loader = c.cdll\nc.cdll = print\nloader.msvcrt\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nwb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nc.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nprint = original\nwb.open = print\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nprint = original\nc.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nsetattr = print\nsetattr(wb, 'open', print)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\noriginal = wb.open\nbuiltins.setattr = print\nsetattr(wb, 'open', print)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"False and vars(wb).update(open=print)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"False and c.__dict__.__setitem__('CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"noop = lambda: vars(wb).update(open=print)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\noriginal = wb.open\nwb.open = print\nbuiltins.setattr(wb, 'open', original)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nwb.__dict__['op' + 'en'] = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nvars(c).update(**{'CD' + 'LL': original})\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nc.__dict__.update([('CDLL', original)])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndict.update(c.__dict__, [('CDLL', original)])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nc.__dict__.__ior__({'CDLL': original})\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndict.__ior__(c.__dict__, {'CDLL': original})\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
+                b"dict.setdefault(c.__dict__, 'CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.__dict__['CDLL']\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nc.__dict__.pop('CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\n"
+                b"put = c.__dict__.setdefault\nput('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL; c.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndict.__setitem__(c.__dict__, 'CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nrestore = c.__dict__.update\n"
+                b"restore(CDLL=original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nput = c.__dict__.__setitem__\n"
+                b"put('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel vars(c)['CDLL']\n"
+                b"vars(c).setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndel c.CDLL\nput = dict.setdefault\n"
+                b"put(c.__dict__, 'CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nput = wb.__dict__.__setitem__\n"
+                b"put('open', original)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndict.__delitem__(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nremove = c.__dict__.pop\nremove('CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nremove = vars(c).pop\nremove('CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nremove = dict.pop\nremove(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ndelattr(c, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\ndict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"builtins.dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"builtins.dict.__delitem__(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"real_dict = builtins.dict\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"real_dict = builtins.dict\nreal_dict.__delitem__(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"real_dict = builtins.dict\nremove = real_dict.pop\nremove(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import (\n    dict as real_dict,\n)\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import (\n    dict as real_dict,\n    len as spare,\n)\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import dict as real_dict, \\\n    len as spare\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import (\n    dict as unused_dict,\n    dict as real_dict,\n)\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\npass; from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n0; from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nif True: from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nif True:\n    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nenabled = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"original = c.CDLL\nc.CDLL = print\nreal_dict.pop(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"from builtins import (\n    dict as real_dict,\n)\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"from builtins import (\n    dict as real_dict,\n    len as spare,\n)\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"from builtins import (\n    dict as unused_dict,\n    dict as real_dict,\n)\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"from builtins import dict as real_dict, \\\n    len as spare\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"from builtins import dict as real_dict; pass\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"pass; from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"0; from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"if True: from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"if True:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"enabled = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"enabled = False\nglobals()['enabled'] = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"enabled = True\nglobals = lambda: {}\nglobals()['enabled'] = False\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"enabled = False\nglobals = lambda: {}\ndel globals\nglobals()['enabled'] = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(c.__dict__, 'CDLL')\n"
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\n",
+                b"enabled = False\nglobals()['globals'] = lambda: {}\ndel globals\n"
+                b"globals()['enabled'] = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(c.__dict__, 'CDLL')\nc.__dict__.setdefault('CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\nremove = dict.pop\n"
+                b"remove(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\noriginal = c.CDLL\nc.CDLL = print\nremove = dict.pop\n"
+                b"relay = remove\nrelay(c.__dict__, 'CDLL')\n",
+                b"c.__dict__.setdefault('CDLL', original)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nprint = original\nwb.open = print\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\noriginal = wb.open\nwb.open = print\nbuiltins.setattr(\n"
+                b"    wb, 'open', original\n)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nvars(c).update(\n"
+                b"    **{'CDLL': original}\n)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nif True:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nwb.open: object = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nnamespace = wb.__dict__\n"
+                b"namespace.update(open=original)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nprint, unused = original, None\nwb.open = print\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nsetattr, unused = print, None\nsetattr(wb, 'open', print)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"import builtins\noriginal = wb.open\nbuiltins.setattr, unused = print, None\n"
+                b"setattr(wb, 'open', print)\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"namespace = wb.__dict__\nnamespace, unused = {}, None\nnamespace.update(open=print)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nimport ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nwb.open = c.CDLL = original\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.cdll\nc.cdll = print\nvars(c).update(CDLL=print, cdll=original)\n"
+                b"loader = c.cdll\nloader.msvcrt\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nif False:\n    wb.open = print\nelse:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    pass\nfinally:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nchanged = setattr(wb, 'open', original)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nchanged = vars(wb).update(open=original)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nimport webbrowser as wb\n",
+                b"original = c.CDLL\nc.CDLL = print\n(wb.open, c.CDLL) = (print, original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nnamespace = wb.__dict__\nnamespace |= {'open': original}\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    wb.open = original\nexcept Exception:\n    pass\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nchanged = (setattr(wb, 'open', original) is None)\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nnoop = lambda arg=setattr(wb, 'open', original): arg\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ndef noop(arg: wb.__dict__.update(open=original)):\n"
+                b"    pass\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"from __future__ import annotations\nimport webbrowser as wb\n",
+                b"def noop(arg: wb.__dict__.update(open=print)):\n    pass\nopener = wb.open\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"[setattr(wb, 'open', print) for _ in []]\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"[setattr(wb, 'open', print) for _ in [0] if False]\nopener = wb.open\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\n(1 == 1) and setattr(c, 'CDLL', original)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nif 1 == 1:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nfor _ in [0, 1]:\n    wb.open = original\n"
+                b"opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    1 / 0\n    c.CDLL = print\nexcept ZeroDivisionError:\n    pass\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"value = wb.__dict__.update(open=print) if "
+                + (b"not " * 1_000)
+                + b"False else None\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    raise RuntimeError()\nexcept (ValueError, TypeError):\n    c.CDLL = print\n"
+                b"except RuntimeError:\n    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ntry:\n    raise FileNotFoundError()\n"
+                b"except OSError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    raise RuntimeError()\nexcept Exception:\n    pass\nexcept RuntimeError:\n"
+                b"    c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ntry:\n    raise PermissionError()\n"
+                b"except OSError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    for _ in [1 / 0]:\n        c.CDLL = print\nexcept ZeroDivisionError:\n    pass\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"try:\n    if True:\n        raise RuntimeError()\n    c.CDLL = print\n"
+                b"except RuntimeError:\n    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"for _ in [0, 1]:\n    if True:\n        continue\n    c.CDLL = print\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"0 == 1 == (wb.__dict__.update(open=print) is None)\nopener = wb.open\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nlist(c.__dict__.update(CDLL=original) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"list = lambda iterable: None\nlist(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b'import webbrowser as wb\n"""\nfrom __future__ import annotations\n"""\n',
+                b"original = wb.open\nwb.open = print\ndef noop(arg: wb.__dict__.update(open=original)):\n"
+                b"    pass\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nif c.__dict__.update(CDLL=original) is None:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nfor _ in [c.__dict__.update(CDLL=original)]:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"original = c.CDLL\nc.CDLL = print\nbuiltins.list(c.__dict__.update(CDLL=original) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"consume = list\noriginal = c.CDLL\nc.CDLL = print\n"
+                b"consume(c.__dict__.update(CDLL=original) for _ in [0])\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nfrom builtins import list as consume\n",
+                b"original = c.CDLL\nc.CDLL = print\nconsume(c.__dict__.update(CDLL=original) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"builtins.list = lambda iterable: None\nlist(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"builtins.__dict__['list'] = lambda iterable: None\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"builtins.__dict__.update(list=lambda iterable: None)\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"setattr(builtins, 'list', lambda iterable: None)\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\n",
+                b"original = c.CDLL\nc.CDLL = print\nb.list(c.__dict__.update(CDLL=original) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nRuntimeError = ValueError\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nValueError = RuntimeError\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\ntry:\n"
+                b"    raise RuntimeError(c.__dict__.update(CDLL=original))\nexcept RuntimeError:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"original = c.CDLL\nc.CDLL = print\n"
+                b"with (c.__dict__.update(CDLL=original) or contextlib.nullcontext()):\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nmatch c.__dict__.update(CDLL=original):\n"
+                b"    case _:\n        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"original = c.CDLL\nc.CDLL = print\nwith contextlib.nullcontext(original) as c.CDLL:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"original = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+                b"contextlib.nullcontext = lambda ignored: real(original)\n"
+                b"with contextlib.nullcontext(print) as c.CDLL:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nfor c.CDLL in [original]:\n"
+                b"    pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nmatch 0:\n"
+                b"    case 0 if c.__dict__.update(CDLL=original) is None:\n"
+                b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nsubject = 0\nmatch subject:\n"
+                b"    case _ if c.__dict__.update(CDLL=original) is None:\n"
+                b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nsubject = 0\nmatch subject:\n"
+                b"    case _ if False:\n        pass\n"
+                b"    case _ if c.__dict__.update(CDLL=original) is None:\n"
+                b"        pass\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"original = c.CDLL\nc.CDLL = print\nbuiltins.ValueError = RuntimeError\ntry:\n"
+                b"    raise RuntimeError()\nexcept ValueError:\n    c.CDLL = original\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
+                b"for ValueError in [RuntimeError]:\n    pass\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"original = c.CDLL\nc.CDLL = print\n"
+                b"with contextlib.nullcontext(RuntimeError) as ValueError:\n    pass\n"
+                b"try:\n    raise RuntimeError()\nexcept ValueError:\n    c.CDLL = original\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
+                b"if globals().get('enabled'):\n    ValueError = RuntimeError\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"dict.update(builtins.__dict__, list=lambda iterable: None)\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"dict.__setitem__(builtins.__dict__, 'list', lambda iterable: None)\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"namespace = builtins.__dict__\nnamespace |= {'list': lambda iterable: None}\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"for list in [lambda iterable: None]:\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"with contextlib.nullcontext(lambda iterable: None) as list:\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"match (lambda iterable: None):\n    case list:\n        pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\n",
+                b"b.setattr(b, 'list', lambda iterable: None)\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"original_list = builtins.list\nbuiltins.list = lambda iterable: None\n"
+                b"globals()['original_list'] = lambda iterable: None\nbuiltins.list = original_list\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"original = c.CDLL\nc.CDLL = print\nnamespace = builtins.__dict__\n"
+                b"namespace |= {'ValueError': RuntimeError}\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nfor b.setattr in [lambda *args: None]:\n    pass\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nfor b.list in [lambda iterable: None]:\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nnamespace = b.vars(b)\n"
+                b"for namespace['list'] in [lambda iterable: None]:\n    pass\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nimport contextlib\n"
+                b"with contextlib.nullcontext(lambda *args: None) as b.setattr:\n    pass\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nb.setattr(b, 'setattr', lambda *args: None)\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nb.setattr(b, 'vars', lambda obj: {})\n"
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
+                b"real_vars(b).update({'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_setattr = b.setattr\nb.setattr = lambda *args: None\n"
+                b"real_setattr(b, 'vars', lambda obj: {})\n"
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n",
+                b"real_vars(b).update({'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\nb.setattr = lambda *args: None\n",
+                b"real_setattr(b, 'vars', lambda obj: {})\n"
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n",
+                b"real_vars(b).update({'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\n"
+                b"b.setattr = lambda *args: None\nif globals().get('enabled'):\n"
+                b"    real_setattr = lambda *args: None\n",
+                b"real_setattr(b, 'vars', lambda obj: {})\n"
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nb.vars = lambda obj: {}\n"
+                b"enabled = True\nif globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"b.vars = real_vars\n",
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\n"
+                b"b.setattr = lambda *args: None\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
+                b"b.setattr = real_setattr\n",
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"real_vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_vars = b.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n",
+                b"real_vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
+                b"real_setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n",
+                b"real_setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_setattr = b.setattr\nreal_vars = b.vars\n"
+                b"b.vars = lambda obj: {}\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
+                b"real_setattr(b, 'vars', real_vars)\n"
+                b"b.vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\nreal_setattr = b.setattr\n"
+                b"b.setattr = lambda *args: None\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n",
+                b"real_setattr(b, 'setattr', real_setattr)\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
+                b"update({'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nns = b.vars(b)\nupdate = ns.update\n"
+                b"update({'list': lambda iterable: None})\n"
+                b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nns = b.vars(b)\nsetitem = ns.__setitem__\n"
+                b"setitem('setattr', lambda *args: None)\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nreal_setattr = b.setattr\n"
+                b"b.setattr = lambda *args: None\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"namespace = real_vars(b)\nput = namespace.__setitem__\n"
+                b"put('setattr', real_setattr)\nb.setattr(c, 'CDLL', print)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nreal_setattr = b.setattr\n"
+                b"b.setattr = lambda *args: None\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"namespace = real_vars(b)\nput = namespace.__setitem__\nrelay = put\n"
+                b"relay('setattr', real_setattr)\nb.setattr(c, 'CDLL', print)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\ndict.update(b.__dict__, {'setattr': lambda *args: None})\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nfor print in [original]:\n    pass\n"
+                b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport contextlib\n",
+                b"original = c.CDLL\nwith contextlib.nullcontext(original) as print:\n    pass\n"
+                b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nmatch original:\n    case print:\n        pass\n"
+                b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins\n",
+                b"original = c.CDLL\nnamespace = builtins.__dict__\nnamespace['print'] = original\n"
+                b"c.CDLL = print\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\n",
+                b"b.setattr = lambda *args: None\nb.setattr(c, 'CDLL', print)\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nimport builtins as b\n",
+                b"namespace = b.__dict__\nnamespace |= {'setattr': lambda *args: None}\n"
+                b"b.setattr(c, 'CDLL', print)\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"match (lambda iterable: None):\n    case _ if False:\n        pass\n"
+                b"    case list:\n        pass\nlist(c.__dict__.update(CDLL=print) for _ in [0])\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\nmatch RuntimeError:\n"
+                b"    case ValueError:\n        pass\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"original = c.CDLL\nc.CDLL = print\nValueError = TypeError\n"
+                b"for (ValueError,) in [(RuntimeError,)]:\n    pass\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_setattr = b.setattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_setattr = lambda *args: None\n"
+                b"real_setattr(b, 'ValueError', RuntimeError)\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = print\nexcept RuntimeError:\n    pass\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"import builtins as b\nreal_vars = b.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"namespace = real_vars(b)\nput = namespace.__setitem__\n"
+                b"put('ValueError', RuntimeError)\ntry:\n    raise RuntimeError()\n"
+                b"except ValueError:\n    c.CDLL = print\nexcept RuntimeError:\n    pass\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    raise RuntimeError()\nexcept RuntimeError:\n"
+                b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nfor _ in [0]:\n    continue\nelse:\n"
+                b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ntry:\n    1 / 0\nexcept ZeroDivisionError:\n"
+                b"    wb.open = original\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"try:\n    raise RuntimeError()\nexcept ValueError:\n    wb.open = print\n"
+                b"except RuntimeError:\n    pass\nopener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_dangerous_typed_member_captured_before_safe_overwrite(
+        self, prefix: bytes, late_state: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + prefix + padding + late_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_scan_model_detects_native_load_in_rebound_typed_member_self_write(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport ctypes as c\nimport webbrowser as wb\n"
+            + padding
+            + b"wb = c.cdll\nwb.open = wb.open\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_detects_typed_member_restore_after_state_overflow(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        alternating_state = (b"wb.open = original\nwb.open = print\n" * 24) + b"wb.open = original\n"
+        source = (
+            b"\x00\xffimport webbrowser as wb\n"
+            + padding
+            + b"original = wb.open\n"
+            + alternating_state
+            + b"opener = wb.open\nopener('https://example.invalid')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_reuses_typed_member_state_signatures_for_late_captures(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        state = b"".join(
+            f"wb.open = wb.open  # distinct state {index}\n".encode()
+            for index in range(jit_script_module._MAX_PRIORITY_ASSIGNMENT_PROBES)
+        )
+        captures = b"".join(f"value_{index} = wb.open\n".encode() for index in range(1_000))
+        source = (
+            b"\x00\xffimport webbrowser as wb\n"
+            + padding
+            + state
+            + captures
+            + b"value_999('https://example.invalid')\n"
+            + padding
+        )
+        normalized_state_bytes = 0
+        real_sub = jit_script_module.re.sub
+
+        def counting_sub(pattern: Any, replacement: Any, string: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal normalized_state_bytes
+            if pattern == rb"\s+" and b"wb.open = wb.open" in string:
+                normalized_state_bytes += len(string)
+            return real_sub(pattern, replacement, string, *args, **kwargs)
+
+        monkeypatch.setattr(jit_script_module.re, "sub", counting_sub)
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert normalized_state_bytes < len(state) * 20
+
+    def test_scan_model_bounds_nonpriority_late_continuation_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        continuation = (b"x + \\\n" * 1_000) + b"0\n"
+        source = (
+            b"\x00\xffimport webbrowser as wb\n"
+            + padding
+            + continuation
+            + b"opener = wb.open\nopener('https://example.invalid')\n"
+            + padding
+        )
+        bounded_statement_calls = 0
+        real_bounded_statement = jit_script_module._bounded_late_binding_statement
+
+        def counting_bounded_statement(
+            candidate: bytes, line_start: int, line_end: int
+        ) -> tuple[bytes, tuple[int, int]]:
+            nonlocal bounded_statement_calls
+            bounded_statement_calls += 1
+            return real_bounded_statement(candidate, line_start, line_end)
+
+        monkeypatch.setattr(jit_script_module, "_bounded_late_binding_statement", counting_bounded_statement)
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert bounded_statement_calls < 20
+
+    def test_scan_model_bounds_typed_member_handler_exception_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        handlers = b"try:\n    raise RuntimeError()\nexcept RuntimeError:\n    c.CDLL = print\n" * 300
+        source = b"\x00\xffimport ctypes as c\n" + padding + handlers + b"loader = c.CDLL\nloader('safe')\n" + padding
+        prefix_resolution_calls = 0
+        real_resolver = jit_script_module._resolved_exception_name_before
+
+        def counting_resolver(candidate: bytes, offset: int, exception_name: str) -> str | None:
+            nonlocal prefix_resolution_calls
+            prefix_resolution_calls += 1
+            return real_resolver(candidate, offset, exception_name)
+
+        monkeypatch.setattr(jit_script_module, "_resolved_exception_name_before", counting_resolver)
+
+        detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert prefix_resolution_calls < 2
+
+    @pytest.mark.parametrize(
+        ("prefix", "initial_binding", "endpoint", "expected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\n",
+                b"value_0 = wb.open\n",
+                b"value_1999('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"value_0 = c.CDLL\n",
+                b"value_1999('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"value_0 = c.cdll\n",
+                b"value_1999.msvcrt\n",
+                "Native library loading detected",
+            ),
+            (
+                b"from webbrowser import open as value_0\n",
+                b"",
+                b"value_1999('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"from ctypes import CDLL as value_0\n",
+                b"",
+                b"value_1999('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"from ctypes import cdll as value_0\n",
+                b"",
+                b"value_1999.msvcrt\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_late_rule_identity_beyond_replay_budget(
+        self, prefix: bytes, initial_binding: bytes, endpoint: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = initial_binding + b"".join(
+            f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
+        )
+        source = b"\x00\xff" + prefix + padding + bindings + endpoint + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+        assert not any(
+            finding.type == "code_execution_pattern"
+            and finding.pattern == "Dynamic module execution detected"
+            and expected_pattern != "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_bounds_typed_proof_inference_for_repeated_late_member_bindings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        bindings = b"".join(
+            (f"wb.open = wb{' ' * (index + 1)}.open\nvalue_{index} = wb{' ' * (index + 1)}.open\n").encode()
+            for index in range(500)
+        )
+        source = (
+            b"\x00\xffimport webbrowser as wb\n"
+            + padding
+            + bindings
+            + b"value_499('https://example.invalid')\n"
+            + padding
+        )
+        resolver_calls = 0
+        real_resolver = jit_script_module._resolve_alias_aware_high_risk_calls
+
+        def counting_resolver(tree: ast.AST) -> set[tuple[str, str]]:
+            nonlocal resolver_calls
+            resolver_calls += 1
+            return real_resolver(tree)
+
+        monkeypatch.setattr(jit_script_module, "_resolve_alias_aware_high_risk_calls", counting_resolver)
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert resolver_calls <= jit_script_module._MAX_PRIORITY_ASSIGNMENT_PROBES + 10
+
+    @pytest.mark.parametrize("shadow", [b"class runner:\n    pass\n", b"del runner\n"])
+    def test_scan_model_preserves_definite_late_alias_shadow(self, shadow: bytes) -> None:
+        detector = JITScriptDetector()
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = b"\x00\xfffrom runpy import run_path as runner\n" + padding + shadow + b"(runner)('safe')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_forwarded_late_class_shadow(self) -> None:
+        detector = JITScriptDetector()
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"runner = rp.run_path\nclass runner:\n    pass\nforward = runner\n(forward)('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix_state", "late_state", "expect_finding"),
+        [
+            (b"", b"rp.run_path = print\n" + b"rp.run_module = print\n" * 8, False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"rp.run_path: object = original\n" + b"rp.run_module = print\n" * 8,
+                True,
+            ),
+            (b"", b"del rp.run_path\n", False),
+            (b"", b"rp.__dict__['run_path'] = print\n", False),
+            (b"", b"vars(rp).update(run_path=print)\n", False),
+            (b"", b"rp.__dict__.update({'other': print, 'run_path': print})\n", False),
+            (b"", b"vars(rp).update(other=print, run_path=print)\n", False),
+            (b"", b"rp.__dict__.update(**{'run_path': print})\n", False),
+            (b"", b"dict.update(rp.__dict__, run_path=print)\n", False),
+            (b"", b"overwrite = dict.update\noverwrite(rp.__dict__, run_path=print)\n", False),
+            (
+                b"",
+                b"import builtins\noverwrite = builtins.dict.update\noverwrite(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (b"", b"import builtins as bi\nbi.dict.update(rp.__dict__, run_path=print)\n", False),
+            (b"", b"ns = rp.__dict__\nns.update(run_path=print)\n", False),
+            (b"", b"restore = vars(rp).update\nrestore(run_path=print)\n", False),
+            (
+                b"",
+                b"import builtins\nnamespace_of = builtins.vars\nbuiltins.vars = lambda obj: {}\n"
+                b"mapping = namespace_of(rp)\nrestore = mapping.update\nrestore(run_path=print)\n",
+                False,
+            ),
+            (b"", b"\x00\xffns = rp.__dict__\nns.update(run_path=print)\n", False),
+            (b"", b"\x00\xffrestore = vars(rp).update\nrestore(run_path=print)\n", False),
+            (b"", b"mod = rp\nns = mod.__dict__\nns.update(run_path=print)\n", False),
+            (b"", b"mod = rp\nrestore = vars(mod).update\nrestore(run_path=print)\n", False),
+            (b"", b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\nrestore(run_path=print)\n", False),
+            (
+                b"",
+                b"mod = rp\nmapping = mod.__dict__\nsecond = mapping\nrestore = second.update\n"
+                b"restore(run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\napply = restore\napply(run_path=print)\n",
+                False,
+            ),
+            (b"", b"rp.__dict__['run' + '_path'] = print\n", False),
+            (b"", b"rp.__dict__[\n    'run' + '_path'\n] = print\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"dict = Safe\ndict.update(rp.__dict__, run_path=original)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"real_dict = dict\ndict = Safe\ndict = real_dict\n"
+                b"dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"real_dict = dict\ndict = Safe\ndict = real_dict\n"
+                b"dict.update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_dict = bi.dict\nbi.dict = Safe\nbi.dict = real_dict\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins as bi\nbi.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"if globals().get('enabled'):\n    dict = Safe\n"
+                b"dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"rp.run_path = print\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nif globals().get('enabled'):\n    dict = Safe\n"
+                b"dict.update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nif globals().get('enabled'):\n    builtins.dict = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"rp.run_path = print\nimport builtins\nclass Safe:\n    @staticmethod\n"
+                b"    def update(*args, **kwargs):\n        pass\nif globals().get('enabled'):\n"
+                b"    builtins.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"if globals().get('enabled'):\n    dict = Safe\n"
+                b"dict.update(\n    rp.__dict__, run_path=print\n)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.__dict__['dict'] = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.__dict__.update(dict=Safe)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+                b"mapping.update(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nbuiltins.__dict__.update(\n"
+                b"    dict=real\n)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\ngetattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\ngetattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\ndef inert():\n    builtins.dict = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars(bi).update(dict=Safe)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbi = builtins\nbi.dict = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nclass Holder:\n    pass\nbi = Holder()\nbi.dict = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"class Restore:\n    rp.run_path = original\n",
+                True,
+            ),
+            (b"", b"class SafeState:\n    rp.run_path = print\n", False),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nclass Shadow:\n    builtins.dict = Safe\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\ngetattr = lambda *args: Safe\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\ngetattr = lambda *args: Safe\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars = lambda obj: {}\nvars(builtins).update(dict=Safe)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"restore = (\n    dict.update\n)\nrestore(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"import builtins\nrestore = getattr(builtins, 'dict').update\nrestore(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+                b"restore = mapping.update\nrestore(dict=real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"",
+                b"ns = rp.__dict__\nif globals().get('enabled'):\n    ns = {}\nns.update(run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"class Safe:\n    run_path = print\nmod = rp\n"
+                b"if globals().get('enabled'):\n    mod = Safe\nmod.run_path = print\n",
+                True,
+            ),
+            (
+                b"",
+                b"class SafeState:\n    apply = dict.update\n    apply(rp.__dict__, run_path=print)\n",
+                False,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\ngetattr = lambda *args: Safe\n"
+                b"if globals().get('enabled'):\n    getattr = builtins.getattr\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.getattr = lambda *args: Safe\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.getattr = lambda *args: Safe\n"
+                b"getattr \\\n (builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nif globals().get('enabled'):\n    builtins.getattr = lambda *args: Safe\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.__dict__['getattr'] = lambda *args: Safe\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars(builtins)['getattr'] = lambda *args: Safe\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars(builtins).__setitem__('getattr', lambda *args: Safe)\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars(builtins).update(getattr=lambda *args: Safe)\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nbuiltins.vars = lambda obj: {}\n"
+                b"vars(builtins).update(dict=real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_getattr = builtins.getattr\nbuiltins.getattr = lambda *args: Safe\n"
+                b"builtins.getattr = real_getattr\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_getattr = builtins.getattr\nbuiltins.getattr = lambda *args: Safe\n"
+                b"real_getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_getattr = builtins.getattr\nbuiltins.getattr = lambda *args: Safe\n"
+                b"if globals().get('enabled'):\n    builtins.getattr = real_getattr\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_getattr = builtins.getattr\nbuiltins.getattr = lambda *args: Safe\n"
+                b"enabled = True\nif globals().get('enabled'):\n    real_getattr = lambda *args: Safe\n"
+                b"builtins.getattr = real_getattr\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_getattr = builtins.getattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_getattr = lambda *args: Safe\n"
+                b"real_getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_dict = builtins.dict\nbuiltins.dict = Safe\n"
+                b"real_vars = builtins.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"real_vars(builtins).update(dict=real_dict)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal_dict = builtins.dict\nbuiltins.dict = Safe\n"
+                b"real_vars = builtins.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    real_vars = lambda obj: {}\n"
+                b"namespace = real_vars(builtins)\nnamespace.update(dict=real_dict)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\n"
+                b"mapping = builtins.__dict__\nput = mapping.__setitem__\nput('dict', real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\n"
+                b"real.__setitem__(builtins.__dict__, 'dict', real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nput = real.__setitem__\n"
+                b"put(builtins.__dict__, 'dict', real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"setattr(rp, 'run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nrestore = builtins.setattr\nrestore(rp, 'run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"dict.__setitem__(rp.__dict__, 'run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"put = dict.__setitem__\nput(rp.__dict__, 'run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nnamespace = builtins.vars(rp)\nput = namespace.__setitem__\n"
+                b"put('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nnamespace = builtins.vars(rp)\nput = namespace.__setitem__\n"
+                b"relay = put\nrelay('run_path', original)\n",
+                True,
+            ),
+            (b"", b"put = dict.__setitem__\nput(rp.__dict__, 'run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"mapping = rp.__dict__\nmapping |= {'run_path': original}\n",
+                True,
+            ),
+            (b"", b"mapping = rp.__dict__\nmapping |= {'run_path': print}\n", False),
+            (b"", b"mapping = rp.__dict__\nmapping['run_path'] = print\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"mapping = rp.__dict__\nmapping['run_path'] = original\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"rp.__dict__.update([('run_path', original)])\n",
+                True,
+            ),
+            (b"", b"rp.__dict__.update([('run_path', print)])\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"mapping = rp.__dict__\nrestore = mapping.update\nrestore([('run_path', original)])\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"rp.__dict__.__ior__({'run_path': original})\n",
+                True,
+            ),
+            (b"", b"rp.__dict__.__ior__({'run_path': print})\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"dict.__ior__(rp.__dict__, {'run_path': original})\n",
+                True,
+            ),
+            (b"", b"dict.__ior__(rp.__dict__, {'run_path': print})\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (b"", b"del rp.run_path\nrp.__dict__.setdefault('run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path\ndict.setdefault(rp.__dict__, 'run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path\nput = rp.__dict__.setdefault\nput('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.__dict__['run_path']\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (b"", b"del rp.__dict__['run_path']\nrp.__dict__.setdefault('run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"rp.__dict__.pop('run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (b"", b"rp.__dict__.pop('run_path')\nrp.__dict__.setdefault('run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path\nput = dict.setdefault\nput(rp.__dict__, 'run_path', original)\n",
+                True,
+            ),
+            (b"", b"del rp.run_path\nput = dict.setdefault\nput(rp.__dict__, 'run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path; rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"(rp.__dict__.pop('run_path'), rp.__dict__.setdefault('run_path', original))\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"dict.__delitem__(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"remove = rp.__dict__.pop\nremove('run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"remove = dict.pop\nremove(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"remove = dict.__delitem__\nremove(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"delattr(rp, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (b"", b"dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"del rp.run_path\nrp.__dict__.setdefault('run_path', original)\n"
+                b"runner = rp.run_path\nrunner('payload.py')\nrp.run_path = print\n",
+                True,
+            ),
+            (
+                b"",
+                b"rp.run_path = print\nrp.__dict__.setdefault('run_path', original)\n",
+                False,
+            ),
+            (
+                b"",
+                b"import builtins\nnamespace_of = builtins.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    namespace_of = lambda obj: {}\n"
+                b"mapping = namespace_of(rp)\nmapping.update(run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nnamespace_of = builtins.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    namespace_of = lambda obj: {}\n"
+                b"mapping = namespace_of(rp)\nrestore = mapping.update\nrestore(run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nnamespace_of = builtins.vars\nenabled = True\n"
+                b"if globals().get('enabled'):\n    namespace_of = lambda obj: {}\n"
+                b"mapping = namespace_of(rp)\nsecond = mapping\nsecond.update(run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nread_descriptor = builtins.getattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    read_descriptor = lambda *args: Safe\n"
+                b"restore = read_descriptor(builtins, 'dict').update\n"
+                b"restore(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nread_descriptor = builtins.getattr\nenabled = True\n"
+                b"if globals().get('enabled'):\n    read_descriptor = lambda *args: Safe\n"
+                b"restore = read_descriptor(builtins, 'dict').update\napply = restore\n"
+                b"apply(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nbuiltins.getattr = lambda *args: Safe\nbuiltins.getattr = getattr\n"
+                b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\ngetattr = lambda *args: Safe\ndel getattr\n"
+                b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"",
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nvars = lambda obj: {}\ndel vars\nvars(builtins).update(dict=Safe)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+                True,
+            ),
+            (b"", b"if False:\n    dict = object\ndict.update(rp.__dict__, run_path=print)\n", False),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"if False:\n    dict = object\ndict.update(rp.__dict__, run_path=original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\ndict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\nremove = dict.pop\nremove(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"import builtins\noriginal = rp.run_path\nrp.run_path = print\nremove = builtins.dict.pop\n"
+                b"remove(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"import builtins as bi\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"bi.dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"import builtins\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"real_dict = builtins.dict\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"import builtins\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"real_dict = builtins.dict\nremove = real_dict.pop\nremove(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"from builtins import dict as real_dict\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"from builtins import (\n    dict as real_dict,\n)\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"from builtins import (\n    dict as real_dict,\n    len as spare,\n)\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"pass; from builtins import dict as real_dict\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"0; from builtins import dict as real_dict\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"if True: from builtins import dict as real_dict\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"if True:\n    from builtins import dict as real_dict\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"enabled = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"original = rp.run_path\nrp.run_path = print\nreal_dict.pop(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"from builtins import (\n    dict as real_dict,\n    len as spare,\n)\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"from builtins import dict as real_dict, \\\n    len as spare\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"from builtins import dict as real_dict; pass\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"pass; from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"0; from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"if True: from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"if True:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"enabled = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"enabled = False\nglobals()['enabled'] = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"enabled = True\nglobals = lambda: {}\nglobals()['enabled'] = False\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"enabled = False\nglobals = lambda: {}\ndel globals\nglobals()['enabled'] = True\nif enabled:\n"
+                b"    from builtins import dict as real_dict\nreal_dict.pop(rp.__dict__, 'run_path')\n"
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\n",
+                b"enabled = False\nglobals()['globals'] = lambda: {}\ndel globals\n"
+                b"globals()['enabled'] = True\nif enabled:\n    from builtins import dict as real_dict\n"
+                b"real_dict.pop(rp.__dict__, 'run_path')\nrp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\nremove = dict.pop\nrelay = remove\n"
+                b"relay(rp.__dict__, 'run_path')\n",
+                b"rp.__dict__.setdefault('run_path', original)\n",
+                True,
+            ),
+        ],
+    )
+    def test_scan_model_preserves_latest_late_runpy_member_state(
+        self, prefix_state: bytes, late_state: bytes, expect_finding: bool
+    ) -> None:
+        detector = JITScriptDetector()
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + prefix_state
+            + padding
+            + late_state
+            + b"((rp).run_path)('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+        has_dynamic_finding = any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+        assert has_dynamic_finding is expect_finding
+
+    @pytest.mark.parametrize(
+        ("late_state", "call_line"),
+        [
+            (b"mod = rp\nmod.run_path = original\n", b"((mod).run_path)('payload.py')\n"),
+            (b"mod = rp\nmod.run_path = original\n", b"((rp).run_path)('payload.py')\n"),
+            (b"\x00\xffrp.run_path = original\n\x00\xff", b"((rp).run_path)('payload.py')\n"),
+            (b"\x00\xffrp.run_path = original\n", b"\x00\xff(\n rp.run_path\n)('payload.py')\n"),
+            (b"\x00\xffrp.run_path = original\n", b"\x00\xffrp \\\n .run_path('payload.py')\n"),
+            (
+                b"\x00\xffrp.run_path = original\n",
+                b"\x00\xffgetattr \\\n (rp, 'run_path')('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.run_path = original\n",
+                b"\x00\xffgetattr(rp, 'run_path')('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.run_path = original\n",
+                b"\x00\xffgetattr(rp, 'run_' + 'path')('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.run_path = original\n",
+                b"\x00\xffgetattr \\\n (rp, 'run_' + 'path')('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.run_path = original\n",
+                b"\x00\xffgetattr(\n rp, 'run_' + 'path'\n)('payload.py')\n",
+            ),
+            (b"\x00\xffrp.__dict__['run_path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+            (b"\x00\xffvars(rp).update(run_path=original)\n", b"((rp).run_path)('payload.py')\n"),
+            (
+                b"\x00\xffrp.__dict__.update({'other': print, 'run_path': original})\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"\x00\xffvars(rp).update(other=print, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (b"\x00\xffrp.__dict__.update(**{'run_path': original})\n", b"((rp).run_path)('payload.py')\n"),
+            (
+                b"\x00\xffrp.__dict__.update({'other': {'x': print}, 'run_path': original})\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"restore = rp.__dict__.update\n\x00\xffrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (b"\x00\xffdict.update(rp.__dict__, run_path=original)\n", b"((rp).run_path)('payload.py')\n"),
+            (
+                b"\x00\xffrestore = dict.update\nrestore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\n\x00\xffrestore = builtins.dict.update\nrestore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"ns = rp.__dict__\n\x00\xffns.update(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"restore = vars(rp).update\n\x00\xffrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"\x00\xffns = rp.__dict__\nns.update(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrestore = vars(rp).update\nrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"mod = rp\nns = mod.__dict__\nns.update(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"mod = rp\nrestore = vars(mod).update\nrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\nrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"mod = rp\nmapping = mod.__dict__\nsecond = mapping\nrestore = second.update\n"
+                b"restore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\napply = restore\n"
+                b"apply(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (b"\x00\xffrp.__dict__['run_' + 'path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+            (b"\x00\xffrp.__dict__['run' + '_path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+            (
+                b"\x00\xffrp.__dict__[\n    'run' + '_path'\n] = original\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.__dict__.update(\n    **{'run' + '_path': original}\n)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"\x00\xffrp.__dict__.__setitem__('run_' + 'path', original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"if globals().get('enabled'):\n    rp.run_path = original\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"if globals().get('enabled'):\n    restore = dict.update\nrestore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"class Restore:\n    rp.run_path = original\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"restore = (\n    dict.update\n)\nrestore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nrestore = getattr(builtins, 'dict').update\n"
+                b"restore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+                b"restore = mapping.update\nrestore(dict=real)\n"
+                b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nnamespace_of = builtins.vars\nbuiltins.vars = lambda obj: {}\n"
+                b"namespace_of(rp).update(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nnamespace_of = builtins.vars\nbuiltins.vars = lambda obj: {}\n"
+                b"mapping = namespace_of(rp)\nrestore = mapping.update\nrestore(run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\n"
+                b"if globals().get('enabled'):\n    mapping = builtins.__dict__\n"
+                b"mapping.update(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"class Restore:\n    restore = dict.update\n    restore(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+                b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+                b"restore = mapping.update\nif globals().get('enabled'):\n    restore = Safe.update\n"
+                b"restore(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+                b"((rp).run_path)('payload.py')\n",
+            ),
+            (
+                b"harmless = None\nfield: setattr(rp, 'run_path', original) = harmless\n",
+                b"rp.run_path('payload.py')\n",
+            ),
+        ],
+    )
+    def test_scan_model_detects_possible_late_runpy_member_restore(self, late_state: bytes, call_line: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            + padding
+            + late_state
+            + call_line
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix_state", "tail_state"),
+        [
+            (
+                b"import builtins\nread_member = builtins.getattr\nbuiltins.getattr = lambda *args: print\n",
+                b"read_member(rp, 'run_path')('payload.py')\n",
+            ),
+            (
+                b"import builtins\nread_member = builtins.getattr\nbuiltins.getattr = lambda *args: print\n",
+                b"read_member \\\n (rp, 'run_path')('payload.py')\n",
+            ),
+            (
+                b"original = rp.run_path\nrp.run_path = print\nimport builtins\n"
+                b"namespace_of = builtins.vars\nbuiltins.vars = lambda obj: {}\n",
+                b"namespace_of(rp).update(run_path=original)\n((rp).run_path)('payload.py')\n",
+            ),
+        ],
+    )
+    def test_scan_model_detects_saved_builtin_helper_runpy_action_across_padding(
+        self, prefix_state: bytes, tail_state: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + prefix_state + padding + tail_state + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_deep_folded_framed_runpy_getattr_without_recursion(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        member_expression = b" + ".join([b"'run_'", *([b"''"] * 1_000), b"'path'"])
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"\x00\xffgetattr(rp, "
+            + member_expression
+            + b")('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize("frame", [b"", b"\x00\xff"])
+    def test_scan_model_detects_late_runpy_call_after_unreachable_member_overwrite(self, frame: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + frame
+            + b"if False:\n    rp.__dict__.update(run_path=print)\n"
+            + b"rp.run_path('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_state",
+        [
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
+            b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+        ],
+    )
+    def test_scan_model_ignores_shadowed_dict_update_before_dangerous_runpy_call(self, shadow_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + shadow_state + b"((rp).run_path)('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "call_line",
+        [b"getattr(rp, 'run_path')('safe')\n", b"getattr(\n    rp, 'run_path'\n)('safe')\n"],
+    )
+    def test_scan_model_ignores_shadowed_getattr_execution_endpoint(self, call_line: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n" + padding + b"getattr = lambda obj, name: print\n" + call_line + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_handles_distinct_builtins_alias_noise_before_safe_runpy_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        aliases = b"".join(f"bi_{index} = builtins\n".encode() for index in range(4_000))
+        noise = b"    # noise\n" * 1_000
+        source = (
+            b"\x00\xffimport runpy as rp\nimport builtins\n"
+            + padding
+            + aliases
+            + noise
+            + b"rp.run_path = print\nrp.run_path('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_handles_distinct_builtins_alias_helper_write_noise_before_safe_runpy_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        aliases = b"".join(f"bi_{index} = builtins\n".encode() for index in range(2_000))
+        writes = b"".join(f"bi_0.setattr = lambda *args: None  # write {index}\n".encode() for index in range(2_000))
+        source = (
+            b"\x00\xffimport runpy as rp\nimport builtins\n"
+            + padding
+            + aliases
+            + writes
+            + b"rp.run_path = print\nrp.run_path('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_tail_framed_runpy_member_restore_with_prefix_context(self) -> None:
+        detector = JITScriptDetector()
+        filler = b"# filler\n" * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(b"# filler\n") + 1)
+        source = (
+            b"\x00\xffimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            + filler
+            + b"\x00\xffrp.run_path = original\n\x00\xff((rp).run_path)('payload.py')\n"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1962,6 +6026,38 @@ class TestJITScriptDetector:
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b"\x00\xffimport runpy as rp\n" + filler + b"\x00\xffdef payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_parenthesized_tail_alias_with_prefix_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + filler
+            + b"\x00\xffdef payload():\n    return ((rp).run_path)('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_multiline_parenthesized_tail_alias_with_prefix_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + filler
+            + b"\x00\xffdef payload():\n    return (\n        rp.run_path\n    )('payload.py')\n"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -2384,6 +6480,16 @@ class TestJITScriptDetector:
             + (b"\xff" * 64)
             + b"\n    return \"runpy.run_path('payload.py')\"\n\x00\xffMODEL-FRAMING"
         )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_framed_runpy_call_inside_multiline_literal(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffimport runpy as rp\npayload = '''\n\x00\xff((rp).run_path)('safe')\n'''\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
@@ -2822,6 +6928,375 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_invalidates_safe_libraryloader_proof_after_member_write(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import builtins\n"
+            b"    import ctypes\n"
+            b"    import runpy\n"
+            b"    original = runpy.run_path\n"
+            b"    runpy.run_path = print\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    loader.payload = builtins.setattr\n"
+            b"    loader.payload(runpy, 'run_path', original)\n"
+            b"    runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_independent_inert_libraryloader_after_other_rebound(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import ctypes\n"
+            b"    first = ctypes.LibraryLoader(len)\n"
+            b"    second = ctypes.LibraryLoader(len)\n"
+            b"    first.payload = ctypes.CDLL\n"
+            b"    second.payload.printf(b'x')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_inert_libraryloader_metadata_assignment(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import ctypes\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    loader.label = 'debug'\n"
+            b"    loader.payload.printf(b'x')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_detects_inert_libraryloader_dlltype_mapping_rebound(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import ctypes\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    loader.__dict__['_dlltype'] = ctypes.CDLL\n"
+            b"    loader.payload\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            b"    loader.__setattr__('_dlltype', ctypes.CDLL)\n",
+            b"    loader.__setattr__.__call__('_dlltype', ctypes.CDLL)\n",
+        ],
+    )
+    def test_scan_model_detects_inert_libraryloader_bound_setattr_rebound(self, mutation: bytes) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import ctypes\n"
+            b"    loader = ctypes.LibraryLoader(len)\n" + mutation + b"    loader.payload\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"def payload():\n"
+                b"    import builtins\n"
+                b"    import runpy\n"
+                b"    original = runpy.run_path\n"
+                b"    builtins.len = original\n"
+                b"    runpy.run_path = len\n"
+                b"    runpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"def payload():\n"
+                b"    import builtins\n"
+                b"    import ctypes\n"
+                b"    original = ctypes.CDLL\n"
+                b"    builtins.len = original\n"
+                b"    loader = ctypes.LibraryLoader(len)\n"
+                b"    loader.payload\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_detects_poisoned_implicit_builtin_safe_proof(
+        self, source: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_scan_model_detects_native_load_after_inert_libraryloader_member_rebound(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import ctypes\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    alias = loader\n"
+            b"    loader.payload = ctypes.CDLL\n"
+            b"    alias.payload('/missing')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_detects_late_ctypes_subscript_alias_after_priority_window(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xfffrom ctypes import cdll\n" + padding + b"cdll['payload']\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("helper_import", "endpoint"),
+        [
+            (b"from builtins import getattr as helper\n", b"helper(ctypes_alias, 'CDLL')('payload')\n"),
+            (b"from builtins import vars as helper\n", b"helper(ctypes_alias)['CDLL']('payload')\n"),
+            (
+                b"from builtins import (\n    getattr as helper,\n)\n",
+                b"helper(ctypes_alias, 'CDLL')('payload')\n",
+            ),
+        ],
+    )
+    def test_scan_model_detects_late_ctypes_call_through_imported_builtin_helper(
+        self, helper_import: bytes, endpoint: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + helper_import + b"import ctypes as ctypes_alias\n" + padding + endpoint
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("helper_import", "safe_rebind", "endpoint"),
+        [
+            (
+                b"from builtins import getattr as helper\n",
+                b"helper = lambda *_args: len\n",
+                b"helper(ctypes_alias, 'CDLL')('payload')\n",
+            ),
+            (
+                b"from builtins import vars as helper\n",
+                b"helper = lambda *_args: {'CDLL': len}\n",
+                b"helper(ctypes_alias)['CDLL']('payload')\n",
+            ),
+        ],
+    )
+    def test_scan_model_ignores_late_shadowed_imported_builtin_helper(
+        self, helper_import: bytes, safe_rebind: bytes, endpoint: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xff" + helper_import + b"import ctypes as ctypes_alias\n" + padding + safe_rebind + endpoint
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            b"loader._dlltype = ctypes.CDLL\n",
+            b"loader.__dict__['_dlltype'] = ctypes.CDLL\n",
+            b"setattr(loader, '_dlltype', ctypes.CDLL)\n",
+            b"vars(loader)['_dlltype'] = ctypes.CDLL\n",
+        ],
+    )
+    def test_scan_model_detects_late_inert_libraryloader_dlltype_rebound(self, mutation: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport ctypes\nloader = ctypes.LibraryLoader(len)\n" + padding + mutation + b"loader.payload\n"
+        )
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "late_state",
+        [
+            b"loader.label = 'debug'\nloader.payload\n",
+            b"loader._dlltype = len\nloader.payload\n",
+        ],
+    )
+    def test_scan_model_ignores_late_inert_libraryloader_safe_state(self, late_state: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport ctypes\nloader = ctypes.LibraryLoader(len)\n" + padding + late_state
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            b"@runpy_alias.run_path('payload.py')\ndef payload():\n    pass\n",
+            b"def payload(value=runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"class Payload(runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"class Payload(metaclass=runpy_alias.run_path('payload.py')):\n    pass\n",
+            b"def payload() -> runpy_alias.run_path('payload.py'):\n    pass\n",
+        ],
+    )
+    def test_scan_model_detects_late_runpy_definition_time_call(self, definition: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as runpy_alias\n" + padding + definition
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            b"@runpy_alias.run_path('payload.py')\ndef payload():\n    pass\n",
+            b"def payload(value=runpy_alias.run_path('payload.py')):\n    pass\n",
+        ],
+    )
+    def test_scan_model_ignores_late_safe_runpy_definition_time_call(self, definition: bytes) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as runpy_alias\nrunpy_alias.run_path = print\n" + padding + definition
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_late_deferred_runpy_annotation(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xfffrom __future__ import annotations\n"
+            b"import runpy as runpy_alias\n"
+            + padding
+            + b"def payload() -> runpy_alias.run_path('payload.py'):\n    pass\n"
+        )
+
+        findings = detector.scan_model(source, "onnx", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_late_ctypes_subscript_after_safe_rebind(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xfffrom ctypes import cdll\n" + padding + b"cdll = {}\ncdll['payload']\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_shadowed_delattr_before_safe_late_runpy_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + padding
+            + b"original = rp.run_path\nrp.run_path = print\nimport builtins\n"
+            + b"builtins.delattr = lambda *args: None\n"
+            + b"delattr(rp, 'run_path')\nrp.__dict__.setdefault('run_path', original)\nrp.run_path('safe')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_invalidates_state_after_bound_explicit_dunder_callback(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    import runpy\n"
+            b"    original = runpy.run_path\n"
+            b"    runpy.run_path = print\n"
+            b"    class CallbackHost:\n"
+            b"        def __getattr__(self, name):\n"
+            b"            return setattr\n"
+            b"    callback_host = CallbackHost()\n"
+            b"    callback_host.__getattr__('mutate')(runpy, 'run_path', original)\n"
+            b"    runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})
@@ -2950,11 +7425,10 @@ class TestDetectJITScriptRisks:
         assert any("Python operator" in str(f) for f in findings)
 
 
-def test_priority_assignment_aliases_bounds_expensive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Each indirect-alias probe re-parses the whole snippet; without a bound this is
-    # quadratic in the assignment count (PR #1402 DoS follow-up). The expensive
-    # probes are capped while the cheap direct-reference fast path still resolves.
-    lines = ["import ctypes", *[f"v{index} = index + {index}" for index in range(400)], "alias = ctypes"]
+def test_priority_assignment_aliases_skips_rootless_expensive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rootless assignments cannot depend on a tracked alias. Replaying the whole
+    # snippet for each literal assignment makes a small framed source CPU-bound.
+    lines = ["import ctypes", *[f"v{index} = {index}" for index in range(400)], "alias = ctypes"]
     source = "\n".join(lines)
     tree = ast.parse(source)
 
@@ -2969,9 +7443,18 @@ def test_priority_assignment_aliases_bounds_expensive_probes(monkeypatch: pytest
     monkeypatch.setattr(jit_script_module.ast, "parse", counting_parse)
     aliases = jit_script_module._priority_assignment_aliases(source, tree, {"ctypes"})
 
-    assert parse_calls <= jit_script_module._MAX_PRIORITY_ASSIGNMENT_PROBES + 1
+    assert parse_calls == 0
     # The direct-reference alias is still discovered via the cheap fast path.
     assert b"alias" in aliases
+
+
+def test_priority_assignment_aliases_preserves_wrapped_tracked_references() -> None:
+    source = "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)"
+    tree = ast.parse(source)
+
+    aliases = jit_script_module._priority_assignment_aliases(source, tree, {"ctypes"})
+
+    assert b"loader" in aliases
 
 
 def test_first_body_statement_segment_bounds_nested_recursion() -> None:
