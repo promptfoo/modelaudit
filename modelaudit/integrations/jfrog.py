@@ -87,6 +87,7 @@ def scan_jfrog_artifact(
     max_download_size: int | None = None,
     selective_download: bool = True,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """Download and scan an artifact or folder from JFrog Artifactory.
@@ -172,6 +173,8 @@ def scan_jfrog_artifact(
             folder_download_kwargs: dict[str, Any] = {}
             if scannable_extensions is not None:
                 folder_download_kwargs["scannable_extensions"] = scannable_extensions
+            if scannable_filenames is not None:
+                folder_download_kwargs["scannable_filenames"] = scannable_filenames
             scanner_selection = scan_kwargs.get(SCANNER_SELECTION_CONFIG_KEY)
             if isinstance(scanner_selection, dict):
                 folder_download_kwargs["scanner_selection"] = scanner_selection
