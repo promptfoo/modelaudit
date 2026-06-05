@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - redact signed stream source URLs across JSON, SARIF, CLI, progress, and SBOM reporting, including malformed source identifiers
+- classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence
