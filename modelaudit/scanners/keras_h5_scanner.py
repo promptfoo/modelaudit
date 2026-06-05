@@ -1090,6 +1090,7 @@ class KerasH5Scanner(BaseScanner):
                 result,
                 "Lambda" if is_lambda_layer else layer_class,
                 redact_nested_context=is_lambda_layer,
+                case_sensitive=is_lambda_layer,
             )
 
             # If there are nested models, scan them recursively
@@ -1637,6 +1638,7 @@ class KerasH5Scanner(BaseScanner):
         context: str = "",
         *,
         redact_nested_context: bool = False,
+        case_sensitive: bool = False,
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
 
@@ -1649,7 +1651,11 @@ class KerasH5Scanner(BaseScanner):
             if isinstance(value, str):
                 # Check for suspicious strings
                 for suspicious_term in self.suspicious_config_props:
-                    if self._contains_suspicious_config_term(value, suspicious_term):
+                    if self._contains_suspicious_config_term(
+                        value,
+                        suspicious_term,
+                        case_sensitive=case_sensitive,
+                    ):
                         result.add_check(
                             name="Suspicious Configuration String Check",
                             passed=False,
@@ -1670,6 +1676,7 @@ class KerasH5Scanner(BaseScanner):
                     result,
                     nested_context,
                     redact_nested_context=redact_nested_context,
+                    case_sensitive=case_sensitive,
                 )
             elif isinstance(value, list):
                 # Check each item in the list
@@ -1681,25 +1688,33 @@ class KerasH5Scanner(BaseScanner):
                             result,
                             nested_context,
                             redact_nested_context=redact_nested_context,
+                            case_sensitive=case_sensitive,
                         )
 
     @staticmethod
-    def _contains_suspicious_config_term(value: str, suspicious_term: str) -> bool:
+    def _contains_suspicious_config_term(
+        value: str,
+        suspicious_term: str,
+        *,
+        case_sensitive: bool = False,
+    ) -> bool:
         """Match suspicious config terms without substring hits inside benign identifiers."""
-        normalized_term = suspicious_term.strip().lower()
+        normalized_term = suspicious_term.strip()
         if not normalized_term:
             return False
 
-        normalized_value = value.lower()
+        if not case_sensitive:
+            normalized_term = normalized_term.lower()
+            value = value.lower()
         if normalized_term.replace("_", "").isalnum():
             normalized_core_term = normalized_term.strip("_")
             if not normalized_core_term:
                 return False
 
             pattern = rf"(?<![0-9A-Za-z])_*{re.escape(normalized_core_term)}_*(?![0-9A-Za-z])"
-            return re.search(pattern, normalized_value) is not None
+            return re.search(pattern, value) is not None
 
-        return normalized_term in normalized_value
+        return normalized_term in value
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract Keras H5 model metadata."""

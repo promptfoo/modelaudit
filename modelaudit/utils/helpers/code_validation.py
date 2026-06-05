@@ -1,10 +1,7 @@
-"""Python code validation utilities using py_compile."""
+"""Python code validation utilities."""
 
 import ast
 import logging
-import py_compile
-import tempfile
-from pathlib import Path
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -26,19 +23,9 @@ def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool,
         return False, "Empty or invalid code string"
 
     try:
-        # First try AST parsing for quick syntax check
-        ast.parse(code)
-
-        # Then use py_compile for more thorough validation
-        with tempfile.TemporaryDirectory(prefix="modelaudit-python-validation-") as temp_dir:
-            source_path = Path(temp_dir) / "snippet.py"
-            bytecode_path = Path(temp_dir) / "snippet.pyc"
-            source_path.write_text(code, encoding="utf-8")
-            try:
-                py_compile.compile(str(source_path), cfile=str(bytecode_path), doraise=True)
-                return True, None
-            except py_compile.PyCompileError as e:
-                return False, str(e)
+        tree = ast.parse(code, filename=filename)
+        compile(tree, filename, "exec", dont_inherit=True)
+        return True, None
 
     except SyntaxError as e:
         error_msg = f"Syntax error at line {e.lineno}: {e.msg}"

@@ -1900,6 +1900,7 @@ def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_
     result = KerasH5Scanner().scan(str(model_path))
 
     assert not any(check.name == "Lambda Layer Suspicious Keywords Check" for check in result.checks)
+    assert not any(check.name == "Suspicious Configuration String Check" for check in result.checks)
 
 
 def test_lambda_invalid_source_does_not_casefold_builtin_names(tmp_path: Path) -> None:
@@ -1925,6 +1926,7 @@ def test_lambda_invalid_source_does_not_casefold_builtin_names(tmp_path: Path) -
     result = KerasH5Scanner().scan(str(model_path))
 
     assert not any(check.name == "Lambda Layer Suspicious Keywords Check" for check in result.checks)
+    assert not any(check.name == "Suspicious Configuration String Check" for check in result.checks)
 
 
 def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_layers(tmp_path: Path) -> None:
