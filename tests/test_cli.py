@@ -961,6 +961,32 @@ def test_cli_report_writers_preserve_existing_output_on_fsync_failure(
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory fsync is required")
+def test_cli_report_writers_fsync_published_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful report write must persist both content and its directory entry."""
+    output_path = tmp_path / "scanners.json"
+    original_fsync = os.fsync
+    synced_file_types: list[int] = []
+
+    def record_fsync(fd: int) -> None:
+        synced_file_types.append(stat.S_IFMT(os.fstat(fd).st_mode))
+        original_fsync(fd)
+
+    monkeypatch.setattr(cli_module.os, "fsync", record_fsync)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IFREG in synced_file_types
+    assert stat.S_IFDIR in synced_file_types
+
+
 def test_cli_report_writers_reject_missing_path_with_trailing_separator(tmp_path: Path) -> None:
     """A directory-spelled output must not silently become a regular file."""
     output_path = tmp_path / "new-output"
@@ -1082,8 +1108,8 @@ def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
     assert os.getxattr(output_path, attribute_name) == b"keep"
 
 
-def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
-    """A report path must not truncate another name for the same inode."""
+def test_cli_report_writers_replace_hard_link_without_modifying_alias(tmp_path: Path) -> None:
+    """Atomic replacement must leave an existing hard-link alias unchanged."""
     victim_path = tmp_path / "victim.txt"
     output_path = tmp_path / "scanners.json"
     victim_path.write_text("sentinel")
@@ -1094,9 +1120,56 @@ def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
         ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
     )
 
-    assert result.exit_code == 2
-    assert "Refusing to overwrite hard-linked output" in result.output
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
     assert victim_path.read_text() == "sentinel"
+    assert not output_path.samefile(victim_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+def test_cli_report_writers_reject_unpreservable_extended_acl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing report must remain intact when its ACL cannot be preserved."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("sentinel")
+    monkeypatch.setattr(cli_module, "_posix_fd_has_extended_acl", lambda _path, _fd: True)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Unable to preserve extended output ACL" in result.output
+    assert output_path.read_text() == "sentinel"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptors are required")
+def test_directory_can_replace_entries_allows_darwin_root_without_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary root-owned macOS aliases such as /tmp must remain usable."""
+    monkeypatch.setattr(cli_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(cli_module, "_darwin_fd_has_extended_acl", lambda _fd: False)
+    monkeypatch.setattr(Path, "stat", lambda _path: types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755))
+    monkeypatch.setattr(cli_module.os, "open", lambda *_args, **_kwargs: 123)
+    monkeypatch.setattr(cli_module.os, "close", lambda _fd: None)
+    monkeypatch.setattr(cli_module.os, "access", lambda *_args, **_kwargs: False)
+
+    assert not cli_module._directory_can_replace_entries(Path("/"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptors are required")
+def test_directory_can_replace_entries_rejects_darwin_extended_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hidden macOS ACL grant must make a symlink parent untrusted."""
+    monkeypatch.setattr(cli_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(cli_module, "_darwin_fd_has_extended_acl", lambda _fd: True)
+
+    assert cli_module._directory_can_replace_entries(Path("/"))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
@@ -1312,11 +1385,11 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     assert json.loads(output_path.read_text())["scanners"]
 
 
-def test_windows_output_rename_uses_same_directory_filename(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Same-directory handle renames must leave FILE_RENAME_INFO.RootDirectory null."""
+def test_windows_output_rename_uses_absolute_destination_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A null RootDirectory requires an absolute FILE_RENAME_INFO destination."""
     import ctypes.wintypes as wintypes
 
-    captured: dict[str, int | None] = {}
+    captured: dict[str, object] = {}
 
     class FileRenameInfo(ctypes.Structure):
         _fields_ = [
@@ -1341,6 +1414,11 @@ def test_windows_output_rename_uses_same_directory_filename(monkeypatch: pytest.
             captured["root_directory"] = rename_info.root_directory
             captured["replace_if_exists"] = rename_info.replace_if_exists
             captured["file_name_length"] = rename_info.file_name_length
+            file_name_address = ctypes.addressof(rename_info) + FileRenameInfo.file_name.offset
+            captured["file_name"] = ctypes.string_at(
+                file_name_address,
+                rename_info.file_name_length,
+            ).decode("utf-16-le")
             return True
 
     set_file_information = SetFileInformationByHandle()
@@ -1348,17 +1426,173 @@ def test_windows_output_rename_uses_same_directory_filename(monkeypatch: pytest.
     monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
     monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: fd))
 
+    destination_path = Path(r"C:\reports\output.txt")
     cli_module._replace_windows_output_file(
-        "output.txt",
+        str(destination_path),
         123,
-        "output.txt",
+        destination_path,
         replace_existing=False,
     )
 
     assert captured == {
         "root_directory": None,
         "replace_if_exists": 0,
-        "file_name_length": len("output.txt".encode("utf-16-le")),
+        "file_name_length": len(str(destination_path).encode("utf-16-le")),
+        "file_name": str(destination_path),
+    }
+
+
+def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing reports need DACL-enforced write access plus identity metadata."""
+    captured: dict[str, object] = {}
+
+    class CreateFileW:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            path: str,
+            desired_access: int,
+            share_mode: int,
+            _security_attributes: object,
+            creation_disposition: int,
+            flags: int,
+            _template: object,
+        ) -> int:
+            captured.update(
+                path=path,
+                desired_access=desired_access,
+                share_mode=share_mode,
+                creation_disposition=creation_disposition,
+                flags=flags,
+            )
+            return 321
+
+    def open_osfhandle(handle: int, flags: int) -> int:
+        captured["handle"] = handle
+        captured["os_flags"] = flags
+        return 7
+
+    create_file = CreateFileW()
+    kernel32 = types.SimpleNamespace(CreateFileW=create_file)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(open_osfhandle=open_osfhandle))
+
+    destination_path = Path(r"C:\reports\output.txt")
+    output_fd = cli_module._open_windows_existing_output_file(str(destination_path), destination_path)
+
+    assert output_fd == 7
+    assert captured == {
+        "path": str(destination_path),
+        "desired_access": 0x0002 | 0x0080 | 0x00020000,
+        "share_mode": 0x00000001 | 0x00000002 | 0x00000004,
+        "creation_disposition": 3,
+        "flags": 0x00200000,
+        "handle": 321,
+        "os_flags": os.O_WRONLY | getattr(os, "O_BINARY", 0),
+    }
+
+
+def test_windows_output_security_preserves_protected_dacl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Atomic replacement must preserve the DACL and inheritance state."""
+    import ctypes.wintypes as wintypes
+
+    captured: dict[str, object] = {}
+
+    class GetSecurityInfo:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            source_handle: int,
+            object_type: int,
+            security_information: int,
+            owner: Any,
+            group: Any,
+            dacl: Any,
+            _sacl: Any,
+            descriptor: Any,
+        ) -> int:
+            captured["get"] = (source_handle, object_type, security_information)
+            assert owner is None
+            assert group is None
+            ctypes.cast(dacl, ctypes.POINTER(wintypes.LPVOID)).contents.value = 33
+            ctypes.cast(descriptor, ctypes.POINTER(wintypes.LPVOID)).contents.value = 44
+            return 0
+
+    class GetSecurityDescriptorControl:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(self, descriptor: Any, control: Any, revision: Any) -> bool:
+            captured["descriptor"] = ctypes.cast(descriptor, wintypes.LPVOID).value
+            ctypes.cast(control, ctypes.POINTER(wintypes.WORD)).contents.value = 0x1000
+            ctypes.cast(revision, ctypes.POINTER(wintypes.DWORD)).contents.value = 1
+            return True
+
+    class SetSecurityInfo:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            target_handle: int,
+            object_type: int,
+            security_information: int,
+            owner: Any,
+            group: Any,
+            dacl: Any,
+            _sacl: Any,
+        ) -> int:
+            captured["set"] = (
+                target_handle,
+                object_type,
+                security_information,
+                owner,
+                group,
+                dacl.value,
+            )
+            return 0
+
+    class LocalFree:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(self, descriptor: Any) -> None:
+            captured["freed"] = descriptor.value
+
+    advapi32 = types.SimpleNamespace(
+        GetSecurityInfo=GetSecurityInfo(),
+        GetSecurityDescriptorControl=GetSecurityDescriptorControl(),
+        SetSecurityInfo=SetSecurityInfo(),
+    )
+    kernel32 = types.SimpleNamespace(LocalFree=LocalFree())
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda name, **_kwargs: advapi32 if name == "advapi32" else kernel32,
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda fd: fd + 1000))
+
+    cli_module._copy_windows_output_security("output.txt", 5, 6)
+
+    assert captured == {
+        "get": (1005, 1, 0x00000004),
+        "descriptor": 44,
+        "set": (
+            1006,
+            1,
+            0x00000004 | 0x80000000,
+            None,
+            None,
+            33,
+        ),
+        "freed": 44,
     }
 
 
@@ -1398,7 +1632,7 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
     def attempt_parent_swap(
         output: str,
         temp_fd: int,
-        destination_name: str,
+        destination_path: Path,
         *,
         replace_existing: bool,
     ) -> None:
@@ -1407,7 +1641,7 @@ def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
         original_replace(
             output,
             temp_fd,
-            destination_name,
+            destination_path,
             replace_existing=replace_existing,
         )
 
