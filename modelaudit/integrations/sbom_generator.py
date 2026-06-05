@@ -118,14 +118,15 @@ def _open_scan_root_fd(scan_root: str, *, readable: bool = False) -> int | None:
     if not _supports_descriptor_walk():
         return None
 
-    flags = _directory_open_flags(readable=readable)
+    components = [component for component in scan_root.split(os.path.sep) if component]
+    ancestor_flags = _directory_open_flags(readable=False)
+    root_flags = _directory_open_flags(readable=readable)
 
     current_fd = -1
     try:
-        current_fd = os.open(os.path.sep, flags)
-        for component in scan_root.split(os.path.sep):
-            if not component:
-                continue
+        current_fd = os.open(os.path.sep, root_flags if not components else ancestor_flags)
+        for index, component in enumerate(components):
+            flags = root_flags if index == len(components) - 1 else ancestor_flags
             next_fd = os.open(component, flags, dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd

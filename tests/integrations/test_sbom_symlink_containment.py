@@ -97,6 +97,23 @@ def test_sbom_hashes_ordinary_files(tmp_path: Path) -> None:
     assert _property_value(component, "size") == str(len(content))
 
 
+def test_sbom_normalizes_top_level_component_metadata_path(tmp_path: Path) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    model_file = scan_root / "model.bin"
+    model_file.write_bytes(b"top-level model content")
+    results = {
+        "issues": [{"location": str(model_file), "severity": "critical"}],
+        "file_metadata": {str(model_file): {"is_model": True}},
+    }
+
+    component = _component_named(json.loads(generate_sbom([str(scan_root)], results)), model_file.name)
+
+    assert component["bom-ref"] == str(model_file)
+    assert _property_value(component, "ml:is_model") == "true"
+    assert _property_value(component, "risk_score") == "5"
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
 @pytest.mark.parametrize("use_pydantic", [False, True])
 def test_sbom_rejects_fifo_without_blocking(tmp_path: Path, use_pydantic: bool) -> None:
@@ -524,6 +541,35 @@ def test_sbom_hashes_single_file_beneath_execute_only_parent(
             sbom_text = generate_sbom_pydantic([str(model_file)], create_initial_audit_result())
         else:
             sbom_text = generate_sbom([str(model_file)], {"issues": [], "file_metadata": {}})
+    finally:
+        parent.chmod(0o700)
+
+    component = _component_named(json.loads(sbom_text), model_file.name)
+    assert _sha256_values(component) == [hashlib.sha256(content).hexdigest()]
+    assert _property_value(component, "size") == str(len(content))
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not (hasattr(os, "O_PATH") or hasattr(os, "O_SEARCH")),
+    reason="execute-only directory descriptors are unavailable",
+)
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_hashes_directory_beneath_execute_only_parent(
+    tmp_path: Path,
+    use_pydantic: bool,
+) -> None:
+    parent = tmp_path / "execute-only"
+    scan_root = parent / "models"
+    scan_root.mkdir(parents=True)
+    model_file = scan_root / "model.bin"
+    content = b"readable scan root beneath an execute-only parent"
+    model_file.write_bytes(content)
+    parent.chmod(0o111)
+    try:
+        if use_pydantic:
+            sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
+        else:
+            sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
     finally:
         parent.chmod(0o700)
 
