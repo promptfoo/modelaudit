@@ -120,10 +120,10 @@ COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     re.sub(r"[._-]", "", key.lower()) for key in SENSITIVE_QUERY_KEYS
 )
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[_-])*"
-    r"(?:access[_-]?key(?:[_-]?id)?|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
-    r"cookie|credential|jwt|passphrase|password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|"
-    r"secret[_-]?key|session[_-]?(?:id|token)|sessionid|signature|sig|token)"
+    r"(?:[a-z0-9]+[_.-])*"
+    r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|client[_.-]?secret|"
+    r"cookie|credential|jwt|passphrase|password|passwd|private[_.-]?key|pwd|refresh[_.-]?token|sas|secret|"
+    r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
 )
 AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY: Final[str] = r"(?-i:(?:awsAccessKeyId|awsSecretAccessKey|awsSessionToken))"
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|{AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY})"
@@ -188,9 +188,22 @@ COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
     r"(?:=|\s+))(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
+COMMAND_CERT_PASSWORD_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?P<option>((?<!\w)--(?:proxy-)?cert|(?<!\w)-E)(?:=|\s+))"
+    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<certificate>(?:\\.|(?!(?P=quote)).)*:)"
+    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+)
+COMMAND_CERT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?P<option>((?<!\w)--(?:proxy-)?cert|(?<!\w)-E)(?:=|\s+))"
+    r"(?P<certificate>[^\s\"';&|)]*:)(?P<password>[^\s\"';&|)]+)"
+)
 COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)(\$?[\"']?)([^:\s\"';&|]*:)"
     r"([^\"'\s;&|)]+)([\"']?)"
+)
+SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b[A-Za-z_][A-Za-z0-9_.]*\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
+    rf"(?P<key_quote>[\"'])(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})(?P=key_quote)\s*,\s*)"
 )
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
@@ -1790,6 +1803,84 @@ def _redact_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED_EVIDENCE_VALUE}{match.group(5)}"
 
 
+def _redact_quoted_certificate_password(match: re.Match[str]) -> str:
+    if re.fullmatch(r"[A-Za-z]:", match.group("certificate")) and match.group("password").startswith(("\\", "/")):
+        return match.group(0)
+    return (
+        f"{match.group('option')}{match.group('prefix')}{match.group('quote')}"
+        f"{match.group('certificate')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+    )
+
+
+def _redact_certificate_password(match: re.Match[str]) -> str:
+    if re.fullmatch(r"[A-Za-z]:", match.group("certificate")) and match.group("password").startswith(("\\", "/")):
+        return match.group(0)
+    return f"{match.group('option')}{match.group('certificate')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _find_function_argument_end(text: str, start: int) -> int:
+    quote: str | None = None
+    quote_slashes = 0
+    triple = False
+    bracket_depth = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            current_slashes = _count_preceding_backslashes(text, index) if char == quote else -1
+            closes_plain_quote = quote_slashes == 0 and current_slashes % 2 == 0
+            closes_serialized_quote = quote_slashes > 0 and current_slashes == quote_slashes
+            if triple and text.startswith(quote * 3, index) and (closes_plain_quote or closes_serialized_quote):
+                quote = None
+                quote_slashes = 0
+                triple = False
+                index += 3
+            elif not triple and char == quote and (closes_plain_quote or closes_serialized_quote):
+                quote = None
+                quote_slashes = 0
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            quote_slashes = _count_preceding_backslashes(text, index)
+            triple = text.startswith(char * 3, index)
+            index += 3 if triple else 1
+            continue
+        if char in "([{":
+            bracket_depth += 1
+        elif char in ")]}" and bracket_depth > 0:
+            bracket_depth -= 1
+        elif (char in {",", ")", ";", "\n"}) and bracket_depth == 0:
+            return index
+        index += 1
+    return len(text)
+
+
+def _redact_sensitive_function_arguments(text: str) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    for match in SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text):
+        value_end = _find_function_argument_end(text, match.end())
+        raw_value = text[match.end() : value_end]
+        if not raw_value.strip():
+            continue
+        leading = raw_value[: len(raw_value) - len(raw_value.lstrip())]
+        trailing = raw_value[len(raw_value.rstrip()) :]
+        replacements.append(
+            (
+                match.end(),
+                value_end,
+                f'{leading}"{REDACTED_EVIDENCE_VALUE}"{trailing}',
+            )
+        )
+
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
+
+
 def _redact_command_structured_value(match: re.Match[str]) -> str:
     quote = match.group("value_quote")
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
@@ -1906,6 +1997,8 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SENSITIVE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, redacted)
+    redacted = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
     pieces: list[str] = []
     cursor = 0
@@ -1957,6 +2050,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = redacted[:redaction_budget]
     redacted = _redact_command_context_tokens(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
+    redacted = _redact_sensitive_function_arguments(redacted)
     redacted = _normalize_expression_sensitive_keys(redacted)
     redacted = _normalize_quoted_sensitive_keys(redacted)
     redacted = _normalize_subscript_sensitive_keys(redacted)
