@@ -7206,6 +7206,8 @@ class TestJITScriptDetector:
             b"globals().update(**{'setattr': lambda *args: None})\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
             b"import builtins\nbuiltins.__dict__.update(setattr=lambda *args: None)\n",
+            b"import builtins as b\nv = vars\nv(b).update(setattr=lambda *args: None)\n",
+            b"d = dict\nd.__setitem__(__builtins__, 'setattr', lambda *args: None)\n",
             b"__builtins__.setattr = lambda *args: None\n",
             b"__builtins__['setattr'] = lambda *args: None\n",
         ],
@@ -7230,6 +7232,7 @@ class TestJITScriptDetector:
         [
             "if False:\n    globals()['setattr'] = lambda *args: None\n",
             "globals = lambda: {}\nglobals()['setattr'] = lambda *args: None\n",
+            "v = vars\nv = lambda _value: {}\nv(__builtins__).update(setattr=lambda *args: None)\n",
             "def helper():\n    setattr = lambda *args: None\n",
         ],
     )
@@ -7297,6 +7300,20 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_uses_explicit_builtins_setattr_after_local_shadow(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import builtins, runpy as rp\nsetattr = print\n"
+            b"builtins.setattr(rp, 'run_path', print)\nrp.run_path('safe')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_overwritten_runpy_capture(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\ncaptured = rp.run_path\ncaptured = print\nrp.run_path = print\ncaptured('safe')\n"
@@ -7343,6 +7360,16 @@ class TestJITScriptDetector:
                 b"setattr(c, 'CDLL', print)\nactual.CDLL('payload.so')\n",
                 "Native library loading detected",
             ),
+            (
+                b"import webbrowser as wb\nactual = wb\n(wb,) = (object(),)\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nm = __builtins__\n"
+                b"m.update(setattr=lambda *args: None)\nsetattr(c, 'CDLL', print)\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
         ],
     )
     def test_scan_model_keeps_typed_call_after_other_owner_safe_overwrite(
@@ -7366,6 +7393,33 @@ class TestJITScriptDetector:
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_extract_python_code_scopes_suppressions_to_each_candidate(self) -> None:
+        detector = JITScriptDetector()
+        safe = b"import webbrowser as wb\nwb.open = print\nwb.open('safe')\n"
+        dangerous = b"import webbrowser as wb\nwb.open('https://example.invalid')\n"
+        dangerous_start = len(safe) + 1
+        data = safe + b"\x00" + dangerous
+        candidates: list[jit_script_module._EmbeddedPythonCandidate] = [
+            (safe, (0, len(safe)), ((0, len(safe)),)),
+            (
+                dangerous,
+                (dangerous_start, dangerous_start + len(dangerous)),
+                ((dangerous_start, dangerous_start + len(dangerous)),),
+            ),
+        ]
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "TorchScript",
+            "payload.py",
+            prioritized_snippets=candidates,
+        )
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
@@ -7411,6 +7465,7 @@ class TestJITScriptDetector:
             b"put = globals().__setitem__\nput('print', eval)\n",
             b"update = globals().update\nupdate(print=eval)\n",
             b"globals().update(**{'print': eval})\n",
+            b"v = vars\nv(__builtins__).update(print=eval)\n",
             b"if enabled:\n    globals()['print'] = eval\n",
             b"__builtins__.print = eval\n",
             b"__builtins__['print'] = eval\n",
@@ -7435,6 +7490,7 @@ class TestJITScriptDetector:
         [
             b"if False:\n    globals()['print'] = eval\n",
             b"globals = lambda: {}\nglobals()['print'] = eval\n",
+            b"v = vars\nv = lambda _value: {}\nv(__builtins__).update(print=eval)\n",
             b"dict = lambda *args: None\ndict.__setitem__(globals(), 'print', eval)\n",
         ],
     )
