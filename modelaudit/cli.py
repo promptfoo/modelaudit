@@ -653,6 +653,22 @@ def _validated_absolute_output_path(output_path: str) -> Path:
     current_path = Path(absolute_path.anchor)
     path_parts = absolute_path.parts[1:]
     for index, part in enumerate(path_parts):
+        if part == ".." and os.name == "nt":
+            if _is_link_like_path(current_path):
+                raise _OutputWriteError(
+                    f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+                )
+            try:
+                component_stat = current_path.lstat()
+            except OSError as exc:
+                raise _OutputWriteError(
+                    f"Refusing output path through invalid parent component: {_display_path(output_path)}"
+                ) from exc
+            if not stat.S_ISDIR(component_stat.st_mode):
+                raise _OutputWriteError(
+                    f"Refusing output path through non-directory component: {_display_path(output_path)}"
+                )
+
         candidate_path = current_path / part
         if not _is_link_like_path(candidate_path):
             current_path = candidate_path

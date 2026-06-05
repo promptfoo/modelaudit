@@ -864,8 +864,42 @@ def test_cli_report_writers_reject_dotdot_after_regular_file(tmp_path: Path) -> 
     )
 
     assert result.exit_code == 2
+    if os.name == "nt":
+        assert "non-directory component" in result.output
     assert regular_file.read_text() == "sentinel"
     assert not (tmp_path / "scanners.json").exists()
+
+
+def test_cli_report_writers_reject_dotdot_after_missing_component(tmp_path: Path) -> None:
+    """Missing intermediate components must not disappear during Windows normalization."""
+    output_path = tmp_path / "missing-directory" / ".." / "scanners.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert not (tmp_path / "scanners.json").exists()
+
+
+def test_windows_dotdot_validation_rejects_invalid_intermediate_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the Windows-only raw component guard on every CI platform."""
+    regular_file = tmp_path / "not-a-directory"
+    regular_file.write_text("sentinel")
+    file_output = regular_file / ".." / "scanners.json"
+    missing_output = tmp_path / "missing-directory" / ".." / "scanners.json"
+
+    monkeypatch.setattr(cli_module, "Path", type(tmp_path))
+    monkeypatch.setattr(cli_module.os, "name", "nt")
+
+    with pytest.raises(cli_module._OutputWriteError, match="non-directory component"):
+        cli_module._validated_absolute_output_path(str(file_output))
+    with pytest.raises(cli_module._OutputWriteError, match="invalid parent component"):
+        cli_module._validated_absolute_output_path(str(missing_output))
 
 
 def test_cli_report_writers_pin_dotdot_before_parent_rename(
