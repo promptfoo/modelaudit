@@ -2049,6 +2049,13 @@ def test_call_graph_treats_proven_frozen_function_body_import_as_safe() -> None:
     assert call_graph._import_module_can_execute_user_code("ntpath") is False
 
 
+def test_call_graph_does_not_trust_dotted_name_under_frozen_module() -> None:
+    if FrozenImporter.find_spec("ntpath") is None:
+        pytest.skip("ntpath is not frozen on this interpreter")
+
+    assert call_graph._import_module_can_execute_user_code("ntpath.attacker") is True
+
+
 def test_call_graph_fails_closed_when_custom_finder_can_shadow_frozen_function_body_import(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

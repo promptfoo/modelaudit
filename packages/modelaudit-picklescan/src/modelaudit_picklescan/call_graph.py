@@ -4057,20 +4057,19 @@ def _user_positional_argument_range(
 
 
 def _import_module_can_execute_user_code(module_name: str) -> bool:
-    top_level_module = module_name.partition(".")[0]
-    if not top_level_module or top_level_module in _IMPORT_EXECUTION_SAFE_MODULES:
+    if not module_name or module_name in _IMPORT_EXECUTION_SAFE_MODULES:
         return False
     try:
-        standard_spec = FrozenImporter.find_spec(top_level_module)
+        standard_spec = FrozenImporter.find_spec(module_name)
     except Exception:
         return True
     if standard_spec is None or not _module_spec_uses_builtin_or_frozen_loader(standard_spec):
         return True
-    loaded_module = sys.modules.get(top_level_module)
+    loaded_module = sys.modules.get(module_name)
     if loaded_module is not None:
         loaded_spec = getattr(loaded_module, "__spec__", None)
         return not (isinstance(loaded_spec, ModuleSpec) and _module_spec_uses_builtin_or_frozen_loader(loaded_spec))
-    return _untrusted_meta_path_finder_precedes(FrozenImporter, top_level_module)
+    return _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
 
 
 def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
