@@ -6250,25 +6250,11 @@ class TestJITScriptDetector:
                 b"Alias().run(eval)\n"
             ),
             (b"__builtins__.__dict__.pop('eval')('1+1')\n"),
-            (b"\x00\xffdef payload():\n    for _index, callback in enumerate([eval]):\n        callback('1+1')\n"),
-            (
-                b"\x00\xffasync def get_callback():\n"
-                b"    return eval\n"
-                b"async def payload():\n"
-                b"    (await get_callback())('1+1')\n"
-            ),
-            (b"\x00\xffdef payload():\n    return next(iter([eval]))('1+1')\n"),
-            (b"\x00\xffdef payload():\n    return next(iter([]), eval)('1+1')\n"),
-            (b"\x00\xffdef payload():\n    callbacks = list([eval])\n    return callbacks[0]('1+1')\n"),
-            (b"\x00\xffdef payload():\n    callbacks = dict(run=eval)\n    return callbacks['run']('1+1')\n"),
-            (
-                b"\x00\xffdef payload():\n"
-                b"    match [eval]:\n"
-                b"        case [callback] | (callback,):\n"
-                b"            callback('1+1')\n"
-            ),
-            (b"callbacks = []\nalias = callbacks\ncallbacks += [eval]\nalias[0]('1+1')\n"),
+            b"\x00\xffcallbacks = []\ncallbacks += [eval]\ncallbacks[0]('1+1')\n",
+            b"callbacks = []\nalias = callbacks\ncallbacks += [eval]\nalias[0]('1+1')\n",
+            b"\x00\xffdef run(g=getattr):\n    g(__builtins__, 'eval')('1+1')\nrun()\n",
             (b"\x00\xffdef run(g=getattr):\n    return g(__builtins__, 'eval')('1+1')\nrun()\n"),
+            (b"\x00\xffdef run(callback):\n    callback('1+1')\ndef outer(*funcs):\n    funcs[0](eval)\nouter(run)\n"),
             (
                 b"\x00\xffdef run(callback):\n"
                 b"    return callback('1+1')\n"
@@ -6276,9 +6262,64 @@ class TestJITScriptDetector:
                 b"    return functions[0](eval)\n"
                 b"outer(run)\n"
             ),
-            (b"(lambda callback: callback('1+1'))(eval)\n"),
-            (b"\x00\xffglobals().update({'sink': eval})\nsink('1+1')\n"),
+            b"\x00\xff(lambda callback: callback('1+1'))(eval)\n",
+            b"(lambda callback: callback('1+1'))(eval)\n",
+            b"\x00\xffglobals().update({'sink': eval})\nsink('1+1')\n",
+            b"\x00\xffglobals().update(sink=eval)\nsink('1+1')\n",
+            b"\x00\xfffor _index, callback in enumerate([eval]):\n    callback('1+1')\n",
+            (b"\x00\xffdef payload():\n    for _index, callback in enumerate([eval]):\n        callback('1+1')\n"),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return eval\n"
+                b"async def main():\n"
+                b"    (await get_callback())('1+1')\n"
+            ),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return eval\n"
+                b"async def payload():\n"
+                b"    (await get_callback())('1+1')\n"
+            ),
+            b"\x00\xffnext(iter([eval]))('1+1')\n",
+            (b"\x00\xffdef payload():\n    return next(iter([eval]))('1+1')\n"),
+            (b"\x00\xffdef payload():\n    return next(iter([]), eval)('1+1')\n"),
+            b"\x00\xffcallbacks = list([eval])\ncallbacks[0]('1+1')\n",
+            (b"\x00\xffdef payload():\n    callbacks = list([eval])\n    return callbacks[0]('1+1')\n"),
+            b"\x00\xffcallbacks = dict(sink=eval)\ncallbacks['sink']('1+1')\n",
+            (b"\x00\xffdef payload():\n    callbacks = dict(run=eval)\n    return callbacks['run']('1+1')\n"),
+            b"\x00\xffmatch [eval]:\n    case [sink] | (sink,):\n        sink('1+1')\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match [eval]:\n"
+                b"        case [callback] | (callback,):\n"
+                b"            callback('1+1')\n"
+            ),
             (b"\x00\xffdef run(callbacks=[]):\n    callbacks.append(eval)\n    return callbacks[0]('1+1')\nrun()\n"),
+            (b"callbacks = {'run': eval}\nfor callback in callbacks.values():\n    callback('1+1')\n"),
+            (b"callbacks = {**{'run': eval}}\ncallbacks['run']('1+1')\n"),
+            (b"callbacks = [len, eval]\ncallbacks[1:][0]('1+1')\n"),
+            (b"callbacks = [len] + [eval]\ncallbacks[1]('1+1')\n"),
+            (b"callbacks = [] + [eval]\ncallbacks[0]('1+1')\n"),
+            (b"def run(callback):\n    callback('1+1')\ncallbacks = [] + [run]\ncallbacks[0](eval)\n"),
+            (b"class C:\n    def __call__(self, callback):\n        callback('1+1')\nC()(eval)\n"),
+            (b"class C:\n    def __new__(cls):\n        return eval\nC()('1+1')\n"),
+            (b"callbacks = {eval}\nfor callback in callbacks:\n    callback('1+1')\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'eval')('1+1')\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['eval']('1+1')\n"),
+            (b"def configure():\n    globals()['sink'] = eval\nconfigure()\nsink('1+1')\n"),
+            (b"import operator\noperator.call(eval, '1+1')\n"),
+            (b"from operator import call as invoke\ninvoke(eval, '1+1')\n"),
+            (b"name = f'eval'\ngetattr(__builtins__, name)('1+1')\n"),
+            (b"callbacks = {'run': eval}\ncallbacks.setdefault('run')('1+1')\n"),
+            (b"callbacks = {'run': eval}\ndict.get(callbacks, 'run')('1+1')\n"),
+            (b"callbacks = [eval]\nlist.__getitem__(callbacks, 0)('1+1')\n"),
+            (b"staticmethod(eval)('1+1')\n"),
+            (b"def run():\n    list(map(lambda callback: callback('1+1'), [eval]))\nrun()\n"),
+            (b"def callbacks():\n    yield eval\nfor callback in callbacks():\n    callback('1+1')\n"),
+            (b"from functools import reduce\nreduce(lambda _value, callback: callback('1+1'), [eval], None)\n"),
+            (b"try:\n    raise Exception(eval)\nexcept Exception as error:\n    error.args[0]('1+1')\n"),
+            (b"type(eval).__call__(eval, '1+1')\n"),
+            (b"def annotated(value: eval):\n    pass\nannotated.__annotations__['value']('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -6605,6 +6646,33 @@ class TestJITScriptDetector:
                 b"unused = eval\n"
             ),
             (b"__builtins__.__dict__.pop('len')([])\nunused = eval\n"),
+            b"\x00\xffcallbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n",
+            b"callbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n",
+            b"callbacks = (len,)\nalias = callbacks\ncallbacks += (eval,)\nalias[1]('1+1')\n",
+            b"\x00\xffdef run(g=getattr):\n    g(__builtins__, 'len')([])\nrun()\nunused = eval\n",
+            b"\x00\xffdef run(g=lambda *_args: len):\n    return g(__builtins__, 'eval')([])\nrun()\nunused = eval\n",
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    callback([])\n"
+                b"def outer(*funcs):\n"
+                b"    funcs[0](len)\n"
+                b"outer(run)\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback([])\n"
+                b"def outer(*functions):\n"
+                b"    return functions[0](len)\n"
+                b"outer(run)\n"
+                b"unused = eval\n"
+            ),
+            b"\x00\xff(lambda callback: callback([]))(len)\nunused = eval\n",
+            b"(lambda callback: callback([]))(len)\nunused = eval\n",
+            b"\x00\xffglobals().update({'sink': len})\nsink([])\nunused = eval\n",
+            b"\x00\xffglobals().update(sink=len)\nsink([])\nunused = eval\n",
+            b"\x00\xffglobals().update({'sink': eval})\nglobals().update({'sink': len})\nsink([])\n",
+            b"\x00\xfffor _index, callback in enumerate([len]):\n    callback([])\nunused = eval\n",
             (
                 b"\x00\xffdef payload():\n"
                 b"    for _index, callback in enumerate([len]):\n"
@@ -6614,19 +6682,30 @@ class TestJITScriptDetector:
             (
                 b"\x00\xffasync def get_callback():\n"
                 b"    return len\n"
+                b"async def main():\n"
+                b"    (await get_callback())([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return len\n"
                 b"async def payload():\n"
                 b"    (await get_callback())([])\n"
                 b"unused = eval\n"
             ),
-            (b"\x00\xffdef payload():\n    return next(iter([len]))([])\nunused = eval\n"),
-            (b"\x00\xffdef payload():\n    return next(iter([]), len)([])\nunused = eval\n"),
-            (b"\x00\xffdef payload():\n    callbacks = list([len])\n    return callbacks[0]([])\nunused = eval\n"),
+            b"\x00\xffnext(iter([len]))([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    return next(iter([len]))([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    return next(iter([]), len)([])\nunused = eval\n",
+            b"\x00\xffcallbacks = list([len])\ncallbacks[0]([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    callbacks = list([len])\n    return callbacks[0]([])\nunused = eval\n",
+            b"\x00\xffcallbacks = dict(sink=len)\ncallbacks['sink']([])\nunused = eval\n",
             (
                 b"\x00\xffdef payload():\n"
                 b"    callbacks = dict(run=len)\n"
                 b"    return callbacks['run']([])\n"
                 b"unused = eval\n"
             ),
+            b"\x00\xffmatch [len]:\n    case [sink] | (sink,):\n        sink([])\nunused = eval\n",
             (
                 b"\x00\xffdef payload():\n"
                 b"    match [len]:\n"
@@ -6634,25 +6713,68 @@ class TestJITScriptDetector:
                 b"            callback([])\n"
                 b"unused = eval\n"
             ),
-            (b"callbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n"),
-            (b"callbacks = (len,)\nalias = callbacks\ncallbacks += (eval,)\nalias[1]('1+1')\n"),
-            (b"\x00\xffdef run(g=lambda *_args: len):\n    return g(__builtins__, 'eval')([])\nrun()\nunused = eval\n"),
-            (
-                b"\x00\xffdef run(callback):\n"
-                b"    return callback([])\n"
-                b"def outer(*functions):\n"
-                b"    return functions[0](len)\n"
-                b"outer(run)\n"
-                b"unused = eval\n"
-            ),
-            (b"(lambda callback: callback([]))(len)\nunused = eval\n"),
-            (b"\x00\xffglobals().update({'sink': eval})\nglobals().update({'sink': len})\nsink([])\n"),
             (
                 b"\x00\xffdef run(callbacks=[]):\n"
                 b"    callbacks.append(len)\n"
                 b"    return callbacks[0]([])\n"
                 b"run()\n"
                 b"unused = eval\n"
+            ),
+            (b"callbacks = {'run': len}\nfor callback in callbacks.values():\n    callback([])\nunused = eval\n"),
+            (b"callbacks = {**{'run': len}}\ncallbacks['run']([])\nunused = eval\n"),
+            (b"callbacks = [eval, len]\ncallbacks[1:][0]([])\n"),
+            (b"callbacks = [eval] + [len]\ncallbacks[1]([])\n"),
+            (b"callbacks = {**{'run': {'inner': eval}}, 'run': len}\ncallbacks['run']([])\n"),
+            (
+                b"def run(callback):\n"
+                b"    callback('1+1')\n"
+                b"callbacks = {**{'run': run}, 'run': len}\n"
+                b"callbacks['run']([])\n"
+                b"unused = eval\n"
+            ),
+            (b"class C:\n    def __call__(self, callback):\n        callback([])\nC()(len)\nunused = eval\n"),
+            (b"class C:\n    def __new__(cls):\n        return len\nC()([])\nunused = eval\n"),
+            (
+                b"class C:\n"
+                b"    def __new__(cls):\n"
+                b"        return len\n"
+                b"    def __call__(self, callback):\n"
+                b"        callback('1+1')\n"
+                b"C()(eval)\n"
+            ),
+            (b"callbacks = {len}\nfor callback in callbacks:\n    callback([])\nunused = eval\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'len')([])\nunused = eval\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['len']([])\nunused = eval\n"),
+            (b"def configure():\n    globals()['sink'] = len\nconfigure()\nsink([])\nunused = eval\n"),
+            (b"import operator\noperator.call(len, [])\nunused = eval\n"),
+            (
+                b"import operator\n"
+                b"class Safe:\n"
+                b"    call = staticmethod(lambda callback, value: value)\n"
+                b"operator = Safe\n"
+                b"operator.call(eval, '1+1')\n"
+            ),
+            (b"name = f'len'\ngetattr(__builtins__, name)([])\nunused = eval\n"),
+            (b"callbacks = {'run': len}\ncallbacks.setdefault('run', eval)([])\n"),
+            (b"callbacks = {'run': len}\ndict.get(callbacks, 'run')([])\nunused = eval\n"),
+            (b"callbacks = [len]\nlist.__getitem__(callbacks, 0)([])\nunused = eval\n"),
+            (b"staticmethod(len)([])\nunused = eval\n"),
+            (b"callbacks = {-1: eval}\ncallbacks.pop()('1+1')\n"),
+            (b"callbacks = [eval]\nlist.get(callbacks, 0)('1+1')\n"),
+            (b"list(map(lambda callback: callback([]), [len]))\nunused = eval\n"),
+            (b"def callbacks():\n    yield len\nfor callback in callbacks():\n    callback([])\nunused = eval\n"),
+            (
+                b"from functools import reduce\n"
+                b"reduce(lambda _value, callback: callback([]), [len], None)\n"
+                b"unused = eval\n"
+            ),
+            (b"try:\n    raise Exception(len)\nexcept Exception as error:\n    error.args[0]([])\nunused = eval\n"),
+            (b"type(len).__call__(len, [])\nunused = eval\n"),
+            (
+                b"from __future__ import annotations\n"
+                b"def annotated(value: eval):\n"
+                b"    pass\n"
+                b"annotated.__annotations__['value']('1+1')\n"
             ),
         ],
     )
@@ -7889,6 +8011,16 @@ class TestJITScriptDetector:
             len(candidate) <= jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
             for candidate, _span, _real_ranges in priority_selected
         )
+
+    def test_candidate_extraction_bounds_dense_assignments_and_keeps_late_priority_import(self) -> None:
+        assignments = b"".join(f"value_{index} = {index}\n".encode() for index in range(1_000))
+        priority_source = b"import runpy as rp\nrp.run_path('payload.py')\n"
+        source = assignments + priority_source
+
+        candidates = jit_script_module._candidate_embedded_python_snippets(source)
+
+        assert len(candidates) <= jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
+        assert any(candidate.startswith(b"import runpy as rp\n") for candidate, _span, _ranges in candidates)
 
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
