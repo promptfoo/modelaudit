@@ -157,7 +157,7 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
 _STATIC_TRUTHY_BUILTIN_REFERENCES = frozenset({"builtins.print", "builtins.len"})
 _STATIC_EAGER_GENERATOR_CONSUMER_REFERENCES = frozenset(
     name
-    for consumer in {"all", "any", "list", "max", "min", "set", "sorted", "sum", "tuple"}
+    for consumer in {"list", "max", "min", "set", "sorted", "sum", "tuple"}
     for name in (
         consumer,
         f"builtins.{consumer}",
@@ -2496,6 +2496,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 resolved_names,
                 eager_scope_index=eager_scope_index,
             )
+
+    @staticmethod
+    def _generator_direct_body_is_guaranteed(node: ast.GeneratorExp) -> bool:
+        if not isinstance(node.elt, ast.Call):
+            return False
+        for generator in node.generators:
+            if generator.is_async or generator.ifs:
+                return False
+            if isinstance(generator.iter, (ast.List, ast.Tuple, ast.Set)):
+                if not generator.iter.elts:
+                    return False
+            elif isinstance(generator.iter, ast.Dict):
+                if not generator.iter.keys:
+                    return False
+            else:
+                return False
+        return True
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -5582,7 +5599,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self.risky_calls.add(normalized_name)
         self.visit(node.func)
         for argument in node.args:
-            if eagerly_consumes_generators and isinstance(argument, ast.GeneratorExp):
+            if (
+                eagerly_consumes_generators
+                and isinstance(argument, ast.GeneratorExp)
+                and self._generator_direct_body_is_guaranteed(argument)
+            ):
                 self._eager_comprehension_depth += 1
                 try:
                     self.visit(argument)

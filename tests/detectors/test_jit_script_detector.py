@@ -6385,6 +6385,18 @@ class TestJITScriptDetector:
             "callbacks = [len]\nalias = callbacks\nalias.insert(1, eval)\ncallbacks[1]('1+1')\n",
             "callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks['run']('1+1')\n",
             "callbacks = {'run': len}\nalias = callbacks\nalias.update(run=eval)\ncallbacks['run']('1+1')\n",
+            "callbacks = {'run': eval}\nfor _name, callback in callbacks.items():\n    callback('1+1')\n",
+            "import operator\noperator.getitem([eval], 0)('1+1')\n",
+            "from operator import getitem\ngetitem([eval], 0)('1+1')\n",
+            "callbacks = [len]\ncallbacks.__setitem__(0, eval)\ncallbacks[0]('1+1')\n",
+            "callbacks = {'run': len}\ndict.__setitem__(callbacks, 'run', eval)\ncallbacks['run']('1+1')\n",
+            "callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[1]('1+1')\n",
+            "iter([eval]).__next__()('1+1')\n",
+            "[eval][::-1][0]('1+1')\n",
+            "([eval] * 2)[1]('1+1')\n",
+            "([eval] * 100)[99]('1+1')\n",
+            "next(iter({'run': eval}.values()))('1+1')\n",
+            "((callback := eval), callback)[1]('1+1')\n",
         ],
     )
     def test_dangerous_builtin_alias_regressions(self, source: str) -> None:
@@ -6441,6 +6453,23 @@ class TestJITScriptDetector:
             "callbacks = [eval]\ncallbacks.insert(0, len)\ncallbacks[0]([])\n",
             "callbacks = {}\ncallbacks.update({'run': len})\ncallbacks['run']([])\nunused = eval\n",
             "callbacks = {'run': eval}\ncallbacks.update(run=len)\ncallbacks['run']([])\n",
+            "callbacks = {'run': len}\nfor _name, callback in callbacks.items():\n    callback([])\nunused = eval\n",
+            "import operator\noperator.getitem([len], 0)([])\nunused = eval\n",
+            (
+                "import operator\n"
+                "operator = type('Safe', (), {'getitem': lambda _items, _index: len})\n"
+                "operator.getitem([eval], 0)([])\n"
+            ),
+            "callbacks = [eval]\ncallbacks.__setitem__(0, len)\ncallbacks[0]([])\n",
+            "callbacks = {'run': eval}\ndict.__setitem__(callbacks, 'run', len)\ncallbacks['run']([])\n",
+            "callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[0]([])\n",
+            "callbacks = [eval]\ncallbacks.clear()\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            "iter([len]).__next__()([])\nunused = eval\n",
+            "[len][::-1][0]([])\nunused = eval\n",
+            "([len] * 2)[1]([])\nunused = eval\n",
+            "([len] * 100)[99]([])\nunused = eval\n",
+            "next(iter({'run': len}.values()))([])\nunused = eval\n",
+            "((callback := len), callback)[1]([])\nunused = eval\n",
         ],
     )
     def test_dangerous_builtin_alias_regressions_avoid_false_positives(self, source: str) -> None:
@@ -8969,6 +8998,16 @@ class TestJITScriptDetector:
             b"def identity(callback):\n    return callback\nidentity(eval)('1+1')\n",
             b"def identity(callback):\n    return callback\nidentity(callback=eval)('1+1')\n",
             b"identity = lambda callback: callback\nidentity(eval)('1+1')\n",
+            b"callbacks = {'run': eval}\nfor _name, callback in callbacks.items():\n    callback('1+1')\n",
+            b"import operator\noperator.getitem([eval], 0)('1+1')\n",
+            b"callbacks = [len]\ncallbacks.__setitem__(0, eval)\ncallbacks[0]('1+1')\n",
+            b"callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[1]('1+1')\n",
+            b"iter([eval]).__next__()('1+1')\n",
+            b"[eval][::-1][0]('1+1')\n",
+            b"([eval] * 2)[1]('1+1')\n",
+            b"([eval] * 100)[99]('1+1')\n",
+            b"next(iter({'run': eval}.values()))('1+1')\n",
+            b"((callback := eval), callback)[1]('1+1')\n",
         ],
     )
     def test_scan_model_detects_dynamic_callbacks_from_returned_mapping_values(self, data: bytes) -> None:
@@ -8986,6 +9025,17 @@ class TestJITScriptDetector:
             b"def identity(callback):\n    return callback\nidentity(len)([])\nunused = eval\n",
             b"def identity(callback):\n    callback = len\n    return callback\nidentity(eval)([])\n",
             (b"def choose(callback, enabled):\n    return callback if enabled else len\nchoose(eval, False)([])\n"),
+            b"callbacks = {'run': len}\nfor _name, callback in callbacks.items():\n    callback([])\nunused = eval\n",
+            b"import operator\noperator.getitem([len], 0)([])\nunused = eval\n",
+            b"callbacks = [eval]\ncallbacks.__setitem__(0, len)\ncallbacks[0]([])\n",
+            b"callbacks = [eval, len]\ncallbacks.reverse()\ncallbacks[0]([])\n",
+            b"callbacks = [eval]\ncallbacks.clear()\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            b"iter([len]).__next__()([])\nunused = eval\n",
+            b"[len][::-1][0]([])\nunused = eval\n",
+            b"([len] * 2)[1]([])\nunused = eval\n",
+            b"([len] * 100)[99]([])\nunused = eval\n",
+            b"next(iter({'run': len}.values()))([])\nunused = eval\n",
+            b"((callback := len), callback)[1]([])\nunused = eval\n",
         ],
     )
     def test_scan_model_ignores_removed_or_safe_dynamic_callbacks(self, data: bytes) -> None:

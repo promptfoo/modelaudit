@@ -4550,6 +4550,21 @@ def test_shadowed_generator_consumer_does_not_apply_module_member_overwrite() ->
     assert any(call.rule_code == "S110" for call in high_risk_python_calls_in_source(source))
 
 
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "list(c.__dict__.update(CDLL=print) for _ in [0] if False)",
+        "list(print if True else c.__dict__.update(CDLL=print) for _ in [0])",
+        "any(True if i == 0 else c.__dict__.update(CDLL=print) for i in [0, 1])",
+        "all(False if i == 0 else c.__dict__.update(CDLL=print) for i in [0, 1])",
+    ],
+)
+def test_generator_consumer_does_not_apply_skipped_module_member_overwrite(consumer: str) -> None:
+    source = f"import ctypes as c\n{consumer}\nloader = c.CDLL\nloader('payload.so')\n".encode()
+
+    assert any(call.rule_code == "S110" for call in high_risk_python_calls_in_source(source))
+
+
 def test_scan_zip_nonempty_loop_target_shadows_dangerous_import(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     source = "import subprocess\nfor subprocess in (object(),):\n    pass\nsubprocess.run()\n"

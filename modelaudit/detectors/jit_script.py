@@ -10040,7 +10040,7 @@ class JITScriptDetector:
                     return None
                 if (
                     isinstance(node, ast.Attribute)
-                    and node.attr in {"attrgetter", "methodcaller"}
+                    and node.attr in {"attrgetter", "getitem", "methodcaller"}
                     and isinstance(node.value, ast.Name)
                     and self._has_binding_marker(node.value.id, self._OPERATOR_MODULE_MARKER)
                 ):
@@ -10769,9 +10769,20 @@ class JITScriptDetector:
                     if bound is None:
                         bounds.append(None)
                         continue
-                    if not isinstance(bound, ast.Constant) or not isinstance(bound.value, int):
+                    if isinstance(bound, ast.Constant) and isinstance(bound.value, int):
+                        bounds.append(bound.value)
+                        continue
+                    if (
+                        isinstance(bound, ast.UnaryOp)
+                        and isinstance(bound.op, (ast.UAdd, ast.USub))
+                        and isinstance(bound.operand, ast.Constant)
+                        and isinstance(bound.operand.value, int)
+                    ):
+                        value = bound.operand.value
+                        bounds.append(value if isinstance(bound.op, ast.UAdd) else -value)
+                        continue
+                    else:
                         return None
-                    bounds.append(bound.value)
                 try:
                     return list(range(length))[slice(*bounds)]
                 except ValueError:
@@ -10807,6 +10818,13 @@ class JITScriptDetector:
                     right_length = self._sequence_expression_length(node.right, right)
                     if left_length is not None and right_length is not None:
                         return left_length + right_length
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+                    for sequence_node, count_node in ((node.left, node.right), (node.right, node.left)):
+                        count_resolved, count = self._constant_container_key(count_node)
+                        sequence = self._resolve_builtin_container(sequence_node)
+                        sequence_length = self._sequence_expression_length(sequence_node, sequence)
+                        if count_resolved and isinstance(count, int) and sequence_length is not None:
+                            return max(0, count) * sequence_length
                 return None
 
             @classmethod
@@ -10835,6 +10853,29 @@ class JITScriptDetector:
                         new_length,
                     ),
                 }
+
+            @classmethod
+            def _repeat_sequence_container(
+                cls,
+                container: Mapping[tuple[object, ...], _ContainerValue],
+                count: int,
+            ) -> dict[tuple[object, ...], _ContainerValue]:
+                length = cls._sequence_container_length(container)
+                if length is None or count <= 0:
+                    return {}
+                new_length = length * count
+                if new_length > cls._MAX_CONSTANT_STRING_CANDIDATES:
+                    return {}
+                repeated: dict[tuple[object, ...], _ContainerValue] = {}
+                for repeat_index in range(count):
+                    repeated.update(
+                        cls._reindex_sequence_container(
+                            container,
+                            {index: repeat_index * length + index for index in range(length)},
+                            new_length,
+                        )
+                    )
+                return repeated
 
             @classmethod
             def _container_path_element_matches(cls, element: object, key: object) -> bool:
@@ -11057,6 +11098,13 @@ class JITScriptDetector:
                         left_length=self._sequence_expression_length(node.left, left),
                         right_length=self._sequence_expression_length(node.right, right),
                     )
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+                    for sequence_node, count_node in ((node.left, node.right), (node.right, node.left)):
+                        count_resolved, count = self._constant_container_key(count_node)
+                        if count_resolved and isinstance(count, int):
+                            sequence = self._resolve_builtin_container(sequence_node)
+                            if sequence:
+                                return self._repeat_sequence_container(sequence, count)
                 if isinstance(node, ast.IfExp):
                     truth = self._constant_truth(node.test)
                     if truth is True:
@@ -11591,6 +11639,35 @@ class JITScriptDetector:
                         return self._dangerous_constant_string(node.slice)
                     key_resolved, key = self._constant_container_key(node.slice)
                     if key_resolved:
+                        if isinstance(node.value, (ast.List, ast.Tuple)) and isinstance(key, int):
+                            index = key if key >= 0 else len(node.value.elts) + key
+                            if 0 <= index < len(node.value.elts):
+                                for element in node.value.elts[:index]:
+                                    self.visit(element)
+                                return self._resolve_builtin(node.value.elts[index])
+                        if (
+                            isinstance(node.value, ast.BinOp)
+                            and isinstance(node.value.op, ast.Mult)
+                            and isinstance(key, int)
+                        ):
+                            for sequence_node, count_node in (
+                                (node.value.left, node.value.right),
+                                (node.value.right, node.value.left),
+                            ):
+                                count_resolved, count = self._constant_container_key(count_node)
+                                sequence = self._resolve_builtin_container(sequence_node)
+                                length = self._sequence_expression_length(sequence_node, sequence)
+                                if not count_resolved or not isinstance(count, int) or length is None or count <= 0:
+                                    continue
+                                repeated_length = length * count
+                                repeated_index = key if key >= 0 else repeated_length + key
+                                if not 0 <= repeated_index < repeated_length:
+                                    continue
+                                prefixes = self._container_access_prefixes(sequence, (repeated_index % length,))
+                                return next(
+                                    (builtin for prefix in prefixes if (builtin := sequence.get(prefix)) is not None),
+                                    None,
+                                )
                         container = self._resolve_builtin_container(node.value)
                         prefixes = self._container_access_prefixes(container, (key,))
                         return next(
@@ -11600,6 +11677,33 @@ class JITScriptDetector:
                 if isinstance(node, ast.Call):
                     if (return_binding := self._function_return_binding(node)) and return_binding[0] is not None:
                         return return_binding[0]
+                    if (
+                        len(node.args) == 2
+                        and not node.keywords
+                        and self._resolve_operator_helper(node.func) == "getitem"
+                    ):
+                        key_resolved, key = self._constant_container_key(node.args[1])
+                        if key_resolved:
+                            container = self._resolve_builtin_container(node.args[0])
+                            prefixes = self._container_access_prefixes(container, (key,))
+                            return next(
+                                (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
+                                None,
+                            )
+                    if (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "__next__"
+                        and not node.args
+                        and not node.keywords
+                    ):
+                        return next(
+                            (
+                                binding[0]
+                                for binding in self._iterator_element_bindings(node.func.value)
+                                if binding[0] is not None
+                            ),
+                            None,
+                        )
                     if len(node.args) == 1 and not node.keywords and self._is_builtin_helper(node.func, "staticmethod"):
                         return self._resolve_builtin(node.args[0])
                     if (
@@ -12346,7 +12450,7 @@ class JITScriptDetector:
                         and not iterable.args
                         and not iterable.keywords
                         and isinstance(iterable.func, ast.Attribute)
-                        and iterable.func.attr == "values"
+                        and iterable.func.attr in {"items", "values"}
                     ):
                         container = self._resolve_builtin_container(iterable.func.value)
                         function_container = self._resolve_function_container(iterable.func.value)
@@ -12354,6 +12458,14 @@ class JITScriptDetector:
                             container,
                             function_container,
                         )
+                        if iterable.func.attr == "items" and isinstance(target, (ast.Tuple, ast.List)):
+                            if target.elts:
+                                self._bind_target(target.elts[0], None)
+                            if len(target.elts) >= 2:
+                                self._bind_target_from_container_candidates(target.elts[1], candidates)
+                            for element in target.elts[2:]:
+                                self._bind_target(element, None)
+                            return
                     else:
                         container = self._resolve_builtin_container(iterable)
                         function_container = self._resolve_function_container(iterable)
@@ -12380,6 +12492,24 @@ class JITScriptDetector:
                     and not node.keywords
                 ):
                     iterable = node.args[0]
+                if (
+                    isinstance(iterable, ast.Call)
+                    and not iterable.args
+                    and not iterable.keywords
+                    and isinstance(iterable.func, ast.Attribute)
+                    and iterable.func.attr == "values"
+                ):
+                    return self._mapping_container_value_bindings(
+                        self._resolve_builtin_container(iterable.func.value),
+                        self._resolve_function_container(iterable.func.value),
+                    )
+                if (
+                    isinstance(iterable, ast.Call)
+                    and len(iterable.args) == 1
+                    and not iterable.keywords
+                    and self._is_builtin_helper(iterable.func, "reversed")
+                ):
+                    return list(reversed(self._iterator_element_bindings(iterable.args[0])))
                 elements = self._literal_iterable_elements(iterable)
                 if elements is not None and not isinstance(iterable, ast.Dict):
                     return [self._binding_from_expression(element) for element in elements]
@@ -12689,7 +12819,7 @@ class JITScriptDetector:
                         )
                         if node.module == "functools" and alias.name == "partial":
                             self.builtins_module_aliases[-1].add(f"{self._FUNCTOOLS_PARTIAL_MARKER}{local_name}")
-                        if node.module == "operator" and alias.name in {"attrgetter", "methodcaller"}:
+                        if node.module == "operator" and alias.name in {"attrgetter", "getitem", "methodcaller"}:
                             self.builtins_module_aliases[-1].add(
                                 f"{self._operator_helper_marker_prefix(local_name)}{alias.name}"
                             )
@@ -14278,6 +14408,73 @@ class JITScriptDetector:
                             function_summary=self._function_summary_for_node(value),
                         )
 
+            def _replace_container_identity_contents(
+                self,
+                container_identity: int,
+                container: dict[tuple[object, ...], str | None],
+                function_container: dict[tuple[object, ...], tuple[tuple[str, int], ...]],
+            ) -> None:
+                for scope_index, (identity_scope, container_scope) in enumerate(
+                    zip(
+                        self.container_identity_scopes,
+                        self.container_alias_scopes,
+                        strict=True,
+                    )
+                ):
+                    for name, identity in identity_scope.items():
+                        if identity == container_identity:
+                            container_scope[name] = dict(container)
+                            self._register_container_functions(
+                                name,
+                                function_container,
+                                scope_index=scope_index,
+                            )
+
+            def _bind_container_setitem_call(self, node: ast.Call) -> None:
+                if not isinstance(node.func, ast.Attribute) or node.func.attr != "__setitem__" or node.keywords:
+                    return
+                arguments = list(node.args)
+                owner = node.func.value
+                if any(self._is_builtin_helper(owner, name) for name in ("dict", "list")):
+                    if len(arguments) != 3:
+                        return
+                    container_node = arguments.pop(0)
+                else:
+                    if len(arguments) != 2:
+                        return
+                    container_node = owner
+                if not isinstance(container_node, ast.Name):
+                    return
+                container_identity = self._lookup_container_identity(container_node.id)
+                if container_identity is None:
+                    return
+                key_resolved, key = self._constant_container_key(arguments[0])
+                if not key_resolved:
+                    return
+                value_binding = self._binding_from_expression(arguments[1])
+                container = dict(self._lookup_container_alias(container_node.id))
+                function_container = dict(self._lookup_container_functions(container_node.id))
+                if container_identity in self.mutable_mapping_identities:
+                    self._replace_mapping_container_entries(container, {}, {key})
+                    self._replace_mapping_container_entries(function_container, {}, {key})
+                    container[(key,)] = value_binding[0]
+                    container.update({(key, *path): builtin for path, builtin in value_binding[2].items()})
+                    if value_binding[8]:
+                        function_container[(key,)] = value_binding[8]
+                    function_container.update({(key, *path): functions for path, functions in value_binding[3].items()})
+                elif container_identity in self.mutable_sequence_identities and isinstance(key, int):
+                    bindings = self._sequence_container_element_bindings(container, function_container)
+                    index = key if key >= 0 else len(bindings) + key
+                    if not 0 <= index < len(bindings):
+                        return
+                    bindings[index] = value_binding
+                    sequence_binding = self._sequence_binding(bindings)
+                    container = sequence_binding[2]
+                    function_container = sequence_binding[3]
+                else:
+                    return
+                self._replace_container_identity_contents(container_identity, container, function_container)
+
             def _bind_container_mutation_call(self, node: ast.Call) -> None:
                 if not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
                     return
@@ -14287,6 +14484,14 @@ class JITScriptDetector:
                     return
                 container = dict(self._lookup_container_alias(container_name))
                 function_container = dict(self._lookup_container_functions(container_name))
+                if (
+                    node.func.attr == "clear"
+                    and not node.args
+                    and not node.keywords
+                    and container_identity in self.mutable_mapping_identities | self.mutable_sequence_identities
+                ):
+                    self._replace_container_identity_contents(container_identity, {}, {})
+                    return
                 if node.func.attr == "update" and container_identity in self.mutable_mapping_identities:
                     if len(node.args) > 1:
                         return
@@ -14417,6 +14622,9 @@ class JITScriptDetector:
                 elif node.func.attr == "extend" and len(node.args) == 1:
                     bindings.extend(self._iterator_element_bindings(node.args[0]))
                     sequence_mutation = True
+                elif node.func.attr == "reverse" and not node.args:
+                    bindings.reverse()
+                    sequence_mutation = True
                 elif node.func.attr == "pop" and len(node.args) <= 1 and bindings:
                     if node.args:
                         key_resolved, key = self._constant_container_key(node.args[0])
@@ -14435,21 +14643,7 @@ class JITScriptDetector:
                     sequence_binding = self._sequence_binding(bindings)
                     container = sequence_binding[2]
                     function_container = sequence_binding[3]
-                for scope_index, (identity_scope, container_scope) in enumerate(
-                    zip(
-                        self.container_identity_scopes,
-                        self.container_alias_scopes,
-                        strict=True,
-                    )
-                ):
-                    for name, identity in identity_scope.items():
-                        if identity == container_identity:
-                            container_scope[name] = dict(container)
-                            self._register_container_functions(
-                                name,
-                                function_container,
-                                scope_index=scope_index,
-                            )
+                self._replace_container_identity_contents(container_identity, container, function_container)
 
             def _bind_runtime_namespace_update_call(self, node: ast.Call) -> None:
                 if (
@@ -14539,6 +14733,7 @@ class JITScriptDetector:
                     self.generic_visit(node)
                 self._apply_function_effects(node.func)
                 self._bind_attribute_setter_call(node)
+                self._bind_container_setitem_call(node)
                 self._bind_container_mutation_call(node)
                 self._bind_runtime_namespace_update_call(node)
 
