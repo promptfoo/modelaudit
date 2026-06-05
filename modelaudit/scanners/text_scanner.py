@@ -65,8 +65,14 @@ MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
+DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
+    rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_ENCLOSING_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}$")
+DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:"
     rb"[\"'](?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']"
@@ -102,11 +108,13 @@ DOCUMENTATION_PRIVILEGE_OPTION = (
     + DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT
     + rb"(?:=[^\s]+|\s+[^\s]+)|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?)"
 )
-DOCUMENTATION_PRIVILEGE_WRAPPER = rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+)?"
 DOCUMENTATION_ENV_ASSIGNMENT = rb"[A-Za-z_][A-Za-z0-9_]{0,127}=(?:[^\s\"']+|\"[^\"\r\n]{0,4096}\"|'[^'\r\n]{0,4096}')"
 DOCUMENTATION_ENV_WRAPPER = (
     rb"(?:(?:env(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+)?"
     rb"(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){1,16})?"
+)
+DOCUMENTATION_PRIVILEGE_WRAPPER = (
+    rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
@@ -314,6 +322,9 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _documentation_line_has_import_statement(line: bytes) -> bool:
         source = line.lstrip()
+        markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
+        if markdown_prefix is not None:
+            source = source[markdown_prefix.end() :].lstrip()
         if source.startswith((b">>>", b"...")):
             source = source[3:].lstrip()
         try:
@@ -361,6 +372,13 @@ class TextScanner(BaseScanner):
         value_indent = len(value_line) - len(value_line.lstrip(b" \t"))
         return value_indent > parent_indent
 
+    @staticmethod
+    def _documentation_assignment_is_actionable(prefix: bytes) -> bool:
+        return (
+            DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
+            and DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
+        )
+
     @classmethod
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
@@ -377,7 +395,10 @@ class TextScanner(BaseScanner):
                 )
             )
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
+            or (
+                DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
+                and cls._documentation_assignment_is_actionable(prefix)
+            )
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
@@ -423,7 +444,7 @@ class TextScanner(BaseScanner):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         return (
-            DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
+            cls._documentation_assignment_is_actionable(prefix)
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)

