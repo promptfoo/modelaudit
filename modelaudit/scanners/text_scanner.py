@@ -149,6 +149,7 @@ DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILE
 DOCUMENTATION_POSIX_LAUNCHER_WRAPPER = rb"(?:(?:(?:command|exec|nohup)\s+){0,2})"
 DOCUMENTATION_SHELL_OPTION = rb"--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
 DOCUMENTATION_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
+DOCUMENTATION_COMMAND_ARRAY_SEPARATOR = rb"[\"']?\s*,\s*[\"']?"
 DOCUMENTATION_CMD_OPTION = rb"/[A-Za-z](?::[^\s]+)?"
 DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = (
     rb"(?:(?:(?:bash|sh|zsh)(?:\s+"
@@ -194,9 +195,14 @@ DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX
     + rb"(?:RUN|CMD|ENTRYPOINT|command)\s*(?::|=)?\s*\[\s*[\"']?"
     + DOCUMENTATION_COMMAND_PATH_PREFIX
-    + rb"(?:bash|sh|zsh)[\"']?\s*,\s*[\"']?"
+    + rb"(?:bash|sh|zsh)"
+    + DOCUMENTATION_COMMAND_ARRAY_SEPARATOR
+    + rb"(?:"
+    + DOCUMENTATION_SHELL_OPTION
+    + DOCUMENTATION_COMMAND_ARRAY_SEPARATOR
+    + rb"){0,8}"
     + DOCUMENTATION_SHELL_COMMAND_OPTION
-    + rb"[\"']?\s*,\s*[\"']?"
+    + DOCUMENTATION_COMMAND_ARRAY_SEPARATOR
     + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
     + DOCUMENTATION_DOWNLOADER_COMMAND
     + rb"\b\s+",
@@ -210,12 +216,15 @@ DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX
     + rb"ADD(?:\s+--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+"
     + rb"(?:$|[A-Za-z][A-Za-z0-9+.-]*://)",
-    re.IGNORECASE,
+)
+DOCUMENTATION_DOCKER_ADD_CONTINUATION_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + rb"ADD(?:\s+--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+\\$"
 )
 DOCUMENTATION_CERTUTIL_OPTION = rb"-[A-Za-z][A-Za-z0-9_-]*"
-DOCUMENTATION_CERTUTIL_DOWNLOAD_PATTERN = re.compile(
+DOCUMENTATION_CERTUTIL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX
     + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
     + rb"certutil(?:\.exe)?"
     + rb"(?:\s+"
     + DOCUMENTATION_CERTUTIL_OPTION
@@ -226,11 +235,79 @@ DOCUMENTATION_CERTUTIL_DOWNLOAD_PATTERN = re.compile(
     + rb"(?:[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})",
     re.IGNORECASE,
 )
+DOCUMENTATION_NETCAT_OPTION_WITH_ARGUMENT = (
+    rb"(?:-(?:e|i|p|q|s|w)|--(?:exec|interval|proxy|proxy-type|source|source-port|wait))"
+    rb"(?:=[^\s]+|\s+[^\s]+)"
+)
+DOCUMENTATION_NETCAT_OPTION_WITHOUT_ARGUMENT = (
+    rb"(?:-[46bCdDhklNnrStUuvz]+|--(?:close|listen|no-shutdown|recv-only|send-only|telnet|udp|verbose|zero))"
+)
+DOCUMENTATION_NETCAT_OPTION = (
+    rb"(?:" + DOCUMENTATION_NETCAT_OPTION_WITH_ARGUMENT + rb"|" + DOCUMENTATION_NETCAT_OPTION_WITHOUT_ARGUMENT + rb")"
+)
+DOCUMENTATION_NETCAT_ENDPOINT = (
+    rb"(?:\[[0-9A-Fa-f:]+\]|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|(?:[0-9]{1,3}\.){3}[0-9]{1,3}|localhost)"
+)
+DOCUMENTATION_NETWORK_PORT = (
+    rb"(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])"
+)
+DOCUMENTATION_NETCAT_COMMAND = (
+    DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"(?:nc|ncat|netcat)(?:\.exe)?"
+    + rb"(?:\s+"
+    + DOCUMENTATION_NETCAT_OPTION
+    + rb"){0,8}\s+"
+    + DOCUMENTATION_NETCAT_ENDPOINT
+    + rb"\s+"
+    + DOCUMENTATION_NETWORK_PORT
+    + rb"\b"
+)
+DOCUMENTATION_NETCAT_COMMAND_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_NETCAT_COMMAND,
+    re.IGNORECASE,
+)
+DOCUMENTATION_INLINE_NETCAT_COMMAND_PATTERN = re.compile(
+    rb"(?:^|[;&|]\s*)"
+    + DOCUMENTATION_INLINE_CODE_OPEN
+    + DOCUMENTATION_SHELL_PROMPT
+    + DOCUMENTATION_COMMAND_CONTEXT
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_NETCAT_COMMAND,
+    re.IGNORECASE,
+)
+DOCUMENTATION_POWERSHELL_OPTION_WITH_ARGUMENT = (
+    rb"-(?:configurationname|executionpolicy|inputformat|outputformat|settingsfile|windowstyle|workingdirectory)"
+    rb"(?:=[^\s]+|\s+[^\s]+)"
+)
+DOCUMENTATION_POWERSHELL_OPTION_WITHOUT_ARGUMENT = rb"-(?:login|mta|nologo|noexit|noninteractive|noprofile|sta)"
+DOCUMENTATION_POWERSHELL_COMMAND = (
+    rb"(?:powershell(?:\.exe)?|pwsh)\b"
+    + rb"(?:\s+(?:"
+    + DOCUMENTATION_POWERSHELL_OPTION_WITH_ARGUMENT
+    + rb"|"
+    + DOCUMENTATION_POWERSHELL_OPTION_WITHOUT_ARGUMENT
+    + rb")){0,8}(?:\s+-(?:c|command|e|enc|encodedcommand)\b|\s+"
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+)"
+)
+DOCUMENTATION_POWERSHELL_COMMAND_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_POWERSHELL_COMMAND,
+    re.IGNORECASE,
+)
+DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN = re.compile(
+    rb"(?:^|[;&|]\s*)"
+    + DOCUMENTATION_INLINE_CODE_OPEN
+    + DOCUMENTATION_SHELL_PROMPT
+    + DOCUMENTATION_COMMAND_CONTEXT
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_POWERSHELL_COMMAND,
+    re.IGNORECASE,
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
-    rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
+    rb")",
     re.IGNORECASE,
 )
 DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
@@ -243,7 +320,7 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     + DOCUMENTATION_DOWNLOADER_COMMAND
     + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
-    rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
+    rb")",
     re.IGNORECASE,
 )
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
@@ -270,6 +347,16 @@ DOCUMENTATION_PIP_OPTION = (
     + DOCUMENTATION_PIP_OPTION_WITHOUT_ARGUMENT
     + rb")"
 )
+DOCUMENTATION_JS_OPTION_WITH_ARGUMENT = rb"--(?:cache|cafile|https-proxy|prefix|proxy|registry|userconfig)"
+DOCUMENTATION_JS_OPTION = (
+    rb"(?:"
+    + DOCUMENTATION_JS_OPTION_WITH_ARGUMENT
+    + rb"(?:="
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb"|\s+"
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb")|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?)"
+)
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
     rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?"
@@ -278,7 +365,7 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"|uv\s+(?:pip\s+install|add)"
     rb"|(?:conda|mamba|micromamba)\s+install"
     rb"|poetry\s+add"
-    rb"|(?:npm|pnpm|bun)\s+(?:install|add)"
+    rb"|(?:npm|pnpm|bun)(?:\s+" + DOCUMENTATION_JS_OPTION + rb"){0,8}\s+(?:install|add|i)"
     rb"|yarn\s+add"
     rb"|cargo\s+install"
     rb"|gem\s+install"
@@ -708,7 +795,9 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_COMMAND_ARRAY_PATTERN,
                 DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN,
                 DOCUMENTATION_DOCKER_ADD_PATTERN,
-                DOCUMENTATION_CERTUTIL_DOWNLOAD_PATTERN,
+                DOCUMENTATION_CERTUTIL_COMMAND_PATTERN,
+                DOCUMENTATION_NETCAT_COMMAND_PATTERN,
+                DOCUMENTATION_POWERSHELL_COMMAND_PATTERN,
             )
         )
 
@@ -716,16 +805,21 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
-        if stripped.startswith(b"#") and cls._documentation_anchored_network_command_is_actionable(stripped):
-            return True
-        if cls._documentation_shell_comment_before_position(line, position):
-            return False
-        if (
+        shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
             or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_INLINE_NETCAT_COMMAND_PATTERN.search(line) is not None
+            or DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
+        )
+        if cls._documentation_shell_comment_before_position(line, position) and not (
+            stripped.startswith(b"#") and cls._documentation_anchored_network_command_is_actionable(stripped)
+        ):
+            return False
+        if (
+            shell_command_is_actionable
             or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
             or cls._documentation_suspicious_label_is_actionable(prefix)
             or (
@@ -778,6 +872,7 @@ class TextScanner(BaseScanner):
             if (
                 DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
                 or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+                or DOCUMENTATION_DOCKER_ADD_CONTINUATION_PATTERN.match(stripped) is not None
             ):
                 return True
             if previous_line_start == context_start:
