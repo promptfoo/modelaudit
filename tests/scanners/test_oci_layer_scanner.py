@@ -1474,7 +1474,7 @@ class TestOciLayerScanner:
     def test_scan_layer_scans_in_budget_members_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
         """Layer entry exhaustion should preserve findings from members already within budget."""
         layer_path = tmp_path / "many.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
+        with tarfile.open(layer_path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
             for index in range(3):
                 member_path = tmp_path / f"member-{index}.bin"
                 member_path.write_bytes(b"safe")

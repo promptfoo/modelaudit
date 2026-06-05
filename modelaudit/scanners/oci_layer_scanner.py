@@ -133,7 +133,13 @@ class _TarStreamMetrics:
             self._payload_bytes_remaining = (
                 (payload_size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
             ) * tarfile.BLOCKSIZE
-            if info.type == tarfile.GNUTYPE_SPARSE and info._sparse_structs[1]:
+            sparse_structs: Any = getattr(info, "_sparse_structs", ())
+            if (
+                info.type == tarfile.GNUTYPE_SPARSE
+                and isinstance(sparse_structs, tuple)
+                and len(sparse_structs) > 1
+                and bool(sparse_structs[1])
+            ):
                 self._sparse_extension_pending = True
                 self._sparse_payload_bytes = self._payload_bytes_remaining
                 self._payload_bytes_remaining = 0
