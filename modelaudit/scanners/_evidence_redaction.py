@@ -16,6 +16,7 @@ REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
+MAX_PERCENT_ENCODED_SECRET_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
 
@@ -32,7 +33,7 @@ STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"sq0csp-[0-9A-Za-z_-]{43}|"
     r"(?:stripe|[sr]k)_live_[A-Za-z0-9]{24}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
-    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{24,}|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")(?![A-Za-z0-9])"
 )
@@ -98,7 +99,8 @@ CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z][A-Za-z0-9]*)?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
-    r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
+    r"RefreshToken|refreshToken|GoogleAccessId|googleAccessId|SAS|Secret|SecretKey|secretKey|"
+    r"Signature|Sig|Token)"
     r"(?:[A-Z][A-Za-z0-9]*)?"
 )
 AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
@@ -113,9 +115,9 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[._-])*"
-    r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
-    r"credential|password|passwd|private[._-]?key|pwd|refresh[._-]?token|sas|secret|"
-    r"secret[._-]?key|signature|sig|token)"
+    r"(?:access[._-]?key(?:[._-]?id)?|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|"
+    r"client[._-]?secret|credential|google[._-]?access[._-]?id|password|passwd|private[._-]?key|"
+    r"pwd|refresh[._-]?token|sas|secret|secret[._-]?key|signature|sig|token)"
     r"(?:[._-][a-z0-9]+)*"
 )
 SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
@@ -124,9 +126,10 @@ SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
 )
 SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
     r"(?:[a-z0-9]+[\s._-]+)*"
-    r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
-    r"client[\s._-]*secret|credential|password|passwd|private[\s._-]*key|pwd|"
-    r"refresh[\s._-]*token|sas|secret|secret[\s._-]*key|signature|sig|token)"
+    r"(?:access[\s._-]*key(?:[\s._-]*id)?|access[\s._-]*token|api[\s._-]*key|apikey|"
+    r"auth[\s._-]*token|client[\s._-]*secret|credential|google[\s._-]*access[\s._-]*id|"
+    r"password|passwd|private[\s._-]*key|pwd|refresh[\s._-]*token|sas|secret|"
+    r"secret[\s._-]*key|signature|sig|token)"
     r"(?:[\s._-]+[a-z0-9]+)*"
 )
 SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
@@ -686,9 +689,11 @@ def _redact_percent_encoded_secret_candidate(match: re.Match[str]) -> str:
     decoded = raw_value
     source_spans = [(index, index + 1) for index in range(len(raw_value))]
     secret_spans: list[tuple[int, int]] = []
-    for _ in range(3):
+    exhausted_decode_budget = True
+    for _ in range(MAX_PERCENT_ENCODED_SECRET_REDACTION_DEPTH):
         next_decoded, next_source_spans = _decode_percent_layer_with_spans(decoded, source_spans)
         if next_decoded == decoded:
+            exhausted_decode_budget = False
             break
         decoded = next_decoded
         source_spans = next_source_spans
@@ -699,6 +704,11 @@ def _redact_percent_encoded_secret_candidate(match: re.Match[str]) -> str:
                     source_spans[secret_match.end() - 1][1],
                 )
             )
+
+    if exhausted_decode_budget:
+        next_decoded, _ = _decode_percent_layer_with_spans(decoded, source_spans)
+        if next_decoded != decoded:
+            return REDACTED_EVIDENCE_VALUE
 
     if not secret_spans:
         return raw_value

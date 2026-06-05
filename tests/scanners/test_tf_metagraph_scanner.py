@@ -653,10 +653,12 @@ def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path
         "ghu_" + ("a" * 36),
         "ghr_" + ("a" * 36),
         "sk-proj-" + ("a" * 32),
+        "sk-proj-" + ("a_b-" * 8),
         "npm_" + ("a" * 36),
         "xoxb-" + ("a" * 24),
         "gho%5F" + ("a" * 36),
         "gho%255F" + ("a" * 36),
+        "gho%2525255F" + ("a" * 36),
     ],
 )
 def test_tf_metagraph_scanner_redacts_standalone_secret_tokens(tmp_path: Path, secret: str) -> None:
@@ -677,6 +679,35 @@ def test_tf_metagraph_scanner_redacts_standalone_secret_tokens(tmp_path: Path, s
     executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
 
     assert secret not in result.to_json()
+    assert REDACTED_EVIDENCE_VALUE in executable_check.details["value_preview"]
+
+
+def test_tf_metagraph_scanner_redacts_r_access_identifier_assignments(tmp_path: Path) -> None:
+    google_secret = "service-account@example.iam.gserviceaccount.com"
+    aws_secret = "AKIAEXAMPLEACCESSKEY"
+    script = (
+        f"python -c \"import os; os.system('id')\"; google_access_id <- '{google_secret}'; "
+        f'GoogleAccessId <<- "{google_secret}"; access_key_id <- "{aws_secret}"'
+    )
+    malicious_meta = tmp_path / "r-access-identifiers.meta"
+    malicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": script},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
+    executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
+    serialized_result = result.to_json()
+
+    assert google_secret not in serialized_result
+    assert aws_secret not in serialized_result
     assert REDACTED_EVIDENCE_VALUE in executable_check.details["value_preview"]
 
 

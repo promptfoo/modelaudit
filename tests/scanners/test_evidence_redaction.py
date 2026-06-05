@@ -427,6 +427,7 @@ def test_redacts_legacy_access_identifier_assignments() -> None:
         "ghu_" + ("a" * 36),
         "ghr_" + ("a" * 36),
         "sk-proj-" + ("a" * 32),
+        "sk-proj-" + ("a_b-" * 8),
         "npm_" + ("a" * 36),
         "xoxb-" + ("a" * 24),
     ],
@@ -442,6 +443,7 @@ def test_redacts_standalone_secret_tokens(secret: str) -> None:
     [
         "gho%5F" + ("a" * 36),
         "gho%255F" + ("a" * 36),
+        "gho%2525255F" + ("a" * 36),
         "".join(f"%{ord(char):02X}" for char in ("gho_" + ("a" * 36))),
     ],
 )
@@ -482,6 +484,24 @@ def test_percent_encoded_secret_redaction_preserves_surrounding_context(
     assert redacted == expected_template.format(redacted=REDACTED_EVIDENCE_VALUE)
 
 
+def test_percent_encoded_secret_redaction_fails_closed_beyond_decode_budget() -> None:
+    secret = "gho_" + ("a" * 36)
+    deeply_encoded = secret
+    for _ in range(10):
+        deeply_encoded = deeply_encoded.replace("%", "%25").replace("_", "%5F")
+
+    assert redact_evidence_string(deeply_encoded, max_chars=None) == REDACTED_EVIDENCE_VALUE
+
+
+def test_preserves_deeply_percent_encoded_benign_value_within_decode_budget() -> None:
+    benign = "public_identifier_1234567890"
+    deeply_encoded = benign
+    for _ in range(4):
+        deeply_encoded = deeply_encoded.replace("%", "%25").replace("_", "%5F")
+
+    assert redact_evidence_string(deeply_encoded, max_chars=None) == deeply_encoded
+
+
 @pytest.mark.parametrize(
     "near_match",
     [
@@ -519,6 +539,22 @@ def test_redacts_r_assignment_operators() -> None:
     assert "R_PASSWORD_SECRET" not in redacted
     assert f"token <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f"password <<- {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_redacts_access_identifier_r_assignments() -> None:
+    google_secret = "service-account@example.iam.gserviceaccount.com"
+    aws_secret = "AKIAEXAMPLEACCESSKEY"
+    text = (
+        f"google_access_id <- '{google_secret}' GoogleAccessId <<- \"{google_secret}\" access_key_id <- '{aws_secret}'"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert google_secret not in redacted
+    assert aws_secret not in redacted
+    assert f"google_access_id <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f'GoogleAccessId <<- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"access_key_id <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
 
 
 def test_redacts_r_rightward_assignment_operators() -> None:
