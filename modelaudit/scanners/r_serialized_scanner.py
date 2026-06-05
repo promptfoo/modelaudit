@@ -227,69 +227,76 @@ def _position_is_in_r_suppressing_non_code_span(
     return False
 
 
-def _r_equals_is_named_argument(
+def _r_named_argument_equals_positions(
     text: str,
-    position: int,
+    positions: set[int],
     non_code_spans: list[tuple[int, int]],
-) -> bool:
+) -> set[int]:
+    if not positions:
+        return set()
+
     closing_delimiters = {"(": ")", "[": "]", "{": "}"}
     stack: list[tuple[str, int]] = []
+    contexts: dict[int, tuple[tuple[str, int], tuple[str, int]]] = {}
+    close_positions: dict[int, int] = {}
     cursor = 0
     span_index = 0
-    while cursor < position:
-        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
-            cursor = non_code_spans[span_index][1]
-            span_index += 1
-            continue
-
-        character = text[cursor]
-        if character in "([{":
-            stack.append((character, cursor))
-        elif character in ")]}" and stack:
-            if closing_delimiters[stack[-1][0]] != character:
-                return False
-            stack.pop()
-        cursor += 1
-
-    if not stack or stack[-1][0] not in {"(", "["}:
-        return False
-    target = stack[-1]
-    required_delimiters = set(stack)
-    target_is_function_formals = target[0] == "(" and (
-        _r_function_keyword_before_position(text, target[1], non_code_spans)
-        or _r_lambda_shorthand_before_position(text, target[1], non_code_spans)
-    )
-    if target[0] == "(" and not _r_open_paren_starts_argument_list(text, target[1], non_code_spans):
-        return False
-    if target[0] == "[" and not _r_open_bracket_starts_subscript(text, target[1], non_code_spans):
-        return False
-
-    target_closed = False
     while cursor < len(text):
         if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
             cursor = non_code_spans[span_index][1]
             span_index += 1
             continue
 
+        if cursor in positions and stack:
+            contexts[cursor] = (stack[-1], stack[0])
+
         character = text[cursor]
         if character in "([{":
             stack.append((character, cursor))
         elif character in ")]}" and stack:
             if closing_delimiters[stack[-1][0]] != character:
-                return False
+                break
             closed = stack.pop()
-            if closed == target:
-                if target_is_function_formals and not _r_expression_follows(
-                    text,
-                    cursor + 1,
-                    non_code_spans,
-                ):
-                    return False
-                target_closed = True
-            if target_closed and required_delimiters.isdisjoint(stack):
-                return True
+            close_positions[closed[1]] = cursor
         cursor += 1
-    return False
+
+    valid_positions: set[int] = set()
+    target_validity: dict[int, bool] = {}
+    function_body_validity: dict[int, bool] = {}
+    for position in positions:
+        context = contexts.get(position)
+        if context is None:
+            continue
+
+        target, outermost = context
+        target_close = close_positions.get(target[1])
+        if target_close is None or outermost[1] not in close_positions or target[0] not in {"(", "["}:
+            continue
+
+        target_is_function_formals = target[0] == "(" and (
+            _r_function_keyword_before_position(text, target[1], non_code_spans)
+            or _r_lambda_shorthand_before_position(text, target[1], non_code_spans)
+        )
+        if target[1] not in target_validity:
+            target_validity[target[1]] = (
+                _r_open_paren_starts_argument_list(text, target[1], non_code_spans)
+                if target[0] == "("
+                else _r_open_bracket_starts_subscript(text, target[1], non_code_spans)
+            )
+        if not target_validity[target[1]]:
+            continue
+
+        if target_is_function_formals:
+            if target[1] not in function_body_validity:
+                function_body_validity[target[1]] = _r_expression_follows(
+                    text,
+                    target_close + 1,
+                    non_code_spans,
+                )
+            if not function_body_validity[target[1]]:
+                continue
+        valid_positions.add(position)
+    return valid_positions
 
 
 def _r_open_paren_starts_argument_list(
@@ -402,6 +409,12 @@ def _r_delimited_expression_can_start_call(
         return False
     if all(character.isalnum() or character in "._" for character in expression):
         return _r_token_can_start_call(expression)
+    if expression.endswith("]") and _r_expression_before_position_is_obviously_non_callable(
+        text,
+        closer_position,
+        non_code_spans,
+    ):
+        return False
     return not _r_grouped_expression_is_obviously_non_callable(expression)
 
 
@@ -477,9 +490,61 @@ def _r_expression_follows(
             if opener_position is None or text[opener_position] != "(":
                 return False
             closer_position = _r_matching_close_delimiter_position(text, opener_position, non_code_spans)
-            return closer_position is not None and _r_expression_follows(text, closer_position + 1, non_code_spans)
+            if closer_position is None or not _r_expression_follows(text, closer_position + 1, non_code_spans):
+                return False
+            return token != "if" or not _r_has_incomplete_top_level_else(
+                text,
+                closer_position + 1,
+                non_code_spans,
+            )
         return True
     return text[cursor] not in ";,)]}*/^:%<>=&|"
+
+
+def _r_has_incomplete_top_level_else(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    cursor = position
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    span_index = max(0, span_index)
+    while cursor < len(text):
+        while span_index < len(non_code_spans) and non_code_spans[span_index][1] <= cursor:
+            span_index += 1
+        if span_index < len(non_code_spans) and non_code_spans[span_index][0] <= cursor:
+            cursor = non_code_spans[span_index][1]
+            continue
+
+        character = text[cursor]
+        if not stack and character in ";,)]}":
+            return False
+        if character in closing_delimiters:
+            stack.append(character)
+            cursor += 1
+            continue
+        if character in ")]}":
+            if not stack or closing_delimiters[stack[-1]] != character:
+                return False
+            stack.pop()
+            cursor += 1
+            continue
+        if not stack and (character.isalnum() or character in "._"):
+            token_end = cursor + 1
+            while token_end < len(text) and (text[token_end].isalnum() or text[token_end] in "._"):
+                token_end += 1
+            if text[cursor:token_end] == "else" and not _r_expression_follows(
+                text,
+                token_end,
+                non_code_spans,
+            ):
+                return True
+            cursor = token_end
+            continue
+        cursor += 1
+    return False
 
 
 def _r_expression_before_position_is_obviously_non_callable(
@@ -709,6 +774,7 @@ def _contains_r_raw_credential_assignment(text: str) -> bool:
         for literal_start, _literal_end, _content_start, _content_end, is_terminated in raw_string_spans
         if not is_terminated
     }
+    equals_positions: set[int] = set()
     for literal_start, literal_end, content_start, content_end, is_terminated in raw_string_spans:
         if not is_terminated or content_end - content_start < 6:
             continue
@@ -723,10 +789,10 @@ def _contains_r_raw_credential_assignment(text: str) -> bool:
                 non_code_spans,
                 malformed_raw_span_starts,
             )
-            if not operator_is_suppressed and (
-                text[operator_start] != "=" or not _r_equals_is_named_argument(text, operator_start, non_code_spans)
-            ):
-                return True
+            if not operator_is_suppressed:
+                if text[operator_start] != "=":
+                    return True
+                equals_positions.add(operator_start)
 
         right_match = _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.match(text, literal_end)
         if right_match is not None and not _position_is_in_r_suppressing_non_code_span(
@@ -735,17 +801,23 @@ def _contains_r_raw_credential_assignment(text: str) -> bool:
             malformed_raw_span_starts,
         ):
             return True
-    return False
+    named_argument_positions = _r_named_argument_equals_positions(text, equals_positions, non_code_spans)
+    return not equals_positions.issubset(named_argument_positions)
 
 
 def _contains_r_quoted_credential_assignment(text: str) -> bool:
     non_code_spans = _r_non_code_spans(text)
+    equals_positions: set[int] = set()
     for assignment_match in _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
         operator_start = assignment_match.start("operator")
         if _position_is_in_spans(operator_start, non_code_spans):
             continue
-        if text[operator_start] == "=" and _r_equals_is_named_argument(text, operator_start, non_code_spans):
-            continue
+        if text[operator_start] != "=":
+            return True
+        equals_positions.add(operator_start)
+
+    named_argument_positions = _r_named_argument_equals_positions(text, equals_positions, non_code_spans)
+    if not equals_positions.issubset(named_argument_positions):
         return True
 
     for assignment_match in _R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
@@ -766,11 +838,18 @@ def _r_expression_contains_credential_literal(expression: str) -> bool:
 def _contains_r_expression_credential_assignment(text: str) -> bool:
     non_code_spans = _r_non_code_spans(text)
     statement_starts = _r_statement_starts(text, non_code_spans)
-    for target_match in _R_LEFTWARD_CREDENTIAL_TARGET_RE.finditer(text):
+    target_matches = [
+        target_match
+        for target_match in _R_LEFTWARD_CREDENTIAL_TARGET_RE.finditer(text)
+        if not _position_is_in_spans(target_match.start("operator"), non_code_spans)
+    ]
+    equals_positions = {
+        target_match.start("operator") for target_match in target_matches if text[target_match.start("operator")] == "="
+    }
+    named_argument_positions = _r_named_argument_equals_positions(text, equals_positions, non_code_spans)
+    for target_match in target_matches:
         operator_start = target_match.start("operator")
-        if _position_is_in_spans(operator_start, non_code_spans):
-            continue
-        if text[operator_start] == "=" and _r_equals_is_named_argument(text, operator_start, non_code_spans):
+        if operator_start in named_argument_positions:
             continue
 
         statement_index = bisect_right(statement_starts, target_match.start()) - 1

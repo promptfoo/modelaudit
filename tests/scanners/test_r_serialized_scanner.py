@@ -921,6 +921,7 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'if (TRUE) function(token = r"(standard)") NULL',
         'function(token = "standard") +1',
         'function(token = r"(standard)") if (TRUE) NULL',
+        'function(token = r"(standard)") if (TRUE) 1 else 2',
         'function(token = "standard") repeat break',
         ') list(token = "standard")',
         '] list(token = r"(standard)")',
@@ -936,6 +937,7 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'identity(x)[token = r"(standard)"]',
         'functions[1](token = "standard")',
         'get("functions")[1](token = r"(standard)")',
+        '(functions[1])(token = "standard")',
         'outer(list(token = "standard"))',
         '(identity)(token = "standard")',
         '(function(x) x)(token = "standard")',
@@ -1035,6 +1037,9 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'function(token = r"(TRUNCATED_IF_BODY_SECRET)") if',
         'function(token = "TRUNCATED_IF_CONDITION_SECRET") if (TRUE)',
         'function(token = r"(TRUNCATED_REPEAT_BODY_SECRET)") repeat',
+        '(1[1])(token = r"(GROUPED_NUMERIC_SUBSCRIPT_RESULT_SECRET)")',
+        'function(token = r"(TRUNCATED_ELSE_BODY_SECRET)") if (TRUE) 1 else',
+        'list(token = "standard"); token = "MIXED_BATCH_SECRET"',
         'x[[token = r"(TRUNCATED_DOUBLE_SUBSCRIPT_SECRET)"]',
         'outer(list(token = "TRUNCATED_OUTER_CALL_SECRET")',
         '1(x)[token = r"(NUMERIC_CALL_RESULT_SECRET)"]',
@@ -1057,6 +1062,23 @@ def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment:
     credential_checks = _check_by_name(result, "Credential-like String Detection")
     assert len(credential_checks) == 1
     assert credential_checks[0].status == CheckStatus.FAILED
+
+
+def test_scan_batches_repeated_named_argument_validation(tmp_path: Path) -> None:
+    path = tmp_path / "repeated-named-arguments.rds"
+    fragments = (
+        'list(token = "standard")',
+        'list(token = r"(standard)")',
+        'list(token = paste0("stan", "dard"))',
+    )
+    metadata = ";".join(fragments[index % len(fragments)] for index in range(3_000))
+    _write_raw_r_serialized(path, metadata)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
