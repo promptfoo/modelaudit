@@ -7,6 +7,7 @@ that could be used for data exfiltration or command & control operations.
 import ipaddress
 import math
 import re
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
@@ -433,10 +434,11 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
 
 
 def _is_sensitive_path_key(key: str) -> bool:
-    normalized = _decode_path_token(key).strip().replace("-", "_")
-    if normalized == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+    decoded = _decode_path_token(key).strip()
+    if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
         return True
-    parts = normalized.split("_")
+    normalized = decoded.replace("-", "_")
+    parts = [part for part in re.split(r"[._\[\]]+", normalized) if part]
     return any(
         _SENSITIVE_PATH_KEY_PATTERN.fullmatch("_".join(parts[index:])) is not None for index in range(len(parts))
     )
@@ -465,7 +467,11 @@ def _redact_hostname_tokens(hostname: str) -> str:
     labels = hostname.split(".")
     for index, label in enumerate(labels):
         decoded = _decode_path_token(label)
-        if _redact_sensitive_path_assignment(label) is not None or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
+        if (
+            decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL
+            or _redact_sensitive_path_assignment(label) is not None
+            or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded)
+        ):
             labels[index] = _REDACTED_PATH_TOKEN
     return ".".join(labels)
 
@@ -482,8 +488,23 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             redact_next_value = False
             continue
 
-        decoded_segment = _decode_path_token(_split_trailing_path_delimiters(segment)[0])
-        if _is_sensitive_path_key(decoded_segment):
+        token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+        decoded_segment = _decode_path_token(token_candidate)
+        if decoded_segment == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            redact_next_value = True
+            continue
+
+        is_public_identifier = (
+            _is_public_model_repository_segment(hostname, segments, index)
+            or _is_public_model_api_repository_segment(hostname, segments, index)
+            or _is_public_model_revision_segment(hostname, segments, index)
+            or _is_public_source_repository_segment(hostname, segments, index)
+            or _is_public_source_ref_segment(hostname, segments, index)
+            or _is_path_style_cloud_bucket_segment(scheme, hostname, index)
+            or _is_gcs_api_bucket_segment(hostname, segments, index)
+        )
+        if not is_public_identifier and _is_sensitive_path_key(decoded_segment):
             redact_next_value = True
             continue
         is_slack_webhook_secret = (
@@ -518,19 +539,7 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             segments[index] = parameter_redaction
             continue
 
-        if _is_public_model_repository_segment(hostname, segments, index):
-            continue
-        if _is_public_model_api_repository_segment(hostname, segments, index):
-            continue
-        if _is_public_model_revision_segment(hostname, segments, index):
-            continue
-        if _is_public_source_repository_segment(hostname, segments, index):
-            continue
-        if _is_public_source_ref_segment(hostname, segments, index):
-            continue
-        if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
-            continue
-        if _is_gcs_api_bucket_segment(hostname, segments, index):
+        if is_public_identifier:
             continue
         if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
@@ -596,12 +605,12 @@ def redact_url_for_finding(url: str) -> str:
     return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
 
 
-def _redact_urls_in_text(text: str) -> str:
-    def redact_match(match: re.Match[str]) -> str:
-        source_quote = text[match.start() - 1] if match.start() > 0 and text[match.start() - 1] in {"'", '"'} else None
-        return redact_url_for_finding(_trim_source_literal_url(match.group(), source_quote))
+def _redact_network_evidence(text: str) -> str:
+    """Apply the shared evidence redactor after the detector module is fully loaded."""
+    from modelaudit.scanners._evidence_redaction import redact_evidence_string
 
-    return _URL_IN_TEXT_PATTERN.sub(redact_match, text)
+    safe_urls = _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
+    return redact_evidence_string(safe_urls, max_chars=None)
 
 
 def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
@@ -765,6 +774,12 @@ def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bo
         return False
     url, url_start = url_context
 
+    return _is_match_redacted_from_url_context(url, url_start, match_start, value)
+
+
+def _is_match_redacted_from_url_context(url: str, url_start: int, match_start: int, value: str) -> bool:
+    """Return whether a matched value is removed from a known URL's safe representation."""
+
     try:
         parsed = urlsplit(url)
         safe_parsed = urlsplit(redact_url_for_finding(url))
@@ -797,13 +812,6 @@ def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bo
 
 def _is_match_redacted_from_url_component(component: str, match_start: int, value: str) -> bool:
     """Distinguish redacted credential material from nested endpoints in a query or fragment."""
-    value_lower = value.lower()
-    for nested_url_match in _URL_IN_TEXT_PATTERN.finditer(component):
-        if not (nested_url_match.start() <= match_start < nested_url_match.end()):
-            continue
-        safe_nested_url = redact_url_for_finding(nested_url_match.group())
-        return value_lower not in safe_nested_url.lower()
-
     field_start = 0
     field_end = len(component)
     for separator_match in _URL_COMPONENT_SEPARATOR_PATTERN.finditer(component):
@@ -813,12 +821,47 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
             field_end = separator_match.start()
             break
 
-    key, separator, _value = component[field_start:field_end].partition("=")
+    key, separator, field_value = component[field_start:field_end].partition("=")
+    value_lower = value.lower()
+    nested_url_candidates = (field_value, _decode_path_token(field_value))
+    for candidate in nested_url_candidates:
+        if candidate == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+            continue
+        for nested_url_match in _URL_IN_TEXT_PATTERN.finditer(candidate):
+            nested_url = nested_url_match.group()
+            if value_lower not in nested_url.lower():
+                continue
+            safe_nested_url = redact_url_for_finding(nested_url)
+            return value_lower not in safe_nested_url.lower()
+
+        for decoded_field in _URL_COMPONENT_SEPARATOR_PATTERN.split(candidate):
+            decoded_key, decoded_separator, decoded_value = decoded_field.partition("=")
+            if decoded_separator and value_lower in decoded_value.lower() and _is_sensitive_path_key(decoded_key):
+                return True
+
     return bool(separator and _is_sensitive_path_key(key))
 
 
-def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
-    return _is_match_redacted_from_url(data, match_start, domain)
+def _decoded_nested_urls(url: str) -> Iterator[str]:
+    """Yield nested URLs that only become visible after bounded component decoding."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return
+
+    seen: set[str] = set()
+    for component in (parsed.query, parsed.fragment):
+        for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
+            _key, separator, value = field.partition("=")
+            candidate = value if separator else field
+            decoded = _decode_path_token(candidate)
+            if decoded in {candidate, _PATH_TOKEN_DECODE_LIMIT_SENTINEL}:
+                continue
+            for match in _URL_IN_TEXT_PATTERN.finditer(decoded):
+                nested_url = match.group()
+                if nested_url not in seen:
+                    seen.add(nested_url)
+                    yield nested_url
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -1241,6 +1284,8 @@ class NetworkCommDetector:
         self.findings_truncated = False
         self.truncated_finding_type: str | None = None
         self.truncated_finding: dict[str, Any] | None = None
+        self._url_contexts: list[tuple[int, int, str]] = []
+        self._url_context_starts: list[int] = []
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -1269,6 +1314,8 @@ class NetworkCommDetector:
         self.findings_truncated = False
         self.truncated_finding_type = None
         self.truncated_finding = None
+        self._url_contexts = self._index_url_contexts(data)
+        self._url_context_starts = [start for start, _end, _url in self._url_contexts]
 
         scanners = (
             (
@@ -1327,40 +1374,66 @@ class NetworkCommDetector:
         self.findings.append(finding)
         return True
 
-    def _scan_urls(self, data: bytes, context: str) -> None:
-        """Scan for URL patterns."""
-        for match in self.URL_PATTERN.finditer(data):
+    def _index_url_contexts(self, data: bytes) -> list[tuple[int, int, str]]:
+        contexts: list[tuple[int, int, str]] = []
+        for match in _URL_IN_BYTES_PATTERN.finditer(data):
             raw_url = match.group().decode("utf-8", errors="ignore")
             source_quote = _source_quote_before_url(data, match.start())
             url = _trim_source_literal_url(raw_url, source_quote)
-            safe_url = redact_url_for_finding(url)
+            contexts.append((match.start(), match.start() + len(url.encode("utf-8")), url))
+        return contexts
 
-            # Calculate confidence based on URL characteristics
-            confidence = 0.5
-            severity = "MEDIUM"
-            if any(pattern in url.lower() for pattern in ["eval", "exec", "cmd", "shell"]):
-                confidence = 0.9
-                severity = "HIGH"
-            elif any(port in url for port in [":1337", ":4444", ":31337"]):
-                confidence = 0.8
-                severity = "HIGH"
-            elif "://" in url and not url.startswith(("http://", "https://")):
-                confidence = 0.7
-            elif self._is_cloud_storage_url(url):
-                severity = "INFO"
+    def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
+        context_index = bisect_right(self._url_context_starts, match_start) - 1
+        if context_index >= 0:
+            url_start, url_end, url = self._url_contexts[context_index]
+            if match_start < url_end:
+                return _is_match_redacted_from_url_context(url, url_start, match_start, value)
+        return _is_match_redacted_from_url(data, match_start, value)
 
-            if not self._record_finding(
-                {
-                    "type": "url_detected",
-                    "severity": severity,
-                    "confidence": confidence,
-                    "message": f"URL detected in model: {safe_url[:100]}",
-                    "url": safe_url,
-                    "position": match.start(),
-                    "context": context,
-                }
-            ):
+    def _scan_urls(self, data: bytes, context: str) -> None:
+        """Scan for URL patterns."""
+        for url_start, _url_end, url in self._url_contexts:
+            if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is None:
+                continue
+            if not self._record_url_finding(url, url_start, context):
                 return
+            for nested_url in _decoded_nested_urls(url):
+                if not self._record_url_finding(nested_url, url_start, context):
+                    return
+
+    def _record_url_finding(self, url: str, position: int, context: str) -> bool:
+        safe_url = redact_url_for_finding(url)
+
+        confidence = 0.5
+        severity = "MEDIUM"
+        if any(pattern in url.lower() for pattern in ["eval", "exec", "cmd", "shell"]):
+            confidence = 0.9
+            severity = "HIGH"
+        elif self._url_uses_suspicious_port(url):
+            confidence = 0.8
+            severity = "HIGH"
+        elif "://" in url and not url.startswith(("http://", "https://")):
+            confidence = 0.7
+        elif self._is_cloud_storage_url(url):
+            severity = "INFO"
+
+        return self._record_finding(
+            {
+                "type": "url_detected",
+                "severity": severity,
+                "confidence": confidence,
+                "message": f"URL detected in model: {safe_url[:100]}",
+                "url": safe_url,
+                "position": position,
+                "context": context,
+            }
+        )
+
+    def _url_uses_suspicious_port(self, url: str) -> bool:
+        with suppress(ValueError):
+            return urlsplit(url).port in self.SUSPICIOUS_PORTS
+        return False
 
     def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
         """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).
@@ -1416,7 +1489,7 @@ class NetworkCommDetector:
         for match in self.IPV4_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
 
-            if _is_match_redacted_from_url(data, match.start(), ip):
+            if self._is_redacted_url_value(data, match.start(), ip):
                 continue
 
             # Check for common false positives (version numbers) only when the
@@ -1472,7 +1545,7 @@ class NetworkCommDetector:
         # IPv6
         for match in self.IPV6_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
-            if _is_match_redacted_from_url(data, match.start(), ip):
+            if self._is_redacted_url_value(data, match.start(), ip):
                 continue
             with suppress(ipaddress.AddressValueError):
                 ip6_obj = ipaddress.IPv6Address(ip)
@@ -1518,7 +1591,7 @@ class NetworkCommDetector:
                         domain = match.group().decode("utf-8", errors="ignore").lower()
 
                     if domain not in seen_domains:
-                        if _is_match_redacted_from_url(data, match.start(), domain):
+                        if self._is_redacted_url_value(data, match.start(), domain):
                             continue
                         seen_domains.add(domain)
                         severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
@@ -1543,7 +1616,7 @@ class NetworkCommDetector:
             # Skip common false positives
             if domain in seen_domains:
                 continue
-            if _is_domain_match_redacted_from_url_path(data, match.start(), domain):
+            if self._is_redacted_url_value(data, match.start(), domain):
                 continue
             if domain.endswith((".pkl", ".pt", ".h5", ".pb", ".onnx", ".json")):
                 continue  # File extensions
@@ -1783,23 +1856,31 @@ class NetworkCommDetector:
 
         # For non-ML files, use the original port detection logic
         for port in self.SUSPICIOUS_PORTS:
+            port_bytes = str(port).encode()
+            matched = False
             for pattern_bytes in self.PORT_PATTERNS[port]:
-                if pattern_bytes in data:
-                    port_name = self._get_port_name(port)
-
-                    if not self._record_finding(
-                        {
-                            "type": "suspicious_port",
-                            "severity": "MEDIUM",
-                            "confidence": 0.6,
-                            "message": f"Suspicious port detected: {port} ({port_name})",
-                            "port": port,
-                            "service": port_name,
-                            "context": context,
-                        }
-                    ):
-                        return
+                for pattern_start in _iter_pattern_matches(data, pattern_bytes):
+                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    if self._is_redacted_url_value(data, port_start, str(port)):
+                        continue
+                    matched = True
                     break
+                if matched:
+                    break
+            if matched:
+                port_name = self._get_port_name(port)
+                if not self._record_finding(
+                    {
+                        "type": "suspicious_port",
+                        "severity": "MEDIUM",
+                        "confidence": 0.6,
+                        "message": f"Suspicious port detected: {port} ({port_name})",
+                        "port": port,
+                        "service": port_name,
+                        "context": context,
+                    }
+                ):
+                    return
 
     def _scan_explicit_network_patterns_in_ml_models(self, data: bytes, context: str) -> None:
         """Scan for very explicit network patterns in ML models with high confidence."""
@@ -1808,7 +1889,7 @@ class NetworkCommDetector:
 
         explicit_network_patterns = [
             # Very explicit URL patterns that are unlikely in model weights
-            (rb"https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*", "url"),
+            (rb"https?://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+", "url"),
             # Explicit socket connection patterns with clear text context
             (rb'socket\.connect\s*\(\s*["\']?[a-zA-Z0-9.-]+["\']?\s*,\s*\d+', "socket_connection"),
             # Clear HTTP request patterns
@@ -1843,7 +1924,8 @@ class NetworkCommDetector:
                     printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
 
                     if printable_ratio > 0.7:  # High ratio of printable characters
-                        matched_text = _redact_urls_in_text(match.group().decode("utf-8", errors="ignore"))
+                        raw_matched_text = match.group().decode("utf-8", errors="ignore")
+                        matched_text = _redact_network_evidence(raw_matched_text)
                         if not self._record_finding(
                             {
                                 "type": "explicit_network_pattern",
