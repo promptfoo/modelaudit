@@ -2875,7 +2875,11 @@ class KerasZipScanner(BaseScanner):
 
         suffix = (version_match.group(4) or "").strip().lower()
         if version_match.group(3) is None and suffix in {"x", ".x", "-x", "_x"}:
-            return None
+            if (3, 0) <= (major, minor) < (3, 12):
+                return True
+            if (major, minor) in {(3, 12), (3, 13)}:
+                return None
+            return False
 
         suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
         parsed = (major, minor, patch)
