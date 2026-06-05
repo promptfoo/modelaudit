@@ -2146,6 +2146,7 @@ class KerasZipScanner(BaseScanner):
             ),
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
+            "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
         }
 
         cve_2026_1669_status = (
@@ -2168,23 +2169,21 @@ class KerasZipScanner(BaseScanner):
             return
 
         if cve_2026_1669_status is False:
+            details["keras_version"] = keras_version
+            details["metadata_only_assessment"] = True
+            details["parse_status"] = "untrusted_artifact_version"
+            details["version_source"] = "keras_archive_metadata"
             result.add_check(
-                name="HDF5 External Weight Reference Metadata Check",
+                name="HDF5 External Weight Reference Risk (Untrusted Version Metadata)",
                 passed=False,
                 message=(
-                    f"Embedded HDF5 external references detected in weights, and archive metadata claims "
-                    f"Keras {keras_version} outside the known CVE-2026-1669 vulnerable ranges; "
-                    "metadata-only assessment is inconclusive without runtime verification"
+                    "Embedded HDF5 external references detected in Keras archive weights; "
+                    f"the archive claims Keras {keras_version}, but artifact-controlled version metadata "
+                    "cannot prove the loader runtime is outside the CVE-2026-1669 vulnerable ranges"
                 ),
                 severity=IssueSeverity.WARNING,
                 location=location,
-                details=details
-                | {
-                    "keras_version": keras_version,
-                    "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
-                    "metadata_only_assessment": True,
-                    "parse_status": "metadata_non_vulnerable",
-                },
+                details=details,
                 why=get_cve_2026_1669_explanation("hdf5_external_reference"),
             )
             return
@@ -2875,10 +2874,10 @@ class KerasZipScanner(BaseScanner):
             return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
-        if suffix_status is None:
+        if version_match.group(3) is None and suffix in {"x", ".x", "-x", "_x"}:
             return None
 
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True

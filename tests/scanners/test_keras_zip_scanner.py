@@ -212,9 +212,12 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == "3.12.1"
         assert cve_issues[0].details["metadata_only_assessment"] is True
-        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["version_source"] == "keras_archive_metadata"
         metadata_checks = [
-            check for check in result.checks if check.name == "HDF5 External Weight Reference Metadata Check"
+            check
+            for check in result.checks
+            if check.name == "HDF5 External Weight Reference Risk (Untrusted Version Metadata)"
         ]
         assert len(metadata_checks) == 1
         assert metadata_checks[0].status == CheckStatus.FAILED
@@ -296,6 +299,37 @@ class TestKerasZipScanner:
 
     @pytest.mark.parametrize(
         "keras_version",
+        ["3.11.3rc1evil", "3.12.0rc1evil", "3.13.1+bad+tag"],
+    )
+    def test_cve_2026_1669_noncanonical_suffix_inside_vulnerable_range_is_attributed(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Malformed suffixes cannot erase an unambiguously vulnerable numeric release."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
+
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_checks = [check for check in result.checks if check.name.startswith("CVE-2026-1669:")]
+        unknown_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].details["keras_version"] == keras_version
+        assert unknown_checks == []
+
+    @pytest.mark.parametrize(
+        "keras_version",
         [
             "3.12.1",
             "3.12.1+cpu",
@@ -328,6 +362,8 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == keras_version
         assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["version_source"] == "keras_archive_metadata"
 
     def test_embedded_hdf5_external_references_noncanonical_version_warns_unknown(self, tmp_path: Path) -> None:
         """Malformed archive version metadata must not claim a confidently fixed runtime."""
