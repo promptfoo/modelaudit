@@ -7115,6 +7115,42 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    @pytest.mark.parametrize(
+        ("data", "expected_pattern"),
+        [
+            (
+                b"import runpy as rp\ndef arm():\n    global print\n    print = eval\n"
+                b"arm()\nrp.run_path = print\n((rp).run_path)('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\nbuiltins = fake\n"
+                b"builtins.setattr(rp, 'run_path', print)\n((rp).run_path)('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\nvars = lambda _: {}\nvars(rp).pop('run_path', None)\n"
+                b"rp.__dict__.setdefault('run_path', print)\n((rp).run_path)('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\ntry:\n    missing.attr = print\n    wb.open = print\n"
+                b"except Exception:\n    pass\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_call_when_safe_overwrite_proof_is_untrusted(
+        self,
+        data: bytes,
+        expected_pattern: str,
+    ) -> None:
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
     def test_scan_model_keeps_cross_candidate_webbrowser_member_after_safe_call(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)

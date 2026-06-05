@@ -10588,6 +10588,10 @@ def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
         shadowed_references.add("setattr")
     if builtins_setattr_shadowed:
         shadowed_references.update({"builtins.setattr", "__builtins__.setattr"})
+    if "builtins" not in builtins_aliases:
+        shadowed_references.add("builtins.setattr")
+    if "__builtins__" not in builtins_aliases:
+        shadowed_references.add("__builtins__.setattr")
     return shadowed_references
 
 
@@ -11665,6 +11669,44 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
     executed: list[ast.stmt] = []
     exception_aliases = {name: name for name in _BUILTIN_EXCEPTION_TYPE_NAMES}
     builtins_aliases = {"builtins"}
+    non_raising_module_aliases: set[str] = set()
+
+    def update_non_raising_module_aliases(statement: ast.stmt) -> None:
+        aliases_before = frozenset(non_raising_module_aliases)
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                non_raising_module_aliases.discard(local_name)
+                if alias.name in {"ctypes", "runpy", "webbrowser"}:
+                    non_raising_module_aliases.add(local_name)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                non_raising_module_aliases.discard(alias.asname or alias.name)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            value = statement.value
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                for target_name in _assignment_target_names(target):
+                    non_raising_module_aliases.discard(target_name)
+                    if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
+                        non_raising_module_aliases.add(target_name)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            non_raising_module_aliases.discard(statement.name)
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            non_raising_module_aliases.difference_update(_assignment_target_names(statement.target))
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    non_raising_module_aliases.difference_update(_assignment_target_names(item.optional_vars))
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                non_raising_module_aliases.difference_update(_assignment_target_names(target))
+        for evaluated_expression in _deterministically_evaluated_statement_expressions(
+            statement, evaluate_annotations=False
+        ):
+            for node in ast.walk(evaluated_expression):
+                if isinstance(node, ast.NamedExpr):
+                    non_raising_module_aliases.difference_update(_assignment_target_names(node.target))
 
     def statement_is_non_raising(statement: ast.stmt) -> bool:
         if isinstance(statement, ast.Pass):
@@ -11673,6 +11715,7 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
             return all(
                 isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
+                and target.value.id in non_raising_module_aliases
                 and isinstance(statement.value, ast.Name)
                 and statement.value.id == "print"
                 for target in statement.targets
@@ -11681,6 +11724,7 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
             isinstance(statement, ast.AnnAssign)
             and isinstance(statement.target, ast.Attribute)
             and isinstance(statement.target.value, ast.Name)
+            and statement.target.value.id in non_raising_module_aliases
             and isinstance(statement.value, ast.Name)
             and statement.value.id == "print"
         )
@@ -11725,6 +11769,7 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
         for statement in block:
             executed.append(statement)
             update_exception_aliases(statement)
+            update_non_raising_module_aliases(statement)
             if isinstance(statement, ast.Break):
                 return "break"
             if isinstance(statement, ast.Continue):
@@ -11732,7 +11777,10 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
             if isinstance(statement, ast.Return):
                 return "return"
             if isinstance(statement, ast.ClassDef):
+                module_aliases_before = set(non_raising_module_aliases)
                 visit(statement.body)
+                non_raising_module_aliases.clear()
+                non_raising_module_aliases.update(module_aliases_before)
             elif isinstance(statement, ast.If) and isinstance(statement.test, ast.Constant):
                 outcome = visit(statement.body if bool(statement.test.value) else statement.orelse)
                 if outcome is not None:
