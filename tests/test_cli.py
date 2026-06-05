@@ -1476,6 +1476,7 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
+    assert mock_download_streaming.call_args.kwargs["timeout"] > 0
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
