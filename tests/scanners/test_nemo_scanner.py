@@ -3403,6 +3403,7 @@ class TestCVE202523304HydraTarget:
             "numpy.lib._npyio_impl.genfromtxt",
             "numpy.lib._npyio_impl.load",
             "numpy.lib._npyio_impl.loadtxt",
+            "numpy.lib._npyio_impl.NpzFile",
             "numpy.lib._npyio_impl.save",
             "numpy.lib._npyio_impl.savez",
             "numpy.lib._npyio_impl.savez_compressed",
@@ -3416,6 +3417,7 @@ class TestCVE202523304HydraTarget:
             "numpy.lib.npyio.genfromtxt",
             "numpy.lib.npyio.load",
             "numpy.lib.npyio.loadtxt",
+            "numpy.lib.npyio.NpzFile",
             "numpy.lib.npyio.recfromcsv",
             "numpy.lib.npyio.recfromtxt",
             "numpy.lib.npyio.save",
@@ -4331,6 +4333,7 @@ class TestCVE202523304HydraTarget:
             "custom.ftplib.FTP.connect_factory.SafeBuilder",
             "custom.pathlib.Path.iterdir_factory.SafeBuilder",
             "custom.ctypes.util.find_library_factory.SafeBuilder",
+            "custom.numpy.lib.npyio.NpzFileFactory.SafeBuilder",
         ],
     )
     def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
@@ -4616,6 +4619,7 @@ class TestCVE202523304HydraTarget:
             "ctypes.util.find_library",
             "numpy.lib._datasource.DataSource.open",
             "numpy.lib._npyio_impl.load",
+            "numpy.lib._npyio_impl.NpzFile",
             "tarfile.open",
             "tempfile.NamedTemporaryFile",
             "ctypes.PyDLL",
@@ -4623,6 +4627,9 @@ class TestCVE202523304HydraTarget:
             "os.chmod",
             "pathlib.Path.iterdir",
             "pathlib.Path.resolve",
+            "posix.execve",
+            "os.fork",
+            "os.chdir",
             "shutil.unpack_archive",
         ],
     )
@@ -4651,9 +4658,23 @@ class TestCVE202523304HydraTarget:
             "os.posix_spawn",
             "os.posix_spawnp",
             "posix.system",
+            "posix.execv",
+            "posix.execve",
             "posix.posix_spawn",
             "posix.posix_spawnp",
+            "nt.execv",
+            "nt.execve",
             "nt.system",
+            "os.fork",
+            "posix.fork",
+            "os.forkpty",
+            "posix.forkpty",
+            "pty.fork",
+            "os.chdir",
+            "posix.chdir",
+            "nt.chdir",
+            "os.fchdir",
+            "posix.fchdir",
             "os.startfile",
             "nt.startfile",
             "runpy.run_module",
@@ -4661,8 +4682,8 @@ class TestCVE202523304HydraTarget:
             "operator.call",
         ],
     )
-    def test_process_and_dynamic_execution_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
-        """Exact immediate execution aliases should not fall through to INFO-only review."""
+    def test_process_and_global_side_effect_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Exact process and cwd side effects should not fall through to INFO-only review."""
         path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
 
         result = NemoScanner().scan(str(path))
@@ -4683,6 +4704,9 @@ class TestCVE202523304HydraTarget:
         [
             "custom.spawnv_factory.SafeBuilder",
             "custom.run_path_factory.SafeBuilder",
+            "custom.posix.execve_factory.SafeBuilder",
+            "custom.os.fork_factory.SafeBuilder",
+            "custom.os.chdir_factory.SafeBuilder",
             "operator.callable",
         ],
     )
