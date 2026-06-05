@@ -98,7 +98,6 @@ DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
     rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
     re.IGNORECASE,
 )
-DOCUMENTATION_LAMBDA_PATTERN = re.compile(rb"\blambda\b[^:\n]{0,256}:\s*[^\n]*$", re.IGNORECASE)
 DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT = (
     rb"(?:-(?:C|D|g|h|p|R|T|u)|--(?:chdir|chroot|close-from|command-timeout|group|host|other-user|"
     rb"prompt|role|type|user))"
@@ -206,7 +205,7 @@ DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
     rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
-    rb"[^\n]{0,32}:\s*$",
+    rb"(?:[_ -]+(?:address|destination|endpoint|host|server|target|url|uri)){0,2}\s*(?:=|:)\s*$",
     re.IGNORECASE,
 )
 GENERIC_CC_BENIGN_TERM_PATTERN = rb"(?:malwares?|backdoors?|trojans?|botnets?|zombies?)"
@@ -445,17 +444,13 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
-        shell_context_is_actionable = not cls._documentation_shell_comment_before_position(line, position)
-        return (
-            (
-                shell_context_is_actionable
-                and (
-                    DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
-                    or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
-                    or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
-                    or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
-                )
-            )
+        if cls._documentation_shell_comment_before_position(line, position):
+            return False
+        if (
+            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
             or (
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
@@ -465,9 +460,15 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_LAMBDA_PATTERN.search(prefix) is not None
-            or cls._documentation_line_has_import_statement(line)
-            or cls._documentation_line_has_definition(line)
+        ):
+            return True
+
+        statements = cls._documentation_python_statements(line)
+        return any(
+            isinstance(node, (ast.Call, ast.Lambda)) for statement in statements for node in ast.walk(statement)
+        ) or any(
+            isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Import, ast.ImportFrom))
+            for statement in statements
         )
 
     @classmethod
@@ -508,8 +509,12 @@ class TextScanner(BaseScanner):
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
-        if line_parts is not None and cls._documentation_line_is_code_shaped(*line_parts):
-            return True
+        if line_parts is not None:
+            line, line_position = line_parts
+            if cls._documentation_shell_comment_before_position(line, line_position):
+                return False
+            if cls._documentation_line_is_code_shaped(line, line_position):
+                return True
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return False

