@@ -212,6 +212,31 @@ def test_windows_capture_barrier_ignores_ancestor_churn(
     assert captured_identity[1:] == ("secure:stable", 1, ancestor_identity)
 
 
+def test_capture_file_identity_retries_transient_monitor_start_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_stat_matches = cache._stat_matches
+    comparisons = {"count": 0}
+
+    def transient_stat_mismatch(left: os.stat_result, right: os.stat_result) -> bool:
+        comparisons["count"] += 1
+        if comparisons["count"] == 1:
+            return False
+        return original_stat_matches(left, right)
+
+    monkeypatch.setattr(cache, "_stat_matches", transient_stat_mismatch)
+
+    identity = cache.capture_file_identity(str(file_path))
+    try:
+        assert identity[1].startswith("secure:")
+        assert comparisons["count"] > 1
+    finally:
+        cache.release_ancestor_identity(identity[-1])
+
+
 def test_capture_file_identity_advances_clock_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,7 +261,7 @@ def test_capture_file_identity_advances_clock_before_hashing(
     monkeypatch.setattr(cache, "_touch_change_clock_probe", advance_probe)
     monkeypatch.setattr(cache.hasher, "hash_file_with_stat", mutate_during_hash)
 
-    with pytest.raises(ValueError, match=r"File changed while (starting|capturing) cache identity"):
+    with pytest.raises(ValueError, match=r"File (changed|kept changing) while (starting|capturing) cache identity"):
         cache.capture_file_identity(str(file_path))
 
 
