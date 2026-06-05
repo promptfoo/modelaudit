@@ -247,6 +247,8 @@ def _open_file_beneath_root(root_fd: int, relative_path: str, scan_root: str) ->
             is_final_component = not pending_parts
             if not is_final_component:
                 flags |= os.O_DIRECTORY
+            elif hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
 
             try:
                 opened_fd = os.open(component, flags, dir_fd=current_fd)
@@ -293,6 +295,8 @@ def _opened_file_size_and_sha256(
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
 
         try:
             fd = os.open(hash_path, flags)
@@ -301,6 +305,8 @@ def _opened_file_size_and_sha256(
 
     try:
         opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return None
         if scan_root is not None and scan_root_fd is None:
             current_path = os.path.realpath(path)
             if os.path.normcase(current_path) != os.path.normcase(hash_path) or not _is_path_within_directory(

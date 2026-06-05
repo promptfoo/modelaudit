@@ -97,6 +97,64 @@ def test_sbom_hashes_ordinary_files(tmp_path: Path) -> None:
     assert _property_value(component, "size") == str(len(content))
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_rejects_fifo_without_blocking(tmp_path: Path, use_pydantic: bool) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    fifo_path = scan_root / "model.bin"
+    os.mkfifo(fifo_path)
+
+    if use_pydantic:
+        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
+    else:
+        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+
+    component = _component_named(json.loads(sbom_text), fifo_path.name)
+    assert _sha256_values(component) == []
+    assert _property_value(component, "size") == "0"
+
+
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_omits_hash_when_file_becomes_directory_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_pydantic: bool,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    model_file = scan_root / "model.bin"
+    model_file.write_bytes(b"regular before enumeration")
+    real_open = os.open
+    replaced = False
+
+    def _replace_file_before_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if path == model_file.name and dir_fd is not None and not replaced:
+            replaced = True
+            model_file.unlink()
+            model_file.mkdir()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _replace_file_before_open)
+
+    if use_pydantic:
+        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
+    else:
+        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+
+    component = _component_named(json.loads(sbom_text), model_file.name)
+    assert replaced is True
+    assert _sha256_values(component) == []
+    assert _property_value(component, "size") == "0"
+
+
 def test_sbom_hashes_in_root_symlink_targets(
     tmp_path: Path,
     requires_symlinks: None,
