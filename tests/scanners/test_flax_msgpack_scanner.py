@@ -1035,6 +1035,17 @@ def test_flax_msgpack_redacts_standalone_secret_shaped_metadata_key(tmp_path: Pa
     assert token not in result.to_json()
 
 
+def test_flax_msgpack_redacts_url_safe_openai_project_key(tmp_path: Path) -> None:
+    path = tmp_path / "openai_project_key.msgpack"
+    token = "sk-proj-" + "abc_def-" * 4
+    create_msgpack_file(path, {token: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.metadata["top_level_keys"] == ["<redacted>"]
+    assert token not in result.to_json()
+
+
 def test_flax_msgpack_redacts_percent_encoded_secret_metadata_key(tmp_path: Path) -> None:
     path = tmp_path / "encoded_secret_key.msgpack"
     encoded_token = "ghp%5F" + "a" * 36

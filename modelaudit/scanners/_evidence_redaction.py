@@ -35,7 +35,7 @@ STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"sq0csp-[0-9A-Za-z_-]{43}|"
     r"(?:stripe|[sr]k)_live_[A-Za-z0-9]{24}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
-    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"sk-(?:proj-[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])|[A-Za-z0-9]{24,})|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")(?![A-Za-z0-9])"
 )

@@ -1236,6 +1236,7 @@ def test_preserves_valid_azure_container_url_nested_in_query() -> None:
         "stripe_live_" + "a" * 24,
         "sk_live_" + "a" * 24,
         "rk_live_" + "a" * 24,
+        "sk-proj-" + "abc_def-" * 4,
     ],
 )
 def test_redacts_standalone_secret_token_shapes(token: str) -> None:
@@ -1265,6 +1266,7 @@ def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) ->
     [
         "ghp_" + "a" * 35,
         "sk_live_" + "a" * 23,
+        "sk-proj-" + "abc_def-" * 2 + "abcdefg",
         "modelghp_" + "a" * 36,
     ],
 )
