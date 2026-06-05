@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 import logging
 import os
 import shutil
@@ -63,6 +64,10 @@ class _FakeStreamingResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _fake_json_response(payload: object, *, headers: dict[str, str] | None = None) -> _FakeStreamingResponse:
+    return _FakeStreamingResponse(json.dumps(payload).encode(), headers=headers)
 
 
 def _encode_proto_varint(value: int) -> bytes:
@@ -943,10 +948,7 @@ class TestJFrogDownload:
         self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Storage API probing should share the same credential forwarding policy."""
-        mock_response = mock_get.return_value
-        mock_response.status_code = 200
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {"repo": "public-repo", "path": "/model.bin", "size": 12}
+        mock_get.return_value = _fake_json_response({"repo": "public-repo", "path": "/model.bin", "size": 12})
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
 
         result = detect_jfrog_target_type(
@@ -981,11 +983,7 @@ class TestJFrogDownload:
         redirect_response = MagicMock(spec=requests.Response)
         redirect_response.status_code = 302
         redirect_response.headers = {"Location": "https://evil.example/storage/model.bin"}
-        final_response = MagicMock(spec=requests.Response)
-        final_response.status_code = 200
-        final_response.headers = {}
-        final_response.raise_for_status.return_value = None
-        final_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
+        final_response = _fake_json_response({"repo": "repo", "path": "/model.bin", "size": 12})
         mock_get.side_effect = [redirect_response, final_response]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
@@ -1025,10 +1023,7 @@ class TestJFrogDownload:
         self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Explicit Storage API access tokens should not be shadowed by env API tokens."""
-        mock_response = mock_get.return_value
-        mock_response.status_code = 200
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
+        mock_get.return_value = _fake_json_response({"repo": "repo", "path": "/model.bin", "size": 12})
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
 
@@ -1186,17 +1181,17 @@ class TestJFrogFolderDetection:
     """Test JFrog folder detection and listing."""
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_detect_jfrog_target_type_file(self, mock_get, tmp_path):
+    def test_detect_jfrog_target_type_file(self, mock_get: MagicMock) -> None:
         """Test detection of JFrog file targets."""
         # Mock response for a file
-        mock_response = mock_get.return_value
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {
-            "repo": "my-repo",
-            "path": "/model.pkl",
-            "size": 1024,
-            "lastModified": "2024-01-01T00:00:00.000Z",
-        }
+        mock_get.return_value = _fake_json_response(
+            {
+                "repo": "my-repo",
+                "path": "/model.pkl",
+                "size": 1024,
+                "lastModified": "2024-01-01T00:00:00.000Z",
+            }
+        )
 
         result = detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl", api_token="test-token")
 
@@ -1210,26 +1205,81 @@ class TestJFrogFolderDetection:
         assert "api/storage" in called_url
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_detect_jfrog_target_type_folder(self, mock_get):
+    def test_detect_jfrog_target_type_folder(self, mock_get: MagicMock) -> None:
         """Test detection of JFrog folder targets."""
         # Mock response for a folder with children
-        mock_response = mock_get.return_value
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {
-            "repo": "my-repo",
-            "path": "/models",
-            "children": [
-                {"uri": "/model1.pkl", "folder": False, "size": 1024},
-                {"uri": "/subfolder", "folder": True},
-                {"uri": "/model2.pt", "folder": False, "size": 2048},
-            ],
-        }
+        mock_get.return_value = _fake_json_response(
+            {
+                "repo": "my-repo",
+                "path": "/models",
+                "children": [
+                    {"uri": "/model1.pkl", "folder": False, "size": 1024},
+                    {"uri": "/subfolder", "folder": True},
+                    {"uri": "/model2.pt", "folder": False, "size": 2048},
+                ],
+            }
+        )
 
         result = detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/models/", api_token="test-token")
 
         assert result["type"] == "folder"
         assert len(result["children"]) == 3
         assert result["repo"] == "my-repo"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_detect_jfrog_target_type_rejects_declared_oversized_storage_response(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("modelaudit.utils.sources.jfrog._MAX_JFROG_STORAGE_RESPONSE_BYTES", 64)
+        response = _fake_json_response(
+            {"repo": "my-repo", "path": "/model.pkl", "size": 12},
+            headers={"Content-Length": "65"},
+        )
+        mock_get.return_value = response
+
+        with pytest.raises(ValueError, match="Storage API response size"):
+            detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl")
+
+        assert response.closed
+        assert mock_get.call_args.kwargs["stream"] is True
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_detect_jfrog_target_type_rejects_streamed_oversized_storage_response(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("modelaudit.utils.sources.jfrog._MAX_JFROG_STORAGE_RESPONSE_BYTES", 64)
+        response = _FakeStreamingResponse(b"{" + b" " * 64 + b"}")
+        mock_get.return_value = response
+
+        with pytest.raises(ValueError, match="Storage API response size"):
+            detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl")
+
+        assert response.closed
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_detect_jfrog_target_type_allows_storage_response_at_exact_limit(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = json.dumps({"repo": "repo", "path": "/model.pkl", "size": 12}).encode()
+        monkeypatch.setattr("modelaudit.utils.sources.jfrog._MAX_JFROG_STORAGE_RESPONSE_BYTES", len(payload))
+        response = _FakeStreamingResponse(payload, headers={"Content-Length": str(len(payload))})
+        mock_get.return_value = response
+
+        result = detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/model.pkl")
+
+        assert result["type"] == "file"
+        assert result["size"] == 12
+        assert response.closed
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_detect_jfrog_target_type_rejects_non_list_children(self, mock_get: MagicMock) -> None:
+        response = _fake_json_response({"repo": "repo", "path": "/models", "children": {}})
+        mock_get.return_value = response
+
+        with pytest.raises(ValueError, match="expected children to be a list"):
+            detect_jfrog_target_type("https://company.jfrog.io/artifactory/repo/models/")
+
+        assert response.closed
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_detect_jfrog_target_type_auth_error(self, mock_get):

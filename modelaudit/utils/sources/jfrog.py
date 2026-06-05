@@ -32,6 +32,7 @@ _MAX_JFROG_CONTENT_PROBES = 256
 _MAX_JFROG_REDIRECTS = 5
 _MAX_JFROG_LISTING_ENTRIES = 100_000
 _MAX_JFROG_LISTED_FOLDERS = 10_000
+_MAX_JFROG_STORAGE_RESPONSE_BYTES = 64 * 1024 * 1024
 _JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
@@ -485,6 +486,41 @@ def _require_known_size_within_limit(
         )
 
     _require_size_within_limit(size=size, limit=limit, display_url=display_url, description=description)
+
+
+def _read_bounded_jfrog_json_response(response: requests.Response, *, display_url: str) -> dict[str, Any]:
+    """Read and decode one bounded JFrog JSON response."""
+    response_headers = getattr(response, "headers", {})
+    content_length = None
+    if hasattr(response_headers, "get"):
+        content_length = _coerce_nonnegative_size(response_headers.get("Content-Length"))
+    _require_size_within_limit(
+        size=content_length,
+        limit=_MAX_JFROG_STORAGE_RESPONSE_BYTES,
+        display_url=display_url,
+        description="Storage API response",
+    )
+
+    payload = bytearray()
+    for chunk in response.iter_content(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE):
+        if not chunk:
+            continue
+        next_size = len(payload) + len(chunk)
+        _require_size_within_limit(
+            size=next_size,
+            limit=_MAX_JFROG_STORAGE_RESPONSE_BYTES,
+            display_url=display_url,
+            description="Storage API response",
+        )
+        payload.extend(chunk)
+
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid JFrog Storage API JSON response from {display_url}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"Invalid JFrog Storage API response from {display_url}: expected a JSON object")
+    return decoded
 
 
 def _cleanup_failed_artifact_download(temp_dir: Path | None, partial_path: Path | None) -> None:
@@ -1314,17 +1350,23 @@ def detect_jfrog_target_type(
 
     headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
+    response: requests.Response | None = None
     try:
-        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout)
+        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout, stream=True)
         response.raise_for_status()
 
-        data = response.json()
+        data = _read_bounded_jfrog_json_response(response, display_url=display_storage_api_url)
 
         # If it has children, it's a folder
         if "children" in data:
+            children = data["children"]
+            if not isinstance(children, list):
+                raise ValueError(
+                    f"Invalid JFrog Storage API response from {display_storage_api_url}: expected children to be a list"
+                )
             return JFrogFolderInfo(
                 type="folder",
-                children=data["children"],
+                children=children,
                 path=data.get("path", ""),
                 repo=data.get("repo", ""),
             )
@@ -1354,6 +1396,9 @@ def detect_jfrog_target_type(
     except requests.exceptions.RequestException as e:
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Network error accessing {display_storage_api_url}: {error_msg}") from e
+    finally:
+        if response is not None:
+            response.close()
 
 
 def list_jfrog_folder_contents(
