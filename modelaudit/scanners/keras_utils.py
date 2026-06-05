@@ -32,7 +32,9 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "webbrowser",
     "socket",
     "http",
+    "https",
     "urllib",
+    "urllib3",
     "shutil",
     "ctypes",
 ]
