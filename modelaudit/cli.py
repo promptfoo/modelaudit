@@ -616,7 +616,7 @@ def _replace_windows_output_file(
 
     class FileRenameInfo(ctypes.Structure):
         _fields_ = [
-            ("replace_if_exists", wintypes.BOOLEAN),
+            ("flags", wintypes.DWORD),
             ("root_directory", wintypes.HANDLE),
             ("file_name_length", wintypes.DWORD),
             ("file_name", wintypes.WCHAR * 1),
@@ -627,7 +627,9 @@ def _replace_windows_output_file(
     buffer_size = ctypes.sizeof(FileRenameInfo) + len(encoded_name)
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
-    rename_info.replace_if_exists = replace_existing
+    file_rename_replace_if_exists = 0x00000001
+    file_rename_posix_semantics = 0x00000002
+    rename_info.flags = file_rename_replace_if_exists | file_rename_posix_semantics if replace_existing else 0
     rename_info.root_directory = None
     rename_info.file_name_length = len(encoded_name)
     ctypes.memmove(ctypes.addressof(rename_buffer) + file_name_offset, encoded_name, len(encoded_name))
@@ -637,10 +639,10 @@ def _replace_windows_output_file(
     set_file_information = kernel32.SetFileInformationByHandle
     set_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     set_file_information.restype = wintypes.BOOL
-    file_rename_info_class = 3
+    file_rename_info_ex_class = 22
     msvcrt_windows: Any = msvcrt
     temp_handle = msvcrt_windows.get_osfhandle(temp_fd)
-    if not set_file_information(temp_handle, file_rename_info_class, rename_buffer, buffer_size):
+    if not set_file_information(temp_handle, file_rename_info_ex_class, rename_buffer, buffer_size):
         error = ctypes_windows.get_last_error()
         raise _OutputWriteError(
             f"Unable to write output {_display_path(output_path)}: {ctypes_windows.WinError(error)}"

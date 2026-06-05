@@ -1419,15 +1419,20 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     assert json.loads(output_path.read_text())["scanners"]
 
 
-def test_windows_output_rename_uses_absolute_destination_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A null RootDirectory requires an absolute FILE_RENAME_INFO destination."""
+@pytest.mark.parametrize(("replace_existing", "expected_flags"), [(False, 0), (True, 0x00000003)])
+def test_windows_output_rename_uses_absolute_destination_path(
+    monkeypatch: pytest.MonkeyPatch,
+    replace_existing: bool,
+    expected_flags: int,
+) -> None:
+    """The extended rename request must be absolute and allow a pinned target handle."""
     import ctypes.wintypes as wintypes
 
     captured: dict[str, object] = {}
 
     class FileRenameInfo(ctypes.Structure):
         _fields_ = [
-            ("replace_if_exists", wintypes.BOOLEAN),
+            ("flags", wintypes.DWORD),
             ("root_directory", wintypes.HANDLE),
             ("file_name_length", wintypes.DWORD),
             ("file_name", wintypes.WCHAR * 1),
@@ -1440,13 +1445,14 @@ def test_windows_output_rename_uses_absolute_destination_path(monkeypatch: pytes
         def __call__(
             self,
             _handle: int,
-            _information_class: int,
+            information_class: int,
             buffer: ctypes.c_void_p,
             _buffer_size: int,
         ) -> bool:
             rename_info = ctypes.cast(buffer, ctypes.POINTER(FileRenameInfo)).contents
+            captured["information_class"] = information_class
             captured["root_directory"] = rename_info.root_directory
-            captured["replace_if_exists"] = rename_info.replace_if_exists
+            captured["flags"] = rename_info.flags
             captured["file_name_length"] = rename_info.file_name_length
             file_name_address = ctypes.addressof(rename_info) + FileRenameInfo.file_name.offset
             captured["file_name"] = ctypes.string_at(
@@ -1465,12 +1471,13 @@ def test_windows_output_rename_uses_absolute_destination_path(monkeypatch: pytes
         str(destination_path),
         123,
         destination_path,
-        replace_existing=False,
+        replace_existing=replace_existing,
     )
 
     assert captured == {
+        "information_class": 22,
         "root_directory": None,
-        "replace_if_exists": 0,
+        "flags": expected_flags,
         "file_name_length": len(str(destination_path).encode("utf-16-le")),
         "file_name": str(destination_path),
     }
