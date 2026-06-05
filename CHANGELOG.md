@@ -197,6 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files
+- bind cache reads and writes to complete file and pathname identities captured before scanning
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
