@@ -20,6 +20,14 @@ from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
 
+def _gzip_with_comment(payload: bytes, comment: bytes) -> bytes:
+    """Return a valid gzip member whose optional comment is not part of the deflate payload."""
+    assert b"\0" not in comment
+    member = bytearray(gzip.compress(payload))
+    member[3] |= 0x10
+    return bytes(member[:10] + comment + b"\0" + member[10:])
+
+
 def _assert_inconclusive_aggregate_not_cached(
     path: Path,
     expected_reason: str,
@@ -1211,6 +1219,257 @@ class TestOciLayerScanner:
 
         assert result.success is True
         assert "oci_layer_decompression_ratio_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_scan_layer_rejects_in_tar_ratio_dilution_before_copying(self, tmp_path: Path) -> None:
+        """Later incompressible TAR members must not hide an earlier high-ratio prefix."""
+        compressible = tmp_path / "zeros.bin"
+        compressible.write_bytes(b"\0" * 1024 * 1024)
+        filler = tmp_path / "filler.bin"
+        filler.write_bytes(b"".join(hashlib.sha256(str(index).encode()).digest() for index in range(65536)))
+
+        layer_path = tmp_path / "in-tar-dilution.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(compressible, arcname="zeros.bin")
+            tar.add(filler, arcname="filler.bin")
+
+        manifest_path = tmp_path / "in-tar-dilution.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 2.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 0
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("dilution", ["comment", "empty_members"])
+    def test_scan_layer_rejects_gzip_framing_ratio_dilution(self, tmp_path: Path, dilution: str) -> None:
+        """Gzip metadata and zero-output members must not increase the ratio denominator."""
+        payload = tmp_path / "zeros.bin"
+        payload.write_bytes(b"\0" * 256 * 1024)
+        raw_tar_path = tmp_path / "raw-framing.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload, arcname="zeros.bin")
+        raw_tar = raw_tar_path.read_bytes()
+
+        layer_path = tmp_path / f"{dilution}.tar.gz"
+        if dilution == "comment":
+            layer_path.write_bytes(_gzip_with_comment(raw_tar, b"A" * 4096))
+        else:
+            layer_path.write_bytes((gzip.compress(b"") * 128) + gzip.compress(raw_tar))
+
+        manifest_path = tmp_path / f"{dilution}.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 100.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_follows_nul_padded_gzip_continuation(self, tmp_path: Path) -> None:
+        """Permitted NUL padding between gzip members must not hide later expanded bytes."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+        raw_tar_path = tmp_path / "raw-continuation.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload, arcname="payload.bin")
+        raw_tar = raw_tar_path.read_bytes()
+
+        layer_path = tmp_path / "padded-continuation.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar) + (b"\0" * 10) + gzip.compress(b"\0" * 64 * 1024))
+        manifest_path = tmp_path / "padded-continuation.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompressed_bytes": len(raw_tar) + 1024}).scan(
+                str(manifest_path)
+            )
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_decompressed_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("corruption", ["checksum", "truncated"])
+    def test_scan_layer_rejects_corrupt_gzip_before_tar_parsing(self, tmp_path: Path, corruption: str) -> None:
+        """CRC and trailer truncation must fail preflight even when TAR EOF hides them from tarfile."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+        layer_path = tmp_path / f"{corruption}.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="payload.bin")
+        encoded = bytearray(layer_path.read_bytes())
+        if corruption == "checksum":
+            encoded[-8] ^= 0x01
+        else:
+            del encoded[-4:]
+        layer_path.write_bytes(encoded)
+
+        manifest_path = tmp_path / f"{corruption}.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_processing_failed" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("budget", ["members", "metadata", "header", "padding"])
+    def test_scan_layer_bounds_gzip_framing_work(self, tmp_path: Path, budget: str) -> None:
+        """Gzip member and optional-header floods must fail before TAR parsing."""
+        scanner = OciLayerScanner()
+        if budget == "members":
+            encoded = gzip.compress(b"") * (scanner._MAX_GZIP_MEMBERS + 1)
+            expected_message = "member count exceeded"
+        elif budget == "metadata":
+            comment = b"A" * (scanner._MAX_GZIP_HEADER_BYTES - 32)
+            member_count = (scanner._MAX_GZIP_METADATA_BYTES // len(comment)) + 2
+            encoded = b"".join(_gzip_with_comment(b"", comment) for _ in range(member_count))
+            expected_message = "metadata limit exceeded"
+        elif budget == "header":
+            encoded = _gzip_with_comment(b"", b"A" * scanner._MAX_GZIP_HEADER_BYTES)
+            expected_message = "header limit exceeded"
+        else:
+            encoded = gzip.compress(b"") + (b"\0" * (scanner._MAX_GZIP_PADDING_BYTES + 1))
+            expected_message = "padding limit exceeded"
+
+        layer_path = tmp_path / f"{budget}-budget.tar.gz"
+        layer_path.write_bytes(encoded)
+        manifest_path = tmp_path / f"{budget}-budget.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = scanner.scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_gzip_structure_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(expected_message in check.message for check in result.checks)
+
+    def test_scan_layer_counts_hidden_pax_headers_against_entry_budget(self, tmp_path: Path) -> None:
+        """PAX headers consumed internally by tarfile must still count toward raw entry limits."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+        layer_path = tmp_path / "pax.tar.gz"
+        with tarfile.open(layer_path, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+            tar.add(payload, arcname=f"{'nested/' * 20}payload.bin")
+
+        manifest_path = tmp_path / "pax.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner({"max_oci_layer_entries": 1}).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        check = next(check for check in result.checks if check.name == "Layer Decompression Budget Check")
+        assert check.details["hidden_entries"] == 1
+
+    def test_scan_layer_stops_after_visible_members_within_raw_entry_budget(self, tmp_path: Path) -> None:
+        """Visible entries beyond a hidden-header-adjusted raw limit must not be parsed."""
+        first_payload = tmp_path / "first.bin"
+        first_payload.write_bytes(b"first")
+        second_payload = tmp_path / "second.bin"
+        second_payload.write_bytes(b"second")
+        layer_path = tmp_path / "pax-plus-visible.tar.gz"
+        with tarfile.open(layer_path, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+            tar.add(first_payload, arcname=f"{'nested/' * 20}first.bin")
+            tar.add(second_payload, arcname="second.bin")
+
+        manifest_path = tmp_path / "pax-plus-visible.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_entries": 2}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_rejects_oversized_gnu_metadata_before_tar_parsing(self, tmp_path: Path) -> None:
+        """A large GNU long-name body must hit preflight limits before tarfile can allocate it."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+        layer_path = tmp_path / "long-name.tar.gz"
+        with tarfile.open(layer_path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+            tar.add(payload, arcname=f"{'a' * (2 * 1024 * 1024)}/payload.bin")
+
+        manifest_path = tmp_path / "long-name.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner(
+                {
+                    "compressed_max_decompressed_bytes": 1024,
+                    "compressed_max_decompression_ratio": 10000.0,
+                }
+            ).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_decompressed_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_rejects_non_regular_layer_path(self, tmp_path: Path) -> None:
+        """Directory and device-like layer paths must not be opened as gzip streams."""
+        layer_path = tmp_path / "directory.tar.gz"
+        layer_path.mkdir()
+        manifest_path = tmp_path / "directory.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_processing_failed" in result.metadata["scan_outcome_reasons"]
+        assert any("not a regular file" in check.message for check in result.checks)
+
+    def test_huge_ratio_config_falls_back_to_default(self) -> None:
+        """Integer-to-float overflow in untrusted config must not crash scanner construction."""
+        scanner = OciLayerScanner({"compressed_max_decompression_ratio": 10**400})
+
+        assert scanner.max_decompression_ratio == scanner._DEFAULT_MAX_DECOMPRESSION_RATIO
+
+    @pytest.mark.parametrize("budget", ["size", "ratio"])
+    def test_scan_layer_reports_early_malicious_member_before_stream_budget_exhaustion(
+        self,
+        tmp_path: Path,
+        budget: str,
+    ) -> None:
+        """Later expansion must not suppress malicious members completed inside the safe prefix."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        filler = tmp_path / "zeros.bin"
+        filler.write_bytes(b"\0" * 1024 * 1024)
+
+        layer_path = tmp_path / f"early-malicious-{budget}.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+            tar.add(filler, arcname="zeros.bin")
+
+        manifest_path = tmp_path / f"early-malicious-{budget}.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+        config: dict[str, int | float]
+        if budget == "size":
+            config = {
+                "compressed_max_decompressed_bytes": 32 * 1024,
+                "compressed_max_decompression_ratio": 10000.0,
+            }
+            expected_reason = "oci_layer_decompressed_size_exceeded"
+        else:
+            config = {
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 10.0,
+            }
+            expected_reason = "oci_layer_decompression_ratio_exceeded"
+
+        result = OciLayerScanner(config).scan(str(manifest_path))
+
+        assert result.success is False
+        assert expected_reason in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and f"{manifest_path.name}:{layer_path.name}:payload.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
 
     def test_scan_layer_scans_in_budget_members_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
         """Layer entry exhaustion should preserve findings from members already within budget."""
