@@ -7,7 +7,7 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -25,6 +25,7 @@ _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES = 10000
 _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
 _OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_IS_WINDOWS = os.name == "nt"
 _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])[\"']?"
@@ -295,45 +296,6 @@ def _is_local_mlflow_artifact_repository(artifact_repository: Any) -> bool:
     return isinstance(artifact_repository, LocalArtifactRepository)
 
 
-def _iter_local_mlflow_artifacts(
-    source_root: Path,
-    artifact_path: str | None,
-) -> Iterator[_MlflowArtifactInfo]:
-    """Yield local artifact metadata without materializing a whole directory."""
-    source_path = source_root
-    if artifact_path is not None:
-        for part in PurePosixPath(artifact_path).parts:
-            source_path /= part
-            if source_path.is_symlink():
-                raise ValueError("artifact source path contains a symbolic link")
-
-    if not source_path.exists():
-        return
-
-    resolved_source = source_path.resolve(strict=True)
-    if not resolved_source.is_relative_to(source_root):
-        raise ValueError("artifact source path escaped the repository root")
-    if not resolved_source.is_dir():
-        return
-
-    with os.scandir(resolved_source) as entries:
-        for entry in entries:
-            if entry.is_symlink():
-                raise ValueError("artifact source path contains a symbolic link")
-            entry_path = posixpath.join(artifact_path, entry.name) if artifact_path else entry.name
-            normalized_path = _normalize_mlflow_artifact_path(entry_path)
-            if entry.is_dir(follow_symlinks=False):
-                yield _MlflowArtifactInfo(path=normalized_path, is_dir=True, file_size=None)
-                continue
-            if not entry.is_file(follow_symlinks=False):
-                raise ValueError(f"Artifact entry is not a regular file: {normalized_path}")
-            yield _MlflowArtifactInfo(
-                path=normalized_path,
-                is_dir=False,
-                file_size=entry.stat(follow_symlinks=False).st_size,
-            )
-
-
 def _copy_local_mlflow_artifact(
     source_root: Path,
     artifact: _MlflowArtifact,
@@ -376,6 +338,58 @@ def _copy_local_mlflow_artifact(
     return copied_size
 
 
+def _opened_local_mlflow_path(source_fd: int) -> Path | None:
+    """Return the path of the opened file handle when the platform exposes it."""
+    if _IS_WINDOWS:
+        try:
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            win_dll = getattr(ctypes, "WinDLL", None)
+            get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
+            if not callable(win_dll) or not callable(get_osfhandle):
+                return None
+            kernel32: Any = win_dll("kernel32", use_last_error=True)
+            get_final_path = kernel32.GetFinalPathNameByHandleW
+            get_final_path.argtypes = (
+                wintypes.HANDLE,
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+            )
+            get_final_path.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            handle_value = get_osfhandle(source_fd)
+            if handle_value == -1:
+                return None
+            length = int(get_final_path(wintypes.HANDLE(handle_value), buffer, len(buffer), 0))
+            if length <= 0 or length >= len(buffer):
+                return None
+            opened_path = buffer.value
+            if opened_path.startswith("\\\\?\\UNC\\"):
+                opened_path = f"\\\\{opened_path[8:]}"
+            elif opened_path.startswith("\\\\?\\"):
+                opened_path = opened_path[4:]
+            return Path(opened_path)
+        except (AttributeError, ImportError, OSError, OverflowError, TypeError, ValueError):
+            return None
+
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{source_fd}"))
+    except OSError:
+        return None
+
+
+def _opened_path_is_within_root(opened_path: Path, source_root: Path) -> bool:
+    try:
+        normalized_root = os.path.normcase(os.path.abspath(source_root))
+        normalized_path = os.path.normcase(os.path.abspath(opened_path))
+        return os.path.commonpath((normalized_root, normalized_path)) == normalized_root
+    except (OSError, ValueError):
+        return False
+
+
 def _open_local_mlflow_artifact(source_root: Path, artifact_path: str) -> int:
     """Open a repository file without following replaceable path components."""
     parts = PurePosixPath(artifact_path).parts
@@ -409,6 +423,11 @@ def _open_local_mlflow_artifact(source_root: Path, artifact_path: str) -> int:
         raise ValueError("artifact source path escaped the repository root")
     source_fd = os.open(resolved_source, os.O_RDONLY | nofollow | nonblock | cloexec)
     try:
+        opened_path = _opened_local_mlflow_path(source_fd)
+        if opened_path is None:
+            raise ValueError("platform cannot verify the opened artifact path")
+        if not _opened_path_is_within_root(opened_path, source_root):
+            raise ValueError("opened artifact path escaped the repository root")
         path_stat = resolved_source.stat(follow_symlinks=False)
         opened_stat = os.fstat(source_fd)
         if (path_stat.st_dev, path_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
@@ -581,7 +600,12 @@ def _artifact_path_matches(artifact_path: str | None, requested_path: str) -> bo
 def _normalize_mlflow_artifact_path(artifact_path: object) -> str:
     if not isinstance(artifact_path, str) or not artifact_path or "\x00" in artifact_path:
         raise ValueError("Artifact entry did not include a valid path")
-    if "\\" in artifact_path or posixpath.isabs(artifact_path) or ntpath.isabs(artifact_path):
+    if (
+        "\\" in artifact_path
+        or (_IS_WINDOWS and ":" in artifact_path)
+        or posixpath.isabs(artifact_path)
+        or ntpath.isabs(artifact_path)
+    ):
         raise ValueError(f"Artifact entry path is not relative: {artifact_path}")
     normalized = posixpath.normpath(artifact_path)
     if normalized in {"", ".", ".."} or normalized.startswith("../") or ntpath.splitdrive(normalized)[0]:
@@ -764,11 +788,23 @@ def _preflight_mlflow_download_budget(
         )
 
     if _is_local_mlflow_artifact_repository(artifact_repository):
+        return _preflight_local_mlflow_sources(
+            model_uri,
+            root_uri,
+            (
+                _MlflowLocalSource(
+                    local_artifact_root,
+                    initial_artifact_path,
+                    initial_artifact_path,
+                ),
+            ),
+            details,
+            max_file_size=max_file_size,
+            max_total_size=max_total_size,
+            max_artifact_entries=max_artifact_entries,
+        )
 
-        def list_artifacts(path: str | None) -> Iterator[_MlflowArtifactInfo]:
-            return _iter_local_mlflow_artifacts(local_artifact_root, path)
-    else:
-        list_artifacts = artifact_repository.list_artifacts
+    list_artifacts = artifact_repository.list_artifacts
     total_size = 0
     file_count = 0
     entry_count = 0

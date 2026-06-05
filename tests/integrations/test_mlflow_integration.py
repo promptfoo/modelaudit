@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import os
 import sys
@@ -16,6 +17,8 @@ from modelaudit.integrations.mlflow import (
     _MlflowArtifact,
     _MlflowArtifactSizeChangedError,
     _MlflowLocalSource,
+    _normalize_mlflow_artifact_path,
+    _opened_local_mlflow_path,
     _snapshot_local_mlflow_sources,
     scan_mlflow_model,
 )
@@ -26,6 +29,61 @@ def _write_local_artifacts(source_root: Path, artifact_sizes: dict[str, int]) ->
         source_path = source_root.joinpath(*artifact_path.split("/"))
         source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(b"x" * artifact_size)
+
+
+@pytest.mark.parametrize("artifact_path", ["model.pkl:payload", "nested/model.bin:stream"])
+def test_normalize_mlflow_artifact_path_rejects_windows_streams(
+    artifact_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.integrations.mlflow._IS_WINDOWS", True)
+
+    with pytest.raises(ValueError, match="not relative"):
+        _normalize_mlflow_artifact_path(artifact_path)
+
+
+def test_normalize_mlflow_artifact_path_allows_posix_colons(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("modelaudit.integrations.mlflow._IS_WINDOWS", False)
+
+    assert _normalize_mlflow_artifact_path("checkpoint:1/model.pkl") == "checkpoint:1/model.pkl"
+
+
+def test_opened_local_mlflow_path_preserves_windows_handle_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ctypes import wintypes
+
+    handle_value = 1 << 40
+
+    class FakeGetFinalPath:
+        argtypes: tuple[Any, ...] | None = None
+        restype: Any = None
+
+        def __call__(self, handle: Any, buffer: Any, length: int, flags: int) -> int:
+            assert handle.value == handle_value
+            assert length == 32768
+            assert flags == 0
+            buffer.value = r"\\?\C:\artifacts\model.pkl"
+            return len(buffer.value)
+
+    get_final_path = FakeGetFinalPath()
+    fake_msvcrt = ModuleType("msvcrt")
+    fake_msvcrt.get_osfhandle = lambda source_fd: handle_value  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *args, **kwargs: SimpleNamespace(GetFinalPathNameByHandleW=get_final_path),
+        raising=False,
+    )
+    monkeypatch.setattr("modelaudit.integrations.mlflow._IS_WINDOWS", True)
+
+    assert str(_opened_local_mlflow_path(7)) == r"C:\artifacts\model.pkl"
+    assert get_final_path.argtypes == (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    assert get_final_path.restype is wintypes.DWORD
 
 
 def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path: Path) -> None:
@@ -642,6 +700,41 @@ def test_copy_local_mlflow_artifact_rejects_symlink_swap(
     monkeypatch.setattr(os, "open", swapping_open)
 
     with pytest.raises(OSError):
+        _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="nested/model.bin", size=4), destination)
+
+    assert swapped is True
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="opened file paths are not exposed through procfs")
+def test_copy_local_mlflow_artifact_rejects_symlink_swap_without_secure_walk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback opening must verify the handle path after an intermediate-directory swap."""
+    source_root = tmp_path / "source"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "model.bin").write_bytes(b"SAFE")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "model.bin").write_bytes(b"EVIL")
+    destination = tmp_path / "download" / "model.bin"
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal swapped
+        if Path(path) == source_root / "nested" / "model.bin" and not swapped:
+            nested.rename(source_root / "preserved")
+            nested.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("modelaudit.integrations.mlflow._OS_OPEN_SUPPORTS_DIR_FD", False)
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="escaped the repository root"):
         _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="nested/model.bin", size=4), destination)
 
     assert swapped is True
@@ -1300,6 +1393,72 @@ def test_scan_mlflow_model_bounds_real_local_repository_listing(
     assert determine_exit_code(result) == 2
     assert result.checks[0].details["reason"] == "artifact_listing_budget_exceeded"
     assert result.checks[0].details["artifact_entry_count"] == 3
+
+
+def test_scan_mlflow_model_direct_local_file_does_not_enumerate_siblings(tmp_path: Path) -> None:
+    """A direct local file request should spend the entry budget only on that file."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(
+        source_root,
+        {
+            "model.pkl": 1,
+            "unrelated-a.bin": 1,
+            "unrelated-b.bin": 1,
+        },
+    )
+    repository = LocalArtifactRepository(source_root)
+    repository.list_artifacts = MagicMock(side_effect=AssertionError("direct local files should not list siblings"))  # type: ignore[attr-defined]
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "models:/TestModel/1",
+        "model.pkl",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 1, "issues": []}
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model(
+            "models:/TestModel/1/model.pkl",
+            max_file_size=1,
+            max_total_size=1,
+            max_mlflow_artifact_entries=1,
+        )
+
+    assert result == scan_result
+    assert (download_dir / "model.pkl").read_bytes() == b"x"
+    repository.list_artifacts.assert_not_called()  # type: ignore[attr-defined]
+    mock_scan.assert_called_once()
 
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
