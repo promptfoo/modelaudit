@@ -116,6 +116,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "x-amz-signature",
     }
 )
+COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
+    re.sub(r"[._-]", "", key.lower()) for key in SENSITIVE_QUERY_KEYS
+)
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
     r"(?:access[_-]?key(?:[_-]?id)?|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
@@ -174,14 +177,15 @@ COMMAND_BARE_SENSITIVE_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?<![-/\w.])(?![-/])[A-Za-z0-9_.+/=-]*(?:api[_-]?key|client[_-]?secret|credential|password|passwd|"
     r"private[_-]?key|secret|signature|token)[A-Za-z0-9_.+/=-]*(?![/\w.-])"
+    rf"(?![\"']?\s*[:=]\s*[\"']?{re.escape(REDACTED_EVIDENCE_VALUE)})"
 )
 COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
 )
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)((?<!\w)--(?:password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
+    r"(?i)(((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
     r"proxy-tls-?password|tls-?password|"
-    r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)"
+    r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
     r"(?:=|\s+))(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
 COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
@@ -195,6 +199,20 @@ HIGH_ENTROPY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:sk-[A-Za-z0-9_
 COMMAND_SENSITIVE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*:\s*)"
     r"(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
+)
+COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(\$?(?P<cookie_quote>[\"'])cookie\s*:\s*)"
+    r"(?:\\.|(?!(?P=cookie_quote)).)*(?P=cookie_quote)"
+)
+COMMAND_STRUCTURED_SENSITIVE_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)((?P<key_quote>[\"'])(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})"
+    rf"(?P=key_quote)\s*:\s*)(?P<value_quote>[\"'])(?:\\.|(?!(?P=value_quote)).)*(?P=value_quote)"
+)
+STRUCTURED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?:^|[{{,])\s*[\"'](?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})[\"']\s*:"
+)
+REDACTED_STRUCTURED_VALUE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^\s*(?P<quote>[\"']){re.escape(REDACTED_EVIDENCE_VALUE)}(?P=quote)\s*(?=[,}}])"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
@@ -292,7 +310,12 @@ def _redact_malformed_url(raw_url: str) -> str:
 
 def _is_sensitive_query_key(key: str) -> bool:
     normalized_key = re.sub(r"(?:\[[^\]]*\])+$", "", key)
-    return normalized_key.lower() in SENSITIVE_QUERY_KEYS or _normalize_sensitive_key(normalized_key) is not None
+    compact_key = re.sub(r"[._-]", "", normalized_key.lower())
+    return (
+        normalized_key.lower() in SENSITIVE_QUERY_KEYS
+        or compact_key in COMPACT_SENSITIVE_QUERY_KEYS
+        or _normalize_sensitive_key(normalized_key) is not None
+    )
 
 
 def _query_value_contains_secret(value: str) -> bool:
@@ -304,6 +327,8 @@ def _query_value_contains_secret(value: str) -> bool:
         decoded = next_decoded
 
     if re.search(rf"(?i)(?:^|[?&;])\s*{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]", decoded):
+        return True
+    if STRUCTURED_SENSITIVE_KEY_RE.search(decoded):
         return True
 
     for nested_url in URL_RE.finditer(decoded):
@@ -1653,7 +1678,9 @@ def _redact_sensitive_literal_expressions(text: str) -> str:
         segment_end = _find_value_expression_end(text, match.end(), segment_end)
         segment = text[match.end() : segment_end]
         pieces.append(text[cursor : match.start()])
-        if COMMAND_EVIDENCE_RE.search(segment):
+        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(segment):
+            pieces.append(text[match.start() : segment_end])
+        elif COMMAND_EVIDENCE_RE.search(segment):
             pieces.append(f"{text[match.start() : match.end()]}{_redact_sensitive_command_value(segment)}")
         elif PYTHON_STRING_LITERAL_DETECT_RE.search(segment):
             trailing_whitespace = re.search(r"\s*$", segment)
@@ -1708,6 +1735,9 @@ def _redact_adjacent_string_literals(text: str) -> str:
 
 def _redact_residual_expression_literals(text: str) -> str:
     def replace_residual(match: re.Match[str]) -> str:
+        value = match.group(0)[len(match.group(1)) :]
+        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(value):
+            return match.group(0)
         if COMMAND_EVIDENCE_RE.search(match.group(0)):
             return match.group(0)
         return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}"
@@ -1724,6 +1754,8 @@ def _redact_residual_expression_literals(text: str) -> str:
 def _redact_unquoted_sensitive_assignment(match: re.Match[str]) -> str:
     value = match.group(3)
     stripped_value = value.lstrip()
+    if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(stripped_value):
+        return match.group(0)
     if stripped_value.startswith(REDACTED_EVIDENCE_VALUE):
         command_tail = stripped_value[len(REDACTED_EVIDENCE_VALUE) :]
         if COMMAND_CONTEXT_LITERAL_RE.search(command_tail):
@@ -1756,6 +1788,11 @@ def _redact_unknown_authorization_scheme_value(match: re.Match[str]) -> str:
 
 def _redact_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED_EVIDENCE_VALUE}{match.group(5)}"
+
+
+def _redact_command_structured_value(match: re.Match[str]) -> str:
+    quote = match.group("value_quote")
+    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _find_command_context_end(text: str, start: int) -> int:
@@ -1860,7 +1897,9 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
-    redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, text)
+    redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", text)
+    redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
+    redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
     redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
