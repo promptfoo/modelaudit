@@ -469,16 +469,19 @@ def _candidate_embedded_python_snippets(
             }
         )
 
+    skip_block_candidates = False
     if include_full_source:
         span = (0, len(bounded))
         candidates.append((bounded, span, (span,)))
+        skip_block_candidates = len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and bool(priority_starts)
 
-    for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
-        span = match.span()
-        if include_full_source and span[0] == 0:
-            continue
-        block_spans.append(span)
-        candidates.append((match.group(0), span, (span,)))
+    if not skip_block_candidates:
+        for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
+            span = match.span()
+            if include_full_source and span[0] == 0:
+                continue
+            block_spans.append(span)
+            candidates.append((match.group(0), span, (span,)))
 
     for start in start_offsets:
         if include_full_source and start == 0:

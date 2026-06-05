@@ -6878,6 +6878,7 @@ class TestJITScriptDetector:
             + padding
         )
 
+        candidates = jit_script_module._candidate_embedded_python_snippets(data, include_full_source=True)
         findings = detector._extract_and_check_python_code(
             data,
             "Generic Python",
@@ -6885,6 +6886,7 @@ class TestJITScriptDetector:
             include_full_source=True,
         )
 
+        assert len(candidates) <= jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
             for finding in findings
