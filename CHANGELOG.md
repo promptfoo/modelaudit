@@ -129,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
-- fail closed and cap downstream scanning and metadata listings when PyTorch ZIP archives exceed the configured entry limit, preserve parent structure attribution across nested limits, and retain deadline and prefixed-layout metadata handling
+- fail closed and cap downstream scanning, metadata listings, and version metadata probes for PyTorch ZIP archives, preserve parent structure attribution across nested entry limits, and retain deadline and prefixed-layout metadata handling
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - include supported non-PT artifacts linked from PyTorch Hub model pages while rejecting format-changing redirects and non-artifact responses
 - enforce `--max-size` while streaming PyTorch Hub model weights
