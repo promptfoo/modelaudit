@@ -21,10 +21,12 @@ from modelaudit.core_results import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.utils.sources.cloud_storage import redact_cloud_error_for_display as _redact_cloud_error_for_display
 from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
 
+_URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
 _URL_TOKEN_RE = re.compile(
-    r"(stream://[a-z][a-z0-9+.-]*://[^\s\"'<>]+|[a-z][a-z0-9+.-]*://[^\s\"'<>]+)",
+    rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
     re.IGNORECASE,
 )
 
@@ -459,7 +461,14 @@ def _redact_path_for_sarif(path: str) -> str:
 
 def _redact_text_for_sarif(text: str) -> str:
     """Redact signed URL tokens embedded in SARIF text fields."""
-    return _URL_TOKEN_RE.sub(lambda match: _redact_path_for_sarif(match.group(0)), text)
+    return _URL_TOKEN_RE.sub(lambda match: _redact_url_token_for_sarif(match.group(0)), text)
+
+
+def _redact_url_token_for_sarif(url: str) -> str:
+    """Keep already-sanitized query context without weakening raw URL redaction."""
+    if "<redacted>" in url:
+        return _redact_cloud_error_for_display(url)
+    return _redact_path_for_sarif(url)
 
 
 def _redact_value_for_sarif(value: Any) -> Any:

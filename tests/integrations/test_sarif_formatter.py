@@ -102,6 +102,28 @@ class TestFormatSarifOutput:
         assert safe_path in invocation["commandLine"]
         assert invocation["arguments"] == [safe_path]
 
+    def test_already_redacted_url_preserves_benign_query_context(self) -> None:
+        """Repeated SARIF sanitization must not corrupt safe query context."""
+        safe_url = "https://collector.example/upload?visible=yes&token=<redacted>"
+        partially_redacted_url = f"{safe_url}&Signature=remaining-secret"
+        fully_redacted_url = f"{safe_url}&Signature=<redacted>"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Related endpoint: {partially_redacted_url}",
+                severity=IssueSeverity.WARNING,
+                details={"related_url": partially_redacted_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert fully_redacted_url in output
+        assert "remaining-secret" not in output
+        assert "https://collector.example/upload<redacted>" not in output
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()

@@ -241,6 +241,9 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     assert safe_url in json_text
     assert safe_url in sarif_text
     assert "visible=yes" in json_text
+    assert "visible=yes" in sarif_text
+    assert "token=<redacted>" in sarif_text
+    assert "https://collector.example/upload<redacted>" not in sarif_text
     assert safe_url in result.file_metadata
     assert all(asset.path != stream_url for asset in result.assets)
 
