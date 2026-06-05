@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlparse, urlsplit, urlunsplit
 
 import click
 from yaspin import yaspin
@@ -35,15 +35,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
-_SENSITIVE_QUERY_PARAM_RE = re.compile(
-    (
-        r"([?&;][^=\s&;]*(?:signature|credential|security-token|access-key|access_key|accesskey|token|"
-        r"secret|api-key|api_key|apikey|password|passwd|pwd|authorization|auth|bearer|private-key|"
-        r"private_key|privatekey|refresh-token|refresh_token|refreshtoken|client-secret|client_secret|"
-        r"clientsecret|session|sig|sas)[^=\s&;]*=)[^\s&#;]+"
-    ),
-    re.IGNORECASE,
-)
+_QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
@@ -103,7 +95,51 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
     if source_url:
         redacted = redacted.replace(source_url, redact_url_for_display(source_url))
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
-    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+    return _QUERY_PARAM_RE.sub(_redact_sensitive_query_param, redacted)
+
+
+def _redact_sensitive_query_param(match: re.Match[str]) -> str:
+    if not _is_sensitive_query_param(match.group("key")):
+        return match.group(0)
+    return f"{match.group('prefix')}{match.group('key')}=<redacted>"
+
+
+def _is_sensitive_query_param(key: str) -> bool:
+    decoded_key = unquote_plus(key).lower()
+    normalized_key = re.sub(r"[^a-z0-9]", "", decoded_key)
+    exact_sensitive_keys = {
+        "auth",
+        "authorization",
+        "awsaccesskeyid",
+        "bearer",
+        "googleaccessid",
+        "password",
+        "passwd",
+        "pwd",
+        "sas",
+        "session",
+        "sessionid",
+        "sig",
+        "token",
+    }
+    sensitive_suffixes = (
+        "accesstoken",
+        "apikey",
+        "accesskey",
+        "clientsecret",
+        "credential",
+        "idtoken",
+        "password",
+        "privatekey",
+        "refreshtoken",
+        "secret",
+        "secretkey",
+        "securitytoken",
+        "signature",
+        "sessiontoken",
+        "token",
+    )
+    return normalized_key in exact_sensitive_keys or normalized_key.endswith(sensitive_suffixes)
 
 
 def redact_stream_url_for_display(url: str) -> str:

@@ -180,7 +180,7 @@ class TestCloudURLRedaction:
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
 
     def test_redact_url_for_display_fails_closed_for_invalid_port(self) -> None:
-        url = "https://example.com:not-a-port/model.bin?token=secret"
+        url = "https://user:password@example.com:not-a-port/model.bin?token=secret"
         assert redact_url_for_display(url) == "<cloud URL redacted>"
 
     def test_redact_url_for_display_preserves_ipv6_authority(self) -> None:
@@ -262,6 +262,19 @@ class TestCloudURLRedaction:
         assert "Signature=<redacted>" in redacted
         assert "AKIASECRET" not in redacted
         assert "deadbeef" not in redacted
+
+    def test_redact_cloud_error_for_display_handles_encoded_and_fragment_credentials(self) -> None:
+        message = (
+            "provider failed: https://example.com/model?tokenizer=bert&X-Amz-Sign%61ture=secret"
+            "#access_token=fragment-secret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "tokenizer=bert" in redacted
+        assert "X-Amz-Sign%61ture=<redacted>" in redacted
+        assert "access_token=<redacted>" in redacted
+        assert "fragment-secret" not in redacted
 
 
 @patch("modelaudit.utils.helpers.retry.time.sleep")

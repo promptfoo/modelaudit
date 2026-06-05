@@ -10,7 +10,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import AnyUrl, BaseModel
 
 try:
     from modelaudit_picklescan import shared_source_sensitive_caches
@@ -93,7 +93,7 @@ from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.file.streaming import stream_analyze_file
+from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -187,19 +187,23 @@ def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
 def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
     if isinstance(value, BaseModel):
         return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
+    if isinstance(value, AnyUrl):
+        return _redact_stream_value_for_reporting(str(value), stream_url, report_url)
+    if isinstance(value, os.PathLike):
+        return _redact_stream_value_for_reporting(os.fspath(value), stream_url, report_url)
     if isinstance(value, str):
         return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
     if isinstance(value, bytes):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
-            return value
+            return b"<binary data>"
         return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
     if isinstance(value, bytearray):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
-            return value
+            return bytearray(b"<binary data>")
         return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
     if isinstance(value, dict):
         return {
@@ -969,7 +973,7 @@ def scan_model_directory_or_file(
             # Perform streaming analysis
             from modelaudit.scanners import get_scanner_for_file
 
-            scanner = get_scanner_for_file(stream_url, config=config)
+            scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
                 scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:

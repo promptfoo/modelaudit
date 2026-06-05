@@ -1147,7 +1147,10 @@ def _scan_local_or_downloaded_path(
         elif runtime.show_styled_output:
             click.echo(f"Error scanning {display_path}")
 
-        logger.error(f"Error during scan of {display_path}: {display_error}", exc_info=verbose)
+        logger.error(
+            f"Error during scan of {display_path}: {display_error}",
+            exc_info=verbose and not (actual_path.startswith("stream://") or is_cloud_url(path)),
+        )
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
         path_state.scanned_paths.append(_display_scan_path(actual_path))
