@@ -340,6 +340,48 @@ class TestDvcIntegration:
         assert result.content_hash is None
         assert str(linked_dir) in incomplete_issue.details["unresolved_outputs"]
 
+    def test_escaping_dvc_directory_junction_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows junctions must be pruned and reported like directory symlinks."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        junction_dir = output_dir / "junction"
+        junction_dir.mkdir()
+        hidden_payload = junction_dir / "hidden.pkl"
+        hidden_payload.write_bytes(pickle.dumps({"hidden": True}))
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        original_resolve = Path.resolve
+
+        def resolve_simulated_junction(self: Path, *args: Any, **kwargs: Any) -> Path:
+            if self == junction_dir:
+                return outside_dir
+            return original_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "is_junction", lambda self: self == junction_dir, raising=False)
+        monkeypatch.setattr(Path, "resolve", resolve_simulated_junction)
+
+        result = scan_model_directory_or_file(str(dvc_file))
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert result.files_scanned == 0
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None
+        assert str(junction_dir) in incomplete_issue.details["unresolved_outputs"]
+        assert all(Path(asset.path).name != hidden_payload.name for asset in result.assets)
+
     def test_non_dvc_symlink_bypasses_dvc_resolution(
         self,
         tmp_path: Path,

@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import logging
 import os
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
@@ -810,6 +811,23 @@ def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None 
     return content_hashes
 
 
+def _is_directory_link(path: Path) -> bool:
+    """Return whether a directory entry is a symlink, junction, or other Windows reparse point."""
+    if path.is_symlink():
+        return True
+
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        with suppress(OSError):
+            if is_junction():
+                return True
+
+    with suppress(OSError):
+        file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
 def _resolve_directory_scan_target(
     file_path: Path,
     base_dir: Path,
@@ -1313,17 +1331,18 @@ def scan_model_directory_or_file(
 
                 if isinstance(dvc_parent_file, str) or dvc_directory_output_owners:
                     dvc_directory_roots_by_file = get_dvc_directory_roots_by_file()
-                    for directory_name in dirs:
+                    for directory_name in tuple(dirs):
                         symlink_dir = Path(root) / directory_name
-                        if not symlink_dir.is_symlink():
+                        if not _is_directory_link(symlink_dir):
                             continue
+                        dirs.remove(directory_name)
                         symlink_path = Path(os.path.abspath(symlink_dir))
                         for affected_dvc_file, output_roots in dvc_directory_roots_by_file.items():
                             if not any(symlink_path.is_relative_to(output_root) for output_root in output_roots):
                                 continue
                             try:
                                 resolved_symlink = symlink_dir.resolve(strict=True)
-                            except OSError:
+                            except (OSError, RuntimeError):
                                 resolved_symlink = None
                             if resolved_symlink is not None and any(
                                 is_within_directory(str(output_root), str(resolved_symlink))
