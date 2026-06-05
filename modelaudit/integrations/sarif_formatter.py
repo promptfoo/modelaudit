@@ -473,16 +473,25 @@ def _redact_url_token_for_sarif(url: str) -> str:
     """Preserve benign query context while removing credentials from evidence URLs."""
     if url.startswith("stream://"):
         return _redact_path_for_sarif(url)
-    if "<redacted>" in url:
-        return _redact_cloud_error_for_display(url)
+    preserve_redacted_params = "<redacted>" in url
     redacted_url = _redact_cloud_error_for_display(url)
-    if redacted_url == url:
-        return url
+    parts = urlsplit(url) if redacted_url == url else urlsplit(redacted_url)
 
-    parts = urlsplit(redacted_url)
-    safe_query = "&".join(part for part in parts.query.split("&") if not part.endswith("=<redacted>"))
-    safe_fragment = "" if parts.fragment.endswith("=<redacted>") else parts.fragment
+    safe_query = _filter_sarif_url_params(parts.query, preserve_redacted_params=preserve_redacted_params)
+    safe_fragment = _filter_sarif_url_params(parts.fragment, preserve_redacted_params=preserve_redacted_params)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, safe_query, safe_fragment))
+
+
+def _filter_sarif_url_params(value: str, *, preserve_redacted_params: bool) -> str:
+    """Keep structured safe URL parameters and discard opaque credential material."""
+    safe_parts: list[str] = []
+    for part in re.split(r"[&;]", value):
+        if "=" not in part:
+            continue
+        if part.endswith("=<redacted>") and not preserve_redacted_params:
+            continue
+        safe_parts.append(part)
+    return "&".join(safe_parts)
 
 
 def _redact_value_for_sarif(value: Any) -> Any:

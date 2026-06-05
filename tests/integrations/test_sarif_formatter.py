@@ -215,6 +215,26 @@ class TestFormatSarifOutput:
         assert "opaque=" not in output
         assert "SUPERSECRET" not in output
 
+    def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
+        """Opaque URL components must not bypass key/value redaction."""
+        raw_url = "https://evil.example/c2?campaign=test&BARE-QUERY-SECRET#section=overview&BARE-FRAGMENT-SECRET"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Detected callback {raw_url}",
+                severity=IssueSeverity.WARNING,
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "campaign=test" in output
+        assert "section=overview" in output
+        assert "BARE-QUERY-SECRET" not in output
+        assert "BARE-FRAGMENT-SECRET" not in output
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()
