@@ -5,6 +5,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 _MLFLOW_DOWNLOAD_BUDGET_CHECK = "MLflow Download Size Check"
 _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES = 10000
 _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
+_MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
 _MLFLOW_AUTH_VALUE_RE = re.compile(
     r"(?i)(\b(?:authorization|proxy-authorization)\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s,;]+"
 )
@@ -38,9 +40,15 @@ class _MlflowArtifact:
 
 @dataclass(frozen=True)
 class _MlflowDownloadPlan:
-    artifact_repository: Any
     artifacts: tuple[_MlflowArtifact, ...]
     root_uri: str
+    local_artifact_root: Path
+
+
+class _MlflowArtifactSizeChangedError(Exception):
+    def __init__(self, actual_size: int) -> None:
+        super().__init__(f"artifact size changed to {actual_size} bytes")
+        self.actual_size = actual_size
 
 
 def _finite_budget(max_file_size: int, max_total_size: int) -> bool:
@@ -128,6 +136,81 @@ def _redact_mlflow_error_for_display(error: object) -> str:
     if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
         return redacted
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
+
+
+def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
+    """Return a trusted local source root that ModelAudit can copy itself."""
+    try:
+        from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
+        from mlflow.store.artifact.models_artifact_repo import ModelsArtifactRepository
+    except Exception:
+        return None
+
+    repository = artifact_repository
+    seen: set[int] = set()
+    while isinstance(repository, ModelsArtifactRepository):
+        repository_id = id(repository)
+        if repository_id in seen:
+            return None
+        seen.add(repository_id)
+        repository = repository.repo
+
+    if not isinstance(repository, LocalArtifactRepository):
+        return None
+
+    try:
+        artifact_root = Path(repository.artifact_dir).expanduser().resolve(strict=True)
+    except (OSError, TypeError, ValueError):
+        return None
+    return artifact_root if artifact_root.is_dir() else None
+
+
+def _copy_local_mlflow_artifact(
+    source_root: Path,
+    artifact: _MlflowArtifact,
+    destination: Path,
+) -> int:
+    """Copy one local artifact without writing more than its preflight size."""
+    source_path = source_root
+    for part in PurePosixPath(artifact.path).parts:
+        source_path /= part
+        if source_path.is_symlink():
+            raise ValueError("artifact source path contains a symbolic link")
+
+    resolved_source = source_path.resolve(strict=True)
+    if not resolved_source.is_relative_to(source_root):
+        raise ValueError("artifact source path escaped the repository root")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    copied_size = 0
+    try:
+        with resolved_source.open("rb") as source:
+            source_stat = os.fstat(source.fileno())
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ValueError("artifact source path is not a regular file")
+            if source_stat.st_size != artifact.size:
+                raise _MlflowArtifactSizeChangedError(source_stat.st_size)
+
+            with destination.open("xb") as output:
+                while copied_size < artifact.size:
+                    chunk = source.read(min(_MLFLOW_COPY_CHUNK_SIZE, artifact.size - copied_size))
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    copied_size += len(chunk)
+
+                extra_byte = source.read(1)
+                final_source_size = os.fstat(source.fileno()).st_size
+                if copied_size != artifact.size or extra_byte or final_source_size != artifact.size:
+                    actual_size = final_source_size
+                    if actual_size == artifact.size:
+                        actual_size = copied_size + len(extra_byte)
+                    raise _MlflowArtifactSizeChangedError(actual_size)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+    return copied_size
 
 
 def _bounded_artifact_listing(
@@ -361,10 +444,19 @@ def _preflight_mlflow_download_budget(
             details,
         )
 
+    local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
+    if local_artifact_root is None:
+        details["reason"] = "artifact_streaming_budget_unavailable"
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "MLflow artifact repository cannot enforce the configured download budget",
+            details,
+        )
+
     return _MlflowDownloadPlan(
-        artifact_repository=artifact_repository,
         artifacts=tuple(planned_artifacts.values()),
         root_uri=root_uri,
+        local_artifact_root=local_artifact_root,
     )
 
 
@@ -376,7 +468,6 @@ def _download_preflighted_mlflow_artifacts(
     max_file_size: int,
     max_total_size: int,
 ) -> str | ModelAuditResultModel:
-    download_file = getattr(plan.artifact_repository, "_download_file", None)
     details: dict[str, Any] = {
         "model_uri": model_uri,
         "root_uri": plan.root_uri,
@@ -384,13 +475,6 @@ def _download_preflighted_mlflow_artifacts(
         "max_total_size": max_total_size,
         "artifact_file_count": len(plan.artifacts),
     }
-    if not callable(download_file):
-        details["reason"] = "artifact_download_unavailable"
-        return _mlflow_budget_failure_result(
-            model_uri,
-            "Unable to download preflighted MLflow artifacts safely",
-            details,
-        )
 
     download_root = Path(download_dir).resolve()
     actual_total_size = 0
@@ -405,13 +489,26 @@ def _download_preflighted_mlflow_artifacts(
                 details,
             )
 
-        download_file(artifact.path, str(local_path))
         try:
+            actual_size = _copy_local_mlflow_artifact(plan.local_artifact_root, artifact, local_path)
             if local_path.is_symlink() or not local_path.is_file():
                 raise ValueError("downloaded path is not a regular file")
             if not local_path.resolve().is_relative_to(download_root):
                 raise ValueError("downloaded path escaped the download directory")
-            actual_size = local_path.stat().st_size
+        except _MlflowArtifactSizeChangedError as exc:
+            details.update(
+                {
+                    "reason": "artifact_download_size_changed",
+                    "artifact_path": artifact.path,
+                    "expected_artifact_size": artifact.size,
+                    "downloaded_artifact_size": exc.actual_size,
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                "MLflow artifact size changed after preflight",
+                details,
+            )
         except OSError as exc:
             details.update(
                 {
@@ -440,20 +537,6 @@ def _download_preflighted_mlflow_artifacts(
             )
 
         actual_total_size += actual_size
-        if actual_size != artifact.size:
-            details.update(
-                {
-                    "reason": "artifact_download_size_changed",
-                    "artifact_path": artifact.path,
-                    "expected_artifact_size": artifact.size,
-                    "downloaded_artifact_size": actual_size,
-                }
-            )
-            return _mlflow_budget_failure_result(
-                model_uri,
-                "MLflow artifact size changed after preflight",
-                details,
-            )
         if max_file_size > 0 and actual_size > max_file_size:
             details.update(
                 {

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preflight MLflow artifact sizes and verify the exact planned files before scanning, rejecting unsafe paths, changed content, and over-budget downloads
+- preflight MLflow artifact sizes and copy supported local repositories under hard byte limits, rejecting unsafe paths, size drift, and backends that cannot enforce the configured download budget
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings

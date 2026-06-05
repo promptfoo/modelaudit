@@ -1,23 +1,116 @@
 import hashlib
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit.core import determine_exit_code
-from modelaudit.integrations.mlflow import scan_mlflow_model
+from modelaudit.integrations.mlflow import (
+    _copy_local_mlflow_artifact,
+    _local_mlflow_artifact_root,
+    _MlflowArtifact,
+    _MlflowArtifactSizeChangedError,
+    scan_mlflow_model,
+)
 
 
-def _configure_mock_file_download(mock_repo: MagicMock, artifact_sizes: dict[str, int]) -> None:
-    def _download_file(remote_path: str, local_path: str) -> None:
-        destination = Path(local_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"x" * artifact_sizes[remote_path])
+def _write_local_artifacts(source_root: Path, artifact_sizes: dict[str, int]) -> None:
+    for artifact_path, artifact_size in artifact_sizes.items():
+        source_path = source_root.joinpath(*artifact_path.split("/"))
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(b"x" * artifact_size)
 
-    mock_repo._download_file.side_effect = _download_file
+
+def test_local_mlflow_artifact_root_unwraps_models_repository(tmp_path: Path) -> None:
+    """Only MLflow's local repository type should expose a bounded-copy source root."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        def __init__(self, repository: object) -> None:
+            self.repo = repository
+
+    mlflow_module = ModuleType("mlflow")
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    source_root = tmp_path / "artifacts"
+    source_root.mkdir()
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow": mlflow_module,
+            "mlflow.store": store_module,
+            "mlflow.store.artifact": artifact_module,
+            "mlflow.store.artifact.local_artifact_repo": local_module,
+            "mlflow.store.artifact.models_artifact_repo": models_module,
+        },
+    ):
+        assert (
+            _local_mlflow_artifact_root(ModelsArtifactRepository(LocalArtifactRepository(source_root))) == source_root
+        )
+        assert _local_mlflow_artifact_root(object()) is None
+
+
+def test_copy_local_mlflow_artifact_removes_partial_file_when_source_grows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mutable local source must not write beyond its advertised size."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_path = source_root / "model.bin"
+    source_path.write_bytes(b"abcd")
+    destination = tmp_path / "download" / "model.bin"
+    original_open = Path.open
+
+    class GrowingReader:
+        def __init__(self, file_object: Any) -> None:
+            self.file_object = file_object
+            self.grew = False
+
+        def __enter__(self) -> "GrowingReader":
+            self.file_object.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self.file_object.__exit__(*args)
+
+        def fileno(self) -> int:
+            return cast(int, self.file_object.fileno())
+
+        def read(self, size: int = -1) -> bytes:
+            data = cast(bytes, self.file_object.read(size))
+            if not self.grew:
+                with original_open(source_path, "ab") as output:
+                    output.write(b"e")
+                self.grew = True
+            return data
+
+    def growing_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        file_object = original_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == source_path and mode == "rb":
+            return GrowingReader(file_object)
+        return file_object
+
+    monkeypatch.setattr("modelaudit.integrations.mlflow._MLFLOW_COPY_CHUNK_SIZE", 2)
+    monkeypatch.setattr(Path, "open", growing_open)
+
+    with pytest.raises(_MlflowArtifactSizeChangedError) as exc_info:
+        _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="model.bin", size=4), destination)
+
+    assert exc_info.value.actual_size == 5
+    assert not destination.exists()
 
 
 def test_scan_mlflow_model_import_error(monkeypatch):
@@ -44,7 +137,8 @@ def test_scan_mlflow_model_success(
     mock_repo.list_artifacts.return_value = [
         SimpleNamespace(path="model.pkl", is_dir=False, file_size=1024),
     ]
-    _configure_mock_file_download(mock_repo, {"model.pkl": 1024})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 1024})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
 
     # Create a temporary directory for the test
@@ -63,7 +157,10 @@ def test_scan_mlflow_model_success(
     }
     mock_scan.return_value = expected_results
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         results = scan_mlflow_model(
             "models:/TestModel/1",
             registry_uri="http://localhost:5000",
@@ -77,7 +174,7 @@ def test_scan_mlflow_model_success(
     mock_mlflow.set_registry_uri.assert_called_once_with("http://localhost:5000")
     mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
     mock_repo.list_artifacts.assert_called_once_with(None)
-    mock_repo._download_file.assert_called_once_with("model.pkl", str(temp_dir / "model.pkl"))
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
 
@@ -114,22 +211,23 @@ def test_scan_mlflow_model_splits_subpath_and_downloads_from_resolved_repo(
     mock_repo.list_artifacts.return_value = [
         SimpleNamespace(path="path/to/model/model.pkl", is_dir=False, file_size=1024),
     ]
-    _configure_mock_file_download(mock_repo, {"path/to/model/model.pkl": 1024})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"path/to/model/model.pkl": 1024})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
     mock_scan.return_value = {"bytes_scanned": 1024, "issues": []}
     download_dir = tmp_path / "modelaudit_mlflow_test"
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         scan_mlflow_model("models:/TestModel/2/path/to/model", max_file_size=2048)
 
     mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/2")
     mock_repo.list_artifacts.assert_called_once_with("path/to/model")
-    mock_repo._download_file.assert_called_once_with(
-        "path/to/model/model.pkl",
-        str(download_dir / "path/to/model/model.pkl"),
-    )
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_scan.assert_called_once()
@@ -154,16 +252,20 @@ def test_scan_mlflow_model_accepts_single_file_artifact_with_size_metadata(
         [],
         [SimpleNamespace(path="model.pkl", is_dir=False, file_size=1024)],
     ]
-    _configure_mock_file_download(mock_repo, {"model.pkl": 1024})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 1024})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
     mock_scan.return_value = {"bytes_scanned": 1024, "issues": []}
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         scan_mlflow_model("models:/TestModel/2/model.pkl", max_file_size=2048)
 
     assert [call.args for call in mock_repo.list_artifacts.call_args_list] == [("model.pkl",), (None,)]
-    mock_repo._download_file.assert_called_once_with("model.pkl", str(download_dir / "model.pkl"))
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_scan.assert_called_once_with(
@@ -193,19 +295,23 @@ def test_scan_mlflow_model_downloads_mutable_ref_from_preflight_repo(
     mock_repo.list_artifacts.return_value = [
         SimpleNamespace(path="model.pkl", is_dir=False, file_size=1024),
     ]
-    _configure_mock_file_download(mock_repo, {"model.pkl": 1024})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 1024})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
     mock_scan.return_value = {"bytes_scanned": 1024, "issues": []}
     download_dir = tmp_path / "modelaudit_mlflow_test"
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         scan_mlflow_model("models:/TestModel/Production", max_total_size=2048)
 
     mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/Production")
     mock_repo.list_artifacts.assert_called_once_with(None)
-    mock_repo._download_file.assert_called_once_with("model.pkl", str(download_dir / "model.pkl"))
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_scan.assert_called_once()
@@ -309,6 +415,32 @@ def test_scan_mlflow_model_rejects_oversized_artifact_before_download(
     assert result.checks[0].details["artifact_path"] == "large.bin"
 
 
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_repository_without_bounded_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+) -> None:
+    """Finite budgets must not call repositories that cannot cap transferred bytes."""
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = [
+        SimpleNamespace(path="model.pkl", is_dir=False, file_size=4),
+    ]
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+
+    mock_repo._download_file.assert_not_called()
+    mock_repo.download_artifacts.assert_not_called()
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_streaming_budget_unavailable"
+
+
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -326,14 +458,18 @@ def test_scan_mlflow_model_rejects_artifact_size_change_after_preflight(
     mock_repo.list_artifacts.return_value = [
         SimpleNamespace(path="model.pkl", is_dir=False, file_size=4),
     ]
-    _configure_mock_file_download(mock_repo, {"model.pkl": 5})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 5})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
     mock_mkdtemp.return_value = str(download_dir)
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
 
-    mock_repo._download_file.assert_called_once_with("model.pkl", str(download_dir / "model.pkl"))
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_scan.assert_not_called()
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
@@ -341,6 +477,7 @@ def test_scan_mlflow_model_rejects_artifact_size_change_after_preflight(
     assert result.checks[0].details["reason"] == "artifact_download_size_changed"
     assert result.checks[0].details["expected_artifact_size"] == 4
     assert result.checks[0].details["downloaded_artifact_size"] == 5
+    assert not (download_dir / "model.pkl").exists()
 
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
@@ -387,12 +524,16 @@ def test_scan_mlflow_model_accepts_exact_download_size_boundaries(
         SimpleNamespace(path="a.bin", is_dir=False, file_size=4),
         SimpleNamespace(path="b.bin", is_dir=False, file_size=3),
     ]
-    _configure_mock_file_download(mock_repo, {"a.bin": 4, "b.bin": 3})
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"a.bin": 4, "b.bin": 3})
     mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
     mock_mkdtemp.return_value = str(download_dir)
     mock_scan.return_value = {"bytes_scanned": 7, "issues": []}
 
-    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
         result = scan_mlflow_model(
             "models:/TestModel/1",
             max_file_size=4,
@@ -400,7 +541,7 @@ def test_scan_mlflow_model_accepts_exact_download_size_boundaries(
         )
 
     assert result == mock_scan.return_value
-    assert mock_repo._download_file.call_count == 2
+    mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
     mock_scan.assert_called_once_with(
         str(download_dir),
