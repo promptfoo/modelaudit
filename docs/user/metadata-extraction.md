@@ -27,6 +27,17 @@ modelaudit metadata model.onnx --format yaml
 modelaudit metadata model.onnx --security-only
 ```
 
+## Directory limits
+
+Directory metadata extraction stops after 10,000 file entries, 20,000 total filesystem entries,
+1 GiB of aggregate file size, or 64 directory levels. When a limit is reached, table output shows
+an incomplete-extraction warning. JSON and YAML output include `analysis_incomplete: true`,
+`scan_outcome: inconclusive`, and a `budget_events` list describing the exceeded limit.
+
+Special filesystem entries such as named pipes and sockets, including symlinks to those entries,
+are reported as errors and are not opened or sent to scanners. Regular files and in-directory
+symlinks to regular files remain eligible for metadata extraction.
+
 ## Trusting loaders (advanced)
 
 `--trust-loaders` allows scanner metadata loaders that may deserialize model content.
