@@ -2,8 +2,9 @@
 
 import logging
 import os
-from collections.abc import Iterator
-from pathlib import Path
+from collections.abc import Collection, Iterator
+from glob import escape as escape_glob
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..helpers.disk_space import check_disk_space
@@ -19,6 +20,9 @@ from .huggingface_paths import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
+_MAX_HF_STREAMING_UNFILTERED_FILES = 128
 
 __all__ = [
     "download_file_from_hf",
@@ -57,12 +61,35 @@ def _build_extension_allow_patterns() -> list[str]:
     return sorted(patterns)
 
 
+def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
+    """Escape repository filenames before passing them to the Hub glob filter."""
+    return [escape_glob(filename) for filename in filenames]
+
+
+def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
+    """Extract repository filenames from a Hugging Face repository response."""
+    siblings = getattr(repo_info, "siblings", None)
+    if siblings is None:
+        return None
+
+    files: list[str] = []
+    for sibling in siblings:
+        if isinstance(sibling, dict):
+            file_name = sibling.get("rfilename") or sibling.get("path")
+        else:
+            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+
+        if isinstance(file_name, str) and file_name:
+            files.append(file_name)
+    return files
+
+
 def _case_insensitive_suffix_glob(extension: str) -> str:
     """Build a fnmatch suffix glob that preserves mixed-case remote files."""
     return "".join(f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in extension)
 
 
-def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
+def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
     return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
@@ -73,6 +100,106 @@ def _raise_no_scannable_hf_files(repo_id: str) -> None:
         f"Refusing to download full snapshot for {repo_id}: "
         "repository listing contains no recognized ModelAudit-scannable files"
     )
+
+
+def _get_default_hf_streaming_extensions() -> set[str]:
+    """Return remotely scannable suffixes, including safe extensionless routes."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    extensions = set(_get_model_extensions())
+    for scanner_info in get_scanner_registry_metadata().values():
+        scanner_extensions = {str(extension).lower() for extension in scanner_info.get("extensions", [])}
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        if "" in scanner_extensions and "" not in remote_excluded_extensions:
+            extensions.add("")
+            break
+    return extensions
+
+
+def _get_default_hf_streaming_filenames() -> set[str]:
+    """Return exact remotely scannable basenames without widening them to suffix routes."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    filenames: set[str] = set()
+    for scanner_info in get_scanner_registry_metadata().values():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for filename in scanner_info.get("content_routed_filenames", []):
+            filename_text = str(filename).lower()
+            if PurePosixPath(filename_text).suffix.lower() not in remote_excluded_extensions:
+                filenames.add(filename_text)
+    return filenames
+
+
+def _select_streamable_hf_files(
+    repo_id: str,
+    repo_files: list[str],
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    *,
+    include_all_files: bool = False,
+) -> list[str]:
+    """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
+    if scannable_extensions is None:
+        extensions = _get_default_hf_streaming_extensions()
+        filenames = (
+            _get_default_hf_streaming_filenames()
+            if scannable_filenames is None
+            else {str(filename).lower() for filename in scannable_filenames}
+        )
+    else:
+        extensions = {str(extension).lower() for extension in scannable_extensions}
+        filenames = (
+            set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
+        )
+    model_files: list[str] = []
+    extensionless_count = 0
+    unfiltered_count = 0
+    seen_files: set[str] = set()
+
+    for file_name in repo_files:
+        if file_name in seen_files:
+            continue
+        seen_files.add(file_name)
+
+        if _is_scannable_hf_file(file_name, extensions):
+            model_files.append(file_name)
+            continue
+
+        remote_path = PurePosixPath(file_name)
+        is_extensionless = not remote_path.suffixes
+        if remote_path.name.lower() in filenames:
+            model_files.append(file_name)
+            continue
+
+        if include_all_files:
+            unfiltered_count += 1
+            if unfiltered_count > _MAX_HF_STREAMING_UNFILTERED_FILES:
+                raise Exception(
+                    f"Refusing to stream-download unfiltered files from {repo_id}: "
+                    f"repository listing exceeds the bounded unfiltered candidate limit "
+                    f"({_MAX_HF_STREAMING_UNFILTERED_FILES}); streaming coverage is incomplete"
+                )
+            model_files.append(file_name)
+            continue
+
+        if "" in extensions and is_extensionless:
+            extensionless_count += 1
+            if extensionless_count > _MAX_HF_STREAMING_EXTENSIONLESS_FILES:
+                raise Exception(
+                    f"Refusing to stream-download extensionless files from {repo_id}: "
+                    f"repository listing exceeds the bounded extensionless candidate limit "
+                    f"({_MAX_HF_STREAMING_EXTENSIONLESS_FILES}); streaming coverage is incomplete"
+                )
+            model_files.append(file_name)
+
+    if not model_files:
+        _raise_no_scannable_hf_files(repo_id)
+
+    return model_files
 
 
 def _get_hf_cache_root() -> Path:
@@ -93,6 +220,24 @@ def _format_size(size_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} PB"
+
+
+def _normalize_download_size_limit(max_size: int | None) -> int | None:
+    """Normalize ModelAudit's zero-is-unlimited download size semantics."""
+    if max_size is not None and max_size < 0:
+        raise ValueError("Maximum download size must be non-negative")
+    return max_size or None
+
+
+def _is_huggingface_commit_sha(revision: object) -> bool:
+    """Return whether revision is a full immutable Git commit SHA."""
+    if not isinstance(revision, str) or len(revision) not in {40, 64}:
+        return False
+    try:
+        int(revision, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_within_directory(base_dir: Path, target: Path) -> bool:
@@ -130,21 +275,132 @@ def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> 
     except Exception as exc:
         return None, str(exc)
 
-    siblings = getattr(repo_info, "siblings", None)
-    if siblings is None:
+    files = _extract_huggingface_repo_files(repo_info)
+    if files is None:
         return None, "repository listing unavailable"
 
-    files: list[str] = []
-    for sibling in siblings:
-        if isinstance(sibling, dict):
-            file_name = sibling.get("rfilename") or sibling.get("path")
-        else:
-            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
-
-        if isinstance(file_name, str) and file_name:
-            files.append(file_name)
-
     return files, None
+
+
+def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str], str]:
+    """Return repository filenames and the revision that produced the listing."""
+    from huggingface_hub import HfApi
+
+    repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+    raw_revision = getattr(repo_info, "sha", None)
+    if not _is_huggingface_commit_sha(raw_revision):
+        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+    assert isinstance(raw_revision, str)
+
+    files = _extract_huggingface_repo_files(repo_info)
+    if files is None:
+        raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing unavailable")
+    return files, raw_revision
+
+
+def _get_huggingface_path_sizes(
+    repo_id: str,
+    filenames: list[str],
+    *,
+    requested_revision: str | None = None,
+    resolved_revision: str | None = None,
+) -> tuple[dict[str, int | None], str]:
+    """Return exact Hugging Face sizes for selected files and the checked revision."""
+    if not filenames:
+        return {}, ""
+
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    if resolved_revision is None:
+        repo_info_kwargs: dict[str, Any] = {"files_metadata": False}
+        if requested_revision is not None:
+            repo_info_kwargs["revision"] = requested_revision
+        repo_info = api.repo_info(repo_id, **repo_info_kwargs)
+        raw_revision = getattr(repo_info, "sha", None)
+        if not _is_huggingface_commit_sha(raw_revision):
+            raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        assert isinstance(raw_revision, str)
+        resolved_revision = raw_revision
+    assert resolved_revision is not None
+    path_info = api.get_paths_info(repo_id, filenames, revision=resolved_revision)
+    sizes: dict[str, int | None] = {}
+    for item in path_info:
+        path = getattr(item, "path", None)
+        if not isinstance(path, str):
+            continue
+        raw_size = getattr(item, "size", None)
+        sizes[path] = (
+            raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+        )
+    return sizes, resolved_revision
+
+
+def _ensure_huggingface_selection_within_max_size(
+    repo_id: str,
+    filenames: list[str],
+    max_size: int | None,
+    *,
+    requested_revision: str | None = None,
+    resolved_revision: str | None = None,
+) -> tuple[str | None, dict[str, int]]:
+    """Preflight selected files and return their pinned revision and verified sizes."""
+    size_limit = _normalize_download_size_limit(max_size)
+    if size_limit is None or not filenames:
+        return None, {}
+
+    filenames = list(dict.fromkeys(filenames))
+    sizes, revision = _get_huggingface_path_sizes(
+        repo_id,
+        filenames,
+        requested_revision=requested_revision,
+        resolved_revision=resolved_revision,
+    )
+    total_size = 0
+    for filename in filenames:
+        size = sizes.get(filename)
+        if size is None:
+            raise Exception(f"Cannot download {repo_id}: unknown size for selected file {filename}")
+        total_size += size
+        if total_size > size_limit:
+            raise Exception(
+                f"Cannot download {repo_id}: selected Hugging Face files total {total_size} bytes "
+                f"exceeds max size {size_limit} bytes"
+            )
+    return revision, {filename: size for filename, size in sizes.items() if size is not None}
+
+
+def _verify_huggingface_selection_within_max_size(
+    repo_id: str,
+    downloaded_path: Path,
+    filenames: list[str],
+    max_size: int | None,
+    *,
+    initial_size: int = 0,
+) -> int:
+    """Fail closed when downloaded selected files cannot be verified within the cap."""
+    size_limit = _normalize_download_size_limit(max_size)
+    if size_limit is None:
+        return initial_size
+
+    total_size = initial_size
+    for filename in dict.fromkeys(filenames):
+        file_path = downloaded_path / filename
+        if not file_path.is_file():
+            raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
+        try:
+            file_size = file_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(
+                f"Cannot verify max-size for {repo_id}: downloaded selected file unreadable: {filename}"
+            ) from exc
+        total_size += file_size
+        if total_size > size_limit:
+            raise ValueError(
+                f"Cannot download {repo_id}: downloaded selected Hugging Face files total {total_size} bytes "
+                f"exceeds max size {size_limit} bytes"
+            )
+    return total_size
 
 
 def get_model_info(url: str) -> dict:
@@ -235,13 +491,19 @@ def get_model_size(repo_id: str) -> int | None:
         return None
 
 
-def download_model(url: str, cache_dir: Path | None = None, show_progress: bool = True) -> Path:
+def download_model(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+) -> Path:
     """Download a model from HuggingFace.
 
     Args:
         url: HuggingFace model URL
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
+        max_size: Optional maximum total selected download size in bytes
 
     Returns:
         Path to the downloaded model directory
@@ -290,6 +552,8 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
+        size_limit = _normalize_download_size_limit(max_size)
+
         # Enable/disable progress bars based on parameter
         if not show_progress:
             disable_progress_bars()
@@ -298,14 +562,23 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files in the repository to identify model files
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
-        if repo_files is None:
-            repo_listing_failed = True
-            logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
-            repo_files = []
-        else:
+        # Resolve capped listings and transfers against one immutable revision.
+        budget_revision = None
+        if size_limit is not None:
+            try:
+                repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
+            except Exception as exc:
+                raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing failed: {exc}") from exc
             repo_listing_failed = False
+        else:
+            listed_repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+            if listed_repo_files is None:
+                repo_listing_failed = True
+                logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
+                repo_files = []
+            else:
+                repo_listing_failed = False
+                repo_files = listed_repo_files
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
@@ -330,7 +603,15 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # If we found specific model files, download them
         if model_files:
-            download_kwargs["allow_patterns"] = model_files
+            revision, _ = _ensure_huggingface_selection_within_max_size(
+                repo_id,
+                model_files,
+                size_limit,
+                resolved_revision=budget_revision,
+            )
+            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+            if revision is not None:
+                download_kwargs["revision"] = revision
         elif repo_listing_failed:
             extension_allow_patterns = _build_extension_allow_patterns()
             if not extension_allow_patterns:
@@ -345,6 +626,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
+        _verify_huggingface_selection_within_max_size(repo_id, downloaded_path, model_files, size_limit)
         model_extensions = _get_model_extensions()
         found_models = any(
             path.is_file() and _is_scannable_hf_file(path.name, model_extensions) for path in downloaded_path.rglob("*")
@@ -381,7 +663,14 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
 
 def download_model_streaming(
-    url: str, cache_dir: Path | None = None, show_progress: bool = True
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+    *,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    include_all_files: bool = False,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -392,6 +681,10 @@ def download_model_streaming(
         url: HuggingFace model URL
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
+        max_size: Optional maximum total selected download size in bytes
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -418,6 +711,8 @@ def download_model_streaming(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
+        size_limit = _normalize_download_size_limit(max_size)
+
         # Configure progress display
         if not show_progress:
             disable_progress_bars()
@@ -425,19 +720,34 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout without leaking a blocking worker thread.
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
-        if repo_files is None:
-            if repo_listing_error and repo_listing_error.startswith("timed out after"):
-                raise Exception(f"Timeout listing files in repository {repo_id}")
-            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+        # Resolve capped listings and transfers against one immutable revision.
+        budget_revision = None
+        if size_limit is not None:
+            try:
+                repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
+            except Exception as exc:
+                raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing failed: {exc}") from exc
+        else:
+            listed_repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+            if listed_repo_files is None:
+                if repo_listing_error and repo_listing_error.startswith("timed out after"):
+                    raise Exception(f"Timeout listing files in repository {repo_id}")
+                raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+            repo_files = listed_repo_files
 
-        # Filter for model files
-        model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
-
-        if not model_files:
-            _raise_no_scannable_hf_files(repo_id)
+        model_files = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            scannable_extensions,
+            scannable_filenames,
+            include_all_files=include_all_files,
+        )
+        revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+            repo_id,
+            model_files,
+            size_limit,
+            resolved_revision=budget_revision,
+        )
 
         # Setup cache directory
         download_path = None
@@ -447,26 +757,44 @@ def download_model_streaming(
 
         # Download each file one at a time
         total_files = len(model_files)
+        downloaded_total_size = 0
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
 
+            if size_limit is not None:
+                advertised_size = selected_sizes[filename]
+                projected_total = downloaded_total_size + advertised_size
+                if projected_total > size_limit:
+                    raise ValueError(
+                        f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
+                        f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
+                    )
+
             # Download single file
+            download_kwargs: dict[str, Any] = {
+                "repo_id": repo_id,
+                "filename": filename,
+            }
+            if revision is not None:
+                download_kwargs["revision"] = revision
             if cache_dir is not None and download_path is not None:
                 # Use specific cache dir for local placement
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    cache_dir=str(cache_dir / "huggingface"),
-                    local_dir=str(download_path),
-                )
+                download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
+                download_kwargs["local_dir"] = str(download_path)
+                local_path = hf_hub_download(**download_kwargs)
             else:
                 # Use HF default cache
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                )
+                local_path = hf_hub_download(**download_kwargs)
 
-            yield (Path(local_path), is_last)
+            downloaded_file = Path(local_path)
+            downloaded_total_size = _verify_huggingface_selection_within_max_size(
+                repo_id,
+                downloaded_file.parent,
+                [downloaded_file.name],
+                size_limit,
+                initial_size=downloaded_total_size,
+            )
+            yield (downloaded_file, is_last)
 
     except Exception as e:
         raise Exception(
@@ -511,8 +839,9 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
             api = HfApi()
             repo_info = api.repo_info(repo_id, revision=branch)
             pinned_revision = getattr(repo_info, "sha", None)
-            if not isinstance(pinned_revision, str) or not pinned_revision:
+            if not _is_huggingface_commit_sha(pinned_revision):
                 raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+            assert isinstance(pinned_revision, str)
 
             path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
             file_metadata = path_info[0] if path_info else None
