@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
+- fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
