@@ -1,5 +1,5 @@
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
 import pytest
@@ -170,11 +170,16 @@ def test_stream_analyze_file_signed_pickle_url_uses_path_for_header_fallback(
     signed_url = f"file://{file_path}?X-Amz-Signature=secret"
 
     class QueryIgnoringLocalFileSystem(LocalFileSystem):
+        @staticmethod
+        def _without_query(path: str) -> str:
+            parts = urlsplit(path)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
         def info(self, path: str, **kwargs: object) -> dict[str, object]:
-            return dict(super().info(urlsplit(path).path, **kwargs))
+            return dict(super().info(self._without_query(path), **kwargs))
 
         def open(self, path: str, mode: str = "rb", **kwargs: object) -> object:
-            return super().open(urlsplit(path).path, mode=mode, **kwargs)
+            return super().open(self._without_query(path), mode=mode, **kwargs)
 
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: QueryIgnoringLocalFileSystem())
