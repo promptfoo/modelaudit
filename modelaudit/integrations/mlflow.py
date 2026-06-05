@@ -265,7 +265,11 @@ def _local_runs_mlflow_sources(
         return tuple(sources)
 
     model_name, separator, model_artifact_path = effective_path.partition("/")
-    logged_model_repository = get_logged_model_repository(run_id=run_id, name=model_name)
+    try:
+        logged_model_repository = get_logged_model_repository(run_id=run_id, name=model_name)
+    except Exception:
+        logger.debug("MLflow logged-model lookup failed; continuing with bounded local run artifacts")
+        return tuple(sources)
     if logged_model_repository is None:
         return tuple(sources)
 

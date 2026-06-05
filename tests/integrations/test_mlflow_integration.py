@@ -330,6 +330,83 @@ def test_scan_mlflow_model_allows_logged_model_without_run_artifact(tmp_path: Pa
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
+def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_path: Path) -> None:
+    """Optional logged-model lookup failures must not hide bounded run artifacts."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1"
+
+        def __init__(self, run_repository: object) -> None:
+            self.repo = run_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1"
+            return "run-1", None
+
+        @staticmethod
+        def _get_logged_model_artifact_repo(run_id: str, name: str) -> object:
+            assert (run_id, name) == ("run-1", "model")
+            raise RuntimeError("logged-model search is unsupported")
+
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    run_root = tmp_path / "run-artifacts"
+    _write_local_artifacts(run_root, {"model/model.pkl": 4})
+    repository = RunsArtifactRepository(LocalArtifactRepository(run_root))
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "runs:/run-1",
+        "model",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+                "mlflow.store.artifact.runs_artifact_repo": runs_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model(
+            "runs:/run-1/model",
+            max_file_size=4,
+            max_total_size=4,
+        )
+
+    assert result == scan_result
+    assert (download_dir / "model" / "model.pkl").read_bytes() == b"xxxx"
+    mock_scan.assert_called_once()
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+
+
 @pytest.mark.parametrize("repository_scoped", [False, True], ids=["unscoped", "scoped"])
 def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, repository_scoped: bool) -> None:
     """Run repositories must apply the wrapper prefix exactly once."""
@@ -1200,6 +1277,7 @@ def test_scan_mlflow_model_bounds_real_local_repository_listing(
     tmp_path: Path,
 ) -> None:
     """Verified local repositories should be traversed lazily by ModelAudit."""
+    pytest.importorskip("mlflow")
     from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
 
     source_root = tmp_path / "mlflow_artifacts"
