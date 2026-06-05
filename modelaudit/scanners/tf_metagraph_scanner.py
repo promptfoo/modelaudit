@@ -84,12 +84,18 @@ _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocke
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
+_FUNCTION_ATTRIBUTE_SUFFIX = ".func.name"
 
 
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
     sanitized = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, text)
     return redact_evidence_string(sanitized, max_chars=max_chars)
+
+
+def _attribute_context_name(attr_name: str) -> str:
+    """Return the original attribute name before generated function metadata suffixes."""
+    return attr_name.removesuffix(_FUNCTION_ATTRIBUTE_SUFFIX)
 
 
 def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
@@ -468,7 +474,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
                 evidence_location, evidence_node_name = get_evidence_context()
                 evidence_attr_name = _redact_metagraph_evidence(attr_name, max_chars=200)
-                sensitive_attr_value = is_sensitive_evidence_key(attr_name)
+                sensitive_attr_value = is_sensitive_evidence_key(_attribute_context_name(attr_name))
                 needs_value_preview = bool(library_match or command_match or network_match or encoded_payload_match)
                 evidence_value_preview = (
                     (
