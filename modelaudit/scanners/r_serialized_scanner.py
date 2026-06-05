@@ -152,18 +152,38 @@ def _r_function_keyword_before_position(
     if text[cursor + 1 : token_end] != "function":
         return False
 
+    crossed_newline = False
     while cursor >= 0:
         while cursor >= 0 and text[cursor].isspace():
+            crossed_newline = crossed_newline or text[cursor] in "\r\n"
             cursor -= 1
         if cursor < 0:
             return True
 
         span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
         if span_index < 0 or cursor >= non_code_spans[span_index][1]:
-            return text[cursor] not in "$@:"
+            character = text[cursor]
+            if crossed_newline:
+                return character not in "$@:"
+            if character in "$@:":
+                return False
+            if character.isalnum() or character in "._":
+                previous_token_end = cursor + 1
+                while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+                    cursor -= 1
+                return text[cursor + 1 : previous_token_end] in {"else", "repeat"}
+            if character in ")]}":
+                opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+                if opener_position is None:
+                    cursor -= 1
+                    continue
+                if character != ")":
+                    return False
+                return _r_identifier_before_position(text, opener_position, non_code_spans) in {"for", "if", "while"}
+            return character in "([{,;=<>+-*/^!&|~"
         span_start, _span_end = non_code_spans[span_index]
         if text[span_start] != "#":
-            return True
+            return crossed_newline
         cursor = span_start - 1
     return True
 
@@ -314,12 +334,17 @@ def _r_open_paren_starts_argument_list(
             return False
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
         return (
-            _r_grouped_expression_can_start_call(text, opener_position, cursor, non_code_spans)
+            _r_delimited_expression_can_start_call(text, opener_position, cursor, non_code_spans)
             if opener_prefix is None
             else opener_prefix in {"else", "repeat"} or _r_token_can_start_call(opener_prefix)
         )
     if character == "}":
-        return not crossed_newline and _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        return (
+            not crossed_newline
+            and opener_position is not None
+            and _r_delimited_expression_can_start_call(text, opener_position, cursor, non_code_spans)
+        )
     if character == "\\":
         return True
     if not (character.isalnum() or character in "._"):
@@ -345,7 +370,7 @@ def _r_token_can_start_call(token: str) -> bool:
     )
 
 
-def _r_grouped_expression_can_start_call(
+def _r_delimited_expression_can_start_call(
     text: str,
     opener_position: int,
     closer_position: int,
@@ -411,7 +436,23 @@ def _r_function_body_follows(
                 return True
             cursor = span_end
             continue
-        return text[cursor] not in ";,)]}"
+        if text[cursor] in ";,)]}":
+            return False
+        while text[cursor] in "+-!~?":
+            cursor += 1
+            while True:
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(text):
+                    return False
+                span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+                if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+                    break
+                span_start, span_end = non_code_spans[span_index]
+                if text[span_start] != "#":
+                    return True
+                cursor = span_end
+        return text[cursor] not in ";,)]}*/^:%<>=&|"
     return False
 
 
