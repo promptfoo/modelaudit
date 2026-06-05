@@ -266,7 +266,7 @@ class MemoryMappedHandler:
                     window_data = mmapped_file[position:end_pos]
 
                     # Analyze window for suspicious patterns
-                    window_result = self._analyze_window(window_data, position)
+                    window_result = self._analyze_window(window_data, position, detector_result=result)
                     result.merge(window_result)
 
                     bytes_scanned += len(window_data)
@@ -311,7 +311,12 @@ class MemoryMappedHandler:
         )
         return result
 
-    def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
+    def _analyze_window(
+        self,
+        data: bytes,
+        offset: int,
+        detector_result: "ScanResult | None" = None,
+    ) -> "ScanResult":
         """Analyze a window of data using the actual scanner's checks."""
         from ...scanner_results import IssueSeverity, ScanResult
 
@@ -356,7 +361,8 @@ class MemoryMappedHandler:
         # Run any additional scanner-specific checks
         if hasattr(self.scanner, "check_for_embedded_secrets"):
             # Check for embedded secrets in this window
-            self.scanner.check_for_embedded_secrets(data, result, f"offset {offset:,}")
+            raw_detector_result = detector_result if detector_result is not None else result
+            self.scanner.check_for_embedded_secrets(data, raw_detector_result, f"offset {offset:,}")
 
         if hasattr(self.scanner, "check_for_dangerous_imports"):
             # Check for dangerous imports

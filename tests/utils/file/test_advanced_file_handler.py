@@ -312,6 +312,36 @@ class TestMemoryMappedHandler:
             check.name == "Embedded Secrets Detection" and check.status.value == "passed" for check in result.checks
         )
 
+    def test_mmap_repeated_raw_detector_failure_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "repeated-detector-error.bin"
+        model_path.write_bytes(b"a" * (16 * 25))
+        scanner = RawDetectorMemoryMappedScanner()
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=RuntimeError("detector failed"),
+        ) as scan_model_weights:
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        coverage_checks = [
+            check
+            for check in result.checks
+            if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+        ]
+        assert scan_model_weights.call_count == 25
+        assert result.success is False
+        assert len(coverage_checks) == 1
+        assert len(result.metadata["raw_detector_analysis_failures"]) == 20
+        assert result.metadata["raw_detector_failed_detectors"] == ["embedded_secrets"]
+        assert not any(
+            check.name == "Embedded Secrets Detection" and check.status.value == "passed" for check in result.checks
+        )
+
 
 class TestAdvancedFileHandler:
     """Test extreme large file handler."""
