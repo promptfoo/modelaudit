@@ -119,8 +119,7 @@ def _redact_sensitive_query_param(match: re.Match[str]) -> str:
 
 def _is_safe_display_query_param(key: str) -> bool:
     decoded_key = unquote_plus(key).lower()
-    normalized_key = re.sub(r"[^a-z0-9]", "", decoded_key)
-    return normalized_key in _SAFE_DISPLAY_QUERY_KEYS
+    return decoded_key in _SAFE_DISPLAY_QUERY_KEYS
 
 
 def redact_stream_url_for_display(url: str) -> str:
