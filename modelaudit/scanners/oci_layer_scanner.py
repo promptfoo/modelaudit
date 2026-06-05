@@ -613,7 +613,11 @@ class OciLayerScanner(BaseScanner):
 
         basename = posixpath.basename(normalized_name)
         if basename.startswith(".wh."):
-            valid_whiteout = basename != ".wh." and member.isfile() and member.size == 0
+            whiteout_target = basename.removeprefix(".wh.")
+            valid_whiteout_target = basename == ".wh..wh..opq" or (
+                whiteout_target not in {"", ".", ".."} and not whiteout_target.startswith(".wh.")
+            )
+            valid_whiteout = valid_whiteout_target and member.isfile() and member.size == 0
             if not valid_whiteout:
                 metadata_valid = False
                 if not state.invalid_whiteout_reported:
@@ -683,12 +687,13 @@ class OciLayerScanner(BaseScanner):
     ) -> tuple[str, bool]:
         if not is_symlink:
             return sanitize_archive_path(target, extraction_root)
-        if target.startswith("/") and not target.startswith("//"):
+        normalized_archive_target = target.replace("\\", "/")
+        if target.startswith("/") and not normalized_archive_target.startswith("//"):
             # OCI layers describe a container root filesystem. A POSIX-absolute
             # symlink therefore targets that root, not the extraction host.
-            container_relative_target = posixpath.normpath(target).lstrip("/")
+            container_relative_target = posixpath.normpath(normalized_archive_target).lstrip("/")
             return posixpath.join(extraction_root.replace("\\", "/"), container_relative_target), True
-        if is_absolute_archive_path(target):
+        if is_absolute_archive_path(normalized_archive_target):
             return target, False
 
         normalized_target = target.replace("\\", os.sep).replace("/", os.sep)

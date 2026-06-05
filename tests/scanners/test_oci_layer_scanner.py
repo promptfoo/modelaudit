@@ -1706,13 +1706,21 @@ class TestOciLayerScanner:
         finally:
             reset_cache_manager()
 
-    def test_scan_layer_reports_unsafe_link_metadata(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "C:\\Windows\\System32\\config\\SAM",
+            "\\Windows\\System32\\config\\SAM",
+            "/\\\\server\\share\\model.bin",
+        ],
+    )
+    def test_scan_layer_reports_unsafe_link_metadata(self, tmp_path: Path, target: str) -> None:
         """Host-absolute symlink targets should be reported from layer metadata."""
         layer_path = tmp_path / "unsafe-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             link_info = tarfile.TarInfo("links/system")
             link_info.type = tarfile.SYMTYPE
-            link_info.linkname = "C:\\Windows\\System32\\config\\SAM"
+            link_info.linkname = target
             tar.addfile(link_info)
 
         manifest_path = tmp_path / "unsafe-link.manifest"
@@ -1724,7 +1732,7 @@ class TestOciLayerScanner:
         checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.CRITICAL
-        assert checks[0].details["target"] == "C:\\Windows\\System32\\config\\SAM"
+        assert checks[0].details["target"] == target
 
     @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
     def test_scan_layer_reports_empty_link_target(self, tmp_path: Path, link_type: bytes) -> None:
@@ -1979,7 +1987,13 @@ class TestOciLayerScanner:
 
     @pytest.mark.parametrize(
         ("member_name", "payload", "expected_scan_calls"),
-        [(".wh.", b"", 0), (".wh.deleted", b"payload", 1)],
+        [
+            (".wh.", b"", 0),
+            (".wh..", b"", 0),
+            (".wh...", b"", 0),
+            (".wh..wh.deleted", b"", 0),
+            (".wh.deleted", b"payload", 1),
+        ],
     )
     def test_scan_layer_reports_invalid_whiteout_metadata(
         self,
@@ -1988,7 +2002,7 @@ class TestOciLayerScanner:
         payload: bytes,
         expected_scan_calls: int,
     ) -> None:
-        """Bare or non-empty whiteout markers are invalid OCI layer metadata."""
+        """Bare, reserved-target, or non-empty whiteouts are invalid OCI metadata."""
         layer_path = tmp_path / "invalid-whiteout.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             whiteout = tarfile.TarInfo(member_name)
