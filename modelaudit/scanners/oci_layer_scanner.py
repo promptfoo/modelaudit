@@ -611,13 +611,24 @@ class OciLayerScanner(BaseScanner):
 
         if member.issym() or member.islnk():
             target = member.linkname
+            details = {"layer": layer_ref, "member": name, "target": target}
+            if not target:
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Layer link {name} has an empty target",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details=details,
+                    rule_code="S406",
+                )
+                return False, False
             _target_resolved, target_safe = self._resolve_link_target(
                 target,
                 resolved_member_name=resolved_name,
                 extraction_root=temp_base,
                 is_symlink=member.issym(),
             )
-            details = {"layer": layer_ref, "member": name, "target": target}
             if not target_safe:
                 if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                     message = f"Layer link {name} points to critical system path: {target}"

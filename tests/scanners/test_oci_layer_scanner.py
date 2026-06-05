@@ -1726,6 +1726,28 @@ class TestOciLayerScanner:
         assert checks[0].severity == IssueSeverity.CRITICAL
         assert checks[0].details["target"] == "C:\\Windows\\System32\\config\\SAM"
 
+    @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_scan_layer_reports_empty_link_target(self, tmp_path: Path, link_type: bytes) -> None:
+        """Links without a target are malformed and must not be treated as safe."""
+        layer_path = tmp_path / "empty-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/empty")
+            link_info.type = link_type
+            link_info.linkname = ""
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "empty-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["empty-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].message == "Layer link links/empty has an empty target"
+        assert checks[0].details["target"] == ""
+
     @pytest.mark.parametrize("target", ["/bin/dash", "/C:/models/model.bin"])
     def test_scan_layer_allows_posix_absolute_symlink_within_container_root(
         self,
