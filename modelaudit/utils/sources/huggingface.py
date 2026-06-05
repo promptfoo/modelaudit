@@ -2,9 +2,9 @@
 
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from glob import escape as escape_glob
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..helpers.disk_space import check_disk_space
@@ -20,6 +20,9 @@ from .huggingface_paths import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
+_MAX_HF_STREAMING_UNFILTERED_FILES = 128
 
 __all__ = [
     "download_file_from_hf",
@@ -86,7 +89,7 @@ def _case_insensitive_suffix_glob(extension: str) -> str:
     return "".join(f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in extension)
 
 
-def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
+def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
     return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
@@ -97,6 +100,106 @@ def _raise_no_scannable_hf_files(repo_id: str) -> None:
         f"Refusing to download full snapshot for {repo_id}: "
         "repository listing contains no recognized ModelAudit-scannable files"
     )
+
+
+def _get_default_hf_streaming_extensions() -> set[str]:
+    """Return remotely scannable suffixes, including safe extensionless routes."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    extensions = set(_get_model_extensions())
+    for scanner_info in get_scanner_registry_metadata().values():
+        scanner_extensions = {str(extension).lower() for extension in scanner_info.get("extensions", [])}
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        if "" in scanner_extensions and "" not in remote_excluded_extensions:
+            extensions.add("")
+            break
+    return extensions
+
+
+def _get_default_hf_streaming_filenames() -> set[str]:
+    """Return exact remotely scannable basenames without widening them to suffix routes."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    filenames: set[str] = set()
+    for scanner_info in get_scanner_registry_metadata().values():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for filename in scanner_info.get("content_routed_filenames", []):
+            filename_text = str(filename).lower()
+            if PurePosixPath(filename_text).suffix.lower() not in remote_excluded_extensions:
+                filenames.add(filename_text)
+    return filenames
+
+
+def _select_streamable_hf_files(
+    repo_id: str,
+    repo_files: list[str],
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    *,
+    include_all_files: bool = False,
+) -> list[str]:
+    """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
+    if scannable_extensions is None:
+        extensions = _get_default_hf_streaming_extensions()
+        filenames = (
+            _get_default_hf_streaming_filenames()
+            if scannable_filenames is None
+            else {str(filename).lower() for filename in scannable_filenames}
+        )
+    else:
+        extensions = {str(extension).lower() for extension in scannable_extensions}
+        filenames = (
+            set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
+        )
+    model_files: list[str] = []
+    extensionless_count = 0
+    unfiltered_count = 0
+    seen_files: set[str] = set()
+
+    for file_name in repo_files:
+        if file_name in seen_files:
+            continue
+        seen_files.add(file_name)
+
+        if _is_scannable_hf_file(file_name, extensions):
+            model_files.append(file_name)
+            continue
+
+        remote_path = PurePosixPath(file_name)
+        is_extensionless = not remote_path.suffixes
+        if remote_path.name.lower() in filenames:
+            model_files.append(file_name)
+            continue
+
+        if include_all_files:
+            unfiltered_count += 1
+            if unfiltered_count > _MAX_HF_STREAMING_UNFILTERED_FILES:
+                raise Exception(
+                    f"Refusing to stream-download unfiltered files from {repo_id}: "
+                    f"repository listing exceeds the bounded unfiltered candidate limit "
+                    f"({_MAX_HF_STREAMING_UNFILTERED_FILES}); streaming coverage is incomplete"
+                )
+            model_files.append(file_name)
+            continue
+
+        if "" in extensions and is_extensionless:
+            extensionless_count += 1
+            if extensionless_count > _MAX_HF_STREAMING_EXTENSIONLESS_FILES:
+                raise Exception(
+                    f"Refusing to stream-download extensionless files from {repo_id}: "
+                    f"repository listing exceeds the bounded extensionless candidate limit "
+                    f"({_MAX_HF_STREAMING_EXTENSIONLESS_FILES}); streaming coverage is incomplete"
+                )
+            model_files.append(file_name)
+
+    if not model_files:
+        _raise_no_scannable_hf_files(repo_id)
+
+    return model_files
 
 
 def _get_hf_cache_root() -> Path:
@@ -564,6 +667,10 @@ def download_model_streaming(
     cache_dir: Path | None = None,
     show_progress: bool = True,
     max_size: int | None = None,
+    *,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    include_all_files: bool = False,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -575,6 +682,9 @@ def download_model_streaming(
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
         max_size: Optional maximum total selected download size in bytes
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -625,12 +735,13 @@ def download_model_streaming(
                 raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
             repo_files = listed_repo_files
 
-        # Filter for model files
-        model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
-
-        if not model_files:
-            _raise_no_scannable_hf_files(repo_id)
+        model_files = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            scannable_extensions,
+            scannable_filenames,
+            include_all_files=include_all_files,
+        )
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
