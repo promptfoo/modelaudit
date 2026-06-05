@@ -197,6 +197,19 @@ def create_regular_weights_h5(tmp_path: Path) -> Path:
     return weights_path
 
 
+def create_virtual_dataset_weights_h5(tmp_path: Path) -> Path:
+    """Create weights containing a virtual dataset backed by another HDF5 file."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    layout = h5py.VirtualLayout(shape=(2,), dtype="float32")
+    layout[:] = h5py.VirtualSource("virtual_source.h5", "payload", shape=(2,))
+    weights_path = tmp_path / "virtual_dataset.weights.h5"
+    with h5py.File(weights_path, "w", libver="latest") as f:
+        f.create_virtual_dataset("virtual_kernel", layout)
+    return weights_path
+
+
 class TestKerasZipScanner:
     """Test the Keras ZIP scanner functionality."""
 
@@ -295,6 +308,104 @@ class TestKerasZipScanner:
                 "path": "/payload",
             },
         ]
+
+    def test_detects_hdf5_virtual_dataset_external_source(self, tmp_path: Path) -> None:
+        """Virtual datasets must be treated as external HDF5 references."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=create_virtual_dataset_weights_h5(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["external_references"] == [
+            {
+                "kind": "virtual_dataset",
+                "hdf5_path": "/virtual_kernel",
+                "sources": [{"filename": "virtual_source.h5", "dataset_path": "payload"}],
+            }
+        ]
+
+    def test_same_file_hdf5_virtual_dataset_is_not_external(self, tmp_path: Path) -> None:
+        """The HDF5 '.' VDS filename references the current file and must remain benign."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "same_file_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0])
+            layout = h5py.VirtualLayout(shape=(1,), dtype="float64")
+            layout[:] = h5py.VirtualSource(".", "payload", shape=(1,))
+            f.create_virtual_dataset("virtual_kernel", layout)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == []
+
+    def test_same_file_virtual_source_does_not_hide_later_external_source(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Evidence caps must not stop inspection before a later external VDS source."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "mixed_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            layout[0] = h5py.VirtualSource(".", "payload", shape=(2,))[0]
+            layout[1] = h5py.VirtualSource("external_source.h5", "payload", shape=(2,))[1]
+            f.create_virtual_dataset("virtual_kernel", layout)
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 1)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "virtual_dataset",
+                "hdf5_path": "/virtual_kernel",
+                "sources": [{"filename": "external_source.h5", "dataset_path": "payload"}],
+            }
+        ]
+
+    def test_hdf5_virtual_source_visit_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A same-file VDS prefix must not hide an external source beyond the visit budget."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "bounded_virtual_dataset.weights.h5"
+        with h5py.File(weights_path, "w", libver="latest") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+            layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+            layout[0] = h5py.VirtualSource(".", "payload", shape=(2,))[0]
+            layout[1] = h5py.VirtualSource("external_source.h5", "payload", shape=(2,))[1]
+            f.create_virtual_dataset("virtual_kernel", layout)
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_VIRTUAL_SOURCE_VISITS", 1)
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            reason,
+            "Embedded HDF5 External Reference Analysis Limit",
+        )
 
     @pytest.mark.parametrize(
         ("weights_factory", "expected_kind"),
@@ -434,6 +545,81 @@ class TestKerasZipScanner:
         assert findings[0]["filename_truncated"] is True
         assert findings[0]["path"] == "/long_extern"
         assert findings[0]["path_truncated"] is True
+
+    def test_hdf5_external_reference_evidence_is_redacted(self, tmp_path: Path) -> None:
+        """External-reference paths must not leak embedded credentials or tokens."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        password_secret = "HDF5_PASSWORD_SECRET"
+        query_secret = "HDF5_QUERY_SECRET"
+        link_name_secret = "HDF5_LINK_NAME_SECRET"
+        target_secret = "HDF5_TARGET_SECRET"
+        storage_secret = "HDF5_STORAGE_SECRET"
+        virtual_secret = "HDF5_VIRTUAL_SECRET"
+        weights_path = tmp_path / "secret_reference.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f[f"token={link_name_secret}"] = h5py.ExternalLink(
+                f"https://alice:{password_secret}@example.test/data?token={query_secret}",
+                f"/token={target_secret}",
+            )
+            f.create_dataset(
+                "external_storage",
+                shape=(1,),
+                dtype="float32",
+                external=[(f"token={storage_secret}.raw", 0, 4)],
+            )
+            virtual_layout = h5py.VirtualLayout(shape=(1,), dtype="float32")
+            virtual_layout[:] = h5py.VirtualSource(f"token={virtual_secret}.h5", "payload", shape=(1,))
+            f.create_virtual_dataset("virtual_dataset", virtual_layout)
+
+        model_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        scanner_result = KerasZipScanner().scan(str(model_path))
+        audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        rendered_outputs = [
+            json.dumps([check.details for check in scanner_result.checks], default=str),
+            audit_result.model_dump_json(indent=2, exclude_none=True),
+            format_sarif_output(audit_result, [str(model_path)]),
+        ]
+
+        for output in rendered_outputs:
+            assert password_secret not in output
+            assert query_secret not in output
+            assert link_name_secret not in output
+            assert target_secret not in output
+            assert storage_secret not in output
+            assert virtual_secret not in output
+            assert "<redacted>" in output
+
+    def test_hdf5_url_credentials_are_redacted_before_evidence_truncation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Truncation inside URL userinfo must not expose a credential prefix."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        credential_secret = "SUPER_SECRET_PASSWORD"
+        weights_path = tmp_path / "truncated_secret_reference.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f["external_kernel"] = h5py.ExternalLink(
+                f"https://alice:{credential_secret}@example.test/data",
+                "/payload",
+            )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_REFERENCE_TEXT_CHARS", 24)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert len(findings) == 1
+        assert credential_secret not in findings[0]["filename"]
+        assert "SUPER_SECRET" not in findings[0]["filename"]
+        assert findings[0]["filename_truncated"] is True
 
     def test_embedded_hdf5_external_reference_traversal_limit_fails_closed(
         self,
@@ -1111,6 +1297,34 @@ class TestKerasZipScanner:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
+
+    def test_embedded_weights_without_h5py_is_inconclusive_and_not_cached(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing h5py must not turn uninspected embedded weights into a clean result."""
+        weights_path = tmp_path / "uninspected.weights.h5"
+        safe_h5_fixture = Path(__file__).parents[1] / "assets" / "samples" / "keras" / "safe_model.h5"
+        weights_path.write_bytes(safe_h5_fixture.read_bytes())
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        reason = "keras_zip_hdf5_dependency_unavailable"
+
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            reason,
+            "Embedded HDF5 Dependency Check",
+        )
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            reason,
+            tmp_path / "missing-h5py-cache",
+        )
 
     def test_embedded_weights_size_limit_returns_exit2_and_skips_cache(
         self,
@@ -1907,7 +2121,15 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
 
-    def test_lambda_module_reference_uses_token_boundaries_for_benign_module(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "module_name",
+        ["custom_package.systematic_math", "company.os.metrics", "company.operator.layers"],
+    )
+    def test_lambda_module_reference_uses_import_root_for_benign_module(
+        self,
+        tmp_path: Path,
+        module_name: str,
+    ) -> None:
         """Benign module identifiers containing suspicious substrings should remain quiet."""
         config = {
             "class_name": "Sequential",
@@ -1917,7 +2139,7 @@ __import__('pickle').loads(data)
                         "class_name": "Lambda",
                         "name": "benign_module_lambda",
                         "config": {
-                            "module": "custom_package.systematic_math",
+                            "module": module_name,
                             "function_name": "normalize",
                         },
                     }
@@ -1929,8 +2151,88 @@ __import__('pickle').loads(data)
 
         assert not any(check.name == "Lambda Layer Module Reference Check" for check in result.checks)
 
-    def test_lambda_function_name_escalates_without_dangerous_module(self, tmp_path: Path) -> None:
-        """A dangerous Lambda function name remains actionable even with a benign module."""
+    @pytest.mark.parametrize(
+        ("module_name", "function_name"),
+        [("os", "system"), ("operator", "attrgetter")],
+    )
+    def test_nested_named_lambda_function_reference_is_detected(
+        self,
+        tmp_path: Path,
+        module_name: str,
+        function_name: str,
+    ) -> None:
+        """Keras 3 named-function Lambda metadata must not bypass module checks."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "nested_named_function",
+                        "config": {
+                            "function": {
+                                "module": module_name,
+                                "class_name": "function",
+                                "config": function_name,
+                                "registered_name": function_name,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            check.name == "Lambda Layer Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("module") == module_name
+            and check.details.get("function") == function_name
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("module_name", "function_name"),
+        [("operator", "add"), ("keras.ops", "absolute")],
+    )
+    def test_benign_nested_named_lambda_function_is_not_critical(
+        self,
+        tmp_path: Path,
+        module_name: str,
+        function_name: str,
+    ) -> None:
+        """Benign named functions must not inherit module-wide critical severity."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_named_function",
+                        "config": {
+                            "function": {
+                                "module": module_name,
+                                "class_name": "function",
+                                "config": function_name,
+                                "registered_name": function_name,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(
+            check.name == "Lambda Layer Module Reference Check" and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+
+    def test_lambda_function_name_does_not_escalate_with_benign_module(self, tmp_path: Path) -> None:
+        """A custom function sharing a gadget name must not be treated as a stdlib gadget."""
         config = {
             "class_name": "Sequential",
             "config": {
@@ -1949,14 +2251,72 @@ __import__('pickle').loads(data)
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
 
-        assert any(
-            check.name == "Lambda Layer Module Reference Check"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("module") == "custom_package.math"
-            and check.details.get("function") == "system"
+        assert not any(
+            check.name == "Lambda Layer Module Reference Check" and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
         )
+
+    def test_lambda_function_name_without_module_is_warning(self, tmp_path: Path) -> None:
+        """Sensitive function names without provenance should remain visible without critical attribution."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "unattributed_function_lambda",
+                        "config": {"function_name": "system"},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Module Reference Check"
+            and check.details.get("parse_status") == "module_unavailable"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+
+    def test_malformed_nested_named_lambda_function_is_warning(self, tmp_path: Path) -> None:
+        """Malformed nested callable metadata must fail closed without retaining its payload."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_nested_function",
+                        "config": {
+                            "function": {
+                                "module": None,
+                                "class_name": "function",
+                                "config": ["system"],
+                                "registered_name": None,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Module Reference Check"
+            and check.details.get("function_format") == "nested_named_function"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+        assert matching_checks[0].details["module_type"] == "NoneType"
+        assert matching_checks[0].details["function_type"] == "list"
+        assert "system" not in json.dumps(matching_checks[0].details)
 
     @pytest.mark.parametrize("function_format", ["list", "dict"])
     @pytest.mark.parametrize("benign_identifier", ["opened", "executor", "osésystem"])
