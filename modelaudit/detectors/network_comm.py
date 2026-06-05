@@ -20,6 +20,11 @@ _URL_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URL_IN_BYTES_PATTERN = re.compile(_URL_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
+_URI_IN_TEXT_PATTERN = re.compile(
+    r"[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
+_URI_IN_BYTES_PATTERN = re.compile(_URI_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
 _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     r"^(?:"
     r"api_?key|x_?api_?key|(?:aws_?)?access_?key(?:_?id)?|(?:aws_?)?secret_?access_?key|"
@@ -83,6 +88,13 @@ _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
+_AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
+_SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
+    rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)",
+    re.IGNORECASE,
+)
+_EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
+_EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
@@ -247,6 +259,7 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
     """Redact assignments and sensitive key/value pairs split by a path delimiter."""
     changed = False
     redact_next_value = False
+    authorization_value_pending = False
     for index, part in enumerate(parts):
         if not part:
             continue
@@ -254,12 +267,17 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
         token_candidate, trailing_delimiters = _split_trailing_path_delimiters(part)
         if redact_next_value:
             parts[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
-            redact_next_value = False
+            following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
+            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
+                token_candidate, following_value
+            )
+            authorization_value_pending = False
             changed = True
             continue
 
         if _is_sensitive_path_key(token_candidate):
             redact_next_value = True
+            authorization_value_pending = _is_authorization_path_key(token_candidate)
             continue
 
         redacted_part, part_changed = _redact_boundary_component(part)
@@ -439,11 +457,30 @@ def _is_sensitive_path_key(key: str) -> bool:
     decoded = _decode_path_token(key).strip()
     if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
         return True
-    normalized = decoded.replace("-", "_")
+    normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", decoded)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized).replace("-", "_")
     parts = [part for part in re.split(r"[._\[\]]+", normalized) if part]
     return any(
         _SENSITIVE_PATH_KEY_PATTERN.fullmatch("_".join(parts[index:])) is not None for index in range(len(parts))
     )
+
+
+def _is_authorization_path_key(key: str) -> bool:
+    decoded = _decode_path_token(key).strip()
+    if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+        return False
+    normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", decoded)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized).replace("-", "_")
+    parts = [part.lower() for part in re.split(r"[._\[\]]+", normalized) if part]
+    return any(
+        "_".join(parts[index:]) in {"auth", "authorization", "proxy_authorization"} for index in range(len(parts))
+    )
+
+
+def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
+    if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
+        return False
+    return not _looks_like_known_artifact_filename(following_value)
 
 
 def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
@@ -474,11 +511,16 @@ def _redact_hostname_tokens(hostname: str) -> str:
 
     labels = hostname.split(".")
     redact_next_value = False
+    authorization_value_pending = False
     for index, label in enumerate(labels):
         decoded = _decode_path_token(label)
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
-            redact_next_value = False
+            following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
+            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
+                decoded, following_value
+            )
+            authorization_value_pending = False
             continue
         if decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
             labels[index] = _REDACTED_PATH_TOKEN
@@ -486,6 +528,7 @@ def _redact_hostname_tokens(hostname: str) -> str:
             continue
         if _is_sensitive_path_key(decoded) and len(labels) - index >= 4:
             redact_next_value = True
+            authorization_value_pending = _is_authorization_path_key(decoded)
             continue
         if _redact_sensitive_path_assignment(label) is not None or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
             labels[index] = _REDACTED_PATH_TOKEN
@@ -495,13 +538,18 @@ def _redact_hostname_tokens(hostname: str) -> str:
 def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     segments = path.split("/")
     redact_next_value = False
+    authorization_value_pending = False
     for index, segment in enumerate(segments):
         if not segment:
             continue
         if redact_next_value:
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
-            redact_next_value = False
+            following_value = next((candidate for candidate in segments[index + 1 :] if candidate), None)
+            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
+                _token_candidate, following_value
+            )
+            authorization_value_pending = False
             continue
 
         token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
@@ -527,6 +575,7 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             _is_sensitive_path_key(decoded_segment) or _compound_path_segment_ends_with_sensitive_key(decoded_segment)
         ):
             redact_next_value = True
+            authorization_value_pending = _is_authorization_path_key(decoded_segment)
             continue
         is_slack_webhook_secret = (
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
@@ -770,10 +819,14 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
     return f"{snippet[: _MAX_SNIPPET_CHARS - 3]}..."
 
 
-def _url_text_bounds_containing_offset(data: bytes, offset: int) -> tuple[str, int] | None:
+def _uri_text_bounds_containing_offset(
+    data: bytes,
+    offset: int,
+    pattern: re.Pattern[bytes],
+) -> tuple[str, int] | None:
     scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
     scan_end = min(len(data), offset + _MAX_URL_TEXT_LOOKUP_BYTES)
-    for match in _URL_IN_BYTES_PATTERN.finditer(data, scan_start, scan_end):
+    for match in pattern.finditer(data, scan_start, scan_end):
         if not (match.start() <= offset < match.end()):
             continue
         if match.end() == scan_end and scan_end < len(data) and data[scan_end] not in _URL_TEXT_BOUNDARY_BYTES:
@@ -788,27 +841,44 @@ def _url_text_bounds_containing_offset(data: bytes, offset: int) -> tuple[str, i
     return None
 
 
+def _url_text_bounds_containing_offset(data: bytes, offset: int) -> tuple[str, int] | None:
+    return _uri_text_bounds_containing_offset(data, offset, _URL_IN_BYTES_PATTERN)
+
+
 def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
     url_context = _url_text_bounds_containing_offset(data, offset)
     return url_context[0] if url_context is not None else None
 
 
 def _bounded_url_lookup_starts_mid_token(data: bytes, offset: int) -> bool:
-    """Fail closed when the URL lookup window begins inside one long token."""
+    """Return whether a bounded lookup may have begun inside one long URL token."""
     scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
     bounded_prefix = data[scan_start:offset]
     return (
         scan_start > 0
         and data[scan_start - 1] not in _URL_TEXT_BOUNDARY_BYTES
         and not any(byte in _URL_TEXT_BOUNDARY_BYTES for byte in bounded_prefix)
-        and any(byte in b"/?#&;@" for byte in bounded_prefix)
     )
+
+
+def _match_starts_inside_percent_escape(data: bytes, match_start: int) -> bool:
+    """Reject domain prefixes made from an encoded URL separator's hex bytes."""
+    if (
+        match_start <= 0
+        or data[match_start - 1 : match_start] != b"%"
+        or match_start + 1 >= len(data)
+        or not all(byte in b"0123456789abcdefABCDEF" for byte in data[match_start : match_start + 2])
+    ):
+        return False
+    return int(data[match_start : match_start + 2], 16) in b"/=?&#;:@"
 
 
 def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
     url_context = _url_text_bounds_containing_offset(data, match_start)
     if url_context is None:
-        return _bounded_url_lookup_starts_mid_token(data, match_start)
+        url_context = _uri_text_bounds_containing_offset(data, match_start, _URI_IN_BYTES_PATTERN)
+    if url_context is None:
+        return False
     url, url_start = url_context
 
     return _is_match_redacted_from_url_context(url, url_start, match_start, value)
@@ -864,7 +934,7 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
     for candidate in nested_url_candidates:
         if candidate == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
             continue
-        for nested_url_match in _URL_IN_TEXT_PATTERN.finditer(candidate):
+        for nested_url_match in _URI_IN_TEXT_PATTERN.finditer(candidate):
             nested_url = nested_url_match.group()
             if value_lower not in nested_url.lower():
                 continue
@@ -877,6 +947,71 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
                 return True
 
     return bool(separator and _is_sensitive_path_key(key))
+
+
+def _url_path_awaits_sensitive_value(url: str) -> bool:
+    """Return whether a truncated URL path ends just before a credential value."""
+    try:
+        segments = [segment for segment in urlsplit(url).path.split("/") if segment]
+    except ValueError:
+        return False
+    if not segments:
+        return False
+
+    final_segment = _decode_path_token(_split_trailing_path_delimiters(segments[-1])[0])
+    if _is_sensitive_path_key(final_segment) or _compound_path_segment_ends_with_sensitive_key(final_segment):
+        return True
+    return (
+        len(segments) > 1
+        and _AUTHORIZATION_SCHEME_PATTERN.fullmatch(final_segment) is not None
+        and _is_sensitive_path_key(_decode_path_token(segments[-2]))
+    )
+
+
+def _is_split_sensitive_url_value(data: bytes, match_start: int) -> bool:
+    """Recognize credentials after bounded source or UTF-8 URL-path splits."""
+    scan_start = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
+    preceding_url_match = None
+    for candidate in _URL_IN_BYTES_PATTERN.finditer(data, scan_start, match_start):
+        preceding_url_match = candidate
+    if preceding_url_match is None:
+        return False
+
+    gap = data[preceding_url_match.end() : match_start]
+    if not gap:
+        return False
+    gap_without_comments = re.sub(rb"#[^\r\n]*", b"", gap)
+    source_composition = all(
+        byte >= 128 or byte in b"\\\"' +(){}[]\t\r\n" or byte in b"rRuUbBfF" for byte in gap_without_comments
+    )
+    path_continuation = all(byte >= 128 or byte in b"\\\"'" for byte in gap)
+    if not source_composition and not path_continuation:
+        return False
+
+    url = preceding_url_match.group().decode("utf-8", errors="ignore")
+    return _url_path_awaits_sensitive_value(url)
+
+
+def _is_redacted_evidence_value(data: bytes, match_start: int, value: str) -> bool:
+    """Use the shared redactor to reject endpoint-shaped credential values."""
+    before = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
+    match_end = match_start + len(value.encode("utf-8"))
+    after = min(len(data), match_end + _MAX_URL_TEXT_LOOKUP_BYTES)
+    evidence = data[before:after]
+    if _SENSITIVE_EVIDENCE_HINT_PATTERN.search(evidence) is None:
+        return False
+
+    marked_text = "".join(
+        (
+            data[before:match_start].decode("utf-8", errors="ignore"),
+            _EVIDENCE_MATCH_START_MARKER,
+            data[match_start:match_end].decode("utf-8", errors="ignore"),
+            _EVIDENCE_MATCH_END_MARKER,
+            data[match_end:after].decode("utf-8", errors="ignore"),
+        )
+    )
+    redacted = _redact_network_evidence(marked_text)
+    return _EVIDENCE_MATCH_START_MARKER not in redacted or _EVIDENCE_MATCH_END_MARKER not in redacted
 
 
 def _decoded_nested_urls(url: str) -> Iterator[str]:
@@ -894,7 +1029,7 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
             decoded = _decode_path_token(candidate)
             if decoded in {candidate, _PATH_TOKEN_DECODE_LIMIT_SENTINEL}:
                 continue
-            for match in _URL_IN_TEXT_PATTERN.finditer(decoded):
+            for match in _URI_IN_TEXT_PATTERN.finditer(decoded):
                 nested_url = match.group()
                 if nested_url not in seen:
                     seen.add(nested_url)
@@ -1436,13 +1571,67 @@ class NetworkCommDetector:
 
     def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
         if self.max_findings is not None:
-            return _is_match_redacted_from_url(data, match_start, value)
+            local_uri_context = _url_text_bounds_containing_offset(data, match_start)
+            if local_uri_context is None:
+                local_uri_context = _uri_text_bounds_containing_offset(data, match_start, _URI_IN_BYTES_PATTERN)
+            if local_uri_context is not None:
+                url, url_start = local_uri_context
+                return _is_match_redacted_from_url_context(url, url_start, match_start, value)
+
+            if _bounded_url_lookup_starts_mid_token(data, match_start):
+                lazy_url_context = self._lazy_url_context_containing(match_start)
+                if lazy_url_context is not None:
+                    url_start, _url_end, url = lazy_url_context
+                    return _is_match_redacted_from_url_context(url, url_start, match_start, value)
+            return _is_split_sensitive_url_value(data, match_start) or _is_redacted_evidence_value(
+                data, match_start, value
+            )
         context_index = bisect_right(self._url_context_starts, match_start) - 1
         if context_index >= 0:
             url_start, url_end, url = self._url_contexts[context_index]
             if match_start < url_end:
                 return _is_match_redacted_from_url_context(url, url_start, match_start, value)
-        return _is_match_redacted_from_url(data, match_start, value)
+        return (
+            _is_match_redacted_from_url(data, match_start, value)
+            or _is_split_sensitive_url_value(data, match_start)
+            or _is_redacted_evidence_value(data, match_start, value)
+        )
+
+    def _lazy_url_context_containing(self, match_start: int) -> tuple[int, int, str] | None:
+        """Advance the bounded lazy URL index only far enough to classify one match."""
+        context_index = bisect_right(self._url_context_starts, match_start) - 1
+        if context_index >= 0:
+            cached = self._url_contexts[context_index]
+            if match_start < cached[1]:
+                return cached
+
+        while not self._url_context_scan_complete:
+            if self._pending_url_context is None:
+                if self._url_context_iterator is None:
+                    self._url_context_scan_complete = True
+                    break
+                try:
+                    self._pending_url_context = next(self._url_context_iterator)
+                except StopIteration:
+                    self._url_context_iterator = None
+                    self._url_context_scan_complete = True
+                    break
+
+            context = self._pending_url_context
+            if context[0] > match_start:
+                break
+            self._pending_url_context = None
+            _start, _end, url = context
+            cache_limit = (self.max_findings or 0) + 1
+            recordable_url = self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None or any(
+                _decoded_nested_urls(url)
+            )
+            if recordable_url and len(self._url_contexts) < cache_limit:
+                self._url_contexts.append(context)
+                self._url_context_starts.append(context[0])
+            if match_start < context[1]:
+                return context
+        return None
 
     def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
         """Yield cached URL contexts followed by the remaining lazy index."""
@@ -1686,6 +1875,8 @@ class NetworkCommDetector:
             return
 
         for match in self.DOMAIN_PATTERN.finditer(data):
+            if _match_starts_inside_percent_escape(data, match.start()):
+                continue
             domain = match.group().decode("utf-8", errors="ignore").lower()
 
             # Skip common false positives
