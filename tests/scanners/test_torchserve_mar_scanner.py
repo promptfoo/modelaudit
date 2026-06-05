@@ -868,6 +868,32 @@ def test_dynamic_import_handler_analysis_resolves_nested_attributes(
 @pytest.mark.parametrize(
     "handler_source",
     [
+        b"def handle(data, context):\n    return __import__(('os',)[0]).system('id')\n",
+        b"def handle(data, context):\n    return getattr(__import__('os'), ['system'][0])('id')\n",
+        b"def handle(data, context):\n    return getattr(__import__('os'), {'run': 'system'}['run'])('id')\n",
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_literal_selected_strings(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_ignores_invalid_literal_string_selection() -> None:
+    handler_source = b"def handle(data, context):\n    return getattr(__import__('os'), ['system'][1])('id')\n"
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
         (b"from importlib import import_module as load\n\ndef helper(load):\n    return load('os').system('id')\n"),
         (
             b"from importlib import import_module as load\n"
@@ -1555,6 +1581,48 @@ def test_dynamic_import_handler_analysis_closes_literal_helper_and_callback_bypa
 @pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
+        (b"def handle(data, context):\n    return list(map(eval, ['1 + 1']))\n", "eval"),
+        (b"def handle(data, context):\n    return list(filter(exec, ['pass']))\n", "exec"),
+        (b"def handle(data, context):\n    return sorted(['1 + 1'], key=eval)\n", "eval"),
+        (b"def handle(data, context):\n    return max(['1 + 1'], key=eval)\n", "eval"),
+        (
+            b"import os\n"
+            b"def handle(data, context):\n"
+            b"    values = ['id']\n"
+            b"    values.sort(key=os.system)\n"
+            b"    return values\n",
+            "os.system",
+        ),
+        (b"def handle(data, context):\n    return list(map(eval, data))\n", "eval"),
+        (
+            b"import functools\n"
+            b"import os\n"
+            b"def handle(data, context):\n"
+            b"    return functools.partial(os.system, 'id')()\n",
+            "os.system",
+        ),
+        (
+            b"from functools import partial\n"
+            b"def handle(data, context):\n"
+            b"    runner = partial(eval, '1 + 1')\n"
+            b"    return runner()\n",
+            "eval",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_tracks_executed_callable_arguments(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
         (b"def handle(data, context):\n    return [eval][0]('1 + 1')\n", "eval"),
         (b"import os\ndef handle(data, context):\n    return [os.system][0]('id')\n", "os.system"),
     ],
@@ -1603,6 +1671,37 @@ def test_dynamic_import_handler_analysis_does_not_execute_callbacks_for_empty_in
 
     assert parse_error is None
     assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"def handle(data, context):\n    return list(map(eval, []))\n", "eval"),
+        (b"def handle(data, context):\n    return sorted([], key=eval)\n", "eval"),
+        (
+            b"from functools import partial\n"
+            b"def handle(data, context):\n"
+            b"    runner = partial(eval, '1 + 1')\n"
+            b"    return None\n",
+            "eval",
+        ),
+        (
+            b"def partial(function, *args):\n"
+            b"    return lambda: None\n"
+            b"def handle(data, context):\n"
+            b"    return partial(eval, '1 + 1')()\n",
+            "eval",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_avoids_unexecuted_callable_argument_false_positives(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name not in risky_calls
 
 
 @pytest.mark.parametrize(
@@ -1941,6 +2040,40 @@ def test_dynamic_import_handler_analysis_does_not_execute_unused_getattr_default
         b"def handle(data, context):\n"
         b"    runner = getattr(__import__('os'), 'definitely_missing', __import__('os').system)\n"
         b"    return []\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    return vars(__import__('os')).get('system')('id')\n",
+        b"def handle(data, context):\n    return __import__('os').__dict__.get('system')('id')\n",
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = vars(__import__('math'))\n"
+            b"    return namespace.get('missing', __import__('os').system)('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_namespace_mapping_get_calls(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_respects_shadowed_namespace_mapping_helper() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    vars = lambda value: {'system': lambda command: None}\n"
+        b"    return vars(__import__('os')).get('system')('id')\n"
     )
 
     risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)

@@ -97,6 +97,7 @@ _EAGER_GENERATOR_CONSUMERS = frozenset(
 )
 _LAZY_GENERATOR_WRAPPERS = frozenset({"builtins.enumerate", "builtins.zip", "enumerate", "zip"})
 _LAZY_CALLBACK_WRAPPERS = frozenset({"builtins.filter", "builtins.map", "filter", "map"})
+_PARTIAL_CALL_HELPERS = frozenset({"functools.partial"})
 _DynamicAstNode = TypeVar("_DynamicAstNode", bound=ast.AST)
 
 
@@ -1539,10 +1540,14 @@ class TorchServeMarScanner(BaseScanner):
         risky_calls.update(self._find_dynamic_import_execution_calls(tree))
         return risky_calls
 
-    @staticmethod
-    def _static_string_value(node: ast.AST) -> str | None:
+    @classmethod
+    def _static_string_value(cls, node: ast.AST) -> str | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
+        if isinstance(node, ast.Subscript):
+            selected_value = cls._literal_subscript_value(node)
+            if selected_value is not None:
+                return cls._static_string_value(selected_value)
         if isinstance(node, ast.JoinedStr):
             parts: list[str] = []
             for value in node.values:
@@ -1551,8 +1556,8 @@ class TorchServeMarScanner(BaseScanner):
                 parts.append(value.value)
             return "".join(parts)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left = TorchServeMarScanner._static_string_value(node.left)
-            right = TorchServeMarScanner._static_string_value(node.right)
+            left = cls._static_string_value(node.left)
+            right = cls._static_string_value(node.right)
             if left is not None and right is not None:
                 return f"{left}{right}"
         return None
@@ -2089,6 +2094,51 @@ class TorchServeMarScanner(BaseScanner):
             call_name for root in roots if (call_name := _normalized_high_risk_python_call_name(root)) is not None
         )
 
+    def _resolve_dynamic_namespace_mapping_roots(
+        self,
+        node: ast.AST,
+        aliases: dict[str, str],
+        module_aliases: dict[str, frozenset[str]],
+        import_loader_aliases: dict[str, frozenset[str]],
+        shadowed_names: set[str],
+    ) -> frozenset[str]:
+        target_node: ast.AST | None = None
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            target_node = node.value
+        elif isinstance(node, ast.Call):
+            helper_name = self._resolve_call_name(node.func)
+            resolved_helper_name = (
+                self._apply_unshadowed_alias(helper_name, aliases, shadowed_names)
+                if helper_name is not None and helper_name.split(".", maxsplit=1)[0] not in shadowed_names
+                else None
+            )
+            expanded_args = self._expanded_literal_call_arguments(node.args)
+            if (
+                resolved_helper_name in _DYNAMIC_NAMESPACE_HELPERS
+                and expanded_args is not None
+                and len(expanded_args) == 1
+                and not node.keywords
+            ):
+                target_node = expanded_args[0]
+        if target_node is None:
+            return frozenset()
+
+        module_names = self._resolve_dynamic_import_roots(
+            target_node,
+            aliases,
+            module_aliases,
+            import_loader_aliases,
+            shadowed_names,
+        )
+        target_name = self._resolve_call_name(target_node)
+        if (
+            target_name is not None
+            and target_name.split(".", maxsplit=1)[0] not in shadowed_names
+            and target_name.split(".", maxsplit=1)[0] in aliases
+        ):
+            module_names |= frozenset({self._apply_alias(target_name, aliases)})
+        return module_names
+
     def _resolve_dynamic_import_getattr_roots(
         self,
         node: ast.Call,
@@ -2237,55 +2287,20 @@ class TorchServeMarScanner(BaseScanner):
                 mapped_name = f"{container_name}.{key_name}"
                 if mapped_name in callable_aliases:
                     return callable_aliases[mapped_name]
-            if isinstance(node.value, ast.Attribute) and node.value.attr == "__dict__":
-                module_names = self._resolve_dynamic_import_roots(
-                    node.value.value,
-                    aliases,
-                    module_aliases,
-                    import_loader_aliases,
-                    shadowed_names,
+            namespace_module_names = self._resolve_dynamic_namespace_mapping_roots(
+                node.value,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+            attr_name = self._static_string_value(node.slice)
+            if namespace_module_names and attr_name is not None:
+                return frozenset(
+                    call_name
+                    for module_name in namespace_module_names
+                    if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}")) is not None
                 )
-                attr_name = self._static_string_value(node.slice)
-                if attr_name is not None:
-                    return frozenset(
-                        call_name
-                        for module_name in module_names
-                        if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}"))
-                        is not None
-                    )
-            if isinstance(node.value, ast.Call):
-                helper_name = self._resolve_call_name(node.value.func)
-                resolved_helper_name = (
-                    self._apply_unshadowed_alias(
-                        helper_name,
-                        aliases,
-                        shadowed_names,
-                    )
-                    if helper_name is not None and helper_name.split(".", maxsplit=1)[0] not in shadowed_names
-                    else None
-                )
-                expanded_args = self._expanded_literal_call_arguments(node.value.args)
-                if (
-                    resolved_helper_name in _DYNAMIC_NAMESPACE_HELPERS
-                    and expanded_args is not None
-                    and len(expanded_args) == 1
-                    and not node.value.keywords
-                ):
-                    module_names = self._resolve_dynamic_import_roots(
-                        expanded_args[0],
-                        aliases,
-                        module_aliases,
-                        import_loader_aliases,
-                        shadowed_names,
-                    )
-                    attr_name = self._static_string_value(node.slice)
-                    if attr_name is not None:
-                        return frozenset(
-                            call_name
-                            for module_name in module_names
-                            if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}"))
-                            is not None
-                        )
             module_names = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
@@ -2316,6 +2331,35 @@ class TorchServeMarScanner(BaseScanner):
                     shadowed_names,
                 )
             )
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+                expanded_args = self._expanded_literal_call_arguments(node.args)
+                if expanded_args is not None and len(expanded_args) in {1, 2} and not node.keywords:
+                    module_names = self._resolve_dynamic_namespace_mapping_roots(
+                        node.func.value,
+                        aliases,
+                        module_aliases,
+                        import_loader_aliases,
+                        shadowed_names,
+                    )
+                    attr_name = self._static_string_value(expanded_args[0])
+                    if attr_name is not None:
+                        call_names.update(
+                            call_name
+                            for module_name in module_names
+                            if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}"))
+                            is not None
+                        )
+                    if len(expanded_args) == 2:
+                        call_names.update(
+                            self._resolve_dynamic_import_execution_calls(
+                                expanded_args[1],
+                                aliases,
+                                module_aliases,
+                                callable_aliases,
+                                import_loader_aliases,
+                                shadowed_names,
+                            )
+                        )
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "__getattribute__"
@@ -2969,6 +3013,23 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 if isinstance(value, ast.Lambda):
                     callable_names |= self._lambda_execution_calls(value)
+                if isinstance(value, ast.Call):
+                    value_call_name = scanner._resolve_call_name(value.func)
+                    resolved_value_call_name = (
+                        scanner._apply_unshadowed_alias(
+                            value_call_name,
+                            self.import_aliases,
+                            self.shadowed_names,
+                        )
+                        if value_call_name is not None
+                        else None
+                    )
+                    if resolved_value_call_name in _PARTIAL_CALL_HELPERS:
+                        callable_names |= frozenset(
+                            normalized_name
+                            for root in self._function_aware_roots(value)
+                            if (normalized_name := _normalized_high_risk_python_call_name(root)) is not None
+                        )
 
                 value_name = scanner._resolve_call_name(value)
                 resolved_value_names = (
@@ -3815,6 +3876,40 @@ class TorchServeMarScanner(BaseScanner):
                 self.risky_calls.update(callback_calls)
                 return True
 
+            def _visit_callable_callback(
+                self,
+                callback: ast.AST,
+                arguments: list[ast.expr] | None,
+            ) -> bool:
+                callback_calls = set(
+                    scanner._resolve_dynamic_import_execution_calls(
+                        callback,
+                        self.import_aliases,
+                        self.module_aliases,
+                        self.callable_aliases,
+                        self.import_loader_aliases,
+                        self.shadowed_names,
+                    )
+                )
+                callback_calls.update(
+                    normalized_name
+                    for root in self._function_aware_roots(callback)
+                    if (normalized_name := _normalized_high_risk_python_call_name(root)) is not None
+                )
+                self.risky_calls.update(callback_calls)
+
+                if arguments is None:
+                    lambda_nodes = self._lambda_nodes_for_callable(callback)
+                    lambda_calls = {
+                        call_name
+                        for lambda_node in lambda_nodes
+                        for call_name in self._lambda_execution_calls(lambda_node)
+                    }
+                    self.risky_calls.update(lambda_calls)
+                    return bool(callback_calls or lambda_nodes)
+
+                return self._visit_lambda_callback(callback, arguments) or bool(callback_calls)
+
             def _propagate_declared_name(self, name: str, destination_index: int, caller_index: int) -> None:
                 self._copy_name_binding_to_scope_index(name, destination_index)
                 for scope_index in range(destination_index + 1, caller_index + 1):
@@ -3961,6 +4056,30 @@ class TorchServeMarScanner(BaseScanner):
                     if function_nodes is not None:
                         for function_node in function_nodes:
                             roots.update(self._called_function_return_roots(function_node, node))
+                    resolved_function_name = (
+                        scanner._apply_unshadowed_alias(
+                            function_name,
+                            self.import_aliases,
+                            self.shadowed_names,
+                        )
+                        if function_name is not None
+                        else None
+                    )
+                    if resolved_function_name in _PARTIAL_CALL_HELPERS:
+                        expanded_args = scanner._expanded_literal_call_arguments(node.args)
+                        if expanded_args:
+                            partial_target = expanded_args[0]
+                            roots.update(self._function_aware_roots(partial_target))
+                            roots.update(
+                                scanner._resolve_dynamic_import_execution_calls(
+                                    partial_target,
+                                    self.import_aliases,
+                                    self.module_aliases,
+                                    self.callable_aliases,
+                                    self.import_loader_aliases,
+                                    self.shadowed_names,
+                                )
+                            )
                     factory_roots = self._function_aware_roots(node.func)
                     roots.update(
                         scanner._module_names_for_import_helpers(
@@ -4461,17 +4580,23 @@ class TorchServeMarScanner(BaseScanner):
                             self.visit(value.func)
                             self.visit(expanded_args[0])
                             callback_arguments: list[ast.expr] = []
-                            all_inputs_nonempty = True
+                            callback_arguments_known = True
+                            has_empty_input = False
                             for iterable in expanded_args[1:]:
                                 elements = self._literal_iterable_elements(iterable)
-                                if not elements or elements[0] is None:
-                                    all_inputs_nonempty = False
+                                if elements == []:
+                                    has_empty_input = True
+                                elif elements is None or elements[0] is None:
+                                    callback_arguments_known = False
                                 else:
                                     callback_arguments.append(elements[0])
                                 if not self._visit_consumed_generator_value(iterable):
                                     self.visit(iterable)
-                            if all_inputs_nonempty:
-                                self._visit_lambda_callback(expanded_args[0], callback_arguments)
+                            if not has_empty_input:
+                                self._visit_callable_callback(
+                                    expanded_args[0],
+                                    callback_arguments if callback_arguments_known else None,
+                                )
                             return True
                     if resolved_wrapper_name in _LAZY_GENERATOR_WRAPPERS:
                         consumed_generator = False
@@ -4973,22 +5098,26 @@ class TorchServeMarScanner(BaseScanner):
                 }
                 key_keywords = [keyword for keyword in node.keywords if keyword.arg == "key"]
                 if len(key_keywords) == 1 and consumer_names & {"max", "min", "sorted"}:
-                    callback_argument: ast.expr | None = None
+                    callback_arguments: list[ast.expr] | None = None
+                    callback_may_run = False
                     if "sorted" in consumer_names and len(node.args) == 1:
                         elements = self._literal_iterable_elements(node.args[0])
+                        callback_may_run = elements != []
                         if elements and elements[0] is not None:
-                            callback_argument = elements[0]
-                    if callback_argument is None and consumer_names & {"max", "min"}:
+                            callback_arguments = [elements[0]]
+                    if not callback_may_run and consumer_names & {"max", "min"}:
                         expanded_callback_args = scanner._expanded_literal_call_arguments(node.args)
                         if expanded_callback_args:
                             if len(expanded_callback_args) == 1:
                                 elements = self._literal_iterable_elements(expanded_callback_args[0])
+                                callback_may_run = elements != []
                                 if elements and elements[0] is not None:
-                                    callback_argument = elements[0]
+                                    callback_arguments = [elements[0]]
                             else:
-                                callback_argument = expanded_callback_args[0]
-                    if callback_argument is not None:
-                        self._visit_lambda_callback(key_keywords[0].value, [callback_argument])
+                                callback_may_run = True
+                                callback_arguments = [expanded_callback_args[0]]
+                    if callback_may_run:
+                        self._visit_callable_callback(key_keywords[0].value, callback_arguments)
                 if (
                     len(key_keywords) == 1
                     and isinstance(node.func, ast.Attribute)
@@ -4997,8 +5126,11 @@ class TorchServeMarScanner(BaseScanner):
                     and all(keyword.arg in {"key", "reverse"} for keyword in node.keywords)
                 ):
                     for list_node in self._list_nodes_for_value(node.func.value):
-                        if list_node.elts and not isinstance(list_node.elts[0], ast.Starred):
-                            self._visit_lambda_callback(key_keywords[0].value, [list_node.elts[0]])
+                        if list_node.elts:
+                            callback_arguments = (
+                                None if isinstance(list_node.elts[0], ast.Starred) else [list_node.elts[0]]
+                            )
+                            self._visit_callable_callback(key_keywords[0].value, callback_arguments)
                 short_circuit_on = True if consumer_names == {"any"} else False if consumer_names == {"all"} else None
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
                     self._visit_consumed_generator_value(node.func.value, first_only=True)
