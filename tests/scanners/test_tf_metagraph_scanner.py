@@ -621,7 +621,20 @@ def test_tf_metagraph_scanner_redacts_secret_after_encoded_url_path(tmp_path: Pa
 
     assert project_key not in serialized_result
     assert "abc_def" not in serialized_result
-    assert REDACTED_EVIDENCE_VALUE in executable_check.details["value_preview"]
+    assert (
+        executable_check.details["value_preview"]
+        == f"curl https://example.com/{REDACTED_EVIDENCE_VALUE}/{REDACTED_EVIDENCE_VALUE}/model.so"
+    )
+
+
+def test_redact_metagraph_evidence_canonicalizes_wholly_redacted_payload() -> None:
+    assert _redact_metagraph_evidence("A" * (_MAX_ATTR_VALUE_BYTES + 1), max_chars=200) == REDACTED_EVIDENCE_VALUE
+
+
+def test_redact_metagraph_evidence_redacts_complete_payload_with_slashes() -> None:
+    encoded_payload = f"{'A' * 130}/{'B' * 20}"
+
+    assert _redact_metagraph_evidence(encoded_payload, max_chars=200) == REDACTED_EVIDENCE_VALUE
 
 
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
