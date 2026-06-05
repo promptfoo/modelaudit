@@ -27,6 +27,7 @@ _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
+_TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
 
 
 def _is_sampled_fingerprint(value: object) -> bool:
@@ -103,6 +104,49 @@ def _import_hook_identity(hook: object) -> str:
     return f"{module}.{qualname}:{digest}"
 
 
+def _path_hook_resolution_identity(hook: object) -> str:
+    """Return the cache identity used for trusted and replacement path hooks."""
+    for trusted_hook in _TRUSTED_PATH_HOOKS:
+        if hook is trusted_hook:
+            module = getattr(hook, "__module__", type(hook).__module__)
+            qualname = getattr(hook, "__qualname__", type(hook).__qualname__)
+            return f"trusted:{module}.{qualname}"
+
+    hook_identity = _import_hook_identity(hook)
+    for trusted_hook in _TRUSTED_PATH_HOOKS:
+        if hook_identity == _import_hook_identity(trusted_hook):
+            module = getattr(trusted_hook, "__module__", type(trusted_hook).__module__)
+            qualname = getattr(trusted_hook, "__qualname__", type(trusted_hook).__qualname__)
+            return f"trusted:{module}.{qualname}"
+    return hook_identity
+
+
+def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
+    rewrite_module = sys.modules.get("_pytest.assertion.rewrite")
+    finder_type = getattr(rewrite_module, "AssertionRewritingHook", None) if rewrite_module is not None else None
+    if not isinstance(finder_type, type) or type(finder) is not finder_type:
+        return None
+
+    basenames = {str(value) for value in getattr(finder, "_basenames_to_check_rewrite", ())}
+    session = getattr(finder, "session", None)
+    for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
+        basenames.add(Path(str(initial_path)).stem)
+    state = _bounded_hook_value_identity(
+        (
+            tuple(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
+            tuple(str(value) for value in getattr(finder, "fnpats", ())),
+            tuple(sorted(basenames)),
+            bool(getattr(finder, "_writing_pyc", False)),
+        )
+    )
+    digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()
+    return f"{finder_type.__module__}.{finder_type.__qualname__}:{digest}"
+
+
+def _meta_path_finder_resolution_identity(finder: object) -> str:
+    return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
+
+
 def _source_resolution_context() -> dict[str, list[str]]:
     nonstandard_importers = []
     for entry in sys.path:
@@ -112,8 +156,8 @@ def _source_resolution_context() -> dict[str, list[str]]:
             continue
         nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
     return {
-        "meta_path": [_import_hook_identity(finder) for finder in sys.meta_path],
-        "path_hooks": [_import_hook_identity(hook) for hook in sys.path_hooks],
+        "meta_path": [_meta_path_finder_resolution_identity(finder) for finder in sys.meta_path],
+        "path_hooks": [_path_hook_resolution_identity(hook) for hook in sys.path_hooks],
         "path_importers": nonstandard_importers,
     }
 

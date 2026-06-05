@@ -34,7 +34,6 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -52,6 +51,8 @@ from modelaudit_picklescan.call_graph import (
     StartupHookWriteFinding,
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
+    _is_standard_path_hook,
+    _path_hook_resolution_identity,
     find_startup_hook_write_call_graphs,
 )
 
@@ -3888,10 +3889,30 @@ def test_equivalent_file_finder_hooks_keep_standard_resolution(
     trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
     equivalent_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
     different_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
-    monkeypatch.setattr(call_graph_module, "_TRUSTED_PATH_HOOKS", (trusted_hook,))
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (trusted_hook,))
 
-    assert call_graph_module._is_standard_path_hook(equivalent_hook)
-    assert not call_graph_module._is_standard_path_hook(different_hook)
+    assert _is_standard_path_hook(equivalent_hook)
+    assert not _is_standard_path_hook(different_hook)
+
+
+def test_exact_trusted_path_hook_identity_survives_lazy_method_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LazyTrustedHook:
+        @classmethod
+        def find_spec(cls, _name: str) -> None:
+            return None
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (LazyTrustedHook,))
+    initial_identity = _path_hook_resolution_identity(LazyTrustedHook)
+
+    def initialized_find_spec(cls: type[LazyTrustedHook], _name: str) -> None:
+        return None
+
+    monkeypatch.setattr(LazyTrustedHook, "find_spec", classmethod(initialized_find_spec))
+
+    assert _path_hook_resolution_identity(LazyTrustedHook) == initial_identity
+    assert _is_standard_path_hook(LazyTrustedHook)
 
 
 def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:
