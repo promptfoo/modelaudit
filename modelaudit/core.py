@@ -155,10 +155,14 @@ _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
+_DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
+_DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
+_MAX_DVC_DIRECTORY_COVERAGE_GAPS = 100
 _DVC_PARENT_FILE_CONFIG_KEY = "_dvc_parent_file"
 _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
 _DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY = "_dvc_total_size_limit"
 _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
+_DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 
 
 def _record_incomplete_dvc_resolution(
@@ -902,12 +906,18 @@ def scan_model_directory_or_file(
     dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
     dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
     dvc_excluded_paths_value = kwargs.pop(_DVC_EXCLUDED_PATHS_CONFIG_KEY, ())
+    dvc_coverage_roots_value = kwargs.pop(_DVC_COVERAGE_ROOTS_CONFIG_KEY, ())
     if not isinstance(dvc_excluded_paths_value, (list, tuple, set, frozenset)):
         dvc_excluded_paths_value = ()
     dvc_excluded_paths = {
         str(Path(excluded_path).resolve())
         for excluded_path in dvc_excluded_paths_value
         if isinstance(excluded_path, str)
+    }
+    if not isinstance(dvc_coverage_roots_value, (list, tuple, set, frozenset)):
+        dvc_coverage_roots_value = ()
+    dvc_coverage_roots = {
+        Path(coverage_root).resolve() for coverage_root in dvc_coverage_roots_value if isinstance(coverage_root, str)
     }
 
     # Initialize results using Pydantic model from the start
@@ -1054,8 +1064,38 @@ def scan_model_directory_or_file(
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
+            dvc_directory_output_owners: list[tuple[Path, str]] = []
+            directory_coverage_gaps: dict[tuple[str, str], set[str]] = {}
+
+            def get_dvc_directory_roots_by_file() -> dict[str, set[Path]]:
+                roots_by_file: dict[str, set[Path]] = {}
+                if isinstance(dvc_parent_file, str):
+                    roots_by_file[dvc_parent_file] = dvc_coverage_roots or {base_dir}
+                for output_dir, owner_dvc_file in dvc_directory_output_owners:
+                    roots_by_file.setdefault(owner_dvc_file, set()).add(output_dir)
+                return roots_by_file
+
+            def record_dvc_directory_coverage_gap(dvc_file: str, reason: str, failed_path: str) -> None:
+                failed_paths = directory_coverage_gaps.setdefault((dvc_file, reason), set())
+                if len(failed_paths) < _MAX_DVC_DIRECTORY_COVERAGE_GAPS:
+                    failed_paths.add(failed_path)
+
+            def collect_dvc_directory_walk_error(error: OSError) -> None:
+                failed_path = error.filename if isinstance(error.filename, str) else path
+                for affected_dvc_file, output_roots in get_dvc_directory_roots_by_file().items():
+                    if any(is_within_directory(str(output_root), failed_path) for output_root in output_roots):
+                        record_dvc_directory_coverage_gap(
+                            affected_dvc_file,
+                            _DVC_DIRECTORY_WALK_FAILED_REASON,
+                            failed_path,
+                        )
+
             directory_discovery_started_at = _start_phase_timing(phase_timings)
-            for root, dirs, files in os.walk(path, followlinks=False):
+            for root, dirs, files in os.walk(
+                path,
+                followlinks=False,
+                onerror=collect_dvc_directory_walk_error,
+            ):
                 dirs.sort()
                 for file in sorted(files):
                     file_path = os.path.join(root, file)
@@ -1112,7 +1152,9 @@ def scan_model_directory_or_file(
 
                     # Handle DVC files and get target paths
                     target_paths = [scan_source]
+                    dvc_pointer_file: str | None = None
                     if file.lower().endswith(".dvc"):
+                        dvc_pointer_file = file_path
                         dvc_resolution = resolve_dvc_file_status(file_path)
                         _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
                         if dvc_resolution.analysis_incomplete:
@@ -1126,6 +1168,8 @@ def scan_model_directory_or_file(
                         # The root walk already discovers files below resolved DVC
                         # directory outputs. Do not queue the directory as a file.
                         if target_path.is_dir():
+                            if dvc_pointer_file is not None:
+                                dvc_directory_output_owners.append((target_path, dvc_pointer_file))
                             continue
 
                         target_str = str(target_path)
@@ -1198,6 +1242,43 @@ def scan_model_directory_or_file(
                             continue
 
                         files_to_scan.append(target_str)
+
+                if isinstance(dvc_parent_file, str) or dvc_directory_output_owners:
+                    dvc_directory_roots_by_file = get_dvc_directory_roots_by_file()
+                    for directory_name in dirs:
+                        symlink_dir = Path(root) / directory_name
+                        if not symlink_dir.is_symlink():
+                            continue
+                        symlink_path = Path(os.path.abspath(symlink_dir))
+                        for affected_dvc_file, output_roots in dvc_directory_roots_by_file.items():
+                            if not any(symlink_path.is_relative_to(output_root) for output_root in output_roots):
+                                continue
+                            try:
+                                resolved_symlink = symlink_dir.resolve(strict=True)
+                            except OSError:
+                                resolved_symlink = None
+                            if resolved_symlink is not None and any(
+                                is_within_directory(str(output_root), str(resolved_symlink))
+                                for output_root in output_roots
+                            ):
+                                continue
+                            record_dvc_directory_coverage_gap(
+                                affected_dvc_file,
+                                _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON,
+                                str(symlink_dir),
+                            )
+
+            for (affected_dvc_file, incomplete_reason), failed_paths in directory_coverage_gaps.items():
+                aggregate_hash_complete = False
+                _record_incomplete_dvc_resolution(
+                    results,
+                    scan_metadata,
+                    affected_dvc_file,
+                    DvcResolution(
+                        unresolved_outputs=tuple(sorted(failed_paths)),
+                        incomplete_reason=incomplete_reason,
+                    ),
+                )
             _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
 
             if hf_shard_blob_paths:
@@ -1500,6 +1581,9 @@ def scan_model_directory_or_file(
                 if dvc_resolution.analysis_incomplete:
                     aggregate_hash_complete = False
                 target_files = list(dvc_resolution.resolved_paths)
+            dvc_directory_coverage_roots = tuple(
+                str(Path(target).resolve()) for target in target_files if os.path.isdir(target)
+            )
             scanned_dvc_paths: set[str] = set()
 
             for _idx, target in enumerate(target_files):
@@ -1560,12 +1644,13 @@ def scan_model_directory_or_file(
 
                 if os.path.isdir(target):
                     nested_kwargs = dict(kwargs)
-                    if is_dvc_pointer and max_total_size > 0:
+                    if is_dvc_pointer:
                         nested_kwargs[_DVC_PARENT_FILE_CONFIG_KEY] = path
+                        nested_kwargs[_DVC_EXCLUDED_PATHS_CONFIG_KEY] = tuple(scanned_dvc_paths)
+                        nested_kwargs[_DVC_COVERAGE_ROOTS_CONFIG_KEY] = dvc_directory_coverage_roots
+                    if is_dvc_pointer and max_total_size > 0:
                         nested_kwargs[_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY] = max_total_size - results.bytes_scanned
                         nested_kwargs[_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY] = max_total_size
-                    if is_dvc_pointer:
-                        nested_kwargs[_DVC_EXCLUDED_PATHS_CONFIG_KEY] = tuple(scanned_dvc_paths)
                     nested_result = scan_model_directory_or_file(
                         target,
                         blacklist_patterns=blacklist_patterns,
@@ -1602,6 +1687,16 @@ def scan_model_directory_or_file(
                             path,
                             budget_type="total_size",
                             limit=max_total_size,
+                        )
+                        break
+                    if is_dvc_pointer and time.time() - start_time > timeout:
+                        aggregate_hash_complete = False
+                        _record_incomplete_dvc_scan_budget(
+                            results,
+                            scan_metadata,
+                            path,
+                            budget_type="timeout",
+                            limit=timeout,
                         )
                         break
                     continue
@@ -1718,6 +1813,17 @@ def scan_model_directory_or_file(
                     else:
                         scan_metadata["success"] = False
                         scan_metadata["has_operational_errors"] = True
+                    break
+
+                if is_dvc_pointer and time.time() - start_time > timeout:
+                    aggregate_hash_complete = False
+                    _record_incomplete_dvc_scan_budget(
+                        results,
+                        scan_metadata,
+                        path,
+                        budget_type="timeout",
+                        limit=timeout,
+                    )
                     break
 
                 if progress_callback:

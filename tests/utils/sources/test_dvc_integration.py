@@ -1,6 +1,8 @@
+import errno
 import json
 import os
 import pickle
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -253,6 +255,172 @@ class TestDvcIntegration:
             issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON for issue in results.issues
         )
 
+    @pytest.mark.parametrize("scan_directory", [False, True])
+    def test_unreadable_dvc_directory_subtree_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        scan_directory: bool,
+    ) -> None:
+        """Walk failures below resolved DVC directories must not look like complete coverage."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        blocked_dir = output_dir / "blocked"
+        blocked_dir.mkdir()
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        original_walk = os.walk
+
+        def walk_with_denied_subtree(
+            top: str,
+            topdown: bool = True,
+            onerror: Callable[[OSError], None] | None = None,
+            followlinks: bool = False,
+        ) -> Iterator[tuple[str, list[str], list[str]]]:
+            resolved_top = Path(top).resolve()
+            if resolved_top == (tmp_path if scan_directory else output_dir).resolve():
+                if scan_directory:
+                    yield str(tmp_path), [output_dir.name], [dvc_file.name]
+                else:
+                    yield str(output_dir), [blocked_dir.name], []
+                if onerror is not None:
+                    onerror(PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(blocked_dir)))
+                return
+            yield from original_walk(
+                top,
+                topdown=topdown,
+                onerror=onerror,
+                followlinks=followlinks,
+            )
+
+        monkeypatch.setattr(core_module.os, "walk", walk_with_denied_subtree)
+
+        result = scan_model_directory_or_file(str(tmp_path if scan_directory else dvc_file))
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_walk_failed"
+        )
+
+        assert result.files_scanned == 0
+        assert result.has_errors is True
+        assert result.success is False
+        assert result.content_hash is None
+        assert str(blocked_dir) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_escaping_dvc_directory_symlink_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A linked directory outside the declared output must not be silently skipped."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        payload = outside_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"hidden": True}))
+        linked_dir = output_dir / "linked"
+        linked_dir.symlink_to(outside_dir, target_is_directory=True)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert result.files_scanned == 0
+        assert result.has_errors is True
+        assert result.success is False
+        assert result.content_hash is None
+        assert str(linked_dir) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_internal_dvc_directory_symlinks_cannot_hide_later_escape(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Benign links must not consume the bounded diagnostic sample before an escape."""
+        output_dir = tmp_path / "model"
+        real_dir = output_dir / "real"
+        real_dir.mkdir(parents=True)
+        (real_dir / "payload.pkl").write_bytes(pickle.dumps({"covered": True}))
+        for index in range(100):
+            (output_dir / f"internal-{index:03}").symlink_to(real_dir, target_is_directory=True)
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        escaping_link = output_dir / "zz-escaping"
+        escaping_link.symlink_to(outside_dir, target_is_directory=True)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert result.has_errors is True
+        assert result.success is False
+        assert str(escaping_link) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_internal_dvc_directory_symlink_does_not_create_coverage_gap(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A linked directory whose target is already inside the output remains covered."""
+        output_dir = tmp_path / "model"
+        real_dir = output_dir / "real"
+        real_dir.mkdir(parents=True)
+        payload = real_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"covered": True}))
+        (output_dir / "linked").symlink_to(real_dir, target_is_directory=True)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == 1
+        assert result.has_errors is False
+        assert result.success is True
+        assert any(Path(asset.path) == payload for asset in result.assets)
+        assert not any(
+            issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
+        )
+
+    def test_dvc_directory_symlink_covered_by_another_declared_output(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Overlapping declared directories should cover a linked target exactly once."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        linked_target = tmp_path / "linked-target"
+        linked_target.mkdir()
+        payload = linked_target / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"covered": True}))
+        (model_dir / "linked").symlink_to(linked_target, target_is_directory=True)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n- path: linked-target\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == 1
+        assert result.has_errors is False
+        assert result.success is True
+        assert any(Path(asset.path) == payload for asset in result.assets)
+        assert not any(
+            issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
+        )
+
     def test_dvc_directory_outputs_share_timeout_and_total_size_budgets(
         self,
         tmp_path: Path,
@@ -291,6 +459,57 @@ class TestDvcIntegration:
         assert any(
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
             and issue.details.get("budget_type") == "total_size"
+            for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("target_kind", ["file", "directory"])
+    def test_final_dvc_output_timeout_overrun_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        target_kind: str,
+    ) -> None:
+        """The last resolved output must not overrun the shared deadline silently."""
+        target = tmp_path / ("model.pkl" if target_kind == "file" else "model")
+        if target_kind == "file":
+            target.write_bytes(pickle.dumps({"covered": True}))
+        else:
+            target.mkdir()
+        dvc_file = tmp_path / "timeout.dvc"
+        dvc_file.write_text(f"outs:\n- path: {target.name}\n")
+        now = [100.0]
+        monkeypatch.setattr(core_module.time, "time", lambda: now[0])
+
+        if target_kind == "file":
+
+            def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
+                now[0] += 11
+                result = ScanResult(scanner_name="test")
+                result.bytes_scanned = Path(path).stat().st_size
+                result.finish(success=True)
+                return result
+
+            monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+            result = scan_model_directory_or_file(str(dvc_file), timeout=10, cache_scan_results=False)
+        else:
+            original_scan = core_module.scan_model_directory_or_file
+
+            def fake_recursive_scan(path: str, *args: Any, **kwargs: Any) -> Any:
+                assert Path(path).is_dir()
+                now[0] += 11
+                nested_result = create_initial_audit_result()
+                nested_result.success = True
+                return nested_result
+
+            monkeypatch.setattr(core_module, "scan_model_directory_or_file", fake_recursive_scan)
+            result = original_scan(str(dvc_file), timeout=10)
+
+        assert result.has_errors is True
+        assert result.success is False
+        assert result.content_hash is None
+        assert any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
+            and issue.details.get("budget_type") == "timeout"
             for issue in result.issues
         )
 
