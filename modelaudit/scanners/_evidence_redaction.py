@@ -1774,6 +1774,14 @@ def _redact_fstring_formatted_value(node: ast.FormattedValue) -> None:
     node.format_spec = None
 
 
+def _redact_fstring_value_tail(values: list[ast.expr], start_index: int) -> None:
+    for value in values[start_index:]:
+        if isinstance(value, ast.FormattedValue):
+            _redact_fstring_formatted_value(value)
+        elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+            value.value = REDACTED_EVIDENCE_VALUE
+
+
 def _redacted_sensitive_fstring(node: ast.JoinedStr) -> str | None:
     redacted = copy.deepcopy(node)
     changed = False
@@ -1787,8 +1795,9 @@ def _redacted_sensitive_fstring(node: ast.JoinedStr) -> str | None:
         ):
             continue
         value.value = REDACTED_EVIDENCE_VALUE
-        _redact_fstring_formatted_value(next_value)
+        _redact_fstring_value_tail(redacted.values, index + 1)
         changed = True
+        break
     for index, key_value in enumerate(redacted.values[:-2]):
         separator = redacted.values[index + 1]
         candidate_value = redacted.values[index + 2]
@@ -1801,8 +1810,9 @@ def _redacted_sensitive_fstring(node: ast.JoinedStr) -> str | None:
             or not isinstance(candidate_value, ast.FormattedValue)
         ):
             continue
-        _redact_fstring_formatted_value(candidate_value)
+        _redact_fstring_value_tail(redacted.values, index + 2)
         changed = True
+        break
     return ast.unparse(redacted) if changed else None
 
 
@@ -2055,14 +2065,18 @@ def _append_token_literal_replacements(
     replacements: list[tuple[int, int, str]],
 ) -> None:
     for token in _significant_tokens(tokens):
-        if token.type != tokenize.STRING:
+        if token.type == tokenize.STRING:
+            replacement = _redacted_python_string_source(token.string)
+            replacement = replacement or repr(REDACTED_EVIDENCE_VALUE)
+        elif token.type == tokenize.NUMBER:
+            replacement = repr(REDACTED_EVIDENCE_VALUE)
+        else:
             continue
-        replacement = _redacted_python_string_source(token.string)
         replacements.append(
             (
                 _position_offset(offsets, token.start, len(text)),
                 _position_offset(offsets, token.end, len(text)),
-                replacement or repr(REDACTED_EVIDENCE_VALUE),
+                replacement,
             )
         )
 
@@ -2317,7 +2331,9 @@ def _redact_sensitive_comparisons(text: str) -> str:
         value_start = _position_offset(offsets, tokens[value_index].start, text_length)
         while value_end > value_start and text[value_end - 1].isspace():
             value_end -= 1
-        if left_target_is_sensitive and any(value_token.type == tokenize.STRING for value_token in significant):
+        if left_target_is_sensitive and any(
+            value_token.type in {tokenize.NUMBER, tokenize.STRING} for value_token in significant
+        ):
             if _tokens_contain_dangerous_call(significant):
                 _append_token_literal_replacements(text, offsets, significant, literal_replacements)
             else:

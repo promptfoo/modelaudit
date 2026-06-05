@@ -156,19 +156,23 @@ _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
 )
-_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
+    r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
+    r"([A-Za-z+_-][A-Za-z0-9.+_-]*|\.[A-Za-z][A-Za-z0-9.+_-]*)?\s*$"
+)
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
     r"(?i)^[._-]?(?:"
-    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?"
-    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)?"
-    r"(?:[._-]?dev(?:[._-]?\d+)?)?"
-    r"|dev(?:[._-]?\d+)?"
+    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?[0-9]+)?"
+    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?[0-9]+)?)|-[0-9]+)?"
+    r"(?:[._-]?dev(?:[._-]?[0-9]+)?)?"
+    r"|dev(?:[._-]?[0-9]+)?"
     r")(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
 )
 _KERAS_LOCAL_VERSION_SUFFIX_PATTERN = re.compile(r"(?i)^\+[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 _KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
-    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
-    r"(?:[._-]?dev(?:[._-]?\d+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?[0-9]+)?)|-[0-9]+)"
+    r"(?:[._-]?dev(?:[._-]?[0-9]+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
 )
 
 
@@ -392,6 +396,7 @@ class KerasZipScanner(BaseScanner):
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
         self._nested_layer_items_scanned = 0
+        self._torchmodule_version_status: bool | None = None
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -636,6 +641,7 @@ class KerasZipScanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._nested_layer_items_scanned = 0
+        self._torchmodule_version_status = None
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -816,7 +822,10 @@ class KerasZipScanner(BaseScanner):
         result.metadata["keras_metadata"] = redact_evidence_value(metadata)
         keras_version = metadata.get("keras_version")
         if isinstance(keras_version, str) and keras_version.strip():
-            result.metadata["keras_version"] = redact_evidence_string(keras_version.strip())
+            raw_keras_version = keras_version.strip()
+            # Classify before evidence truncation can alter a valid long local-version label.
+            self._torchmodule_version_status = self._is_vulnerable_keras_3_11_x(raw_keras_version)
+            result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
 
     def _check_archive_security_members(
         self,
@@ -1476,13 +1485,14 @@ class KerasZipScanner(BaseScanner):
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
 
-        TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
-        in from_config(), enabling arbitrary code execution via pickle deserialization.
+        TorchModuleWrapper in Keras >= 3.11.0 and < 3.11.3 calls
+        torch.load(weights_only=False) in from_config(),
+        enabling arbitrary code execution via pickle deserialization.
         """
         keras_version = result.metadata.get("keras_version")
         vulnerability_status: bool | None = None
         if isinstance(keras_version, str):
-            vulnerability_status = self._is_vulnerable_keras_3_11_x(keras_version)
+            vulnerability_status = self._torchmodule_version_status
 
         if vulnerability_status is True:
             result.add_check(
@@ -1490,7 +1500,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper in "
-                    f"Keras {keras_version} (3.11.0-3.11.2 vulnerable range) — "
+                    f"Keras {keras_version} (>= 3.11.0 and < 3.11.3) — "
                     "uses torch.load(weights_only=False) enabling arbitrary code execution"
                 ),
                 severity=IssueSeverity.CRITICAL,
@@ -1506,7 +1516,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper in vulnerable Keras versions can deserialize attacker-controlled "
                         "pickles via torch.load(weights_only=False), enabling RCE."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": "Keras >= 3.11.0 and < 3.11.3",
                     "remediation": "Upgrade Keras to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1517,7 +1527,8 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"TorchModuleWrapper detected in Keras {keras_version}; "
-                    "version metadata is outside known CVE-2025-49655 range (3.11.0-3.11.2), "
+                    "version metadata is outside known CVE-2025-49655 range "
+                    "(>= 3.11.0 and < 3.11.3), "
                     "but metadata-only assessment is inconclusive without runtime verification"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1557,7 +1568,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
                         "non-canonical so CVE attribution confidence is reduced."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": "Keras >= 3.11.0 and < 3.11.3",
                     "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1565,26 +1576,38 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
-        """Return True for Keras 3.11.0-3.11.2 (including prerelease/dev), else False/None."""
-        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        """Return True for vulnerable Keras 3.11 TorchModuleWrapper versions."""
+        version_match = _KERAS_TORCHMODULE_VERSION_PATTERN.match(version)
         if not version_match:
             return None
 
         try:
-            major = int(version_match.group(1))
-            minor = int(version_match.group(2))
-            patch = int(version_match.group(3) or 0)
-            suffix = (version_match.group(4) or "").strip().lower()
+            epoch = int(version_match.group(1) or 0)
+            release = tuple(int(part) for part in version_match.group(2).split("."))
+            suffix = (version_match.group(3) or "").strip().lower()
 
-            if suffix and not (
-                re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix)
-                or suffix.startswith("+")
-                or suffix.startswith(".post")
-                or suffix.startswith("post")
-            ):
+            suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
+            if suffix_status is None:
                 return None
+            if epoch != 0:
+                return False
 
-            return major == 3 and minor == 11 and 0 <= patch <= 2
+            if release[:2] != (3, 11):
+                return False
+
+            while len(release) > 3 and release[-1] == 0:
+                release = release[:-1]
+            comparison_size = max(len(release), 3)
+            normalized_release = release + (0,) * (comparison_size - len(release))
+            vulnerable_release = (3, 11, 0) + (0,) * (comparison_size - 3)
+            fixed_release = (3, 11, 3) + (0,) * (comparison_size - 3)
+            if normalized_release < vulnerable_release or normalized_release > fixed_release:
+                return False
+            if normalized_release == vulnerable_release:
+                return not suffix_status
+            if normalized_release == fixed_release:
+                return suffix_status
+            return True
         except ValueError:
             return None
 

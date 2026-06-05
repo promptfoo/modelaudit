@@ -1687,6 +1687,7 @@ def test_sensitive_keyed_calls_preserve_dangerous_value_operations() -> None:
         'headers.setdefault("api_key", exec("SETTERSECRET1234567890")); '
         'Field(key="client_secret", value=compile("COMPILESECRET1234567890", "file", "exec")); '
         'parser.add_argument("--api-key", default=eval("OPTIONSECRET1234567890")); '
+        'numeric = os.getenv("CLIENT_SECRET", eval(12345678901234567890)); '
         'settings.get("region", eval("VISIBLEDEFAULT1234567890"))'
     )
 
@@ -1703,6 +1704,8 @@ def test_sensitive_keyed_calls_preserve_dangerous_value_operations() -> None:
     assert 'headers.setdefault("api_key", exec("<redacted>"))' in redacted
     assert 'Field(key="client_secret", value=compile("<redacted>", "<redacted>", "<redacted>"))' in redacted
     assert 'parser.add_argument("--api-key", default=eval("<redacted>"))' in redacted
+    assert "12345678901234567890" not in redacted
+    assert "numeric = os.getenv(\"CLIENT_SECRET\", eval('<redacted>'))" in redacted
     assert 'settings.get("region", eval("VISIBLEDEFAULT1234567890"))' in redacted
 
 
@@ -1738,6 +1741,8 @@ def test_sensitive_comparisons_preserve_dangerous_operand_calls() -> None:
     text = (
         'if api_key == eval("COMPARESECRET1234567890"): pass\n'
         'if client_secret in exec("MEMBERSHIPSECRET1234567890"): pass\n'
+        "if access_token == eval(98765432109876543210): pass\n"
+        "if session_id == 11223344556677889900: pass\n"
         'if tokenizer == eval("VISIBLECOMPARE1234567890"): pass'
     )
 
@@ -1747,6 +1752,9 @@ def test_sensitive_comparisons_preserve_dangerous_operand_calls() -> None:
     assert "MEMBERSHIPSECRET1234567890" not in redacted
     assert 'api_key == eval("<redacted>")' in redacted
     assert 'client_secret in exec("<redacted>")' in redacted
+    assert "98765432109876543210" not in redacted
+    assert "11223344556677889900" not in redacted
+    assert "access_token == eval('<redacted>')" in redacted
     assert 'tokenizer == eval("VISIBLECOMPARE1234567890")' in redacted
 
 
@@ -1787,6 +1795,9 @@ def test_redacts_sensitive_fstring_interpolations_without_losing_calls() -> None
         "second = f'client_secret={exec(\"FSTRINGCALLSECRET1234567890\")} status={status}'\n"
         'third = f\'{"api_key"}={"DYNAMICKEYSECRET1234567890"}\'\n'
         'fourth = f\'{"client_secret"}: {eval("DYNAMICKEYCALLSECRET1234567890")}\'\n'
+        "fifth = f'api_key=PREFIX-{value}-TRAILINGSECRET1234567890'\n"
+        "sixth = f'{\"api_key\"}={value}-DYNAMICTRAILINGSECRET1234567890'\n"
+        "seventh = f'client_secret={value} operation={exec(24681357902468135790)}'\n"
         "visible = f'tokenizer={value} api_key_count={count}'\n"
         "dynamic_visible = f'{\"tokenizer\"}={value}'"
     )
@@ -1797,8 +1808,12 @@ def test_redacts_sensitive_fstring_interpolations_without_losing_calls() -> None
     assert "FSTRINGCALLSECRET1234567890" not in redacted
     assert "DYNAMICKEYSECRET1234567890" not in redacted
     assert "DYNAMICKEYCALLSECRET1234567890" not in redacted
+    assert "TRAILINGSECRET1234567890" not in redacted
+    assert "DYNAMICTRAILINGSECRET1234567890" not in redacted
+    assert "24681357902468135790" not in redacted
     assert "exec('<redacted>')" in redacted
     assert "eval('<redacted>')" in redacted
+    assert "exec('<redacted>')" in redacted
     assert "f'tokenizer={value} api_key_count={count}'" in redacted
     assert "f'{\"tokenizer\"}={value}'" in redacted
     assert 'eval("1")' in redacted
