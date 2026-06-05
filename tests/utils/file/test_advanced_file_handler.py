@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
@@ -15,6 +17,7 @@ from modelaudit.utils.file.handlers import (
     MemoryMappedHandler,
     ParallelShardHandler,
     ShardedModelDetector,
+    ValidatedShardTargets,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -232,6 +235,114 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(shard_one), str(shard_two)]
         assert shard_info["total_shards"] == 2
         assert "out_of_scope_shard_count" not in shard_info
+
+    def test_detect_shards_direct_hf_snapshot_includes_blob_backed_siblings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Selecting one normal HF snapshot shard should scan its complete sibling family."""
+        hf_home = tmp_path / "hf-home"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        cache_dir = hf_home / "hub" / "models--org--model"
+        snapshot = cache_dir / "snapshots" / "abc123"
+        blobs_dir = cache_dir / "blobs"
+        snapshot.mkdir(parents=True)
+        blobs_dir.mkdir()
+        shard_paths: list[Path] = []
+        for index in range(1, 3):
+            blob = blobs_dir / f"blob-{index}"
+            blob.write_bytes(f"blob-{index}".encode())
+            shard = snapshot / f"model-{index:05d}-of-00002.safetensors"
+            shard.symlink_to(Path("../../blobs") / blob.name)
+            shard_paths.append(shard)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_paths[0]))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(path) for path in shard_paths]
+        assert shard_info["total_shards"] == 2
+        assert "missing_shard_count" not in shard_info
+        assert "out_of_scope_shard_count" not in shard_info
+
+    def test_detect_shards_rejects_duplicate_symlink_targets(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Two shard indices cannot satisfy coverage by resolving to one file."""
+        blob = tmp_path / "blob"
+        blob.write_bytes(b"shared")
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.symlink_to(blob.name)
+        shard_two.symlink_to(blob.name)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+        result = AdvancedFileHandler(str(shard_one), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["total_shards"] == 1
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["duplicate_shard_count"] == 1
+        assert shard_info["duplicate_shards"] == [str(shard_two)]
+        assert result.success is False
+        assert "duplicate_model_shard_targets" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_shards_rejects_duplicate_hardlink_targets(self, tmp_path: Path) -> None:
+        """Hardlinked shard names must not be double-counted as distinct coverage."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"shared")
+        os.link(shard_one, shard_two)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["total_shards"] == 1
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["duplicate_shard_count"] == 1
+
+    def test_validated_shard_target_mapping_rejects_alias_swap(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """An alias cannot switch to another already-approved family target."""
+        target_one = tmp_path / "target-one"
+        target_two = tmp_path / "target-two"
+        target_one.write_bytes(b"one")
+        target_two.write_bytes(b"two")
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.symlink_to(target_one.name)
+        shard_two.symlink_to(target_two.name)
+        allowed_targets: ValidatedShardTargets = {
+            str(shard_one): {
+                "resolved_path": str(target_one),
+                "device": target_one.stat().st_dev,
+                "inode": target_one.stat().st_ino,
+            },
+            str(shard_two): {
+                "resolved_path": str(target_two),
+                "device": target_two.stat().st_dev,
+                "inode": target_two.stat().st_ino,
+            },
+        }
+        shard_one.unlink()
+        shard_one.symlink_to(target_two.name)
+
+        result = AdvancedFileHandler(
+            str(shard_one),
+            CompletingShardScanner(),
+            allowed_shard_paths=[str(target_one), str(target_two)],
+            allowed_shard_targets=allowed_targets,
+        ).scan()
+
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+        assert any(check.details["reason"] == "shard_target_changed" for check in result.checks)
 
     def test_detect_shards_preserves_direct_symlink_representative_outside_scan_directory(
         self,

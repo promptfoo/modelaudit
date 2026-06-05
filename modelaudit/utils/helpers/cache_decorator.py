@@ -80,6 +80,15 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
     )
 
 
+def should_bypass_cache_for_sharded_model(file_path: str) -> bool:
+    """Bypass representative-only cache keys for files that can expand to sibling shards."""
+    try:
+        from ..file.handlers import ShardedModelDetector
+    except Exception:
+        return False
+    return ShardedModelDetector.match_shard_filename(os.path.basename(file_path)) is not None
+
+
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
     """Do not key or store terminal bounded outcomes from oversized SafeTensors framing."""
     try:
@@ -183,6 +192,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_sharded_model(file_path):
+                    logger.debug(f"Bypassing cache for sharded model family: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):

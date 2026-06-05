@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+from ..sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _trusted_hf_blobs_root
 
 if TYPE_CHECKING:
     from ...scanner_results import ScanResult
@@ -38,6 +39,8 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
+
+ValidatedShardTargets = dict[str, dict[str, int | str]]
 
 
 def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> bool:
@@ -141,6 +144,7 @@ class ShardedModelDetector:
         file_path: str,
         *,
         allowed_paths: list[str] | None = None,
+        allowed_targets: ValidatedShardTargets | None = None,
     ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
@@ -154,9 +158,20 @@ class ShardedModelDetector:
         file_name = Path(file_path).name
         dir_path = Path(file_path).parent
         requested_path = str(Path(file_path).absolute())
+        normalized_allowed_targets = (
+            {
+                os.path.normcase(os.path.normpath(os.path.abspath(source_path))): target
+                for source_path, target in allowed_targets.items()
+                if isinstance(source_path, str) and isinstance(target, dict)
+            }
+            if allowed_targets is not None
+            else None
+        )
         allowed_path_set: set[str] | None = None
         if allowed_paths is not None:
             allowed_path_set = {os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in allowed_paths}
+        elif normalized_allowed_targets is None:
+            allowed_path_set = cls._direct_hf_shard_allowed_paths(Path(file_path))
 
         for pattern in cls.SHARD_PATTERNS:
             match = re.fullmatch(pattern, file_name)
@@ -168,7 +183,9 @@ class ShardedModelDetector:
                 unreadable_shards: list[str] = []
                 out_of_scope_shards: list[str] = []
                 unvalidated_shards: list[str] = []
+                duplicate_shards: list[str] = []
                 shard_targets: dict[str, dict[str, int | str]] = {}
+                seen_target_identities: set[tuple[int | str, ...]] = set()
                 total_size = 0
                 requested_expected_total: int | None = None
                 if (match.lastindex or 0) >= 2:
@@ -177,7 +194,7 @@ class ShardedModelDetector:
                         expected_totals.add(requested_expected_total)
 
                 # Find all related shards
-                for file in dir_path.glob("*"):
+                for file in sorted(dir_path.glob("*")):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
                         candidate_expected_total: int | None = None
@@ -195,6 +212,18 @@ class ShardedModelDetector:
                             unreadable_shards.append(str(file))
                             continue
                         normalized_resolved_file = os.path.normcase(os.path.normpath(resolved_file))
+                        normalized_source_path = os.path.normcase(os.path.normpath(str(file.absolute())))
+                        expected_target = (
+                            normalized_allowed_targets.get(normalized_source_path)
+                            if normalized_allowed_targets is not None
+                            else None
+                        )
+                        if normalized_allowed_targets is not None and expected_target is None:
+                            if not _is_resolved_path_within_directory(dir_path, resolved_file):
+                                out_of_scope_shards.append(str(file))
+                            else:
+                                unvalidated_shards.append(str(file))
+                            continue
                         if allowed_path_set is not None and normalized_resolved_file not in allowed_path_set:
                             if not _is_resolved_path_within_directory(dir_path, resolved_file):
                                 out_of_scope_shards.append(str(file))
@@ -219,6 +248,32 @@ class ShardedModelDetector:
                         if not stat.S_ISREG(shard_stat.st_mode):
                             unreadable_shards.append(str(file))
                             continue
+                        if expected_target is not None:
+                            expected_path = expected_target.get("resolved_path")
+                            expected_device = expected_target.get("device")
+                            expected_inode = expected_target.get("inode")
+                            if not isinstance(expected_path, str) or normalized_resolved_file != os.path.normcase(
+                                os.path.normpath(expected_path)
+                            ):
+                                unvalidated_shards.append(str(file))
+                                continue
+                            if (
+                                isinstance(expected_device, int)
+                                and isinstance(expected_inode, int)
+                                and expected_inode
+                                and (shard_stat.st_dev, shard_stat.st_ino) != (expected_device, expected_inode)
+                            ):
+                                unvalidated_shards.append(str(file))
+                                continue
+                        target_identity: tuple[int | str, ...]
+                        if shard_stat.st_ino:
+                            target_identity = ("inode", shard_stat.st_dev, shard_stat.st_ino)
+                        else:
+                            target_identity = ("path", normalized_resolved_file)
+                        if target_identity in seen_target_identities:
+                            duplicate_shards.append(str(file))
+                            continue
+                        seen_target_identities.add(target_identity)
                         shard_size = shard_stat.st_size
                         shard_info["shards"].append(str(file))
                         shard_targets[str(file)] = {
@@ -247,6 +302,9 @@ class ShardedModelDetector:
                 if unvalidated_shards:
                     shard_info["unvalidated_shards"] = sorted(unvalidated_shards)
                     shard_info["unvalidated_shard_count"] = len(unvalidated_shards)
+                if duplicate_shards:
+                    shard_info["duplicate_shards"] = sorted(duplicate_shards)
+                    shard_info["duplicate_shard_count"] = len(duplicate_shards)
                 if expected_totals:
                     expected_total = max(expected_totals)
                     shard_info["expected_total_shards"] = expected_total
@@ -265,6 +323,35 @@ class ShardedModelDetector:
                 return shard_info
 
         return None
+
+    @classmethod
+    def _direct_hf_shard_allowed_paths(cls, file_path: Path) -> set[str] | None:
+        """Allow complete direct scans of a real HF snapshot family backed by its blobs directory."""
+        absolute_path = file_path.absolute()
+        if not _path_has_part(absolute_path, "snapshots"):
+            return None
+        cache_root = _find_hf_cache_root(absolute_path)
+        if cache_root is None:
+            return None
+        blobs_root = _trusted_hf_blobs_root(cache_root)
+        if blobs_root is None:
+            return None
+
+        allowed_paths: set[str] = set()
+        for candidate in absolute_path.parent.glob("*"):
+            try:
+                resolved_candidate = candidate.resolve(strict=True)
+                candidate_stat = os.stat(resolved_candidate, follow_symlinks=False)
+            except (OSError, RuntimeError):
+                continue
+            if not stat.S_ISREG(candidate_stat.st_mode):
+                continue
+            if _is_resolved_path_within_directory(
+                absolute_path.parent,
+                str(resolved_candidate),
+            ) or resolved_candidate.is_relative_to(blobs_root):
+                allowed_paths.add(os.path.normcase(os.path.normpath(str(resolved_candidate))))
+        return allowed_paths or None
 
     @classmethod
     def find_model_config(cls, file_path: str) -> str | None:
@@ -290,24 +377,55 @@ class ShardedModelDetector:
             if not _is_resolved_path_within_directory(dir_path, str(resolved_config)):
                 continue
             if stat.S_ISREG(config_stat.st_mode):
-                return str(resolved_config)
+                return str(config_path)
 
         return None
 
 
-def _grouped_shard_boundary_error(file_path: str, allowed_paths: list[str] | None) -> dict[str, str] | None:
+def _grouped_shard_boundary_error(
+    file_path: str,
+    allowed_paths: list[str] | None,
+    allowed_targets: ValidatedShardTargets | None = None,
+) -> dict[str, str] | None:
     """Return details when a selected shard no longer matches its validated target set."""
-    if allowed_paths is None or ShardedModelDetector.match_shard_filename(Path(file_path).name) is None:
+    if (allowed_paths is None and allowed_targets is None) or ShardedModelDetector.match_shard_filename(
+        Path(file_path).name
+    ) is None:
         return None
-    allowed_path_set = {
-        os.path.normcase(os.path.normpath(os.path.abspath(allowed_path))) for allowed_path in allowed_paths
-    }
+    allowed_path_set = (
+        {os.path.normcase(os.path.normpath(os.path.abspath(allowed_path))) for allowed_path in allowed_paths}
+        if allowed_paths is not None
+        else set()
+    )
     try:
         resolved_path = Path(file_path).resolve(strict=True)
         resolved_stat = os.stat(resolved_path, follow_symlinks=False)
     except (OSError, RuntimeError) as e:
         return {"path": file_path, "error": str(e), "reason": "shard_target_unavailable"}
-    if os.path.normcase(os.path.normpath(str(resolved_path))) not in allowed_path_set:
+    normalized_resolved_path = os.path.normcase(os.path.normpath(str(resolved_path)))
+    expected_target: dict[str, int | str] | None = None
+    if allowed_targets is not None:
+        normalized_source_path = os.path.normcase(os.path.normpath(os.path.abspath(file_path)))
+        expected_target = next(
+            (
+                target
+                for source_path, target in allowed_targets.items()
+                if os.path.normcase(os.path.normpath(os.path.abspath(source_path))) == normalized_source_path
+            ),
+            None,
+        )
+        if expected_target is None:
+            return {"path": file_path, "reason": "shard_path_outside_validated_family"}
+        expected_path = expected_target.get("resolved_path")
+        if not isinstance(expected_path, str) or normalized_resolved_path != os.path.normcase(
+            os.path.normpath(expected_path)
+        ):
+            return {
+                "path": file_path,
+                "resolved_path": str(resolved_path),
+                "reason": "shard_target_changed",
+            }
+    elif normalized_resolved_path not in allowed_path_set:
         return {
             "path": file_path,
             "resolved_path": str(resolved_path),
@@ -319,6 +437,20 @@ def _grouped_shard_boundary_error(file_path: str, allowed_paths: list[str] | Non
             "resolved_path": str(resolved_path),
             "reason": "shard_target_not_regular_file",
         }
+    if expected_target is not None:
+        expected_device = expected_target.get("device")
+        expected_inode = expected_target.get("inode")
+        if (
+            isinstance(expected_device, int)
+            and isinstance(expected_inode, int)
+            and expected_inode
+            and (resolved_stat.st_dev, resolved_stat.st_ino) != (expected_device, expected_inode)
+        ):
+            return {
+                "path": file_path,
+                "resolved_path": str(resolved_path),
+                "reason": "shard_target_identity_changed",
+            }
     return None
 
 
@@ -623,6 +755,7 @@ class AdvancedFileHandler:
         progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 7200,  # 2 hours for large models
         allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: ValidatedShardTargets | None = None,
     ):
         """
         Initialize advanced file handler.
@@ -638,13 +771,21 @@ class AdvancedFileHandler:
         self.progress_callback = progress_callback
         self.timeout = timeout
         self.start_time = time.time()
-        self.shard_boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths)
+        self.shard_boundary_error = _grouped_shard_boundary_error(
+            file_path,
+            allowed_shard_paths,
+            allowed_shard_targets,
+        )
 
         # Check for sharded model
         self.shard_info = (
             None
             if self.shard_boundary_error is not None
-            else ShardedModelDetector.detect_shards(file_path, allowed_paths=allowed_shard_paths)
+            else ShardedModelDetector.detect_shards(
+                file_path,
+                allowed_paths=allowed_shard_paths,
+                allowed_targets=allowed_shard_targets,
+            )
         )
 
         # Get file/model size
@@ -772,6 +913,7 @@ class AdvancedFileHandler:
             unreadable_count = self.shard_info.get("unreadable_shard_count")
             out_of_scope_count = self.shard_info.get("out_of_scope_shard_count")
             unvalidated_count = self.shard_info.get("unvalidated_shard_count")
+            duplicate_count = self.shard_info.get("duplicate_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
             if isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
@@ -780,6 +922,8 @@ class AdvancedFileHandler:
                 _mark_inconclusive_scan_outcome(result, "unreadable_model_shards")
             if isinstance(unvalidated_count, int) and unvalidated_count > 0:
                 _mark_inconclusive_scan_outcome(result, "unvalidated_model_shards")
+            if isinstance(duplicate_count, int) and duplicate_count > 0:
+                _mark_inconclusive_scan_outcome(result, "duplicate_model_shard_targets")
             if isinstance(missing_count, int) and missing_count > 0:
                 result.add_check(
                     name="Sharded Model Coverage Check",
@@ -800,6 +944,8 @@ class AdvancedFileHandler:
                         "out_of_scope_shards": self.shard_info.get("out_of_scope_shards", []),
                         "unvalidated_shard_count": self.shard_info.get("unvalidated_shard_count", 0),
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
+                        "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
+                        "duplicate_shards": self.shard_info.get("duplicate_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "missing_model_shards",
@@ -822,6 +968,8 @@ class AdvancedFileHandler:
                         "unreadable_shards": self.shard_info.get("unreadable_shards", []),
                         "unvalidated_shard_count": self.shard_info.get("unvalidated_shard_count", 0),
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
+                        "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
+                        "duplicate_shards": self.shard_info.get("duplicate_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "out_of_scope_model_shards",
@@ -839,6 +987,8 @@ class AdvancedFileHandler:
                         "unreadable_shards": self.shard_info.get("unreadable_shards", []),
                         "unvalidated_shard_count": self.shard_info.get("unvalidated_shard_count", 0),
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
+                        "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
+                        "duplicate_shards": self.shard_info.get("duplicate_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "unreadable_model_shards",
@@ -860,6 +1010,24 @@ class AdvancedFileHandler:
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "unvalidated_model_shards",
+                    },
+                )
+            if isinstance(duplicate_count, int) and duplicate_count > 0:
+                result.add_check(
+                    name="Sharded Model Coverage Check",
+                    passed=False,
+                    message=(
+                        f"Skipped {duplicate_count} model shard name(s) resolving to duplicate targets; "
+                        "scan coverage is incomplete."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    details={
+                        "present_total_shards": self.shard_info.get("total_shards"),
+                        "duplicate_shard_count": duplicate_count,
+                        "duplicate_shards": self.shard_info.get("duplicate_shards", []),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "duplicate_model_shard_targets",
                     },
                 )
         result.finish(success=shard_scan_success and not result.has_errors and "scan_outcome" not in result.metadata)
@@ -911,7 +1079,12 @@ class AdvancedFileHandler:
         return result
 
 
-def should_use_advanced_handler(file_path: str, *, allowed_shard_paths: list[str] | None = None) -> bool:
+def should_use_advanced_handler(
+    file_path: str,
+    *,
+    allowed_shard_paths: list[str] | None = None,
+    allowed_shard_targets: ValidatedShardTargets | None = None,
+) -> bool:
     """
     Check if file should use advanced file handler.
 
@@ -922,11 +1095,15 @@ def should_use_advanced_handler(file_path: str, *, allowed_shard_paths: list[str
     Returns:
         True if advanced handler should be used
     """
-    if _grouped_shard_boundary_error(file_path, allowed_shard_paths) is not None:
+    if _grouped_shard_boundary_error(file_path, allowed_shard_paths, allowed_shard_targets) is not None:
         return True
 
     # Check for sharded model
-    if ShardedModelDetector.detect_shards(file_path, allowed_paths=allowed_shard_paths):
+    if ShardedModelDetector.detect_shards(
+        file_path,
+        allowed_paths=allowed_shard_paths,
+        allowed_targets=allowed_shard_targets,
+    ):
         return True
 
     # Check file size
@@ -943,6 +1120,7 @@ def scan_advanced_large_file(
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
     allowed_shard_paths: list[str] | None = None,
+    allowed_shard_targets: ValidatedShardTargets | None = None,
 ) -> "ScanResult":
     """
     Scan a large file with advanced handler.
@@ -961,7 +1139,7 @@ def scan_advanced_large_file(
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
 
-    boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths)
+    boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths, allowed_shard_targets)
     if boundary_error is not None:
         return _shard_boundary_failure_result(scanner.name, file_path, boundary_error)
 
@@ -972,13 +1150,21 @@ def scan_advanced_large_file(
     # A representative-file cache key cannot safely describe sibling shard
     # targets, identities, or coverage changes. Re-evaluate sharded families on
     # every scan so retargeted aliases and missing members fail closed.
-    if ShardedModelDetector.detect_shards(file_path, allowed_paths=allowed_shard_paths) is not None:
+    if (
+        ShardedModelDetector.detect_shards(
+            file_path,
+            allowed_paths=allowed_shard_paths,
+            allowed_targets=allowed_shard_targets,
+        )
+        is not None
+    ):
         return _scan_advanced_large_file_internal(
             file_path,
             scanner,
             progress_callback,
             timeout,
             allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
         )
 
     # If caching is disabled, proceed with direct scan
@@ -989,6 +1175,7 @@ def scan_advanced_large_file(
             progress_callback,
             timeout,
             allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
         )
 
     # Use cache manager for advanced large file scans
@@ -1013,6 +1200,7 @@ def scan_advanced_large_file(
                 progress_callback,
                 timeout,
                 allowed_shard_paths=allowed_shard_paths,
+                allowed_shard_targets=allowed_shard_targets,
             )
             return result.to_dict()
 
@@ -1037,6 +1225,7 @@ def scan_advanced_large_file(
             progress_callback,
             timeout,
             allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
         )
 
 
@@ -1046,6 +1235,7 @@ def _scan_advanced_large_file_internal(
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
     allowed_shard_paths: list[str] | None = None,
+    allowed_shard_targets: ValidatedShardTargets | None = None,
 ) -> "ScanResult":
     """
     Internal implementation of advanced large file scanning (cache-agnostic).
@@ -1065,5 +1255,6 @@ def _scan_advanced_large_file_internal(
         progress_callback,
         timeout,
         allowed_shard_paths=allowed_shard_paths,
+        allowed_shard_targets=allowed_shard_targets,
     )
     return handler.scan()

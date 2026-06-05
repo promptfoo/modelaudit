@@ -68,3 +68,18 @@ def _find_hf_cache_root(path: Path) -> Path | None:
             return candidate
 
     return None
+
+
+def _trusted_hf_blobs_root(cache_root: Path) -> Path | None:
+    """Return the canonical blobs directory only when it stays inside the model cache."""
+    blobs_root = cache_root / "blobs"
+    try:
+        if blobs_root.is_symlink():
+            return None
+        resolved_cache_root = cache_root.resolve(strict=True)
+        resolved_blobs_root = blobs_root.resolve(strict=True)
+        if not resolved_blobs_root.is_dir() or not resolved_blobs_root.is_relative_to(resolved_cache_root):
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return resolved_blobs_root
