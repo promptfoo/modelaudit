@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
+- fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
+- omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
+- block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
+- add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
+- redact and detect secrets in R serialized executable samples across native assignment syntax
+- redact authorization aliases across structured, malformed, subscripted, and R scanner evidence
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
 - fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
@@ -32,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
 - preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
+- preserve late `runpy` execution findings across bounded state updates, restoration, and builtin shadowing
 - mark embedded Python/JIT byte and snippet budget exhaustion as incomplete coverage instead of clean scans
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
 - resolve embedded `ctypes` loads through more CDLL-subclass construction forms (`__new__` returning inside `try`/`for`/`while`/`with`, `super()`/`*args` initializer forwarding) and indirect loader/controller bindings (conditional, boolean, walrus, and loop-bound expressions)
@@ -44,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- bound Jinja sandbox safety probes so render amplification fails closed instead of exhausting scanner resources
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
 - redact secret previews and URL path credentials from metadata scanner findings
@@ -91,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
+- enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
@@ -106,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- fail closed when scanner selection disables required NumPy object-dtype embedded pickle analysis
 - classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
 - classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
 - classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
