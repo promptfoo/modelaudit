@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
-from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
+from modelaudit.integrations.sbom_generator import (
+    _supports_descriptor_walk,
+    generate_sbom,
+    generate_sbom_pydantic,
+)
 from modelaudit.models import FileHashesModel, FileMetadataModel, create_initial_audit_result
 
 
@@ -66,7 +70,7 @@ def test_sbom_does_not_hash_outside_root_symlink(
     )
     dict_component = _component_named(dict_sbom, "external.bin")
     assert _sha256_values(dict_component) == []
-    assert _property_value(dict_component, "size") == str(os.lstat(link).st_size)
+    assert _property_value(dict_component, "size") == "0"
 
     pydantic_result = create_initial_audit_result()
     pydantic_result.file_metadata[str(link)] = FileMetadataModel(
@@ -76,7 +80,7 @@ def test_sbom_does_not_hash_outside_root_symlink(
     pydantic_sbom: dict[str, Any] = json.loads(generate_sbom_pydantic([str(scan_root)], pydantic_result))
     pydantic_component = _component_named(pydantic_sbom, "external.bin")
     assert _sha256_values(pydantic_component) == []
-    assert _property_value(pydantic_component, "size") == str(os.lstat(link).st_size)
+    assert _property_value(pydantic_component, "size") == "0"
 
 
 def test_sbom_hashes_ordinary_files(tmp_path: Path) -> None:
@@ -104,7 +108,7 @@ def test_sbom_hashes_in_root_symlink_targets(
     target.write_bytes(content)
 
     link = scan_root / "weights-link.bin"
-    link.symlink_to(target)
+    link.symlink_to(target.name)
 
     pydantic_result = create_initial_audit_result()
     sbom_data: dict[str, Any] = json.loads(generate_sbom_pydantic([str(scan_root)], pydantic_result))
@@ -130,26 +134,29 @@ def test_sbom_omits_hash_when_in_root_symlink_target_changes_during_validation(
 
     link = scan_root / "swapped.bin"
     link.symlink_to(inside_file)
-    real_realpath = os.path.realpath
+    real_readlink = os.readlink
     swapped = False
 
-    def _swap_link_after_resolution(path: str) -> str:
+    def _swap_link_before_read(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> str:
         nonlocal swapped
-        resolved = real_realpath(path)
-        if path == str(link) and not swapped:
+        if path == link.name and dir_fd is not None and not swapped:
             swapped = True
             link.unlink()
             link.symlink_to(outside_file)
-        return resolved
+        return real_readlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os.path, "realpath", _swap_link_after_resolution)
+    monkeypatch.setattr(os, "readlink", _swap_link_before_read)
 
     sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
     component = _component_named(sbom_data, "swapped.bin")
 
     assert _sha256_values(component) == []
     assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
-    assert _property_value(component, "size") == str(os.lstat(link).st_size)
+    assert _property_value(component, "size") == "0"
 
 
 def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_open(
@@ -168,13 +175,19 @@ def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_o
     real_open = os.open
     swapped = False
 
-    def _swap_file_before_open(path: str, flags: int, mode: int = 0o777) -> int:
+    def _swap_file_before_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         nonlocal swapped
-        if path == str(model_file) and not swapped:
+        if path in {str(model_file), model_file.name} and not swapped:
             swapped = True
             model_file.unlink()
             model_file.symlink_to(outside_file)
-        return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", _swap_file_before_open)
 
@@ -183,7 +196,54 @@ def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_o
 
     assert _sha256_values(component) == []
     assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
-    assert _property_value(component, "size") == str(os.lstat(model_file).st_size)
+    assert _property_value(component, "size") == "0"
+
+
+def test_sbom_hashing_stays_bound_to_open_parent_directory_during_swap(
+    tmp_path: Path,
+    requires_symlinks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    parent = scan_root / "models"
+    parent.mkdir(parents=True)
+    model_file = parent / "model.bin"
+    inside_content = b"descriptor-bound in-root model"
+    model_file.write_bytes(inside_content)
+
+    outside_parent = tmp_path / "outside-models"
+    outside_parent.mkdir()
+    outside_content = b"outside model selected by a parent symlink swap"
+    (outside_parent / model_file.name).write_bytes(outside_content)
+    moved_parent = scan_root / "models-original"
+
+    real_open = os.open
+    swapped = False
+
+    def _swap_parent_before_file_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == model_file.name and dir_fd is not None and not swapped:
+            swapped = True
+            parent.rename(moved_parent)
+            parent.symlink_to(outside_parent, target_is_directory=True)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _swap_parent_before_file_open)
+
+    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
+    component = _component_named(sbom_data, model_file.name)
+
+    if _supports_descriptor_walk():
+        assert _sha256_values(component) == [hashlib.sha256(inside_content).hexdigest()]
+    else:
+        assert _sha256_values(component) == []
+    assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
 
 
 def test_sbom_omits_recorded_hash_when_listed_symlink_disappears_after_containment_check(
@@ -200,18 +260,21 @@ def test_sbom_omits_recorded_hash_when_listed_symlink_disappears_after_containme
 
     link = scan_root / "disappearing.bin"
     link.symlink_to(inside_file)
-    real_realpath = os.path.realpath
+    real_readlink = os.readlink
     removed = False
 
-    def _remove_link_after_resolution(path: str) -> str:
+    def _remove_link_before_read(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> str:
         nonlocal removed
-        resolved = real_realpath(path)
-        if path == str(link) and not removed:
+        if path == link.name and dir_fd is not None and not removed:
             removed = True
             link.unlink()
-        return resolved
+        return real_readlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os.path, "realpath", _remove_link_after_resolution)
+    monkeypatch.setattr(os, "readlink", _remove_link_before_read)
     fake_metadata = {
         "file_size": len(outside_content),
         "file_hashes": {"sha256": outside_hash},
@@ -227,7 +290,7 @@ def test_sbom_omits_recorded_hash_when_listed_symlink_disappears_after_containme
     assert _property_value(component, "size") == "0"
 
 
-def test_sbom_preserves_recorded_hash_for_input_missing_before_generation(tmp_path: Path) -> None:
+def test_sbom_omits_recorded_hash_for_local_input_missing_before_generation(tmp_path: Path) -> None:
     missing_file = tmp_path / "missing.bin"
     recorded_content = b"metadata-only component"
     recorded_hash = hashlib.sha256(recorded_content).hexdigest()
@@ -241,5 +304,121 @@ def test_sbom_preserves_recorded_hash_for_input_missing_before_generation(tmp_pa
     )
     component = _component_named(sbom_data, "missing.bin")
 
+    assert _sha256_values(component) == []
+    assert _property_value(component, "size") == "0"
+
+
+def test_sbom_omits_recorded_hash_for_removed_outside_symlink(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    outside_file = tmp_path / "outside.bin"
+    outside_content = b"outside symlink target scanned before the link disappeared"
+    outside_file.write_bytes(outside_content)
+    outside_hash = hashlib.sha256(outside_content).hexdigest()
+    link = tmp_path / "removed-link.bin"
+    link.symlink_to(outside_file)
+    link.unlink()
+
+    metadata = {
+        "file_size": len(outside_content),
+        "file_hashes": {"sha256": outside_hash},
+    }
+    sbom_data: dict[str, Any] = json.loads(
+        generate_sbom([str(link)], {"issues": [], "file_metadata": {str(link): metadata}})
+    )
+    component = _component_named(sbom_data, "removed-link.bin")
+
+    assert _sha256_values(component) == []
+    assert _property_value(component, "size") == "0"
+
+
+def test_sbom_preserves_recorded_hash_for_remote_identifier() -> None:
+    remote_path = "s3://model-bucket/model.bin"
+    recorded_content = b"remote metadata-only component"
+    recorded_hash = hashlib.sha256(recorded_content).hexdigest()
+    metadata = {
+        "file_size": len(recorded_content),
+        "file_hashes": {"sha256": recorded_hash},
+    }
+
+    sbom_data: dict[str, Any] = json.loads(
+        generate_sbom([remote_path], {"issues": [], "file_metadata": {remote_path: metadata}})
+    )
+    component = _component_named(sbom_data, "model.bin")
+
     assert _sha256_values(component) == [recorded_hash]
     assert _property_value(component, "size") == str(len(recorded_content))
+
+
+def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamed_path = tmp_path / "streamed.bin"
+    recorded_content = b"ephemeral streamed component"
+    recorded_hash = hashlib.sha256(recorded_content).hexdigest()
+    metadata = {
+        "file_size": len(recorded_content),
+        "file_hashes": {"sha256": recorded_hash},
+    }
+    results = {
+        "issues": [],
+        "assets": [{"path": str(streamed_path), "type": "streaming"}],
+        "file_metadata": {str(streamed_path): metadata},
+    }
+    real_open = os.open
+
+    def _reject_late_streamed_path_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == str(streamed_path):
+            raise AssertionError("missing streamed paths must use trusted metadata without reopening")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _reject_late_streamed_path_open)
+
+    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(streamed_path)], results))
+    component = _component_named(sbom_data, streamed_path.name)
+
+    assert _sha256_values(component) == [recorded_hash]
+    assert _property_value(component, "size") == str(len(recorded_content))
+
+
+def test_sbom_does_not_hash_replaced_scan_root(
+    tmp_path: Path,
+    requires_symlinks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    (scan_root / "inside.bin").write_bytes(b"original contained file")
+    moved_root = tmp_path / "moved-root"
+    outside_root = tmp_path / "outside-root"
+    outside_root.mkdir()
+    outside_content = b"outside directory content must not be hashed"
+    (outside_root / "secret.bin").write_bytes(outside_content)
+    outside_hash = hashlib.sha256(outside_content).hexdigest()
+    real_walk = os.walk
+    swapped = False
+
+    def _replace_root_before_walk(path: str) -> Any:
+        nonlocal swapped
+        if path == str(scan_root) and not swapped:
+            swapped = True
+            scan_root.rename(moved_root)
+            scan_root.symlink_to(outside_root, target_is_directory=True)
+        return real_walk(path)
+
+    monkeypatch.setattr(os, "walk", _replace_root_before_walk)
+
+    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
+    component = _component_named(sbom_data, "secret.bin")
+
+    assert _sha256_values(component) == []
+    assert outside_hash not in json.dumps(sbom_data)
+    assert _property_value(component, "size") == "0"

@@ -1699,7 +1699,7 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "streaming",
                 "size": file_sizes[str(file_path)],
             }
             for file_path in streamed_files
@@ -1772,7 +1772,7 @@ def test_scan_huggingface_sbom_excludes_download_cache_files(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "streaming",
                 "size": len(content),
             }
             for file_path, content in real_files.items()
