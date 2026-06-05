@@ -1410,6 +1410,8 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     layer_name_secret = "H5_LAYER_NAME_SECRET"
     dangerous_module_secret = "H5_DANGEROUS_MODULE_SECRET"
     safe_module_secret = "H5_SAFE_MODULE_SECRET"
+    variadic_identifier_secret = "H5_VARIADIC_IDENTIFIER_SECRET"
+    variadic_identifier = f"aws_secret_access_key_{variadic_identifier_secret}"
 
     dict_code = compile(
         f"client_secret = '{dict_secret}'\nimport os\nos.system('id')",
@@ -1434,7 +1436,10 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                         "class_name": "Lambda",
                         "config": {
                             "name": f"direct_lambda?token={layer_name_secret}",
-                            "function": f"lambda x: (eval('1'), '{direct_secret}', x)[-1]",
+                            "function": (
+                                f"lambda *{variadic_identifier}: "
+                                f"(eval('1'), '{direct_secret}', {variadic_identifier})[-1]"
+                            ),
                         },
                     },
                     {
@@ -1490,6 +1495,8 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     assert all("code_preview" not in check.details for check in scanner_result.checks)
     assert any(
         check.name == "Lambda Layer Code Analysis"
+        and check.details.get("code_analysis_omitted") == "lambda_code_analysis_may_contain_sensitive_identifiers"
+        and "code_analysis" not in check.details
         and check.details.get("code_preview_omitted") == "lambda_code_may_contain_sensitive_literals"
         for check in scanner_result.checks
     )
@@ -1522,6 +1529,7 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         layer_name_secret,
         dangerous_module_secret,
         safe_module_secret,
+        variadic_identifier_secret,
     ):
         assert secret not in json_output
         assert secret not in sarif_output

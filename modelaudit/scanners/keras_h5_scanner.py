@@ -1079,7 +1079,7 @@ class KerasH5Scanner(BaseScanner):
 
                 if is_valid:
                     # It's valid Python! Check if it's dangerous
-                    is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
+                    is_dangerous, _ = is_code_potentially_dangerous(function_str, "low")
 
                     # Check if code is dangerous
                     if is_dangerous:
@@ -1091,7 +1091,7 @@ class KerasH5Scanner(BaseScanner):
                             location=self.current_file_path,
                             details={
                                 "layer_class": "Lambda",
-                                "code_analysis": risk_desc,
+                                "code_analysis_omitted": "lambda_code_analysis_may_contain_sensitive_identifiers",
                                 "code_preview_omitted": "lambda_code_may_contain_sensitive_literals",
                             },
                             rule_code="S507",  # Python embedded code
