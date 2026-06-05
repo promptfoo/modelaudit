@@ -168,6 +168,9 @@ DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
     + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
 )
 DOCUMENTATION_SHELL_PROMPT = rb"(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])\s*)?"
+DOCUMENTATION_ROOT_PROMPT_NON_SHELL_PREFIX_PATTERN = re.compile(
+    rb"^(?:[A-Za-z][A-Za-z0-9 _-]{0,31}\s*:\s+|(?:ADD|CMD|ENTRYPOINT|RUN)\b)"
+)
 DOCUMENTATION_INLINE_CODE_OPEN = rb"(?:`{1,3}\s*)?"
 DOCUMENTATION_COMMAND_LABEL = rb"(?:[A-Za-z][A-Za-z0-9 _-]{0,31}\s*:\s*)?"
 DOCUMENTATION_DOCKER_RUN_OPTION = rb"--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
@@ -226,7 +229,7 @@ DOCUMENTATION_CERTUTIL_COMMAND_PATTERN = re.compile(
     + DOCUMENTATION_COMMAND_PATH_PREFIX
     + rb"certutil(?:\.exe)?\b"
     + rb"(?=[^\r\n]{0,4096}(?:^|\s)-urlcache(?:\s|$))"
-    + rb"(?:\s+-[A-Za-z][A-Za-z0-9_-]*){1,8}\s+https?://",
+    + rb"(?:\s+-[A-Za-z][A-Za-z0-9_-]*){1,8}\s+[\"']?https?://",
     re.IGNORECASE,
 )
 DOCUMENTATION_NETCAT_OPTION_WITH_ARGUMENT = (
@@ -620,6 +623,7 @@ class TextScanner(BaseScanner):
         stack: list[tuple[str, bool]] = []
         previous: tokenize.TokenInfo | None = None
         before_previous: tokenize.TokenInfo | None = None
+        previous_closed_subscript = False
         expression_keywords = {
             "and",
             "await",
@@ -648,6 +652,7 @@ class TextScanner(BaseScanner):
             for current in tokens:
                 if current.type in ignored_token_types:
                     continue
+                current_closed_subscript = False
                 if current.type == token.OP and current.string in "([{":
                     name_starts_call = (
                         previous is not None
@@ -659,17 +664,30 @@ class TextScanner(BaseScanner):
                             or (before_previous.type == token.NAME and before_previous.string in expression_keywords)
                         )
                     )
-                    is_call = current.string == "(" and (
-                        name_starts_call
-                        or (previous is not None and previous.type == token.OP and previous.string in {")", "]"})
+                    follows_callable_expression = (
+                        previous is not None
+                        and previous.type == token.OP
+                        and (previous.string == ")" or (previous.string == "]" and previous_closed_subscript))
                     )
-                    stack.append((current.string, is_call))
+                    is_call = current.string == "(" and (name_starts_call or follows_callable_expression)
+                    is_subscript = (
+                        current.string == "["
+                        and previous is not None
+                        and previous.end == current.start
+                        and (
+                            (previous.type == token.NAME and not keyword.iskeyword(previous.string))
+                            or (previous.type == token.OP and previous.string in {")", "]"})
+                        )
+                    )
+                    stack.append((current.string, is_call or is_subscript))
                 elif current.type == token.OP and current.string in ")]}":
                     expected = {")": "(", "]": "[", "}": "{"}[current.string]
                     if stack and stack[-1][0] == expected:
-                        stack.pop()
+                        _, opens_callable_expression = stack.pop()
+                        current_closed_subscript = current.string == "]" and opens_callable_expression
                 before_previous = previous
                 previous = current
+                previous_closed_subscript = current_closed_subscript
         except (IndentationError, tokenize.TokenError):
             # Incomplete prefixes are expected; the partial stack still identifies an open call.
             return any(opening == "(" and is_call for opening, is_call in stack)
@@ -794,10 +812,12 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
             or DOCUMENTATION_DOCKER_ADD_PATTERN.match(stripped) is not None
         )
-        if cls._documentation_shell_comment_before_position(line, position) and not (
-            stripped.startswith(b"#") and shell_command_is_actionable
-        ):
-            return False
+        if cls._documentation_shell_comment_before_position(line, position):
+            if not stripped.startswith(b"#") or not shell_command_is_actionable:
+                return False
+            root_prompt_command = stripped[1:].lstrip()
+            if DOCUMENTATION_ROOT_PROMPT_NON_SHELL_PREFIX_PATTERN.match(root_prompt_command) is not None:
+                return False
         if (
             shell_command_is_actionable
             or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
