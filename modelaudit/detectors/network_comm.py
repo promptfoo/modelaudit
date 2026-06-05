@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any, ClassVar
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
@@ -25,6 +25,10 @@ _URI_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URI_IN_BYTES_PATTERN = re.compile(_URI_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
+_ENCODED_URI_SCHEME_PATTERN = re.compile(
+    r"[a-z][a-z0-9+.-]{0,31}%(?:25)*3a%(?:25)*2f%(?:25)*2f",
+    re.IGNORECASE,
+)
 _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     r"^(?:"
     r"api_?key|x_?api_?key|(?:aws_?)?access_?key(?:_?id)?|(?:aws_?)?secret_?access_?key|"
@@ -98,6 +102,7 @@ _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
 )
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
 _EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
+_OVER_ENCODED_NESTED_URL = "overencoded://redacted.invalid/nested-endpoint"
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
@@ -138,6 +143,18 @@ def _decode_path_token(value: str) -> str:
             return value
         value = decoded
     if unquote(value) != value:
+        return _PATH_TOKEN_DECODE_LIMIT_SENTINEL
+    return value
+
+
+def _decode_query_component(value: str) -> str:
+    """Decode nested query escaping, including form-style plus separators."""
+    for _ in range(_MAX_PATH_TOKEN_DECODE_PASSES):
+        decoded = unquote_plus(value)
+        if decoded == value:
+            return value
+        value = decoded
+    if unquote_plus(value) != value:
         return _PATH_TOKEN_DECODE_LIMIT_SENTINEL
     return value
 
@@ -847,7 +864,7 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
 
     match_text = data[match_start:match_end].decode("utf-8", errors="ignore")
     snippet_parts = [match_text]
-    for url_match in _URL_IN_BYTES_PATTERN.finditer(data, start, end):
+    for url_match in _URI_IN_BYTES_PATTERN.finditer(data, start, end):
         raw_url = url_match.group().decode("utf-8", errors="ignore")
         source_quote = _source_quote_before_url(data, url_match.start())
         trimmed_url = _trim_source_literal_url(raw_url, source_quote)
@@ -998,7 +1015,7 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
                 return True
 
     field = component[field_start:field_end]
-    decoded_field = _decode_path_token(field)
+    decoded_field = _decode_query_component(field)
     if decoded_field == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
         return True
     delimited_parts = [part for part in re.split(r"(?i)&amp;|[/,:;&\s]", decoded_field) if part]
@@ -1067,7 +1084,9 @@ def _is_split_sensitive_url_value(data: bytes, match_start: int) -> bool:
     if not source_composition and not path_continuation:
         return False
 
-    url = preceding_url_match.group().decode("utf-8", errors="ignore")
+    raw_url = preceding_url_match.group().decode("utf-8", errors="ignore")
+    source_quote = _source_quote_before_url(data, preceding_url_match.start())
+    url = _trim_source_literal_url(raw_url, source_quote)
     return _url_path_awaits_sensitive_value(url)
 
 
@@ -1105,14 +1124,36 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
         for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
             _key, separator, value = field.partition("=")
             candidate = value if separator else field
-            decoded = _decode_path_token(candidate)
-            if decoded in {candidate, _PATH_TOKEN_DECODE_LIMIT_SENTINEL}:
+            decoded = candidate
+            decode_limit_exhausted = False
+            for _ in range(_MAX_PATH_TOKEN_DECODE_PASSES):
+                next_decoded = unquote_plus(decoded)
+                if next_decoded == decoded:
+                    break
+                decoded = next_decoded
+            else:
+                next_decoded = unquote_plus(decoded)
+                if next_decoded != decoded:
+                    decoded = next_decoded
+                    decode_limit_exhausted = True
+
+            if decoded == candidate:
                 continue
+            found_nested_url = False
             for match in _URI_IN_TEXT_PATTERN.finditer(decoded):
                 nested_url = match.group()
                 if nested_url not in seen:
                     seen.add(nested_url)
+                    found_nested_url = True
                     yield nested_url
+            if (
+                decode_limit_exhausted
+                and not found_nested_url
+                and _ENCODED_URI_SCHEME_PATTERN.search(decoded) is not None
+                and _OVER_ENCODED_NESTED_URL not in seen
+            ):
+                seen.add(_OVER_ENCODED_NESTED_URL)
+                yield _OVER_ENCODED_NESTED_URL
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (

