@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- stream Hugging Face files through case-insensitive suffix filtering with bounded extensionless coverage
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
 - classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
 - classify unavailable Joblib reads as inconclusive rather than security findings
