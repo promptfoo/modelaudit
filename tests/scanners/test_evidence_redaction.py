@@ -2,6 +2,7 @@
 
 import ast
 import json
+import time
 from urllib.parse import quote
 
 import pytest
@@ -11,9 +12,65 @@ from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
     REDACTION_LOOKAHEAD_CHARS,
+    is_sensitive_evidence_key,
     redact_evidence_string,
     redact_evidence_value,
 )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "auth",
+        "basic_auth",
+        "cookie",
+        "set_cookie",
+        "session_id",
+        "sessionid",
+        "runtime_auth",
+        "runtime_hook_cookie",
+        "auth_header",
+        "authentication_header",
+        "cookie_header",
+        "set_cookie_header",
+        "session_id_header",
+        "runtime_hook_cookie_header",
+    ],
+)
+def test_sensitive_evidence_key_recognizes_credential_containers(key: str) -> None:
+    assert is_sensitive_evidence_key(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["auth_timeout", "cookie_count", "session_timeout", "authorization_status", "oauth", "runtime_oauth"],
+)
+def test_sensitive_evidence_key_preserves_benign_near_matches(key: str) -> None:
+    assert not is_sensitive_evidence_key(key)
+
+
+def test_sensitive_evidence_key_fails_closed_before_long_key_regexes() -> None:
+    long_near_match = ("a." * 10_000) + "oauthx"
+
+    start = time.perf_counter()
+    sensitive = is_sensitive_evidence_key(long_near_match)
+    elapsed = time.perf_counter() - start
+
+    assert sensitive
+    assert elapsed < 1.0
+
+
+def test_redaction_handles_unicode_tokenizer_errors() -> None:
+    secret = "REAL_UNICODE_TOKENIZER_SECRET"
+    comparison_secret = "REAL_UNICODE_COMPARISON_SECRET"
+
+    redacted = redact_evidence_string(f"curl https://example.com/?token={secret}\rو", max_chars=200)
+    comparison_redacted = redact_evidence_string(f"token == '{comparison_secret}'\rو", max_chars=200)
+
+    assert secret not in redacted
+    assert comparison_secret not in comparison_redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert REDACTED_EVIDENCE_VALUE in comparison_redacted
 
 
 def test_redacts_compound_credential_assignments() -> None:

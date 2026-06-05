@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -17,6 +18,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from ._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTION_LOOKAHEAD_CHARS,
+    STANDALONE_SECRET_RE,
     is_sensitive_evidence_key,
     redact_evidence_string,
 )
@@ -90,12 +92,98 @@ _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
 _FUNCTION_ATTRIBUTE_SUFFIX = ".func.name"
+_ESCAPED_EVIDENCE_ASCII_RE = re.compile(
+    r"\\(?:"
+    r"(?P<continuation>\r\n|\r|\n)|"
+    r"u00(?P<unicode>[0-7][0-9A-Fa-f])|"
+    r"U000000(?P<long_unicode>[0-7][0-9A-Fa-f])|"
+    r"u\{0{0,4}(?P<braced_unicode>[2-7][0-9A-Fa-f])\}|"
+    r"N\{(?P<named_unicode>[A-Za-z0-9 -]{1,64})\}|"
+    r"x(?P<hex>[2-7][0-9A-Fa-f])|"
+    r"(?P<octal>[0-7]{1,3})|"
+    r"(?P<literal>[\\/:=?&#@])"
+    r")"
+)
+_UNRESOLVED_ESCAPED_EVIDENCE_RE = re.compile(r"\\(?:u(?:[0-9A-Fa-f]|\{)|U[0-9A-Fa-f]|N\{|x[0-9A-Fa-f]|[0-7])")
+_MAX_ESCAPED_EVIDENCE_DECODE_PASSES = 8
+_MAX_ESCAPED_EVIDENCE_SEQUENCE_CHARS = 68
+_PLAIN_EVIDENCE_IDENTIFIER_RE = re.compile(r"\A[a-z][a-z0-9_-]{0,63}\Z")
+_SENSITIVE_IDENTIFIER_HINT_RE = re.compile(
+    r"(?i)(?:access|api|auth|cookie|credential|key|pass|private|secret|session|signature|token)"
+)
+
+
+def _normalize_metagraph_evidence_escapes(text: str) -> str:
+    """Expose bounded printable-ASCII escapes before evidence redaction."""
+
+    def decode_escape(match: re.Match[str]) -> str:
+        if match.group("continuation") is not None:
+            return ""
+        if match.group("unicode") is not None:
+            decoded = chr(int(match.group("unicode"), 16))
+        elif match.group("long_unicode") is not None:
+            decoded = chr(int(match.group("long_unicode"), 16))
+        elif match.group("braced_unicode") is not None:
+            decoded = chr(int(match.group("braced_unicode"), 16))
+        elif match.group("named_unicode") is not None:
+            try:
+                decoded = unicodedata.lookup(match.group("named_unicode").upper())
+            except KeyError:
+                return match.group(0)
+        elif match.group("hex") is not None:
+            decoded = chr(int(match.group("hex"), 16))
+        elif match.group("octal") is not None:
+            decoded = chr(int(match.group("octal"), 8))
+        else:
+            literal = match.group("literal")
+            assert literal is not None
+            decoded = literal
+        return decoded if decoded.isascii() and decoded.isprintable() else match.group(0)
+
+    normalized = text
+    for _ in range(_MAX_ESCAPED_EVIDENCE_DECODE_PASSES):
+        next_value = _ESCAPED_EVIDENCE_ASCII_RE.sub(decode_escape, normalized)
+        if next_value == normalized:
+            return REDACTED_EVIDENCE_VALUE if _UNRESOLVED_ESCAPED_EVIDENCE_RE.search(normalized) else normalized
+        normalized = next_value
+
+    if _UNRESOLVED_ESCAPED_EVIDENCE_RE.search(normalized):
+        return REDACTED_EVIDENCE_VALUE
+    return normalized
+
+
+def _is_plain_metagraph_evidence(text: str) -> bool:
+    """Recognize small generated-style identifiers that cannot contain credentials."""
+
+    def is_plain_identifier(identifier: str) -> bool:
+        return bool(
+            _PLAIN_EVIDENCE_IDENTIFIER_RE.fullmatch(identifier)
+            and not _SENSITIVE_IDENTIFIER_HINT_RE.search(identifier)
+            and not STANDALONE_SECRET_RE.search(identifier)
+        )
+
+    if is_plain_identifier(text):
+        return True
+    if text.startswith("node: "):
+        return is_plain_identifier(text.removeprefix("node: "))
+    if text.startswith("function: "):
+        function_name, separator, node_name = text.removeprefix("function: ").partition(", node: ")
+        return bool(separator and is_plain_identifier(function_name) and is_plain_identifier(node_name))
+    return False
 
 
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
-    secret_redacted = redact_evidence_string(text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
+    normalization_limit = max(0, max_chars) + (2 * REDACTION_LOOKAHEAD_CHARS) + _MAX_ESCAPED_EVIDENCE_SEQUENCE_CHARS
+    normalized_text = _normalize_metagraph_evidence_escapes(text[:normalization_limit])
+    if normalized_text == REDACTED_EVIDENCE_VALUE:
+        return normalized_text
+    if _is_plain_metagraph_evidence(normalized_text):
+        return normalized_text[:max_chars]
+    secret_redacted = redact_evidence_string(normalized_text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
     payload_redacted = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, secret_redacted)
+    if payload_redacted == f"{REDACTED_EVIDENCE_VALUE}...":
+        return REDACTED_EVIDENCE_VALUE
     if len(payload_redacted) <= max_chars:
         return payload_redacted
     if max_chars <= 3:
@@ -104,8 +192,12 @@ def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
 
 
 def _attribute_context_name(attr_name: str) -> str:
-    """Return the original attribute name before generated function metadata suffixes."""
-    return attr_name.removesuffix(_FUNCTION_ATTRIBUTE_SUFFIX)
+    """Strip generated function metadata suffixes for conservative key classification."""
+    end = len(attr_name)
+    suffix_length = len(_FUNCTION_ATTRIBUTE_SUFFIX)
+    while attr_name.endswith(_FUNCTION_ATTRIBUTE_SUFFIX, 0, end):
+        end -= suffix_length
+    return attr_name[:end]
 
 
 def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
@@ -139,6 +231,7 @@ class _AttrString:
     attr_name: str
     attr_value: str
     byte_length: int
+    sensitive_context_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,7 +316,13 @@ def _iter_nodes(metagraph: Any) -> Iterable[_NodeContext]:
             )
 
 
-def _append_attr_string(strings: list[_AttrString], attr_name: str, raw_value: bytes) -> None:
+def _append_attr_string(
+    strings: list[_AttrString],
+    attr_name: str,
+    raw_value: bytes,
+    *,
+    sensitive_context_name: str | None = None,
+) -> None:
     decoded = raw_value[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore").strip()
     if decoded or len(raw_value) > _MAX_ATTR_VALUE_BYTES:
         strings.append(
@@ -231,6 +330,7 @@ def _append_attr_string(strings: list[_AttrString], attr_name: str, raw_value: b
                 attr_name=attr_name,
                 attr_value=decoded,
                 byte_length=len(raw_value),
+                sensitive_context_name=sensitive_context_name,
             )
         )
 
@@ -243,7 +343,12 @@ def _extract_attr_strings(attrs: Any) -> list[_AttrString]:
             _append_attr_string(strings, attr_name, attr_value.s)
 
         if hasattr(attr_value, "func") and attr_value.func.name:
-            _append_attr_string(strings, f"{attr_name}.func.name", attr_value.func.name.encode("utf-8"))
+            _append_attr_string(
+                strings,
+                f"{attr_name}{_FUNCTION_ATTRIBUTE_SUFFIX}",
+                attr_value.func.name.encode("utf-8"),
+                sensitive_context_name=_attribute_context_name(attr_name),
+            )
 
         if hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):
             for item in attr_value.list.s:
@@ -252,7 +357,12 @@ def _extract_attr_strings(attrs: Any) -> list[_AttrString]:
         if hasattr(attr_value, "list") and hasattr(attr_value.list, "func"):
             for function_attr in attr_value.list.func:
                 if function_attr.name:
-                    _append_attr_string(strings, f"{attr_name}.func.name", function_attr.name.encode("utf-8"))
+                    _append_attr_string(
+                        strings,
+                        f"{attr_name}{_FUNCTION_ATTRIBUTE_SUFFIX}",
+                        function_attr.name.encode("utf-8"),
+                        sensitive_context_name=_attribute_context_name(attr_name),
+                    )
 
     return strings
 
@@ -484,7 +594,9 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
                 evidence_location, evidence_node_name = get_evidence_context()
                 evidence_attr_name = _redact_metagraph_evidence(attr_name, max_chars=200)
-                sensitive_attr_value = is_sensitive_evidence_key(_attribute_context_name(attr_name))
+                sensitive_attr_value = is_sensitive_evidence_key(
+                    attr_string.sensitive_context_name or _attribute_context_name(attr_name)
+                )
                 needs_value_preview = bool(library_match or command_match or network_match or encoded_payload_match)
                 evidence_value_preview = (
                     (

