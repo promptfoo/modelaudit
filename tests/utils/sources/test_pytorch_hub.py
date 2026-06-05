@@ -1,10 +1,12 @@
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
 from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
 import pytest
+import requests
 
 from modelaudit.utils.sources.pytorch_hub import (
     _append_owned_fd,
@@ -12,6 +14,7 @@ from modelaudit.utils.sources.pytorch_hub import (
     _extract_weight_urls,
     _open_binary_fd,
     _open_destination_file,
+    _open_trusted_artifact_response,
     _safe_destination_path,
     download_pytorch_hub_model,
     download_pytorch_hub_model_streaming,
@@ -273,6 +276,90 @@ def test_download_pytorch_hub_model_follows_trusted_artifact_redirect(
     assert result == tmp_path
     assert (tmp_path / "resnet50.onnx").read_bytes() == b"model"
     mock_get.assert_any_call(redirected_url, stream=True, timeout=30, allow_redirects=False)
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_format_changing_redirect(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.onnx"
+    redirected_url = "https://download.pytorch.org/models/model.pkl"
+    mock_extensions.return_value = {".onnx", ".pkl"}
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">onnx</a>'
+    html_resp.raise_for_status = lambda: None
+    redirect_resp = MagicMock()
+    redirect_resp.__enter__.return_value = redirect_resp
+    redirect_resp.status_code = 302
+    redirect_resp.headers = {"location": redirected_url}
+    mock_get.side_effect = [html_resp, redirect_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "5"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    with pytest.raises(ValueError, match="changed artifact format"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    assert call(redirected_url, stream=True, timeout=30, allow_redirects=False) not in mock_get.mock_calls
+    assert not (tmp_path / "model.onnx").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_open_trusted_artifact_response_rejects_non_artifact_success_status(mock_get: MagicMock) -> None:
+    weight_url = "https://download.pytorch.org/models/model.onnx"
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.status_code = 204
+    response.raise_for_status = lambda: None
+    mock_get.return_value = response
+
+    with (
+        pytest.raises(requests.HTTPError, match="Unexpected status code 204"),
+        _open_trusted_artifact_response(weight_url),
+    ):
+        pass
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_open_trusted_artifact_response_allows_equivalent_pytorch_suffix_redirect(
+    mock_get: MagicMock,
+    mock_extensions: MagicMock,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.pt"
+    redirected_url = "https://download.pytorch.org/models/releases/model.pth"
+    mock_extensions.return_value = {".pt", ".pth"}
+    redirect_response = MagicMock()
+    redirect_response.__enter__.return_value = redirect_response
+    redirect_response.status_code = 302
+    redirect_response.headers = {"location": redirected_url}
+    artifact_response = MagicMock()
+    artifact_response.__enter__.return_value = artifact_response
+    artifact_response.status_code = 200
+    mock_get.side_effect = [redirect_response, artifact_response]
+
+    with _open_trusted_artifact_response(weight_url) as response:
+        assert response is artifact_response
+
+    mock_get.assert_has_calls(
+        [
+            call(weight_url, stream=True, timeout=30, allow_redirects=False),
+            call(redirected_url, stream=True, timeout=30, allow_redirects=False),
+        ]
+    )
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
@@ -618,11 +705,15 @@ def test_append_owned_fd_closes_descriptor_when_ownership_transfer_fails(tmp_pat
     path = tmp_path / "descriptor.bin"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
 
-    with pytest.raises(RuntimeError, match="append failed"):
-        _append_owned_fd(FailingFDList(), fd)
+    try:
+        with pytest.raises(RuntimeError, match="append failed"):
+            _append_owned_fd(FailingFDList(), fd)
 
-    with pytest.raises(OSError):
-        os.fstat(fd)
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    finally:
+        with suppress(OSError):
+            os.close(fd)
 
 
 def test_open_binary_fd_closes_descriptor_when_fdopen_fails(
@@ -638,8 +729,12 @@ def test_open_binary_fd_closes_descriptor_when_fdopen_fails(
 
     monkeypatch.setattr(os, "fdopen", fail_fdopen)
 
-    with pytest.raises(RuntimeError, match="fdopen failed"), _open_binary_fd(fd):
-        pass
+    try:
+        with pytest.raises(RuntimeError, match="fdopen failed"), _open_binary_fd(fd):
+            pass
 
-    with pytest.raises(OSError):
-        os.fstat(fd)
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    finally:
+        with suppress(OSError):
+            os.close(fd)

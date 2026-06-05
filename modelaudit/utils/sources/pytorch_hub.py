@@ -120,16 +120,26 @@ def _weight_relative_path(url: str) -> Path:
     return Path(*(_safe_local_component(part) for part in relative_parts))
 
 
-def _is_supported_model_url(url: str, model_extensions: set[str] | None = None) -> bool:
+def _supported_model_extension(url: str, model_extensions: set[str] | None = None) -> str | None:
+    """Return the longest registered suffix for a trusted model URL."""
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
-        return False
+        return None
     extensions = (
         model_extensions
         if model_extensions is not None
         else {extension.lower() for extension in _get_model_extensions()}
     )
-    return any(normalized_path.lower().endswith(extension) for extension in extensions)
+    normalized_path = normalized_path.lower()
+    return max(
+        (extension.lower() for extension in extensions if extension and normalized_path.endswith(extension.lower())),
+        key=len,
+        default=None,
+    )
+
+
+def _is_supported_model_url(url: str, model_extensions: set[str] | None = None) -> bool:
+    return _supported_model_extension(url, model_extensions) is not None
 
 
 def _path_collision_key(path: Path) -> tuple[str, ...]:
@@ -237,15 +247,36 @@ def _open_binary_fd(fd: int) -> Iterator[BinaryIO]:
 @contextmanager
 def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
     """Open an artifact while keeping every redirect inside the trusted model path."""
+    from ...scanner_registry_metadata import get_extension_format_map
+
+    model_extensions = {extension.lower() for extension in _get_model_extensions()}
+    extension_format_map = get_extension_format_map()
+    expected_extension = _supported_model_extension(url, model_extensions)
+    if expected_extension is None:
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
+    expected_format = extension_format_map.get(expected_extension, expected_extension)
+
     current_url = url
     for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
-        if not _is_supported_model_url(current_url):
+        current_extension = _supported_model_extension(current_url, model_extensions)
+        if current_extension is None:
             raise ValueError(f"Unsafe PyTorch Hub model URL: {current_url}")
+        current_format = extension_format_map.get(current_extension, current_extension)
+        if current_format != expected_format:
+            raise ValueError(
+                "PyTorch Hub artifact redirect changed artifact format "
+                f"from {expected_format} to {current_format}: {current_url}"
+            )
 
         with requests.get(current_url, stream=True, timeout=30, allow_redirects=False) as response:
             status_code = response.status_code if isinstance(response.status_code, int) else 200
             if status_code not in _REDIRECT_STATUS_CODES:
                 response.raise_for_status()
+                if status_code != 200:
+                    raise requests.HTTPError(
+                        f"Unexpected status code {status_code} for PyTorch Hub artifact: {current_url}",
+                        response=response,
+                    )
                 yield response
                 return
 
