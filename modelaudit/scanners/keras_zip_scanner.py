@@ -1,6 +1,7 @@
 """Scanner for ZIP-based Keras model files (.keras format)."""
 
 import base64
+import io
 import json
 import os
 import re
@@ -30,9 +31,13 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded, _read_zip_member_prefix
+from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string, redact_evidence_value
-from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
+from .archive_dispatch import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
+)
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
@@ -44,7 +49,11 @@ from .keras_utils import (
     is_known_safe_keras_layer_class,
     normalize_keras_layer_class,
 )
-from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
+from .zip_scanner import (
+    ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
+    ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
+    ZipScanner,
+)
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -117,6 +126,13 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+_HDF5_USERBLOCK_FIRST_OFFSET = 512
+_HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
+_HDF5_SUPERBLOCK_PROBE_BYTES = 96
+_HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
+_ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
+_ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
 _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
@@ -135,6 +151,145 @@ _KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
     r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
     r"(?:[._-]?dev(?:[._-]?\d+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
 )
+
+
+def _hdf5_signature_offsets(file_size: int) -> list[int]:
+    max_signature_end = min(file_size, _HDF5_SIGNATURE_SCAN_MAX_BYTES)
+    offsets = [0]
+    offset = _HDF5_USERBLOCK_FIRST_OFFSET
+    while offset + len(_HDF5_MAGIC) <= max_signature_end:
+        offsets.append(offset)
+        offset *= 2
+    return offsets
+
+
+def _has_plausible_hdf5_superblock(prefix: bytes, signature_offset: int, file_size: int) -> bool:
+    """Validate bounded superblock invariants after an HDF5 signature."""
+    superblock_start = signature_offset
+    if prefix[superblock_start : superblock_start + len(_HDF5_MAGIC)] != _HDF5_MAGIC:
+        return False
+    if len(prefix) <= superblock_start + len(_HDF5_MAGIC):
+        return False
+
+    superblock_version = prefix[superblock_start + 8]
+    if superblock_version in (0, 1):
+        fixed_header_bytes = 24 if superblock_version == 0 else 28
+        if len(prefix) < superblock_start + fixed_header_bytes:
+            return False
+        if any(prefix[superblock_start + field_offset] != 0 for field_offset in (9, 10, 11, 12, 15)):
+            return False
+        if int.from_bytes(prefix[superblock_start + 16 : superblock_start + 18], "little") == 0:
+            return False
+        if int.from_bytes(prefix[superblock_start + 18 : superblock_start + 20], "little") == 0:
+            return False
+        if superblock_version == 1:
+            if int.from_bytes(prefix[superblock_start + 24 : superblock_start + 26], "little") == 0:
+                return False
+            if prefix[superblock_start + 26 : superblock_start + 28] != b"\x00\x00":
+                return False
+        offset_size = prefix[superblock_start + 13]
+        length_size = prefix[superblock_start + 14]
+        base_address_offset = superblock_start + fixed_header_bytes
+    elif superblock_version in (2, 3):
+        if len(prefix) < superblock_start + 12:
+            return False
+        offset_size = prefix[superblock_start + 9]
+        length_size = prefix[superblock_start + 10]
+        base_address_offset = superblock_start + 12
+    else:
+        return False
+
+    if not 1 <= offset_size <= 16 or not 1 <= length_size <= 16:
+        return False
+
+    end_of_file_offset = base_address_offset + (2 * offset_size)
+    if len(prefix) < end_of_file_offset + offset_size:
+        return False
+
+    undefined_address = (1 << (offset_size * 8)) - 1
+    base_address = int.from_bytes(prefix[base_address_offset : base_address_offset + offset_size], "little")
+    end_of_file_address = int.from_bytes(prefix[end_of_file_offset : end_of_file_offset + offset_size], "little")
+    if base_address == undefined_address or end_of_file_address == undefined_address:
+        return False
+
+    adjusted_end_of_file = end_of_file_address + (signature_offset - base_address)
+    return signature_offset < adjusted_end_of_file <= file_size
+
+
+def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> int | None:
+    offsets = _hdf5_signature_offsets(member_info.file_size)
+    if not offsets:
+        return None
+
+    read_size = min(member_info.file_size, offsets[-1] + _HDF5_SUPERBLOCK_PROBE_BYTES)
+    prefix = _read_zip_member_prefix(archive, member_info, read_size)
+    for offset in offsets:
+        if _has_plausible_hdf5_superblock(prefix, offset, member_info.file_size):
+            return offset
+    return None
+
+
+def _split_concatenated_zip_payload(payload: bytes) -> tuple[bytes, ...]:
+    """Split bounded concatenated ZIP payloads so earlier archives remain visible."""
+    segments: list[bytes] = []
+    remaining = payload
+
+    while len(segments) < _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS - 1:
+        split_offset: int | None = None
+        search_start = 0
+        while True:
+            eocd_offset = remaining.find(_ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE, search_start)
+            if eocd_offset < 0:
+                break
+            search_start = eocd_offset + 1
+
+            fixed_end = eocd_offset + _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES
+            if fixed_end > len(remaining):
+                continue
+            comment_length = int.from_bytes(remaining[eocd_offset + 20 : fixed_end], "little")
+            zip_end = fixed_end + comment_length
+            if zip_end >= len(remaining):
+                continue
+
+            first_archive = remaining[:zip_end]
+            later_archives = remaining[zip_end:]
+            if zipfile.is_zipfile(io.BytesIO(first_archive)) and zipfile.is_zipfile(io.BytesIO(later_archives)):
+                split_offset = zip_end
+                break
+
+        if split_offset is None:
+            break
+        segments.append(remaining[:split_offset])
+        remaining = remaining[split_offset:]
+
+    segments.append(remaining)
+    return tuple(segments)
+
+
+def _content_routable_hdf5_userblock_segments(prefix: bytes) -> tuple[bytes, ...]:
+    """Split a user block into a valid ZIP prefix and later non-padding content."""
+    search_end = len(prefix)
+    while True:
+        eocd_offset = prefix.rfind(_ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE, 0, search_end)
+        if eocd_offset < 0:
+            break
+
+        fixed_end = eocd_offset + _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES
+        if fixed_end <= len(prefix):
+            comment_length = int.from_bytes(prefix[eocd_offset + 20 : fixed_end], "little")
+            zip_end = fixed_end + comment_length
+            if zip_end <= len(prefix):
+                candidate = prefix[:zip_end]
+                if zipfile.is_zipfile(io.BytesIO(candidate)):
+                    zip_segments = _split_concatenated_zip_payload(candidate)
+                    trailing_content = prefix[zip_end:].rstrip(b"\x00")
+                    if trailing_content:
+                        return *zip_segments, trailing_content
+                    return zip_segments
+        search_end = eocd_offset
+
+    candidate = prefix.rstrip(b"\x00")
+    return (candidate,) if candidate else ()
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -354,7 +509,13 @@ class KerasZipScanner(BaseScanner):
             return self.max_embedded_weights_bytes
         return _KERAS_CONFIG_MAX_BYTES
 
-    def _get_recursive_archive_scan_config(self, *, skip_weights_entry: bool = False) -> dict[str, Any]:
+    def _get_recursive_archive_scan_config(
+        self,
+        *,
+        skip_weights_entry: bool = False,
+        security_only_weights_entry: bool = False,
+        content_only_weights_entry: bool = False,
+    ) -> dict[str, Any]:
         """Return bounded ZIP-recursion config for entries not owned by this scanner."""
         recursive_config = dict(self.config)
         member_size_limits = [self.max_embedded_weights_bytes]
@@ -386,14 +547,26 @@ class KerasZipScanner(BaseScanner):
             security_only_entries = [entry for entry in raw_security_only_entries if isinstance(entry, str)]
         else:
             security_only_entries = []
+        raw_content_only_entries = recursive_config.get(ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_content_only_entries, str):
+            content_only_entries: list[str] = [raw_content_only_entries]
+        elif isinstance(raw_content_only_entries, (list, tuple, set, frozenset)):
+            content_only_entries = [entry for entry in raw_content_only_entries if isinstance(entry, str)]
+        else:
+            content_only_entries = []
+        if skip_weights_entry and _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
+            skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
         owned_entries = [_KERAS_CONFIG_ENTRY]
-        if skip_weights_entry:
+        if security_only_weights_entry:
             owned_entries.append(_KERAS_WEIGHTS_ENTRY)
         for owned_entry in owned_entries:
             if owned_entry not in security_only_entries:
                 security_only_entries.append(owned_entry)
+        if content_only_weights_entry and _KERAS_WEIGHTS_ENTRY not in content_only_entries:
+            content_only_entries.append(_KERAS_WEIGHTS_ENTRY)
         recursive_config["skip_archive_entries"] = skip_entry_values
         recursive_config[ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = security_only_entries
+        recursive_config[ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = content_only_entries
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
@@ -401,11 +574,16 @@ class KerasZipScanner(BaseScanner):
         if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
             return
 
-        from .zip_scanner import ZipScanner
-
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
-        skip_weights_entry = has_embedded_weights_limit or self._has_embedded_weights_h5py_unavailable_reason(result)
-        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config(skip_weights_entry=skip_weights_entry))
+        security_only_weights_entry = self._should_security_scan_owned_weights_entry(result)
+        content_only_weights_entry = self._should_content_route_owned_weights_entry(result)
+        zip_scanner = ZipScanner(
+            self._get_recursive_archive_scan_config(
+                skip_weights_entry=has_embedded_weights_limit,
+                security_only_weights_entry=security_only_weights_entry,
+                content_only_weights_entry=content_only_weights_entry,
+            )
+        )
         nested_result = zip_scanner._scan_zip_file(
             path,
             depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
@@ -663,9 +841,16 @@ class KerasZipScanner(BaseScanner):
         return isinstance(reasons, list) and "keras_zip_embedded_weights_too_large" in reasons
 
     @staticmethod
-    def _has_embedded_weights_h5py_unavailable_reason(result: ScanResult) -> bool:
+    def _should_security_scan_owned_weights_entry(result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
-        return isinstance(reasons, list) and "keras_zip_embedded_weights_h5py_unavailable" in reasons
+        if not isinstance(reasons, list):
+            return False
+        return "keras_zip_embedded_weights_h5py_unavailable" in reasons
+
+    @staticmethod
+    def _should_content_route_owned_weights_entry(result: ScanResult) -> bool:
+        reasons = result.metadata.get("scan_outcome_reasons")
+        return isinstance(reasons, list) and "keras_zip_embedded_weights_hdf5_signature_probe_incomplete" in reasons
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
@@ -687,6 +872,15 @@ class KerasZipScanner(BaseScanner):
     def _scan_result_has_security_findings(result: ScanResult) -> bool:
         """Return True when the scan found warning or critical security risk."""
         return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    @staticmethod
+    def _scan_result_has_actionable_security_findings(result: ScanResult) -> bool:
+        """Return True for actionable findings, excluding standalone pickle parse-noise warnings."""
+        return any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+            and issue.rule_code not in {"S901", "S902"}
+            for issue in result.issues
+        )
 
     @classmethod
     def _finish_scan_result(cls, result: ScanResult) -> None:
@@ -1852,26 +2046,40 @@ class KerasZipScanner(BaseScanner):
             return
 
         if not HAS_H5PY:
+            hdf5_signature_offset = _zip_member_hdf5_signature_offset(archive, weights_info)
+            if hdf5_signature_offset is None:
+                if weights_info.file_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES:
+                    self._mark_embedded_weights_hdf5_signature_probe_incomplete(weights_info, result)
+                return
+
             weights_entry = weights_info.filename
-            self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_h5py_unavailable")
+            reason = "keras_zip_embedded_weights_h5py_unavailable"
+            result.metadata["embedded_weights_hdf5_signature_offset"] = hdf5_signature_offset
+            self._mark_inconclusive_scan_result(result, reason)
+            self._scan_embedded_weights_security_prefix(
+                archive,
+                weights_info,
+                hdf5_signature_offset,
+                result,
+                hdf5_signature_offset=hdf5_signature_offset,
+            )
             result.add_check(
-                name="Embedded Weights HDF5 Scanner Availability",
+                name="Embedded Weights H5PY Library Check",
                 passed=False,
                 message=(
-                    "Skipping embedded model.weights.h5 inspection because h5py is unavailable; "
-                    "install with 'pip install modelaudit[h5]'"
+                    "Skipping embedded model.weights.h5 inspection because h5py is required for HDF5 weights "
+                    "analysis. Install with 'pip install modelaudit[h5]'."
                 ),
                 severity=IssueSeverity.INFO,
                 location=f"{self.current_file_path}:{weights_entry}",
                 details={
                     "entry": weights_entry,
                     "required_package": "h5py",
-                    "scan_outcome_reason": "keras_zip_embedded_weights_h5py_unavailable",
+                    "hdf5_signature_offset": hdf5_signature_offset,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
                 },
-                why=(
-                    "Embedded Keras HDF5 weights require h5py inspection to rule out external storage "
-                    "and ExternalLink references."
-                ),
+                rule_code="S902",
             )
             return
 
@@ -2004,6 +2212,197 @@ class KerasZipScanner(BaseScanner):
                 "parse_status": "unknown",
             },
         )
+
+    def _mark_embedded_weights_hdf5_signature_probe_incomplete(
+        self,
+        weights_info: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> None:
+        weights_entry = weights_info.filename
+        reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+        self._mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="Embedded Weights HDF5 Signature Probe",
+            passed=False,
+            message=(
+                "Skipping embedded model.weights.h5 inspection because h5py is unavailable and the weights entry "
+                "is too large to rule out a valid HDF5 user-block signature within the bounded probe window. "
+                "Install with 'pip install modelaudit[h5]'."
+            ),
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path}:{weights_entry}",
+            details={
+                "entry": weights_entry,
+                "required_package": "h5py",
+                "file_size": weights_info.file_size,
+                "hdf5_signature_probe_max_bytes": _HDF5_SIGNATURE_SCAN_MAX_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+
+    def _scan_embedded_weights_security_prefix(
+        self,
+        archive: zipfile.ZipFile,
+        weights_info: zipfile.ZipInfo,
+        prefix_bytes: int,
+        result: ScanResult,
+        *,
+        hdf5_signature_offset: int | None,
+    ) -> None:
+        """Content-route security findings hidden before the HDF5 user-block signature."""
+        if prefix_bytes <= 0:
+            return
+
+        weights_entry = weights_info.filename
+        from .pickle_scanner import PickleScanner
+        from .picklescan_adapter import apply_pickle_member_context
+
+        nested_config = dict(self.config)
+        nested_config.pop("skip_archive_entries", None)
+        nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
+        nested_config.pop(ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
+        nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+        nested_config["cache_enabled"] = False
+        nested_config["_archive_depth"] = get_archive_depth(self.config) + 1
+
+        zip_scanner = ZipScanner(config=self.config)
+        if self._scan_embedded_weights_full_payload_security(
+            archive,
+            weights_info,
+            result,
+            zip_scanner=zip_scanner,
+            nested_config=nested_config,
+            hdf5_signature_offset=hdf5_signature_offset,
+        ):
+            return
+
+        prefix_segments = _content_routable_hdf5_userblock_segments(
+            _read_zip_member_prefix(archive, weights_info, prefix_bytes)
+        )
+        if not prefix_segments:
+            return
+
+        for segment_index, prefix in enumerate(prefix_segments):
+            temp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    temp_file.write(prefix)
+                    temp_path = temp_file.name
+
+                prefix_result = zip_scanner._scan_nested_archive_entry(temp_path, nested_config)
+                if self._scan_result_has_actionable_security_findings(prefix_result):
+                    zip_scanner._rewrite_nested_result_context(
+                        prefix_result,
+                        temp_path,
+                        self.current_file_path,
+                        weights_entry,
+                    )
+                    self._annotate_embedded_weights_security_prefix_result(
+                        prefix_result,
+                        weights_entry=weights_entry,
+                        hdf5_signature_offset=hdf5_signature_offset,
+                    )
+                    result.merge(prefix_result)
+                    continue
+                pickle_scan_was_selection_skipped = (
+                    prefix_result.scanner_name == "scanner_selection"
+                    and prefix_result.metadata.get("skipped_scanner_id") == "pickle"
+                )
+                if prefix_result.scanner_name != "unknown" and not pickle_scan_was_selection_skipped:
+                    continue
+            finally:
+                if temp_path is not None:
+                    Path(temp_path).unlink(missing_ok=True)
+
+            pickle_source = f"{self.current_file_path}:{weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            pickle_result = PickleScanner(config=self.config).scan_stream(
+                io.BytesIO(prefix),
+                len(prefix),
+                source=pickle_source,
+            )
+            if self._scan_result_has_actionable_security_findings(pickle_result):
+                apply_pickle_member_context(
+                    pickle_result,
+                    archive_path=self.current_file_path,
+                    member_name=weights_entry,
+                )
+                self._annotate_embedded_weights_security_prefix_result(
+                    pickle_result,
+                    weights_entry=weights_entry,
+                    hdf5_signature_offset=hdf5_signature_offset,
+                )
+                result.merge(pickle_result)
+
+    def _scan_embedded_weights_full_payload_security(
+        self,
+        archive: zipfile.ZipFile,
+        weights_info: zipfile.ZipInfo,
+        result: ScanResult,
+        *,
+        zip_scanner: ZipScanner,
+        nested_config: dict[str, Any],
+        hdf5_signature_offset: int | None,
+    ) -> bool:
+        """Preserve actionable findings from a polyglot's complete weights payload."""
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = temp_file.name
+                copied_bytes = 0
+                with archive.open(weights_info, "r") as source:
+                    while True:
+                        chunk = source.read(64 * 1024)
+                        if not chunk:
+                            break
+                        copied_bytes += len(chunk)
+                        if copied_bytes > self.max_embedded_weights_bytes:
+                            return False
+                        temp_file.write(chunk)
+
+            full_result = zip_scanner._scan_nested_archive_entry(temp_path, nested_config)
+            if not self._scan_result_has_actionable_security_findings(full_result):
+                return False
+
+            zip_scanner._rewrite_nested_result_context(
+                full_result,
+                temp_path,
+                self.current_file_path,
+                weights_info.filename,
+            )
+            self._annotate_embedded_weights_security_prefix_result(
+                full_result,
+                weights_entry=weights_info.filename,
+                hdf5_signature_offset=hdf5_signature_offset,
+            )
+            result.merge(full_result)
+            return True
+        finally:
+            if temp_path is not None:
+                Path(temp_path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _annotate_embedded_weights_security_prefix_result(
+        prefix_result: ScanResult,
+        *,
+        weights_entry: str,
+        hdf5_signature_offset: int | None,
+    ) -> None:
+        for check in prefix_result.checks:
+            check.details.setdefault("zip_entry", weights_entry)
+            check.details["embedded_weights_hdf5_userblock"] = True
+            if hdf5_signature_offset is None:
+                check.details["hdf5_signature_probe_max_bytes"] = _HDF5_SIGNATURE_SCAN_MAX_BYTES
+            else:
+                check.details["hdf5_signature_offset"] = hdf5_signature_offset
+        for issue in prefix_result.issues:
+            issue.details.setdefault("zip_entry", weights_entry)
+            issue.details["embedded_weights_hdf5_userblock"] = True
+            if hdf5_signature_offset is None:
+                issue.details["hdf5_signature_probe_max_bytes"] = _HDF5_SIGNATURE_SCAN_MAX_BYTES
+            else:
+                issue.details["hdf5_signature_offset"] = hdf5_signature_offset
 
     @staticmethod
     def _collect_hdf5_external_references(h5_file: Any) -> list[dict[str, Any]]:

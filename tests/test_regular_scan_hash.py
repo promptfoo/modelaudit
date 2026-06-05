@@ -4,11 +4,12 @@ import hashlib
 import os
 import pickle
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
@@ -267,6 +268,265 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(source)] == content_hashes[str(linked_path)]
         assert hashed_paths == [str(source)]
+
+    def test_directory_scan_does_not_hash_files_over_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Directory hash prepass should not read files regular scanning will reject."""
+        from modelaudit import core
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+        small = tmp_path / "small.pkl"
+        small.write_bytes(pickle.dumps({"safe": True}))
+
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def fail_if_oversized_hashed(path: str) -> str:
+            hashed_paths.append(path)
+            if path == str(oversized):
+                raise AssertionError("oversized file was hashed before max_file_size rejection")
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_if_oversized_hashed)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_file_size=64,
+            cache_enabled=False,
+        )
+
+        assert str(oversized) not in hashed_paths
+        assert str(small) in hashed_paths
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
+
+    def test_single_file_scan_does_not_hash_files_over_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-file hashing should honor the same regular scan size budget."""
+        from modelaudit import core
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("oversized file was hashed before max_file_size rejection"),
+        )
+
+        result = scan_model_directory_or_file(
+            str(oversized),
+            max_file_size=64,
+            cache_enabled=False,
+        )
+
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
+
+    def test_single_file_scan_bypasses_cache_hash_for_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cache lookup should not content-hash files regular scanning will reject."""
+        from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+
+        def fail_if_cache_hashes_oversized(self: SecureFileHasher, path: str) -> str:
+            if path == str(oversized):
+                pytest.fail("oversized file was content-hashed for cache lookup before max_file_size rejection")
+            return "a" * 64
+
+        monkeypatch.setattr(SecureFileHasher, "hash_file", fail_if_cache_hashes_oversized)
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file_with_stat",
+            lambda self, path, _stat: fail_if_cache_hashes_oversized(self, path),
+        )
+
+        result = scan_model_directory_or_file(
+            str(oversized),
+            max_file_size=64,
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            content_hash_threshold=1,
+            max_cache_file_size=1024,
+        )
+
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
+
+    def test_hash_files_by_path_stops_hashing_at_max_total_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Directory hash prepasses should stop after crossing the aggregate scan budget."""
+        from modelaudit import core
+
+        first = tmp_path / "first.pkl"
+        first.write_bytes(b"A" * 32)
+        second = tmp_path / "second.pkl"
+        second.write_bytes(b"B" * 33)
+        third = tmp_path / "third.pkl"
+        third.write_bytes(b"C")
+
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(first), str(second), str(third)],
+            config={"max_total_size": 64},
+        )
+
+        assert hashed_paths == [str(first), str(second)]
+        assert content_hashes[str(third)].startswith("unhashable_max_total_size_")
+
+    def test_directory_scan_omits_content_hash_when_max_total_hashing_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Successful scans must not publish aggregate hashes for only a prefix of files."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        first = tmp_path / "first.pkl"
+        first.write_bytes(b"A" * 32)
+        second = tmp_path / "second.pkl"
+        second.write_bytes(b"B" * 33)
+        third = tmp_path / "third.pkl"
+        third.write_bytes(b"C")
+        original_walk = core.os.walk
+
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def unsorted_walk(top: str, followlinks: bool = False) -> Iterator[tuple[str, list[str], list[str]]]:
+            if Path(top) == tmp_path:
+                yield str(tmp_path), [], ["third.pkl", "first.pkl", "second.pkl"]
+                return
+            yield from original_walk(top, followlinks=followlinks)
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        def successful_scan(_path: str, _config: dict[str, object]) -> ScanResult:
+            scan_result = ScanResult(scanner_name="bounded_test")
+            scan_result.bytes_scanned = 1
+            scan_result.finish(success=True)
+            return scan_result
+
+        monkeypatch.setattr(core.os, "walk", unsorted_walk)
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+        monkeypatch.setattr(core, "scan_file", successful_scan)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_total_size=64,
+            cache_enabled=False,
+        )
+
+        assert len(hashed_paths) == 2
+        assert result.content_hash is None
+        assert result.success is True
+
+    def test_directory_scan_omits_content_hash_when_max_file_size_hashing_incomplete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Directory scans must not publish hashes that omit oversized rejected files."""
+        small = tmp_path / "small.pkl"
+        small.write_bytes(pickle.dumps(1))
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(pickle.dumps({"safe": True}) + b"X" * 128)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_file_size=64,
+            cache_enabled=False,
+        )
+
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+    def test_directory_scan_omits_content_hash_when_expanded_scan_bytes_exceed_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scan stopped by expanded bytes must not publish its precomputed aggregate hash."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        first = tmp_path / "first.pkl"
+        first.write_bytes(b"A")
+        second = tmp_path / "second.pkl"
+        second.write_bytes(b"B")
+        scanned_paths: list[str] = []
+
+        def expanded_scan(path: str, _config: dict[str, object]) -> ScanResult:
+            scanned_paths.append(path)
+            scan_result = ScanResult(scanner_name="bounded_test")
+            scan_result.bytes_scanned = 128
+            scan_result.finish(success=True)
+            return scan_result
+
+        monkeypatch.setattr(core, "scan_file", expanded_scan)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_total_size=64,
+            cache_enabled=False,
+        )
+
+        assert scanned_paths == [str(first)]
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
+
+    def test_single_file_scan_fails_closed_after_max_total_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-file scans should fail closed after measured budget overflow."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(pickle.dumps({"safe": True}) + b"X" * 128)
+        scan_result = ScanResult(scanner_name="bounded_test")
+        scan_result.bytes_scanned = 128
+        scan_result.finish(success=True)
+
+        hashed_paths: list[str] = []
+        original_hash = core._calculate_file_hash
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+        monkeypatch.setattr(core, "scan_file", lambda _path, _config: scan_result)
+
+        result = scan_model_directory_or_file(
+            str(oversized),
+            max_total_size=64,
+            cache_enabled=False,
+        )
+
+        assert hashed_paths == [str(oversized)]
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
+        assert result.has_errors is True
+        assert result.content_hash is None
 
     def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
         """Test that files failing to hash are excluded from aggregate hash."""
