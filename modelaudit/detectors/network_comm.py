@@ -35,8 +35,9 @@ _URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(rb"[\"']?\s*[:=]\s*(?:[rRuUbBfF]{0,3
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
-    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"hf_[A-Za-z0-9]{30,}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
@@ -302,14 +303,32 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
     changed = False
     redacted_parts: list[str] = []
     cursor = 0
+    redact_next_value = False
     for match in _PATH_TOKEN_BOUNDARY_PATTERN.finditer(decoded):
-        redacted_component, component_changed = _redact_boundary_component(decoded[cursor : match.start()])
+        component = decoded[cursor : match.start()]
+        token_component, component_delimiters = _split_trailing_path_delimiters(component)
+        if redact_next_value and component:
+            redacted_component = f"{_REDACTED_PATH_TOKEN}{component_delimiters}"
+            component_changed = True
+            redact_next_value = False
+        else:
+            redacted_component, component_changed = _redact_boundary_component(component)
+            if _is_sensitive_path_key(token_component):
+                redact_next_value = match.group().lower() in {"&", "&amp;", ","}
         redacted_parts.append(redacted_component)
         redacted_parts.append(match.group())
         changed = changed or component_changed
+        if match.group().lower() not in {"&", "&amp;", ","}:
+            redact_next_value = False
         cursor = match.end()
 
-    redacted_component, component_changed = _redact_boundary_component(decoded[cursor:])
+    component = decoded[cursor:]
+    if redact_next_value and component:
+        _token_component, component_delimiters = _split_trailing_path_delimiters(component)
+        redacted_component = f"{_REDACTED_PATH_TOKEN}{component_delimiters}"
+        component_changed = True
+    else:
+        redacted_component, component_changed = _redact_boundary_component(component)
     redacted_parts.append(redacted_component)
     changed = changed or component_changed
     if not changed:
@@ -392,6 +411,14 @@ def _is_gcs_api_bucket_segment(hostname: str, segments: list[str], index: int) -
 def _is_azure_authority_container(container: str) -> bool:
     decoded = unquote(container)
     return decoded == container and _AZURE_CONTAINER_NAME_PATTERN.fullmatch(container) is not None
+
+
+def _is_azure_container_authority(scheme: str, hostname: str, authority: str) -> bool:
+    return (
+        scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES
+        and hostname.lower().endswith(_AZURE_STORAGE_HOST_SUFFIXES)
+        and _is_azure_authority_container(authority)
+    )
 
 
 def _redact_path_parameter_tokens(segment: str) -> str | None:
@@ -578,9 +605,9 @@ def redact_url_for_finding(url: str) -> str:
     netloc_host = f"{hostname}:{port}" if port is not None else hostname
     netloc = netloc_host
     scheme = parsed.scheme.lower()
-    if scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES and "@" in parsed.netloc:
+    if "@" in parsed.netloc:
         container, _separator, _host = parsed.netloc.rpartition("@")
-        if _is_azure_authority_container(container):
+        if _is_azure_container_authority(scheme, hostname, container):
             netloc = f"{container}@{netloc_host}"
 
     safe_path = _redact_url_path_tokens(scheme, raw_hostname.lower(), parsed.path)
@@ -654,7 +681,7 @@ def _url_is_likely_call_endpoint(data: bytes, match_end: int, url_start: int) ->
     argument_prefix = data[current_argument_start:url_start].strip()
     if b"#" in argument_prefix:
         return False
-    string_prefix = rb"(?:[rRuUbBfF]{0,3})?[\"']"
+    string_prefix = rb"(?:[rRuUbBfF]{0,3})?(?:\"\"\"|'''|[\"'])"
     if re.fullmatch(string_prefix, argument_prefix) is not None:
         return True
     return re.fullmatch(rb"(?i:(?:url|uri|endpoint))\s*=\s*" + string_prefix, argument_prefix) is not None
@@ -1966,6 +1993,9 @@ class NetworkCommDetector:
 
                     if printable_ratio > 0.7:  # High ratio of printable characters
                         raw_matched_text = match.group().decode("utf-8", errors="ignore")
+                        if pattern_type == "url":
+                            source_quote = _source_quote_before_url(data, match.start())
+                            raw_matched_text = _trim_source_literal_url(raw_matched_text, source_quote)
                         matched_text = _redact_network_evidence(raw_matched_text)
                         if not self._record_finding(
                             {
