@@ -913,9 +913,18 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         '\'r"{BROKEN; token <- r"(NOT_A_SECRET)"\'',
         'list(token = "standard")',
         'list(token = r"(standard)")',
+        "list(token =)",
+        "x[token =]",
+        'list(token = "standard" + "suffix")',
+        'list(\n  token = "standard"\n)',
+        'list(\n#x\n  token = "standard"\n)',
+        'x[\n  token = r"(standard)"\n]',
+        'x[\n#x\n  token = r"(standard)"\n]',
+        'get("list")(\n  token = "standard"\n)',
         'function(token = "standard") NULL',
         'function(token = r"(standard)") NULL',
         'function\n(token = "standard") NULL',
+        'function\n#x\n(token = "standard") NULL',
         'function # formal list follows\n(token = r"(standard)") NULL',
         'x\nfunction(token = "standard") NULL',
         'if (TRUE) function(token = r"(standard)") NULL',
@@ -923,6 +932,7 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'function(token = r"(standard)") if (TRUE) NULL',
         'function(token = r"(standard)") if (TRUE) 1 else 2',
         'function(token = "standard") repeat break',
+        'function(token = "standard") \\(x) x',
         'function(token = "standard") {}',
         'function(token = r"(standard)") "body"',
         'function(token = "standard") value +\nother',
@@ -933,13 +943,17 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         '\\(token = "standard")\nvalue',
         'list("token" = "standard")',
         'list(`token` = r"(standard)")',
+        'list(NULL = "standard")',
         'x["token" = "standard"]',
+        'x[NULL = r"(standard)"]',
         'function(`token` = r"(standard)") NULL',
         ') list(token = "standard")',
         '] list(token = r"(standard)")',
         '(] list(token = "standard")',
         '} function(token = paste0("stan", "dard")) NULL',
         'base::list(token = "standard")',
+        '"base"::list(token = "standard")',
+        "'base':::list(token = r\"(standard)\")",
         '`list`(token = r"(standard)")',
         '`function`(token = "standard")',
         '\\(token = "standard") NULL',
@@ -1081,6 +1095,32 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'function(token = "TRAILING_CALL_OPERATOR_SECRET") list(value +)',
         'function(token = paste0("EXPRESSION_", "TRUNCATED_SECRET")) value <-',
         'function(token = r"(TRUNCATED_EQUALS_BODY_SECRET)") value =',
+        'list(token = "TRUNCATED_ARGUMENT_SECRET" +)',
+        'x[token = r"(TRUNCATED_INDEX_SECRET)" +]',
+        'list(token = if (TRUE) "TRUNCATED_CONTROL_SECRET" else)',
+        'list(token = "ADJACENT_ARGUMENT_SECRET" value)',
+        'list(token = paste0("ADJACENT_CALL_SECRET") value)',
+        'list(token = if (TRUE) "ADJACENT_CONTROL_SECRET" value)',
+        'function(token = paste0("ADJACENT_DEFAULT_SECRET")) value value',
+        'list(token = (paste0("NESTED_GROUP_SECRET") value))',
+        'list(token = { paste0("NESTED_BRACE_SECRET") value })',
+        'list(token = if (TRUE) (paste0("NESTED_CONTROL_SECRET") value))',
+        'list(token = if () "EMPTY_IF_SECRET")',
+        'list(token = while () "EMPTY_WHILE_SECRET")',
+        'list(token = for () "EMPTY_FOR_SECRET")',
+        'list(token = for (x) "MISSING_IN_FOR_SECRET")',
+        'list(token = for (x in) "MISSING_SEQUENCE_FOR_SECRET")',
+        'list(token = value ! "MALFORMED_BANG_SECRET")',
+        'list(token = value +* "MALFORMED_OPERATOR_SECRET")',
+        'list(token = value % "MALFORMED_PERCENT_SECRET")',
+        'list(token = 1x + "NUMERIC_SUFFIX_VALUE_SECRET")',
+        'list(token = .1x + "DOT_NUMERIC_SUFFIX_VALUE_SECRET")',
+        'list(token = _ + "UNDERSCORE_VALUE_SECRET")',
+        'list(token = 1::foo + "NUMERIC_NAMESPACE_VALUE_SECRET")',
+        'list(token = "SECOND_EQUALS_SECRET" = value)',
+        '1$f(token = "NUMERIC_MEMBER_RECEIVER_SECRET")',
+        'NULL@f(token = r"(NULL_SLOT_RECEIVER_SECRET)")',
+        '1::f(token = "NUMERIC_NAMESPACE_RECEIVER_SECRET")',
         'list(obj$token = "MEMBER_TAG_SECRET")',
         'list(obj@token = r"(SLOT_TAG_SECRET)")',
         'list(x["token"] = "SUBSCRIPT_TAG_SECRET")',
@@ -1117,6 +1157,61 @@ def test_scan_batches_repeated_named_argument_validation(tmp_path: Path) -> None
     credential_checks = _check_by_name(result, "Credential-like String Detection")
     assert len(credential_checks) == 1
     assert credential_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_deep_repeat_prefix_is_bounded_without_recursion_error(tmp_path: Path) -> None:
+    path = tmp_path / "deep-expression-prefix.rds"
+    _write_raw_r_serialized(path, 'function(token = "DEEP_PREFIX_SECRET") ' + "repeat " * 1_100 + "break")
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_expression_depth_ceiling_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "deep-expression-nesting.rds"
+    nested_body = "if (TRUE) " * 130 + "break"
+    _write_raw_r_serialized(path, f'function(token = "standard") {nested_body}')
+
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "r_serialized_expression_depth_incomplete" in result.metadata["scan_outcome_reasons"]
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+    ceiling_checks = _check_by_name(result, "R Expression Analysis Ceiling")
+    assert len(ceiling_checks) == 1
+    assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_expression_depth_incomplete"
+
+
+def test_scan_deep_subscript_nesting_does_not_raise_recursion_error(tmp_path: Path) -> None:
+    path = tmp_path / "deep-subscript.rds"
+    _write_raw_r_serialized(path, "x" + "[" * 1_100 + 'token = "standard"' + "]" * 1_100)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+
+
+def test_scan_continuation_analysis_ceiling_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "continued-function.rds"
+    comment_lines = "".join(f"#{'a' * 250}\n" for _ in range(80))
+    _write_raw_r_serialized(path, f'function\n{comment_lines}(token = "standard") NULL')
+
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "r_serialized_continuation_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    ceiling_checks = _check_by_name(result, "String Extraction Ceiling")
+    assert len(ceiling_checks) == 1
+    assert "continuation-analysis ceiling" in ceiling_checks[0].message
+    assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_continuation_analysis_incomplete"
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:

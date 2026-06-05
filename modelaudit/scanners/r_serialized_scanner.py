@@ -29,6 +29,8 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
 _STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
+_CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON = "r_serialized_continuation_analysis_incomplete"
+_EXPRESSION_DEPTH_INCONCLUSIVE_REASON = "r_serialized_expression_depth_incomplete"
 _R_SEPARATED_CREDENTIAL_KEY_PATTERN = (
     r"(?:[a-z0-9]+[._-])*"
     r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
@@ -121,6 +123,13 @@ _R_OBVIOUS_NONCALLABLE_GROUPED_TOKEN_RE = re.compile(
     re.VERBOSE,
 )
 _R_INCOMPLETE_EXPRESSION_TRAILING_CHARACTERS = frozenset("+-*/^:!&|<>$@~?%\\")
+_R_EXPRESSION_MAX_DEPTH = 128
+_R_CONTINUATION_ANALYSIS_MAX_CHARS = 16 * 1024
+_R_CONTINUATION_ANALYSIS_MAX_WORK = 256 * 1024
+
+
+class _RExpressionDepthExceeded(Exception):
+    pass
 
 
 def _r_function_keyword_before_position(
@@ -191,8 +200,13 @@ def _r_function_keyword_before_position(
     return True
 
 
-def _r_function_keyword_awaits_formals(text: str) -> bool:
-    return _r_function_keyword_before_position(text, len(text), _r_non_code_spans(text))
+def _r_function_keyword_awaits_formals(
+    text: str,
+    non_code_spans: list[tuple[int, int]] | None = None,
+) -> bool:
+    if non_code_spans is None:
+        non_code_spans = _r_non_code_spans(text)
+    return _r_function_keyword_before_position(text, len(text), non_code_spans)
 
 
 def _r_lambda_shorthand_before_position(
@@ -336,9 +350,12 @@ def _r_named_argument_target_kind(
     if target_kind is None:
         if not (text[cursor].isalnum() or text[cursor] in "._"):
             return None
+        token_end = cursor + 1
         while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
             cursor -= 1
-        target_kind = "symbol"
+        target_kind = _r_unquoted_named_argument_target_kind(text[cursor + 1 : token_end])
+        if target_kind is None:
+            return None
 
     while cursor >= 0:
         while cursor >= 0 and text[cursor].isspace():
@@ -355,6 +372,20 @@ def _r_named_argument_target_kind(
         cursor = span_start - 1
 
     return target_kind if text[cursor] in "([," else None
+
+
+def _r_unquoted_named_argument_target_kind(token: str) -> str | None:
+    if token == "NULL":
+        return "null"
+    if (
+        not token
+        or token.startswith("_")
+        or token[0].isdigit()
+        or (token.startswith(".") and len(token) > 1 and token[1].isdigit())
+        or token in _R_RESERVED_WORDS
+    ):
+        return None
+    return "symbol"
 
 
 def _r_named_argument_equals_positions(
@@ -428,22 +459,246 @@ def _r_named_argument_equals_positions(
         if target_is_function_formals:
             if target[1] not in function_body_validity:
                 body_start = target_close + 1
-                function_body_validity[target[1]] = _r_expression_follows(
-                    text,
-                    body_start,
-                    non_code_spans,
-                    delimiter_pairs,
-                    unterminated_literal_starts,
-                ) and not _r_expression_is_obviously_incomplete(
-                    text,
-                    body_start,
-                    non_code_spans,
-                    unterminated_literal_starts,
+                function_body_validity[target[1]] = (
+                    _r_expression_follows(
+                        text,
+                        body_start,
+                        non_code_spans,
+                        delimiter_pairs,
+                        unterminated_literal_starts,
+                    )
+                    and not _r_expression_is_obviously_incomplete(
+                        text,
+                        body_start,
+                        non_code_spans,
+                        unterminated_literal_starts,
+                    )
+                    and not _r_expression_has_obvious_adjacent_values(
+                        text,
+                        body_start,
+                        len(text),
+                        non_code_spans,
+                        delimiter_pairs,
+                    )
                 )
             if not function_body_validity[target[1]]:
                 continue
+        if not _r_named_argument_value_is_complete(
+            text,
+            position + 1,
+            target_close,
+            non_code_spans,
+            delimiter_pairs,
+            unterminated_literal_starts,
+            allow_missing=not target_is_function_formals,
+        ):
+            continue
         valid_positions.add(position)
     return valid_positions
+
+
+def _r_named_argument_value_is_complete(
+    text: str,
+    value_start: int,
+    target_close: int,
+    non_code_spans: list[tuple[int, int]],
+    delimiter_pairs: dict[int, int],
+    unterminated_literal_starts: set[int],
+    *,
+    allow_missing: bool,
+) -> bool:
+    first_code = _r_next_code_position(text, value_start, non_code_spans)
+    if first_code is None or first_code >= target_close or text[first_code] == ",":
+        return allow_missing
+    if not _r_expression_follows(
+        text,
+        first_code,
+        non_code_spans,
+        delimiter_pairs,
+        unterminated_literal_starts,
+    ) or _r_expression_is_obviously_incomplete(
+        text,
+        first_code,
+        non_code_spans,
+        unterminated_literal_starts,
+    ):
+        return False
+    if _r_expression_has_obvious_adjacent_values(
+        text,
+        first_code,
+        target_close,
+        non_code_spans,
+        delimiter_pairs,
+    ):
+        return False
+    span_index = bisect_right(non_code_spans, first_code, key=lambda span: span[0]) - 1
+    if span_index < 0 or first_code >= non_code_spans[span_index][1]:
+        return True
+    span_start, span_end = non_code_spans[span_index]
+    if text[span_start] == "#" or span_start in unterminated_literal_starts:
+        return False
+    continuation = _r_next_code_position(text, span_end, non_code_spans)
+    if continuation is None or continuation >= target_close or text[continuation] in ",)]":
+        return True
+    return text[continuation] in "+-*/^:!&|<>$@~?%(["
+
+
+def _r_expression_has_obvious_adjacent_values(
+    text: str,
+    position: int,
+    stop: int,
+    non_code_spans: list[tuple[int, int]],
+    delimiter_pairs: dict[int, int],
+    *,
+    allow_newline_separator: bool = False,
+) -> bool:
+    cursor = position
+    expects_value = True
+    namespace_receiver_is_valid = False
+    while cursor < stop:
+        search_start = cursor
+        cursor = _r_next_code_position(text, cursor, non_code_spans) or stop
+        if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
+            expects_value = True
+        if cursor >= stop or text[cursor] in ",;)]}":
+            return False
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+            span_start, span_end = non_code_spans[span_index]
+            if text[span_start] == "#":
+                cursor = span_end
+                continue
+            if not expects_value:
+                return True
+            expects_value = False
+            namespace_receiver_is_valid = text[span_start] != "#"
+            cursor = span_end
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            closer = delimiter_pairs.get(cursor)
+            if closer is None or closer >= stop:
+                return False
+            if expects_value and _r_expression_has_obvious_adjacent_values(
+                text,
+                cursor + 1,
+                closer,
+                non_code_spans,
+                delimiter_pairs,
+                allow_newline_separator=character == "{",
+            ):
+                return True
+            expects_value = False
+            namespace_receiver_is_valid = False
+            cursor = closer + 1
+            continue
+        if character == "\\":
+            if not expects_value:
+                return True
+            opener = _r_next_code_position(text, cursor + 1, non_code_spans)
+            if opener is None or opener >= stop or text[opener] != "(":
+                return True
+            closer = delimiter_pairs.get(opener)
+            if closer is None or closer >= stop:
+                return True
+            expects_value = True
+            cursor = closer + 1
+            continue
+        if character == "%":
+            operator_end = text.find("%", cursor + 1, stop)
+            if expects_value or operator_end < 0:
+                return True
+            expects_value = True
+            namespace_receiver_is_valid = False
+            cursor = operator_end + 1
+            continue
+        if character in "+-":
+            expects_value = True
+            namespace_receiver_is_valid = False
+            cursor += 1
+            continue
+        if character in "~?":
+            expects_value = True
+            namespace_receiver_is_valid = False
+            cursor += 1
+            continue
+        if character == "!" and (cursor + 1 >= stop or text[cursor + 1] != "="):
+            if not expects_value:
+                return True
+            cursor += 1
+            continue
+        if character == "=":
+            if cursor + 1 >= stop or text[cursor + 1] != "=":
+                return True
+            operator = "=="
+        else:
+            operator = next(
+                (
+                    candidate
+                    for candidate in ("<<-", "->>", ":::", "::", "|>", "||", "&&", "<=", ">=", "!=", "<-", "->")
+                    if text.startswith(candidate, cursor)
+                ),
+                character if character in "*/^:&|<>$@" else "",
+            )
+        if operator:
+            if expects_value:
+                return True
+            if operator in {"::", ":::"} and not namespace_receiver_is_valid:
+                return True
+            expects_value = True
+            namespace_receiver_is_valid = False
+            cursor += len(operator)
+            continue
+        if character.isalnum() or character in "._":
+            token_end = cursor + 1
+            while token_end < stop and (text[token_end].isalnum() or text[token_end] in "._"):
+                token_end += 1
+            token = text[cursor:token_end]
+            if token in {"for", "function", "if", "while"}:
+                if not expects_value:
+                    return True
+                opener = _r_next_code_position(text, token_end, non_code_spans)
+                if opener is None or opener >= stop or text[opener] != "(":
+                    return False
+                closer = delimiter_pairs.get(opener)
+                if closer is None or closer >= stop:
+                    return False
+                expects_value = True
+                namespace_receiver_is_valid = False
+                cursor = closer + 1
+                continue
+            if token == "repeat":
+                if not expects_value:
+                    return True
+                expects_value = True
+                namespace_receiver_is_valid = False
+                cursor = token_end
+                continue
+            if token == "else":
+                if expects_value:
+                    return True
+                expects_value = True
+                namespace_receiver_is_valid = False
+                cursor = token_end
+                continue
+            if not expects_value:
+                return True
+            if token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit()):
+                if _R_SIMPLE_NUMERIC_TOKEN_RE.fullmatch(token) is None:
+                    return True
+                namespace_receiver_is_valid = False
+            elif token.startswith("_") or token in _R_CONTROL_WORDS - {"break", "next"}:
+                return True
+            else:
+                namespace_receiver_is_valid = token not in _R_RESERVED_WORDS
+            expects_value = False
+            cursor = token_end
+            continue
+
+        cursor += 1
+    return False
 
 
 def _r_open_paren_starts_argument_list(
@@ -521,7 +776,51 @@ def _r_open_paren_starts_argument_list(
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
     token = text[cursor + 1 : token_end]
-    return not crossed_newline and _r_token_can_start_call(token)
+    if crossed_newline or not _r_token_can_start_call(token):
+        return False
+
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    if cursor >= 0 and text[cursor] in "$@:":
+        operator_start = cursor
+        if text[cursor] == ":":
+            while operator_start >= 0 and text[operator_start] == ":":
+                operator_start -= 1
+            operator_start += 1
+            if cursor - operator_start + 1 not in {2, 3}:
+                return False
+            return _r_namespace_receiver_is_valid(text, operator_start, non_code_spans)
+        return not _r_expression_before_position_is_obviously_non_callable(
+            text,
+            operator_start,
+            non_code_spans,
+            delimiter_pairs,
+        )
+    return True
+
+
+def _r_namespace_receiver_is_valid(
+    text: str,
+    operator_start: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = operator_start - 1
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    if cursor < 0:
+        return False
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        span_start, span_end = non_code_spans[span_index]
+        return span_end == cursor + 1 and text[span_start] in "\"'`" and text[span_end - 1] == text[span_start]
+
+    if not (text[cursor].isalnum() or text[cursor] in "._"):
+        return False
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    return _r_token_can_start_call(text[cursor + 1 : token_end])
 
 
 def _r_token_can_start_call(token: str) -> bool:
@@ -693,8 +992,12 @@ def _r_expression_is_obviously_incomplete(
     return bool(stack) or current_expression_ends_with_operator()
 
 
-def _r_function_body_awaits_continuation(text: str) -> bool:
-    non_code_spans = _r_non_code_spans(text)
+def _r_function_body_awaits_continuation(
+    text: str,
+    non_code_spans: list[tuple[int, int]] | None = None,
+) -> bool:
+    if non_code_spans is None:
+        non_code_spans = _r_non_code_spans(text)
     closing_delimiters = {"(": ")", "[": "]", "{": "}"}
     stack: list[tuple[str, int]] = []
     delimiter_pairs: dict[int, int] = {}
@@ -746,7 +1049,10 @@ def _r_expression_follows(
     non_code_spans: list[tuple[int, int]],
     delimiter_pairs: dict[int, int] | None = None,
     unterminated_literal_starts: set[int] | None = None,
+    remaining_depth: int = _R_EXPRESSION_MAX_DEPTH,
 ) -> bool:
+    if remaining_depth <= 0:
+        raise _RExpressionDepthExceeded
     cursor = _r_next_code_position(text, position, non_code_spans)
     if cursor is None:
         return False
@@ -776,6 +1082,7 @@ def _r_expression_follows(
             non_code_spans,
             delimiter_pairs,
             unterminated_literal_starts,
+            remaining_depth - 1,
         )
     while text[cursor] in "+-!~?":
         cursor = _r_next_code_position(text, cursor + 1, non_code_spans)
@@ -800,12 +1107,28 @@ def _r_expression_follows(
         if token in {"break", "next"}:
             return True
         if token == "repeat":
+            repeat_cursor = token_end
+            while True:
+                cursor = _r_next_code_position(text, repeat_cursor, non_code_spans)
+                if cursor is None:
+                    return False
+                if not (text[cursor].isalnum() or text[cursor] in "._"):
+                    break
+                repeat_token_end = cursor + 1
+                while repeat_token_end < len(text) and (
+                    text[repeat_token_end].isalnum() or text[repeat_token_end] in "._"
+                ):
+                    repeat_token_end += 1
+                if text[cursor:repeat_token_end] != "repeat":
+                    break
+                repeat_cursor = repeat_token_end
             return _r_expression_follows(
                 text,
-                token_end,
+                cursor,
                 non_code_spans,
                 delimiter_pairs,
                 unterminated_literal_starts,
+                remaining_depth - 1,
             )
         if token in {"for", "function", "if", "while"}:
             opener_position = _r_next_code_position(text, token_end, non_code_spans)
@@ -817,12 +1140,25 @@ def _r_expression_follows(
                 non_code_spans,
                 delimiter_pairs,
             )
-            if closer_position is None or not _r_expression_follows(
-                text,
-                closer_position + 1,
-                non_code_spans,
-                delimiter_pairs,
-                unterminated_literal_starts,
+            if (
+                closer_position is None
+                or not _r_control_header_is_complete(
+                    text,
+                    token,
+                    opener_position,
+                    closer_position,
+                    non_code_spans,
+                    delimiter_pairs,
+                    unterminated_literal_starts,
+                )
+                or not _r_expression_follows(
+                    text,
+                    closer_position + 1,
+                    non_code_spans,
+                    delimiter_pairs,
+                    unterminated_literal_starts,
+                    remaining_depth - 1,
+                )
             ):
                 return False
             return token != "if" or not _r_has_incomplete_top_level_else(
@@ -831,9 +1167,62 @@ def _r_expression_follows(
                 non_code_spans,
                 delimiter_pairs,
                 unterminated_literal_starts,
+                remaining_depth - 1,
             )
         return True
     return text[cursor] not in ";,)]}*/^:%<>=&|"
+
+
+def _r_control_header_is_complete(
+    text: str,
+    token: str,
+    opener_position: int,
+    closer_position: int,
+    non_code_spans: list[tuple[int, int]],
+    delimiter_pairs: dict[int, int] | None,
+    unterminated_literal_starts: set[int] | None,
+) -> bool:
+    if token == "function":
+        return True
+    if unterminated_literal_starts is None:
+        unterminated_literal_starts = _r_unterminated_literal_span_starts(text, non_code_spans)
+
+    expression_start = _r_next_code_position(text, opener_position + 1, non_code_spans)
+    if expression_start is None or expression_start >= closer_position:
+        return False
+    if token == "for":
+        if not (text[expression_start].isalpha() or text[expression_start] in "._"):
+            return False
+        symbol_end = expression_start + 1
+        while symbol_end < closer_position and (text[symbol_end].isalnum() or text[symbol_end] in "._"):
+            symbol_end += 1
+        if _r_unquoted_named_argument_target_kind(text[expression_start:symbol_end]) != "symbol":
+            return False
+        in_position = _r_next_code_position(text, symbol_end, non_code_spans)
+        if in_position is None or not (
+            text[in_position : in_position + 2] == "in"
+            and (
+                in_position + 2 >= closer_position
+                or not (text[in_position + 2].isalnum() or text[in_position + 2] in "._")
+            )
+        ):
+            return False
+        expression_start = _r_next_code_position(text, in_position + 2, non_code_spans)
+        if expression_start is None or expression_start >= closer_position:
+            return False
+
+    return _r_expression_follows(
+        text,
+        expression_start,
+        non_code_spans,
+        delimiter_pairs,
+        unterminated_literal_starts,
+    ) and not _r_expression_is_obviously_incomplete(
+        text,
+        expression_start,
+        non_code_spans,
+        unterminated_literal_starts,
+    )
 
 
 def _r_has_incomplete_top_level_else(
@@ -842,7 +1231,10 @@ def _r_has_incomplete_top_level_else(
     non_code_spans: list[tuple[int, int]],
     delimiter_pairs: dict[int, int] | None = None,
     unterminated_literal_starts: set[int] | None = None,
+    remaining_depth: int = _R_EXPRESSION_MAX_DEPTH,
 ) -> bool:
+    if remaining_depth <= 0:
+        raise _RExpressionDepthExceeded
     closing_delimiters = {"(": ")", "[": "]", "{": "}"}
     stack: list[str] = []
     cursor = position
@@ -878,6 +1270,7 @@ def _r_has_incomplete_top_level_else(
                 non_code_spans,
                 delimiter_pairs,
                 unterminated_literal_starts,
+                remaining_depth - 1,
             ):
                 return True
             cursor = token_end
@@ -984,24 +1377,25 @@ def _r_open_bracket_starts_subscript(
     non_code_spans: list[tuple[int, int]],
     delimiter_pairs: dict[int, int] | None = None,
 ) -> bool:
-    cursor = position - 1
-    crossed_newline = False
-    while cursor >= 0 and text[cursor].isspace():
-        crossed_newline = crossed_newline or text[cursor] in "\r\n"
-        cursor -= 1
+    while True:
+        cursor = position - 1
+        crossed_newline = False
+        while cursor >= 0 and text[cursor].isspace():
+            crossed_newline = crossed_newline or text[cursor] in "\r\n"
+            cursor -= 1
 
-    if cursor < 0 or crossed_newline:
-        return False
-    if text[cursor] == "[":
-        return _r_open_bracket_starts_subscript(text, cursor, non_code_spans, delimiter_pairs)
-    if text[cursor] == "]":
-        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans, delimiter_pairs)
-        return opener_position is not None and _r_open_bracket_starts_subscript(
-            text,
-            opener_position,
-            non_code_spans,
-            delimiter_pairs,
-        )
+        if cursor < 0 or crossed_newline:
+            return False
+        if text[cursor] == "[":
+            position = cursor
+            continue
+        if text[cursor] == "]":
+            opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans, delimiter_pairs)
+            if opener_position is None:
+                return False
+            position = opener_position
+            continue
+        break
     if text[cursor] == ")":
         opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans, delimiter_pairs)
         if opener_position is None:
@@ -1025,6 +1419,36 @@ def _r_open_bracket_starts_subscript(
         cursor -= 1
     token = text[cursor + 1 : token_end]
     return _r_token_can_start_subscript(token)
+
+
+def _r_open_call_or_subscript_awaits_continuation(
+    text: str,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    stack: list[tuple[str, int]] = []
+    closing_delimiters = {")": "(", "]": "[", "}": "{"}
+    cursor = 0
+    span_index = 0
+    while cursor < len(text):
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+        character = text[cursor]
+        if character in "([{":
+            stack.append((character, cursor))
+        elif character in closing_delimiters:
+            if not stack or stack[-1][0] != closing_delimiters[character]:
+                stack.clear()
+            else:
+                stack.pop()
+        cursor += 1
+
+    return any(
+        (opener == "(" and _r_open_paren_starts_argument_list(text, position, non_code_spans))
+        or (opener == "[" and _r_open_bracket_starts_subscript(text, position, non_code_spans))
+        for opener, position in stack
+    )
 
 
 def _r_identifier_before_position(
@@ -1582,14 +2006,17 @@ class RSerializedScanner(BaseScanner):
 
         return bytes(decompressed), truncated, total_decompressed
 
-    def _extract_strings(self, payload: bytes) -> tuple[list[_ExtractedString], bool, int, int]:
+    def _extract_strings(self, payload: bytes) -> tuple[list[_ExtractedString], str | None, int, int]:
         strings: list[_ExtractedString] = []
-        truncated = False
+        incomplete_reason: str | None = None
         total_printable_bytes = 0
         longest_string = 0
         current_parts: list[str] = []
+        current_length = 0
         current_offset = 0
         previous_match_end: int | None = None
+        continuation_active = False
+        continuation_analysis_work = 0
 
         def append_current_run() -> bool:
             nonlocal total_printable_bytes, longest_string
@@ -1605,57 +2032,115 @@ class RSerializedScanner(BaseScanner):
             total_printable_bytes += len(text)
             return True
 
+        def append_part(part: str) -> None:
+            nonlocal current_length
+            current_parts.append(part)
+            current_length += len(part)
+
         def append_printable_tail(start: int, end: int) -> None:
             if not current_parts or start >= end:
                 return
-            tail_end = start
+            tail_start = start
+            if continuation_active:
+                while tail_start < end and payload[tail_start] in (0x09, 0x0A, 0x0D, 0x20):
+                    tail_start += 1
+            tail_end = tail_start
             while tail_end < end and 0x20 <= payload[tail_end] <= 0x7E:
                 tail_end += 1
-            if tail_end == start:
+            if tail_end == tail_start:
                 return
-            tail = payload[start:tail_end]
-            current_parts.append(tail.decode("utf-8", errors="ignore"))
+            tail = payload[start if continuation_active else tail_start : tail_end]
+            append_part(tail.decode("utf-8", errors="ignore"))
+
+        def append_short_continuation_prefix(end: int) -> None:
+            nonlocal continuation_active, current_offset
+            prefix_end = end
+            while True:
+                while prefix_end > 0 and payload[prefix_end - 1] in (0x09, 0x0A, 0x0D, 0x20):
+                    prefix_end -= 1
+                line_start = max(payload.rfind(b"\n", 0, prefix_end), payload.rfind(b"\r", 0, prefix_end)) + 1
+                if payload[line_start:prefix_end].lstrip().startswith(b"#"):
+                    prefix_end = line_start
+                    continue
+                break
+            prefix_start = prefix_end
+            while prefix_start > 0 and 0x21 <= payload[prefix_start - 1] <= 0x7E:
+                prefix_start -= 1
+            if not 0 < prefix_end - prefix_start < 3:
+                return
+            prefix = payload[prefix_start:prefix_end].decode("utf-8", errors="ignore")
+            non_code_spans = _r_non_code_spans(prefix)
+            if not _r_open_call_or_subscript_awaits_continuation(prefix, non_code_spans):
+                return
+            current_offset = prefix_start
+            append_part(payload[prefix_start:end].decode("utf-8", errors="ignore"))
+            continuation_active = True
+
+        def gap_supports_continuation(gap: bytes) -> bool:
+            if not gap or not any(byte in (0x0A, 0x0D) for byte in gap):
+                return False
+            try:
+                lines = gap.decode("ascii").splitlines()
+            except UnicodeDecodeError:
+                return False
+            return all(not line.strip() or line.lstrip().startswith("#") for line in lines)
 
         for match in self._PRINTABLE_RE.finditer(payload):
             if previous_match_end != match.start():
                 if previous_match_end is not None:
                     append_printable_tail(previous_match_end, match.start())
                     gap = payload[previous_match_end : match.start()]
-                    current_text = "".join(current_parts)
+                    is_newline_whitespace_gap = gap_supports_continuation(gap)
                     if (
-                        gap
-                        and any(byte in (0x0A, 0x0D) for byte in gap)
-                        and all(byte in (0x09, 0x0A, 0x0D, 0x20) for byte in gap)
-                        and (
+                        is_newline_whitespace_gap
+                        and continuation_active
+                        and (current_length > _R_CONTINUATION_ANALYSIS_MAX_CHARS)
+                    ):
+                        incomplete_reason = _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                        break
+                    if is_newline_whitespace_gap and current_length <= _R_CONTINUATION_ANALYSIS_MAX_CHARS:
+                        continuation_analysis_work += current_length
+                        if continuation_analysis_work > _R_CONTINUATION_ANALYSIS_MAX_WORK:
+                            incomplete_reason = _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                            break
+                        current_text = "".join(current_parts)
+                        non_code_spans = _r_non_code_spans(current_text)
+                        continuation_active = (
                             _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
-                            or _r_function_keyword_awaits_formals(current_text)
-                            or _r_function_body_awaits_continuation(current_text)
+                            or _r_function_keyword_awaits_formals(current_text, non_code_spans)
+                            or _r_function_body_awaits_continuation(current_text, non_code_spans)
                             or _r_lambda_shorthand_before_position(
                                 current_text,
                                 len(current_text),
-                                _r_non_code_spans(current_text),
+                                non_code_spans,
                             )
+                            or _r_open_call_or_subscript_awaits_continuation(current_text, non_code_spans)
                         )
-                    ):
-                        current_parts.append(gap.decode("ascii"))
-                        current_parts.append(match.group().decode("utf-8", errors="ignore"))
+                    else:
+                        continuation_active = False
+                    if continuation_active:
+                        append_part(gap.decode("ascii"))
+                        append_part(match.group().decode("utf-8", errors="ignore"))
                         previous_match_end = match.end()
                         continue
                 if not append_current_run():
-                    truncated = True
+                    incomplete_reason = _STRING_EXTRACTION_INCONCLUSIVE_REASON
                     break
                 current_parts = []
+                current_length = 0
+                continuation_active = False
                 current_offset = match.start()
+                append_short_continuation_prefix(match.start())
 
-            current_parts.append(match.group().decode("utf-8", errors="ignore"))
+            append_part(match.group().decode("utf-8", errors="ignore"))
             previous_match_end = match.end()
         else:
             if previous_match_end is not None:
                 append_printable_tail(previous_match_end, len(payload))
             if not append_current_run():
-                truncated = True
+                incomplete_reason = _STRING_EXTRACTION_INCONCLUSIVE_REASON
 
-        return strings, truncated, total_printable_bytes, longest_string
+        return strings, incomplete_reason, total_printable_bytes, longest_string
 
     def _context_window(self, strings: list[_ExtractedString], index: int, window_size: int = 2) -> str:
         start = max(0, index - window_size)
@@ -1690,6 +2175,7 @@ class RSerializedScanner(BaseScanner):
         url_hits: set[str] = set()
         ip_hits: set[str] = set()
         credential_hits: set[str] = set()
+        expression_analysis_incomplete = False
 
         for index, extracted in enumerate(strings):
             text = extracted.text
@@ -1732,11 +2218,19 @@ class RSerializedScanner(BaseScanner):
             for name, pattern in self._CREDENTIAL_PATTERNS.items():
                 if pattern.search(text):
                     credential_hits.add(name)
-            if (
-                _contains_r_quoted_credential_assignment(text)
-                or _contains_r_raw_credential_assignment(text)
-                or _contains_r_expression_credential_assignment(text)
-            ):
+            try:
+                has_credential_assignment = (
+                    _contains_r_quoted_credential_assignment(text)
+                    or _contains_r_raw_credential_assignment(text)
+                    or _contains_r_expression_credential_assignment(text)
+                )
+            except _RExpressionDepthExceeded:
+                expression_analysis_incomplete = True
+                has_credential_assignment = False
+            except RecursionError:
+                # Ambiguous deeply nested R syntax must not turn into lost coverage.
+                has_credential_assignment = True
+            if has_credential_assignment:
                 credential_hits.add("generic_secret_assignment")
 
         if critical_symbol_hits:
@@ -1830,6 +2324,22 @@ class RSerializedScanner(BaseScanner):
                 passed=True,
                 message="No suspicious URL/IP indicators detected",
                 location=path,
+            )
+
+        if expression_analysis_incomplete:
+            mark_inconclusive_scan_result(result, _EXPRESSION_DEPTH_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="R Expression Analysis Ceiling",
+                passed=False,
+                message=f"R expression analysis exceeded the nesting ceiling ({_R_EXPRESSION_MAX_DEPTH})",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "max_expression_depth": _R_EXPRESSION_MAX_DEPTH,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _EXPRESSION_DEPTH_INCONCLUSIVE_REASON,
+                },
+                why="A nesting ceiling bounds parser work. Review deeply nested expressions manually.",
             )
 
         if credential_hits:
@@ -2000,30 +2510,42 @@ class RSerializedScanner(BaseScanner):
                 details={"max_scan_bytes": self.max_scan_bytes, "compression": compression},
             )
 
-        extracted_strings, strings_truncated, total_printable_bytes, longest_string = self._extract_strings(payload)
+        extracted_strings, extraction_incomplete_reason, total_printable_bytes, longest_string = self._extract_strings(
+            payload
+        )
+        strings_truncated = extraction_incomplete_reason is not None
         result.metadata["compression"] = compression
         result.metadata["decompressed_bytes"] = decompressed_bytes
         result.metadata["extracted_string_count"] = len(extracted_strings)
         result.bytes_scanned = len(payload)
 
-        if strings_truncated:
-            mark_inconclusive_scan_result(result, _STRING_EXTRACTION_INCONCLUSIVE_REASON)
+        if extraction_incomplete_reason is not None:
+            mark_inconclusive_scan_result(result, extraction_incomplete_reason)
+            continuation_analysis_incomplete = (
+                extraction_incomplete_reason == _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+            )
+            message = (
+                f"Analysis reached the R continuation-analysis ceiling "
+                f"({_R_CONTINUATION_ANALYSIS_MAX_CHARS} characters)"
+                if continuation_analysis_incomplete
+                else f"Analysis reached configured extracted-string ceiling ({self.max_extracted_strings} strings)"
+            )
             result.add_check(
                 name="String Extraction Ceiling",
                 passed=False,
-                message=(
-                    f"Analysis reached configured extracted-string ceiling ({self.max_extracted_strings} strings)"
-                ),
+                message=message,
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "max_extracted_strings": self.max_extracted_strings,
+                    "max_continuation_analysis_chars": _R_CONTINUATION_ANALYSIS_MAX_CHARS,
+                    "max_continuation_analysis_work": _R_CONTINUATION_ANALYSIS_MAX_WORK,
                     "analysis_incomplete": True,
-                    "scan_outcome_reason": _STRING_EXTRACTION_INCONCLUSIVE_REASON,
+                    "scan_outcome_reason": extraction_incomplete_reason,
                 },
                 why=(
-                    "An extracted-string ceiling limits resource usage. Review with higher limits if deeper "
-                    "inspection is needed."
+                    "Parser work ceilings limit resource usage. Review the artifact manually when deeper "
+                    "inspection is required."
                 ),
             )
 
