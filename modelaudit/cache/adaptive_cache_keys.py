@@ -64,10 +64,14 @@ class AdaptiveCacheKeyGenerator:
         self.cache_expiry = 5.0  # Cache fingerprints for 5 seconds
 
     def generate_key_material_with_stat_reuse(
-        self, file_path: str, stat_result: os.stat_result
+        self,
+        file_path: str,
+        stat_result: os.stat_result,
+        content_hash: str | None = None,
     ) -> tuple[str, str | None]:
         """Generate a cache key plus any content hash already needed for that key."""
         fingerprint = FileFingerprint.from_stat(file_path, stat_result)
+        fingerprint.content_hash = content_hash
 
         # Use content hash strategy based on file size
         if self._should_use_content_hash(stat_result.st_size):
