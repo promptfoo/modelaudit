@@ -76,6 +76,7 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
                 path=asset_dict.get("path", "/test/path"),
                 type=asset_dict.get("type", "test"),
                 size=asset_dict.get("size", 0),
+                is_streamed=asset_dict.get("is_streamed"),
                 tensors=asset_dict.get("tensors"),
                 keys=asset_dict.get("keys"),
                 contents=asset_dict.get("contents"),
@@ -2381,6 +2382,68 @@ def test_scan_pytorchhub_url_passes_max_download_bytes(
     assert mock_download.call_args.kwargs["max_size"] == 5 * 1024
 
 
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--scanners", "pickle"],
+        ["--exclude-scanner", "onnx", "--exclude-scanner", "weight_distribution"],
+    ],
+)
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_passes_selected_scanner_extensions(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    selection_args: list[str],
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", *selection_args, "--quiet", "https://pytorch.org/hub/pytorch_vision_resnet/"],
+    )
+
+    assert result.exit_code == 0
+    extensions = mock_download.call_args.kwargs["scannable_extensions"]
+    assert ".pkl" in extensions
+    assert ".onnx" not in extensions
+
+
+@pytest.mark.parametrize("scanner_id", ["keras_h5", "zip"])
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_preserves_header_routed_artifacts(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    scanner_id: str,
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--scanners", scanner_id, "--quiet", "https://pytorch.org/hub/pytorch_vision_resnet/"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["scannable_extensions"] is None
+
+
 @patch("modelaudit.cli.is_pytorch_hub_url")
 @patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
@@ -2408,6 +2471,44 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
     assert mock_download_streaming.call_args.kwargs["timeout"] > 0
+
+
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--scanners", "pickle"],
+        ["--exclude-scanner", "onnx", "--exclude-scanner", "weight_distribution"],
+    ],
+)
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_pytorchhub_stream_passes_selected_scanner_extensions(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_ph_url: MagicMock,
+    selection_args: list[str],
+) -> None:
+    mock_is_ph_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            *selection_args,
+            "--quiet",
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+        ],
+    )
+
+    assert result.exit_code == 0
+    extensions = mock_download_streaming.call_args.kwargs["scannable_extensions"]
+    assert ".pkl" in extensions
+    assert ".onnx" not in extensions
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
@@ -2631,7 +2732,8 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "safetensors",
+                "is_streamed": True,
                 "size": file_sizes[str(file_path)],
             }
             for file_path in streamed_files
@@ -2704,7 +2806,7 @@ def test_scan_huggingface_sbom_excludes_download_cache_files(
         assets=[
             {
                 "path": str(file_path),
-                "type": "streamed",
+                "type": "streaming",
                 "size": len(content),
             }
             for file_path, content in real_files.items()
