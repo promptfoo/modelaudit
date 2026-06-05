@@ -762,6 +762,8 @@ def _without_unproven_oversized_frame_tamper(
     normalized_stream_start_offset = max(stream_start_offset, 0)
 
     def oversized_frame_is_proven(details: Mapping[str, Any]) -> bool:
+        if details.get("overrun_boundary") in {"stop", "next_frame"}:
+            return True
         if bytes_total is None:
             return False
         position = details.get("position")
