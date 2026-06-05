@@ -167,7 +167,7 @@ def test_stream_analyze_file_signed_pickle_url_uses_path_for_header_fallback(
     """Signed URL queries must not hide pickle extensions from fallback checks."""
     file_path = tmp_path / "sample.pkl"
     file_path.write_bytes(b"os\nsystem")
-    signed_url = f"file://{file_path}?X-Amz-Signature=secret"
+    signed_url = f"{file_path.as_uri()}?X-Amz-Signature=secret"
 
     class QueryIgnoringLocalFileSystem(LocalFileSystem):
         @staticmethod
