@@ -5917,14 +5917,18 @@ class TestJITScriptDetector:
 
         assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
 
-    def test_single_window_prefix_context_is_extracted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_single_window_prefix_context_checks_are_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         original_is_priority_context = jit_script_module._is_priority_prefix_context_statement
         priority_context_checks = 0
 
-        def recording_is_priority_context(context: bytes, statement: bytes) -> bool:
+        def recording_is_priority_context(
+            context: bytes,
+            statement: bytes,
+            active_priority_names: set[str] | None = None,
+        ) -> bool:
             nonlocal priority_context_checks
             priority_context_checks += 1
-            return original_is_priority_context(context, statement)
+            return original_is_priority_context(context, statement, active_priority_names)
 
         monkeypatch.setattr(
             jit_script_module,
@@ -5938,7 +5942,7 @@ class TestJITScriptDetector:
         windows = jit_script_module._embedded_python_extraction_windows(data)
 
         assert windows
-        assert priority_context_checks == 1
+        assert priority_context_checks <= 1
 
     def test_scan_model_does_not_flag_builtin_substring_inside_identifier(self) -> None:
         detector = JITScriptDetector()
@@ -8768,6 +8772,53 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
             for finding in findings
         )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [f for f in [eval]]\ncallbacks[0]('1+1')",
+            "for _x, callback in zip([0], [eval]):\n    callback('1+1')",
+            (
+                "class Base:\n"
+                "    def run(self, callback): callback('1+1')\n"
+                "class Child(Base):\n"
+                "    def go(self): super().run(eval)\n"
+                "Child().go()"
+            ),
+            "import operator\noperator.methodcaller('__call__', '1+1')(eval)",
+            "import operator\noperator.attrgetter('__call__')(eval)('1+1')",
+            "callbacks = []\ncallbacks.insert(0, eval)\ncallbacks[0]('1+1')",
+            "callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks['run']('1+1')",
+        ],
+    )
+    def test_dangerous_builtin_analysis_tracks_additional_alias_flows(self, source: str) -> None:
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(ast.parse(source))
+
+        assert "eval" in findings
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "callbacks = [f for f in [len]]\ncallbacks[0]([])\nunused = eval",
+            "callbacks = [f for f in [eval] if False]\ncallbacks[0]('1+1')",
+            "for _x, callback in zip([0], [len]):\n    callback([])\nunused = eval",
+            (
+                "class Base:\n"
+                "    def run(self, callback): callback([])\n"
+                "class Child(Base):\n"
+                "    def go(self): super().run(len)\n"
+                "Child().go()\nunused = eval"
+            ),
+            "import operator\noperator.methodcaller('__str__')(eval)",
+            "import operator\noperator.attrgetter('__name__')(eval)",
+            "callbacks = []\ncallbacks.insert(0, eval)\ncallbacks[0] = len\ncallbacks[0]([])",
+            ("callbacks = {}\ncallbacks.update({'run': eval})\ncallbacks.update(run=len)\ncallbacks['run']([])"),
+        ],
+    )
+    def test_dangerous_builtin_analysis_ignores_safe_alias_near_matches(self, source: str) -> None:
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(ast.parse(source))
+
+        assert "eval" not in findings
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""

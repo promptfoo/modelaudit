@@ -323,7 +323,8 @@ _EMBEDDED_PYTHON_STATIC_MEMBER_CONTEXT_START_PATTERN = re.compile(
 _EMBEDDED_PYTHON_STATIC_MAPPING_CALL_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*\([^#\n]*__dict__[^#\n]*\)"
 )
-_EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
+_EmbeddedPythonCandidateData = bytes | memoryview
+_EmbeddedPythonCandidate = tuple[_EmbeddedPythonCandidateData, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
 def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
@@ -396,6 +397,7 @@ def _candidate_embedded_python_snippets(
     include_full_source: bool = False,
 ) -> list[_EmbeddedPythonCandidate]:
     candidates: list[_EmbeddedPythonCandidate] = []
+    bounded_view = memoryview(bounded)
     block_spans: list[tuple[int, int]] = []
     start_offsets = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)]
     if start_offsets and b"__future__" in bounded and b"annotations" in bounded and _source_defers_annotations(bounded):
@@ -436,7 +438,7 @@ def _candidate_embedded_python_snippets(
                 continue
         candidate_start = _candidate_start_with_enclosing_header(bounded, start)
         span = (candidate_start, len(bounded))
-        candidates.append((bounded[candidate_start:], span, (span,)))
+        candidates.append((bounded_view[candidate_start:], span, (span,)))
 
     return candidates
 
@@ -713,11 +715,95 @@ def _priority_assignment_probe_calls(target: str) -> list[str]:
     ]
 
 
+def _simple_priority_forwarding_usage(
+    candidate: bytes,
+    aliases: frozenset[bytes],
+) -> tuple[list[tuple[int, int]], frozenset[str]] | None:
+    alias_names = {alias.decode("utf-8") for alias in aliases}
+    namespace_modules: dict[str, str] = {}
+    rule_codes_by_name: dict[str, frozenset[str]] = {}
+    rule_codes_by_reference = {
+        reference_name: rule_code for rule_code, (reference_name, _probe) in _PROVEN_HIGH_RISK_CALL_PROBES.items()
+    }
+    line_start = 0
+    for line in candidate.splitlines(keepends=True):
+        line_end = line_start + len(line)
+        structural_line = _python_structural_line_bytes(line.lstrip(b"\x00\xff")).strip()
+        if not structural_line:
+            line_start = line_end
+            continue
+        import_match = re.fullmatch(
+            rb"import\s+(runpy|webbrowser|ctypes)(?:\s+as\s+([A-Za-z_]\w*))?",
+            structural_line,
+        )
+        if import_match is not None:
+            module_name = import_match.group(1).decode("utf-8")
+            local_name = (import_match.group(2) or import_match.group(1)).decode("utf-8")
+            if local_name in alias_names:
+                namespace_modules[local_name] = module_name
+            line_start = line_end
+            continue
+        forwarding = _simple_forwarded_alias_assignment(structural_line)
+        if forwarding is not None:
+            target_name, dependency_name, expression = forwarding
+            normalized_reference = re.sub(rb"\s+", b"", expression).decode("utf-8")
+            propagated_rules = rule_codes_by_name.get(dependency_name)
+            propagated_namespace = namespace_modules.get(dependency_name)
+            if propagated_rules is not None:
+                rule_codes_by_name[target_name] = propagated_rules
+                namespace_modules.pop(target_name, None)
+            elif propagated_namespace is not None:
+                if normalized_reference == dependency_name:
+                    namespace_modules[target_name] = propagated_namespace
+                    rule_codes_by_name.pop(target_name, None)
+                else:
+                    suffix = normalized_reference.removeprefix(f"{dependency_name}.")
+                    rule_code = rule_codes_by_reference.get(f"{propagated_namespace}.{suffix}")
+                    if rule_code is not None:
+                        rule_codes_by_name[target_name] = frozenset({rule_code})
+                        namespace_modules.pop(target_name, None)
+                    else:
+                        return None
+            else:
+                namespace_modules.pop(target_name, None)
+                rule_codes_by_name.pop(target_name, None)
+            line_start = line_end
+            continue
+        tracked_names = alias_names | set(namespace_modules) | set(rule_codes_by_name)
+        identifiers = _python_identifier_names(structural_line)
+        if b"(" in structural_line:
+            called_roots = _callable_root_names(structural_line)
+            matched_roots = called_roots.intersection(rule_codes_by_name)
+            if matched_roots:
+                return (
+                    [(line_start, line_end)],
+                    frozenset(rule_code for root_name in matched_roots for rule_code in rule_codes_by_name[root_name]),
+                )
+            return None
+        elif (
+            not identifiers.isdisjoint(tracked_names)
+            and re.fullmatch(
+                rb"(?:\(\s*)*[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*(?:\s*\))*",
+                structural_line,
+            )
+            is None
+        ):
+            return None
+        line_start = line_end
+    return [], frozenset()
+
+
 def _priority_alias_usage_lines(
     candidate: bytes,
     aliases: frozenset[bytes],
     search_start: int,
+    *,
+    deferred_annotations: bool = False,
 ) -> tuple[list[tuple[int, int]], frozenset[str]]:
+    simple_forwarding_usage = _simple_priority_forwarding_usage(candidate, aliases)
+    if simple_forwarding_usage is not None:
+        return simple_forwarding_usage
+
     usage_lines: list[tuple[int, int]] = []
     retained_alias_names = {alias.decode("utf-8") for alias in aliases}
     relevant_binding_names = set(retained_alias_names)
@@ -803,7 +889,9 @@ def _priority_alias_usage_lines(
     uncertain_builtin_dict_descriptor_setdefault_aliases: set[str] = set()
     builtin_mapping_state_spans: dict[str, tuple[int, int]] = {}
     runpy_namespace_owner_names = {alias.decode("utf-8") for alias in aliases}
-    deferred_annotations = _source_defers_annotations(candidate)
+    deferred_annotations = deferred_annotations or (
+        b"__future__" in candidate and b"annotations" in candidate and _source_defers_annotations(candidate)
+    )
 
     def register_builtins_alias(name: str) -> None:
         builtins_alias_names.add(name)
@@ -1585,6 +1673,8 @@ def _priority_alias_usage_lines(
                 continue
             selected.add(span)
             selected_size += span[1] - span[0] + 1
+            if selected_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                return [], True, True
             pending.extend(
                 (candidate[state_start:state_end], (state_start, state_end))
                 for state_start, state_end in typed_binding_state_spans.get(span, [])
@@ -1598,8 +1688,7 @@ def _priority_alias_usage_lines(
                     pending.append(definition)
                 elif reference in retained_alias_names:
                     reaches_retained_alias = True
-        overflowed = selected_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
-        return ([] if overflowed else sorted(selected)), reaches_retained_alias, overflowed
+        return sorted(selected), reaches_retained_alias, False
 
     def has_inert_forwarding_state(spans: list[tuple[int, int]]) -> bool:
         return any(
@@ -2061,7 +2150,14 @@ def _priority_alias_usage_lines(
         )
         if structural_code_line.endswith(b":"):
             active_late_headers.append((line_indent, structural_code_line, line_start))
-        parenthesis_delta = _line_parenthesis_delta(code_line)
+        parenthesis_delta = (
+            code_line.count(b"(")
+            + code_line.count(b"[")
+            + code_line.count(b"{")
+            - code_line.count(b")")
+            - code_line.count(b"]")
+            - code_line.count(b"}")
+        )
         has_line_continuation = code_line.rstrip().endswith(b"\\")
         skips_state_neutral_forwarding = (
             line_end > search_start
@@ -5059,6 +5155,10 @@ def _simple_forwarded_alias_assignment(statement: bytes) -> tuple[str, str, byte
             match.group(2),
         )
 
+    assignment = parse_assignment(raw_statement)
+    if assignment is not None:
+        return assignment
+
     structural_statement = _python_structural_line_bytes(raw_statement).rstrip()
     while True:
         if structural_statement.endswith(b";"):
@@ -5799,6 +5899,14 @@ def _python_identifier_names(statement: bytes) -> set[str]:
 
 
 def _simple_late_assignment_value_reference(statement: bytes) -> str | None:
+    simple_assignment = re.fullmatch(
+        rb"\s*[A-Za-z_]\w*\s*(?::[^=\n]+)?=\s*(?:\(\s*)*"
+        rb"(?P<reference>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)(?:\s*\))*\s*",
+        statement.lstrip(b"\x00\xff").rstrip(),
+    )
+    if simple_assignment is not None:
+        return re.sub(rb"\s+", b"", simple_assignment.group("reference")).decode("utf-8")
+
     source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
     try:
         tree = ast.parse(textwrap.dedent(source))
@@ -7369,6 +7477,8 @@ def _runpy_priority_member_update_key(
     )
     if ast_update is not None:
         return ast_update
+    if not any(member_name in line for member_name in (b"_run_module_as_main", b"run_module", b"run_path")):
+        return None
     member_names = rb"(_run_module_as_main|run_module|run_path)"
     for alias in aliases:
         match = re.search(
@@ -8345,7 +8455,7 @@ def _select_prioritized_embedded_python_snippets(
         has_priority_marker = (
             _span_contains_priority_offset(span, priority_offsets)
             if bounded is not None
-            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
+            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(bytes(candidate).lower()) is not None
         )
         oversized_priority_candidate = (
             has_priority_marker and bounded is not None and len(candidate) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
@@ -8355,7 +8465,7 @@ def _select_prioritized_embedded_python_snippets(
                 omitted_budgeted_spans.append(span)
                 continue
             candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
-                candidate, span, priority_offsets
+                bytes(candidate), span, priority_offsets
             )
             if span in selected_spans:
                 continue
@@ -8369,10 +8479,10 @@ def _select_prioritized_embedded_python_snippets(
                 continue
             if bounded is not None:
                 candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
-                    candidate, span, priority_offsets
+                    bytes(candidate), span, priority_offsets
                 )
             else:
-                candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+                candidate = bytes(candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES])
                 span = (span[0], span[0] + len(candidate))
                 real_ranges = (span,)
             if span in selected_spans:
@@ -8380,6 +8490,12 @@ def _select_prioritized_embedded_python_snippets(
             selected_priority_candidates += 1
         else:
             selected_default_candidates += 1
+            if isinstance(candidate, memoryview) and len(candidate) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                candidate = bytes(candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES])
+                span = (span[0], span[0] + len(candidate))
+                real_ranges = (span,)
+            else:
+                candidate = bytes(candidate)
         selected_spans.add(span)
         selected.append((candidate, span, real_ranges))
     return selected, omitted_budgeted_spans
@@ -8705,8 +8821,32 @@ def _builtins_helper_import_alias_bindings(statement: bytes) -> dict[str, str]:
     }
 
 
-def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> bool:
-    aliases = _priority_import_aliases(context)
+def _is_priority_prefix_context_statement(
+    context: bytes,
+    statement: bytes,
+    active_priority_names: set[str] | None = None,
+) -> bool:
+    descriptor_reference = _simple_late_assignment_value_reference(statement)
+    if (
+        active_priority_names
+        and descriptor_reference is not None
+        and descriptor_reference.split(".", maxsplit=1)[0] in active_priority_names
+    ):
+        return True
+    if (
+        active_priority_names
+        and not _python_identifier_names(statement).isdisjoint(active_priority_names)
+        and any(
+            marker in statement
+            for marker in (b"__dict__", b"setattr", b"delattr", b".update", b"__setitem__", b"setdefault")
+        )
+    ):
+        return True
+    aliases = (
+        frozenset(name.encode("utf-8") for name in active_priority_names)
+        if active_priority_names is not None
+        else _priority_import_aliases(context)
+    )
     if (
         aliases
         and _runpy_priority_member_update_key(statement, _python_structural_line_bytes(statement), aliases) is not None
@@ -8717,7 +8857,6 @@ def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> b
     if aliases and _runpy_priority_deleted_member_key(statement, aliases) is not None:
         return True
     if aliases:
-        descriptor_reference = _simple_late_assignment_value_reference(statement)
         if descriptor_reference is not None and (
             descriptor_reference == "dict"
             or descriptor_reference.startswith("dict.")
@@ -8801,6 +8940,26 @@ def _statement_defined_names(statement: bytes) -> set[str]:
             for target in targets:
                 names.update(_assignment_target_names(target))
                 names.update(_assignment_target_root_names(target))
+    return names
+
+
+def _statement_bound_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
     return names
 
 
@@ -8917,6 +9076,8 @@ def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dic
         if compact_forward is not None:
             target_name, dependency_name, expression = compact_forward
             retained_expression = compact_alias_expressions.get(dependency_name)
+            if retained_expression is None and dependency_name == "builtins":
+                retained_expression = b"builtins"
             if retained_expression is None and dependency_name in active_priority_names:
                 retained_expression = expression
             if retained_expression is not None:
@@ -8936,7 +9097,7 @@ def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dic
         if (
             not compact_priority_statement
             and not preserves_deferred_annotations
-            and not _is_priority_prefix_context_statement(current_context, statement)
+            and not _is_priority_prefix_context_statement(current_context, statement, active_priority_names)
             and not _is_prefix_context_shadow_statement(current_context, statement)
         ):
             multiline_quote = statement_line_quote
@@ -8965,15 +9126,17 @@ def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dic
         context_size += len(statement)
         if compact_priority_statement:
             defined_names = {target_name}
+            bound_names = defined_names
             priority_aliases: set[str] = set()
         else:
             defined_names = _statement_defined_names(statement)
+            bound_names = _statement_bound_names(statement)
             priority_aliases = (
                 {alias.decode("utf-8") for alias in _priority_import_aliases(statement)}
                 if re.match(rb"\s*(?:import|from)\b", statement) is not None
                 else set()
             )
-        active_priority_names.difference_update(defined_names - priority_aliases)
+        active_priority_names.difference_update(bound_names - priority_aliases)
         active_priority_names.update(priority_aliases)
         retained_context_names.update(defined_names)
         index += 1
@@ -8996,10 +9159,12 @@ def _append_single_window_prefix_context_windows(
     if not any(marker in bounded for marker in _BUILTIN_ALIAS_CONTEXT_MARKERS):
         return
     starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded) if match.start() > 0]
-    selected_starts = [
-        *starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
-        *starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
-    ]
+    # The base extraction window already covers the first default candidates.
+    # Add contextual windows only for late candidates that need prefix state.
+    selected_starts = _deduplicated_context_starts(
+        bounded,
+        starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+    )
     selected_starts = list(dict.fromkeys(selected_starts))
     contexts = _priority_prefix_contexts_at_offsets(bounded, selected_starts)
     for start in selected_starts:
@@ -9026,25 +9191,44 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     import_context = _extract_priority_prefix_context(data[:prefix_context_end])
     if import_context:
         contextual_source = import_context + b"\n" + contextual_tail
-        extraction_windows.append((contextual_source, True))
-        extraction_windows.extend(_contextual_priority_framed_windows(contextual_source))
         tail_starts = [
             match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(contextual_tail) if match.start() > 0
         ]
         context_aliases = _priority_import_aliases(import_context)
-        priority_tail_starts = set(_tail_starts_for_priority_alias_uses(contextual_tail, tail_starts, context_aliases))
+        priority_tail_start_values, proved_rule_codes = _tail_starts_for_priority_alias_uses(
+            contextual_tail,
+            tail_starts,
+            context_aliases,
+            deferred_annotations=(
+                b"__future__" in import_context
+                and b"annotations" in import_context
+                and _source_defers_annotations(import_context)
+            ),
+        )
+        priority_tail_starts = set(priority_tail_start_values)
         for priority_offset in _priority_import_offsets(contextual_tail):
             insertion_index = bisect_right(tail_starts, priority_offset)
             if insertion_index:
                 priority_tail_starts.add(tail_starts[insertion_index - 1])
         priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
-        selected_starts = [
-            *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
-            *priority_tail_start_list,
-            *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        selected_starts = _deduplicated_context_starts(
+            contextual_tail,
+            sorted(set(priority_tail_start_list) | set(tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:])),
+        )
+        targeted_contextual_windows = [
+            (import_context + b"\n" + contextual_tail[start:], True) for start in selected_starts
         ]
-        for start in dict.fromkeys(selected_starts):
-            extraction_windows.append((import_context + b"\n" + contextual_tail[start:], True))
+        if proved_rule_codes and targeted_contextual_windows:
+            proof_suffix = b"".join(
+                _PROVEN_HIGH_RISK_CALL_PROBES[rule_code][1]
+                for rule_code in sorted(proved_rule_codes)
+                if rule_code in _PROVEN_HIGH_RISK_CALL_PROBES
+            )
+            proof_window, include_full_source = targeted_contextual_windows[0]
+            targeted_contextual_windows[0] = (proof_window + proof_suffix, include_full_source)
+        contextual_windows = [] if proved_rule_codes else _contextual_priority_framed_windows(contextual_source)
+        fallback_contextual_windows = [] if proved_rule_codes else [*contextual_windows, (contextual_source, True)]
+        extraction_windows[0:0] = [*targeted_contextual_windows, *fallback_contextual_windows]
     return extraction_windows
 
 
@@ -9114,6 +9298,17 @@ def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
     return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
 
 
+def _deduplicated_context_starts(data: bytes, starts: list[int]) -> list[int]:
+    selected: list[int] = []
+    for start in dict.fromkeys(starts):
+        if selected and start - selected[-1] <= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+            intervening = data[selected[-1] : start]
+            if b"\x00" not in intervening and b"\xff" not in intervening:
+                continue
+        selected.append(start)
+    return selected
+
+
 def _embedded_python_analysis_incomplete_finding(
     *,
     framework: str,
@@ -9156,16 +9351,23 @@ def _tail_starts_for_priority_alias_uses(
     tail: bytes,
     tail_starts: list[int],
     aliases: frozenset[bytes],
-) -> list[int]:
+    *,
+    deferred_annotations: bool = False,
+) -> tuple[list[int], frozenset[str]]:
     selected_starts: list[int] = []
     if not tail_starts or not aliases:
-        return selected_starts
-    usage_lines, _proved_rule_codes = _priority_alias_usage_lines(tail, aliases, 0)
+        return selected_starts, frozenset()
+    usage_lines, proved_rule_codes = _priority_alias_usage_lines(
+        tail,
+        aliases,
+        min(len(tail), _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES),
+        deferred_annotations=deferred_annotations,
+    )
     for usage_start, _usage_end in usage_lines:
         start_index = bisect_right(tail_starts, usage_start) - 1
         if start_index >= 0:
             selected_starts.append(tail_starts[start_index])
-    return selected_starts
+    return selected_starts, proved_rule_codes
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
@@ -9328,18 +9530,23 @@ class JITScriptDetector:
     def _looks_like_framed_dangerous_python_source(
         data: bytes,
         prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] | None = None,
+        *,
+        extraction_windows: list[tuple[bytes, bool]] | None = None,
     ) -> bool:
         """Return whether a bounded binary blob has parseable dangerous Python framing."""
         if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
             return False
-        for window_index, (window, include_full_source) in enumerate(_embedded_python_extraction_windows(data)):
+        windows = extraction_windows if extraction_windows is not None else _embedded_python_extraction_windows(data)
+        for window_index, (window, include_full_source) in enumerate(windows):
             bounded = window if include_full_source else window[:1000000]
             candidates = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
             prioritized_snippets = _prioritized_embedded_python_snippets(candidates, bounded=bounded)
             if prioritized_snippets_by_window is not None:
                 prioritized_snippets_by_window[window_index] = prioritized_snippets
-            for candidate, _span, _real_ranges in prioritized_snippets:
+            for candidate, span, real_ranges in prioritized_snippets:
                 if any(probe in candidate for _name, probe in _PROVEN_HIGH_RISK_CALL_PROBES.values()):
+                    if prioritized_snippets_by_window is not None:
+                        prioritized_snippets_by_window[window_index] = [(candidate, span, real_ranges)]
                     return True
                 code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
@@ -9348,9 +9555,13 @@ class JITScriptDetector:
                 snippet_tree, _parsed_chars = parsed_snippet
                 try:
                     if JITScriptDetector._ast_contains_dangerous_python(snippet_tree):
+                        if prioritized_snippets_by_window is not None:
+                            prioritized_snippets_by_window[window_index] = [(candidate, span, real_ranges)]
                         return True
                 except RecursionError:
                     if any(probe in candidate for _name, probe in _PROVEN_HIGH_RISK_CALL_PROBES.values()):
+                        if prioritized_snippets_by_window is not None:
+                            prioritized_snippets_by_window[window_index] = [(candidate, span, real_ranges)]
                         return True
         return False
 
@@ -9441,6 +9652,8 @@ class JITScriptDetector:
                 self.container_alias_scopes: list[dict[str, dict[tuple[object, ...], str | None]]] = [{}]
                 self.container_identity_scopes: list[dict[str, int | None]] = [{}]
                 self.attribute_alias_scopes: list[dict[tuple[str, ...], str | None]] = [{}]
+                self.attribute_container_names: list[set[str]] = [set()]
+                self.attribute_function_names: list[set[str]] = [set()]
                 self.scope_kinds = ["module"]
                 self.global_name_scopes: list[set[str]] = [set()]
                 self.next_container_identity = 1
@@ -9448,6 +9661,7 @@ class JITScriptDetector:
                 self.return_binding_stack: list[list[_BuiltinAliasBinding]] = []
                 self.yield_binding_stack: list[list[_BuiltinAliasBinding]] = []
                 self.active_function_calls: set[str] = set()
+                self.active_class_calls: list[str] = []
                 self.deferred_annotations = False
                 self.function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = {}
                 self.lambda_summaries: dict[int, _FunctionAliasSummary] = {}
@@ -9474,6 +9688,8 @@ class JITScriptDetector:
                 self.container_alias_scopes.append({})
                 self.container_identity_scopes.append({})
                 self.attribute_alias_scopes.append({})
+                self.attribute_container_names.append(set())
+                self.attribute_function_names.append(set())
                 self.scope_kinds.append(kind)
                 self.global_name_scopes.append(set(global_names or set()))
                 for name in local_names or set():
@@ -9501,6 +9717,8 @@ class JITScriptDetector:
                 self.container_alias_scopes.pop()
                 self.container_identity_scopes.pop()
                 self.attribute_alias_scopes.pop()
+                self.attribute_container_names.pop()
+                self.attribute_function_names.pop()
                 self.scope_kinds.pop()
                 self.global_name_scopes.pop()
 
@@ -9637,7 +9855,7 @@ class JITScriptDetector:
                     return return_binding[7]
                 if (
                     isinstance(node, ast.Attribute)
-                    and node.attr in {"call", "reduce"}
+                    and node.attr in {"attrgetter", "call", "methodcaller", "reduce"}
                     and isinstance(node.value, ast.Name)
                 ):
                     if node.attr == "call" and self._has_binding_marker(
@@ -9650,6 +9868,11 @@ class JITScriptDetector:
                         self._FUNCTOOLS_MODULE_MARKER,
                     ):
                         return "functools.reduce"
+                    if node.attr in {"attrgetter", "methodcaller"} and self._has_binding_marker(
+                        node.value.id,
+                        self._OPERATOR_MODULE_MARKER,
+                    ):
+                        return f"operator.{node.attr}"
                 if not isinstance(node, ast.Name):
                     return None
                 helper = self._resolve_builtin_helper(node)
@@ -9910,6 +10133,16 @@ class JITScriptDetector:
                 if isinstance(node, ast.Name):
                     return self._lookup_function_summary(node.id)[1]
                 if isinstance(node, ast.Attribute):
+                    if (
+                        self.active_class_calls
+                        and isinstance(node.value, ast.Call)
+                        and not node.value.args
+                        and not node.value.keywords
+                        and self._is_builtin_helper(node.value.func, "super")
+                    ):
+                        function_name = self._attribute_function_name((self.active_class_calls[-1], node.attr))
+                        if summary := self._lookup_function_summary(function_name)[1]:
+                            return summary
                     attribute_key = self._attribute_alias_key(node)
                     if attribute_key is not None:
                         return self._lookup_function_summary(self._attribute_function_name(attribute_key))[1]
@@ -10191,10 +10424,11 @@ class JITScriptDetector:
                 for index in self._visible_scope_indexes():
                     containers = {
                         attribute_key[len(key) :]: dict(container)
-                        for name, container in self.container_alias_scopes[index].items()
+                        for name in self.attribute_container_names[index]
                         if (attribute_key := self._attribute_container_key(name)) is not None
                         and len(attribute_key) > len(key)
                         and attribute_key[: len(key)] == key
+                        and (container := self.container_alias_scopes[index].get(name)) is not None
                     }
                     if containers:
                         return containers
@@ -10213,7 +10447,7 @@ class JITScriptDetector:
                 for index in self._visible_scope_indexes():
                     summaries = {
                         attribute_key[len(key) :]: summary
-                        for name in self.alias_scopes[index]
+                        for name in self.attribute_function_names[index]
                         if (attribute_key := self._attribute_function_key(name)) is not None
                         and len(attribute_key) > len(key)
                         and attribute_key[: len(key)] == key
@@ -10243,6 +10477,10 @@ class JITScriptDetector:
                     return self._container_expression_identity(node.value)
                 if isinstance(node, ast.List):
                     return self._new_container_identity(mutable_sequence=True)
+                if isinstance(node, ast.ListComp):
+                    return self._new_container_identity(mutable_sequence=True)
+                if isinstance(node, (ast.DictComp, ast.SetComp, ast.GeneratorExp)):
+                    return self._new_container_identity()
                 if isinstance(node, (ast.Tuple, ast.Dict, ast.Set)):
                     return self._new_container_identity()
                 if isinstance(node, ast.Call):
@@ -10501,6 +10739,17 @@ class JITScriptDetector:
                     return self._lookup_attribute_container(attribute_key) if attribute_key is not None else {}
                 if isinstance(node, ast.NamedExpr):
                     return self._resolve_builtin_container(node.value)
+                if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                    binding = self._comprehension_result_binding(node.generators, node.elt)
+                    return self._sequence_binding([binding])[2] if binding is not None else {}
+                if isinstance(node, ast.DictComp):
+                    binding = self._comprehension_result_binding(node.generators, node.value)
+                    key_resolved, key = self._constant_container_key(node.key)
+                    return (
+                        self._mapping_binding({key: binding})[2]
+                        if binding is not None and key_resolved and isinstance(key, str)
+                        else {}
+                    )
                 if isinstance(node, (ast.List, ast.Tuple)):
                     resolved: dict[tuple[object, ...], str | None] = {}
                     for index, element in enumerate(node.elts):
@@ -10632,6 +10881,17 @@ class JITScriptDetector:
                     return dict(self._lookup_container_functions(node.id))
                 if isinstance(node, ast.NamedExpr):
                     return self._resolve_function_container(node.value)
+                if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                    binding = self._comprehension_result_binding(node.generators, node.elt)
+                    return self._sequence_binding([binding])[3] if binding is not None else {}
+                if isinstance(node, ast.DictComp):
+                    binding = self._comprehension_result_binding(node.generators, node.value)
+                    key_resolved, key = self._constant_container_key(node.key)
+                    return (
+                        self._mapping_binding({key: binding})[3]
+                        if binding is not None and key_resolved and isinstance(key, str)
+                        else {}
+                    )
                 if isinstance(node, (ast.List, ast.Tuple)):
                     resolved: dict[tuple[object, ...], tuple[tuple[str, int], ...]] = {}
                     for index, element in enumerate(node.elts):
@@ -11207,17 +11467,19 @@ class JITScriptDetector:
                 for key in tuple(attribute_aliases):
                     if key[0] == name:
                         del attribute_aliases[key]
-                for container_name in tuple(self.container_alias_scopes[scope_index]):
+                for container_name in tuple(self.attribute_container_names[scope_index]):
                     attribute_key = self._attribute_container_key(container_name)
                     if attribute_key is not None and attribute_key[0] == name:
-                        del self.container_alias_scopes[scope_index][container_name]
-                for alias_name in tuple(self.alias_scopes[scope_index]):
+                        self.container_alias_scopes[scope_index].pop(container_name, None)
+                        self.attribute_container_names[scope_index].discard(container_name)
+                for alias_name in tuple(self.attribute_function_names[scope_index]):
                     attribute_key = self._attribute_function_key(alias_name)
                     if attribute_key is not None and attribute_key[0] == name:
                         self._bind_name(alias_name, None, defined=False, scope_index=scope_index)
                         self.alias_scopes[scope_index].pop(alias_name, None)
                         self.container_alias_scopes[scope_index].pop(alias_name, None)
                         self.container_identity_scopes[scope_index].pop(alias_name, None)
+                        self.attribute_function_names[scope_index].discard(alias_name)
                 if defined:
                     self.defined_names[scope_index].add(name)
                 else:
@@ -11240,10 +11502,12 @@ class JITScriptDetector:
                 self.attribute_alias_scopes[scope_index][key] = builtin
                 synthetic_name = self._attribute_container_name(key)
                 self.container_alias_scopes[scope_index][synthetic_name] = dict(container_aliases or {})
+                self.attribute_container_names[scope_index].add(synthetic_name)
                 self.attribute_alias_scopes[scope_index].update(
                     {(*key, *path): nested_builtin for path, nested_builtin in (attribute_aliases or {}).items()}
                 )
                 function_name = self._attribute_function_name(key)
+                self.attribute_function_names[scope_index].add(function_name)
                 self._bind_name(function_name, None, scope_index=scope_index)
                 if function_summary is not None:
                     self._register_function_summary(
@@ -11878,6 +12142,22 @@ class JITScriptDetector:
                             )
                             for index, element in enumerate(elements)
                         ]
+                    if node.args and not node.keywords and self._is_builtin_helper(node.func, "zip"):
+                        iterables = [self._literal_iterable_elements(argument) for argument in node.args]
+                        if any(elements is None for elements in iterables):
+                            return None
+                        concrete = [elements for elements in iterables if elements is not None]
+                        length = min(
+                            min((len(elements) for elements in concrete), default=0),
+                            self._MAX_CONSTANT_STRING_CANDIDATES,
+                        )
+                        return [
+                            ast.Tuple(
+                                elts=[elements[index] for elements in concrete],
+                                ctx=ast.Load(),
+                            )
+                            for index in range(length)
+                        ]
                 return None
 
             @staticmethod
@@ -12121,6 +12401,8 @@ class JITScriptDetector:
                             callback_invoker=(
                                 "operator.call"
                                 if node.module == "operator" and alias.name == "call"
+                                else f"operator.{alias.name}"
+                                if node.module == "operator" and alias.name in {"attrgetter", "methodcaller"}
                                 else "functools.reduce"
                                 if node.module == "functools" and alias.name == "reduce"
                                 else None
@@ -12680,6 +12962,20 @@ class JITScriptDetector:
                 summary = self._function_summary_for_node(node.func)
                 if summary is None:
                     return
+                class_name: str | None = None
+                if isinstance(node.func, ast.Attribute):
+                    receiver = node.func.value
+                    if (
+                        isinstance(receiver, ast.Call)
+                        and isinstance(receiver.func, ast.Name)
+                        and self._is_class_name(receiver.func)
+                    ):
+                        class_name = receiver.func.id
+                    elif self.active_class_calls and (
+                        isinstance(receiver, ast.Name)
+                        or (isinstance(receiver, ast.Call) and self._is_builtin_helper(receiver.func, "super"))
+                    ):
+                        class_name = self.active_class_calls[-1]
                 _effects, _return_binding, functions = summary
                 for function_id, positional_offset in functions:
                     if function_id in self.active_function_calls:
@@ -12698,6 +12994,8 @@ class JITScriptDetector:
                         else self._outer_binding_declarations(body_nodes)[0]
                     )
                     self.active_function_calls.add(function_id)
+                    if class_name is not None:
+                        self.active_class_calls.append(class_name)
                     self._push_scope(
                         function_node.args,
                         default_bindings,
@@ -12727,6 +13025,8 @@ class JITScriptDetector:
                             self._visit_statements(function_node.body)
                     finally:
                         self._pop_scope()
+                        if class_name is not None:
+                            self.active_class_calls.pop()
                         self.active_function_calls.discard(function_id)
 
             def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -13414,6 +13714,25 @@ class JITScriptDetector:
                     return body_terminal
                 return None
 
+            def _comprehension_result_binding(
+                self,
+                generators: list[ast.comprehension],
+                result_node: ast.AST,
+            ) -> _BuiltinAliasBinding | None:
+                if not generators:
+                    return None
+                self._push_scope(kind="comprehension")
+                try:
+                    for generator in generators:
+                        if self._constant_iterable_truth(generator.iter) is False:
+                            return None
+                        self._bind_loop_target_from_iterable(generator.target, generator.iter)
+                        if any(self._constant_truth(condition) is False for condition in generator.ifs):
+                            return None
+                    return self._binding_from_expression(result_node)
+                finally:
+                    self._pop_scope()
+
             def _visit_comprehension(
                 self,
                 generators: list[ast.comprehension],
@@ -13528,6 +13847,27 @@ class JITScriptDetector:
                     return None
                 return self._resolve_builtin(node.args[0])
 
+            def _operator_wrapper_builtin(self, node: ast.Call) -> str | None:
+                if not isinstance(node.func, ast.Call):
+                    return None
+                builder = node.func
+                invoker = self._resolve_callback_invoker(builder.func)
+                if invoker == "operator.methodcaller":
+                    if builder.args and "__call__" in self._constant_strings(builder.args[0]) and node.args:
+                        return self._resolve_builtin(node.args[0])
+                    return None
+                if not isinstance(builder.func, ast.Call):
+                    return None
+                accessor = builder.func
+                if (
+                    self._resolve_callback_invoker(accessor.func) == "operator.attrgetter"
+                    and accessor.args
+                    and "__call__" in self._constant_strings(accessor.args[0])
+                    and builder.args
+                ):
+                    return self._resolve_builtin(builder.args[0])
+                return None
+
             def _bind_attribute_setter_call(self, node: ast.Call) -> None:
                 target: ast.AST | None = None
                 name_node: ast.AST | None = None
@@ -13554,11 +13894,7 @@ class JITScriptDetector:
                         )
 
             def _bind_container_mutation_call(self, node: ast.Call) -> None:
-                if (
-                    not isinstance(node.func, ast.Attribute)
-                    or not isinstance(node.func.value, ast.Name)
-                    or node.keywords
-                ):
+                if not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
                     return
                 container_name = node.func.value.id
                 container_identity = self._lookup_container_identity(container_name)
@@ -13567,8 +13903,45 @@ class JITScriptDetector:
                 container = dict(self._lookup_container_alias(container_name))
                 function_container = dict(self._lookup_container_functions(container_name))
                 bindings = self._sequence_container_element_bindings(container, function_container)
-                if node.func.attr == "append" and len(node.args) == 1:
+                if node.func.attr == "update" and len(node.args) <= 1:
+                    replacement = self._resolve_builtin_container(node.args[0]) if node.args else {}
+                    replacement_functions = self._resolve_function_container(node.args[0]) if node.args else {}
+                    for keyword in node.keywords:
+                        if keyword.arg is None:
+                            replacement = self._merge_container_aliases(
+                                replacement,
+                                self._resolve_builtin_container(keyword.value),
+                            )
+                            replacement_functions = self._merge_container_functions(
+                                replacement_functions,
+                                self._resolve_function_container(keyword.value),
+                            )
+                        else:
+                            binding = self._binding_from_expression(keyword.value)
+                            replacement[(keyword.arg,)] = binding[0]
+                            replacement.update({(keyword.arg, *path): builtin for path, builtin in binding[2].items()})
+                            if binding[8]:
+                                replacement_functions[(keyword.arg,)] = binding[8]
+                            replacement_functions.update(
+                                {(keyword.arg, *path): functions for path, functions in binding[3].items()}
+                            )
+                    replacement_keys = {path[0] for path in set(replacement) | set(replacement_functions) if path}
+                    self._replace_mapping_container_entries(container, replacement, replacement_keys)
+                    self._replace_mapping_container_entries(
+                        function_container,
+                        replacement_functions,
+                        replacement_keys,
+                    )
+                elif node.keywords:
+                    return
+                elif node.func.attr == "append" and len(node.args) == 1:
                     bindings.append(self._binding_from_expression(node.args[0]))
+                elif node.func.attr == "insert" and len(node.args) == 2:
+                    key_resolved, key = self._constant_container_key(node.args[0])
+                    if not key_resolved or not isinstance(key, int):
+                        return
+                    index = max(0, len(bindings) + key) if key < 0 else min(key, len(bindings))
+                    bindings.insert(index, self._binding_from_expression(node.args[1]))
                 elif node.func.attr == "extend" and len(node.args) == 1:
                     bindings.extend(self._iterator_element_bindings(node.args[0]))
                 elif node.func.attr == "pop" and len(node.args) <= 1 and bindings:
@@ -13584,9 +13957,10 @@ class JITScriptDetector:
                     bindings.pop(index)
                 else:
                     return
-                sequence_binding = self._sequence_binding(bindings)
-                container = sequence_binding[2]
-                function_container = sequence_binding[3]
+                if node.func.attr != "update":
+                    sequence_binding = self._sequence_binding(bindings)
+                    container = sequence_binding[2]
+                    function_container = sequence_binding[3]
                 for scope_index, (identity_scope, container_scope) in enumerate(
                     zip(
                         self.container_identity_scopes,
@@ -13677,6 +14051,8 @@ class JITScriptDetector:
                     self.findings.add(builtin)
                 if descriptor_builtin := self._function_type_descriptor_builtin(node):
                     self.findings.add(descriptor_builtin)
+                if wrapper_builtin := self._operator_wrapper_builtin(node):
+                    self.findings.add(wrapper_builtin)
                 self.findings.update(self._dangerous_callback_builtins(node))
                 self._analyze_eager_callback_calls(node)
                 self._analyze_function_call(node)
@@ -13802,7 +14178,13 @@ class JITScriptDetector:
                 )
         return dangerous_imports
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_torchscript(
+        self,
+        data: bytes,
+        context: str = "",
+        *,
+        source_like_embedded_python: bool | None = None,
+    ) -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
@@ -13861,7 +14243,9 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if _has_source_like_embedded_python_start(data):
+        if source_like_embedded_python is None:
+            source_like_embedded_python = _has_source_like_embedded_python_start(data)
+        if source_like_embedded_python:
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -14074,8 +14458,8 @@ class JITScriptDetector:
             return findings
 
         bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
-        matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
         if prioritized_snippets is None:
+            matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
             prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
                 matches, bounded=bounded
             )
@@ -14112,7 +14496,14 @@ class JITScriptDetector:
         bounded_builtin_calls: set[str] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         snippet_builtin_calls: set[str] = set()
-        contextual_builtin_sources = self._contextual_dangerous_builtin_sources(bounded)
+        has_proven_priority_candidate = any(
+            probe in match
+            for match, _span, _real_ranges in prioritized_matches
+            for _name, probe in _PROVEN_HIGH_RISK_CALL_PROBES.values()
+        )
+        contextual_builtin_sources = (
+            {} if has_proven_priority_candidate else self._contextual_dangerous_builtin_sources(bounded)
+        )
         parsed_snippet_spans: list[tuple[int, int]] = []
         skips_unbounded_ast_prepass = len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and (
             (include_full_source and _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(bounded.lower()) is not None)
@@ -14130,9 +14521,11 @@ class JITScriptDetector:
                 bounded_builtin_calls = None
 
         for match, span, real_ranges in prioritized_matches:
+            proven_high_risk_calls: set[tuple[str, str]] = set()
             for rule_code, (call_name, probe) in _PROVEN_HIGH_RISK_CALL_PROBES.items():
                 if probe in match:
-                    snippet_high_risk_calls.add((call_name, rule_code))
+                    proven_high_risk_calls.add((call_name, rule_code))
+            snippet_high_risk_calls.update(proven_high_risk_calls)
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
@@ -14155,13 +14548,27 @@ class JITScriptDetector:
                     self._dangerous_imports_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
                 )
                 parsed_builtin_calls = (
-                    self._dangerous_builtin_calls_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
+                    self._dangerous_builtin_calls_in_tree(parsed_snippet[0])
+                    if parsed_snippet is not None and not proven_high_risk_calls
+                    else set()
+                    if parsed_snippet is not None
+                    else None
+                )
+                parsed_high_risk_calls = (
+                    proven_high_risk_calls
+                    if parsed_snippet is not None and proven_high_risk_calls
+                    else _resolve_alias_aware_high_risk_calls(parsed_snippet[0])
+                    if parsed_snippet is not None
+                    else None
                 )
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
-                    if self._contains_dangerous_import(code_str, dangerous_import) and (
-                        parsed_imports is None or dangerous_import in parsed_imports
-                    ):
+                    has_dangerous_import = (
+                        dangerous_import in parsed_imports
+                        if parsed_imports is not None
+                        else self._contains_dangerous_import(code_str, dangerous_import)
+                    )
+                    if has_dangerous_import:
                         findings.append(
                             create_jit_finding(
                                 message=f"Dangerous import '{dangerous_import}' in embedded code",
@@ -14209,9 +14616,14 @@ class JITScriptDetector:
                     tree, parsed_chars = parsed_snippet
                     parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
-                    snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
-                    snippet_builtin_calls.update(self._dangerous_builtin_calls_in_tree(tree))
-                    ast_findings = self._analyze_ast(tree, framework, context)
+                    snippet_high_risk_calls.update(parsed_high_risk_calls or set())
+                    snippet_builtin_calls.update(parsed_builtin_calls or set())
+                    ast_findings = self._analyze_ast(
+                        tree,
+                        framework,
+                        context,
+                        resolved_dangerous_builtins=parsed_builtin_calls,
+                    )
                     findings.extend(ast_findings)
 
             except Exception:
@@ -14324,7 +14736,14 @@ class JITScriptDetector:
 
         return findings
 
-    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list["JITScriptFinding"]:
+    def _analyze_ast(
+        self,
+        tree: ast.AST,
+        framework: str,
+        context: str,
+        *,
+        resolved_dangerous_builtins: set[str] | None = None,
+    ) -> list["JITScriptFinding"]:
         """Analyze Python AST for dangerous patterns.
 
         Args:
@@ -14338,7 +14757,11 @@ class JITScriptDetector:
         from modelaudit.models import JITScriptFinding
 
         findings: list[JITScriptFinding] = []
-        resolved_dangerous_builtins = self._dangerous_builtin_calls_in_tree(tree)
+        dangerous_builtin_calls = (
+            self._dangerous_builtin_calls_in_tree(tree)
+            if resolved_dangerous_builtins is None
+            else resolved_dangerous_builtins
+        )
 
         class DangerousNodeVisitor(ast.NodeVisitor):
             def __init__(self) -> None:
@@ -14387,7 +14810,7 @@ class JITScriptDetector:
 
             def visit_Call(self, node: ast.Call) -> None:
                 # Check for dangerous function calls
-                if isinstance(node.func, ast.Name) and node.func.id in resolved_dangerous_builtins:
+                if isinstance(node.func, ast.Name) and node.func.id in dangerous_builtin_calls:
                     self.findings.append(
                         create_jit_finding(
                             message=f"AST analysis: Dangerous function call '{node.func.id}'",
@@ -14673,11 +15096,24 @@ class JITScriptDetector:
             else False
         )
         model_specific_embedded_python_fully_scanned = False
+        model_specific_embedded_python_prefix_scanned = False
 
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
-            findings.extend(self.scan_torchscript(data, context))
+            torchscript_source_like_embedded_python = (
+                source_like_embedded_python
+                if len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+                else _has_source_like_embedded_python_start(data)
+            )
+            findings.extend(
+                self.scan_torchscript(
+                    data,
+                    context,
+                    source_like_embedded_python=torchscript_source_like_embedded_python,
+                )
+            )
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            model_specific_embedded_python_prefix_scanned = torchscript_source_like_embedded_python
             model_specific_embedded_python_fully_scanned = (
                 source_like_embedded_python and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
             )
@@ -14727,10 +15163,23 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
-        elif not dangerous_python_source:
+        elif not dangerous_python_source and (
+            not model_specific_embedded_python_fully_scanned or any(marker in data[2:] for marker in (b"\x00", b"\xff"))
+        ):
             prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] = {}
-            if self._looks_like_framed_dangerous_python_source(data, prioritized_snippets_by_window):
-                for window_index, (window, include_full_source) in enumerate(_embedded_python_extraction_windows(data)):
+            extraction_windows = _embedded_python_extraction_windows(data)
+            if self._looks_like_framed_dangerous_python_source(
+                data,
+                prioritized_snippets_by_window,
+                extraction_windows=extraction_windows,
+            ):
+                for window_index, (window, include_full_source) in enumerate(extraction_windows):
+                    if (
+                        model_specific_embedded_python_prefix_scanned
+                        and not include_full_source
+                        and window == data[: len(window)]
+                    ):
+                        continue
                     findings.extend(
                         self._extract_and_check_python_code(
                             window,
