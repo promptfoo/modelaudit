@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preflight MLflow artifact sizes and verify the exact planned files before scanning, rejecting unsafe paths, changed content, and over-budget downloads
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
 - omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
 - block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
