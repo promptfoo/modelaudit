@@ -43,6 +43,7 @@ from .scanner_selection import (
     scanner_catalog,
     scanner_selection_config_from_inputs,
     selected_scanner_extensions,
+    selected_scanner_filenames,
 )
 from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
@@ -123,12 +124,15 @@ class _ScanRuntimeConfig:
     strict_license: bool
     use_hf_whitelist: bool
     max_download_bytes: int | None
+    explicit_max_download_bytes: int | None
     jfrog_api_token: str | None
     jfrog_access_token: str | None
     mlflow_registry_uri: str | None
     scanner_selection: dict[str, Any] | None
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
+    scannable_filenames: frozenset[str] | None
+    hf_stream_include_all_files: bool
 
 
 @dataclass
@@ -531,10 +535,12 @@ def _resolve_scan_runtime_config(
             click.echo(style_text(f"Using local ModelAudit config: {local_config_path}", fg="cyan"))
             click.echo(style_text("Scan result cache disabled for this run.", fg="yellow"))
 
+    explicit_max_download_bytes = None
     max_download_bytes = None
     if max_size is not None:
         with contextlib.suppress(ValueError):
-            max_download_bytes = parse_size_string(max_size)
+            explicit_max_download_bytes = parse_size_string(max_size)
+            max_download_bytes = explicit_max_download_bytes
     else:
         configured_max_file_size = config_values.get("max_file_size", 0)
         if isinstance(configured_max_file_size, int) and configured_max_file_size > 0:
@@ -545,6 +551,10 @@ def _resolve_scan_runtime_config(
     scannable_extensions = (
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_filenames = (
+        selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
+    )
+    hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
         config=config_values,
@@ -563,12 +573,15 @@ def _resolve_scan_runtime_config(
         strict_license=config_values.get("strict_license", False),
         use_hf_whitelist=config_values.get("use_hf_whitelist", True),
         max_download_bytes=max_download_bytes,
+        explicit_max_download_bytes=explicit_max_download_bytes,
         jfrog_api_token=os.getenv("JFROG_API_TOKEN"),
         jfrog_access_token=os.getenv("JFROG_ACCESS_TOKEN"),
         mlflow_registry_uri=os.getenv("MLFLOW_TRACKING_URI"),
         scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
 
@@ -1257,11 +1270,19 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                hf_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scannable_filenames is not None:
+                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.hf_stream_include_all_files:
+                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
+                    **hf_stream_kwargs,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -1412,6 +1433,7 @@ def _resolve_scan_source_for_path(
             download_path = download_pytorch_hub_model(
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
+                max_size=runtime.max_download_bytes,
             )
             download_duration = time.time() - download_start
             try:
@@ -1662,6 +1684,8 @@ def _resolve_scan_source_for_path(
             jfrog_scan_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 jfrog_scan_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.explicit_max_download_bytes is not None:
+                jfrog_scan_kwargs["max_download_size"] = runtime.explicit_max_download_bytes
             jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                 path,
                 api_token=runtime.jfrog_api_token,

@@ -1,3 +1,4 @@
+import contextlib
 import re
 import shutil
 import tempfile
@@ -26,22 +27,30 @@ def _extract_weight_urls(html: str) -> list[str]:
 def _get_total_size(urls: list[str]) -> int:
     total = 0
     for u in urls:
+        resp: requests.Response | None = None
         try:
-            resp = requests.head(u, timeout=10)
-            if resp.ok and "content-length" in resp.headers:
-                total += int(resp.headers["content-length"])
+            resp = requests.head(u, timeout=10, allow_redirects=True)
+            if 200 <= resp.status_code < 300:
+                content_length = _response_content_length(resp)
+                if content_length is not None:
+                    total += content_length
         except Exception:
             continue
+        finally:
+            if resp is not None:
+                with contextlib.suppress(Exception):
+                    resp.close()
     return total
 
 
 def _format_size(size_bytes: int) -> str:
-    size = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} PB"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    absolute_size = abs(size_bytes)
+    for index, unit in enumerate(units):
+        divisor = 1024**index
+        if absolute_size < divisor * 1024:
+            return f"{size_bytes / divisor:.1f} {unit}"
+    return f"{size_bytes} B"
 
 
 def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
@@ -55,12 +64,97 @@ def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
 def _response_content_length(resp: requests.Response) -> int | None:
     try:
         content_length = resp.headers.get("content-length")
-        return int(content_length) if content_length is not None else None
+        parsed_length = int(content_length) if content_length is not None else None
+        return parsed_length if parsed_length is not None and parsed_length >= 0 else None
     except (TypeError, ValueError):
         return None
 
 
-def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
+def _remove_partial_file(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def _path_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _remove_path_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _commit_staged_weight_files(weight_urls: list[str], staging_dir: Path, dest_dir: Path) -> None:
+    """Install all staged weights or restore the original cache entries."""
+    backup_dir = staging_dir / ".backups"
+    backup_dir.mkdir()
+    committed: list[tuple[Path, Path, bool]] = []
+    try:
+        for weight_url in weight_urls:
+            filename = weight_url.split("/")[-1]
+            staged_file = staging_dir / filename
+            dest_file = dest_dir / filename
+            backup_file = backup_dir / filename
+            had_existing_entry = _path_entry_exists(dest_file)
+            if dest_file.is_dir() and not dest_file.is_symlink():
+                raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_file}")
+            if had_existing_entry:
+                dest_file.replace(backup_file)
+            try:
+                staged_file.replace(dest_file)
+            except Exception:
+                if had_existing_entry and _path_entry_exists(backup_file):
+                    backup_file.replace(dest_file)
+                raise
+            committed.append((dest_file, backup_file, had_existing_entry))
+    except Exception as commit_error:
+        rollback_errors: list[Exception] = []
+        for dest_file, backup_file, had_existing_entry in reversed(committed):
+            try:
+                _remove_path_entry(dest_file)
+                if had_existing_entry:
+                    backup_file.replace(dest_file)
+            except Exception as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
+        raise
+
+
+def _download_weight_file(weight_url: str, dest_file: Path, downloaded_size: int, max_size: int | None) -> int:
+    """Download one weight file atomically and return the cumulative byte count."""
+    partial_file: Path | None = None
+    try:
+        with requests.get(weight_url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            content_length = _response_content_length(resp)
+            if content_length is not None:
+                _enforce_max_size(downloaded_size + content_length, max_size)
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{dest_file.name}.",
+                suffix=".part",
+                dir=dest_file.parent,
+                delete=False,
+            ) as f:
+                partial_file = Path(f.name)
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        _enforce_max_size(downloaded_size + len(chunk), max_size)
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+
+        partial_file.replace(dest_file)
+        return downloaded_size
+    finally:
+        if partial_file is not None:
+            _remove_partial_file(partial_file)
+
+
+def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")
@@ -78,28 +172,45 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     dest_dir = cache_dir or Path(tempfile.mkdtemp(prefix="modelaudit_pth_"))
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    total_size = _get_total_size(weight_urls)
-    if total_size > 0:
-        has_space, message = check_disk_space(dest_dir, total_size)
-        if not has_space:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Cannot download model from {url}: {message}")
+    try:
+        total_size = _get_total_size(weight_urls)
+        if total_size > 0:
+            _enforce_max_size(total_size, max_size)
+            has_space, message = check_disk_space(dest_dir, total_size)
+            if not has_space:
+                raise Exception(f"Cannot download model from {url}: {message}")
+    except Exception:
+        if cache_dir is None:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
 
-    for weight_url in weight_urls:
-        filename = weight_url.split("/")[-1]
-        dest_file = dest_dir / filename
-        try:
-            with requests.get(weight_url, stream=True, timeout=30) as resp:
-                resp.raise_for_status()
-                with open(dest_file, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-        except Exception as e:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+    staging_dir: Path | None = None
+    download_dir = dest_dir
+    if cache_dir is not None:
+        staging_dir = Path(tempfile.mkdtemp(prefix=".modelaudit_pth_stage_", dir=dest_dir))
+        download_dir = staging_dir
+
+    try:
+        downloaded_size = 0
+        for weight_url in weight_urls:
+            filename = weight_url.split("/")[-1]
+            staged_file = download_dir / filename
+            try:
+                downloaded_size = _download_weight_file(weight_url, staged_file, downloaded_size, max_size)
+            except ValueError:
+                raise
+            except Exception as e:
+                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+
+        if staging_dir is not None:
+            _commit_staged_weight_files(weight_urls, staging_dir, dest_dir)
+    except Exception:
+        if cache_dir is None:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     return dest_dir
 
@@ -117,7 +228,7 @@ def download_pytorch_hub_model_streaming(
     Args:
         url: PyTorch Hub model page URL
         show_progress: Whether to show progress messages
-        max_size: Maximum cumulative weight download size in bytes
+        max_size: Maximum total download size in bytes
 
     Yields:
         Tuples of (file_path, is_last) for each weight file
@@ -143,6 +254,10 @@ def download_pytorch_hub_model_streaming(
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
+    total_size = _get_total_size(weight_urls)
+    if total_size > 0:
+        _enforce_max_size(total_size, max_size)
+
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))
 
@@ -158,18 +273,7 @@ def download_pytorch_hub_model_streaming(
                 click.echo(f"⬇️  Downloading {filename}")
 
             try:
-                with requests.get(weight_url, stream=True, timeout=30) as resp:
-                    resp.raise_for_status()
-                    content_length = _response_content_length(resp)
-                    if content_length is not None:
-                        _enforce_max_size(downloaded_size + content_length, max_size)
-
-                    with open(dest_file, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                _enforce_max_size(downloaded_size + len(chunk), max_size)
-                                f.write(chunk)
-                                downloaded_size += len(chunk)
+                downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
             except ValueError:
                 raise
             except Exception as e:
