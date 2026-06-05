@@ -742,6 +742,21 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     )
 
 
+def test_pytorch_zip_scanner_corrupt_pk_zip_keeps_s902(tmp_path: Path) -> None:
+    invalid_path = tmp_path / "corrupt-central-directory.pt"
+    invalid_path.write_bytes(b"PK\x03\x04truncated-local-header")
+
+    result = PyTorchZipScanner().scan(str(invalid_path))
+    format_checks = [check for check in result.checks if check.name == "PyTorch ZIP Format Validation"]
+
+    assert result.success is False
+    assert len(format_checks) == 1
+    assert format_checks[0].status == CheckStatus.FAILED
+    assert format_checks[0].severity == IssueSeverity.CRITICAL
+    assert format_checks[0].rule_code == "S902"
+    assert format_checks[0].message == f"Not a valid zip file: {invalid_path}"
+
+
 def test_pytorch_zip_scanner_missing_data_pkl(tmp_path):
     """Test scanning a PyTorch ZIP file without data.pkl."""
     # Create a ZIP file without data.pkl
@@ -6370,6 +6385,10 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path: Path) -> None:
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pytorch_zip_entry_limit" in result.metadata["scan_outcome_reasons"]
     assert entry_issues[0].details["analysis_incomplete"] is True
+    entry_check = next(check for check in result.checks if check.name == "Archive Entry Limit")
+    assert entry_check.message == (
+        "Archive contains 16 entries (max processed: 10); 6 entries were skipped and scan coverage is incomplete"
+    )
 
 
 def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> None:

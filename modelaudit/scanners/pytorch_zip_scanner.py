@@ -2349,6 +2349,7 @@ class PyTorchZipScanner(BaseScanner):
             severity=IssueSeverity.CRITICAL,
             location=path,
             details={"path": path},
+            rule_code="S902",
         )
         result.finish(success=False)
         return result
