@@ -129,6 +129,7 @@ _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _HDF5_USERBLOCK_FIRST_OFFSET = 512
 _HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
+_HDF5_SUPERBLOCK_PROBE_BYTES = 96
 _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
@@ -162,15 +163,68 @@ def _hdf5_signature_offsets(file_size: int) -> list[int]:
     return offsets
 
 
+def _has_plausible_hdf5_superblock(prefix: bytes, signature_offset: int, file_size: int) -> bool:
+    """Validate bounded superblock invariants after an HDF5 signature."""
+    superblock_start = signature_offset
+    if prefix[superblock_start : superblock_start + len(_HDF5_MAGIC)] != _HDF5_MAGIC:
+        return False
+    if len(prefix) <= superblock_start + len(_HDF5_MAGIC):
+        return False
+
+    superblock_version = prefix[superblock_start + 8]
+    if superblock_version in (0, 1):
+        fixed_header_bytes = 24 if superblock_version == 0 else 28
+        if len(prefix) < superblock_start + fixed_header_bytes:
+            return False
+        if any(prefix[superblock_start + field_offset] != 0 for field_offset in (9, 10, 11, 12, 15)):
+            return False
+        if int.from_bytes(prefix[superblock_start + 16 : superblock_start + 18], "little") == 0:
+            return False
+        if int.from_bytes(prefix[superblock_start + 18 : superblock_start + 20], "little") == 0:
+            return False
+        if superblock_version == 1:
+            if int.from_bytes(prefix[superblock_start + 24 : superblock_start + 26], "little") == 0:
+                return False
+            if prefix[superblock_start + 26 : superblock_start + 28] != b"\x00\x00":
+                return False
+        offset_size = prefix[superblock_start + 13]
+        length_size = prefix[superblock_start + 14]
+        base_address_offset = superblock_start + fixed_header_bytes
+    elif superblock_version in (2, 3):
+        if len(prefix) < superblock_start + 12:
+            return False
+        offset_size = prefix[superblock_start + 9]
+        length_size = prefix[superblock_start + 10]
+        base_address_offset = superblock_start + 12
+    else:
+        return False
+
+    if not 1 <= offset_size <= 16 or not 1 <= length_size <= 16:
+        return False
+
+    end_of_file_offset = base_address_offset + (2 * offset_size)
+    if len(prefix) < end_of_file_offset + offset_size:
+        return False
+
+    undefined_address = (1 << (offset_size * 8)) - 1
+    base_address = int.from_bytes(prefix[base_address_offset : base_address_offset + offset_size], "little")
+    end_of_file_address = int.from_bytes(prefix[end_of_file_offset : end_of_file_offset + offset_size], "little")
+    if base_address == undefined_address or end_of_file_address == undefined_address:
+        return False
+
+    adjusted_end_of_file = end_of_file_address + (signature_offset - base_address)
+    return signature_offset < adjusted_end_of_file <= file_size
+
+
 def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> int | None:
     offsets = _hdf5_signature_offsets(member_info.file_size)
     if not offsets:
         return None
 
-    read_size = offsets[-1] + len(_HDF5_MAGIC)
+    read_size = min(member_info.file_size, offsets[-1] + _HDF5_SUPERBLOCK_PROBE_BYTES)
     prefix = _read_zip_member_prefix(archive, member_info, read_size)
     for offset in offsets:
-        if prefix[offset : offset + len(_HDF5_MAGIC)] == _HDF5_MAGIC:
+        if _has_plausible_hdf5_superblock(prefix, offset, member_info.file_size):
             return offset
     return None
 
@@ -2191,12 +2245,6 @@ class KerasZipScanner(BaseScanner):
         if prefix_bytes <= 0:
             return
 
-        prefix_segments = _content_routable_hdf5_userblock_segments(
-            _read_zip_member_prefix(archive, weights_info, prefix_bytes)
-        )
-        if not prefix_segments:
-            return
-
         weights_entry = weights_info.filename
         from .pickle_scanner import PickleScanner
         from .picklescan_adapter import apply_pickle_member_context
@@ -2210,6 +2258,22 @@ class KerasZipScanner(BaseScanner):
         nested_config["_archive_depth"] = get_archive_depth(self.config) + 1
 
         zip_scanner = ZipScanner(config=self.config)
+        if self._scan_embedded_weights_full_payload_security(
+            archive,
+            weights_info,
+            result,
+            zip_scanner=zip_scanner,
+            nested_config=nested_config,
+            hdf5_signature_offset=hdf5_signature_offset,
+        ):
+            return
+
+        prefix_segments = _content_routable_hdf5_userblock_segments(
+            _read_zip_member_prefix(archive, weights_info, prefix_bytes)
+        )
+        if not prefix_segments:
+            return
+
         for segment_index, prefix in enumerate(prefix_segments):
             temp_path: str | None = None
             try:
@@ -2260,6 +2324,53 @@ class KerasZipScanner(BaseScanner):
                     hdf5_signature_offset=hdf5_signature_offset,
                 )
                 result.merge(pickle_result)
+
+    def _scan_embedded_weights_full_payload_security(
+        self,
+        archive: zipfile.ZipFile,
+        weights_info: zipfile.ZipInfo,
+        result: ScanResult,
+        *,
+        zip_scanner: ZipScanner,
+        nested_config: dict[str, Any],
+        hdf5_signature_offset: int | None,
+    ) -> bool:
+        """Preserve actionable findings from a polyglot's complete weights payload."""
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = temp_file.name
+                copied_bytes = 0
+                with archive.open(weights_info, "r") as source:
+                    while True:
+                        chunk = source.read(64 * 1024)
+                        if not chunk:
+                            break
+                        copied_bytes += len(chunk)
+                        if copied_bytes > self.max_embedded_weights_bytes:
+                            return False
+                        temp_file.write(chunk)
+
+            full_result = zip_scanner._scan_nested_archive_entry(temp_path, nested_config)
+            if not self._scan_result_has_actionable_security_findings(full_result):
+                return False
+
+            zip_scanner._rewrite_nested_result_context(
+                full_result,
+                temp_path,
+                self.current_file_path,
+                weights_info.filename,
+            )
+            self._annotate_embedded_weights_security_prefix_result(
+                full_result,
+                weights_entry=weights_info.filename,
+                hdf5_signature_offset=hdf5_signature_offset,
+            )
+            result.merge(full_result)
+            return True
+        finally:
+            if temp_path is not None:
+                Path(temp_path).unlink(missing_ok=True)
 
     @staticmethod
     def _annotate_embedded_weights_security_prefix_result(

@@ -32,6 +32,7 @@ from modelaudit.scanners.keras_zip_scanner import (
 )
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
+from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 try:
     import h5py
@@ -140,6 +141,24 @@ def create_regular_weights_h5(tmp_path: Path) -> Path:
     with h5py.File(weights_path, "w") as f:
         f.create_dataset("kernel", data=[1.0, 2.0])
     return weights_path
+
+
+def _embed_plausible_hdf5_superblock(payload: bytes, signature_offset: int) -> bytes:
+    """Embed a bounded v3 superblock while preserving surrounding polyglot bytes."""
+    output = bytearray(payload)
+    minimum_size = signature_offset + 64
+    if len(output) < minimum_size:
+        output.extend(bytes(minimum_size - len(output)))
+
+    superblock = bytearray(b"\x89HDF\r\n\x1a\n\x03\x08\x08\x00")
+    superblock.extend(signature_offset.to_bytes(8, "little"))
+    superblock.extend(b"\xff" * 8)
+    superblock.extend(len(output).to_bytes(8, "little"))
+    superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+    superblock.extend(b"\x00" * 4)
+    output[signature_offset : signature_offset + len(superblock)] = superblock
+    output[signature_offset + len(superblock) : signature_offset + len(superblock) + 4] = b"OHDR"
+    return bytes(output)
 
 
 class TestKerasZipScanner:
@@ -373,16 +392,21 @@ class TestKerasZipScanner:
         finally:
             reset_cache_manager()
 
+    @pytest.mark.parametrize("libver", [None, "latest"])
     def test_userblock_embedded_weights_missing_h5py_returns_exit2(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        libver: str | None,
     ) -> None:
         """HDF5 weights with a user block should still fail closed when h5py is unavailable."""
         if h5py is None:
             pytest.skip("h5py not available")
         weights_path = tmp_path / "userblock.weights.h5"
-        with h5py.File(weights_path, "w", userblock_size=512) as h5_file:
+        h5_kwargs: dict[str, Any] = {"userblock_size": 512}
+        if libver is not None:
+            h5_kwargs["libver"] = libver
+        with h5py.File(weights_path, "w", **h5_kwargs) as h5_file:
             h5_file.create_dataset("kernel", data=[1.0, 2.0])
         assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
 
@@ -411,6 +435,75 @@ class TestKerasZipScanner:
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
+    @pytest.mark.parametrize(("op_type", "malicious"), [("Relu", False), ("PythonOp", True)])
+    def test_magic_only_embedded_weights_preserve_full_onnx_dispatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        op_type: str,
+        malicious: bool,
+    ) -> None:
+        """HDF5 magic inside a non-HDF payload must not suppress its real scanner."""
+        pytest.importorskip("onnx")
+        weights_path = create_mock_onnx(tmp_path / "magic_only.weights.h5", op_type=op_type)
+        prefix_mock_onnx_with_unknown_field(weights_path, value_size=1024)
+        weights_payload = bytearray(weights_path.read_bytes())
+        weights_payload[512 : 512 + 8] = b"\x89HDF\r\n\x1a\n"
+        weights_path.write_bytes(weights_payload)
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert "keras_zip_embedded_weights_h5py_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        python_op_findings = [issue for issue in result.issues if issue.details.get("op_type") == "PythonOp"]
+        assert bool(python_op_findings) is malicious
+        assert (
+            bool(
+                [issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)]
+            )
+            is malicious
+        )
+
+    def test_plausible_hdf5_superblock_preserves_full_onnx_security_dispatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A spoofed plausible superblock must not hide a malicious polyglot payload."""
+        pytest.importorskip("onnx")
+        weights_path = create_mock_onnx(tmp_path / "polyglot.weights.h5", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_field(weights_path, value_size=1024)
+        weights_payload = bytearray(weights_path.read_bytes())
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(bytes(weights_payload), 512))
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["embedded_weights_hdf5_signature_offset"] == 512
+        assert any(
+            issue.details.get("op_type") == "PythonOp"
+            and issue.details.get("zip_entry") == "model.weights.h5"
+            and issue.details.get("embedded_weights_hdf5_userblock") is True
+            for issue in result.issues
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
     def test_userblock_embedded_weights_preserves_generic_security_scan(
         self,
         tmp_path: Path,
@@ -419,7 +512,7 @@ class TestKerasZipScanner:
         """Missing h5py must not suppress malicious bytes stored before the user-block signature."""
         pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
         weights_path = tmp_path / "userblock_pickle.weights.h5"
-        weights_path.write_bytes(pickle_payload + bytes(512 - len(pickle_payload)) + b"\x89HDF\r\n\x1a\n")
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(pickle_payload, 512))
         assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
@@ -458,9 +551,7 @@ class TestKerasZipScanner:
         nested_zip_payload = nested_zip_path.read_bytes()
         assert len(nested_zip_payload) < hdf5_signature_offset
         weights_path = tmp_path / "userblock_zip.weights.h5"
-        weights_path.write_bytes(
-            nested_zip_payload + bytes(hdf5_signature_offset - len(nested_zip_payload)) + b"\x89HDF\r\n\x1a\n"
-        )
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(nested_zip_payload, hdf5_signature_offset))
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
@@ -507,9 +598,7 @@ class TestKerasZipScanner:
         userblock_payload = first_zip_path.read_bytes() + second_zip_path.read_bytes()
         assert len(userblock_payload) < hdf5_signature_offset
         weights_path = tmp_path / "concatenated_zip_userblock.weights.h5"
-        weights_path.write_bytes(
-            userblock_payload + bytes(hdf5_signature_offset - len(userblock_payload)) + b"\x89HDF\r\n\x1a\n"
-        )
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(userblock_payload, hdf5_signature_offset))
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
@@ -553,9 +642,7 @@ class TestKerasZipScanner:
         hdf5_signature_offset = 512
         assert len(nested_zip_payload) < hdf5_signature_offset
         weights_path = tmp_path / "userblock_zip.weights.h5"
-        weights_path.write_bytes(
-            nested_zip_payload + bytes(hdf5_signature_offset - len(nested_zip_payload)) + b"\x89HDF\r\n\x1a\n"
-        )
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(nested_zip_payload, hdf5_signature_offset))
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
@@ -592,9 +679,7 @@ class TestKerasZipScanner:
         userblock_payload = empty_zip_path.read_bytes() + pickle_payload
         assert len(userblock_payload) < hdf5_signature_offset
         weights_path = tmp_path / "zip_then_pickle.weights.h5"
-        weights_path.write_bytes(
-            userblock_payload + bytes(hdf5_signature_offset - len(userblock_payload)) + b"\x89HDF\r\n\x1a\n"
-        )
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(userblock_payload, hdf5_signature_offset))
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
@@ -636,9 +721,7 @@ class TestKerasZipScanner:
         userblock_payload = nested_zip_payload + (b"X" * (70 * 1024))
         assert len(userblock_payload) < hdf5_signature_offset
         weights_path = tmp_path / "zip_then_large_trailer.weights.h5"
-        weights_path.write_bytes(
-            userblock_payload + bytes(hdf5_signature_offset - len(userblock_payload)) + b"\x89HDF\r\n\x1a\n"
-        )
+        weights_path.write_bytes(_embed_plausible_hdf5_superblock(userblock_payload, hdf5_signature_offset))
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
