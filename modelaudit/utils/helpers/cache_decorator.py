@@ -130,6 +130,23 @@ def _known_uncacheable_scan_result(result: Any) -> bool:
     )
 
 
+def should_bypass_cache_for_max_file_size(file_path: str, config: dict[str, Any], file_size: int) -> bool:
+    """Bypass cache key hashing when regular scanning will reject the file size."""
+    try:
+        max_file_size = int(config.get("max_file_size", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if max_file_size <= 0 or file_size <= max_file_size:
+        return False
+
+    try:
+        from ..file.handlers import should_use_advanced_handler
+    except Exception:
+        return True
+
+    return not should_use_advanced_handler(file_path)
+
+
 def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
     """
     Cache decorator for scan functions that take (path, config) arguments.
@@ -199,6 +216,9 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 raw_config, _ = _extract_config_and_path(args, kwargs)
                 if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
+                    return func(*args, **kwargs)
+                if should_bypass_cache_for_max_file_size(file_path, raw_config or {}, file_stat.st_size):
+                    logger.debug(f"Bypassing cache for max_file_size rejection: {file_path}")
                     return func(*args, **kwargs)
 
             except OSError:
