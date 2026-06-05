@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.base import BaseScanner
@@ -286,6 +288,28 @@ class TestMemoryMappedHandler:
         assert any(
             check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
             for check in result.checks
+        )
+
+    def test_mmap_raw_detector_failure_suppresses_later_clean_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "detector-error-then-clean.bin"
+        model_path.write_bytes(b"a" * 32)
+        scanner = RawDetectorMemoryMappedScanner()
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=[RuntimeError("detector failed"), []],
+        ) as scan_model_weights:
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        assert scan_model_weights.call_count == 2
+        assert result.success is False
+        assert not any(
+            check.name == "Embedded Secrets Detection" and check.status.value == "passed" for check in result.checks
         )
 
 

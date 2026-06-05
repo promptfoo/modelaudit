@@ -295,6 +295,14 @@ class MemoryMappedHandler:
                 details={"error": str(e), "bytes_scanned": bytes_scanned},
             )
 
+        remove_failed_raw_detector_clean_checks = getattr(
+            self.scanner,
+            "_remove_failed_raw_detector_clean_checks",
+            None,
+        )
+        if callable(remove_failed_raw_detector_clean_checks):
+            remove_failed_raw_detector_clean_checks(result)
+
         result.finish(
             success=not scan_result_has_inconclusive_outcome(result)
             and not any(

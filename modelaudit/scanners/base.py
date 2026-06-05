@@ -587,6 +587,7 @@ class BaseScanner(ABC):
         already_recorded = isinstance(failed_detectors, list) and detector in failed_detectors
         if isinstance(failed_detectors, list) and not already_recorded:
             failed_detectors.append(detector)
+        self._remove_failed_raw_detector_clean_checks(result)
         if already_recorded:
             return
 
@@ -608,6 +609,27 @@ class BaseScanner(ABC):
     def _raw_detector_failed(result: ScanResult, detector: str) -> bool:
         failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
         return isinstance(failed_detectors, list) and detector in failed_detectors
+
+    @staticmethod
+    def _remove_failed_raw_detector_clean_checks(result: ScanResult) -> None:
+        failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
+        if not isinstance(failed_detectors, list):
+            return
+        clean_check_names = {
+            "embedded_secrets": {"Embedded Secrets Detection"},
+            "jit_script": {"JIT/Script Code Execution Detection", "JIT/Script Code Execution Summary"},
+            "network_communication": {"Network Communication Detection", "Network Communication Summary"},
+        }
+        failed_clean_checks = {
+            check_name for detector in failed_detectors for check_name in clean_check_names.get(detector, set())
+        }
+        if not failed_clean_checks:
+            return
+        result.checks = [
+            check
+            for check in result.checks
+            if not (check.name in failed_clean_checks and check.status == CheckStatus.PASSED)
+        ]
 
     def check_for_embedded_secrets(
         self,
@@ -724,7 +746,7 @@ class BaseScanner(ABC):
                 why=finding.get("recommendation", "Remove sensitive data from model"),
             )
 
-        if not findings and context:
+        if not findings and context and not self._raw_detector_failed(result, "embedded_secrets"):
             result.add_check(
                 name="Embedded Secrets Detection",
                 passed=True,
