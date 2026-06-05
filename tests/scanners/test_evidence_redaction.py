@@ -824,6 +824,75 @@ def test_redacts_authorization_values_by_structured_key() -> None:
     }
 
 
+def test_redacts_camel_case_authorization_key_aliases() -> None:
+    """Authorization suffix aliases should redact string and structured values."""
+    secret = "CAMEL_AUTHORIZATION_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"proxyAuthorization={secret} authorizationValue='{secret}' proxyAuthorizationHeader='{secret}'",
+        max_chars=500,
+    )
+    redacted_value = redact_evidence_value(
+        {
+            "proxyAuthorization": secret,
+            "authorizationValue": secret,
+            "proxyAuthorizationHeader": secret,
+        },
+        max_string_chars=500,
+    )
+
+    assert secret not in redacted_text
+    assert secret not in json.dumps(redacted_value)
+    assert f"proxyAuthorization={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f"authorizationValue='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert f"proxyAuthorizationHeader='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert redacted_value == {
+        "proxyAuthorization": REDACTED_EVIDENCE_VALUE,
+        "authorizationValue": REDACTED_EVIDENCE_VALUE,
+        "proxyAuthorizationHeader": REDACTED_EVIDENCE_VALUE,
+    }
+
+
+def test_redacts_authorization_aliases_in_specialized_string_contexts() -> None:
+    """Malformed, subscripted, and R assignments should share authorization alias coverage."""
+    subscript_secret = "SUBSCRIPT_AUTHORIZATION_SECRET"
+    r_left_secret = "R_LEFT_AUTHORIZATION_SECRET"
+    r_right_secret = "R_RIGHT_AUTHORIZATION_SECRET"
+    unterminated_secret = "UNTERMINATED_AUTHORIZATION_SECRET"
+    text = (
+        f'headers["proxyAuthorization"] = "{subscript_secret}" '
+        f'headers$proxyAuthorization <- "{r_left_secret}" '
+        f'"{r_right_secret}" -> headers$proxyAuthorization '
+        f"proxyAuthorization='{unterminated_secret}"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (subscript_secret, r_left_secret, r_right_secret, unterminated_secret):
+        assert secret not in redacted
+    assert 'headers["proxyAuthorization"] = "<redacted>"' in redacted
+    assert 'headers$proxyAuthorization <- "<redacted>"' in redacted
+    assert '"<redacted>" -> headers$proxyAuthorization' in redacted
+    assert "proxyAuthorization='<redacted>" in redacted
+
+
+def test_preserves_non_secret_authorization_metadata_keys() -> None:
+    """Authorization-related status and method metadata should not be over-redacted."""
+    text = (
+        "authorizationStatus='allowed' proxyAuthorizationEnabled=true "
+        "authorizationMethod='oauth' authorizationHeaderName='Authorization'"
+    )
+    structured = {
+        "authorizationStatus": "allowed",
+        "proxyAuthorizationEnabled": True,
+        "authorizationMethod": "oauth",
+        "authorizationHeaderName": "Authorization",
+    }
+
+    assert redact_evidence_string(text, max_chars=None) == text
+    assert redact_evidence_value(structured) == structured
+
+
 def test_redacts_secret_bearing_structured_keys() -> None:
     """Secret-bearing dict keys should be redacted as evidence too."""
     token_key_secret = "ZIP_TOKEN_KEY_SECRET"
