@@ -449,6 +449,7 @@ class TestTarScanner:
 
         result = self.scanner.scan(str(archive_path))
 
+        assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_allows_replaced_runpy_execution(self, tmp_path: Path) -> None:
@@ -877,6 +878,14 @@ class TestTarScanner:
             (b"import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
+            (b"import ctypes\nctypes.CDLL(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+            (b"from ctypes import CDLL as load\nload(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+            (b"import webbrowser\nwebbrowser.open('https://example.invalid')\n", "S109", "webbrowser.open"),
+            (
+                b"from webbrowser import open_new_tab as launch\nlaunch('https://example.invalid')\n",
+                "S109",
+                "webbrowser.open_new_tab",
+            ),
             (b"eval('1 + 1')\n", "S104", "eval"),
             (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
         ],
@@ -886,6 +895,7 @@ class TestTarScanner:
     ) -> None:
         """Each risk category must surface its own rule code (os.system as S101, etc.)."""
         archive_path = tmp_path / "model_bundle.tar"
+        source = source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
@@ -899,6 +909,29 @@ class TestTarScanner:
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].rule_code == expected_rule_code
         assert expected_call in python_checks[0].details["reason"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"from ctypes import CDLL as load\nload = len\nload([])\n",
+            b"import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
+            b"from webbrowser import open as launch\nlaunch = len\nlaunch([])\n",
+            b"import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
+        ],
+    )
+    def test_scan_tar_allows_shadowed_direct_python_member_primitives(self, tmp_path: Path, source: bytes) -> None:
+        """Safe final bindings should not become ctypes or browser findings."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_path_traversal_detection(self):
         """Test detection of path traversal attempts"""

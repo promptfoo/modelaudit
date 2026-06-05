@@ -1021,6 +1021,33 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_passes_max_size_to_download(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Repository HuggingFace downloads should receive the parsed acquisition budget."""
+    mock_is_hf_url.return_value = True
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["max_size"] == 2048
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
 def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     """Test handling of download failure for HuggingFace URL."""
     # Setup mocks
@@ -1062,6 +1089,39 @@ def test_scan_huggingface_no_scannable_listing_fails_closed(
     assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
     mock_snapshot_download.assert_not_called()
     mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HuggingFace file downloads should receive the parsed acquisition budget."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"weights")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--no-cache",
+            "--max-size",
+            "2KB",
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_file.call_args.kwargs["max_size"] == 2048
+    mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.download_file_from_hf")
@@ -1419,6 +1479,30 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_passes_max_size_to_download(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Streaming HuggingFace downloads should receive the parsed acquisition budget."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"weights")
+    mock_download_streaming.return_value = iter([(test_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, has_errors=False)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--quiet", "--max-size", "2KB", "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["max_size"] == 2048
 
 
 @patch("modelaudit.cli.is_huggingface_url")
