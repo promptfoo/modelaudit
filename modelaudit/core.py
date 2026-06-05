@@ -2314,6 +2314,15 @@ def scan_model_streaming(
     )
     nearby_license_cache: dict[str, list[str]] = {}
 
+    def delete_streamed_source(source_path: Path, context: str) -> None:
+        if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
+            return
+        try:
+            source_path.unlink()
+            logger.debug(f"Deleted {source_path} {context}")
+        except Exception as e:
+            logger.warning(f"Failed to delete {source_path} {context}: {e}")
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
@@ -2324,19 +2333,18 @@ def scan_model_streaming(
             scan_path = source_path
             report_path = str(source_path)
 
-            # Check for interruption
-            check_interrupted()
+            # Check for interruption before starting work on the yielded file.
+            try:
+                check_interrupted()
+            except KeyboardInterrupt:
+                delete_streamed_source(source_path, "after streaming interruption")
+                raise
 
             # Check timeout
             if time.time() - start_time > timeout:
                 results.has_errors = True
                 logger.error(f"Streaming scan timeout after {timeout}s")
-                if delete_after_scan and source_path.exists():
-                    try:
-                        source_path.unlink()
-                        logger.debug(f"Deleted {source_path} after streaming timeout")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {source_path} after streaming timeout: {e}")
+                delete_streamed_source(source_path, "after streaming timeout")
                 break
 
             try:
@@ -2481,12 +2489,7 @@ def scan_model_streaming(
 
             finally:
                 # Delete file after scanning if requested
-                if delete_after_scan and source_path.exists():
-                    try:
-                        source_path.unlink()
-                        logger.debug(f"Deleted {source_path} after scanning")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {source_path}: {e}")
+                delete_streamed_source(source_path, "after scanning")
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:

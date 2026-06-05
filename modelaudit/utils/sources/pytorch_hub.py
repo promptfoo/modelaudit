@@ -246,11 +246,6 @@ def download_pytorch_hub_model_streaming(
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 
-    if max_size is not None and max_size > 0:
-        total_size = _get_total_size(weight_urls)
-        if total_size > 0:
-            _enforce_max_size(total_size, max_size)
-
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
