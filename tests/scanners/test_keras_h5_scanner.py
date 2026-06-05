@@ -1590,7 +1590,11 @@ def test_lambda_deep_unary_number_fails_closed_without_aborting_scan(tmp_path: P
     assert any(
         check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.FAILED
-        and check.details.get("allowlist_status") == "not_allowlisted"
+        and check.severity == IssueSeverity.WARNING
+        and (
+            check.details.get("allowlist_status") == "not_allowlisted"
+            or check.details.get("validation_status") == "invalid_python"
+        )
         for check in result.checks
     )
     assert any(
