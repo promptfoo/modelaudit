@@ -93,33 +93,48 @@ DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_LAMBDA_PATTERN = re.compile(rb"\blambda\b[^:\n]{0,256}:\s*[^\n]*$", re.IGNORECASE)
-DOCUMENTATION_PRIVILEGE_WRAPPER = rb"(?:(?:sudo|doas)(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+)?"
+DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT = (
+    rb"(?:-(?:C|D|g|h|p|R|T|u)|--(?:chdir|chroot|close-from|command-timeout|group|host|other-user|"
+    rb"prompt|role|type|user))"
+)
+DOCUMENTATION_PRIVILEGE_OPTION = (
+    rb"(?:"
+    + DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT
+    + rb"(?:=[^\s]+|\s+[^\s]+)|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?)"
+)
+DOCUMENTATION_PRIVILEGE_WRAPPER = rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+)?"
+DOCUMENTATION_ENV_ASSIGNMENT = rb"[A-Za-z_][A-Za-z0-9_]{0,127}=(?:[^\s\"']+|\"[^\"\r\n]{0,4096}\"|'[^'\r\n]{0,4096}')"
+DOCUMENTATION_ENV_WRAPPER = (
+    rb"(?:(?:env(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+)?"
+    rb"(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){1,16})?"
+)
+DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_PRIVILEGE_WRAPPER
+    + DOCUMENTATION_SHELL_WRAPPERS
     + rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
     rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
-    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'])"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     rb"(?:^|[;&|]\s*)"
-    + DOCUMENTATION_PRIVILEGE_WRAPPER
+    + DOCUMENTATION_SHELL_WRAPPERS
     + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
-    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"']|$)"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
-    rb"(?:\$\(|`)\s*" + DOCUMENTATION_PRIVILEGE_WRAPPER + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
-    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"']|$)",
+    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPERS + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_PRIVILEGE_WRAPPER
+    + DOCUMENTATION_SHELL_WRAPPERS
     + rb"(?:"
     rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
     rb"|pipx\s+install"
@@ -214,7 +229,7 @@ class TextScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if filename in {"readme", "model_card"}:
+        if filename in {"readme", "model_card"} or filename.startswith("readme."):
             return True
 
         ext = os.path.splitext(path)[1].lower()
@@ -265,7 +280,7 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _is_documentation_sidecar(path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return filename in DOCUMENTATION_TEXT_FILENAMES
+        return filename in DOCUMENTATION_TEXT_FILENAMES or filename.startswith("readme.")
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -298,11 +313,36 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _documentation_line_has_import_statement(line: bytes) -> bool:
+        source = line.lstrip()
+        if source.startswith((b">>>", b"...")):
+            source = source[3:].lstrip()
         try:
-            parsed = ast.parse(line.decode("utf-8"))
+            parsed = ast.parse(source.decode("utf-8"))
         except (SyntaxError, UnicodeDecodeError, ValueError):
             return False
         return any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in parsed.body)
+
+    @staticmethod
+    def _documentation_shell_comment_before_position(line: bytes, position: int) -> bool:
+        quote: int | None = None
+        escaped = False
+        for index, value in enumerate(line[:position]):
+            if escaped:
+                escaped = False
+                continue
+            if value == ord("\\") and quote != ord("'"):
+                escaped = True
+                continue
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                continue
+            if value in {ord("'"), ord('"')}:
+                quote = value
+                continue
+            if value == ord("#") and (index == 0 or line[index - 1] in b" \t;|&()"):
+                return True
+        return False
 
     @staticmethod
     def _documentation_nested_config_is_actionable(prefix: bytes) -> bool:
@@ -325,11 +365,17 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
+        shell_context_is_actionable = not cls._documentation_shell_comment_before_position(line, position)
         return (
-            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
-            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
-            or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
+            (
+                shell_context_is_actionable
+                and (
+                    DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+                    or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+                    or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
+                    or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
+                )
+            )
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
@@ -342,6 +388,28 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_previous_line_continues_command(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        if line_start <= 0:
+            return False
+        current_line_prefix = payload[line_start:position]
+        if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
+            return False
+        previous_line_end = line_start - 1
+        previous_line_start = max(
+            payload.rfind(b"\n", 0, previous_line_end) + 1,
+            previous_line_end - MAX_TEXT_FINDING_CONTEXT_BYTES,
+        )
+        previous_line = payload[previous_line_start:previous_line_end].rstrip()
+        if not previous_line.endswith(b"\\"):
+            return False
+        stripped = previous_line.lstrip()
+        return not cls._documentation_shell_comment_before_position(previous_line, len(previous_line)) and (
+            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+        )
+
+    @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
@@ -351,6 +419,8 @@ class TextScanner(BaseScanner):
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return False
+        if cls._documentation_previous_line_continues_command(payload, position):
+            return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         return (
             DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
@@ -557,6 +627,7 @@ class TextScanner(BaseScanner):
             return False
         try:
             raw_url = urlsplit(raw_url_match.group().decode("utf-8", errors="ignore"))
+            raw_port = raw_url.port
             if raw_url.username is not None or raw_url.password is not None:
                 return False
             if any(
@@ -570,7 +641,7 @@ class TextScanner(BaseScanner):
             return False
         if stripped.startswith(b"#"):
             return True
-        if raw_url.scheme.casefold() != "https" or raw_url.port not in {None, 443}:
+        if raw_url.scheme.casefold() != "https" or raw_port not in {None, 443}:
             return False
         return (
             REQUIREMENTS_URL_DIRECTIVE_PATTERN.match(stripped) is not None

