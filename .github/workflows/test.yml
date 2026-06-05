@@ -380,6 +380,8 @@ jobs:
     # Always run for fastest feedback
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    # The full fast suite can approach 30 minutes on hosted runners when the
+    # bounded-replay security regressions land on the long-running worker.
     timeout-minutes: 40
     steps:
       - name: Checkout repo
