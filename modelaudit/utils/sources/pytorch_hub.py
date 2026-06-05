@@ -27,22 +27,30 @@ def _extract_weight_urls(html: str) -> list[str]:
 def _get_total_size(urls: list[str]) -> int:
     total = 0
     for u in urls:
+        resp: requests.Response | None = None
         try:
-            resp = requests.head(u, timeout=10)
-            if resp.ok and "content-length" in resp.headers:
-                total += int(resp.headers["content-length"])
+            resp = requests.head(u, timeout=10, allow_redirects=True)
+            if 200 <= resp.status_code < 300:
+                content_length = _response_content_length(resp)
+                if content_length is not None:
+                    total += content_length
         except Exception:
             continue
+        finally:
+            if resp is not None:
+                with contextlib.suppress(Exception):
+                    resp.close()
     return total
 
 
 def _format_size(size_bytes: int) -> str:
-    size = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} PB"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    absolute_size = abs(size_bytes)
+    for index, unit in enumerate(units):
+        divisor = 1024**index
+        if absolute_size < divisor * 1024:
+            return f"{size_bytes / divisor:.1f} {unit}"
+    return f"{size_bytes} B"
 
 
 def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
@@ -56,7 +64,8 @@ def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
 def _response_content_length(resp: requests.Response) -> int | None:
     try:
         content_length = resp.headers.get("content-length")
-        return int(content_length) if content_length is not None else None
+        parsed_length = int(content_length) if content_length is not None else None
+        return parsed_length if parsed_length is not None and parsed_length >= 0 else None
     except (TypeError, ValueError):
         return None
 
@@ -127,20 +136,35 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size
             shutil.rmtree(dest_dir, ignore_errors=True)
         raise
 
-    downloaded_size = 0
-    for weight_url in weight_urls:
-        filename = weight_url.split("/")[-1]
-        dest_file = dest_dir / filename
-        try:
-            downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
-        except ValueError:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise
-        except Exception as e:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+    staging_dir: Path | None = None
+    download_dir = dest_dir
+    if cache_dir is not None:
+        staging_dir = Path(tempfile.mkdtemp(prefix=".modelaudit_pth_stage_", dir=dest_dir))
+        download_dir = staging_dir
+
+    try:
+        downloaded_size = 0
+        for weight_url in weight_urls:
+            filename = weight_url.split("/")[-1]
+            staged_file = download_dir / filename
+            try:
+                downloaded_size = _download_weight_file(weight_url, staged_file, downloaded_size, max_size)
+            except ValueError:
+                raise
+            except Exception as e:
+                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
+
+        if staging_dir is not None:
+            for weight_url in weight_urls:
+                filename = weight_url.split("/")[-1]
+                (staging_dir / filename).replace(dest_dir / filename)
+    except Exception:
+        if cache_dir is None:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     return dest_dir
 

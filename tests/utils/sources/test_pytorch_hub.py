@@ -39,12 +39,14 @@ def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp
     html_resp.raise_for_status = lambda: None
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
     file_resp.iter_content.return_value = [b"abc"]
     file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
     head_resp.ok = True
+    head_resp.status_code = 200
     head_resp.headers = {"content-length": "3"}
     mock_head.return_value = head_resp
     mock_check.return_value = (True, "ok")
@@ -73,6 +75,7 @@ def test_download_pytorch_hub_model_rejects_known_total_over_max_size(
 
     head_resp = MagicMock()
     head_resp.ok = True
+    head_resp.status_code = 200
     head_resp.headers = {"content-length": "4"}
     mock_head.return_value = head_resp
 
@@ -106,6 +109,7 @@ def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejecti
 
     head_resp = MagicMock()
     head_resp.ok = True
+    head_resp.status_code = 200
     head_resp.headers = {"content-length": "4"}
     mock_head.return_value = head_resp
 
@@ -134,12 +138,14 @@ def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
     html_resp.raise_for_status = lambda: None
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
     file_resp.iter_content.return_value = [b"abc", b"def"]
     file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
     head_resp.ok = False
+    head_resp.status_code = 405
     head_resp.headers = {}
     mock_head.return_value = head_resp
 
@@ -151,6 +157,130 @@ def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
         )
 
     assert not (tmp_path / "resnet50.pth").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    tmp_path: Path,
+) -> None:
+    first_url = "https://download.pytorch.org/models/first.pth"
+    second_url = "https://download.pytorch.org/models/second.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+
+    first_resp = MagicMock()
+    first_resp.__enter__.return_value = first_resp
+    first_resp.headers = {"content-length": "3"}
+    first_resp.iter_content.return_value = [b"new"]
+    first_resp.raise_for_status = lambda: None
+    second_resp = MagicMock()
+    second_resp.__enter__.return_value = second_resp
+    second_resp.headers = {"content-length": "3"}
+    second_resp.iter_content.return_value = [b"two"]
+    second_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, first_resp, second_resp]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    first_cache = tmp_path / "first.pth"
+    second_cache = tmp_path / "second.pth"
+    first_cache.write_bytes(b"old-first")
+    second_cache.write_bytes(b"old-second")
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=5,
+        )
+
+    assert first_cache.read_bytes() == b"old-first"
+    assert second_cache.read_bytes() == b"old-second"
+    assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_allows_exact_cumulative_limit(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    urls = [
+        "https://download.pytorch.org/models/first.pth",
+        "https://download.pytorch.org/models/second.pth",
+    ]
+    html_resp = MagicMock()
+    html_resp.text = "".join(f'<a href="{url}">weight</a>' for url in urls)
+    html_resp.raise_for_status = lambda: None
+
+    file_responses = []
+    for payload in (b"one", b"two"):
+        file_resp = MagicMock()
+        file_resp.__enter__.return_value = file_resp
+        file_resp.headers = {"content-length": "3"}
+        file_resp.iter_content.return_value = [payload]
+        file_resp.raise_for_status = lambda: None
+        file_responses.append(file_resp)
+    mock_get.side_effect = [html_resp, *file_responses]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+        max_size=6,
+    )
+
+    assert result == tmp_path
+    assert (tmp_path / "first.pth").read_bytes() == b"one"
+    assert (tmp_path / "second.pth").read_bytes() == b"two"
+    assert mock_head.call_count == 2
+    assert all(call.kwargs["allow_redirects"] is True for call in mock_head.call_args_list)
+    assert head_resp.close.call_count == 2
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_handles_huge_advertised_size(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    mock_get.return_value = html_resp
+
+    head_resp = MagicMock()
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": str(10**400)}
+    mock_head.return_value = head_resp
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=3,
+        )
+
+    mock_check.assert_not_called()
+    mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
@@ -172,6 +302,7 @@ def test_download_pytorch_hub_model_preserves_existing_cache_file_after_size_rej
 
     head_resp = MagicMock()
     head_resp.ok = False
+    head_resp.status_code = 405
     head_resp.headers = {}
     mock_head.return_value = head_resp
 
@@ -210,6 +341,7 @@ def test_download_pytorch_hub_model_does_not_follow_existing_cache_symlink(
 
     head_resp = MagicMock()
     head_resp.ok = True
+    head_resp.status_code = 200
     head_resp.headers = {"content-length": "3"}
     mock_head.return_value = head_resp
     mock_check.return_value = (True, "ok")
@@ -246,12 +378,14 @@ def test_download_pytorch_hub_model_streaming_enforces_max_size_and_cleans_temp_
     html_resp.raise_for_status = lambda: None
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
     file_resp.iter_content.return_value = [b"abc", b"def"]
     file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
 
     head_resp = MagicMock()
     head_resp.ok = False
+    head_resp.status_code = 405
     head_resp.headers = {}
     mock_head.return_value = head_resp
 
