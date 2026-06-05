@@ -94,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
 - inspect mixed dict/list Keras HDF5 Lambda bytecode with bounded, marshal-aware analysis
+- fail closed on malformed Keras HDF5 Lambda functions, code-loading callbacks, and non-allowlisted framework references
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
