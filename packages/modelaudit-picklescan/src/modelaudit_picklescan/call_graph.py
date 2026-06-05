@@ -903,8 +903,13 @@ def find_unanalyzed_callable_call_graph_references(
         if not module or not name or (module, name) in seen:
             continue
         seen.add((module, name))
-        if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
-            module, name
+        if (
+            _is_skippable_torch_extension_global_reference(module, name)
+            or _unresolved_trusted_import_reference_is_safe(module, name)
+            or (
+                (module, name) in _TRUSTED_IMPORT_ONLY_REFERENCES
+                and not trusted_import_reference_requires_invocation_analysis(module, name)
+            )
         ):
             continue
         if (module, name) in incomplete_newobj_ex_references:
@@ -1024,9 +1029,27 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
         return None
     _track_shared_source_candidates(parts)
     try:
-        spec = _find_module_spec_without_imports(module_name)
+        standard_spec = BuiltinImporter.find_spec(module_name)
+        if standard_spec is None:
+            standard_spec = FrozenImporter.find_spec(module_name)
+        if standard_spec is None:
+            standard_spec = _find_standard_filesystem_spec(module_name)
     except Exception:
         return None
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    spec: ModuleSpec | None
+    if isinstance(loaded_spec, ModuleSpec) and (standard_spec is None or loaded_spec.origin == standard_spec.origin):
+        spec = loaded_spec
+    else:
+        if not isinstance(loaded_spec, ModuleSpec) and (
+            _untrusted_meta_path_finder_precedes(BuiltinImporter, module_name)
+            or _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
+            or _untrusted_meta_path_finder_precedes(PathFinder, module_name)
+            or _has_untrusted_path_hook()
+        ):
+            return None
+        spec = standard_spec
     if spec is None:
         return "unresolved"
     if _module_spec_uses_builtin_or_frozen_loader(spec):
@@ -4500,6 +4523,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
         if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
             loaded_source_path = Path(loaded_spec.origin)
             if loaded_source_path.is_file():
+                _track_shared_source_paths((loaded_source_path,))
                 return loaded_source_path
         if loaded_spec.origin not in {"built-in", "frozen"}:
             return None
