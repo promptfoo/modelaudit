@@ -1185,6 +1185,381 @@ def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_GRAPH_NODES", 2)
+    cache_dir = tmp_path / "cache"
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {"op": "Const", "name": "node_0"},
+                {"op": "Const", "name": "node_1"},
+                {"op": "Const", "name": "node_2"},
+            ],
+            model_name="oversized_graph_node_budget",
+        )
+    )
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    budget_checks = [check for check in direct.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "savedmodel_graph_traversal_budget_exceeded"
+    assert direct.metadata["graph_node_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "graph_node_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "graph_node_count"
+    assert budget_checks[0].details["analysis_incomplete"] is True
+    assert determine_exit_code(aggregate) == 2
+
+    reset_cache_manager()
+    try:
+        cached_aggregates = [
+            scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+        assert all(determine_exit_code(cached_aggregate) == 2 for cached_aggregate in cached_aggregates)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_meta_graph_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_META_GRAPHS", 2)
+    model_path = Path(_create_test_savedmodel_with_scoped_nodes(tmp_path, model_name="oversized_meta_graph_budget"))
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    saved_model = SavedModel()
+    saved_model.ParseFromString((model_path / "saved_model.pb").read_bytes())
+    saved_model.meta_graphs.add().meta_info_def.tags.append("extra_1")
+    saved_model.meta_graphs.add().meta_info_def.tags.append("extra_2")
+    (model_path / "saved_model.pb").write_bytes(saved_model.SerializeToString())
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["meta_graph_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "meta_graph_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "meta_graph_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_node_attribute_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_NODE_ATTRIBUTES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
+                }
+            ],
+            model_name="oversized_node_attribute_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["node_attribute_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "node_attribute_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "node_attribute_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_count_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTIONS", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            collection_values={"collection_0": [], "collection_1": [], "collection_2": []},
+            model_name="oversized_collection_count_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["collection_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "collection_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "collection_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_function_node_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTION_NODES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            function_nodes={
+                "__inference_many_nodes_1": [
+                    {"op": "Const", "name": "fn_node_0"},
+                    {"op": "Const", "name": "fn_node_1"},
+                    {"op": "Const", "name": "fn_node_2"},
+                ]
+            },
+            model_name="oversized_function_node_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["function_node_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "function_node_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "function_node_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_function_count_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTIONS", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            function_nodes={
+                "__inference_empty_0": [],
+                "__inference_empty_1": [],
+                "__inference_empty_2": [],
+            },
+            model_name="oversized_function_count_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["function_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "function_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "function_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_attribute_string_value_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1", "safe_2"]},
+                }
+            ],
+            model_name="oversized_attribute_string_values",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "attribute_string_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "attribute_string_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_scalar_attribute_string_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
+                }
+            ],
+            model_name="oversized_scalar_attribute_strings",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "attribute_string_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "attribute_string_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_mixed_attribute_strings_are_allowed_at_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 3)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label": "safe"},
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1"]},
+                }
+            ],
+            model_name="mixed_attribute_strings_at_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+
+    assert result.success is True
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert not any(check.name == "SavedModel Graph Traversal Budget" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_value_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTION_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            collection_values={"runtime_scripts": [b"safe_0", b"safe_1", b"safe_2"]},
+            model_name="oversized_collection_values",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["collection_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "collection_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "collection_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_protobuf_string_injection_detected_in_list_attribute(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "string_list_attrs": {"labels": ["safe", "os.system('echo list-value')"]},
+            }
+        ],
+        model_name="list_attribute_string_injection",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+
+    assert injection_checks
+    assert any(check.details.get("attribute_name") == "labels" for check in injection_checks)
+    assert any(check.details.get("attack_type") == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_META_GRAPHS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_GRAPH_NODES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTIONS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTION_NODES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_NODE_ATTRIBUTES", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTIONS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTION_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "name": "graph_node_0",
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1"]},
+                },
+                {"op": "Identity", "name": "graph_node_1"},
+            ],
+            function_nodes={
+                "__inference_safe_budget_1": [
+                    {"op": "Const", "name": "function_node_0"},
+                    {"op": "Identity", "name": "function_node_1"},
+                ]
+            },
+            collection_values={"runtime_scripts": [b"safe_0", b"safe_1"]},
+            model_name="benign_graph_at_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+
+    assert result.success is True
+    assert result.issues == []
+    assert result.metadata["meta_graph_count"] == 1
+    assert result.metadata["graph_node_count"] == 2
+    assert result.metadata["function_count"] == 1
+    assert result.metadata["function_node_count"] == 2
+    assert result.metadata["node_attribute_count"] == 1
+    assert result.metadata["attribute_string_value_count"] == 2
+    assert result.metadata["collection_count"] == 1
+    assert result.metadata["collection_value_count"] == 2
+    assert result.metadata["op_counts"]["Const"] == 2
+    assert not any(check.name == "SavedModel Graph Traversal Budget" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
@@ -2268,6 +2643,7 @@ def _create_test_savedmodel_with_scoped_nodes(
     *,
     graph_nodes: list[_NodeSpec] | None = None,
     function_nodes: dict[str, list[_NodeSpec]] | None = None,
+    collection_values: dict[str, list[bytes]] | None = None,
     model_name: str | None = None,
 ) -> str:
     """Create a SavedModel with top-level and function-definition graph nodes."""
@@ -2296,7 +2672,6 @@ def _create_test_savedmodel_with_scoped_nodes(
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")
-
         for attr_name, attr_values in spec.get("string_list_attrs", {}).items():
             node.attr[attr_name].list.s.extend(value.encode("utf-8") for value in attr_values)
 
@@ -2312,6 +2687,9 @@ def _create_test_savedmodel_with_scoped_nodes(
         function_def.signature.name = function_name
         for index, spec in enumerate(node_specs):
             add_node(function_def.node_def, spec, f"function_node_{index}_{str(spec['op']).lower()}")
+
+    for collection_name, values in (collection_values or {}).items():
+        meta_graph.collection_def[collection_name].bytes_list.value.extend(values)
 
     # Save the model
     saved_model_path = model_dir / "saved_model.pb"
