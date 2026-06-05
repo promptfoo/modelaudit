@@ -2994,6 +2994,20 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
                 output.append(f"  {file_name} (error: {error})")
             else:
                 output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                for key in (
+                    "has_custom_metadata",
+                    "custom_metadata_entry_count",
+                    "custom_metadata_valid",
+                    "custom_metadata_type",
+                    "custom_metadata_invalid_value_count",
+                    "custom_metadata_security_flags",
+                ):
+                    if key not in file_meta:
+                        continue
+                    value = file_meta[key]
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value)) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:
