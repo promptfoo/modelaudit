@@ -401,32 +401,7 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
         return None
 
     parts = _MATRIX_PARAMETER_SEPARATOR_PATTERN.split(decoded)
-    changed = False
-    if parts[0] and _looks_like_capability_path_token(parts[0]):
-        parts[0] = _REDACTED_PATH_TOKEN
-        changed = True
-
-    for index, part in enumerate(parts[1:], start=1):
-        if not part:
-            continue
-        sensitive_assignment = _redact_sensitive_path_assignment(part, preserve_key=True)
-        if sensitive_assignment is not None:
-            parts[index] = sensitive_assignment
-            changed = True
-            continue
-        if "=" not in part:
-            if _looks_like_capability_path_token(part):
-                parts[index] = _REDACTED_PATH_TOKEN
-                changed = True
-            continue
-        key, value = part.split("=", 1)
-        if _looks_like_capability_path_token(key):
-            key = _REDACTED_PATH_TOKEN
-            changed = True
-        if _looks_like_capability_path_token(value):
-            value = _REDACTED_PATH_TOKEN
-            changed = True
-        parts[index] = f"{key}={value}"
+    changed = _redact_delimited_path_components(parts)
 
     if changed:
         return f"{';'.join(parts)}{trailing_delimiters}"
@@ -557,6 +532,14 @@ def _trim_source_literal_url(url: str, source_quote: str | None = None) -> str:
     if source_quote != "'":
         return url
 
+    authority_start = url.find("://") + 3
+    authority_end = len(url)
+    if authority_start >= 3:
+        authority_end = min(
+            (index for delimiter in "/?#" if (index := url.find(delimiter, authority_start)) >= 0),
+            default=len(url),
+        )
+
     escaped = False
     for index, character in enumerate(url):
         if escaped:
@@ -564,7 +547,7 @@ def _trim_source_literal_url(url: str, source_quote: str | None = None) -> str:
         elif character == "\\":
             escaped = True
         elif character == source_quote:
-            if url[index + 1 :].startswith("@"):
+            if authority_start <= index < authority_end and url[index + 1 :].startswith("@"):
                 continue
             return url[:index]
     return url
@@ -1285,6 +1268,9 @@ class NetworkCommDetector:
         self.truncated_finding: dict[str, Any] | None = None
         self._url_contexts: list[tuple[int, int, str]] = []
         self._url_context_starts: list[int] = []
+        self._url_context_iterator: Iterator[tuple[int, int, str]] | None = None
+        self._pending_url_context: tuple[int, int, str] | None = None
+        self._url_context_scan_complete = False
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -1313,8 +1299,17 @@ class NetworkCommDetector:
         self.findings_truncated = False
         self.truncated_finding_type = None
         self.truncated_finding = None
-        self._url_contexts = self._index_url_contexts(data)
-        self._url_context_starts = [start for start, _end, _url in self._url_contexts]
+        if self.max_findings is None:
+            self._url_contexts = self._index_url_contexts(data)
+            self._url_context_starts = [start for start, _end, _url in self._url_contexts]
+            self._url_context_iterator = None
+            self._url_context_scan_complete = True
+        else:
+            self._url_contexts = []
+            self._url_context_starts = []
+            self._url_context_iterator = self._iter_url_contexts(data)
+            self._url_context_scan_complete = False
+        self._pending_url_context = None
 
         scanners = (
             (
@@ -1374,15 +1369,18 @@ class NetworkCommDetector:
         return True
 
     def _index_url_contexts(self, data: bytes) -> list[tuple[int, int, str]]:
-        contexts: list[tuple[int, int, str]] = []
+        return list(self._iter_url_contexts(data))
+
+    @staticmethod
+    def _iter_url_contexts(data: bytes) -> Iterator[tuple[int, int, str]]:
         for match in _URL_IN_BYTES_PATTERN.finditer(data):
             raw_url = match.group().decode("utf-8", errors="ignore")
             source_quote = _source_quote_before_url(data, match.start())
             url = _trim_source_literal_url(raw_url, source_quote)
-            contexts.append((match.start(), match.start() + len(url.encode("utf-8")), url))
-        return contexts
+            yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
+        self._extend_url_context_index(match_start)
         context_index = bisect_right(self._url_context_starts, match_start) - 1
         if context_index >= 0:
             url_start, url_end, url = self._url_contexts[context_index]
@@ -1390,9 +1388,53 @@ class NetworkCommDetector:
                 return _is_match_redacted_from_url_context(url, url_start, match_start, value)
         return _is_match_redacted_from_url(data, match_start, value)
 
+    def _extend_url_context_index(self, match_start: int) -> None:
+        """Index URL contexts only through the offset needed by a pre-URL scanner."""
+        while not self._url_context_scan_complete:
+            if self._pending_url_context is None:
+                if self._url_context_iterator is None:
+                    self._url_context_scan_complete = True
+                    return
+                try:
+                    self._pending_url_context = next(self._url_context_iterator)
+                except StopIteration:
+                    self._url_context_iterator = None
+                    self._url_context_scan_complete = True
+                    return
+
+            if self._pending_url_context[0] > match_start:
+                return
+
+            context = self._pending_url_context
+            self._pending_url_context = None
+            self._url_contexts.append(context)
+            self._url_context_starts.append(context[0])
+
+    def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
+        """Yield cached URL contexts followed by the remaining lazy index."""
+        yield from self._url_contexts
+        while not self._url_context_scan_complete:
+            if self._pending_url_context is None:
+                if self._url_context_iterator is None:
+                    self._url_context_scan_complete = True
+                    return
+                try:
+                    self._pending_url_context = next(self._url_context_iterator)
+                except StopIteration:
+                    self._url_context_iterator = None
+                    self._url_context_scan_complete = True
+                    return
+
+            context = self._pending_url_context
+            self._pending_url_context = None
+            self._url_contexts.append(context)
+            self._url_context_starts.append(context[0])
+            yield context
+
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
-        for url_start, _url_end, url in self._url_contexts:
+        url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_indexed_url_contexts()
+        for url_start, _url_end, url in url_contexts:
             if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is None:
                 continue
             if not self._record_url_finding(url, url_start, context):

