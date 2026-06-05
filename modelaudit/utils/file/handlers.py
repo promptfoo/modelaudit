@@ -257,6 +257,16 @@ class ShardedModelDetector:
                             ):
                                 unvalidated_shards.append(str(file))
                                 continue
+                            if any(
+                                isinstance(expected_target.get(key), int) and expected_target[key] != current_value
+                                for key, current_value in (
+                                    ("size", shard_stat.st_size),
+                                    ("mtime_ns", shard_stat.st_mtime_ns),
+                                    ("ctime_ns", shard_stat.st_ctime_ns),
+                                )
+                            ):
+                                unvalidated_shards.append(str(file))
+                                continue
                             if (
                                 isinstance(expected_device, int)
                                 and isinstance(expected_inode, int)
@@ -281,6 +291,8 @@ class ShardedModelDetector:
                             "device": shard_stat.st_dev,
                             "inode": shard_stat.st_ino,
                             "size": shard_size,
+                            "mtime_ns": shard_stat.st_mtime_ns,
+                            "ctime_ns": shard_stat.st_ctime_ns,
                         }
                         total_size += shard_size
                         if file_match.lastindex:
@@ -450,6 +462,19 @@ def _grouped_shard_boundary_error(
                 "path": file_path,
                 "resolved_path": str(resolved_path),
                 "reason": "shard_target_identity_changed",
+            }
+        if any(
+            isinstance(expected_target.get(key), int) and expected_target[key] != current_value
+            for key, current_value in (
+                ("size", resolved_stat.st_size),
+                ("mtime_ns", resolved_stat.st_mtime_ns),
+                ("ctime_ns", resolved_stat.st_ctime_ns),
+            )
+        ):
+            return {
+                "path": file_path,
+                "resolved_path": str(resolved_path),
+                "reason": "shard_target_content_changed",
             }
     return None
 
@@ -665,6 +690,50 @@ class ParallelShardHandler:
             },
         )
 
+        expected_members: set[str] | None = None
+        family_dir: Path | None = None
+        if isinstance(self.shard_info.get("current_file"), str) and isinstance(self.shard_info.get("pattern"), str):
+            expected_members = self._expected_family_members()
+            family_dir = Path(self.shard_info["current_file"]).parent
+            try:
+                pre_scan_members = self._current_family_members()
+            except (OSError, RuntimeError) as e:
+                _mark_inconclusive_scan_outcome(result, "shard_family_changed")
+                result.add_check(
+                    name="Sharded Model Membership Check",
+                    passed=False,
+                    message="Unable to revalidate shard family membership before scanning.",
+                    severity=IssueSeverity.INFO,
+                    location=str(family_dir),
+                    details={
+                        "error": str(e),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "shard_family_changed",
+                    },
+                )
+                result.finish(success=False)
+                return result
+
+            if pre_scan_members != expected_members:
+                _mark_inconclusive_scan_outcome(result, "shard_family_changed")
+                result.add_check(
+                    name="Sharded Model Membership Check",
+                    passed=False,
+                    message="Shard family membership changed before scanning; scan coverage is incomplete.",
+                    severity=IssueSeverity.INFO,
+                    location=str(family_dir),
+                    details={
+                        "added_shards": sorted(pre_scan_members - expected_members),
+                        "removed_shards": sorted(expected_members - pre_scan_members),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "shard_family_changed",
+                    },
+                )
+                result.finish(success=False)
+                return result
+
         with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_WORKERS, total_shards)) as executor:
             # Submit all shard scans
             future_to_shard = {
@@ -703,8 +772,73 @@ class ParallelShardHandler:
                         },
                     )
 
+        if expected_members is not None and family_dir is not None:
+            membership_error: str | None
+            try:
+                post_scan_members = self._current_family_members()
+            except (OSError, RuntimeError) as e:
+                post_scan_members = set()
+                membership_error = str(e)
+            else:
+                membership_error = None
+
+            if post_scan_members != expected_members or membership_error is not None:
+                success = False
+                _mark_inconclusive_scan_outcome(result, "shard_family_changed")
+                details: dict[str, Any] = {
+                    "added_shards": sorted(post_scan_members - expected_members),
+                    "removed_shards": sorted(expected_members - post_scan_members),
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_family_changed",
+                }
+                if membership_error is not None:
+                    details["error"] = membership_error
+                result.add_check(
+                    name="Sharded Model Membership Check",
+                    passed=False,
+                    message="Shard family membership changed during scanning; scan coverage is incomplete.",
+                    severity=IssueSeverity.INFO,
+                    location=str(family_dir),
+                    details=details,
+                )
+
         result.finish(success=success and not result.has_errors and "scan_outcome" not in result.metadata)
         return result
+
+    def _expected_family_members(self) -> set[str]:
+        """Return every lexical family member categorized during detection."""
+        members: set[str] = set()
+        for key in (
+            "shards",
+            "unreadable_shards",
+            "out_of_scope_shards",
+            "unvalidated_shards",
+            "duplicate_shards",
+        ):
+            values = self.shard_info.get(key)
+            if isinstance(values, list):
+                members.update(str(Path(value).absolute()) for value in values if isinstance(value, str))
+        return members
+
+    def _current_family_members(self) -> set[str]:
+        """Enumerate current lexical members of the detected shard family."""
+        current_file = Path(self.shard_info["current_file"])
+        pattern = self.shard_info["pattern"]
+        expected_total = self.shard_info.get("expected_total_shards")
+        members: set[str] = set()
+        for candidate in current_file.parent.glob("*"):
+            match = re.fullmatch(pattern, candidate.name)
+            if match is None:
+                continue
+            if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
+                try:
+                    if int(match.group(2)) != expected_total:
+                        continue
+                except (IndexError, ValueError):
+                    continue
+            members.add(str(candidate.absolute()))
+        return members
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":
         from ...scanner_results import ScanResult

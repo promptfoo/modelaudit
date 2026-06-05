@@ -196,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- prevent sharded-model scans from following retargeted, non-regular, or out-of-scope shard and config aliases
+- prevent sharded-model scans from accepting changed family membership, stale shard identities, or unsafe aliases
 - redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - bind cache reads and writes to complete file and pathname identities captured before scanning
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets

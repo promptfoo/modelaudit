@@ -217,6 +217,8 @@ def _build_shard_family_cache_fingerprint(
                 "device": validated_targets.get(scanned_file_path, {}).get("device"),
                 "inode": validated_targets.get(scanned_file_path, {}).get("inode"),
                 "size": validated_targets.get(scanned_file_path, {}).get("size"),
+                "mtime_ns": validated_targets.get(scanned_file_path, {}).get("mtime_ns"),
+                "ctime_ns": validated_targets.get(scanned_file_path, {}).get("ctime_ns"),
                 "content_hash": content_hashes.get(scanned_file_path),
             }
             for scanned_file_path in sorted(scanned_file_paths)
@@ -266,7 +268,7 @@ def _validated_shard_targets_from_config(config: dict[str, Any]) -> ValidatedSha
         if not isinstance(source_path, str) or not isinstance(resolved_path, str):
             continue
         target: dict[str, int | str] = {"resolved_path": resolved_path}
-        for key in ("device", "inode", "size"):
+        for key in ("device", "inode", "size", "mtime_ns", "ctime_ns"):
             value = member.get(key)
             if isinstance(value, int):
                 target[key] = value
@@ -341,6 +343,18 @@ def _grouped_shard_boundary_error(
                 "resolved_path": str(resolved_path),
                 "reason": "shard_target_identity_changed",
             }
+        for key, current_value in (
+            ("size", resolved_stat.st_size),
+            ("mtime_ns", resolved_stat.st_mtime_ns),
+            ("ctime_ns", resolved_stat.st_ctime_ns),
+        ):
+            expected_value = expected_target.get(key)
+            if isinstance(expected_value, int) and current_value != expected_value:
+                return {
+                    "path": path,
+                    "resolved_path": str(resolved_path),
+                    "reason": "shard_target_content_changed",
+                }
     return None
 
 
@@ -855,6 +869,7 @@ def _hash_files_by_path(
     *,
     config: dict[str, Any] | None = None,
     routing_paths: dict[str, str] | None = None,
+    hashed_identities: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
@@ -868,7 +883,7 @@ def _hash_files_by_path(
         hash get unique placeholder values so they still scan independently.
     """
     content_hashes: dict[str, str] = {}
-    hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
+    hashes_by_inode: dict[tuple[int, int, int, int, int], str] = {}
     hashed_bytes = 0
 
     for file_path in file_paths:
@@ -881,18 +896,28 @@ def _hash_files_by_path(
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
             continue
         try:
-            inode_key: tuple[int, int, int, int] | None = None
+            inode_key: tuple[int, int, int, int, int] | None = None
+            pre_hash_stat: os.stat_result | None = None
             try:
-                file_stat = os.stat(file_path)
-                if file_stat.st_nlink > 1:
+                pre_hash_stat = os.stat(file_path, follow_symlinks=False)
+                if pre_hash_stat.st_nlink > 1:
                     inode_key = (
-                        file_stat.st_dev,
-                        file_stat.st_ino,
-                        file_stat.st_size,
-                        file_stat.st_mtime_ns,
+                        pre_hash_stat.st_dev,
+                        pre_hash_stat.st_ino,
+                        pre_hash_stat.st_size,
+                        pre_hash_stat.st_mtime_ns,
+                        pre_hash_stat.st_ctime_ns,
                     )
                     if cached_hash := hashes_by_inode.get(inode_key):
                         content_hashes[file_path] = cached_hash
+                        if hashed_identities is not None:
+                            hashed_identities[file_path] = {
+                                "device": pre_hash_stat.st_dev,
+                                "inode": pre_hash_stat.st_ino,
+                                "size": pre_hash_stat.st_size,
+                                "mtime_ns": pre_hash_stat.st_mtime_ns,
+                                "ctime_ns": pre_hash_stat.st_ctime_ns,
+                            }
                         continue
             except OSError:
                 # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
@@ -904,6 +929,20 @@ def _hash_files_by_path(
             with suppress(OSError):
                 hashed_bytes += os.path.getsize(file_path)
             content_hashes[file_path] = _calculate_file_hash(file_path)
+            post_hash_stat = os.stat(file_path, follow_symlinks=False)
+            if pre_hash_stat is None or any(
+                getattr(pre_hash_stat, field) != getattr(post_hash_stat, field)
+                for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            ):
+                raise OSError(f"File changed while hashing: {file_path}")
+            if hashed_identities is not None:
+                hashed_identities[file_path] = {
+                    "device": post_hash_stat.st_dev,
+                    "inode": post_hash_stat.st_ino,
+                    "size": post_hash_stat.st_size,
+                    "mtime_ns": post_hash_stat.st_mtime_ns,
+                    "ctime_ns": post_hash_stat.st_ctime_ns,
+                }
             if inode_key is not None:
                 hashes_by_inode[inode_key] = content_hashes[file_path]
         except Exception as e:
@@ -1435,11 +1474,18 @@ def scan_model_directory_or_file(
                 routing_paths_by_source = {
                     hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
+                hashed_identities_by_source: dict[str, dict[str, int]] = {}
                 hashes_by_source = _hash_files_by_path(
                     hash_sources,
                     config=config,
                     routing_paths=routing_paths_by_source,
+                    hashed_identities=hashed_identities_by_source,
                 )
+                for family_targets in shard_family_targets.values():
+                    for validated_target in family_targets.values():
+                        resolved_path = validated_target.get("resolved_path")
+                        if isinstance(resolved_path, str) and resolved_path in hashed_identities_by_source:
+                            validated_target.update(hashed_identities_by_source[resolved_path])
                 content_hashes = {
                     scanned_file_path: hashes_by_source.get(
                         hash_source,

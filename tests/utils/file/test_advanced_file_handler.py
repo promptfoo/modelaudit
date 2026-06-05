@@ -542,6 +542,36 @@ class TestShardedModelDetector:
         assert any(check.name == "Shard Scan" and check.status == CheckStatus.FAILED for check in result.checks)
         assert not any(check.name == "Clean Replacement Accepted" for check in result.checks)
 
+    def test_shard_added_during_scan_marks_family_inconclusive(self, tmp_path: Path) -> None:
+        """A shard created after detection cannot remain outside the completed scan set."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        added_shard = tmp_path / "checkpoint_3.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        scanned_names: list[str] = []
+
+        class AddingShardScanner:
+            name = "adding_shard_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_names.append(Path(shard_path).name)
+                if Path(shard_path) == shard_one:
+                    added_shard.write_bytes(b"malicious-unscanned")
+                result = ScanResult(scanner_name=self.name)
+                result.finish(success=True)
+                return result
+
+        result = AdvancedFileHandler(str(shard_one), AddingShardScanner()).scan()
+
+        assert set(scanned_names) == {shard_one.name, shard_two.name}
+        assert added_shard.name not in scanned_names
+        assert result.success is False
+        assert "shard_family_changed" in result.metadata["scan_outcome_reasons"]
+        membership_check = next(check for check in result.checks if check.name == "Sharded Model Membership Check")
+        assert membership_check.details["added_shards"] == [str(added_shard)]
+        assert membership_check.details["analysis_incomplete"] is True
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:

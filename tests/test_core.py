@@ -877,10 +877,16 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
         *,
         config: dict[str, Any] | None = None,
         routing_paths: dict[str, str] | None = None,
+        hashed_identities: dict[str, dict[str, int]] | None = None,
     ) -> dict[str, str]:
         assert set(file_paths) == {str(blob_one), str(blob_two)}
         assert routing_paths == {str(blob_one): str(shard_one), str(blob_two): str(shard_two)}
-        hashes = original_hash_files(file_paths, config=config, routing_paths=routing_paths)
+        hashes = original_hash_files(
+            file_paths,
+            config=config,
+            routing_paths=routing_paths,
+            hashed_identities=hashed_identities,
+        )
         shard_one.unlink()
         shard_one.symlink_to(Path("../../blobs") / blob_two.name)
         return hashes
@@ -1291,6 +1297,44 @@ def test_scan_file_fails_closed_when_grouped_shard_retargets_outside_allowlist(t
     assert any(check.name == "Sharded Model Boundary Check" for check in result.checks)
 
 
+def test_scan_file_fails_closed_when_grouped_shard_content_changes(tmp_path: Path) -> None:
+    """Hash-time shard identity must still match when grouped scanning begins."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"malicious")
+    hash_time_stat = shard.stat()
+    shard.write_bytes(b"benign!!!")
+    os.utime(
+        shard,
+        ns=(hash_time_stat.st_atime_ns, hash_time_stat.st_mtime_ns + 1_000_000_000),
+    )
+
+    result = core_module._scan_file_internal(
+        str(shard),
+        config={
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [
+                    {
+                        "source_path": str(shard),
+                        "path": str(shard.resolve()),
+                        "device": hash_time_stat.st_dev,
+                        "inode": hash_time_stat.st_ino,
+                        "size": hash_time_stat.st_size,
+                        "mtime_ns": hash_time_stat.st_mtime_ns,
+                        "ctime_ns": hash_time_stat.st_ctime_ns,
+                        "content_hash": "stale-hash",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert result.success is False
+    assert result.scanner_name == "shard_boundary"
+    assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+    boundary_check = next(check for check in result.checks if check.name == "Sharded Model Boundary Check")
+    assert boundary_check.details["reason"] == "shard_target_content_changed"
+
+
 def test_scan_file_ignores_outer_shard_boundary_for_non_shard_payload(tmp_path: Path) -> None:
     """A nested non-shard member should retain malicious scanning under an outer fingerprint."""
     shard = tmp_path / "model-00001-of-00001.pt"
@@ -1585,6 +1629,11 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     second_fingerprint = second_material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
 
     assert {member["path"] for member in first_fingerprint["members"]} == {str(shard) for shard in shards}
+    assert all(
+        isinstance(member.get(key), int)
+        for member in first_fingerprint["members"]
+        for key in ("size", "mtime_ns", "ctime_ns")
+    )
     assert first_fingerprint != second_fingerprint
 
 
