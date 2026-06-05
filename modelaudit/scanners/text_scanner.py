@@ -170,7 +170,7 @@ DOCUMENTATION_DOCKER_RUN_OPTION = rb"--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
 DOCUMENTATION_DOCKER_RUN = rb"(?:RUN(?:\s+" + DOCUMENTATION_DOCKER_RUN_OPTION + rb"){0,8}\s+)?"
 DOCUMENTATION_COMMAND_CONTEXT = DOCUMENTATION_COMMAND_LABEL + DOCUMENTATION_DOCKER_RUN
 DOCUMENTATION_SHELL_LINE_PREFIX = (
-    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?"
+    rb"^\s*(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){0,8}"
     + DOCUMENTATION_INLINE_CODE_OPEN
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
@@ -203,6 +203,12 @@ DOCUMENTATION_XARGS_DOWNLOADER_PATTERN = re.compile(
     rb"\|\s*xargs(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"ADD(?:\s+--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+"
+    + rb"(?:$|[A-Za-z][A-Za-z0-9+.-]*://)",
+    re.IGNORECASE,
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
@@ -230,7 +236,8 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
-    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
+    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?"
+    rb"(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?(?:\s+(?!install\b)[^\s]+)?){0,8}\s+install"
     rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
     rb"|(?:conda|mamba|micromamba)\s+install"
@@ -692,6 +699,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
+            or DOCUMENTATION_DOCKER_ADD_PATTERN.match(stripped) is not None
             or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
             or cls._documentation_suspicious_label_is_actionable(prefix)
             or (

