@@ -176,7 +176,7 @@ def pytest_runtest_setup(item):
             "test_models.py",  # aggregate result model and exit-code propagation tests
             "test_file_filter.py",  # Directory file prefilter tests
             "test_huggingface.py",  # HuggingFace provenance and cache path tests
-            "test_pytorch_hub.py",  # PyTorch Hub download budget regression tests
+            "test_pytorch_hub.py",  # PyTorch Hub artifact URL and download budget regression tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "tests/utils/sources/test_dvc_integration.py",  # DVC output-cap fail-closed regressions
             "test_jfrog.py",  # JFrog utility tests
