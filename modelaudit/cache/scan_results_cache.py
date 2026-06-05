@@ -645,7 +645,10 @@ class ScanResultsCache:
             initial_stat = os.stat(file_path)
             initial_change_token = self._get_file_change_token(file_path, initial_stat)
             initial_ancestor_identity = self._capture_ancestor_identity(file_path)
-            newest_initial_token = max([initial_change_token, *(entry[-1] for entry in initial_ancestor_identity)])
+            newest_initial_token = self._newest_identity_change_token(
+                initial_change_token,
+                initial_ancestor_identity,
+            )
             if newest_initial_token < barrier_token:
                 break
             preliminary_change_token = initial_change_token
@@ -754,10 +757,10 @@ class ScanResultsCache:
         if os.fstat(probe.fileno()).st_dev != file_stat.st_dev:
             raise ValueError(f"Cache identity probe is on a different filesystem: {file_path}")
 
-        captured_tokens = [file_change_token]
-        if os.name != "nt":
-            captured_tokens.extend(entry[-1] for entry in ancestor_identity)
-        newest_captured_token = max(captured_tokens)
+        newest_captured_token = self._newest_identity_change_token(
+            file_change_token,
+            ancestor_identity,
+        )
 
         deadline = time.monotonic() + _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS
         while time.monotonic() < deadline:
@@ -767,6 +770,16 @@ class ScanResultsCache:
             time.sleep(0.001)
 
         raise ValueError(f"Filesystem change clock did not advance for cache identity: {file_path}")
+
+    @staticmethod
+    def _newest_identity_change_token(
+        file_change_token: int,
+        ancestor_identity: AncestorIdentity,
+    ) -> int:
+        captured_tokens = [file_change_token]
+        if os.name != "nt":
+            captured_tokens.extend(entry[-1] for entry in ancestor_identity)
+        return max(captured_tokens)
 
     def _touch_change_clock_probe(self, probe: BinaryIO) -> int:
         if os.name != "nt":
@@ -790,7 +803,6 @@ class ScanResultsCache:
         ancestor = Path(os.path.abspath(file_path)).parent
         identity: list[AncestorEntry] = []
         direct_parent = True
-        max_entries = None if sys.platform.startswith("linux") or sys.platform == "win32" else 2
         while True:
             ancestor_path = str(ancestor)
             if ancestor.is_symlink():
@@ -816,8 +828,6 @@ class ScanResultsCache:
                 )
             )
             if not parent_on_same_device:
-                break
-            if max_entries is not None and len(identity) >= max_entries:
                 break
             direct_parent = False
             ancestor = ancestor.parent
@@ -869,12 +879,13 @@ class ScanResultsCache:
             return identity
         try:
             monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None
-            if sys.platform.startswith("linux"):
+            platform_name = getattr(sys, "platform", "")
+            if platform_name.startswith("linux"):
                 monitor = _AncestorPathMonitor(
                     file_path,
                     tuple(identity),
                 )
-            elif sys.platform == "win32":
+            elif platform_name == "win32":
                 monitor = _WindowsPathLockMonitor(file_path, tuple(identity))
             if monitor is None:
                 return identity

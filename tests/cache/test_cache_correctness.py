@@ -176,6 +176,42 @@ def test_windows_change_clock_barrier_ignores_ancestor_churn(
         assert cache._advance_change_clock(str(file_path), probe, 1, ancestor_identity) == 2
 
 
+def test_windows_capture_barrier_ignores_ancestor_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    file_stat = file_path.stat()
+    ancestor_identity = AncestorIdentity(
+        [
+            (
+                str(file_path.parent),
+                file_stat.st_dev,
+                file_path.parent.stat().st_ino,
+                file_path.parent.stat().st_mode,
+                file_path.parent.stat().st_mtime_ns,
+                10_000,
+            )
+        ]
+    )
+
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(cache, "_path_has_symlink_component", lambda _path: False)
+        monkeypatch.setattr(cache, "_get_change_clock_probe", lambda _path, _device: probe)
+        monkeypatch.setattr(cache, "_get_file_change_token", lambda _path, _stat: 1)
+        monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path: ancestor_identity)
+        monkeypatch.setattr(cache, "_advance_change_clock", lambda *_args: 2)
+        monkeypatch.setattr(cache, "_monitor_ancestor_identity", lambda _path, identity: identity)
+        monkeypatch.setattr(cache.hasher, "hash_file_with_stat", lambda _path, _stat: "secure:stable")
+
+        captured_identity = cache.capture_file_identity(str(file_path))
+
+    assert captured_identity[0] == file_stat
+    assert captured_identity[1:] == ("secure:stable", 1, ancestor_identity)
+
+
 def test_capture_file_identity_advances_clock_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -881,6 +917,48 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     assert first["payload_prefix"] == ("evil!:" if os.name == "nt" else "clean:")
     assert second["payload_prefix"] == "evil!:"
     assert calls["count"] == (1 if os.name == "nt" else 2)
+    assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def test_unmonitored_platform_does_not_cache_higher_ancestor_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trees_root = tmp_path / "trees"
+    live_root = trees_root / "live"
+    decoy_root = trees_root / "decoy"
+    live_leaf = live_root / "branch" / "leaf"
+    decoy_leaf = decoy_root / "branch" / "leaf"
+    live_leaf.mkdir(parents=True)
+    decoy_leaf.mkdir(parents=True)
+    malicious_path = _make_cacheable_file(live_leaf, name="model.dat")
+    clean_path = _make_cacheable_file(decoy_leaf, name="model.dat")
+    malicious_path.write_bytes(b"evil!:" + (b"x" * 2042))
+    clean_path.write_bytes(b"clean:" + (b"y" * 2042))
+    held_root = trees_root / "held"
+
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            live_root.rename(held_root)
+            decoy_root.rename(live_root)
+            prefix = Path(path).read_bytes()[:6].decode("utf-8")
+            live_root.rename(decoy_root)
+            held_root.rename(live_root)
+            return {"payload_prefix": prefix}
+        return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
+
+    first = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
+    second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
     assert cache_manager.get_stats()["total_entries"] == 1
 
 
