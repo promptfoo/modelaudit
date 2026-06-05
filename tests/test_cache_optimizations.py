@@ -12,6 +12,7 @@ from modelaudit.cache.adaptive_cache_keys import AdaptiveCacheKeyGenerator, File
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.cache_manager import CacheManager
 from modelaudit.cache.optimized_config import CacheConfiguration, ConfigurationExtractor
+from modelaudit.cache.scan_results_cache import ScannedFileIdentity
 
 
 @pytest.mark.performance
@@ -113,7 +114,7 @@ class TestCacheOptimizationPerformance:
             # Create test files
             test_files = []
             test_results: list[tuple[str, dict[str, Any], int | None]] = []
-            expected_file_identities: dict[str, tuple[os.stat_result, str, int, int]] = {}
+            expected_file_identities: dict[str, ScannedFileIdentity] = {}
             assert cache_manager.cache is not None
 
             for i in range(10):  # Reduced number for faster test

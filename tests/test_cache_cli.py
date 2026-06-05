@@ -52,8 +52,20 @@ class TestCacheCLI:
 
             try:
                 cache_manager = get_cache_manager(cache_dir=temp_dir, enabled=True)
+                assert cache_manager.cache is not None
+                file_stat, file_hash, change_token, ancestor_identity = cache_manager.cache.capture_file_identity(
+                    tmp_file.name
+                )
                 test_result = {"test": "result", "findings": []}
-                cache_manager.store_result(tmp_file.name, test_result, 100)
+                cache_manager.store_result(
+                    tmp_file.name,
+                    test_result,
+                    100,
+                    expected_file_stat=file_stat,
+                    expected_file_hash=file_hash,
+                    expected_change_token=change_token,
+                    expected_ancestor_identity=ancestor_identity,
+                )
 
                 # Check stats show entry
                 runner = CliRunner()

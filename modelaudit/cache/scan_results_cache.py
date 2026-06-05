@@ -15,7 +15,8 @@ from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
 
-ScannedFileIdentity = tuple[os.stat_result, str, int, int]
+AncestorIdentity = tuple[tuple[str, int, int, int, int], ...]
+ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
 
 
 def _is_sampled_fingerprint(value: object) -> bool:
@@ -110,8 +111,8 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Load and validate a cache entry using a caller-provided stat result."""
-        if os.path.islink(file_path):
-            logger.debug("Bypassing scan-result cache lookup for symlink path %s", file_path)
+        if self._path_has_symlink_component(file_path):
+            logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
             return None
 
         try:
@@ -172,8 +173,8 @@ class ScanResultsCache:
         file_stat: os.stat_result | None = None,
     ) -> dict[str, Any] | None:
         """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
-        if file_path is not None and os.path.islink(file_path):
-            logger.debug("Bypassing scan-result cache lookup for symlink path %s", file_path)
+        if file_path is not None and self._path_has_symlink_component(file_path):
+            logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
             return None
 
         try:
@@ -227,7 +228,7 @@ class ScanResultsCache:
         expected_file_stat: os.stat_result | None = None,
         expected_file_hash: str | None = None,
         expected_change_token: int | None = None,
-        expected_parent_change_token: int | None = None,
+        expected_ancestor_identity: AncestorIdentity | None = None,
     ) -> bool:
         """
         Store scan result in cache with optimized file system calls.
@@ -240,65 +241,51 @@ class ScanResultsCache:
             expected_file_stat: File metadata captured before the scan
             expected_file_hash: Secure content hash captured before the scan
             expected_change_token: Platform-specific modification token captured before the scan
-            expected_parent_change_token: Parent directory modification token captured before the scan
+            expected_ancestor_identity: Ancestor directory identities captured before the scan
         Returns:
             True when a cache entry was persisted, False when storage was skipped or failed.
         """
         try:
-            if os.path.islink(file_path):
-                logger.debug("Skipping cache store for symlink path %s", file_path)
+            if self._path_has_symlink_component(file_path):
+                logger.debug("Skipping cache store for symlinked path %s", file_path)
                 return False
-            expected_identity_parts = (
-                expected_file_stat,
-                expected_file_hash,
-                expected_change_token,
-                expected_parent_change_token,
-            )
-            if any(part is not None for part in expected_identity_parts) and any(
-                part is None for part in expected_identity_parts
+            if (
+                expected_file_stat is None
+                or expected_file_hash is None
+                or expected_change_token is None
+                or expected_ancestor_identity is None
             ):
-                logger.debug("Skipping cache store for %s: incomplete expected file identity", file_path)
+                logger.debug("Skipping cache store for %s: missing expected file identity", file_path)
                 return False
 
             # Get file stats ONCE and reuse
             file_stat = os.stat(file_path)
             verified_current_hash: str | None = None
-            if expected_file_stat is not None and not self._stat_matches(file_stat, expected_file_stat):
+            if not self._stat_matches(file_stat, expected_file_stat):
                 logger.debug("Skipping cache store for %s: file metadata changed during scan", file_path)
                 return False
-            if (
-                expected_change_token is not None
-                and self._get_file_change_token(file_path, file_stat) != expected_change_token
-            ):
+            if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
-            parent_path = str(Path(file_path).parent)
-            if expected_parent_change_token is not None:
-                parent_stat = os.stat(parent_path)
-                if self._get_file_change_token(parent_path, parent_stat) != expected_parent_change_token:
-                    logger.debug("Skipping cache store for %s: parent directory changed during scan", file_path)
-                    return False
-            if expected_file_hash is not None:
-                verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
-                if verified_current_hash != expected_file_hash:
-                    logger.debug("Skipping cache store for %s: file hash changed during scan", file_path)
-                    return False
-                post_hash_stat = os.stat(file_path)
-                if expected_file_stat is not None and not self._stat_matches(post_hash_stat, expected_file_stat):
-                    logger.debug("Skipping cache store for %s: file metadata changed during verification", file_path)
-                    return False
-                if (
-                    expected_change_token is not None
-                    and self._get_file_change_token(file_path, post_hash_stat) != expected_change_token
-                ):
-                    logger.debug("Skipping cache store for %s: file changed during verification", file_path)
-                    return False
-                if expected_parent_change_token is not None:
-                    post_hash_parent_stat = os.stat(parent_path)
-                    if self._get_file_change_token(parent_path, post_hash_parent_stat) != expected_parent_change_token:
-                        logger.debug("Skipping cache store for %s: parent changed during verification", file_path)
-                        return False
-                file_stat = post_hash_stat
+            if self._capture_ancestor_identity(file_path) != expected_ancestor_identity:
+                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                return False
+
+            verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+            if verified_current_hash != expected_file_hash:
+                logger.debug("Skipping cache store for %s: file hash changed during scan", file_path)
+                return False
+            post_hash_stat = os.stat(file_path)
+            if not self._stat_matches(post_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed during verification", file_path)
+                return False
+            if self._get_file_change_token(file_path, post_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed during verification", file_path)
+                return False
+            if self._capture_ancestor_identity(file_path) != expected_ancestor_identity:
+                logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
+                return False
+            file_stat = post_hash_stat
 
             version_info = self._get_version_info(version_context)
             if version_info is None:
@@ -355,29 +342,88 @@ class ScanResultsCache:
 
     def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
         """Capture a stable stat, content hash, and platform change token before scanning."""
-        if os.path.islink(file_path):
-            raise ValueError(f"Symlink paths are not cacheable: {file_path}")
+        if self._path_has_symlink_component(file_path):
+            raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
         initial_stat = os.stat(file_path)
         initial_change_token = self._get_file_change_token(file_path, initial_stat)
-        parent_path = str(Path(file_path).parent)
-        initial_parent_stat = os.stat(parent_path)
-        initial_parent_change_token = self._get_file_change_token(parent_path, initial_parent_stat)
+        initial_ancestor_identity = self._capture_ancestor_identity(file_path)
         content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
         verified_stat = os.stat(file_path)
         verified_change_token = self._get_file_change_token(file_path, verified_stat)
-        verified_parent_stat = os.stat(parent_path)
-        verified_parent_change_token = self._get_file_change_token(parent_path, verified_parent_stat)
+        verified_ancestor_identity = self._capture_ancestor_identity(file_path)
 
         if (
             not self._stat_matches(initial_stat, verified_stat)
             or initial_change_token != verified_change_token
-            or not self._stat_matches(initial_parent_stat, verified_parent_stat)
-            or initial_parent_change_token != verified_parent_change_token
+            or initial_ancestor_identity != verified_ancestor_identity
         ):
             raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-        return verified_stat, content_hash, verified_change_token, verified_parent_change_token
+        self._advance_change_clock(file_path, verified_change_token, verified_ancestor_identity)
+        return verified_stat, content_hash, verified_change_token, verified_ancestor_identity
+
+    def _advance_change_clock(
+        self,
+        file_path: str,
+        file_change_token: int,
+        ancestor_identity: AncestorIdentity,
+    ) -> None:
+        """Advance the filesystem change clock past the captured identity or decline caching."""
+        file_stat = os.stat(file_path)
+        probe_stat = os.stat(self.metadata_file)
+        ancestor_devices = {entry[1] for entry in ancestor_identity}
+        if file_stat.st_dev != probe_stat.st_dev or ancestor_devices != {probe_stat.st_dev}:
+            raise ValueError(f"Cache identity probe is on a different filesystem: {file_path}")
+
+        captured_tokens = [file_change_token, *(entry[-1] for entry in ancestor_identity)]
+        newest_captured_token = max(captured_tokens)
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            os.utime(self.metadata_file, None)
+            probe_stat = os.stat(self.metadata_file)
+            probe_token = self._get_file_change_token(str(self.metadata_file), probe_stat)
+            if probe_token > newest_captured_token:
+                return
+            time.sleep(0.001)
+
+        raise ValueError(f"Filesystem change clock did not advance for cache identity: {file_path}")
+
+    def _capture_ancestor_identity(self, file_path: str) -> AncestorIdentity:
+        """Capture same-filesystem lexical ancestors and reject symlinked path components."""
+        file_device = os.stat(file_path).st_dev
+        ancestor = Path(os.path.abspath(file_path)).parent
+        identity: list[tuple[str, int, int, int, int]] = []
+        while True:
+            ancestor_path = str(ancestor)
+            if ancestor.is_symlink():
+                raise ValueError(f"Symlink ancestors are not cacheable: {ancestor_path}")
+            ancestor_stat = os.stat(ancestor_path)
+            if ancestor_stat.st_dev != file_device:
+                break
+            identity.append(
+                (
+                    ancestor_path,
+                    ancestor_stat.st_dev,
+                    ancestor_stat.st_ino,
+                    ancestor_stat.st_mode,
+                    self._get_file_change_token(ancestor_path, ancestor_stat),
+                )
+            )
+            if ancestor.parent == ancestor:
+                break
+            ancestor = ancestor.parent
+        return tuple(identity)
+
+    @staticmethod
+    def _path_has_symlink_component(file_path: str) -> bool:
+        path = Path(os.path.abspath(file_path))
+        while True:
+            if path.is_symlink():
+                return True
+            if path.parent == path:
+                return False
+            path = path.parent
 
     @staticmethod
     def _get_file_change_token(file_path: str, file_stat: os.stat_result) -> int:

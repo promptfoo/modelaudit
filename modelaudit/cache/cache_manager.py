@@ -8,7 +8,7 @@ from typing import Any
 
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_policy import cached_scan_result_dependencies_available, should_cache_scan_result
-from .scan_results_cache import ScanResultsCache
+from .scan_results_cache import AncestorIdentity, ScanResultsCache
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class CacheManager:
         expected_file_stat: os.stat_result | None = None,
         expected_file_hash: str | None = None,
         expected_change_token: int | None = None,
-        expected_parent_change_token: int | None = None,
+        expected_ancestor_identity: AncestorIdentity | None = None,
     ) -> bool:
         """
         Store scan result in cache.
@@ -107,7 +107,7 @@ class CacheManager:
             expected_file_stat: File metadata captured before the scan
             expected_file_hash: Secure content hash captured before the scan
             expected_change_token: Platform-specific modification token captured before the scan
-            expected_parent_change_token: Parent directory modification token captured before the scan
+            expected_ancestor_identity: Ancestor directory identities captured before the scan
         """
         if not self.enabled or not self.cache:
             return False
@@ -120,7 +120,7 @@ class CacheManager:
             expected_file_stat=expected_file_stat,
             expected_file_hash=expected_file_hash,
             expected_change_token=expected_change_token,
-            expected_parent_change_token=expected_parent_change_token,
+            expected_ancestor_identity=expected_ancestor_identity,
         )
 
     def cached_scan(
@@ -168,14 +168,14 @@ class CacheManager:
             pre_scan_stat: os.stat_result | None = None
             pre_scan_hash: str | None = None
             pre_scan_change_token: int | None = None
-            pre_scan_parent_change_token: int | None = None
+            pre_scan_ancestor_identity: AncestorIdentity | None = None
             try:
                 if self.cache is not None:
                     (
                         pre_scan_stat,
                         pre_scan_hash,
                         pre_scan_change_token,
-                        pre_scan_parent_change_token,
+                        pre_scan_ancestor_identity,
                     ) = self.cache.capture_file_identity(file_path)
             except Exception as e:
                 logger.debug("Bypassing cache store for %s: pre-scan hashing failed: %s", file_path, e)
@@ -192,7 +192,7 @@ class CacheManager:
                 and pre_scan_stat is not None
                 and pre_scan_hash is not None
                 and pre_scan_change_token is not None
-                and pre_scan_parent_change_token is not None
+                and pre_scan_ancestor_identity is not None
             ):
                 self.store_result(
                     file_path,
@@ -202,7 +202,7 @@ class CacheManager:
                     expected_file_stat=pre_scan_stat,
                     expected_file_hash=pre_scan_hash,
                     expected_change_token=pre_scan_change_token,
-                    expected_parent_change_token=pre_scan_parent_change_token,
+                    expected_ancestor_identity=pre_scan_ancestor_identity,
                 )
             elif not cacheable_result:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")

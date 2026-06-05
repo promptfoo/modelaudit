@@ -210,7 +210,7 @@ class BatchCacheOperations:
             if expected_file_identity is None:
                 logger.debug(f"Skipping unbound batch cache store for {os.path.basename(file_path)}")
                 return False
-            expected_file_stat, expected_file_hash, expected_change_token, expected_parent_change_token = (
+            expected_file_stat, expected_file_hash, expected_change_token, expected_ancestor_identity = (
                 expected_file_identity
             )
 
@@ -222,7 +222,7 @@ class BatchCacheOperations:
                 expected_file_stat=expected_file_stat,
                 expected_file_hash=expected_file_hash,
                 expected_change_token=expected_change_token,
-                expected_parent_change_token=expected_parent_change_token,
+                expected_ancestor_identity=expected_ancestor_identity,
             )
         except Exception as e:
             logger.debug(f"Failed to store result for {file_path}: {e}")
