@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-import modelaudit.cli as cli_module
 from modelaudit import __version__
+from modelaudit import cli as cli_module
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
@@ -862,6 +862,65 @@ def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
     assert victim_path.read_text() == "sentinel"
 
 
+@pytest.mark.skipif(os.access not in os.supports_dir_fd, reason="Descriptor-relative access checks are required")
+def test_cli_report_writers_check_permissions_through_open_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Permission validation must use the same pinned parent as replacement."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("stale")
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    access_calls: list[tuple[str | Path, dict[str, object]]] = []
+    original_access = cli_module.os.access
+    supports_effective_ids = original_access in os.supports_effective_ids
+    supports_follow_symlinks = original_access in os.supports_follow_symlinks
+
+    def record_access(
+        path: str | Path,
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        effective_ids: bool = False,
+        follow_symlinks: bool = True,
+    ) -> bool:
+        access_calls.append(
+            (
+                path,
+                {
+                    "dir_fd": dir_fd,
+                    "effective_ids": effective_ids,
+                    "follow_symlinks": follow_symlinks,
+                },
+            )
+        )
+        return original_access(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            effective_ids=effective_ids,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(cli_module.os, "access", record_access)
+    monkeypatch.setattr(cli_module.os, "supports_dir_fd", {*os.supports_dir_fd, record_access})
+    effective_id_functions = {record_access} if supports_effective_ids else set()
+    follow_symlink_functions = {record_access} if supports_follow_symlinks else set()
+    monkeypatch.setattr(cli_module.os, "supports_effective_ids", effective_id_functions)
+    monkeypatch.setattr(cli_module.os, "supports_follow_symlinks", follow_symlink_functions)
+    try:
+        cli_module._validate_existing_output_path(str(output_path), output_path, parent_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    assert len(access_calls) == 1
+    access_path, access_kwargs = access_calls[0]
+    assert access_path == output_path.name
+    assert access_kwargs["dir_fd"] == parent_fd
+    assert access_kwargs["effective_ids"] is supports_effective_ids
+    assert access_kwargs["follow_symlinks"] is (not supports_follow_symlinks)
+
+
 def test_cli_report_writers_recheck_parent_links_on_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -876,17 +935,17 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
     victim_path = redirected_dir / "scanners.json"
     victim_path.write_text("sentinel")
     output_path = output_dir / victim_path.name
-    original_open = cli_module._open_output_parent_directory
+    guard_handle = 123
+    closed_handles: list[int] = []
 
-    def swap_parent_then_open(path: str) -> tuple[Path, int | None]:
-        opened_path = original_open(path)
+    def swap_parent_then_open(path: str) -> tuple[Path, int | None, int | None]:
+        opened_path = cli_module._validated_absolute_output_path(path)
         output_dir.rename(original_output_dir)
         output_dir.symlink_to(redirected_dir, target_is_directory=True)
-        return opened_path
+        return opened_path, None, guard_handle
 
-    monkeypatch.setattr(cli_module.os, "O_NOFOLLOW", 0, raising=False)
-    monkeypatch.setattr(cli_module.os, "O_DIRECTORY", 0, raising=False)
     monkeypatch.setattr(cli_module, "_open_output_parent_directory", swap_parent_then_open)
+    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
 
     result = CliRunner().invoke(
         cli,
@@ -897,6 +956,7 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
     assert "Refusing to write output through symlink" in result.output
     assert victim_path.read_text() == "sentinel"
     assert not list(redirected_dir.glob(".scanners.json.*.tmp"))
+    assert closed_handles == [guard_handle]
 
 
 def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
@@ -909,6 +969,8 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
     victim_path.write_text("sentinel")
     original_validate = cli_module._validated_absolute_output_path
     validation_count = 0
+    guard_handle = 123
+    closed_handles: list[int] = []
 
     def install_hard_link_after_validation(path: str) -> Path:
         nonlocal validation_count
@@ -918,8 +980,12 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
             output_path.hardlink_to(victim_path)
         return validated_path
 
-    monkeypatch.setattr(cli_module.os, "O_NOFOLLOW", 0, raising=False)
-    monkeypatch.setattr(cli_module.os, "O_DIRECTORY", 0, raising=False)
+    monkeypatch.setattr(
+        cli_module,
+        "_open_output_parent_directory",
+        lambda path: (original_validate(path), None, guard_handle),
+    )
+    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
     monkeypatch.setattr(cli_module, "_validated_absolute_output_path", install_hard_link_after_validation)
 
     result = CliRunner().invoke(
@@ -930,14 +996,95 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
     assert result.exit_code == 2
     assert victim_path.read_text() == "sentinel"
     assert output_path.samefile(victim_path)
+    assert closed_handles == [guard_handle]
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes are required")
-def test_cli_report_writers_support_write_only_parent_on_fallback(
+def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fallback opening must not require read access when write and search suffice."""
+    """The Windows parent guard must remain live until atomic installation finishes."""
+    output_path = tmp_path / "scanners.json"
+    guard_handle = 123
+    closed_handles: list[int] = []
+    original_replace = cli_module.os.replace
+
+    monkeypatch.setattr(
+        cli_module,
+        "_open_output_parent_directory",
+        lambda _path: (output_path, None, guard_handle),
+    )
+    monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
+
+    def guarded_replace(source: Path, destination: Path) -> None:
+        assert closed_handles == []
+        original_replace(source, destination)
+
+    monkeypatch.setattr(cli_module.os, "replace", guarded_replace)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert closed_handles == [guard_handle]
+    assert json.loads(output_path.read_text())["scanners"]
+
+
+def test_cli_report_writers_fail_closed_without_secure_parent_primitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown path-only platforms must not silently use a racy replacement."""
+    output_path = tmp_path / "scanners.json"
+    monkeypatch.setattr(cli_module.os, "name", "unsupported")
+    monkeypatch.setattr(cli_module, "_validated_absolute_output_path", lambda _path: output_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Secure output writes are unsupported" in result.output
+    assert not output_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory sharing semantics are required")
+def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained native directory handle must block the final parent-swap window."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    renamed_dir = tmp_path / "renamed"
+    output_path = output_dir / "scanners.json"
+    original_replace = cli_module.os.replace
+
+    def attempt_parent_swap(source: Path, destination: Path) -> None:
+        with pytest.raises(OSError):
+            output_dir.rename(renamed_dir)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(cli_module.os, "replace", attempt_parent_swap)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes are required")
+def test_cli_report_writers_fail_closed_for_write_only_parent_without_search_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform without a searchable directory handle must fail closed."""
     output_dir = tmp_path / "write-only"
     output_dir.mkdir()
     output_path = output_dir / "scanners.json"
@@ -952,8 +1099,9 @@ def test_cli_report_writers_support_write_only_parent_on_fallback(
     finally:
         output_dir.chmod(0o700)
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(output_path.read_text())["scanners"]
+    assert result.exit_code == 2
+    assert "Unable to write output" in result.output
+    assert not output_path.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX component limits are required")

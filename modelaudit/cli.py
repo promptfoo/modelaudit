@@ -163,6 +163,98 @@ def _directory_can_replace_entries(path: Path) -> bool:
     return os.access(path, os.W_OK, **access_kwargs)
 
 
+def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> int:
+    """Pin a Windows output parent so path-based replacement cannot be redirected."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(absolute_path.parent),
+        file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to secure output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        get_file_information = kernel32.GetFileInformationByHandleEx
+        get_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        get_file_information.restype = wintypes.BOOL
+        file_attribute_tag_info_class = 9
+        tag_info = FileAttributeTagInfo()
+        if not get_file_information(
+            handle,
+            file_attribute_tag_info_class,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            error = ctypes_windows.get_last_error()
+            raise _OutputWriteError(
+                f"Unable to validate output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+            )
+
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        name_surrogate_flag = 0x20000000
+        if tag_info.file_attributes & reparse_attribute and (
+            not tag_info.reparse_tag or tag_info.reparse_tag & name_surrogate_flag
+        ):
+            raise _OutputWriteError(
+                f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+            )
+
+        if _validated_absolute_output_path(output_path) != absolute_path:
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {_display_path(output_path)}")
+        return handle_value
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _close_windows_handle(handle: int) -> None:
+    """Close a native Windows handle acquired for output-path protection."""
+    import ctypes
+    from ctypes import wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
 def _validated_absolute_output_path(output_path: str) -> Path:
     """Resolve protected parent links and reject attacker-replaceable ones."""
     absolute_path = _absolute_output_path(output_path)
@@ -183,20 +275,23 @@ def _validated_absolute_output_path(output_path: str) -> Path:
     return current_path
 
 
-def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None]:
+def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None, int | None]:
     """Open the validated output parent without following replaceable links."""
     absolute_path = _validated_absolute_output_path(output_path)
+    if os.name == "nt":
+        return absolute_path, None, _open_windows_output_parent_guard(output_path, absolute_path)
+
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     directory_access = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)
     dir_fd_functions = (os.open, os.stat, os.rename, os.unlink)
     if (
-        not nofollow
+        os.name != "posix"
+        or not nofollow
         or not directory
-        or not directory_access
         or any(function not in os.supports_dir_fd for function in dir_fd_functions)
     ):
-        return absolute_path, None
+        raise _OutputWriteError(f"Secure output writes are unsupported on this platform: {_display_path(output_path)}")
 
     directory_flags = directory_access | directory | nofollow
     directory_fd = os.open(absolute_path.anchor, directory_flags)
@@ -205,7 +300,7 @@ def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None]:
             next_directory_fd = os.open(part, directory_flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_directory_fd
-        return absolute_path, directory_fd
+        return absolute_path, directory_fd, None
     except Exception:
         os.close(directory_fd)
         raise
@@ -231,8 +326,16 @@ def _validate_existing_output_path(
         raise _OutputWriteError(f"Refusing to write output to non-regular file: {output_display}")
     if path_stat.st_nlink != 1:
         raise _OutputWriteError(f"Refusing to overwrite hard-linked output: {output_display}")
-    access_kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
-    if not os.access(absolute_path, os.W_OK, **access_kwargs):
+    access_kwargs: dict[str, Any] = {}
+    if os.access in os.supports_effective_ids:
+        access_kwargs["effective_ids"] = True
+    access_path: str | Path = absolute_path
+    if parent_fd is not None and os.access in os.supports_dir_fd:
+        access_path = absolute_path.name
+        access_kwargs["dir_fd"] = parent_fd
+        if os.access in os.supports_follow_symlinks:
+            access_kwargs["follow_symlinks"] = False
+    if not os.access(access_path, os.W_OK, **access_kwargs):
         raise _OutputWriteError(f"Unable to write output {output_display}: Permission denied")
     return path_stat
 
@@ -267,11 +370,12 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
     output_display = _display_path(output_path)
     absolute_path: Path | None = None
     parent_fd: int | None = None
+    parent_guard: int | None = None
     temp_fd: int | None = None
     temp_path: Path | None = None
     temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
     try:
-        absolute_path, parent_fd = _open_output_parent_directory(output_path)
+        absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
         initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -328,6 +432,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         elif temp_path is not None:
             with contextlib.suppress(OSError):
                 temp_path.unlink()
+        if parent_guard is not None:
+            _close_windows_handle(parent_guard)
 
 
 @dataclass
