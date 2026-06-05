@@ -36,7 +36,20 @@ _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
+_BARE_ASSIGNMENT_RE = re.compile(
+    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)=(?P<value>[^\s&#;,)}\]]+)",
+    re.IGNORECASE,
+)
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
+_URL_TOKEN_RE = re.compile(
+    rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
+    re.IGNORECASE,
+)
+_ESCAPED_URL_DELIMITER_RE = re.compile(
+    r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|x2f|x3f|x3d|x26|x23)",
+    re.IGNORECASE,
+)
 _SAFE_DISPLAY_QUERY_KEYS = frozenset(
     {
         "campaign",
@@ -51,6 +64,32 @@ _SAFE_DISPLAY_QUERY_KEYS = frozenset(
     }
 )
 _MAX_QUERY_VALUE_DECODE_PASSES = 4
+_SENSITIVE_ASSIGNMENT_KEY_TOKENS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "sas",
+        "secret",
+        "session",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+_SENSITIVE_ASSIGNMENT_KEY_MARKERS = (
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "authkey",
+    "authtoken",
+    "clientsecret",
+    "privatekey",
+    "securitytoken",
+)
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -110,11 +149,88 @@ def redact_url_for_display(url: str) -> str:
 
 def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
     """Remove signed URL credentials from provider exception text."""
-    redacted = str(message)
+    redacted = normalize_escaped_url_delimiters_for_display(str(message))
     if source_url:
-        redacted = redacted.replace(source_url, redact_url_for_display(source_url))
+        normalized_source_url = normalize_escaped_url_delimiters_for_display(source_url)
+        redacted = redacted.replace(normalized_source_url, redact_url_for_display(normalized_source_url))
+    redacted = _URL_TOKEN_RE.sub(lambda match: _redact_embedded_url_for_display(match.group(0)), redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
+    redacted = _BARE_ASSIGNMENT_RE.sub(_redact_bare_sensitive_assignment, redacted)
     return _QUERY_PARAM_RE.sub(_redact_sensitive_query_param, redacted)
+
+
+def normalize_escaped_url_delimiters_for_display(value: str) -> str:
+    """Expose escaped URL structure so reporting redactors can inspect it."""
+    replacements = {
+        "/": "/",
+        "u002f": "/",
+        "u003f": "?",
+        "u003d": "=",
+        "u0026": "&",
+        "u0023": "#",
+        "x2f": "/",
+        "x3f": "?",
+        "x3d": "=",
+        "x26": "&",
+        "x23": "#",
+    }
+    return _ESCAPED_URL_DELIMITER_RE.sub(
+        lambda match: replacements[match.group("delimiter").lower()],
+        value,
+    )
+
+
+def _redact_embedded_url_for_display(url: str) -> str:
+    if is_stream_url(url):
+        return f"stream://{redact_stream_url_for_display(url[9:])}"
+    try:
+        parts = urlsplit(url)
+        safe_base = redact_url_for_display(url)
+        if safe_base == "<cloud URL redacted>":
+            return safe_base
+        safe_parts = urlsplit(safe_base)
+    except Exception:
+        return "<cloud URL redacted>"
+
+    safe_query = _redact_url_component_for_display(parts.query)
+    safe_fragment = _redact_url_component_for_display(parts.fragment)
+    return urlunsplit((safe_parts.scheme, safe_parts.netloc, safe_parts.path, safe_query, safe_fragment))
+
+
+def _redact_url_component_for_display(value: str) -> str:
+    safe_parts: list[str] = []
+    for part in re.split(r"[&;]", value):
+        if "=" not in part:
+            continue
+        key, parameter_value = part.split("=", 1)
+        if _is_safe_display_query_param(key, parameter_value):
+            safe_parts.append(part)
+        else:
+            safe_parts.append(f"{key}=<redacted>")
+    return "&".join(safe_parts)
+
+
+def _redact_bare_sensitive_assignment(match: re.Match[str]) -> str:
+    key = match.group("key")
+    if not _is_sensitive_assignment_key(key):
+        return match.group(0)
+    return f"{key}=<redacted>"
+
+
+def _is_sensitive_assignment_key(key: str) -> bool:
+    decoded_key = key
+    for _ in range(_MAX_QUERY_VALUE_DECODE_PASSES):
+        next_key = unquote_plus(decoded_key)
+        if next_key == decoded_key:
+            break
+        decoded_key = next_key
+
+    normalized_key = decoded_key.casefold()
+    key_tokens = {token for token in re.split(r"[^a-z0-9]+", normalized_key) if token}
+    if key_tokens & _SENSITIVE_ASSIGNMENT_KEY_TOKENS:
+        return True
+    collapsed_key = re.sub(r"[^a-z0-9]+", "", normalized_key)
+    return any(marker in collapsed_key for marker in _SENSITIVE_ASSIGNMENT_KEY_MARKERS)
 
 
 def _redact_sensitive_query_param(match: re.Match[str]) -> str:
@@ -247,13 +363,14 @@ def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
     scheme = parsed.scheme
+    hostname = (parsed.hostname or "").casefold()
 
     if scheme in {"http", "https"}:
-        if parsed.netloc.endswith(".s3.amazonaws.com"):
+        if hostname.endswith(".s3.amazonaws.com"):
             return "s3"
-        elif parsed.netloc == "storage.googleapis.com":
+        elif hostname == "storage.googleapis.com":
             return "gcs"
-        elif parsed.netloc.endswith(".r2.cloudflarestorage.com"):
+        elif hostname.endswith(".r2.cloudflarestorage.com"):
             return "s3"
         else:
             raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")

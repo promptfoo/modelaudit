@@ -196,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- redact signed stream source URLs across JSON, SARIF, CLI, progress, and SBOM reporting, including malformed source identifiers
+- redact signed stream source URLs across JSON, SARIF, CLI, progress, and SBOM reporting, including malformed, transformed, and escaped source identifiers; preserve mixed-case cloud transport routing
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines

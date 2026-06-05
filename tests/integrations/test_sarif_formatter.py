@@ -115,6 +115,25 @@ class TestFormatSarifOutput:
         assert "X-Amz-Signature" not in output
         assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in output
 
+    def test_escaped_url_delimiters_cannot_bypass_sarif_redaction(self) -> None:
+        escaped_url = r"https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-SARIF-SECRET"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Related endpoint: {escaped_url}",
+                severity=IssueSeverity.WARNING,
+                details={"related_url": escaped_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "ENCODED-SARIF-SECRET" not in output
+        assert "https://collector.example/callback" in output
+        assert "token=" not in output
+
     def test_malformed_stream_paths_fail_closed(self) -> None:
         """SARIF invocation and asset paths must not retain malformed stream queries."""
         raw_path = "stream://bucket/model.pkl?token=secret-token"

@@ -22,6 +22,9 @@ from modelaudit.core_results import (
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
 from modelaudit.utils.sources.cloud_storage import is_stream_url
+from modelaudit.utils.sources.cloud_storage import (
+    normalize_escaped_url_delimiters_for_display as _normalize_escaped_url_delimiters_for_display,
+)
 from modelaudit.utils.sources.cloud_storage import redact_cloud_error_for_display as _redact_cloud_error_for_display
 from modelaudit.utils.sources.cloud_storage import redact_stream_url_for_display as _redact_stream_url_for_display
 from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
@@ -467,7 +470,9 @@ def _redact_path_for_sarif(path: str) -> str:
 
 def _redact_text_for_sarif(text: str) -> str:
     """Redact signed URL tokens embedded in SARIF text fields."""
-    return _URL_TOKEN_RE.sub(lambda match: _redact_url_token_for_sarif(match.group(0)), text)
+    normalized_text = _normalize_escaped_url_delimiters_for_display(text)
+    redacted_text = _URL_TOKEN_RE.sub(lambda match: _redact_url_token_for_sarif(match.group(0)), normalized_text)
+    return _redact_cloud_error_for_display(redacted_text)
 
 
 def _redact_url_token_for_sarif(url: str) -> str:

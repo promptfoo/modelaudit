@@ -31,6 +31,7 @@ from modelaudit.utils.sources.cloud_storage import (
     download_from_cloud_streaming,
     filter_scannable_files,
     get_cloud_object_size,
+    get_fs_protocol,
     is_cloud_url,
     redact_cloud_error_for_display,
     redact_stream_error_for_display,
@@ -170,6 +171,17 @@ class TestCloudURLDetection:
         for url in invalid:
             assert not is_cloud_url(url), f"Incorrectly detected {url}"
 
+    @pytest.mark.parametrize(
+        ("url", "expected_protocol"),
+        [
+            ("HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://STORAGE.GOOGLEAPIS.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://ACCOUNT.R2.CLOUDFLARESTORAGE.COM/bucket/model.pkl", "s3"),
+        ],
+    )
+    def test_resolves_mixed_case_https_provider_hosts(self, url: str, expected_protocol: str) -> None:
+        assert get_fs_protocol(url) == expected_protocol
+
 
 class TestCloudURLRedaction:
     def test_redact_url_for_display_strips_credentials_and_query(self) -> None:
@@ -228,6 +240,28 @@ class TestCloudURLRedaction:
         assert "token=<redacted>" in redacted
         assert "secret" not in redacted
         assert "abc123" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_transformed_credentials_and_opaque_url_parts(self) -> None:
+        message = (
+            "provider normalized token=secret-token from "
+            "https://collector.example/callback?OPAQUE-QUERY-SECRET#OPAQUE-FRAGMENT-SECRET"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "token=<redacted>" in redacted
+        assert "https://collector.example/callback" in redacted
+        assert "secret-token" not in redacted
+        assert "OPAQUE-QUERY-SECRET" not in redacted
+        assert "OPAQUE-FRAGMENT-SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_escaped_url_delimiters(self) -> None:
+        message = r"provider failed: https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-SECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "provider failed: https://collector.example/callback?token=<redacted>"
+        assert "ENCODED-SECRET" not in redacted
 
     def test_redact_cloud_error_for_display_redacts_common_credential_aliases(self) -> None:
         message = (
