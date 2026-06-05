@@ -69,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
+- redact secret-bearing JAX/Orbax, JIT, PyTorch ZIP, and explicit model-network evidence before serializing findings
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - include content-routed renamed JFrog folder artifacts in selective downloads with fail-closed bounded probes
 - strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests

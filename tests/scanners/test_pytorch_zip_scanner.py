@@ -1492,6 +1492,63 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
 
 
+def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    secret = "SECRETKEY1234567890"
+    payload = f"""
+    def payload():
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
+        return eval("1 + 1")
+    """.encode()
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    serialized = result.to_json()
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert secret not in serialized
+    assert any(
+        check.details.get("code_snippet")
+        and 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in check.details["code_snippet"]
+        and 'eval("1 + 1")' in check.details["code_snippet"]
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_redacts_signed_urls_in_explicit_network_findings(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    token = "TOP_SECRET_QUERY"
+    signature = "SIGSECRET1234567890"
+    payload = f"callback = 'https://collector.example/upload?token={token}&X-Amz-Signature={signature}'\n"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/code/__torch__/payload.py", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    serialized = result.to_json()
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    explicit_failure = next(
+        check for check in network_failures if check.details.get("type") == "explicit_network_pattern"
+    )
+    assert token not in serialized
+    assert signature not in serialized
+    assert explicit_failure.details["matched_text"] == "https://collector.example/upload"
+    assert explicit_failure.message == "Explicit network pattern in ML model: https://collector.example/upload"
+
+
 @pytest.mark.parametrize(
     "payload",
     [

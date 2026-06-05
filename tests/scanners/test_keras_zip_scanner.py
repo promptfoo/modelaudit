@@ -569,12 +569,31 @@ class TestKerasZipScanner:
             findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
 
         assert len(findings) == 1
-        assert findings[0]["hdf5_path"] == "/long_group_n"
+        assert findings[0]["hdf5_path"] == "/long_grou..."
         assert findings[0]["hdf5_path_truncated"] is True
-        assert findings[0]["filename"] == "long_externa"
+        assert findings[0]["filename"] == "long_exte..."
         assert findings[0]["filename_truncated"] is True
-        assert findings[0]["path"] == "/long_extern"
+        assert findings[0]["path"] == "/long_ext..."
         assert findings[0]["path_truncated"] is True
+
+    def test_hdf5_reference_redaction_uses_the_evidence_bound(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Large HDF5 names must not receive unbounded redaction analysis."""
+        max_chars_values: list[int | None] = []
+
+        def capture_redaction(value: str, max_chars: int | None = 500) -> str:
+            max_chars_values.append(max_chars)
+            return value[: max_chars or len(value)]
+
+        monkeypatch.setattr(keras_zip_scanner_module, "redact_evidence_string", capture_redaction)
+
+        bounded, was_truncated = KerasZipScanner._bounded_hdf5_reference_text("x" * 100_000)
+
+        assert max_chars_values == [KerasZipScanner.MAX_HDF5_REFERENCE_TEXT_CHARS]
+        assert len(bounded) == KerasZipScanner.MAX_HDF5_REFERENCE_TEXT_CHARS
+        assert was_truncated is True
 
     def test_hdf5_external_reference_evidence_is_redacted(self, tmp_path: Path) -> None:
         """External-reference paths must not leak embedded credentials or tokens."""
@@ -780,7 +799,7 @@ class TestKerasZipScanner:
             findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
 
         assert len(findings) == 1
-        assert findings[0]["segments"][0]["filename"] == "long_externa"
+        assert findings[0]["segments"][0]["filename"] == "long_exte..."
         assert findings[0]["segments"][0]["filename_truncated"] is True
 
     @pytest.mark.parametrize(
