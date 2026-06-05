@@ -1043,10 +1043,14 @@ def test_scan_huggingface_url_passes_max_size_to_download(
     mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "--timeout", "7", "hf://test/model"],
+    )
 
     assert result.exit_code == 0
     assert mock_download.call_args.kwargs["max_size"] == 2048
+    assert mock_download.call_args.kwargs["timeout_seconds"] == 7
     mock_rmtree.assert_called()
 
 

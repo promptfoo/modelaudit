@@ -100,7 +100,8 @@ def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_by
         if match is None:
             raise ValueError("partial Hugging Face response omitted a valid Content-Range")
         end_offset, total_size = (int(value) for value in match.groups())
-        if end_offset + 1 != bytes_read or total_size < end_offset + 1:
+        expected_bytes = min(total_size, max_bytes)
+        if end_offset + 1 != bytes_read or total_size < end_offset + 1 or bytes_read != expected_bytes:
             raise ValueError("partial Hugging Face response reported an inconsistent Content-Range")
         return total_size
 
@@ -109,12 +110,11 @@ def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_by
         if content_length is not None:
             try:
                 total_size = int(content_length)
-            except ValueError:
-                pass
-            else:
-                if total_size >= bytes_read and bytes_read == min(total_size, max_bytes):
-                    return total_size
-                raise ValueError("Hugging Face response reported an inconsistent Content-Length")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Hugging Face response reported an invalid Content-Length") from exc
+            if total_size >= bytes_read and bytes_read == min(total_size, max_bytes):
+                return total_size
+            raise ValueError("Hugging Face response reported an inconsistent Content-Length")
 
     return None
 
@@ -609,6 +609,7 @@ def _detect_huggingface_content_route_format(
         return None
 
     from modelaudit.utils.file.detection import (
+        _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
         PROTO0_1_MAX_PROBE_BYTES,
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
@@ -684,8 +685,12 @@ def _detect_huggingface_content_route_format(
         max(len(prefix), 1),
         None,
     )
+    tflite_route_blocked = Path(filename).suffix.lower() in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS
+    if detected_format == "tflite" and tflite_route_blocked:
+        detected_format = "unknown"
     if (
         detected_format == "unknown"
+        and not tflite_route_blocked
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
     ):
         return "tflite"
@@ -1197,6 +1202,8 @@ def download_model(
     cache_dir: Path | None = None,
     show_progress: bool = True,
     max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
 ) -> Path:
     """Download a model from HuggingFace.
 
@@ -1205,6 +1212,7 @@ def download_model(
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
         max_size: Optional maximum total selected download size in bytes
+        timeout_seconds: Optional end-to-end acquisition deadline in seconds
 
     Returns:
         Path to the downloaded model directory
@@ -1254,6 +1262,7 @@ def download_model(
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
         size_limit = _normalize_download_size_limit(max_size)
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
         # Enable/disable progress bars based on parameter
         if not show_progress:
@@ -1264,7 +1273,12 @@ def download_model(
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files in the repository to identify model files
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+        listing_timeout = 30.0
+        if deadline is not None:
+            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+            if listing_timeout <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id, listing_timeout)
         if repo_files is None:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
@@ -1278,7 +1292,15 @@ def download_model(
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
-        model_files = _select_huggingface_model_files(repo_id, repo_files, repo_revision, model_extensions)
+        model_files = _select_huggingface_model_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_extensions,
+            deadline=deadline,
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)

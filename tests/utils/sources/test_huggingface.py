@@ -16,6 +16,7 @@ import pytest
 
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources.huggingface import (
+    _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
     download_file_from_hf,
@@ -1043,6 +1044,59 @@ class TestModelDownload:
         mock_requests_get.assert_called_once()
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_rejects_short_partial_response_with_content_range(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """A short 206 response cannot claim a larger remote file and suppress routing."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            b"\x81\xa6params\x81\xa1w\x91\x01",
+            headers={"Content-Range": "bytes 0-12/100000"},
+            status_code=206,
+        )
+
+        with pytest.raises(Exception, match="selective filtering incomplete"):
+            download_model("https://huggingface.co/test/model")
+
+        mock_requests_get.assert_called_once()
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.exe"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_preserves_tflite_blocked_suffix_guard(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote TFLite probes should match local blocked-suffix false-positive guards."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(b"\x08\x00\x00\x00TFL3" + b"\x00" * 16)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+
     @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_FILES", 1)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -1082,15 +1136,51 @@ class TestModelDownload:
     ) -> None:
         """Selective filtering should fail closed before aggregate remote probes grow unbounded."""
         mock_requests_get.return_value = _FakeRangeResponse(
-            b"{",
+            b"{" + (b" " * ((8 * 1024) - 1)),
             status_code=206,
-            headers={"Content-Range": "bytes 0-0/100000"},
+            headers={"Content-Range": "bytes 0-8191/100000"},
         )
 
         with pytest.raises(Exception, match="skipped file inspection byte limit exceeded"):
             download_model("https://huggingface.co/test/model")
 
         mock_requests_get.assert_called_once()
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_deadline_stops_content_probes(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_monotonic: MagicMock,
+    ) -> None:
+        """Non-streaming acquisition should stop before a probe exceeds the scan deadline."""
+
+        def expire_probe_budget(budget: _HuggingFaceProbeBudget, repo_id: str) -> float:
+            assert budget.deadline == 101.0
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+
+        with (
+            patch.object(
+                _HuggingFaceProbeBudget,
+                "request_timeout",
+                autospec=True,
+                side_effect=expire_probe_budget,
+            ),
+            pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"),
+        ):
+            download_model("https://huggingface.co/test/model", timeout_seconds=1)
+
+        mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
     @patch("huggingface_hub.HfApi.repo_info")

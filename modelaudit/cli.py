@@ -1333,6 +1333,7 @@ def _resolve_scan_source_for_path(
                 cache_dir=hf_cache_dir,
                 show_progress=show_progress,
                 max_size=runtime.max_download_bytes,
+                timeout_seconds=runtime.timeout,
             )
             download_duration = time.time() - download_start
             try:
