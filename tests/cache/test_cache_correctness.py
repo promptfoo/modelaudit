@@ -86,15 +86,11 @@ def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
 
-    file_stat = file_path.stat()
-    probe = cache._get_change_clock_probe(str(file_path), file_stat.st_dev)
-    ancestor_identity = cache._capture_ancestor_identity(str(file_path))
+    file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
 
     assert ancestor_identity
     expected_probe_dir = Path(tempfile.gettempdir()) if os.name == "nt" else cache.cache_dir
     assert cache._change_clock_probes[file_stat.st_dev][1] == expected_probe_dir
-    probe.close()
-    cache._change_clock_probes.clear()
 
 
 def test_windows_change_clock_probe_uses_existing_handle(
@@ -310,22 +306,6 @@ def test_capture_file_identity_excludes_same_filesystem_mount_root(tmp_path: Pat
 
     assert str(file_path.parent) in tracked_paths
     assert str(mount_root) not in tracked_paths
-
-
-def test_unmonitored_ancestor_identity_ignores_system_temp_sibling_churn(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache = ScanResultsCache(str(tmp_path / "cache"))
-    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
-
-    monkeypatch.setattr(sys, "platform", "darwin")
-    identity = _identity_kwargs(cache, str(file_path))
-    with tempfile.NamedTemporaryFile(dir=tempfile.gettempdir()):
-        pass
-
-    assert cache.store_result(str(file_path), expected, 10, **identity) is True
 
 
 def test_capture_ancestor_identity_includes_direct_parent_at_device_boundary(

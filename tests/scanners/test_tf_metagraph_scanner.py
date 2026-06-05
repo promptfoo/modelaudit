@@ -646,6 +646,20 @@ def test_redact_metagraph_evidence_redacts_encoded_url_authority() -> None:
     assert redacted == f"curl https://{REDACTED_EVIDENCE_VALUE}"
 
 
+def test_redact_metagraph_evidence_redacts_oversized_authority_before_encoded_path() -> None:
+    encoded_authority = "A" * 119
+    encoded_path = "B" * 120
+
+    redacted = _redact_metagraph_evidence(
+        f"curl https://{encoded_authority}/{encoded_path}/path",
+        max_chars=200,
+    )
+
+    assert encoded_authority not in redacted
+    assert encoded_path not in redacted
+    assert redacted == f"curl https://{REDACTED_EVIDENCE_VALUE}"
+
+
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
     public_url = "https://example.com/p.sh?variant=public"
     public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"
