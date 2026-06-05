@@ -138,6 +138,7 @@ class AssetModel(BaseModel, DictCompatMixin):
     path: str = Field(..., description="Path to the asset")
     type: str = Field(..., description="Type of asset (e.g., 'pickle')")
     size: int | None = Field(None, description="Size of the asset in bytes")
+    is_streamed: bool | None = Field(None, description="Whether the asset came from an ephemeral streaming scan")
     tensors: list[str] | None = Field(None, description="List of tensor names (for safetensors)")
     keys: list[str] | None = Field(None, description="List of keys (for JSON manifests)")
     contents: list[dict[str, Any]] | None = Field(None, description="Contents list (for ZIP files)")
