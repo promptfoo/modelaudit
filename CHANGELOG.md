@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- validate OCI layer member and link metadata while preserving valid container-root symlinks
 - omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
 - block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
 - add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets

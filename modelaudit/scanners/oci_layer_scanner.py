@@ -2,6 +2,7 @@
 
 import json
 import os
+import posixpath
 import shutil
 import tarfile
 import tempfile
@@ -171,18 +172,6 @@ class OciLayerScanner(BaseScanner):
                 )
                 return None
 
-            if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
-                result.add_check(
-                    name="Symlink Safety Validation",
-                    passed=False,
-                    message=f"Layer link {name} points to critical system path: {target}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{manifest_path}:{layer_ref}:{name}",
-                    details=details,
-                    rule_code="S408",
-                )
-                return None
-
             result.add_check(
                 name="Symlink Safety Validation",
                 passed=True,
@@ -205,6 +194,11 @@ class OciLayerScanner(BaseScanner):
     ) -> tuple[str, bool]:
         if not is_symlink:
             return sanitize_archive_path(target, extraction_root)
+        if target.startswith("/") and not target.startswith("//"):
+            # OCI layers describe a container root filesystem. A POSIX-absolute
+            # symlink therefore targets that root, not the extraction host.
+            container_relative_target = posixpath.normpath(target).lstrip("/")
+            return sanitize_archive_path(container_relative_target, extraction_root)
         if is_absolute_archive_path(target):
             return target, False
 

@@ -1101,15 +1101,35 @@ class TestOciLayerScanner:
         checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
         assert checks[0].details["member"] == "../../payload.pkl"
 
+        cache_dir = tmp_path / "traversal-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert determine_exit_code(aggregate) == 1
+            assert any(
+                issue.message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
+                for issue in aggregate.issues
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_scan_layer_reports_unsafe_link_metadata(self, tmp_path: Path) -> None:
-        """Unsafe symlink/hardlink targets should be reported from layer metadata."""
+        """Host-absolute symlink targets should be reported from layer metadata."""
         layer_path = tmp_path / "unsafe-link.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
-            link_info = tarfile.TarInfo("links/passwd")
+            link_info = tarfile.TarInfo("links/system")
             link_info.type = tarfile.SYMTYPE
-            link_info.linkname = "/etc/passwd"
+            link_info.linkname = "C:\\Windows\\System32\\config\\SAM"
             tar.addfile(link_info)
 
         manifest_path = tmp_path / "unsafe-link.manifest"
@@ -1121,7 +1141,47 @@ class TestOciLayerScanner:
         checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.CRITICAL
-        assert checks[0].details["target"] == "/etc/passwd"
+        assert checks[0].details["target"] == "C:\\Windows\\System32\\config\\SAM"
+
+    def test_scan_layer_allows_posix_absolute_symlink_within_container_root(self, tmp_path: Path) -> None:
+        """OCI rootfs symlinks may use ordinary POSIX-absolute container paths."""
+        layer_path = tmp_path / "absolute-container-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("bin/sh")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "/bin/dash"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "absolute-container-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["absolute-container-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].status.value == "passed"
+        assert checks[0].details["target"] == "/bin/dash"
+
+    def test_scan_layer_reports_absolute_hardlink_target(self, tmp_path: Path) -> None:
+        """Hardlink targets remain archive-root relative and must not be absolute."""
+        layer_path = tmp_path / "absolute-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("bin/tool")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "/bin/target"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "absolute-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["absolute-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "/bin/target"
 
     def test_scan_layer_allows_safe_link_metadata(self, tmp_path: Path) -> None:
         """Benign relative link metadata should remain clean."""
