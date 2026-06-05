@@ -425,19 +425,30 @@ class TextScanner(BaseScanner):
         current_line_prefix = payload[line_start:position]
         if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
             return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
         previous_line_end = line_start - 1
-        previous_line_start = max(
-            payload.rfind(b"\n", 0, previous_line_end) + 1,
-            previous_line_end - MAX_TEXT_FINDING_CONTEXT_BYTES,
-        )
-        previous_line = payload[previous_line_start:previous_line_end].rstrip()
-        if not previous_line.endswith(b"\\"):
-            return False
-        stripped = previous_line.lstrip()
-        return not cls._documentation_shell_comment_before_position(previous_line, len(previous_line)) and (
-            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
-            or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
-        )
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].rstrip()
+            if not previous_line.endswith(b"\\"):
+                return False
+            if cls._documentation_shell_comment_before_position(previous_line, len(previous_line)):
+                return False
+
+            stripped = previous_line.lstrip()
+            if (
+                DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+                or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            ):
+                return True
+            if previous_line_start == context_start:
+                return context_start > 0
+            previous_line_end = previous_line_start - 1
+        return False
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
