@@ -3,13 +3,13 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import tempfile
 import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 
 import click
@@ -250,34 +250,6 @@ def _safe_destination_path(dest_dir: Path, relative_path: Path) -> Path:
     return dest_file
 
 
-def _supports_secure_dir_fd_open() -> bool:
-    return (
-        hasattr(os, "O_NOFOLLOW")
-        and hasattr(os, "O_DIRECTORY")
-        and os.open in os.supports_dir_fd
-        and os.mkdir in os.supports_dir_fd
-    )
-
-
-def _append_owned_fd(directory_fds: list[int], fd: int) -> None:
-    try:
-        directory_fds.append(fd)
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-@contextmanager
-def _open_binary_fd(fd: int) -> Iterator[BinaryIO]:
-    try:
-        handle = os.fdopen(fd, "wb")
-    except BaseException:
-        os.close(fd)
-        raise
-    with handle:
-        yield handle
-
-
 def _artifact_format(
     url: str,
     model_extensions: set[str],
@@ -333,45 +305,6 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
     raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
 
 
-@contextmanager
-def _open_destination_file(dest_dir: Path, relative_path: Path) -> Iterator[BinaryIO]:
-    """Open an artifact without following replaceable symlink path components."""
-    dest_file = _safe_destination_path(dest_dir, relative_path)
-    if not _supports_secure_dir_fd_open():
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        dest_file = _safe_destination_path(dest_dir, relative_path)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(dest_file, flags, 0o600)
-        with _open_binary_fd(fd) as handle:
-            yield handle
-        return
-
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    directory_fds: list[int] = []
-    _append_owned_fd(directory_fds, os.open(dest_dir.resolve(), directory_flags))
-    try:
-        for part in relative_path.parent.parts:
-            parent_fd = directory_fds[-1]
-            try:
-                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-            except FileNotFoundError:
-                with suppress(FileExistsError):
-                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
-                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-            _append_owned_fd(directory_fds, child_fd)
-
-        fd = os.open(relative_path.name, file_flags, 0o600, dir_fd=directory_fds[-1])
-        with _open_binary_fd(fd) as handle:
-            yield handle
-    finally:
-        for directory_fd in reversed(directory_fds):
-            with suppress(OSError):
-                os.close(directory_fd)
-
-
 def is_pytorch_hub_url(url: str) -> bool:
     """Return True if the URL points to a PyTorch Hub model page."""
     return bool(re.match(_PYTORCH_HUB_PATTERN, url, re.IGNORECASE))
@@ -393,9 +326,9 @@ def _extract_weight_urls(html: str) -> list[str]:
         for candidate in candidates:
             decoded_candidate = candidate if entity_decoded else html_lib.unescape(candidate)
             url = urldefrag(decoded_candidate).url
-            parsed_url = urlsplit(url)
-            url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
             if _is_supported_model_url(url, model_extensions):
+                parsed_url = urlsplit(url)
+                url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
                 if url not in seen:
                     weight_urls.append(url)
                     seen.add(url)
@@ -428,11 +361,14 @@ def _get_total_size(urls: list[str]) -> int:
                     if status_code in _REDIRECT_STATUS_CODES:
                         current_url = _artifact_redirect_url(current_url, response)
                         continue
-                    if response.ok and status_code == 200 and "content-length" in response.headers:
-                        total += int(response.headers["content-length"])
+                    if response.ok and status_code == 200:
+                        content_length = _response_content_length(response)
+                        if content_length is not None:
+                            total += content_length
                     break
                 finally:
-                    response.close()
+                    with suppress(Exception):
+                        response.close()
             else:
                 raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
         except Exception:
@@ -440,7 +376,271 @@ def _get_total_size(urls: list[str]) -> int:
     return total
 
 
-def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
+def _format_size(size_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    absolute_size = abs(size_bytes)
+    for index, unit in enumerate(units):
+        divisor = 1024**index
+        if absolute_size < divisor * 1024:
+            return f"{size_bytes / divisor:.1f} {unit}"
+    return f"{size_bytes} B"
+
+
+def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
+    if max_size is not None and max_size > 0 and size_bytes > max_size:
+        raise ValueError(
+            f"PyTorch Hub model size ({_format_size(size_bytes)}) "
+            f"exceeds maximum allowed size ({_format_size(max_size)})"
+        )
+
+
+def _response_content_length(response: requests.Response) -> int | None:
+    try:
+        content_length = response.headers.get("content-length")
+        parsed_length = int(content_length) if content_length is not None else None
+        return parsed_length if parsed_length is not None and parsed_length >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _path_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _remove_path_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _prepare_destination_parent(
+    dest_dir: Path,
+    relative_path: Path,
+    created_dirs: list[Path] | None = None,
+) -> Path:
+    """Create a destination parent without accepting symlinked path components."""
+    current_dir = dest_dir
+    for part in relative_path.parent.parts:
+        current_dir /= part
+        try:
+            current_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        else:
+            if created_dirs is not None:
+                created_dirs.append(current_dir)
+        if current_dir.is_symlink():
+            raise ValueError(f"Unsafe PyTorch Hub cache path: {relative_path.as_posix()}")
+        if not current_dir.is_dir():
+            raise NotADirectoryError(f"PyTorch Hub cache parent is not a directory: {current_dir}")
+    return _safe_destination_path(dest_dir, relative_path)
+
+
+def _supports_secure_cache_commit() -> bool:
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+        and os.rmdir in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
+def _open_cache_parent_fd(
+    root_fd: int,
+    relative_path: Path,
+    opened_fds: list[int],
+    created_dirs: list[tuple[int, str]],
+) -> int:
+    """Pin a cache parent directory without following replaceable symlinks."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = root_fd
+    for part in relative_path.parent.parts:
+        try:
+            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                created_dirs.append((parent_fd, part))
+            except FileExistsError:
+                pass
+            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+        opened_fds.append(child_fd)
+        parent_fd = child_fd
+    return parent_fd
+
+
+def _path_entry_exists_at(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _remove_path_entry_at(parent_fd: int, name: str) -> None:
+    with suppress(FileNotFoundError):
+        os.unlink(name, dir_fd=parent_fd)
+
+
+def _commit_staged_weight_files_secure(
+    artifacts: list[tuple[str, Path]],
+    files_dir: Path,
+    backup_dir: Path,
+    dest_dir: Path,
+) -> None:
+    """Commit staged files through pinned cache directories."""
+    committed: list[tuple[int, str, Path, bool]] = []
+    opened_fds: list[int] = []
+    created_dirs: list[tuple[int, str]] = []
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root_fd = os.open(dest_dir, directory_flags)
+        opened_fds.append(root_fd)
+        for _, relative_path in artifacts:
+            staged_file = _safe_destination_path(files_dir, relative_path)
+            backup_file = _safe_destination_path(backup_dir, relative_path)
+            backup_file.parent.mkdir(parents=True, exist_ok=True)
+            parent_fd = _open_cache_parent_fd(root_fd, relative_path, opened_fds, created_dirs)
+            filename = relative_path.name
+            try:
+                destination_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                had_existing_entry = False
+            else:
+                had_existing_entry = True
+                if stat.S_ISDIR(destination_stat.st_mode):
+                    raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_dir / relative_path}")
+
+            committed.append((parent_fd, filename, backup_file, had_existing_entry))
+            if had_existing_entry:
+                os.rename(filename, backup_file, src_dir_fd=parent_fd)
+            os.rename(staged_file, filename, dst_dir_fd=parent_fd)
+    except BaseException as commit_error:
+        rollback_errors: list[BaseException] = []
+        for parent_fd, filename, backup_file, had_existing_entry in reversed(committed):
+            try:
+                if had_existing_entry:
+                    if _path_entry_exists(backup_file):
+                        _remove_path_entry_at(parent_fd, filename)
+                        os.rename(backup_file, filename, dst_dir_fd=parent_fd)
+                else:
+                    _remove_path_entry_at(parent_fd, filename)
+            except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                rollback_errors.append(rollback_error)
+        for parent_fd, name in reversed(created_dirs):
+            with suppress(OSError):
+                os.rmdir(name, dir_fd=parent_fd)
+        if rollback_errors:
+            raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
+        raise
+    finally:
+        for fd in reversed(opened_fds):
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _commit_staged_weight_files_path(
+    artifacts: list[tuple[str, Path]],
+    files_dir: Path,
+    backup_dir: Path,
+    dest_dir: Path,
+) -> None:
+    """Install all staged weights or restore the original cache entries."""
+    committed: list[tuple[Path, Path, bool]] = []
+    created_dirs: list[Path] = []
+    try:
+        for _, relative_path in artifacts:
+            staged_file = _safe_destination_path(files_dir, relative_path)
+            dest_file = _prepare_destination_parent(dest_dir, relative_path, created_dirs)
+            backup_file = _safe_destination_path(backup_dir, relative_path)
+            backup_file.parent.mkdir(parents=True, exist_ok=True)
+            had_existing_entry = _path_entry_exists(dest_file)
+            if dest_file.is_dir() and not dest_file.is_symlink():
+                raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_file}")
+            committed.append((dest_file, backup_file, had_existing_entry))
+            if had_existing_entry:
+                dest_file.replace(backup_file)
+            staged_file.replace(dest_file)
+    except BaseException as commit_error:
+        rollback_errors: list[BaseException] = []
+        for dest_file, backup_file, had_existing_entry in reversed(committed):
+            try:
+                if had_existing_entry:
+                    if _path_entry_exists(backup_file):
+                        _remove_path_entry(dest_file)
+                        backup_file.replace(dest_file)
+                else:
+                    _remove_path_entry(dest_file)
+            except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                rollback_errors.append(rollback_error)
+        for created_dir in reversed(created_dirs):
+            with suppress(OSError):
+                created_dir.rmdir()
+        if rollback_errors:
+            raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
+        raise
+
+
+def _commit_staged_weight_files(
+    artifacts: list[tuple[str, Path]],
+    files_dir: Path,
+    backup_dir: Path,
+    dest_dir: Path,
+) -> None:
+    if _supports_secure_cache_commit():
+        _commit_staged_weight_files_secure(artifacts, files_dir, backup_dir, dest_dir)
+    else:
+        _commit_staged_weight_files_path(artifacts, files_dir, backup_dir, dest_dir)
+
+
+def _download_weight_file(
+    weight_url: str,
+    dest_file: Path,
+    downloaded_size: int,
+    max_size: int | None,
+) -> int:
+    """Download one weight file atomically and return the cumulative byte count."""
+    partial_file: Path | None = None
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _open_trusted_artifact_response(weight_url) as response:
+            content_length = _response_content_length(response)
+            if content_length is not None:
+                _enforce_max_size(downloaded_size + content_length, max_size)
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{dest_file.name}.",
+                suffix=".part",
+                dir=dest_file.parent,
+                delete=False,
+            ) as handle:
+                partial_file = Path(handle.name)
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        _enforce_max_size(downloaded_size + len(chunk), max_size)
+                        handle.write(chunk)
+                        downloaded_size += len(chunk)
+
+        partial_file.replace(dest_file)
+        return downloaded_size
+    finally:
+        if partial_file is not None:
+            with suppress(OSError):
+                partial_file.unlink()
+
+
+def download_pytorch_hub_model(
+    url: str,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
+) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")
@@ -457,40 +657,73 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
 
     dest_dir = cache_dir or Path(tempfile.mkdtemp(prefix="modelaudit_pth_"))
     dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
+    artifacts = _artifact_download_paths(weight_urls)
+    for _, relative_path in artifacts:
+        _safe_destination_path(dest_root, relative_path)
 
-    total_size = _get_total_size(weight_urls)
-    if total_size > 0:
-        has_space, message = check_disk_space(dest_dir, total_size)
-        if not has_space:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Cannot download model from {url}: {message}")
+    try:
+        total_size = _get_total_size(weight_urls)
+        if total_size > 0:
+            _enforce_max_size(total_size, max_size)
+            has_space, message = check_disk_space(dest_root, total_size)
+            if not has_space:
+                raise Exception(f"Cannot download model from {url}: {message}")
+    except BaseException:
+        if cache_dir is None:
+            shutil.rmtree(dest_root, ignore_errors=True)
+        raise
 
-    for weight_url, relative_path in _artifact_download_paths(weight_urls):
+    staging_dir: Path | None = None
+    files_dir = dest_root
+    backup_dir: Path | None = None
+    if cache_dir is not None:
         try:
-            _safe_destination_path(dest_dir, relative_path)
-            with (
-                _open_trusted_artifact_response(weight_url) as resp,
-                _open_destination_file(dest_dir, relative_path) as f,
-            ):
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        except ValueError:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
+            staging_dir = Path(tempfile.mkdtemp(prefix=".modelaudit_pth_stage_", dir=dest_root)).resolve()
+            files_dir = staging_dir / "files"
+            backup_dir = staging_dir / "backups"
+            files_dir.mkdir()
+            backup_dir.mkdir()
+        except BaseException:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
             raise
-        except Exception as e:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(
-                f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"
-            ) from e
 
-    return dest_dir
+    try:
+        downloaded_size = 0
+        for weight_url, relative_path in artifacts:
+            try:
+                downloaded_size = _download_weight_file(
+                    weight_url,
+                    _safe_destination_path(files_dir, relative_path),
+                    downloaded_size,
+                    max_size,
+                )
+            except ValueError:
+                raise
+            except Exception as error:
+                raise Exception(
+                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(error)}"
+                ) from error
+
+        if staging_dir is not None and backup_dir is not None:
+            _commit_staged_weight_files(artifacts, files_dir, backup_dir, dest_root)
+    except BaseException:
+        if cache_dir is None:
+            shutil.rmtree(dest_root, ignore_errors=True)
+        raise
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    return dest_root
 
 
-def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -> Iterator[tuple[Path, bool]]:
+def download_pytorch_hub_model_streaming(
+    url: str,
+    show_progress: bool = True,
+    max_size: int | None = None,
+) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
 
@@ -499,6 +732,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
     Args:
         url: PyTorch Hub model page URL
         show_progress: Whether to show progress messages
+        max_size: Maximum total download size in bytes
 
     Yields:
         Tuples of (file_path, is_last) for each weight file
@@ -519,12 +753,18 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
+    total_size = _get_total_size(weight_urls)
+    if total_size > 0:
+        _enforce_max_size(total_size, max_size)
+
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))
 
     try:
-        total_files = len(weight_urls)
-        for i, (weight_url, relative_path) in enumerate(_artifact_download_paths(weight_urls)):
+        artifacts = _artifact_download_paths(weight_urls)
+        total_files = len(artifacts)
+        downloaded_size = 0
+        for i, (weight_url, relative_path) in enumerate(artifacts):
             is_last = i == total_files - 1
             dest_file = _safe_destination_path(temp_dir, relative_path)
 
@@ -532,13 +772,9 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
                 click.echo(f"⬇️  Downloading {relative_path.as_posix()}")
 
             try:
-                with (
-                    _open_trusted_artifact_response(weight_url) as resp,
-                    _open_destination_file(temp_dir, relative_path) as f,
-                ):
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
+            except ValueError:
+                raise
             except Exception as e:
                 raise Exception(
                     f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"

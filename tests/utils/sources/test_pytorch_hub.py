@@ -1,7 +1,5 @@
 import os
-from contextlib import suppress
 from pathlib import Path
-from typing import BinaryIO
 from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
@@ -9,14 +7,12 @@ import pytest
 import requests
 
 from modelaudit.utils.sources.pytorch_hub import (
-    _append_owned_fd,
     _artifact_download_paths,
+    _commit_staged_weight_files_secure,
     _extract_weight_urls,
     _get_total_size,
-    _open_binary_fd,
-    _open_destination_file,
     _open_trusted_artifact_response,
-    _safe_destination_path,
+    _supports_secure_cache_commit,
     download_pytorch_hub_model,
     download_pytorch_hub_model_streaming,
     is_pytorch_hub_url,
@@ -24,7 +20,7 @@ from modelaudit.utils.sources.pytorch_hub import (
 
 
 class TestPytorchHubURLDetection:
-    def test_valid_urls(self):
+    def test_valid_urls(self) -> None:
         valid = [
             "https://pytorch.org/hub/pytorch_vision_resnet/",
             "https://pytorch.org/hub/ultralytics_yolov5/",
@@ -33,7 +29,7 @@ class TestPytorchHubURLDetection:
         for url in valid:
             assert is_pytorch_hub_url(url)
 
-    def test_invalid_urls(self):
+    def test_invalid_urls(self) -> None:
         invalid = [
             "https://example.com/model",
             "pytorch.org/hub/model",  # missing scheme
@@ -57,6 +53,8 @@ def test_download_pytorch_hub_model_success(
     html_resp.raise_for_status = lambda: None
     file_resp = MagicMock()
     file_resp.__enter__.return_value = file_resp
+    file_resp.status_code = 200
+    file_resp.headers = {"content-length": "3"}
     file_resp.iter_content.return_value = [b"abc"]
     file_resp.raise_for_status = lambda: None
     mock_get.side_effect = [html_resp, file_resp]
@@ -415,6 +413,7 @@ def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basenam
     html_resp.text = (
         '<a href="https://download.pytorch.org/models/foo/model.onnx">foo</a>'
         '<a href="https://download.pytorch.org/models/bar/model.onnx">bar</a>'
+        '<a href="https://download.pytorch.org/models/backups/model.onnx">backup</a>'
     )
     html_resp.raise_for_status = lambda: None
     foo_resp = MagicMock()
@@ -425,13 +424,21 @@ def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basenam
     bar_resp.__enter__.return_value = bar_resp
     bar_resp.iter_content.return_value = [b"bar"]
     bar_resp.raise_for_status = lambda: None
-    mock_get.side_effect = [html_resp, foo_resp, bar_resp]
+    backup_resp = MagicMock()
+    backup_resp.__enter__.return_value = backup_resp
+    backup_resp.iter_content.return_value = [b"backup"]
+    backup_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, foo_resp, bar_resp, backup_resp]
 
     head_resp = MagicMock()
     head_resp.ok = True
     head_resp.headers = {"content-length": "3"}
     mock_head.return_value = head_resp
     mock_check.return_value = (True, "ok")
+
+    for parent in (tmp_path / "foo", tmp_path / "bar", tmp_path / "backups"):
+        parent.mkdir()
+        (parent / "model.onnx").write_bytes(b"old")
 
     download_pytorch_hub_model(
         "https://pytorch.org/hub/pytorch_vision_resnet/",
@@ -440,6 +447,7 @@ def test_download_pytorch_hub_model_preserves_nested_artifacts_with_same_basenam
 
     assert (tmp_path / "foo" / "model.onnx").read_bytes() == b"foo"
     assert (tmp_path / "bar" / "model.onnx").read_bytes() == b"bar"
+    assert (tmp_path / "backups" / "model.onnx").read_bytes() == b"backup"
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
@@ -527,12 +535,566 @@ def test_download_pytorch_hub_model_rejects_symlinked_cache_parent(
     mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
 
 
-def test_download_pytorch_hub_model_invalid_url():
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_known_total_over_max_size(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    mock_get.return_value = html_resp
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": "4"}
+    mock_head.return_value = head_resp
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=3,
+        )
+
+    mock_check.assert_not_called()
+    mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
+    assert not (tmp_path / "resnet50.pth").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    mock_get.return_value = html_resp
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": "4"}
+    mock_head.return_value = head_resp
+
+    temp_dir = tmp_path / "modelaudit_pth_test"
+    mock_mkdtemp.return_value = str(temp_dir)
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            max_size=3,
+        )
+
+    mock_check.assert_not_called()
+    assert not temp_dir.exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=4,
+        )
+
+    assert not (tmp_path / "resnet50.pth").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    tmp_path: Path,
+) -> None:
+    first_url = "https://download.pytorch.org/models/first.pth"
+    second_url = "https://download.pytorch.org/models/second.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+
+    first_resp = MagicMock()
+    first_resp.__enter__.return_value = first_resp
+    first_resp.headers = {"content-length": "3"}
+    first_resp.iter_content.return_value = [b"new"]
+    first_resp.raise_for_status = lambda: None
+    second_resp = MagicMock()
+    second_resp.__enter__.return_value = second_resp
+    second_resp.headers = {"content-length": "3"}
+    second_resp.iter_content.return_value = [b"two"]
+    second_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, first_resp, second_resp]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    first_cache = tmp_path / "first.pth"
+    second_cache = tmp_path / "second.pth"
+    first_cache.write_bytes(b"old-first")
+    second_cache.write_bytes(b"old-second")
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=5,
+        )
+
+    assert first_cache.read_bytes() == b"old-first"
+    assert second_cache.read_bytes() == b"old-second"
+    assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+@pytest.mark.parametrize(
+    "commit_error",
+    [OSError("simulated second-file commit failure"), KeyboardInterrupt("simulated commit interruption")],
+)
+def test_download_pytorch_hub_model_rolls_back_cache_on_commit_failure(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    commit_error: BaseException,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_url = "https://download.pytorch.org/models/nested/first.pth"
+    second_url = "https://download.pytorch.org/models/nested/second.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+
+    file_responses = []
+    for payload in (b"new-first", b"new-second"):
+        file_resp = MagicMock()
+        file_resp.__enter__.return_value = file_resp
+        file_resp.headers = {}
+        file_resp.iter_content.return_value = [payload]
+        file_resp.raise_for_status = lambda: None
+        file_responses.append(file_resp)
+    mock_get.side_effect = [html_resp, *file_responses]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    first_cache = tmp_path / "nested" / "first.pth"
+    second_cache = tmp_path / "nested" / "second.pth"
+    first_cache.parent.mkdir()
+    first_cache.write_bytes(b"old-first")
+    second_cache.write_bytes(b"old-second")
+
+    original_replace = Path.replace
+
+    def _fail_second_commit(path: Path, target: Path) -> Path:
+        target_path = Path(target)
+        if (
+            path.name == "second.pth"
+            and path.parents[1].name == "files"
+            and path.parents[2].name.startswith(".modelaudit_pth_stage_")
+            and target_path == second_cache
+        ):
+            raise commit_error
+        return original_replace(path, target_path)
+
+    monkeypatch.setattr(Path, "replace", _fail_second_commit)
+    monkeypatch.setattr(
+        "modelaudit.utils.sources.pytorch_hub._supports_secure_cache_commit",
+        lambda: False,
+    )
+
+    with pytest.raises(type(commit_error)):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=100,
+        )
+
+    assert first_cache.read_bytes() == b"old-first"
+    assert second_cache.read_bytes() == b"old-second"
+    assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
+
+
+def test_secure_cache_commit_rolls_back_nested_files_on_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    if not _supports_secure_cache_commit():
+        pytest.skip("secure directory-descriptor cache commits are unavailable")
+
+    relative_paths = [Path("nested/first.pth"), Path("nested/second.pth")]
+    artifacts = [(f"https://download.pytorch.org/models/{path.as_posix()}", path) for path in relative_paths]
+    files_dir = tmp_path / "stage" / "files"
+    backup_dir = tmp_path / "stage" / "backups"
+    dest_dir = tmp_path / "cache"
+    for root in (files_dir, dest_dir):
+        (root / "nested").mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+    for path in relative_paths:
+        (files_dir / path).write_bytes(f"new-{path.stem}".encode())
+        (dest_dir / path).write_bytes(f"old-{path.stem}".encode())
+
+    original_rename = os.rename
+
+    def interrupt_second_install(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if Path(source) == files_dir / relative_paths[1] and destination == relative_paths[1].name:
+            raise KeyboardInterrupt("simulated commit interruption")
+        original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "rename", interrupt_second_install)
+
+    with pytest.raises(KeyboardInterrupt, match="simulated commit interruption"):
+        _commit_staged_weight_files_secure(artifacts, files_dir, backup_dir, dest_dir)
+
+    assert (dest_dir / relative_paths[0]).read_bytes() == b"old-first"
+    assert (dest_dir / relative_paths[1]).read_bytes() == b"old-second"
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_replaces_cache_hardlink_atomically(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">weight</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock(status_code=200, headers={"content-length": "3"})
+    file_resp.__enter__.return_value = file_resp
+    file_resp.iter_content.return_value = [b"new"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "3"})
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    outside_file = tmp_path / "outside.pth"
+    outside_file.write_bytes(b"old")
+    cached_file = tmp_path / "model.pth"
+    try:
+        cached_file.hardlink_to(outside_file)
+    except OSError as exc:  # pragma: no cover - depends on host hardlink support
+        pytest.skip(f"hardlinks unavailable: {exc}")
+
+    download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert cached_file.read_bytes() == b"new"
+    assert outside_file.read_bytes() == b"old"
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_pins_symlinked_cache_root(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">weight</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock(status_code=200, headers={"content-length": "3"})
+    file_resp.__enter__.return_value = file_resp
+    file_resp.iter_content.return_value = [b"new"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "3"})
+    mock_head.return_value = head_resp
+
+    real_cache = tmp_path / "real-cache"
+    outside_cache = tmp_path / "outside-cache"
+    cache_link = tmp_path / "cache-link"
+    real_cache.mkdir()
+    outside_cache.mkdir()
+    try:
+        cache_link.symlink_to(real_cache, target_is_directory=True)
+    except OSError as exc:  # pragma: no cover - depends on host symlink support
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    def swap_cache_link(path: Path, required_bytes: int) -> tuple[bool, str]:
+        assert path == real_cache
+        assert required_bytes == 3
+        cache_link.unlink()
+        cache_link.symlink_to(outside_cache, target_is_directory=True)
+        return True, "ok"
+
+    mock_check.side_effect = swap_cache_link
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=cache_link,
+    )
+
+    assert result == real_cache
+    assert (real_cache / "model.pth").read_bytes() == b"new"
+    assert not (outside_cache / "model.pth").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_allows_exact_cumulative_limit(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    urls = [
+        "https://download.pytorch.org/models/first.pth",
+        "https://download.pytorch.org/models/second.pth",
+    ]
+    html_resp = MagicMock()
+    html_resp.text = "".join(f'<a href="{url}">weight</a>' for url in urls)
+    html_resp.raise_for_status = lambda: None
+
+    file_responses = []
+    for payload in (b"one", b"two"):
+        file_resp = MagicMock()
+        file_resp.__enter__.return_value = file_resp
+        file_resp.headers = {"content-length": "3"}
+        file_resp.iter_content.return_value = [payload]
+        file_resp.raise_for_status = lambda: None
+        file_responses.append(file_resp)
+    mock_get.side_effect = [html_resp, *file_responses]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+        max_size=6,
+    )
+
+    assert result == tmp_path
+    assert (tmp_path / "first.pth").read_bytes() == b"one"
+    assert (tmp_path / "second.pth").read_bytes() == b"two"
+    assert mock_head.call_count == 2
+    assert all(call.kwargs["allow_redirects"] is False for call in mock_head.call_args_list)
+    assert head_resp.close.call_count == 2
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_handles_huge_advertised_size(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    mock_get.return_value = html_resp
+
+    head_resp = MagicMock()
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": str(10**400)}
+    mock_head.return_value = head_resp
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=3,
+        )
+
+    mock_check.assert_not_called()
+    mock_get.assert_called_once_with("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10)
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_preserves_existing_cache_file_after_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {}
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    cached_file = tmp_path / "resnet50.pth"
+    cached_file.write_bytes(b"trusted-cache")
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=4,
+        )
+
+    assert cached_file.read_bytes() == b"trusted-cache"
+    assert not list(tmp_path.glob(".*.part"))
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_does_not_follow_existing_cache_symlink(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
+    file_resp.iter_content.return_value = [b"abc"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.status_code = 200
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    outside_file = tmp_path / "outside.pth"
+    outside_file.write_bytes(b"trusted-cache")
+    cached_file = tmp_path / "resnet50.pth"
+    try:
+        cached_file.symlink_to(outside_file)
+    except OSError as exc:  # pragma: no cover - depends on host symlink support
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert outside_file.read_bytes() == b"trusted-cache"
+    assert not cached_file.is_symlink()
+    assert cached_file.read_bytes() == b"abc"
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_enforces_max_size_and_cleans_temp_dir(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    temp_dir = tmp_path / "modelaudit_pth_stream_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        list(
+            download_pytorch_hub_model_streaming(
+                "https://pytorch.org/hub/pytorch_vision_resnet/",
+                show_progress=False,
+                max_size=4,
+            )
+        )
+
+    assert not temp_dir.exists()
+
+
+def test_extract_weight_urls_deduplicates_repeated_links() -> None:
+    url = "https://download.pytorch.org/models/resnet50.pth"
+    assert _extract_weight_urls(f'<a href="{url}">first</a><a href="{url}">second</a>') == [url]
+
+
+def test_download_pytorch_hub_model_invalid_url() -> None:
     with pytest.raises(ValueError):
         download_pytorch_hub_model("https://example.com/model")
 
 
-def test_extract_weight_urls_multi_part_extensions():
+def test_extract_weight_urls_multi_part_extensions() -> None:
     html = (
         '<a href="https://download.pytorch.org/models/resnet50.pth.tar.gz">gz</a>'
         '<a href="https://download.pytorch.org/models/resnet50.pth.zip">zip</a>'
@@ -733,100 +1295,3 @@ def test_download_pytorch_hub_model_streaming_preserves_nested_non_pt_artifact(
     with pytest.raises(StopIteration):
         next(downloads)
     assert not dest_file.exists()
-
-
-def test_open_destination_file_rechecks_parent_after_validation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cache_dir = tmp_path / "cache"
-    nested_dir = cache_dir / "nested"
-    outside_dir = tmp_path / "outside"
-    nested_dir.mkdir(parents=True)
-    outside_dir.mkdir()
-    original_safe_destination = _safe_destination_path
-    swapped = False
-
-    def swap_parent_after_validation(dest_dir: Path, relative_path: Path) -> Path:
-        nonlocal swapped
-        dest_file = original_safe_destination(dest_dir, relative_path)
-        if not swapped:
-            nested_dir.rmdir()
-            try:
-                nested_dir.symlink_to(outside_dir, target_is_directory=True)
-            except OSError as exc:  # pragma: no cover - depends on host symlink support
-                pytest.skip(f"symlinks unavailable: {exc}")
-            swapped = True
-        return dest_file
-
-    monkeypatch.setattr(
-        "modelaudit.utils.sources.pytorch_hub._safe_destination_path",
-        swap_parent_after_validation,
-    )
-
-    with (
-        pytest.raises((OSError, ValueError)),
-        _open_destination_file(cache_dir, Path("nested/model.onnx")) as handle,
-    ):
-        handle.write(b"unsafe")
-
-    assert not (outside_dir / "model.onnx").exists()
-
-
-def test_open_destination_file_accepts_symlinked_cache_root(tmp_path: Path) -> None:
-    real_cache = tmp_path / "real-cache"
-    cache_link = tmp_path / "cache-link"
-    real_cache.mkdir()
-    try:
-        cache_link.symlink_to(real_cache, target_is_directory=True)
-    except OSError as exc:  # pragma: no cover - depends on host symlink support
-        pytest.skip(f"symlinks unavailable: {exc}")
-
-    with _open_destination_file(cache_link, Path("model.onnx")) as handle:
-        handle.write(b"model")
-
-    assert (real_cache / "model.onnx").read_bytes() == b"model"
-
-
-def test_append_owned_fd_closes_descriptor_when_ownership_transfer_fails(tmp_path: Path) -> None:
-    class FailingFDList(list[int]):
-        def append(self, fd: int) -> None:
-            del fd
-            raise RuntimeError("append failed")
-
-    path = tmp_path / "descriptor.bin"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
-
-    try:
-        with pytest.raises(RuntimeError, match="append failed"):
-            _append_owned_fd(FailingFDList(), fd)
-
-        with pytest.raises(OSError):
-            os.fstat(fd)
-    finally:
-        with suppress(OSError):
-            os.close(fd)
-
-
-def test_open_binary_fd_closes_descriptor_when_fdopen_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "descriptor.bin"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
-
-    def fail_fdopen(fd_to_open: int, mode: str) -> BinaryIO:
-        del fd_to_open, mode
-        raise RuntimeError("fdopen failed")
-
-    monkeypatch.setattr(os, "fdopen", fail_fdopen)
-
-    try:
-        with pytest.raises(RuntimeError, match="fdopen failed"), _open_binary_fd(fd):
-            pass
-
-        with pytest.raises(OSError):
-            os.fstat(fd)
-    finally:
-        with suppress(OSError):
-            os.close(fd)
