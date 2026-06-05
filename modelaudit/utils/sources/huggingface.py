@@ -38,6 +38,8 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
+_POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
+_POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
 
 __all__ = [
     "download_file_from_hf",
@@ -1251,7 +1253,7 @@ def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> N
             process.terminate()
     else:
         with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, _POSIX_TERMINATE_SIGNAL)
     try:
         process.communicate(timeout=1.0)
     except subprocess.TimeoutExpired:
@@ -1260,7 +1262,7 @@ def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> N
                 process.kill()
         else:
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, _POSIX_KILL_SIGNAL)
         process.communicate()
 
 

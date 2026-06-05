@@ -1490,8 +1490,8 @@ class TestModelDownload:
             _terminate_huggingface_download_process(process)
 
         assert mock_killpg.call_args_list == [
-            call(1234, signal.SIGTERM),
-            call(1234, signal.SIGKILL),
+            call(1234, getattr(signal, "SIGTERM", 15)),
+            call(1234, getattr(signal, "SIGKILL", 9)),
         ]
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
