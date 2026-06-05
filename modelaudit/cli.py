@@ -1518,6 +1518,8 @@ def _resolve_scan_source_for_path(
                 cloud_stream_kwargs: dict[str, Any] = {}
                 if runtime.scannable_extensions is not None:
                     cloud_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scanner_selection is not None:
+                    cloud_stream_kwargs["scanner_selection"] = runtime.scanner_selection
                 file_generator = download_from_cloud_streaming(
                     path,
                     cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
@@ -1559,6 +1561,8 @@ def _resolve_scan_source_for_path(
             cloud_download_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 cloud_download_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scanner_selection is not None:
+                cloud_download_kwargs["scanner_selection"] = runtime.scanner_selection
             download_path = download_from_cloud(  # type: ignore[assignment]
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,

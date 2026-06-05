@@ -20,6 +20,11 @@ import click
 from yaspin import yaspin
 
 from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
+from modelaudit.scanner_selection import (
+    SCANNER_SELECTION_CONFIG_KEY,
+    policy_from_config,
+    scanner_ids_for_detected_format,
+)
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
@@ -1254,20 +1259,32 @@ def _filter_scannable_cloud_files(
     *,
     fs: Any,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
     max_sniff_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
     scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
-    if scannable_extensions is not None:
+    if scannable_extensions is not None and scanner_selection is None:
         return scannable
 
     scannable_paths = {str(file["path"]) for file in scannable}
     sniff_budget = _CloudContentSniffBudget(max_sniff_bytes) if max_sniff_bytes else None
+    scanner_policy = (
+        policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}) if scanner_selection is not None else None
+    )
     for file_info in files:
         file_path = str(file_info["path"])
         if file_path in scannable_paths:
             continue
         detected_format = _detect_cloud_content_route_format(fs, file_info, sniff_budget)
         if detected_format is None:
+            continue
+        if (
+            scanner_policy is not None
+            and scanner_policy.active
+            and not any(
+                scanner_policy.allows(scanner_id) for scanner_id in scanner_ids_for_detected_format(detected_format)
+            )
+        ):
             continue
         routed_file_info = dict(file_info)
         routed_file_info["content_detected_format"] = detected_format
@@ -1419,6 +1436,7 @@ def download_from_cloud(
     selective: bool = True,
     stream_analyze: bool = False,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
 ) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
@@ -1528,6 +1546,7 @@ def download_from_cloud(
                     files,
                     fs=fs,
                     scannable_extensions=scannable_extensions,
+                    scanner_selection=scanner_selection,
                     max_sniff_bytes=max_size,
                 )
                 if show_progress:
@@ -1656,6 +1675,7 @@ def download_from_cloud_streaming(
     show_progress: bool = True,
     selective: bool = True,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
@@ -1721,6 +1741,7 @@ def download_from_cloud_streaming(
                 files,
                 fs=fs,
                 scannable_extensions=scannable_extensions,
+                scanner_selection=scanner_selection,
                 max_sniff_bytes=max_size,
             )
             if show_progress and files:

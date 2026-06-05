@@ -37,9 +37,6 @@ _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECAS
 _JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
-_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
-    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
-)
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -969,41 +966,9 @@ def _detect_jfrog_content_route_format(
 
 
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
-    from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
-    from modelaudit.utils.file.detection import (
-        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
-        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
-        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
-        PROTOBUF_MODEL_CANDIDATE_FORMAT,
-        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
-        XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
-        XML_MODEL_INCONCLUSIVE_FORMAT,
-    )
+    from modelaudit.scanner_selection import scanner_ids_for_detected_format
 
-    scanner_ids: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
-        if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
-            scanner_ids.add(scanner_id)
-    if detected_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
-        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
-    if detected_format in {"tar", "gzip", "bzip2", "xz"}:
-        scanner_ids.add("nemo")
-    if detected_format in {"gzip", "bzip2", "xz"}:
-        scanner_ids.add("tar")
-    if detected_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.add("llamafile")
-        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
-    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
-    if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
-    if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"jax_checkpoint", "mxnet"})
-    if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.add("xgboost")
-    if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"openvino", "pmml"})
-    return scanner_ids
+    return set(scanner_ids_for_detected_format(detected_format))
 
 
 def _jfrog_detected_format_allowed(detected_format: str, scanner_selection: Mapping[str, Any] | None) -> bool:

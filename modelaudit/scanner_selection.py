@@ -24,6 +24,9 @@ SCANNER_SELECTION_CONFIG_KEY = "scanner_selection"
 _GENERIC_CONTAINER_SCANNER_IDS = frozenset({"compressed", "rar", "sevenzip", "tar", "zip"})
 _PROTOBUF_MODEL_CANDIDATE_SCANNER_ID = "protobuf_model_candidate"
 _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS = frozenset({"onnx", "coreml"})
+_ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
+    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
+)
 
 
 def scanner_catalog() -> list[dict[str, Any]]:
@@ -368,6 +371,44 @@ def selected_scanner_filenames(
             if os.path.splitext(filename_text)[1] not in remote_excluded_extensions:
                 filenames.add(filename_text)
     return frozenset(filenames)
+
+
+def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
+    """Return scanners that can analyze a trusted content-routed format."""
+    from modelaudit.utils.file.detection import (
+        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
+        XML_MODEL_INCONCLUSIVE_FORMAT,
+    )
+
+    scanner_ids: set[str] = set()
+    for scanner_id, scanner_info in _scanner_metadata().items():
+        if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
+            scanner_ids.add(scanner_id)
+    if detected_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
+        scanner_ids.update(_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format in {"tar", "gzip", "bzip2", "xz"}:
+        scanner_ids.add("nemo")
+    if detected_format in {"gzip", "bzip2", "xz"}:
+        scanner_ids.add("tar")
+    if detected_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("llamafile")
+        scanner_ids.update(_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
+    if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
+    if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"jax_checkpoint", "mxnet"})
+    if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("xgboost")
+    if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"openvino", "pmml"})
+    return frozenset(scanner_ids)
 
 
 SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"

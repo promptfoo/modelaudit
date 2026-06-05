@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from modelaudit.scanner_selection import resolve_scanner_selection_policy, selected_scanner_extensions
 from modelaudit.utils.file.detection import _XML_MODEL_SIGNATURE_READ_BYTES, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
@@ -440,6 +441,47 @@ def test_filter_scannable_cloud_files_includes_content_routed_objects(
     files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
+@pytest.mark.parametrize(
+    ("selected_scanner", "expected"),
+    [
+        pytest.param("safetensors", True, id="matching-scanner"),
+        pytest.param("tflite", False, id="different-scanner"),
+    ],
+)
+def test_filter_scannable_cloud_files_honors_scanner_selection_for_content_routes(
+    selected_scanner: str,
+    expected: bool,
+) -> None:
+    url = "s3://bucket/models/weights.payload"
+    payload = make_safetensors_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "weights.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+    scanner_policy = resolve_scanner_selection_policy(scanners=[selected_scanner])
+    scanner_selection = scanner_policy.to_config()
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(scanner_policy, conservative=True),
+        scanner_selection=scanner_selection,
+    )
+
+    expected_files = [{**files[0], "content_detected_format": "safetensors"}] if expected else []
+    assert actual == expected_files
+
+
+def test_filter_scannable_cloud_files_keeps_custom_extensions_suffix_only_without_selection() -> None:
+    url = "s3://bucket/models/weights.payload"
+    payload = make_safetensors_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "weights.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, scannable_extensions={".safetensors"}) == []
+    fs.open.assert_not_called()
 
 
 @pytest.mark.parametrize(
