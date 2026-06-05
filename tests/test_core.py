@@ -633,6 +633,7 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
         and issue.details["resolved_path"] == outside_path
         for issue in result.issues
     )
+    assert sum(issue.message == "Path traversal outside scanned directory" for issue in result.issues) == 1
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -679,6 +680,40 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
     assert {asset.path for asset in result.assets} == {str(shard_link) for shard_link in shard_links}
     assert {member["path"] for member in fingerprint["members"]} == {str(blob_path) for blob_path in blob_paths}
     assert not any("path traversal" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_allows_mixed_regular_and_hf_blob_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Family allowlisting must not depend on the first shard being an HF symlink."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir()
+    regular_shard = snapshots_dir / "model-00001-of-00002.safetensors"
+    linked_shard = snapshots_dir / "model-00002-of-00002.safetensors"
+    blob_path = blobs_dir / "blob-2"
+    regular_shard.write_bytes(b"regular-shard")
+    blob_path.write_bytes(b"linked-shard")
+    linked_shard.symlink_to(Path("../../blobs") / blob_path.name)
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(regular_shard.stat().st_size + blob_path.stat().st_size)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshots_dir), cache_scan_results=False)
+
+    assert calls == [str(regular_shard.resolve())]
+    assert result.files_scanned == 2
+    assert not any(issue.message == "Path traversal outside scanned directory" for issue in result.issues)
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -994,6 +1029,57 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     assert result.scanner_name == "dummy"
     assert captured_selection_allowed_paths == [[allowed_path]]
     assert captured_allowed_paths == [[allowed_path]]
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_scan_file_fails_closed_when_grouped_shard_retargets_outside_allowlist(tmp_path: Path) -> None:
+    """A stale grouped representative cannot downgrade into an ordinary scan."""
+    scan_dir = tmp_path / "scan"
+    outside_dir = tmp_path / "outside"
+    scan_dir.mkdir()
+    outside_dir.mkdir()
+    shard = scan_dir / "model-00001-of-00001.safetensors"
+    inside_target = scan_dir / "inside.safetensors"
+    outside_target = outside_dir / "outside.safetensors"
+    inside_target.write_bytes(b"inside")
+    outside_target.write_bytes(b"outside")
+    shard.symlink_to(inside_target)
+    allowed_path = str(inside_target.resolve())
+    shard.unlink()
+    shard.symlink_to(outside_target)
+
+    result = core_module._scan_file_internal(
+        str(shard),
+        config={
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [{"path": allowed_path, "content_hash": "sha256:inside"}],
+            },
+        },
+    )
+
+    assert result.success is False
+    assert result.scanner_name == "shard_boundary"
+    assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+    assert result.metadata["scan_outcome_reasons"] == ["shard_boundary_changed"]
+    assert any(check.name == "Sharded Model Boundary Check" for check in result.checks)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_discovered_shard_path_handles_concurrent_symlink_loop(tmp_path: Path) -> None:
+    """Concurrent shard breakage becomes an incomplete-discovery issue instead of an exception."""
+    shard_path = tmp_path / "model-00002-of-00002.safetensors"
+    shard_path.symlink_to(shard_path.name)
+    results = core_module.create_initial_audit_result()
+
+    resolved = core_module._resolve_discovered_shard_path(str(shard_path), results)
+
+    assert resolved is None
+    assert any(
+        issue.message == "Shard path changed during directory discovery"
+        and issue.location == str(shard_path)
+        and issue.details["scan_outcome_reason"] == "shard_path_changed"
+        for issue in results.issues
+    )
 
 
 def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(

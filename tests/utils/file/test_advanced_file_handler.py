@@ -279,6 +279,115 @@ class TestShardedModelDetector:
         assert result.success is False
         assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
 
+    def test_detect_shards_ignores_nearby_family_with_different_declared_total(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A neighboring shard family must not create false incomplete-coverage findings."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        selected_shard = tmp_path / "model-00001-of-00001.safetensors"
+        unrelated_alias = tmp_path / "model-00001-of-00002.safetensors"
+        outside_target = outside_dir / "other-family.safetensors"
+        selected_shard.write_bytes(b"selected")
+        outside_target.write_bytes(b"unrelated")
+        unrelated_alias.symlink_to(outside_target)
+
+        shard_info = ShardedModelDetector.detect_shards(str(selected_shard))
+        result = AdvancedFileHandler(str(selected_shard), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(selected_shard)]
+        assert "out_of_scope_shard_count" not in shard_info
+        assert result.success is True
+
+    def test_detect_shards_does_not_reresolve_validated_allowlist_targets(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Retargeting a validated sibling path cannot move the allowlist outside."""
+        scan_dir = tmp_path / "scan"
+        outside_dir = tmp_path / "outside"
+        scan_dir.mkdir()
+        outside_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        inside_target = scan_dir / "inside.pt"
+        outside_target = outside_dir / "outside.pt"
+        shard_one.write_bytes(b"first")
+        inside_target.write_bytes(b"inside")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(inside_target)
+        allowed_paths = [str(shard_one.resolve()), str(inside_target.resolve())]
+        inside_target.unlink()
+        inside_target.symlink_to(outside_target)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one), allowed_paths=allowed_paths)
+        result = AdvancedFileHandler(
+            str(shard_one),
+            CompletingShardScanner(),
+            allowed_shard_paths=allowed_paths,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert str(shard_two) not in shard_info["shards"]
+        assert shard_info["out_of_scope_shards"] == [str(shard_two)]
+        assert result.success is False
+        assert "out_of_scope_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_shards_rejects_non_regular_member(self, tmp_path: Path) -> None:
+        """A directory whose name resembles a shard cannot be counted or scanned."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"safe")
+        shard_two.mkdir()
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["unreadable_shards"] == [str(shard_two)]
+
+    def test_shard_target_swap_after_detection_fails_closed(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Shard workers must not follow a symlink retargeted after validation."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        inside_target = tmp_path / "inside.pt"
+        outside_target = outside_dir / "outside.pt"
+        shard_one.write_bytes(b"first")
+        inside_target.write_bytes(b"inside")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(inside_target)
+        scanned_payloads: list[bytes] = []
+
+        class RecordingScanner:
+            name = "recording_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                result = ScanResult(scanner_name=self.name)
+                result.finish(success=True)
+                return result
+
+        handler = AdvancedFileHandler(str(shard_one), RecordingScanner())
+        shard_two.unlink()
+        shard_two.symlink_to(outside_target)
+
+        result = handler.scan()
+
+        assert result.success is False
+        assert b"outside" not in scanned_payloads
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
@@ -302,6 +411,24 @@ class TestShardedModelDetector:
             # Test finding config
             found_config = ShardedModelDetector.find_model_config(str(model_path))
             assert found_config == str(config_path)
+
+    def test_find_model_config_rejects_external_symlink(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Model metadata discovery must not read configuration outside the shard directory."""
+        scan_dir = tmp_path / "scan"
+        outside_dir = tmp_path / "outside"
+        scan_dir.mkdir()
+        outside_dir.mkdir()
+        model_path = scan_dir / "checkpoint_1.pt"
+        outside_config = outside_dir / "config.json"
+        model_path.write_bytes(b"model")
+        outside_config.write_text('{"torch_dtype": "float16"}')
+        (scan_dir / "config.json").symlink_to(outside_config)
+
+        assert ShardedModelDetector.find_model_config(str(model_path)) is None
 
 
 class TestMemoryMappedHandler:
@@ -577,6 +704,99 @@ class TestAdvancedFileHandler:
         assert shard_detection.details["shards"] == [str(shard_one)]
         assert result.bytes_scanned == shard_one.stat().st_size
 
+    def test_sharded_model_marks_in_directory_allowlist_retarget_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """An unnumbered sibling cannot silently move to a new in-directory target."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        original_target = tmp_path / "original.pt"
+        replacement_target = tmp_path / "replacement.pt"
+        shard_one.write_bytes(b"one")
+        original_target.write_bytes(b"original")
+        replacement_target.write_bytes(b"replacement")
+        shard_two.symlink_to(original_target)
+        allowed_paths = [str(shard_one.resolve()), str(original_target.resolve())]
+        shard_two.unlink()
+        shard_two.symlink_to(replacement_target)
+
+        result = AdvancedFileHandler(
+            str(shard_one),
+            CompletingShardScanner(),
+            allowed_shard_paths=allowed_paths,
+        ).scan()
+
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+        coverage_check = next(check for check in result.checks if check.name == "Sharded Model Coverage Check")
+        assert coverage_check.details["unvalidated_shards"] == [str(shard_two)]
+
+    def test_sharded_model_rejects_retargeted_representative_before_fallback(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A changed representative cannot downgrade into an ordinary file scan."""
+        representative = tmp_path / "checkpoint_1.pt"
+        original_target = tmp_path / "original.pt"
+        replacement_target = tmp_path / "replacement.pt"
+        original_target.write_bytes(b"original")
+        replacement_target.write_bytes(b"replacement")
+        representative.symlink_to(original_target)
+        allowed_paths = [str(original_target.resolve())]
+        representative.unlink()
+        representative.symlink_to(replacement_target)
+
+        result = scan_advanced_large_file(
+            str(representative),
+            CompletingShardScanner(),
+            allowed_shard_paths=allowed_paths,
+        )
+
+        assert result.success is False
+        assert result.scanner_name == "completing_shard_scanner"
+        assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+        assert "shard_boundary_changed" in result.metadata["scan_outcome_reasons"]
+
+    def test_sharded_model_reports_unreadable_and_unvalidated_allowlist_members(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """All simultaneous allowlist coverage gaps remain visible in one check."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        broken_shard = tmp_path / "checkpoint_2.pt"
+        retargeted_shard = tmp_path / "checkpoint_3.pt"
+        original_target = tmp_path / "original.pt"
+        replacement_target = tmp_path / "replacement.pt"
+        shard_one.write_bytes(b"one")
+        original_target.write_bytes(b"original")
+        replacement_target.write_bytes(b"replacement")
+        broken_shard.symlink_to(tmp_path / "missing.pt")
+        retargeted_shard.symlink_to(original_target)
+        allowed_paths = [
+            str(shard_one.resolve()),
+            str(original_target.resolve()),
+            str((tmp_path / "missing.pt").absolute()),
+        ]
+        retargeted_shard.unlink()
+        retargeted_shard.symlink_to(replacement_target)
+
+        result = AdvancedFileHandler(
+            str(shard_one),
+            CompletingShardScanner(),
+            allowed_shard_paths=allowed_paths,
+        ).scan()
+
+        coverage_check = next(check for check in result.checks if check.name == "Sharded Model Coverage Check")
+        assert result.success is False
+        assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert coverage_check.details["unreadable_shards"] == [str(broken_shard)]
+        assert coverage_check.details["unvalidated_shards"] == [str(retargeted_shard)]
+
     def test_sharded_model_preserves_scanner_config_for_each_shard(self, tmp_path: Path) -> None:
         """Shard fanout should retain caller configuration for each scanner instance."""
         shard_one = tmp_path / "model-00001-of-00002.safetensors"
@@ -636,6 +856,45 @@ class TestAdvancedFileHandler:
 
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
+
+    def test_cached_sharded_scan_revalidates_retargeted_sibling(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A successful shard scan cache cannot hide a sibling later retargeted outside."""
+        scan_dir = tmp_path / "scan"
+        outside_dir = tmp_path / "outside"
+        scan_dir.mkdir()
+        outside_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        inside_target = scan_dir / "inside.pt"
+        outside_target = outside_dir / "outside.pt"
+        shard_one.write_bytes(b"first")
+        inside_target.write_bytes(b"inside")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(inside_target)
+        cache_dir = tmp_path / "cache"
+
+        class CachedCompletingShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+        scanner = CachedCompletingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
+
+        reset_cache_manager()
+        try:
+            first = scan_advanced_large_file(str(shard_one), scanner)
+            shard_two.unlink()
+            shard_two.symlink_to(outside_target)
+            second = scan_advanced_large_file(str(shard_one), scanner)
+        finally:
+            reset_cache_manager()
+
+        assert first.success is True
+        assert second.success is False
+        assert "out_of_scope_model_shards" in second.metadata["scan_outcome_reasons"]
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""

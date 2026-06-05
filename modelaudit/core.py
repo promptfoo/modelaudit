@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import logging
 import os
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
@@ -205,12 +206,20 @@ def _build_shard_family_cache_fingerprint(
         "expected_total_shards": expected_total_shards,
         "members": [
             {
-                "path": str(Path(scanned_file_path).resolve()),
+                "path": _resolve_or_absolute_path(scanned_file_path),
                 "content_hash": content_hashes.get(scanned_file_path),
             }
             for scanned_file_path in sorted(scanned_file_paths)
         ],
     }
+
+
+def _resolve_or_absolute_path(path: str) -> str:
+    """Return a resolved path, preserving a stable lexical path after concurrent breakage."""
+    try:
+        return str(Path(path).resolve(strict=True))
+    except (OSError, RuntimeError):
+        return str(Path(path).absolute())
 
 
 def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None:
@@ -229,19 +238,89 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
     return allowed_paths or None
 
 
+def _grouped_shard_boundary_error(path: str, allowed_paths: list[str]) -> dict[str, Any] | None:
+    """Return details when a grouped shard no longer matches its validated family."""
+    allowed_path_set = {
+        os.path.normcase(os.path.normpath(os.path.abspath(allowed_path))) for allowed_path in allowed_paths
+    }
+    try:
+        resolved_path = Path(path).resolve(strict=True)
+        resolved_stat = os.stat(resolved_path, follow_symlinks=False)
+    except (OSError, RuntimeError) as e:
+        return {"path": path, "error": str(e), "reason": "shard_target_unavailable"}
+
+    normalized_resolved_path = os.path.normcase(os.path.normpath(str(resolved_path)))
+    if normalized_resolved_path not in allowed_path_set:
+        return {
+            "path": path,
+            "resolved_path": str(resolved_path),
+            "reason": "shard_target_outside_validated_family",
+        }
+    if not stat.S_ISREG(resolved_stat.st_mode):
+        return {
+            "path": path,
+            "resolved_path": str(resolved_path),
+            "reason": "shard_target_not_regular_file",
+        }
+    return None
+
+
 def _allowed_hf_shard_alias_paths(shard_path: str, base_dir: Path, hf_cache_root: Path) -> list[str]:
     """Return shard siblings resolving inside the scan root or the same HF cache blobs directory."""
     allowed_paths: list[str] = []
     blobs_root = hf_cache_root / "blobs"
     for candidate_path in Path(shard_path).parent.glob("*"):
         with suppress(OSError, RuntimeError):
-            resolved_candidate_path = str(candidate_path.resolve())
-            if is_within_directory(str(base_dir), resolved_candidate_path) or is_within_directory(
-                str(blobs_root),
-                resolved_candidate_path,
+            resolved_candidate = candidate_path.resolve(strict=True)
+            resolved_candidate_path = str(resolved_candidate)
+            if resolved_candidate.is_file() and (
+                is_within_directory(str(base_dir), resolved_candidate_path)
+                or is_within_directory(str(blobs_root), resolved_candidate_path)
             ):
                 allowed_paths.append(resolved_candidate_path)
     return allowed_paths
+
+
+def _add_path_traversal_issue_once(
+    results: ModelAuditResultModel,
+    *,
+    location: str,
+    resolved_path: str,
+    reported_targets: set[str] | None = None,
+) -> None:
+    """Report one traversal issue per resolved target during directory discovery."""
+    normalized_target = os.path.normcase(os.path.normpath(resolved_path))
+    if reported_targets is not None:
+        if normalized_target in reported_targets:
+            return
+        reported_targets.add(normalized_target)
+    _add_issue_to_model(
+        results,
+        "Path traversal outside scanned directory",
+        severity=IssueSeverity.CRITICAL.value,
+        location=location,
+        details={"resolved_path": resolved_path},
+    )
+
+
+def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultModel) -> str | None:
+    """Resolve a detected shard without aborting if it changes during discovery."""
+    try:
+        return str(Path(shard_path).resolve(strict=True))
+    except (OSError, RuntimeError) as e:
+        _add_issue_to_model(
+            results,
+            "Shard path changed during directory discovery",
+            severity=IssueSeverity.INFO.value,
+            location=shard_path,
+            details={
+                "error": str(e),
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_path_changed",
+            },
+        )
+        return None
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -709,6 +788,7 @@ def _resolve_directory_scan_target(
     is_hf_cache: bool,
     hf_cache_root: Path | None,
     results: ModelAuditResultModel,
+    reported_traversal_targets: set[str] | None = None,
 ) -> tuple[Path | None, bool]:
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
     resolved_file = file_path.resolve()
@@ -739,12 +819,11 @@ def _resolve_directory_scan_target(
                 resolved_file = resolved_target
 
     if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
-        _add_issue_to_model(
+        _add_path_traversal_issue_once(
             results,
-            "Path traversal outside scanned directory",
-            severity=IssueSeverity.CRITICAL.value,
             location=str(file_path),
-            details={"resolved_path": str(resolved_file)},
+            resolved_path=str(resolved_file),
+            reported_targets=reported_traversal_targets,
         )
         return None, False
 
@@ -932,6 +1011,7 @@ def scan_model_directory_or_file(
             is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
+            reported_traversal_targets: set[str] = set()
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
@@ -955,6 +1035,7 @@ def scan_model_directory_or_file(
                         is_hf_cache=is_hf_cache,
                         hf_cache_root=hf_cache_root,
                         results=results,
+                        reported_traversal_targets=reported_traversal_targets,
                     )
                     if resolved_file is None:
                         continue
@@ -1016,12 +1097,11 @@ def scan_model_directory_or_file(
                         scanned_paths.add(dedupe_target_str)
 
                         if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
-                            _add_issue_to_model(
+                            _add_path_traversal_issue_once(
                                 results,
-                                "Path traversal outside scanned directory",
-                                severity=IssueSeverity.CRITICAL.value,
                                 location=str(target_path),
-                                details={"resolved_path": str(target_path)},
+                                resolved_path=str(target_path),
+                                reported_targets=reported_traversal_targets,
                             )
                             continue
 
@@ -1031,9 +1111,14 @@ def scan_model_directory_or_file(
                             family_paths.add(target_str)
                             if shard_family_key not in shard_family_representatives:
                                 shard_family_representatives[shard_family_key] = target_str
+                                shard_is_in_hf_snapshot = bool(
+                                    is_hf_cache
+                                    and hf_cache_root is not None
+                                    and _path_has_part(Path(target_str), "snapshots")
+                                )
                                 allowed_hf_shard_paths = (
                                     _allowed_hf_shard_alias_paths(target_str, base_dir, hf_cache_root)
-                                    if is_hf_cache_symlink and hf_cache_root is not None
+                                    if shard_is_in_hf_snapshot and hf_cache_root is not None
                                     else None
                                 )
                                 shard_info = ShardedModelDetector.detect_shards(
@@ -1043,16 +1128,18 @@ def scan_model_directory_or_file(
                                 if shard_info is not None:
                                     expected_total_shards = shard_info.get("expected_total_shards")
                                     if (
-                                        is_hf_cache_symlink
+                                        shard_is_in_hf_snapshot
                                         and isinstance(expected_total_shards, int)
                                         and shard_info.get("total_shards") == expected_total_shards
                                         and "missing_shard_count" not in shard_info
-                                        and "inconsistent_expected_total_shards" not in shard_info
                                     ):
                                         complete_hf_shard_families.add(shard_family_key)
                                     for shard_path in shard_info.get("shards", []):
                                         if isinstance(shard_path, str):
-                                            resolved_shard_path = str(Path(shard_path).resolve())
+                                            resolved_shard_path = _resolve_discovered_shard_path(shard_path, results)
+                                            if resolved_shard_path is None:
+                                                family_paths.add(str(Path(shard_path).absolute()))
+                                                continue
                                             shard_in_base_dir = is_within_directory(str(base_dir), resolved_shard_path)
                                             shard_in_hf_blobs = bool(
                                                 is_hf_cache
@@ -1067,23 +1154,23 @@ def scan_model_directory_or_file(
                                             elif shard_in_base_dir:
                                                 family_paths.add(resolved_shard_path)
                                             else:
-                                                _add_issue_to_model(
+                                                _add_path_traversal_issue_once(
                                                     results,
-                                                    "Path traversal outside scanned directory",
-                                                    severity=IssueSeverity.CRITICAL.value,
                                                     location=resolved_shard_path,
-                                                    details={"resolved_path": resolved_shard_path},
+                                                    resolved_path=resolved_shard_path,
+                                                    reported_targets=reported_traversal_targets,
                                                 )
                                     for shard_path in shard_info.get("out_of_scope_shards", []):
                                         if isinstance(shard_path, str):
-                                            resolved_shard_path = str(Path(shard_path).resolve())
+                                            resolved_shard_path = _resolve_discovered_shard_path(shard_path, results)
+                                            if resolved_shard_path is None:
+                                                continue
                                             if not is_within_directory(str(base_dir), resolved_shard_path):
-                                                _add_issue_to_model(
+                                                _add_path_traversal_issue_once(
                                                     results,
-                                                    "Path traversal outside scanned directory",
-                                                    severity=IssueSeverity.CRITICAL.value,
                                                     location=resolved_shard_path,
-                                                    details={"resolved_path": resolved_shard_path},
+                                                    resolved_path=resolved_shard_path,
+                                                    reported_targets=reported_traversal_targets,
                                                 )
                             continue
 
@@ -1094,7 +1181,7 @@ def scan_model_directory_or_file(
                 files_to_scan = [
                     file_path
                     for file_path in files_to_scan
-                    if str(Path(file_path).resolve()) not in hf_shard_blob_paths
+                    if _resolve_or_absolute_path(file_path) not in hf_shard_blob_paths
                 ]
             scan_entries: list[_ScanEntry] = [(file_path, [file_path], None) for file_path in files_to_scan]
             seen_complete_hf_shard_families: set[tuple[str, tuple[str, ...]]] = set()
@@ -1107,7 +1194,9 @@ def scan_model_directory_or_file(
                     and shard_family_key in complete_hf_shard_families
                     and len(ordered_family_paths) == expected_total_shards
                 ):
-                    resolved_family_paths = tuple(sorted(str(Path(path).resolve()) for path in ordered_family_paths))
+                    resolved_family_paths = tuple(
+                        sorted(_resolve_or_absolute_path(path) for path in ordered_family_paths)
+                    )
                     family_dedupe_key = (shard_family_key[1], resolved_family_paths)
                     if family_dedupe_key in seen_complete_hf_shard_families:
                         continue
@@ -1171,6 +1260,9 @@ def scan_model_directory_or_file(
                             file_config = config
                             if shard_family_key is not None:
                                 file_config = dict(config)
+                                # Group membership and symlink targets must be revalidated
+                                # before any representative-file cache lookup can read them.
+                                file_config["cache_enabled"] = False
                                 file_config[_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] = (
                                     _build_shard_family_cache_fingerprint(
                                         shard_family_key,
@@ -1640,6 +1732,29 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     scanner_selection = policy_from_config(config)
     validate_scan_config(config)
 
+    allowed_shard_paths = _allowed_shard_paths_from_config(config)
+    if allowed_shard_paths is not None:
+        boundary_error = _grouped_shard_boundary_error(path, allowed_shard_paths)
+        if boundary_error is not None:
+            sr = ScanResult(scanner_name="shard_boundary")
+            sr.add_check(
+                name="Sharded Model Boundary Check",
+                passed=False,
+                message="Validated shard path changed before scanning; scan coverage is incomplete.",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    **boundary_error,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_boundary_changed",
+                },
+            )
+            _mark_operational_scan_error(sr, "shard_boundary_changed")
+            _mark_inconclusive_scan_outcome(sr, "shard_boundary_changed")
+            sr.finish(success=False)
+            return sr
+
     # Skip HuggingFace cache files to reduce noise
     if _is_huggingface_cache_file(path):
         sr = ScanResult(scanner_name="skipped")
@@ -1705,7 +1820,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Check if we should use extreme handler BEFORE applying size limits
     # Extreme handler bypasses size limits for large models
-    allowed_shard_paths = _allowed_shard_paths_from_config(config)
     use_extreme_handler = should_use_advanced_handler(path, allowed_shard_paths=allowed_shard_paths)
 
     # Check file size limit only if NOT using extreme handler
