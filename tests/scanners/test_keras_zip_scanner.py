@@ -898,6 +898,52 @@ class TestKerasZipScanner:
         assert unknown_checks[0].details["parse_status"] == "unknown"
         assert "is non-canonical" in unknown_checks[0].message
 
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.11.3rc1evil", "3.12.0rc1evil", "3.13.1+bad+tag"],
+    )
+    def test_cve_2026_1669_noncanonical_suffix_inside_vulnerable_range_is_attributed(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Malformed suffixes cannot erase an unambiguously vulnerable numeric release."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
+
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_checks = [check for check in result.checks if check.name.startswith("CVE-2026-1669:")]
+        unknown_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].details["keras_version"] == keras_version
+        assert unknown_checks == []
+
+    @pytest.mark.parametrize("keras_version", ["3.0.x", "3.11.x", "3.11-X", "3.0.*", "3.11.*", "3.11-*"])
+    def test_cve_2026_1669_wildcard_line_entirely_in_vulnerable_range(self, keras_version: str) -> None:
+        """A wildcard cannot hide a minor line whose every release is vulnerable."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
+
+    @pytest.mark.parametrize("keras_version", ["3.12.x", "3.13.x", "3.12.*", "3.13.*"])
+    def test_cve_2026_1669_wildcard_line_crossing_fix_boundary_is_unknown(self, keras_version: str) -> None:
+        """Minor lines containing both vulnerable and fixed patches remain unknown."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is None
+
+    @pytest.mark.parametrize("keras_version", ["2.15.x", "3.14.x", "4.0.x", "2.15.*", "3.14.*", "4.0.*"])
+    def test_cve_2026_1669_wildcard_line_outside_vulnerable_range_is_fixed(self, keras_version: str) -> None:
+        """Wildcard lines wholly outside the vulnerable ranges are not attributed to the CVE."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is False
+
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
         scanner = KerasZipScanner()
@@ -5330,8 +5376,30 @@ class TestCVE202549655TorchModuleWrapper:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper in nested model"
 
-    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
-        """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.11a0",
+            "3.11rc1",
+            "3.11.dev0",
+            "3.11.0a0",
+            "3.11.0rc1",
+            "3.11.0.dev999",
+            "3.11.0.0rc1",
+            "3.11.3",
+            "3.11.3+local",
+            "3.11.3.post1",
+            "3.11.3.post1.dev0",
+            "3.11.3-post1.dev0",
+            "3.11.3-1.dev0",
+            "3.11.3_post1.dev0",
+            "3.11.3-r1.dev0",
+            "3.11.3rev1.dev0",
+            "3.11.4.dev0",
+        ],
+    )
+    def test_no_cve_outside_affected_keras_range(self, tmp_path: Path, keras_version: str) -> None:
+        """Keras builds outside >= 3.11.0 and < 3.11.3 should not be CVE-attributed."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -5345,9 +5413,9 @@ class TestCVE202549655TorchModuleWrapper:
                 ]
             },
         }
-        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11.3"))
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
-        assert len(cve_issues) == 0, "Fixed Keras versions should not get CVE-2025-49655 attribution"
+        assert len(cve_issues) == 0, "Versions outside the affected range should not get CVE attribution"
         risk_checks = [c for c in result.checks if c.name == "TorchModuleWrapper Version Risk Check"]
         assert len(risk_checks) >= 1
         assert risk_checks[0].severity == IssueSeverity.WARNING
@@ -5372,11 +5440,155 @@ class TestCVE202549655TorchModuleWrapper:
             "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
         }
 
-        for prerelease_version in ["3.11.0a0", "3.11.1rc1", "3.11.2.dev0"]:
+        for prerelease_version in ["3.11.1rc1", "3.11.2.dev0"]:
             result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
             cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
             assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
             assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.11.3a0",
+            "3.11.3-alpha.1",
+            "3.11.3b1",
+            "3.11.3c1",
+            "3.11.3rc1",
+            "3.11.3rc1.post1.dev0+local",
+            "3.11.3.dev0",
+            "3.11.3_dev0",
+        ],
+    )
+    def test_fixed_boundary_prerelease_versions_treated_as_vulnerable(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Prereleases of the fixed boundary sort before final 3.11.3 and remain vulnerable."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["affected_versions"] == "Keras >= 3.11.0 and < 3.11.3"
+        assert cve_issues[0].why is not None
+        assert "Keras >= 3.11.0 and < 3.11.3" in cve_issues[0].why
+
+    @pytest.mark.parametrize(
+        ("keras_version", "expected_critical"),
+        [
+            ("3.11.2+" + ("a" * 256), True),
+            ("3.11.3+" + ("a" * 256), False),
+        ],
+    )
+    def test_long_local_version_classified_before_evidence_truncation(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+        expected_critical: bool,
+    ) -> None:
+        """Long valid local labels must not change public-version CVE attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        assert result.metadata["keras_version"].endswith("...")
+        cve_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("cve_id") == "CVE-2025-49655" and issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert bool(cve_issues) is expected_critical
+        if not expected_critical:
+            risk_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Version Risk Check"]
+            assert len(risk_checks) == 1
+            assert risk_checks[0].details["parse_status"] == "metadata_non_vulnerable"
+
+    @pytest.mark.parametrize(
+        ("keras_version", "expected"),
+        [
+            ("3", False),
+            ("4rc1", False),
+            ("3.11a0", False),
+            ("3.11rc1", False),
+            ("3.11.dev0", False),
+            ("3.11.0a0", False),
+            ("3.11.0rc1", False),
+            ("3.11.0.dev999", False),
+            ("3.11.0.0rc1", False),
+            ("3.11", True),
+            ("3.11.0", True),
+            ("3.11.0+local", True),
+            ("3.11.0.post1", True),
+            ("3.11.0.post1.dev0", True),
+            ("3.11.3rc1", True),
+            ("3.11.3c1", True),
+            ("3.11.3.dev0", True),
+            ("3.11.3_dev0", True),
+            ("3.11.3rc1.post1", True),
+            ("3.11.3rc1.post1.dev0+local", True),
+            ("v3.11.3rc1", True),
+            ("V3.11.3.dev0", True),
+            ("0!3.11.3rc1", True),
+            ("3.11.3.0rc1", True),
+            ("3.11.3.0.dev0", True),
+            ("3.11.3.post1.dev0", False),
+            ("3.11.3-post1.dev0", False),
+            ("3.11.3-1.dev0", False),
+            ("3.11.3_post1.dev0", False),
+            ("3.11.3-r1.dev0", False),
+            ("3.11.3rev1.dev0", False),
+            ("v3.11.3", False),
+            ("1!3.11.0", False),
+            ("3.11.3.0", False),
+            ("3.11.3.1.dev0", False),
+            ("3.11.3+rc1", False),
+            ("3.11.3.0rcpu", None),
+            ("3.11.3rcpu", None),
+            ("3.11.3devops", None),
+            ("3.11.3alphafoo", None),
+            ("3.11.3previewbuild", None),
+            ("3.11.\u0663rc1", None),
+            ("3.11.3rc\u0661", None),
+        ],
+    )
+    def test_version_parser_requires_bounded_prerelease_qualifiers(
+        self,
+        keras_version: str,
+        expected: bool | None,
+    ) -> None:
+        """Malformed qualifier lookalikes should not receive critical CVE attribution."""
+        assert KerasZipScanner._is_vulnerable_keras_3_11_x(keras_version) is expected
+
+    @pytest.mark.parametrize("keras_version", ["3.11.3rcpu", "3.11.\u0663rc1", "3.11.3rc\u0661"])
+    def test_malformed_boundary_qualifier_is_warning_only(self, tmp_path: Path, keras_version: str) -> None:
+        """Malformed prerelease lookalikes must not receive critical CVE attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues
+        assert all(issue.severity == IssueSeverity.WARNING for issue in cve_issues)
+        unknown_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Risk (Version Unknown)"]
+        assert len(unknown_checks) == 1
+        assert unknown_checks[0].details["parse_status"] == "unknown"
+        assert result.success is True
 
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
