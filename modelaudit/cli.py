@@ -43,6 +43,7 @@ from .scanner_selection import (
     scanner_catalog,
     scanner_selection_config_from_inputs,
     selected_scanner_extensions,
+    selected_scanner_filenames,
 )
 from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
@@ -129,6 +130,8 @@ class _ScanRuntimeConfig:
     scanner_selection: dict[str, Any] | None
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
+    scannable_filenames: frozenset[str] | None
+    hf_stream_include_all_files: bool
 
 
 @dataclass
@@ -545,6 +548,10 @@ def _resolve_scan_runtime_config(
     scannable_extensions = (
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_filenames = (
+        selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
+    )
+    hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
         config=config_values,
@@ -569,6 +576,8 @@ def _resolve_scan_runtime_config(
         scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
 
@@ -1257,11 +1266,19 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                hf_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scannable_filenames is not None:
+                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.hf_stream_include_all_files:
+                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
+                    **hf_stream_kwargs,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
