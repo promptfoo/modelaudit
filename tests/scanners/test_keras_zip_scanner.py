@@ -929,17 +929,17 @@ class TestKerasZipScanner:
         assert cve_checks[0].details["keras_version"] == keras_version
         assert unknown_checks == []
 
-    @pytest.mark.parametrize("keras_version", ["3.0.x", "3.11.x", "3.11-X"])
+    @pytest.mark.parametrize("keras_version", ["3.0.x", "3.11.x", "3.11-X", "3.0.*", "3.11.*", "3.11-*"])
     def test_cve_2026_1669_wildcard_line_entirely_in_vulnerable_range(self, keras_version: str) -> None:
         """A wildcard cannot hide a minor line whose every release is vulnerable."""
         assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
 
-    @pytest.mark.parametrize("keras_version", ["3.12.x", "3.13.x"])
+    @pytest.mark.parametrize("keras_version", ["3.12.x", "3.13.x", "3.12.*", "3.13.*"])
     def test_cve_2026_1669_wildcard_line_crossing_fix_boundary_is_unknown(self, keras_version: str) -> None:
         """Minor lines containing both vulnerable and fixed patches remain unknown."""
         assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is None
 
-    @pytest.mark.parametrize("keras_version", ["2.15.x", "3.14.x", "4.0.x"])
+    @pytest.mark.parametrize("keras_version", ["2.15.x", "3.14.x", "4.0.x", "2.15.*", "3.14.*", "4.0.*"])
     def test_cve_2026_1669_wildcard_line_outside_vulnerable_range_is_fixed(self, keras_version: str) -> None:
         """Wildcard lines wholly outside the vulnerable ranges are not attributed to the CVE."""
         assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is False

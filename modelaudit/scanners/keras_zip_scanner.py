@@ -156,7 +156,7 @@ _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
 )
-_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.*+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
     r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
     r"([A-Za-z+_-][A-Za-z0-9.+_-]*|\.[A-Za-z][A-Za-z0-9.+_-]*)?\s*$"
@@ -3167,7 +3167,7 @@ class KerasZipScanner(BaseScanner):
             return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        if version_match.group(3) is None and suffix in {"x", ".x", "-x", "_x"}:
+        if version_match.group(3) is None and suffix in {"x", ".x", "-x", "_x", "*", ".*", "-*", "_*"}:
             if (3, 0) <= (major, minor) < (3, 12):
                 return True
             if (major, minor) in {(3, 12), (3, 13)}:
