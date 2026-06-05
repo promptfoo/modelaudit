@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from typing import Any, Final
@@ -21,6 +22,7 @@ STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
+MAX_PERCENT_DECODE_PASSES: Final[int] = 32
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
@@ -627,20 +629,39 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     )
 
 
-def _redact_percent_encoded_secret_candidate(match: re.Match[str]) -> str:
+def _redact_percent_encoded_secret_candidate(match: re.Match[str], *, url_depth: int = 0) -> str:
     raw_value = match.group(0)
     if "%" not in raw_value:
         return raw_value
 
     decoded = raw_value
-    for _ in range(3):
+    for _ in range(MAX_PERCENT_DECODE_PASSES):
         next_decoded = unquote(decoded)
         if next_decoded == decoded:
             break
         decoded = next_decoded
         if STANDALONE_SECRET_RE.search(decoded):
             return REDACTED_EVIDENCE_VALUE
+        normalized_decoded = _remove_unsafe_evidence_characters(decoded)
+        if normalized_decoded != decoded:
+            redacted_decoded = redact_evidence_string(normalized_decoded, max_chars=None, _url_depth=url_depth)
+            if redacted_decoded != normalized_decoded:
+                return redacted_decoded
+    else:
+        # Excessively nested encoding is attacker-controlled and too opaque to
+        # preserve safely in evidence.
+        return REDACTED_EVIDENCE_VALUE
     return raw_value
+
+
+def _remove_unsafe_evidence_characters(text: str) -> str:
+    """Remove model-controlled characters that can alter rendered evidence."""
+    safe_characters: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char in {"\n", "\r", "\t"} or category not in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+            safe_characters.append(char)
+    return "".join(safe_characters)
 
 
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
@@ -804,6 +825,24 @@ def _find_balanced_container_end(text: str, start: int, *, max_scan_chars: int |
     return None
 
 
+def _contains_only_redacted_marker_values(container_text: str) -> bool:
+    try:
+        parsed = ast.literal_eval(container_text)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return False
+
+    def is_redacted(value: Any) -> bool:
+        if isinstance(value, str):
+            return value == REDACTED_EVIDENCE_VALUE
+        if isinstance(value, dict):
+            return bool(value) and all(is_redacted(key) and is_redacted(child) for key, child in value.items())
+        if isinstance(value, list | tuple | set):
+            return bool(value) and all(is_redacted(child) for child in value)
+        return False
+
+    return is_redacted(parsed)
+
+
 def _redact_container_assignments(text: str) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
@@ -819,15 +858,14 @@ def _redact_container_assignments(text: str) -> str:
         if container_start == 0 and text[container_end:].strip():
             search_index = container_end
             continue
-        if REDACTED_EVIDENCE_VALUE in container_text:
-            search_index = container_end
-            continue
-
         if _is_sensitive_detail_key(match.group("key")):
+            if _contains_only_redacted_marker_values(container_text):
+                search_index = container_end
+                continue
             redacted_chunks.append(text[last_index : match.start()])
             redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
             last_index = container_end
-        else:
+        elif REDACTED_EVIDENCE_VALUE not in container_text:
             redacted_container = _redact_structured_evidence(container_text, max_chars=len(container_text))
             if redacted_container is not None and redacted_container != container_text:
                 redacted_chunks.append(text[last_index:container_start])
@@ -854,10 +892,9 @@ def _redact_call_assignments(text: str) -> str:
         if not _is_sensitive_detail_key(match.group("key")):
             search_index = match.end()
             continue
-        if container_end is not None and REDACTED_EVIDENCE_VALUE in text[container_start:container_end]:
+        if container_end is not None and _contains_only_redacted_marker_values(text[container_start:container_end]):
             search_index = container_end
             continue
-
         redacted_chunks.append(text[last_index : match.start()])
         redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
         if container_end is None:
@@ -1008,6 +1045,7 @@ def _redact_quoted_structured_literal(text: str, max_chars: int) -> str | None:
 
 def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth: int = 0) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
+    text = _remove_unsafe_evidence_characters(text)
     effective_max_chars = len(text) if max_chars is None else max_chars
     structured_redaction = _redact_structured_evidence(text, max_chars=effective_max_chars)
     if structured_redaction is not None:
@@ -1021,7 +1059,10 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), redacted)
     redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
-    redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(_redact_percent_encoded_secret_candidate, redacted)
+    redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(
+        lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=_url_depth),
+        redacted,
+    )
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
@@ -1055,6 +1096,11 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = QUOTED_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)
     redacted = GENERIC_ASSIGNMENT_RE.sub(_redact_generic_assignment, redacted)
+    compact_redacted = redacted.replace("\r", "").replace("\n", "").replace("\t", "")
+    if compact_redacted != redacted:
+        compact_candidate = redact_evidence_string(compact_redacted, max_chars=None, _url_depth=_url_depth)
+        if compact_candidate != compact_redacted:
+            redacted = compact_candidate
     return redacted if max_chars is None else _truncate(redacted, max_chars)
 
 

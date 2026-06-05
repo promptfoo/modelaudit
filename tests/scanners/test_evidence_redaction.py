@@ -1252,6 +1252,7 @@ def test_redacts_standalone_secret_token_shapes(token: str) -> None:
         "ghp%5F" + "a" * 36,
         "ghp%255F" + "a" * 36,
         "%67%68%70%5F" + "%61" * 36,
+        "ghp%2525255F" + "a" * 36,
     ],
 )
 def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) -> None:
@@ -1268,6 +1269,7 @@ def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) ->
         "sk_live_" + "a" * 23,
         "sk-proj-" + "abc_def-" * 2 + "abcdefg",
         "modelghp_" + "a" * 36,
+        "sk-this-is-a-benign-model-identifier-2026",
     ],
 )
 def test_preserves_near_miss_standalone_secret_shapes(near_miss: str) -> None:
@@ -1282,3 +1284,49 @@ def test_preserves_percent_encoded_standalone_secret_near_miss() -> None:
     text = "metadata key: ghp%5F" + "a" * 35
 
     assert redact_evidence_string(text, max_chars=500) == text
+
+
+@pytest.mark.parametrize("separator", ["\x00", "\t", "\n", "\r", "\u2028", "\u2029", "\u202e"])
+def test_removes_terminal_and_format_controls_before_redaction(separator: str) -> None:
+    """Model-controlled controls must neither render nor split sensitive keys."""
+    secret = "CONTROLSECRET123456789"
+    text = f"api_{separator}key={secret}\x1b[2J\nFORGED\u202e"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert secret not in redacted
+
+
+@pytest.mark.parametrize("encoded_separator", ["%00", "%E2%80%A8", "%E2%80%A9", "%E2%80%AE"])
+def test_redacts_percent_encoded_controls_inside_sensitive_keys(encoded_separator: str) -> None:
+    secret = "ENCODEDCONTROLSECRET123456789"
+
+    redacted = redact_evidence_string(f"api_{encoded_separator}key={secret}", max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert secret not in redacted
+
+
+def test_attacker_supplied_redaction_marker_does_not_hide_control_split_secret() -> None:
+    secret = "MARKERCONFUSIONSECRET123456789"
+    text = f"note={REDACTED_EVIDENCE_VALUE}\napi_\nkey={REDACTED_EVIDENCE_VALUE}{secret}"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "api_key=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        f'loader("{REDACTED_EVIDENCE_VALUE}", "MARKERCONTAINERSECRET123456789")',
+        f'{{"note":"{REDACTED_EVIDENCE_VALUE}","value":"MARKERCONTAINERSECRET123456789"}}',
+    ],
+)
+def test_attacker_supplied_redaction_marker_does_not_hide_control_split_container_secret(value: str) -> None:
+    redacted = redact_evidence_string(f"api_\nkey={value}", max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert "MARKERCONTAINERSECRET123456789" not in redacted

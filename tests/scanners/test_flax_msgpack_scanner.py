@@ -1058,6 +1058,77 @@ def test_flax_msgpack_redacts_percent_encoded_secret_metadata_key(tmp_path: Path
     assert encoded_token not in serialized
 
 
+def test_flax_msgpack_redacts_deeply_percent_encoded_secret_metadata_key(tmp_path: Path) -> None:
+    path = tmp_path / "deeply_encoded_secret_key.msgpack"
+    encoded_token = "ghp%2525255F" + "a" * 36
+    create_msgpack_file(path, {encoded_token: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.metadata["top_level_keys"] == ["<redacted>"]
+    assert encoded_token not in result.to_json()
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "expected_key"),
+    [
+        (b"token\xff=INVALIDUTF8SECRET123456789", "<redacted>"),
+        (b"api_\x00key=CONTROLBYTESECRET123456789", "api_key=<redacted>"),
+        ("api_\tkey=TABSECRET123456789", "api_key=<redacted>"),
+        ("api_\nkey=LINESECRET123456789", "api_key=<redacted>"),
+        ("api_\rkey=RETURNSECRET123456789", "api_key=<redacted>"),
+        ("api_\u2028key=SEPARATORSECRET123456789", "api_key=<redacted>"),
+        ("api_\u202ekey=BIDISECRET123456789", "api_key=<redacted>"),
+    ],
+)
+def test_flax_msgpack_fails_closed_for_unsafe_metadata_keys(
+    tmp_path: Path,
+    metadata_key: bytes | str,
+    expected_key: str,
+) -> None:
+    path = tmp_path / "unsafe_binary_key.msgpack"
+    create_msgpack_file(path, {metadata_key: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert result.metadata["top_level_keys"] == [expected_key]
+    assert "SECRET123456789" not in serialized
+
+
+def test_flax_msgpack_redacts_openai_project_key_across_persisted_outputs(tmp_path: Path) -> None:
+    path = tmp_path / "openai_project_key.msgpack"
+    cache_dir = tmp_path / "cache"
+    token = "sk-proj-" + "A" * 12 + "_" + "b" * 20 + "-" + "C" * 8
+    create_msgpack_file(path, {token: b"0" * 4096})
+    scanner = FlaxMsgpackScanner(config={"cache_enabled": True, "cache_dir": str(cache_dir)})
+
+    reset_cache_manager()
+    try:
+        direct = scanner.scan(str(path))
+        first = scanner.scan_with_cache(str(path))
+        cached = scanner.scan_with_cache(str(path))
+        cache_stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        sarif_results = _create_results(direct.issues, prefiltered=True)
+        cache_text = "".join(
+            cache_path.read_text(errors="ignore") for cache_path in cache_dir.rglob("*") if cache_path.is_file()
+        )
+
+        assert direct.metadata["top_level_keys"] == ["<redacted>"]
+        assert any(issue.details.get("found_keys") == ["<redacted>"] for issue in direct.issues)
+        assert token not in direct.to_json()
+        assert sarif_results
+        assert "<redacted>" in json.dumps(sarif_results)
+        assert token not in json.dumps(sarif_results)
+        assert token not in first.to_json()
+        assert token not in cached.to_json()
+        assert token not in cache_text
+        assert cache_stats["total_entries"] == 1
+        assert cache_stats["cache_hits"] == 1
+    finally:
+        reset_cache_manager()
+
+
 def test_flax_msgpack_stringifies_extension_metadata_keys(tmp_path: Path) -> None:
     path = tmp_path / "extension_key.msgpack"
     secret = "EXTKEYSECRET123456789"
@@ -1072,6 +1143,27 @@ def test_flax_msgpack_stringifies_extension_metadata_keys(tmp_path: Path) -> Non
     assert secret not in serialized
     assert "token=<redacted>" in serialized
     assert isinstance(result.metadata["top_level_keys"][0], str)
+
+
+@pytest.mark.parametrize(
+    ("extension_data", "expected_key"),
+    [
+        (b"token\xff=INVALIDEXTSECRET123456789", "<redacted>"),
+        (b"api_\x00key=CONTROLEXTSECRET123456789", "<redacted>"),
+    ],
+)
+def test_flax_msgpack_fails_closed_for_unsafe_extension_metadata_keys(
+    tmp_path: Path,
+    extension_data: bytes,
+    expected_key: str,
+) -> None:
+    path = tmp_path / "unsafe_extension_key.msgpack"
+    create_msgpack_file(path, {msgpack.ExtType(1, extension_data): b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.metadata["top_level_keys"] == [expected_key]
+    assert "EXTSECRET123456789" not in result.to_json()
 
 
 def test_flax_msgpack_detects_suspicious_bytes_keys(tmp_path: Path) -> None:

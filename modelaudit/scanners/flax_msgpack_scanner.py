@@ -37,16 +37,36 @@ def _stringify_evidence_fragment(value: Any) -> str:
     return str(value)
 
 
+def _stringify_safe_evidence_fragment(value: Any) -> str:
+    if HAS_MSGPACK and isinstance(value, msgpack.ExtType):
+        try:
+            decoded_data = value.data.decode("utf-8")
+        except UnicodeDecodeError:
+            return REDACTED_EVIDENCE_VALUE
+        if not decoded_data.isprintable():
+            return REDACTED_EVIDENCE_VALUE
+        return f"ExtType(code={value.code}, data={decoded_data})"
+    if isinstance(value, bytes | bytearray):
+        try:
+            return bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return REDACTED_EVIDENCE_VALUE
+    return _stringify_evidence_fragment(value)
+
+
 def _join_evidence_path(path: str, key: Any) -> str:
-    key_str = _stringify_evidence_fragment(key)
+    key_str = _stringify_safe_evidence_fragment(key)
     return f"{path}/{key_str}" if path else key_str
 
 
 def _redact_evidence_fragment(value: Any, max_chars: int) -> str:
-    text = _stringify_evidence_fragment(value)
+    text = _stringify_safe_evidence_fragment(value)
+    if text == REDACTED_EVIDENCE_VALUE:
+        return text
     if len(text) > _EVIDENCE_REDACTION_INPUT_CHARS:
         return REDACTED_EVIDENCE_VALUE
-    return redact_evidence_string(text, max_chars=max_chars)
+    redacted = redact_evidence_string(text, max_chars=max_chars)
+    return redacted.replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
 
 def _redact_evidence_location(location: Any) -> str:
