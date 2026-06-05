@@ -117,11 +117,14 @@ DOCUMENTATION_PRIVILEGE_WRAPPER = (
     rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
+DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
+    DOCUMENTATION_SHELL_WRAPPERS + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER + DOCUMENTATION_SHELL_WRAPPERS
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_SHELL_WRAPPERS
-    + rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
-    rb"(?:(?:\$\(|`)\s*)?"
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
@@ -129,20 +132,20 @@ DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
 )
 DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     rb"(?:^|[;&|]\s*)"
-    + DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
     + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
-    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPERS + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
     + rb"(?:"
     rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
     rb"|pipx\s+install"
@@ -234,10 +237,16 @@ class TextScanner(BaseScanner):
         super().__init__(config)
 
     @classmethod
+    def _is_readme_documentation_filename(cls, filename: str) -> bool:
+        return filename == "readme" or (
+            filename.startswith("readme.") and os.path.splitext(filename)[1].lower() in cls.supported_extensions
+        )
+
+    @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if filename in {"readme", "model_card"} or filename.startswith("readme."):
+        if filename == "model_card" or cls._is_readme_documentation_filename(filename):
             return True
 
         ext = os.path.splitext(path)[1].lower()
@@ -285,10 +294,10 @@ class TextScanner(BaseScanner):
             DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS,
         )
 
-    @staticmethod
-    def _is_documentation_sidecar(path: str) -> bool:
+    @classmethod
+    def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return filename in DOCUMENTATION_TEXT_FILENAMES or filename.startswith("readme.")
+        return filename in DOCUMENTATION_TEXT_FILENAMES or cls._is_readme_documentation_filename(filename)
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -648,7 +657,6 @@ class TextScanner(BaseScanner):
             return False
         try:
             raw_url = urlsplit(raw_url_match.group().decode("utf-8", errors="ignore"))
-            raw_port = raw_url.port
             if raw_url.username is not None or raw_url.password is not None:
                 return False
             if any(
@@ -656,12 +664,13 @@ class TextScanner(BaseScanner):
                 for key, _value in parse_qsl(raw_url.query, keep_blank_values=True)
             ):
                 return False
+            if stripped.startswith(b"#"):
+                return True
+            raw_port = raw_url.port
         except ValueError:
             return False
         if raw_url.hostname is None or raw_url.hostname.casefold() not in TRUSTED_REQUIREMENTS_HOSTS:
             return False
-        if stripped.startswith(b"#"):
-            return True
         if raw_url.scheme.casefold() != "https" or raw_port not in {None, 443}:
             return False
         return (
