@@ -619,11 +619,18 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
     cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
+    swap_blocked = {"value": False}
 
     def scan(path: str) -> dict[str, Any]:
         calls["count"] += 1
         if calls["count"] == 1:
-            live_root.rename(held_root)
+            try:
+                live_root.rename(held_root)
+            except PermissionError:
+                if os.name != "nt":
+                    raise
+                swap_blocked["value"] = True
+                return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
             decoy_root.rename(live_root)
             prefix = Path(path).read_bytes()[:6].decode("utf-8")
             live_root.rename(decoy_root)
@@ -635,12 +642,17 @@ def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_pa
         return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
 
     first = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
-    assert cache_manager.get_stats()["total_entries"] == 0
+    if os.name == "nt":
+        assert swap_blocked["value"] is True
+        assert cache_manager.get_stats()["total_entries"] == 1
+    else:
+        assert swap_blocked["value"] is False
+        assert cache_manager.get_stats()["total_entries"] == 0
     second = cache_manager.cached_scan(str(malicious_path), scan, version_context=version_context)
 
-    assert first["payload_prefix"] == "clean:"
+    assert first["payload_prefix"] == ("evil!:" if os.name == "nt" else "clean:")
     assert second["payload_prefix"] == "evil!:"
-    assert calls["count"] == 2
+    assert calls["count"] == (1 if os.name == "nt" else 2)
     assert cache_manager.get_stats()["total_entries"] == 1
 
 
