@@ -256,6 +256,7 @@ class PyTorchZipScanner(BaseScanner):
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
     BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
     ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
+    LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -707,6 +708,10 @@ class PyTorchZipScanner(BaseScanner):
         reasons = result.metadata.get("scan_outcome_reasons")
         return isinstance(reasons, list) and cls.ENTRY_LIMIT_INCONCLUSIVE_REASON in reasons
 
+    @classmethod
+    def _local_entry_limit_exceeded(cls, result: ScanResult) -> bool:
+        return result.metadata.get(cls.LOCAL_ENTRY_LIMIT_METADATA_KEY) is True
+
     def _validate_zip_entries(
         self,
         zip_file: zipfile.ZipFile,
@@ -733,6 +738,7 @@ class PyTorchZipScanner(BaseScanner):
             entries_to_process = archive_entries[: self.max_archive_entries]
             dropped_entry_count = entry_count - len(entries_to_process)
             mark_inconclusive_scan_result(result, self.ENTRY_LIMIT_INCONCLUSIVE_REASON)
+            result.metadata[self.LOCAL_ENTRY_LIMIT_METADATA_KEY] = True
             entry_summary_details = {
                 "entries_checked": len(entries_to_process),
                 "total_entries": entry_count,
@@ -788,13 +794,15 @@ class PyTorchZipScanner(BaseScanner):
                     (info.external_attr >> 16) & 0o170000,
                 )
                 if current_signature != previous_signature:
+                    coverage_message = (
+                        "all processed copies will be scanned explicitly; later archive entries remain uninspected"
+                        if entry_limit_exceeded
+                        else "all copies will be scanned explicitly"
+                    )
                     result.add_check(
                         name="Duplicate ZIP Entry Collision",
                         passed=False,
-                        message=(
-                            f"Duplicate archive entry {name} has conflicting metadata; "
-                            "all copies will be scanned explicitly"
-                        ),
+                        message=(f"Duplicate archive entry {name} has conflicting metadata; {coverage_message}"),
                         severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
                         details={
@@ -2072,7 +2080,7 @@ class PyTorchZipScanner(BaseScanner):
         """Validate that the PyTorch model has expected structure"""
         pickle_names = self._get_zip_member_names(pickle_files)
         if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_names]:
-            if self._entry_limit_exceeded(result):
+            if self._local_entry_limit_exceeded(result):
                 result.add_check(
                     name="PyTorch Structure Validation",
                     passed=False,

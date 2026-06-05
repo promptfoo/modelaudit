@@ -6505,6 +6505,24 @@ def test_pytorch_zip_entry_limit_reads_selected_symlink_duplicate(tmp_path: Path
     assert symlink_checks[0].details["target"] == str(symlink_target)
 
 
+def test_pytorch_zip_entry_limit_qualifies_duplicate_coverage(tmp_path: Path) -> None:
+    zip_path = tmp_path / "duplicate-coverage-after-limit.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("duplicate-entry", "first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zipf.writestr("duplicate-entry", "second")
+        zipf.writestr("late-entry", "omitted")
+
+    result = PyTorchZipScanner(config={"max_archive_entries": 2}).scan(str(zip_path))
+
+    duplicate_check = next(check for check in result.checks if check.name == "Duplicate ZIP Entry Collision")
+    assert duplicate_check.status == CheckStatus.FAILED
+    assert duplicate_check.message == (
+        "Duplicate archive entry duplicate-entry has conflicting metadata; "
+        "all processed copies will be scanned explicitly; later archive entries remain uninspected"
+    )
+
+
 def test_pytorch_zip_entry_limit_suppresses_archive_wide_clean_claims(tmp_path: Path) -> None:
     zip_path = tmp_path / "late-security-content.pt"
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -6727,6 +6745,16 @@ def test_pytorch_zip_nested_inconclusive_reason_propagates_to_parent() -> None:
     assert parent_result.metadata["nested_zip_scans"][0]["metadata"]["scan_outcome_reasons"] == [
         PyTorchZipScanner.ENTRY_LIMIT_INCONCLUSIVE_REASON
     ]
+
+    scanner = PyTorchZipScanner()
+    scanner.current_file_path = "parent.pt"
+    scanner._validate_pytorch_structure([], parent_result)
+
+    structure_check = next(check for check in parent_result.checks if check.name == "PyTorch Structure Validation")
+    assert structure_check.message == (
+        "PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models."
+    )
+    assert structure_check.details == {"missing_file": "data.pkl"}
 
 
 def test_pytorch_zip_scanner_checks_timeout_between_nested_archives(
