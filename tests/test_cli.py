@@ -640,7 +640,7 @@ def test_scan_output_file(tmp_path: Path) -> None:
     assert f"Results written to {output_file}" in result.output
 
 
-def test_scan_json_output_to_file(tmp_path):
+def test_scan_json_output_to_file(tmp_path: Path) -> None:
     """Test scanning with JSON output to a file - JSON should be valid and not mixed with progress."""
     test_file = tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
