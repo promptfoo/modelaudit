@@ -1053,23 +1053,25 @@ def test_cli_report_writers_fail_closed_without_secure_parent_primitive(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory sharing semantics are required")
+@pytest.mark.parametrize("output_name", ["scanners.json", "x"])
 def test_cli_report_writers_windows_guard_blocks_final_parent_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    output_name: str,
 ) -> None:
-    """A retained native directory handle must block the final parent-swap window."""
+    """The retained child lock must block the final parent-swap window."""
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     renamed_dir = tmp_path / "renamed"
-    output_path = output_dir / "scanners.json"
-    original_replace = cli_module.os.replace
+    output_path = output_dir / output_name
+    original_replace = cli_module._replace_windows_output_file
 
-    def attempt_parent_swap(source: Path, destination: Path) -> None:
+    def attempt_parent_swap(output: str, temp_fd: int, parent_handle: int, destination_name: str) -> None:
         with pytest.raises(OSError):
             output_dir.rename(renamed_dir)
-        original_replace(source, destination)
+        original_replace(output, temp_fd, parent_handle, destination_name)
 
-    monkeypatch.setattr(cli_module.os, "replace", attempt_parent_swap)
+    monkeypatch.setattr(cli_module, "_replace_windows_output_file", attempt_parent_swap)
 
     result = CliRunner().invoke(
         cli,

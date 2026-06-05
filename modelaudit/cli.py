@@ -167,7 +167,7 @@ def _directory_can_replace_entries(path: Path) -> bool:
 def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> int:
     """Pin a Windows output parent so path-based replacement cannot be redirected."""
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     class FileAttributeTagInfo(ctypes.Structure):
         _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
@@ -186,6 +186,7 @@ def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> 
     )
     create_file.restype = wintypes.HANDLE
 
+    file_traverse = 0x0020
     file_read_attributes = 0x0080
     file_share_read = 0x00000001
     file_share_write = 0x00000002
@@ -194,7 +195,7 @@ def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> 
     file_flag_open_reparse_point = 0x00200000
     handle = create_file(
         str(absolute_path.parent),
-        file_read_attributes,
+        file_traverse | file_read_attributes,
         file_share_read | file_share_write,
         None,
         open_existing,
@@ -246,7 +247,7 @@ def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> 
 def _close_windows_handle(handle: int) -> None:
     """Close a native Windows handle acquired for output-path protection."""
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     ctypes_windows: Any = ctypes
     kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
@@ -254,6 +255,195 @@ def _close_windows_handle(handle: int) -> None:
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
     close_handle(handle)
+
+
+def _windows_handle_identity(output_path: str, handle: int) -> tuple[int, int, int]:
+    """Return a stable volume and file identifier for a Windows handle."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    get_file_information = kernel32.GetFileInformationByHandle
+    get_file_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_file_information.restype = wintypes.BOOL
+    information = ByHandleFileInformation()
+    if not get_file_information(handle, ctypes.byref(information)):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to identify output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+    return information.volume_serial_number, information.file_index_high, information.file_index_low
+
+
+def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, parent_handle: int) -> int:
+    """Open a delete-on-close child that locks the validated Windows parent hierarchy."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    delete_access = 0x00010000
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    create_new = 1
+    file_attribute_temporary = 0x00000100
+    file_flag_delete_on_close = 0x04000000
+    lock_path = absolute_path.parent / f".modelaudit-output-{secrets.token_hex(12)}.lock"
+    lock_handle = create_file(
+        str(lock_path),
+        delete_access | file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        create_new,
+        file_attribute_temporary | file_flag_delete_on_close,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if lock_handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to lock output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    lock_handle_value = lock_handle if isinstance(lock_handle, int) else int(lock_handle.value)
+    verification_handle: int | None = None
+    try:
+        verification_handle = _open_windows_output_parent_guard(output_path, absolute_path)
+        if _windows_handle_identity(output_path, parent_handle) != _windows_handle_identity(
+            output_path,
+            verification_handle,
+        ):
+            raise _OutputWriteError(
+                f"Refusing to write output because its parent changed: {_display_path(output_path)}"
+            )
+        return lock_handle_value
+    except Exception:
+        _close_windows_handle(lock_handle_value)
+        raise
+    finally:
+        if verification_handle is not None:
+            _close_windows_handle(verification_handle)
+
+
+def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_name: str) -> tuple[int, Path]:
+    """Create a writable Windows temp file whose handle can be renamed securely."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    generic_write = 0x40000000
+    delete_access = 0x00010000
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_delete = 0x00000004
+    create_new = 1
+    file_attribute_temporary = 0x00000100
+    temp_path = absolute_path.parent / temp_name
+    temp_handle = create_file(
+        str(temp_path),
+        generic_write | delete_access | file_read_attributes,
+        file_share_read | file_share_delete,
+        None,
+        create_new,
+        file_attribute_temporary,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if temp_handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to create output temporary file for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    temp_handle_value = temp_handle if isinstance(temp_handle, int) else int(temp_handle.value)
+    try:
+        msvcrt_windows: Any = msvcrt
+        temp_fd = msvcrt_windows.open_osfhandle(temp_handle_value, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except Exception:
+        _close_windows_handle(temp_handle_value)
+        raise
+    return temp_fd, temp_path
+
+
+def _replace_windows_output_file(output_path: str, temp_fd: int, parent_handle: int, destination_name: str) -> None:
+    """Atomically install an open Windows temp file relative to the pinned parent handle."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    encoded_name = destination_name.encode("utf-16-le")
+    file_name_offset = FileRenameInfo.file_name.offset
+    buffer_size = ctypes.sizeof(FileRenameInfo) + len(encoded_name)
+    rename_buffer = ctypes.create_string_buffer(buffer_size)
+    rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
+    rename_info.flags = 0x00000001
+    rename_info.root_directory = parent_handle
+    rename_info.file_name_length = len(encoded_name)
+    ctypes.memmove(ctypes.addressof(rename_buffer) + file_name_offset, encoded_name, len(encoded_name))
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    set_file_information = kernel32.SetFileInformationByHandle
+    set_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_file_information.restype = wintypes.BOOL
+    file_rename_info_class = 3
+    msvcrt_windows: Any = msvcrt
+    temp_handle = msvcrt_windows.get_osfhandle(temp_fd)
+    if not set_file_information(temp_handle, file_rename_info_class, rename_buffer, buffer_size):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to write output {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
 
 
 def _validated_absolute_output_path(output_path: str) -> Path:
@@ -372,11 +562,15 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
     absolute_path: Path | None = None
     parent_fd: int | None = None
     parent_guard: int | None = None
+    parent_lock: int | None = None
     temp_fd: int | None = None
     temp_path: Path | None = None
     temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
     try:
         absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
+        if os.name == "nt":
+            assert parent_guard is not None
+            parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
         initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -384,7 +578,10 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         if nofollow:
             flags |= nofollow
 
-        if parent_fd is None:
+        if os.name == "nt":
+            temp_fd, temp_path = _open_windows_output_temp_file(output_path, absolute_path, temp_name)
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        elif parent_fd is None:
             temp_path = absolute_path.parent / temp_name
             temp_fd = os.open(temp_path, flags, 0o666)
             _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
@@ -394,11 +591,18 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         if initial_stat is not None and hasattr(os, "fchmod"):
             os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
 
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as output_file:
-            temp_fd = None
-            output_file.write(output_text)
-            if trailing_newline:
-                output_file.write("\n")
+        if os.name == "nt":
+            with os.fdopen(temp_fd, "w", encoding="utf-8", closefd=False) as output_file:
+                output_file.write(output_text)
+                if trailing_newline:
+                    output_file.write("\n")
+            os.fsync(temp_fd)
+        else:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as output_file:
+                temp_fd = None
+                output_file.write(output_text)
+                if trailing_newline:
+                    output_file.write("\n")
 
         if parent_fd is None:
             current_path = _validated_absolute_output_path(output_path)
@@ -411,7 +615,13 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         elif current_stat is None or not os.path.samestat(initial_stat, current_stat):
             raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
-        if parent_fd is None:
+        if os.name == "nt":
+            assert parent_guard is not None
+            assert temp_fd is not None
+            _replace_windows_output_file(output_path, temp_fd, parent_guard, absolute_path.name)
+            temp_path = None
+            temp_name = ""
+        elif parent_fd is None:
             assert temp_path is not None
             os.replace(temp_path, absolute_path)
             temp_path = None
@@ -433,6 +643,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         elif temp_path is not None:
             with contextlib.suppress(OSError):
                 temp_path.unlink()
+        if parent_lock is not None:
+            _close_windows_handle(parent_lock)
         if parent_guard is not None:
             _close_windows_handle(parent_guard)
 
