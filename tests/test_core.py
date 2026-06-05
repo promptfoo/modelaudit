@@ -3350,7 +3350,16 @@ def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
         return scanner.scan(path)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda _path: True)
+
+    def always_use_advanced_handler(
+        _path: str,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+    ) -> bool:
+        assert allowed_shard_paths is None
+        return True
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", always_use_advanced_handler)
     monkeypatch.setattr(core_module, "scan_advanced_large_file", scan_advanced_without_cache)
 
     result = scan_file(
