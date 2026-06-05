@@ -146,6 +146,14 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_SAVEDMODEL_META_GRAPHS = 64
+_MAX_SAVEDMODEL_GRAPH_NODES = 200_000
+_MAX_SAVEDMODEL_FUNCTIONS = 50_000
+_MAX_SAVEDMODEL_FUNCTION_NODES = 100_000
+_MAX_SAVEDMODEL_NODE_ATTRIBUTES = 1_000_000
+_MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES = 100_000
+_MAX_SAVEDMODEL_COLLECTIONS = 50_000
+_MAX_SAVEDMODEL_COLLECTION_VALUES = 100_000
 _MAX_KERAS_METADATA_PARSE_BYTES = _MAX_PROTOBUF_PARSE_BYTES
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD = 10_000
@@ -345,6 +353,26 @@ class SavedModelNodeContext:
     function_name: str | None = None
 
 
+@dataclass(frozen=True)
+class SavedModelGraphBudget:
+    """Bounded structure summary collected before graph traversal."""
+
+    meta_graph_count: int
+    graph_node_count: int
+    function_count: int
+    function_node_count: int
+    node_attribute_count: int
+    attribute_string_value_count: int
+    collection_count: int
+    collection_value_count: int
+    limit_reason: str | None = None
+    limit_name: str | None = None
+
+    @property
+    def exceeded(self) -> bool:
+        return self.limit_reason is not None
+
+
 class TensorFlowSavedModelScanner(BaseScanner):
     """Scanner for TensorFlow SavedModel format"""
 
@@ -395,6 +423,157 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 "exception_type": type(error).__name__,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": "savedmodel_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
+    @staticmethod
+    def _collect_graph_budget(saved_model: Any) -> SavedModelGraphBudget:
+        meta_graphs = getattr(saved_model, "meta_graphs", [])
+        meta_graph_count = len(meta_graphs)
+        graph_node_count = 0
+        function_count = 0
+        function_node_count = 0
+        node_attribute_count = 0
+        attribute_string_value_count = 0
+        collection_count = 0
+        collection_value_count = 0
+
+        def budget(
+            limit_reason: str | None = None,
+            limit_name: str | None = None,
+        ) -> SavedModelGraphBudget:
+            return SavedModelGraphBudget(
+                meta_graph_count=meta_graph_count,
+                graph_node_count=graph_node_count,
+                function_count=function_count,
+                function_node_count=function_node_count,
+                node_attribute_count=node_attribute_count,
+                attribute_string_value_count=attribute_string_value_count,
+                collection_count=collection_count,
+                collection_value_count=collection_value_count,
+                limit_reason=limit_reason,
+                limit_name=limit_name,
+            )
+
+        def collect_node_attributes(nodes: Any) -> SavedModelGraphBudget | None:
+            nonlocal node_attribute_count, attribute_string_value_count
+
+            for node in nodes:
+                attributes = getattr(node, "attr", {})
+                node_attribute_count += len(attributes)
+                if node_attribute_count > _MAX_SAVEDMODEL_NODE_ATTRIBUTES:
+                    return budget("node_attribute_limit_exceeded", "node_attribute_count")
+
+                for attribute in attributes.values():
+                    value_kind = attribute.WhichOneof("value")
+                    if value_kind == "s":
+                        attribute_string_value_count += 1
+                    elif value_kind == "list":
+                        attribute_string_value_count += len(attribute.list.s)
+                    if attribute_string_value_count > _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES:
+                        return budget("attribute_string_value_limit_exceeded", "attribute_string_value_count")
+
+            return None
+
+        if meta_graph_count > _MAX_SAVEDMODEL_META_GRAPHS:
+            return budget("meta_graph_limit_exceeded", "meta_graph_count")
+
+        for meta_graph in meta_graphs:
+            graph_def = meta_graph.graph_def
+            graph_node_count += len(graph_def.node)
+            if graph_node_count > _MAX_SAVEDMODEL_GRAPH_NODES:
+                return budget("graph_node_limit_exceeded", "graph_node_count")
+            if node_budget := collect_node_attributes(graph_def.node):
+                return node_budget
+
+            collections = getattr(meta_graph, "collection_def", {})
+            collection_count += len(collections)
+            if collection_count > _MAX_SAVEDMODEL_COLLECTIONS:
+                return budget("collection_limit_exceeded", "collection_count")
+            for collection in collections.values():
+                collection_value_count += len(collection.bytes_list.value)
+                if collection_value_count > _MAX_SAVEDMODEL_COLLECTION_VALUES:
+                    return budget("collection_value_limit_exceeded", "collection_value_count")
+
+            function_library = getattr(graph_def, "library", None)
+            if function_library is None:
+                continue
+
+            functions = getattr(function_library, "function", [])
+            function_count += len(functions)
+            if function_count > _MAX_SAVEDMODEL_FUNCTIONS:
+                return budget("function_limit_exceeded", "function_count")
+
+            for function_def in functions:
+                function_node_count += len(function_def.node_def)
+                if function_node_count > _MAX_SAVEDMODEL_FUNCTION_NODES:
+                    return budget("function_node_limit_exceeded", "function_node_count")
+                if node_budget := collect_node_attributes(function_def.node_def):
+                    return node_budget
+
+        return budget()
+
+    def _record_graph_budget_metadata(self, result: ScanResult, budget: SavedModelGraphBudget) -> None:
+        result.metadata.update(
+            {
+                "meta_graph_count": budget.meta_graph_count,
+                "graph_node_count": budget.graph_node_count,
+                "function_count": budget.function_count,
+                "function_node_count": budget.function_node_count,
+                "node_attribute_count": budget.node_attribute_count,
+                "attribute_string_value_count": budget.attribute_string_value_count,
+                "collection_count": budget.collection_count,
+                "collection_value_count": budget.collection_value_count,
+                "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
+                "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
+                "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
+                "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+                "max_node_attributes": _MAX_SAVEDMODEL_NODE_ATTRIBUTES,
+                "max_attribute_string_values": _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES,
+                "max_collections": _MAX_SAVEDMODEL_COLLECTIONS,
+                "max_collection_values": _MAX_SAVEDMODEL_COLLECTION_VALUES,
+            }
+        )
+
+    def _finish_graph_budget_failure(
+        self,
+        result: ScanResult,
+        path: str,
+        budget: SavedModelGraphBudget,
+    ) -> ScanResult:
+        reason = "savedmodel_graph_traversal_budget_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        self._record_graph_budget_metadata(result, budget)
+        result.add_check(
+            name="SavedModel Graph Traversal Budget",
+            passed=False,
+            message="SavedModel graph structure exceeds bounded traversal budget",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "limit_reason": budget.limit_reason,
+                "limit_name": budget.limit_name,
+                "meta_graph_count": budget.meta_graph_count,
+                "graph_node_count": budget.graph_node_count,
+                "function_count": budget.function_count,
+                "function_node_count": budget.function_node_count,
+                "node_attribute_count": budget.node_attribute_count,
+                "attribute_string_value_count": budget.attribute_string_value_count,
+                "collection_count": budget.collection_count,
+                "collection_value_count": budget.collection_value_count,
+                "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
+                "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
+                "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
+                "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+                "max_node_attributes": _MAX_SAVEDMODEL_NODE_ATTRIBUTES,
+                "max_attribute_string_values": _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES,
+                "max_collections": _MAX_SAVEDMODEL_COLLECTIONS,
+                "max_collection_values": _MAX_SAVEDMODEL_COLLECTION_VALUES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
             },
         )
         result.finish(success=False)
@@ -577,6 +756,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 saved_model = SavedModel()
                 saved_model.ParseFromString(content)
+                graph_budget = self._collect_graph_budget(saved_model)
+                if graph_budget.exceeded:
+                    return self._finish_graph_budget_failure(result, path, graph_budget)
+                self._record_graph_budget_metadata(result, graph_budget)
+
                 for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(
                         name="TensorFlow Operation Security Check",
