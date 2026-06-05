@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import collections
@@ -9,17 +10,23 @@ import datetime
 import decimal
 import faulthandler
 import functools
+import importlib
 import io
 import logging
 import os
 import pickle
+import py_compile
 import re
+import subprocess
 import sys
 import tarfile
 import uuid
 import warnings
 import zipfile
+from importlib.abc import Loader
+from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import cast
 
 import pytest
@@ -40,8 +47,10 @@ from modelaudit_picklescan import (
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
+    UnanalyzedCallGraphReference,
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
+    _clear_source_sensitive_caches,
     find_startup_hook_write_call_graphs,
 )
 
@@ -1432,7 +1441,14 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
-@pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
+@pytest.mark.parametrize(
+    "metadata_key",
+    [
+        "import_references_truncated",
+        "callable_invocations_truncated",
+        "non_allowlisted_global_imports_truncated",
+    ],
+)
 def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metadata_key: str) -> None:
     pickle_entry = zipfile.ZipInfo("archive/data.pkl")
     member_report = PickleReport(
@@ -2707,6 +2723,16 @@ def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
     assert report.findings == ()
 
 
+def test_scan_bytes_allows_python313_pathlib_local_pure_path_constructor() -> None:
+    payload = b"\x80\x04cpathlib._local\nPurePosixPath\n" + _binunicode(b"model.bin") + b"\x85R."
+
+    report = scan_bytes(payload, source="python313-pathlib-local-constructor.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 @pytest.mark.parametrize(
     ("module", "name", "expected_reference"),
     [
@@ -3464,25 +3490,105 @@ def test_scan_bytes_detects_copyreg_dispatch_table_erasure() -> None:
         copyreg.dispatch_table.update(original_dispatch_table)
 
 
-def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
+def test_scan_bytes_allows_trusted_dill_dump_import_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("dill", "dump"),
+    )
+
+    report = scan_bytes(b"cdill\ndump\n.", source="dill-dump-import-only.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_requires_source_analysis_for_invoked_trusted_dill_dump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = b"\x80\x02cdill\ndump\n(tR."
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("dill", "dump"),
+    )
 
     report = scan_bytes(payload, source="dill-dump.pkl")
 
-    assert report.findings == ()
     source_reason = _call_graph_source_unavailable_reason("dill")
     if source_reason is None:
+        assert report.findings == ()
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.CLEAN
     else:
         assert report.status == ScanStatus.INCONCLUSIVE
-        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+            for finding in report.findings
+        )
         assert any(
             notice.code == "call_graph_source_unavailable"
             and notice.details.get("import_reference") == "dill.dump"
             and notice.details.get("reason") == source_reason
             for notice in report.notices
         )
+
+
+def test_scan_bytes_warns_when_invoked_dill_dump_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-dill-dump-marker"
+    (tmp_path / "dill.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\ndef dump():\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(b"\x80\x02cdill\ndump\n(tR.", source="shadowed-dill-dump.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._resolve_module_source",
+        lambda _module_name: None,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(b"\x80\x02cdill\ndump\n(tR.", source="unresolved-dill-dump.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "call_graph_source_unavailable"
+        and notice.details.get("import_reference") == "dill.dump"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
 
 
 def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
@@ -3823,8 +3929,1599 @@ def test_scan_bytes_resolves_short_binstring_stack_global_operands() -> None:
             "opcode": "STACK_GLOBAL",
             "position": 28,
             "is_dangerous": False,
+            "requires_origin_verification": True,
         }
     ]
+
+
+def test_scan_bytes_warns_on_import_only_custom_global_that_executes_module_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "import_only_global_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(str(source_path), cfile=str(tmp_path / f"{module_name}.pyc"), doraise=True)
+    source_path.unlink()
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_on_source_available_import_only_custom_global(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_source_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "source_available_import_only_global_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_source_available_import_only_global_with_inert_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_inert_source_payload_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\n\nclass Gadget:\n    value = ('safe', os.sep)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_uses_current_import_origin_instead_of_stale_loaded_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stale_loaded_source_{uuid.uuid4().hex}"
+    loaded_dir = tmp_path / "loaded"
+    active_dir = tmp_path / "active"
+    loaded_dir.mkdir()
+    active_dir.mkdir()
+    marker = tmp_path / "stale_loaded_source_marker"
+    (loaded_dir / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    (active_dir / f"{module_name}.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(loaded_dir))
+    importlib.invalidate_caches()
+    imported_module = importlib.import_module(module_name)
+    assert Path(cast(str, imported_module.__file__)).parent == loaded_dir
+    monkeypatch.syspath_prepend(str(active_dir))
+    importlib.invalidate_caches()
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        sys.modules.pop(module_name, None)
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_allows_inert_source_with_future_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_future_import_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from __future__ import annotations\n\nclass Gadget:\n    value: MissingType\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_package_shadows_inert_module_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_package_shadow_{uuid.uuid4().hex}"
+    marker = tmp_path / "package_shadow_marker"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    package_dir = tmp_path / module_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(not EXTENSION_SUFFIXES, reason="Python runtime has no native extension suffix")
+def test_scan_bytes_warns_when_native_extension_shadows_inert_module_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_extension_shadow_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    (tmp_path / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not-a-loadable-extension")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_when_meta_path_finder_shadows_framework_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "meta_path_framework_shadow_marker"
+
+    class ShadowLoader(Loader):
+        def create_module(self, _spec: ModuleSpec) -> ModuleType | None:
+            return None
+
+        def exec_module(self, module: ModuleType) -> None:
+            if module.__name__ == "torch._utils":
+                marker.write_text("owned", encoding="utf-8")
+                module.__dict__["_rebuild_tensor_v2"] = object()
+
+    class ShadowFinder:
+        def find_spec(
+            self,
+            fullname: str,
+            _path: object = None,
+            _target: object = None,
+        ) -> ModuleSpec | None:
+            if fullname == "torch":
+                return ModuleSpec(
+                    fullname,
+                    ShadowLoader(),
+                    origin=str(tmp_path / "torch" / "__init__.py"),
+                    is_package=True,
+                )
+            if fullname == "torch._utils":
+                return ModuleSpec(
+                    fullname,
+                    ShadowLoader(),
+                    origin=str(tmp_path / "torch" / "_utils.py"),
+                )
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [ShadowFinder(), *sys.meta_path])
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
+
+    report = scan_bytes(payload, source="meta-path-shadowed-framework.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.skipif(not EXTENSION_SUFFIXES, reason="Python runtime has no native extension suffix")
+def test_scan_bytes_fails_closed_when_native_extension_appears_during_source_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_extension_race_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    extension_path = tmp_path / f"{module_name}{EXTENSION_SUFFIXES[0]}"
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+    real_ensure_stable = package_api._ensure_shared_source_snapshot_stable
+    extension_created = False
+
+    def create_extension_before_completion_check(report_generation: int | None) -> None:
+        nonlocal extension_created
+        if not extension_created:
+            extension_path.write_bytes(b"not-a-loadable-extension")
+            extension_created = True
+        real_ensure_stable(report_generation)
+
+    monkeypatch.setattr(
+        package_api,
+        "_ensure_shared_source_snapshot_stable",
+        create_extension_before_completion_check,
+    )
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert extension_created is True
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in report.errors)
+
+
+@pytest.mark.parametrize(
+    ("stdlib_module", "shadow_module", "shadow_source"),
+    [
+        (
+            "pathlib",
+            "fnmatch",
+            "def fnmatch(name, pattern): return False\n"
+            "def fnmatchcase(name, pattern): return False\n"
+            "def translate(pattern): return 'a_a'\n",
+        ),
+        (
+            "subprocess",
+            "selectors",
+            "class SelectSelector: pass\nclass PollSelector: pass\n",
+        ),
+    ],
+)
+def test_scan_bytes_warns_when_inert_source_imports_transitively_shadowable_stdlib_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdlib_module: str,
+    shadow_module: str,
+    shadow_source: str,
+) -> None:
+    module_name = f"modelaudit_c095_transitive_shadow_{uuid.uuid4().hex}"
+    marker = tmp_path / f"{shadow_module}_shadow_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import {stdlib_module}\n\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{shadow_module}.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n{shadow_source}",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_source_module_imports_side_effectful_stdlib_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stdlib_side_effect_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import antigravity\n\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_when_unchecked_hash_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_unchecked_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "unchecked_hash_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_checks_source_local_cache_with_pycache_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_prefixed_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "prefixed_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "scanner-cache"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        monkeypatch.setattr(sys, "pycache_prefix", None)
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_timestamp_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "timestamp_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_optimized_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "optimized_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        optimize=1,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-O", "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_higher_optimized_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_higher_optimized_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "higher_optimized_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    compile_module = f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import {module_name}"
+    subprocess.run([sys.executable, "-OOO", "-c", compile_module], check=True)
+    marker.unlink()
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-OOO", "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_checked_hash_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_checked_cache_override_{uuid.uuid4().hex}"
+    marker = tmp_path / "checked_hash_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run(
+        [sys.executable, "--check-hash-based-pycs", "never", "-c", load_payload],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.parametrize("optimization_suffix", ["", ".opt-1", ".opt-2", ".opt-3"])
+def test_scan_bytes_warns_when_other_cpython_cache_targets_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optimization_suffix: str,
+) -> None:
+    module_name = f"modelaudit_c095_other_cpython_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    compiled_path = py_compile.compile(str(source_path), doraise=True)
+    assert compiled_path is not None
+    cache_path = Path(compiled_path)
+    current_tag = sys.implementation.cache_tag
+    assert current_tag is not None and current_tag.startswith("cpython-")
+    other_tag = "cpython-313" if current_tag != "cpython-313" else "cpython-312"
+    other_cache_name = cache_path.name.replace(current_tag, other_tag, 1).replace(
+        ".pyc",
+        f"{optimization_suffix}.pyc",
+    )
+    other_cache_path = cache_path.with_name(other_cache_name)
+    cache_path.replace(other_cache_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_inert_source_with_unrelated_cross_version_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_unrelated_cross_version_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    cache_directory = tmp_path / "__pycache__"
+    cache_directory.mkdir()
+    (cache_directory / "other_module.cpython-313.pyc").write_bytes(b"unrelated")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_allows_inert_source_with_stale_timestamp_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stale_timestamp_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("raise RuntimeError('stale cache executed')\nclass Gadget:\n    pass\n", encoding="utf-8")
+    fixed_mtime = 1_700_000_000
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    os.utime(source_path, (fixed_mtime + 2, fixed_mtime + 2))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_allows_inert_source_with_checked_hash_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_checked_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_allows_inert_source_with_nonimportable_unchecked_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_invalid_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    compiled_path = py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    assert compiled_path is not None
+    cache_path = Path(compiled_path)
+    cache_bytes = cache_path.read_bytes()
+    cache_path.write_bytes(b"BAD!" + cache_bytes[4:])
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_inert_invoked_payload_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n)R.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("invoked") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_when_invoked_custom_function_mutates_process_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_process_state_{uuid.uuid4().hex}"
+    environment_key = f"MODELAUDIT_C095_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import os\ndef Gadget():\n    os.environ[{environment_key!r}] = 'owned'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delenv(environment_key, raising=False)
+    payload = f"c{module_name}\nGadget\n)R.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert environment_key not in os.environ
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("invoked") is True
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert os.environ[environment_key] == "owned"
+
+
+def test_scan_bytes_keeps_each_repeated_global_invocation_under_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_repeated_invocation_{uuid.uuid4().hex}"
+    marker = tmp_path / "repeated_invocation_marker"
+    constructor_payload = f"open({str(marker)!r}, 'w').write('owned')"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __init__(self):\n"
+        f"        exec({constructor_payload!r})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    global_opcode = f"c{module_name}\nGadget\n".encode()
+    payload = b"\x80\x04" + global_opcode + b")\x810" + global_opcode + b")R."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert len(report.metadata["callable_invocations"]) == 2
+    assert {invocation["opcode"] for invocation in report.metadata["callable_invocations"]} == {
+        "NEWOBJ",
+        "REDUCE",
+    }
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.exec"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_blocks_build_slot_state_setattr_rce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_setattr_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_setattr_marker"
+    setattr_payload = f"open({str(marker)!r}, 'w').write(value)"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value',)\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        exec({setattr_payload!r})\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert any(
+        invocation.get("opcode") == "BUILD" and invocation.get("build_uses_slot_state") is True
+        for invocation in report.metadata["callable_invocations"]
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.exec"
+        and finding.details.get("call_path", ())[0].endswith("Gadget.__setattr__")
+        for finding in report.findings
+    )
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_blocks_build_slot_state_setattr_import_rce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_setattr_import_{uuid.uuid4().hex}"
+    imported_module = f"modelaudit_c095_build_setattr_target_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_setattr_import_marker"
+    (tmp_path / f"{imported_module}.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value',)\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        import {imported_module}\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.__import__"
+        and finding.details.get("call_path", ())[0].endswith("Gadget.__setattr__")
+        for finding in report.findings
+    )
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(imported_module, None)
+
+
+def test_scan_bytes_keeps_build_dict_state_under_review_without_calling_setattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_dict_setattr_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_dict_setattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        open({str(marker)!r}, 'w').write(value)\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81}\x8c\x05value\x8c\x05ownedsb."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        invocation.get("opcode") == "BUILD" and invocation.get("build_uses_slot_state") is False
+        for invocation in report.metadata["callable_invocations"]
+    )
+    assert all(finding.rule_code != "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    try:
+        gadget = pickle.loads(payload)
+        assert gadget.value == "owned"
+        assert marker.exists() is False
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_preserves_distinct_build_state_invocations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_state_variants_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_state_variants_marker"
+    setattr_payload = f"open({str(marker)!r}, 'w').write(value)"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value', '__dict__')\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        exec({setattr_payload!r})\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    global_opcode = f"c{module_name}\nGadget\n".encode()
+    direct_dict_state = b")\x81}\x8c\x05value\x8c\x04safesb0"
+    slot_state = b"h\x00)\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+    payload = b"\x80\x04" + global_opcode + b"\x94" + direct_dict_state + slot_state
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    build_invocations = [
+        invocation for invocation in report.metadata["callable_invocations"] if invocation.get("opcode") == "BUILD"
+    ]
+    assert {invocation.get("build_uses_slot_state") for invocation in build_invocations} == {
+        False,
+        True,
+    }
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_allows_import_only_global_with_inert_package_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = f"modelaudit_c095_inert_package_{uuid.uuid4().hex}"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("PACKAGE_NAME = 'safe'\n", encoding="utf-8")
+    (package_dir / "payload.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{package_name}.payload\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{package_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_package_path_rewrite_redirects_submodule_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = f"modelaudit_c095_path_rewrite_{uuid.uuid4().hex}"
+    package_dir = tmp_path / package_name
+    redirected_dir = tmp_path / "redirected"
+    package_dir.mkdir()
+    redirected_dir.mkdir()
+    marker = tmp_path / "package_path_rewrite_marker"
+    (package_dir / "__init__.py").write_text(
+        f"__path__ = [{str(redirected_dir)!r}]\n",
+        encoding="utf-8",
+    )
+    (package_dir / "payload.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    (redirected_dir / "payload.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module_name = f"{package_name}.payload"
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{package_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(package_name, None)
+
+
+def test_scan_bytes_warns_when_parent_package_initialization_is_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = f"modelaudit_c095_active_package_{uuid.uuid4().hex}"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    marker = tmp_path / "parent_package_initialization_marker"
+    (package_dir / "__init__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n",
+        encoding="utf-8",
+    )
+    (package_dir / "payload.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{package_name}.payload\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{package_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_inert_source_module_defines_getattr_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_getattr_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "module_getattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"def __getattr__(name):\n    open({str(marker)!r}, 'w').write(name)\n    return object\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_inert_source_module_assigns_getattr_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_assigned_getattr_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "assigned_module_getattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"__getattr__ = lambda name: open({str(marker)!r}, 'w').write(name) or object\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_inert_source_module_destructures_getattr_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_destructured_getattr_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "destructured_module_getattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"(__getattr__,) = (lambda name: open({str(marker)!r}, 'w').write(name) and object,)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert pickle.loads(payload) is object
+    assert marker.read_text(encoding="utf-8") == "Gadget"
+
+
+def test_scan_bytes_warns_when_inert_source_imports_shadowed_stdlib_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_shadowed_import_{uuid.uuid4().hex}"
+    marker = tmp_path / "shadowed_stdlib_import_marker"
+    (tmp_path / "pathlib.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        "import pathlib\n\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_source_module_uses_wildcard_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_wildcard_import_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from pathlib import *\n\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_known_safe_reference_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed_known_reference_marker"
+    (tmp_path / "string.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Template:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(b"cstring\nTemplate\n.", source="shadowed-string-template.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "string.Template"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_trusted_argparse_namespace() -> None:
+    payload = pickle.dumps(argparse.Namespace(value="safe"), protocol=4)
+
+    report = scan_bytes(payload, source="argparse-namespace.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_warns_when_argparse_namespace_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed_argparse_namespace_marker"
+    (tmp_path / "argparse.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Namespace:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = pickle.dumps(argparse.Namespace(value="safe"), protocol=4)
+
+    report = scan_bytes(payload, source="shadowed-argparse-namespace.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "argparse.Namespace"
+        for finding in report.findings
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})",
+        ],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_allowlisted_module_resolves_from_inactive_fake_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_root = tmp_path / "fakeenv"
+    site_packages = (
+        environment_root / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    site_packages.mkdir(parents=True)
+    (environment_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    marker = tmp_path / "shadowed_allowlisted_module_marker"
+    (site_packages / "numpy.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    dist_info = site_packages / "numpy-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: numpy\nVersion: 1.0\n", encoding="utf-8")
+    (dist_info / "top_level.txt").write_text("numpy\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(site_packages))
+    payload = b"cnumpy\nGadget\n."
+
+    report = scan_bytes(payload, source="shadowed-numpy-gadget.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(site_packages)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "disabled-enrichment-shadow-marker"
+    (tmp_path / "numpy.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"cnumpy\nGadget\n."
+
+    report = scan_bytes(
+        payload,
+        source="disabled-enrichment-shadow-numpy.pkl",
+        enrich_call_graph=False,
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled() -> None:
+    report = scan_bytes(
+        b"ccollections\nOrderedDict\n.",
+        source="disabled-enrichment-ordered-dict.pkl",
+        enrich_call_graph=False,
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed_dunder_builtins_marker"
+    (tmp_path / "__builtins__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"c__builtins__\nGadget\n."
+
+    try:
+        report = scan_bytes(payload, source="shadowed-dunder-builtins-gadget.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == "__builtins__.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop("__builtins__", None)
+
+
+def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(b"cnumpy\nGadget\n.", source="unresolved-numpy-gadget.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+    ],
+)
+def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+
+    report = scan_bytes(f"c{module}\n{name}\n.".encode(), source="unresolved-framework-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_keeps_invoked_unresolved_framework_reconstruction_global_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+
+    report = scan_bytes(
+        b"ctorch._utils\n_rebuild_tensor_v2\n)R.",
+        source="invoked-unresolved-framework-global.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-framework-reconstruction-marker"
+    package_dir = tmp_path / "torch"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "_utils.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\ndef _rebuild_tensor_v2():\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_source_sensitive_caches()
+    payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
+
+    report = scan_bytes(payload, source="shadowed-framework-reconstruction.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", f"import pickle; pickle.loads({payload!r})"],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_on_unresolved_import_only_custom_global() -> None:
+    module_name = f"modelaudit_c095_missing_payload_{uuid.uuid4().hex}"
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_unresolved_reviewed_optional_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(package_api, "import_only_reference_is_proven_trusted", lambda *_args: False)
+
+    report = scan_bytes(
+        b"cbotocore.credentials\nProcessProvider\n.",
+        source="unresolved-reviewed-optional-global.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "botocore.credentials.ProcessProvider"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_invoked_non_allowlisted_custom_global() -> None:
+    report = scan_bytes(b"cprivate_payload\nGadget\n)R.", source="invoked-custom-global.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "private_payload.Gadget"
+        for finding in report.findings
+    )
+    assert all(finding.rule_code != "DANGEROUS_CALL" for finding in report.findings)
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_analysis() -> None:
+    report = scan_bytes(
+        b"c_xxsubinterpreters\ncreate\n)R.",
+        source="invoked-trusted-native-global.pkl",
+    )
+
+    source_unavailable = _call_graph_source_unavailable_reason("_xxsubinterpreters") is not None
+    assert report.status == (ScanStatus.INCONCLUSIVE if source_unavailable else ScanStatus.COMPLETE)
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "_xxsubinterpreters.create"
+        for finding in report.findings
+    )
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices) is source_unavailable
+
+
+@pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])
+def test_scan_bytes_warns_on_unreviewed_name_from_module_with_dangerous_entries(module: str) -> None:
+    report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="dangerous-module-sibling.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_unreviewed_submodule_of_allowlisted_package() -> None:
+    report = scan_bytes(b"cnumpy.evil\nGadget\n.", source="numpy-evil.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.evil.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
+    payload = b"ccollections\nOrderedDict\n."
+
+    report = scan_bytes(payload, source="ordered-dict-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        ref["import_reference"] == "collections.OrderedDict" and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "import_reference"),
+    [
+        (b"ccopy_reg\n_reconstructor\n.", "copy_reg._reconstructor"),
+        (b"cexceptions\nValueError\n.", "exceptions.ValueError"),
+        (b"cexceptions\nWindowsError\n.", "exceptions.WindowsError"),
+    ],
+)
+def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
+    report = scan_bytes(payload, source="legacy-python-two-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert any(
+        ref["import_reference"] == import_reference and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
+
+
+def test_scan_bytes_keeps_copy_reg_compat_alias_clean_when_local_module_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "copy_reg_shadow_marker"
+    (tmp_path / "copy_reg.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n_reconstructor = object()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"ccopy_reg\n_reconstructor\n."
+
+    try:
+        report = scan_bytes(payload, source="copy-reg-compat-shadow.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+        assert marker.exists() is False
+        assert pickle.loads(payload) is vars(copyreg)["_reconstructor"]
+        assert marker.exists() is False
+    finally:
+        sys.modules.pop("copy_reg", None)
+
+
+@pytest.mark.parametrize("module", ["copy_reg", "exceptions"])
+def test_scan_bytes_warns_on_unknown_legacy_compat_global(module: str) -> None:
+    report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="unknown-legacy-compat-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.Gadget"
+        for finding in report.findings
+    )
 
 
 def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> None:
@@ -3890,6 +5587,64 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated is report
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
+
+
+def test_scan_bytes_skips_call_graph_enrichment_without_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_enrichment(_report: PickleReport) -> PickleReport:
+        raise AssertionError("reference-free reports should not enter call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    report = scan_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4), source="no-references.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_enrichment(_report: PickleReport) -> PickleReport:
+        raise AssertionError("critical references should not enter redundant call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    report = scan_bytes(pickle.dumps(MaliciousPayload(), protocol=4), source="already-critical.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_call_graph_enrichment_remains_required_for_unreviewed_sibling() -> None:
+    report = PickleReport(
+        source="critical-with-unreviewed-sibling.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="native critical finding",
+                severity=Severity.CRITICAL,
+                location="critical-with-unreviewed-sibling.pkl",
+                rule_code="DANGEROUS_CALL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        metadata={
+            "import_references": (
+                {"module": "posix", "name": "system"},
+                {"module": "private_payload", "name": "Gadget"},
+            )
+        },
+    )
+
+    assert package_api._call_graph_enrichment_is_redundant(report) is False
 
 
 def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3989,6 +5744,67 @@ def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incompl
         and error.details["analysis_incomplete"] is True
         for error in updated.errors
     )
+
+
+def test_with_call_graph_findings_preserves_suspicious_verdict_on_enrichment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_call_graph_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("call graph exploded")
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_error)
+    finding = Finding(
+        message="existing suspicious evidence",
+        severity=Severity.WARNING,
+        location="suspicious-enrichment-error.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    report = PickleReport(
+        source="suspicious-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={"import_references": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert updated.metadata["analysis_incomplete"] is True
+
+
+def test_unanalyzed_call_graph_notice_preserves_suspicious_verdict() -> None:
+    finding = Finding(
+        message="existing suspicious evidence",
+        severity=Severity.WARNING,
+        location="suspicious-source-unavailable.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    report = PickleReport(
+        source="suspicious-source-unavailable.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+    )
+
+    updated = package_api._with_unanalyzed_call_graph_notices(
+        report,
+        (
+            UnanalyzedCallGraphReference(
+                module="private_payload",
+                name="Gadget",
+                import_reference="private_payload.Gadget",
+                reason="module_source_unavailable",
+            ),
+        ),
+    )
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert updated.metadata["analysis_incomplete"] is True
 
 
 def test_with_call_graph_findings_preserves_startup_hook_findings_before_limit_error(
@@ -4098,6 +5914,103 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocati
     assert updated.findings == ()
 
 
+@pytest.mark.parametrize(
+    "metadata_key",
+    ["callable_invocations_truncated", "non_allowlisted_global_imports_truncated"],
+)
+def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_key: str,
+) -> None:
+    module_name = f"modelaudit_c095_truncated_invocation_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    finding = Finding(
+        message="custom global may have been invoked",
+        severity=Severity.WARNING,
+        location="truncated-invocation.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": module_name,
+            "name": "Gadget",
+            "import_reference": f"{module_name}.Gadget",
+            "position": 0,
+        },
+    )
+    report = PickleReport(
+        source="truncated-invocation.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={
+            "callable_invocations": (),
+            metadata_key: True,
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.findings == (finding,)
+
+
+def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
+    reference = ("_xxsubinterpreters", "create")
+    finding = Finding(
+        message="separate incomplete invocation",
+        severity=Severity.WARNING,
+        location="multiple-invocations.pkl (pos 100)",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": reference[0],
+            "name": reference[1],
+            "import_reference": ".".join(reference),
+            "position": 100,
+            "invoked": True,
+        },
+    )
+
+    proven_safe = package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset({reference}),
+        invoked_global_positions=frozenset({100}),
+        analyzed_invocation_global_positions=frozenset({0}),
+        analyzed_invocation_references=frozenset({reference}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+    )
+
+    assert proven_safe is False
+
+
+def test_with_call_graph_findings_detects_startup_hook_when_only_import_findings_truncated() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-truncated-import-findings.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "non_allowlisted_global_imports_truncated": True,
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
+
+
 def test_with_call_graph_findings_keeps_late_click_startup_hook_invocations() -> None:
     pytest.importorskip("click")
 
@@ -4180,6 +6093,7 @@ def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
             "opcode": "GLOBAL",
             "position": 2,
             "is_dangerous": False,
+            "requires_origin_verification": True,
         },
         {
             "import_reference": "click.echo",
@@ -4188,6 +6102,7 @@ def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
             "opcode": "GLOBAL",
             "position": 19,
             "is_dangerous": False,
+            "requires_origin_verification": True,
         },
     )
     assert report.metadata["callable_invocations"] == ()
@@ -4320,6 +6235,48 @@ def test_scan_bytes_records_data_only_raw_nested_pickle_payloads_as_notices() ->
         and notice.details.get("nested_has_execution_opcode") is False
         for notice in report.notices
     )
+
+
+def test_scan_bytes_warns_on_nested_allowlisted_global_from_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "nested_decimal_shadow_marker"
+    (tmp_path / "decimal.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Decimal:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    nested_payload = b"cdecimal\nDecimal\n."
+    outer_payload = pickle.dumps(nested_payload, protocol=4)
+
+    report = scan_bytes(outer_payload, source="nested-shadowed-decimal.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "decimal.Decimal"
+        for finding in report.findings
+    )
+    load_payload = (
+        f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads(pickle.loads({outer_payload!r}))"
+    )
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_allows_nested_import_only_trusted_constructor() -> None:
+    nested_payload = b"cdecimal\nDecimal\n."
+
+    report = scan_bytes(
+        pickle.dumps(nested_payload, protocol=4),
+        source="nested-trusted-decimal.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize(
