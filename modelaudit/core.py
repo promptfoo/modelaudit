@@ -230,11 +230,9 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
     return allowed_paths or None
 
 
-def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
-    """Select a scanner by trusted file structure, not just suffix."""
+def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    """Select the trusted route that owns content before an HDF5 user block."""
     if header_format == "zip":
-        if find_hdf5_signature_offset(path) is not None:
-            return "keras_h5"
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
         if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
@@ -263,14 +261,23 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     return _registry.get_scanner_id_for_header_format(header_format)
 
 
-def _merge_pytorch_binary_supplemental_analysis(
+def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    """Select a scanner by trusted file structure, not just suffix."""
+    if find_hdf5_signature_offset(path) is not None:
+        return "keras_h5"
+    return _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
+
+
+def _merge_supplemental_scanner_analysis(
     path: str,
     result: ScanResult,
     config: dict[str, Any],
     scanner_selection: ScannerSelectionPolicy,
     supplemental_scanner_id: str | None,
+    *,
+    context: str,
 ) -> None:
-    """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    """Merge findings from a trusted overlapping content route."""
     if supplemental_scanner_id is None:
         return
     if not scanner_selection.allows(supplemental_scanner_id):
@@ -279,7 +286,7 @@ def _merge_pytorch_binary_supplemental_analysis(
             path,
             supplemental_scanner_id,
             scanner_selection,
-            context="supplemental .bin content analysis",
+            context=context,
         )
         return
 
@@ -297,6 +304,24 @@ def _merge_pytorch_binary_supplemental_analysis(
     result.merge(supplemental_result)
     result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
     result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
+
+
+def _merge_pytorch_binary_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any],
+    scanner_selection: ScannerSelectionPolicy,
+    supplemental_scanner_id: str | None,
+) -> None:
+    """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    _merge_supplemental_scanner_analysis(
+        path,
+        result,
+        config,
+        scanner_selection,
+        supplemental_scanner_id,
+        context="supplemental .bin content analysis",
+    )
 
 
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
@@ -1948,7 +1973,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
-    is_hdf5_userblock_zip = header_format == "zip" and scanner_id == "keras_h5"
+    hdf5_userblock_supplemental_scanner_id = (
+        _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
+        if scanner_id == "keras_h5" and header_format != "hdf5"
+        else None
+    )
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
@@ -2229,12 +2258,24 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             context="strict content owner overlapping ambiguous Flax analysis",
         )
 
-    if is_hdf5_userblock_zip and result.scanner_name != "zip":
+    if hdf5_userblock_supplemental_scanner_id == "zip" and result.scanner_name != "zip":
         merge_executable_zip_container_findings(
             path,
             result,
             config,
             context="HDF5 user-block ZIP",
+        )
+    elif (
+        hdf5_userblock_supplemental_scanner_id is not None
+        and result.scanner_name != hdf5_userblock_supplemental_scanner_id
+    ):
+        _merge_supplemental_scanner_analysis(
+            path,
+            result,
+            config,
+            scanner_selection,
+            hdf5_userblock_supplemental_scanner_id,
+            context="HDF5 user-block content analysis",
         )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":

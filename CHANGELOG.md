@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- fail closed on standalone Keras HDF5 scans when `h5py` is unavailable, including ZIP-prefixed and extensionless user-block files, without reviving stale cached results
+- fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
