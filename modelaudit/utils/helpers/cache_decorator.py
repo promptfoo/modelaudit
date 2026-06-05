@@ -208,6 +208,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
+                if cache_manager.cache is None:
+                    return func(*args, **kwargs)
                 version_context = cache_config.get_version_context()
 
                 def cached_func_wrapper(fpath: str) -> Any:
@@ -233,36 +235,51 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 # Use optimized cache lookup with stat reuse
                 logger.debug(f"Attempting cached scan for {file_path}")
 
-                # Try cache first with optimized lookup
-                cached_result = cache_manager.get_cached_result_with_stat(
-                    file_path,
-                    file_stat,
-                    version_context=version_context,
-                )
+                pre_scan_identity = None
+                try:
+                    cached_result, pre_scan_identity = cache_manager.get_cached_result_with_identity(
+                        file_path,
+                        version_context=version_context,
+                    )
 
-                if cached_result is not None:
-                    logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-                    result_dict = cached_result
-                else:
-                    # Cache miss - perform scan
-                    logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
-                    scan_start = time.perf_counter()
-                    result_dict = cached_func_wrapper(file_path)
-                    if not isinstance(result_dict, dict):
-                        logger.debug(
-                            f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
-                        )
-                        return result_dict
-                    if should_cache_scan_result(result_dict):
-                        scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
-                        cache_manager.store_result(
-                            file_path,
-                            result_dict,
-                            scan_duration_ms,
-                            version_context=version_context,
-                        )
+                    if cached_result is not None:
+                        logger.debug(f"Cache hit for {os.path.basename(file_path)}")
+                        result_dict = cached_result
                     else:
-                        logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
+                        # Cache miss - perform scan
+                        logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
+                        if pre_scan_identity is None:
+                            logger.debug(f"Bypassing cache store for {file_path}: stable identity unavailable")
+                            return func(*args, **kwargs)
+                        pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = (
+                            pre_scan_identity
+                        )
+                        scan_start = time.perf_counter()
+                        result_dict = cached_func_wrapper(file_path)
+                        if not isinstance(result_dict, dict):
+                            logger.debug(
+                                f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
+                            )
+                            return result_dict
+                        if should_cache_scan_result(result_dict):
+                            scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
+                            cache_manager.store_result(
+                                file_path,
+                                result_dict,
+                                scan_duration_ms,
+                                version_context=version_context,
+                                expected_file_stat=pre_scan_stat,
+                                expected_file_hash=pre_scan_hash,
+                                expected_change_token=pre_scan_change_token,
+                                expected_ancestor_identity=pre_scan_ancestor_identity,
+                            )
+                        else:
+                            logger.debug(
+                                f"Skipping cache store for operational result from {os.path.basename(file_path)}"
+                            )
+                finally:
+                    if pre_scan_identity is not None:
+                        cache_manager.cache.release_ancestor_identity(pre_scan_identity[-1])
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:
