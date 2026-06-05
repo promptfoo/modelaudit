@@ -6,6 +6,7 @@ from urllib.parse import quote
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
+    REDACTION_LOOKAHEAD_CHARS,
     redact_evidence_string,
     redact_evidence_value,
 )
@@ -610,6 +611,77 @@ def test_rightward_raw_assignment_does_not_bypass_redaction_with_long_identifier
 
     assert "LONG_RIGHTWARD_RAW_SECRET" not in redacted
     assert redacted.startswith(f"{REDACTED_EVIDENCE_VALUE} -> service_")
+
+
+def test_rightward_raw_assignment_crossing_preview_boundary_preserves_safe_context() -> None:
+    """Lookahead-confirmed raw assignments should retain context from the original preview."""
+    long_identifier = f"service_{'a' * 300}_token"
+    redacted = redact_evidence_string(
+        f'base::system("curl"); r"(BOUNDARY_RAW_SECRET)" -> {long_identifier}',
+        max_chars=200,
+    )
+
+    assert "BOUNDARY_RAW_SECRET" not in redacted
+    assert redacted.startswith(f'base::system("curl"); {REDACTED_EVIDENCE_VALUE} -> service_')
+    assert redacted.endswith("...")
+
+
+def test_long_benign_rightward_raw_assignment_near_match_remains_visible() -> None:
+    """A sensitive-looking target prefix must not redact a benign long identifier."""
+    long_identifier = f"service_{'a' * 300}_tokenizer"
+    redacted = redact_evidence_string(
+        f'r"(BENIGN_RAW_VALUE)" -> {long_identifier}',
+        max_chars=200,
+    )
+
+    assert "BENIGN_RAW_VALUE" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+def test_rightward_assignment_targets_beyond_lookahead_fail_closed() -> None:
+    """An unfinished rightward target must not expose values before its sensitive suffix."""
+    long_identifier = f"service_{'a' * 5_000}_token"
+
+    for value in ('r"(RAW_SECRET)"', '"QUOTED_SECRET"', 'paste0("CALL_SECRET")'):
+        redacted = redact_evidence_string(f"{value} -> {long_identifier}", max_chars=180)
+
+        assert "SECRET" not in redacted
+        assert redacted == REDACTED_EVIDENCE_VALUE
+
+    for target in (f"`{long_identifier}`", f'"{long_identifier}"'):
+        redacted = redact_evidence_string(f'r"(QUOTED_TARGET_SECRET)" -> {target}', max_chars=180)
+
+        assert "QUOTED_TARGET_SECRET" not in redacted
+        assert redacted == REDACTED_EVIDENCE_VALUE
+
+    prefix = 'r"(DELIMITER_BOUNDARY_SECRET)" -> "service_'
+    target_length = 180 + REDACTION_LOOKAHEAD_CHARS - len(prefix)
+    exact_boundary_target = f'{prefix}{"a" * (target_length - len("_token"))}_token"'
+    exact_boundary = redact_evidence_string(exact_boundary_target, max_chars=180)
+    assert "DELIMITER_BOUNDARY_SECRET" not in exact_boundary
+    assert exact_boundary == REDACTED_EVIDENCE_VALUE
+
+    r_call = redact_evidence_string(f'def.foo("R_CALL_SECRET") -> {long_identifier}', max_chars=180)
+    assert "R_CALL_SECRET" not in r_call
+    assert r_call == REDACTED_EVIDENCE_VALUE
+
+
+def test_long_python_return_annotation_is_not_treated_as_r_assignment() -> None:
+    """A truncated Python annotation should not trigger the R fail-closed guard."""
+    long_annotation = f"service_{'a' * 5_000}_token"
+    text = f'def handler() -> {long_annotation}:\n    return "VISIBLE"'
+
+    redacted = redact_evidence_string(text, max_chars=180)
+
+    assert redacted.startswith("def handler")
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+def test_python_raw_default_is_not_treated_as_r_assignment() -> None:
+    """Parseable Python containing a raw string should retain its return annotation."""
+    text = 'def handler(value=r"(VISIBLE)") -> token:\n    return value'
+
+    assert redact_evidence_string(text, max_chars=None) == text
 
 
 def test_large_rightward_assignment_evidence_avoids_pathological_backtracking() -> None:
@@ -1446,6 +1518,94 @@ def test_redacts_sensitive_setter_call_values() -> None:
     assert 'eval("1 + 1")' in redacted
 
 
+def test_redacts_embedded_name_value_credentials_and_generic_calls() -> None:
+    """Structured name/value pairs should follow the same credential-key policy."""
+    text = (
+        'meta = {"name": "api_key", "value": "DICTSECRET1234567890"}; '
+        'other = {"key": "client_secret", "value": build("KEYDICTSECRET1234567890")}; '
+        'Credential(name="api_key", value="CALLSECRET1234567890"); '
+        'Field(key="client_secret", value=build("KEYCALLSECRET1234567890")); '
+        'Field(name="api_key_count", value="visible-count"); '
+        'meta = {"name": "tokenizer", "value": "visible-tokenizer"}; eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (
+        "DICTSECRET1234567890",
+        "KEYDICTSECRET1234567890",
+        "CALLSECRET1234567890",
+        "KEYCALLSECRET1234567890",
+    ):
+        assert secret not in redacted
+    assert '"name": "api_key", "value": <redacted>' in redacted
+    assert '"key": "client_secret", "value": <redacted>' in redacted
+    assert 'Credential(name="api_key", value=<redacted>)' in redacted
+    assert 'Field(key="client_secret", value=<redacted>)' in redacted
+    assert 'Field(name="api_key_count", value="visible-count")' in redacted
+    assert '"name": "tokenizer", "value": "visible-tokenizer"' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_redacts_duplicate_name_value_fields() -> None:
+    """Case-variant duplicate value fields must not leave an earlier secret visible."""
+    text = 'meta = {"name": "api_key", "value": "FIRST_DICT_SECRET", "Value": "SECOND_DICT_SECRET"}'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FIRST_DICT_SECRET" not in redacted
+    assert "SECOND_DICT_SECRET" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2
+
+
+def test_redacts_byte_string_name_value_fields() -> None:
+    """Byte-string descriptor keys and values should use the same credential policy."""
+    text = 'meta = {b"name": b"api_key", b"value": b"BYTES_DICT_SECRET"}'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "BYTES_DICT_SECRET" not in redacted
+    assert 'b"value": <redacted>' in redacted
+
+
+def test_name_value_declarations_are_not_treated_as_calls() -> None:
+    """Function and class parameter defaults are declarations, not credential stores."""
+    text = (
+        'def Credential(name="api_key", value="VISIBLE_DEF"): return value\n'
+        'async def AsyncCredential(name="api_key", value="VISIBLE_ASYNC"): return value\n'
+        'class CredentialBase(name="api_key", value="VISIBLE_CLASS"): pass'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "VISIBLE_DEF" in redacted
+    assert "VISIBLE_ASYNC" in redacted
+    assert "VISIBLE_CLASS" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+def test_name_value_call_beyond_lookahead_fails_closed() -> None:
+    """An unfinished sensitive keyword call must not leak a value past the lookahead bound."""
+    text = f'Credential(name="api_key", value="BOUNDARY_CALL_SECRET{"A" * 5_000}")'
+
+    redacted = redact_evidence_string(text, max_chars=180)
+
+    assert "BOUNDARY_CALL_SECRET" not in redacted
+    assert redacted == REDACTED_EVIDENCE_VALUE
+
+    reversed_arguments = (
+        'Credential(value="REVERSED_CALL_SECRET", padding="' + ("A" * 5_000) + '", name=("api_" + "key"))'
+    )
+    reversed_redacted = redact_evidence_string(reversed_arguments, max_chars=180)
+    assert "REVERSED_CALL_SECRET" not in reversed_redacted
+    assert reversed_redacted == REDACTED_EVIDENCE_VALUE
+
+    benign = f'render(value="VISIBLE_VALUE{"A" * 5_000}")'
+    benign_redacted = redact_evidence_string(benign, max_chars=180)
+    assert "VISIBLE_VALUE" in benign_redacted
+    assert REDACTED_EVIDENCE_VALUE not in benign_redacted
+
+
 def test_unparseable_sensitive_assignment_and_setter_variants_fail_closed() -> None:
     """Binary framing must not reopen token-only assignment and setter gaps."""
     text = (
@@ -1761,6 +1921,33 @@ def test_redacts_computed_and_constant_sensitive_subscript_targets() -> None:
     assert 'eval("1 + 1")' in redacted
 
 
+def test_redacts_sensitive_identifier_subscript_targets() -> None:
+    """Named credential keys in subscript targets should redact their assigned values."""
+    text = (
+        'os.environ[API_KEY] = "ENVSECRET1234567890"; '
+        'config[api_key] = "CONFIGSECRET1234567890"; config[auth] = "AUTHSECRET1234567890"; '
+        'config[api_key_count] = "visible-count"; config[auth_timeout] = "visible-timeout"; '
+        'config[tokenizer] = "visible-tokenizer"; eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ENVSECRET1234567890" not in redacted
+    assert "CONFIGSECRET1234567890" not in redacted
+    assert "AUTHSECRET1234567890" not in redacted
+    assert "visible-count" in redacted
+    assert "visible-timeout" in redacted
+    assert "visible-tokenizer" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_dynamic_sensitive_named_subscript_preserves_dangerous_context() -> None:
+    """A dynamic index named token is not a literal credential key on arbitrary containers."""
+    text = 'handlers[token] = eval("MALICIOUS_CONTEXT")'
+
+    assert redact_evidence_string(text, max_chars=None) == text
+
+
 def test_redacts_exact_auth_targets_without_auth_control_false_positives() -> None:
     """Credential-bearing auth variables should redact without matching controls."""
     text = (
@@ -1822,6 +2009,51 @@ def test_redaction_bounds_expression_analysis_to_original_preview() -> None:
     assert redacted.startswith("client_secret = <redacted>\n")
     assert redacted.endswith("...")
     assert len(redacted) < 100
+
+
+def test_indented_python_snippets_use_code_aware_comparison_redaction() -> None:
+    """Function-body snippets should retain dangerous context without leaking comparisons."""
+    text = (
+        '    if api_key == "COMPARESECRET1234567890": eval("1")\n'
+        '    if client_secret in ["MEMBERSHIPSECRET1234567890"]: exec("2")\n'
+        '    if api_key_count == "visible": print("ok")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COMPARESECRET1234567890" not in redacted
+    assert "MEMBERSHIPSECRET1234567890" not in redacted
+    assert "visible" in redacted
+    assert 'eval("1")' in redacted
+    assert 'exec("2")' in redacted
+
+
+def test_indented_embedded_name_value_dict_is_redacted() -> None:
+    """Dedented Python analysis should cover embedded credential descriptors."""
+    text = '    meta = {"name": "api_key", "value": "INDENTED_DICT_SECRET"}; eval("1")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "INDENTED_DICT_SECRET" not in redacted
+    assert '"value": <redacted>' in redacted
+    assert 'eval("1")' in redacted
+
+
+def test_single_line_indented_comparison_preserves_dangerous_call_context() -> None:
+    """Colon-shaped control flow must not be mistaken for a mapping assignment."""
+    text = '    if api_key == "SECRETKEY1234567890": eval("1")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "SECRETKEY1234567890" not in redacted
+    assert redacted.strip() == 'if api_key == <redacted>: eval("1")'
+
+
+def test_indented_python_return_annotation_is_not_treated_as_r_assignment() -> None:
+    """Dedented routing should preserve Python annotations named like credentials."""
+    text = "    def build() -> token:\n        return visible"
+
+    assert redact_evidence_string(text, max_chars=None) == text
 
 
 def test_redacts_triple_quoted_and_escaped_quote_secret_assignments() -> None:
