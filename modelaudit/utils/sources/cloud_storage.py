@@ -83,7 +83,12 @@ def is_cloud_url(url: str) -> bool:
         r"^https?://storage.googleapis.com/.+",
         r"^https?://[^/]+\.r2\.cloudflarestorage\.com/.+",
     ]
-    return any(re.match(p, url) for p in patterns)
+    return any(re.match(p, url, re.IGNORECASE) for p in patterns)
+
+
+def is_stream_url(url: str) -> bool:
+    """Return True for a stream source identifier, regardless of scheme casing."""
+    return url[:9].casefold() == "stream://"
 
 
 def redact_url_for_display(url: str) -> str:

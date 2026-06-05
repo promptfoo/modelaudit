@@ -21,6 +21,7 @@ from modelaudit.core_results import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.utils.sources.cloud_storage import is_stream_url
 from modelaudit.utils.sources.cloud_storage import redact_cloud_error_for_display as _redact_cloud_error_for_display
 from modelaudit.utils.sources.cloud_storage import redact_stream_url_for_display as _redact_stream_url_for_display
 from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
@@ -459,7 +460,7 @@ def _normalize_path_to_uri(path: str) -> str:
 
 def _redact_path_for_sarif(path: str) -> str:
     """Return a SARIF-safe path without signed URL material."""
-    if path.startswith("stream://"):
+    if is_stream_url(path):
         return f"stream://{_redact_stream_url_for_display(path[9:])}"
     return _redact_url_for_display(path)
 
@@ -471,7 +472,7 @@ def _redact_text_for_sarif(text: str) -> str:
 
 def _redact_url_token_for_sarif(url: str) -> str:
     """Preserve benign query context while removing credentials from evidence URLs."""
-    if url.startswith("stream://"):
+    if is_stream_url(url):
         return _redact_path_for_sarif(url)
     preserve_redacted_params = "<redacted>" in url
     redacted_url = _redact_cloud_error_for_display(url)

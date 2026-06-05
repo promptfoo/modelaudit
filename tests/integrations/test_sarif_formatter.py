@@ -102,6 +102,19 @@ class TestFormatSarifOutput:
         assert safe_path in invocation["commandLine"]
         assert invocation["arguments"] == [safe_path]
 
+    def test_mixed_case_signed_stream_paths_are_redacted(self) -> None:
+        """URI scheme casing must not bypass SARIF stream redaction."""
+        raw_path = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl?X-Amz-Signature=secret"
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path=raw_path, type="pickle")]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, [raw_path])
+
+        assert "secret" not in output
+        assert "X-Amz-Signature" not in output
+        assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in output
+
     def test_malformed_stream_paths_fail_closed(self) -> None:
         """SARIF invocation and asset paths must not retain malformed stream queries."""
         raw_path = "stream://bucket/model.pkl?token=secret-token"

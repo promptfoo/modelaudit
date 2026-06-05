@@ -154,6 +154,7 @@ class TestCloudURLDetection:
             "gs://my-bucket/model.pt",
             "r2://data/model.bin",
             "https://bucket.s3.amazonaws.com/file",
+            "HTTPS://BUCKET.S3.AMAZONAWS.COM/file",
             "https://storage.googleapis.com/bucket/file",
             "https://account.r2.cloudflarestorage.com/bucket/file",
         ]

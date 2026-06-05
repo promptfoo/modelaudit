@@ -108,6 +108,9 @@ from modelaudit.utils.sources._huggingface_cache import (
     _resolve_hf_cache_path,
 )
 from modelaudit.utils.sources.cloud_storage import (
+    is_stream_url,
+)
+from modelaudit.utils.sources.cloud_storage import (
     redact_cloud_error_for_display as _redact_cloud_error_for_display,
 )
 from modelaudit.utils.sources.cloud_storage import (
@@ -173,13 +176,13 @@ def _redacted_stream_url_for_reporting(stream_url: str) -> str:
 
 
 def _redacted_scan_path_for_reporting(path: str) -> str:
-    if path.startswith("stream://"):
+    if is_stream_url(path):
         return f"stream://{_redacted_stream_url_for_reporting(path[9:])}"
     return path
 
 
 def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
-    if path.startswith("stream://"):
+    if is_stream_url(path):
         return _redact_stream_error_for_display(error, path[9:])
     return str(error)
 
@@ -963,7 +966,7 @@ def scan_model_directory_or_file(
 
     try:
         # Handle streaming paths
-        if path.startswith("stream://"):
+        if is_stream_url(path):
             # Extract the actual URL
             stream_url = path[9:]  # Remove "stream://" prefix
             report_url = _redacted_stream_url_for_reporting(stream_url)
@@ -1562,7 +1565,7 @@ def scan_model_directory_or_file(
     except Exception as e:
         report_path = _redacted_scan_path_for_reporting(path)
         report_error = _redacted_scan_error_for_reporting(e, path)
-        if path.startswith("stream://"):
+        if is_stream_url(path):
             logger.error(f"Error during scan: {report_error}")
         else:
             logger.exception(f"Error during scan: {report_error}")

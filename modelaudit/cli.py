@@ -67,6 +67,7 @@ from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cloud_url,
+    is_stream_url,
     redact_cloud_error_for_display,
     redact_stream_error_for_display,
     redact_stream_url_for_display,
@@ -94,7 +95,7 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
-    if path.startswith("stream://"):
+    if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
     if is_cloud_url(path):
         return redact_url_for_display(path)
@@ -110,7 +111,7 @@ def _display_scan_path(path: str) -> str:
 
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
-    if path.startswith("stream://"):
+    if is_stream_url(path):
         return redact_stream_error_for_display(error, path[9:])
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
@@ -1161,7 +1162,7 @@ def _scan_local_or_downloaded_path(
 
         logger.error(
             f"Error during scan of {display_path}: {display_error}",
-            exc_info=verbose and not (actual_path.startswith("stream://") or is_cloud_url(path)),
+            exc_info=verbose and not (is_stream_url(actual_path) or is_cloud_url(path)),
         )
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
@@ -2467,7 +2468,7 @@ def scan_command(
                 display_error = _display_error(exc, path)
                 logger.error(
                     f"Unexpected error processing {display_path}: {display_error}",
-                    exc_info=verbose and not path.startswith("stream://"),
+                    exc_info=verbose and not is_stream_url(path),
                 )
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
                 path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))

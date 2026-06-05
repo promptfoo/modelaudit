@@ -100,6 +100,25 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_or_file_mixed_case_streaming_path() -> None:
+    """URI scheme casing must not bypass streaming routing."""
+    stream_url = "S3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        scan_model_directory_or_file(f"STREAM://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+
+
 def test_scan_model_directory_or_file_incomplete_streaming_path_returns_exit_code_2() -> None:
     """Incomplete stream:// analysis without findings should be explicit and fail closed."""
     stream_url = "s3://bucket/model.pkl"

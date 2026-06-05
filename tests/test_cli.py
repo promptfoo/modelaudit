@@ -2265,6 +2265,15 @@ def test_display_path_redacts_signed_stream_url() -> None:
     assert "hidden" not in display_error
 
 
+def test_display_path_redacts_mixed_case_signed_urls() -> None:
+    """URI scheme and host casing must not bypass display redaction."""
+    stream_url = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=stream-secret"
+    cloud_url = "HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=cloud-secret"
+
+    assert _display_path(stream_url) == "stream://https://bucket.s3.amazonaws.com/model.bin"
+    assert _display_path(cloud_url) == "https://bucket.s3.amazonaws.com/model.bin"
+
+
 def test_progress_initial_status_redacts_signed_stream_url() -> None:
     """Initial progress status should not expose signed stream URLs."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
