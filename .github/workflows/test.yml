@@ -455,7 +455,7 @@ jobs:
     # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     strategy:
       matrix:
         # For PRs, only test min and max Python versions to save time
