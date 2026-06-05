@@ -8942,6 +8942,39 @@ class TestJITScriptDetector:
 
         assert "eval" in findings
 
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"callbacks = {'run': eval}\ncallbacks.popitem()[1]('1+1')\n",
+            b"callbacks = {'safe': len, 'run': eval}\ncallbacks.popitem()[1]('1+1')\n",
+            b"callbacks = {'run': eval}\ndict.popitem(callbacks)[1]('1+1')\n",
+            b"def identity(callback):\n    return callback\nidentity(eval)('1+1')\n",
+            b"def identity(callback):\n    return callback\nidentity(callback=eval)('1+1')\n",
+            b"identity = lambda callback: callback\nidentity(eval)('1+1')\n",
+        ],
+    )
+    def test_scan_model_detects_dynamic_callbacks_from_returned_mapping_values(self, data: bytes) -> None:
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"callbacks = {'run': eval}\ndel callbacks['run']\ncallbacks['run']('1+1')\n",
+            b"callbacks = [eval]\ndel callbacks[0]\ncallbacks.append(len)\ncallbacks[0]([])\n",
+            b"callbacks = {'run': eval}\ncallbacks.popitem()\ncallbacks['run']('1+1')\n",
+            b"callbacks = {'run': eval, 'safe': len}\ncallbacks.popitem()[1]([])\n",
+            b"def identity(callback):\n    return callback\nidentity(len)([])\nunused = eval\n",
+            b"def identity(callback):\n    callback = len\n    return callback\nidentity(eval)([])\n",
+            (b"def choose(callback, enabled):\n    return callback if enabled else len\nchoose(eval, False)([])\n"),
+        ],
+    )
+    def test_scan_model_ignores_removed_or_safe_dynamic_callbacks(self, data: bytes) -> None:
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})
