@@ -2757,7 +2757,20 @@ def test_scan_file_fails_closed_for_corrupt_hdf5_userblock_zip(
 ) -> None:
     polyglot = tmp_path / "corrupt-zip-userblock.h5"
     polyglot.write_bytes(b"PK\x03\x04" + bytes(64))
-    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    supplemental_result = ScanResult(scanner_name="keras_h5")
+    supplemental_result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        supplemental_result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    assert supplemental_result.success is False
+    assert "hdf5_userblock_zip_scan_failed" in supplemental_result.metadata["scan_outcome_reasons"]
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
     result = scan_file(str(polyglot), config={"cache_scan_results": False})
@@ -2783,7 +2796,24 @@ def test_scan_file_fails_closed_for_content_after_hdf5_userblock_zip(
     _create_misnamed_zip(polyglot, {"README.txt": b"benign archive"})
     with polyglot.open("ab") as handle:
         handle.write(b'cos\nsystem\n(S"echo pwned"\ntR.')
-    _append_hdf5_userblock_candidate(polyglot, plausible=True, minimum_signature_offset=128 * 1024)
+    signature_offset = _append_hdf5_userblock_candidate(
+        polyglot,
+        plausible=True,
+        minimum_signature_offset=128 * 1024,
+    )
+    supplemental_result = ScanResult(scanner_name="keras_h5")
+    supplemental_result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        supplemental_result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    assert supplemental_result.success is False
+    assert "hdf5_userblock_zip_trailing_content_unanalyzed" in supplemental_result.metadata["scan_outcome_reasons"]
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
     result = scan_file(str(polyglot), config={"cache_scan_results": False})

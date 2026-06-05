@@ -500,6 +500,7 @@ def merge_hdf5_userblock_zip_findings(
                 },
                 rule_code="S902",
             )
+            result.finish(success=False)
         _deduplicate_exact_merged_findings(result)
     except OSError as exc:
         reason = "hdf5_userblock_zip_scan_failed"
@@ -517,6 +518,7 @@ def merge_hdf5_userblock_zip_findings(
             },
             rule_code="S902",
         )
+        result.finish(success=False)
     finally:
         if temp_path is not None:
             with suppress(OSError):
