@@ -71,6 +71,9 @@ class KerasH5Scanner(BaseScanner):
     _SAFE_K_BACKEND_LAMBDA_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
         {"abs", "elu", "hard_sigmoid", "l2_normalize", "relu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
     )
+    _SAFE_KERAS_ACTIVATION_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
+        {"elu", "gelu", "hard_sigmoid", "relu", "selu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
+    )
     _SAFE_TF_NN_LAMBDA_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
         {
             "elu",
@@ -91,17 +94,18 @@ class KerasH5Scanner(BaseScanner):
     )
     _SAFE_LAMBDA_MODULE_FUNCTIONS: ClassVar[dict[str, frozenset[str]]] = {
         "keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
-        "keras.activations": frozenset(
-            {"elu", "gelu", "hard_sigmoid", "relu", "selu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
-        ),
+        "keras.activations": _SAFE_KERAS_ACTIVATION_FUNCTIONS,
         "keras.ops": frozenset({"abs", "identity", "normalize", "relu", "sigmoid", "softmax", "tanh"}),
         "tensorflow": frozenset({"abs", "identity", "sigmoid", "tanh"}),
+        "tensorflow.keras.activations": _SAFE_KERAS_ACTIVATION_FUNCTIONS,
+        "tensorflow.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
         "tensorflow.math": frozenset({"abs", "sigmoid", "tanh"}),
         "tensorflow.nn": _SAFE_TF_NN_LAMBDA_FUNCTIONS,
-        "tensorflow.python.keras.activations": frozenset(
-            {"elu", "gelu", "hard_sigmoid", "relu", "selu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
-        ),
+        "tensorflow.python.keras.activations": _SAFE_KERAS_ACTIVATION_FUNCTIONS,
         "tensorflow.python.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
+        "tf.keras.activations": _SAFE_KERAS_ACTIVATION_FUNCTIONS,
+        "tf.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
+        "tf_keras.activations": _SAFE_KERAS_ACTIVATION_FUNCTIONS,
         "tf_keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
     }
     _TRUSTED_LAMBDA_LAYER_CLASSES: ClassVar[frozenset[str]] = frozenset(

@@ -2503,8 +2503,13 @@ def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Pa
     [
         ("keras.activations", "relu"),
         ("keras.backend", "softmax"),
+        ("tensorflow.keras.activations", "relu"),
+        ("tensorflow.keras.backend", "softmax"),
         ("tensorflow.python.keras.activations", "relu"),
         ("tensorflow.python.keras.backend", "softmax"),
+        ("tf.keras.activations", "relu"),
+        ("tf.keras.backend", "softmax"),
+        ("tf_keras.activations", "relu"),
     ],
 )
 def test_lambda_legacy_named_framework_function_still_passes(

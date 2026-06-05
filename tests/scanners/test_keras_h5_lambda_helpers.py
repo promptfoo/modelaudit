@@ -92,6 +92,25 @@ def test_nested_callable_dict_allowlisted_reference_passes() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [
+        ("tensorflow.keras.activations", "relu"),
+        ("tensorflow.keras.backend", "softmax"),
+        ("tf.keras.activations", "relu"),
+        ("tf.keras.backend", "softmax"),
+        ("tf_keras.activations", "relu"),
+    ],
+)
+def test_public_keras_alias_reference_is_allowlisted(module_name: str, function_name: str) -> None:
+    assert KerasH5Scanner._is_lambda_module_reference_allowlisted(module_name, function_name) is True
+
+
+@pytest.mark.parametrize("module_name", ["tensorflow.keras.activations", "tf.keras.activations"])
+def test_public_keras_alias_dangerous_function_is_not_allowlisted(module_name: str) -> None:
+    assert KerasH5Scanner._is_lambda_module_reference_allowlisted(module_name, "deserialize") is False
+
+
 def test_nested_callable_dict_substring_near_match_stays_warning_level() -> None:
     result = _scan_lambda_config({"function": {"module": "custom.osmium.transforms", "config": "systematic_normalize"}})
 
