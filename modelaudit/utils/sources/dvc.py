@@ -5,6 +5,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MAX_DVC_OUTPUTS = 100
+MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS = MAX_DVC_OUTPUTS + 1
 
 
 @dataclass(frozen=True)
@@ -58,21 +59,34 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         logger.warning(f"Failed to parse DVC file {file_path}: {exc}")
         return DvcResolution(targets=[])
 
-    outs = data.get("outs", [])
-    if not isinstance(outs, list):
+    declared_outs = data.get("outs", [])
+    if not isinstance(declared_outs, list):
         logger.warning(f"DVC file {file_path} has invalid 'outs' structure")
         return DvcResolution(targets=[])
 
     # Limit number of outputs to prevent resource exhaustion
-    declared_output_count = len(outs)
+    declared_output_count = len(declared_outs)
     omitted_output_count = max(declared_output_count - MAX_DVC_OUTPUTS, 0)
+    verification_limit = MAX_DVC_OUTPUTS * 2
+    outs = declared_outs[:verification_limit]
+    bounded_declared_paths = {out["path"] for out in outs if isinstance(out, dict) and isinstance(out.get("path"), str)}
+    unverified_output_paths: set[str] = set()
+    invalid_unverified_output_count = 0
+    for out in declared_outs[verification_limit:]:
+        if not isinstance(out, dict) or not isinstance(out.get("path"), str):
+            invalid_unverified_output_count += 1
+        elif out["path"] not in bounded_declared_paths:
+            unverified_output_paths.add(out["path"])
+        if len(unverified_output_paths) + invalid_unverified_output_count >= MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS:
+            break
+    unverified_omitted_output_count = min(
+        len(unverified_output_paths) + invalid_unverified_output_count,
+        MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS,
+    )
     if omitted_output_count:
         logger.warning(
             f"DVC file {file_path} has too many outputs ({declared_output_count}), limiting to {MAX_DVC_OUTPUTS}"
         )
-        # Resolve one additional bounded window for directory-walk coverage
-        # verification without expanding those omitted targets for scanning.
-        outs = outs[: MAX_DVC_OUTPUTS * 2]
 
     resolved: list[str] = []
     resolved_targets: set[str] = set()
@@ -140,7 +154,7 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         omitted_output_count=omitted_output_count,
         omitted_targets=omitted_targets,
         unresolved_omitted_output_count=unresolved_omitted_output_count,
-        unverified_omitted_output_count=max(declared_output_count - MAX_DVC_OUTPUTS * 2, 0),
+        unverified_omitted_output_count=unverified_omitted_output_count,
     )
 
 

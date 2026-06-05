@@ -283,6 +283,53 @@ class TestDvcSecurity:
         assert determine_exit_code(result) == 0
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
+    def test_duplicate_dvc_tail_past_verification_window_does_not_fail_closed(self, tmp_path: Path) -> None:
+        """Repeated known outputs beyond the verification window do not represent omitted artifacts."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        dvc_file = tmp_path / "duplicate_tail.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 250)
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(target)]
+        assert resolution.omitted_output_count == 150
+        assert resolution.unverified_omitted_output_count == 0
+        assert resolution.analysis_incomplete is False
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_dvc_tail_cannot_hide_new_output_past_verification_window(self, tmp_path: Path) -> None:
+        """A genuinely new output after duplicate padding must still fail closed."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "duplicate_tail_padding.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + f"- path: {late_malicious.name}\n")
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(benign)]
+        assert resolution.unverified_omitted_output_count == 1
+        assert resolution.analysis_incomplete is True
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
     def test_duplicate_dvc_outputs_cannot_hide_unique_late_output(self, tmp_path: Path) -> None:
         """Duplicate padding must not discharge a unique output beyond the declaration cap."""
         benign = tmp_path / "benign.pkl"
