@@ -171,14 +171,22 @@ def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return True, None
 
-    loaded_module = sys.modules.get(module_name)
+    if module_name not in sys.modules:
+        return False, None
+    loaded_module = sys.modules[module_name]
     loaded_spec = getattr(loaded_module, "__spec__", None)
-    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
-        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
-            return True, str(Path(loaded_spec.origin).absolute())
-        if loaded_spec.origin not in {"built-in", "frozen"}:
-            return True, None
-    return False, None
+    if (
+        isinstance(loaded_spec, ModuleSpec)
+        and isinstance(loaded_spec.origin, str)
+        and loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES))
+    ):
+        return True, str(Path(loaded_spec.origin).absolute())
+    return True, None
+
+
+def _has_loaded_parent_package(module_name: str) -> bool:
+    parts = module_name.split(".")
+    return any(".".join(parts[:index]) in sys.modules for index in range(1, len(parts)))
 
 
 @dataclass
@@ -765,6 +773,8 @@ class ScanResultsCache:
                 return False
             is_overridden, current_source = _loaded_module_source_override(module_name)
             if is_overridden and current_source != expected_source:
+                return False
+            if not is_overridden and _has_loaded_parent_package(module_name):
                 return False
         loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
         if not isinstance(loaded_module_sources, dict):

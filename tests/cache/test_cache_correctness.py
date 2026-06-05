@@ -260,6 +260,44 @@ def test_scan_cache_invalidates_when_loaded_module_override_appears(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_invalidates_when_loaded_parent_package_can_redirect_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_source = tmp_path / "first" / "cache_pkg" / "child.py"
+    second_source = tmp_path / "second" / "cache_pkg" / "child.py"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    first_source.write_text("def entrypoint():\n    return 1\n")
+    second_source.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    monkeypatch.syspath_prepend(str(first_source.parents[1]))
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    first_source_path = str(first_source.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
+                module_sources={"cache_pkg.child": first_source_path},
+            )
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    loaded_parent = ModuleType("cache_pkg")
+    loaded_parent.__path__ = [str(second_source.parent)]
+    loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_invalidates_when_loaded_module_disappears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
