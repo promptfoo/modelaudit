@@ -33,7 +33,9 @@ EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
 EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN = re.compile(
     r"(?is)^(?:(?:[a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(\s*|\(\s*)*(?:function\s*\(\s*\)\s*return\s*)?$"
 )
-COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN = re.compile(r"(?is)^\s*(?P<value>.+?)\s+(?P<operator>or|and)\s*$")
+COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN = re.compile(
+    r"(?is)^\s*(?P<value>.+?)\s*(?P<operator>(?<!\w)(?:or|and)(?!\w)|\.\.)\s*$"
+)
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
     r"https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?\s+/c|"
@@ -228,6 +230,9 @@ class Torch7Scanner(BaseScanner):
     def _snippet(text: str, max_chars: int = 180) -> str:
         protected_targets: list[str] = []
         protected_parts: list[str] = []
+        placeholder_prefix = "__MODELAUDIT_TORCH7_TARGET_"
+        while placeholder_prefix in text:
+            placeholder_prefix = f"_{placeholder_prefix}"
         cursor = 0
 
         for match in EXECUTION_ASSIGNMENT_TARGET_PATTERN.finditer(text):
@@ -257,14 +262,14 @@ class Torch7Scanner(BaseScanner):
 
             protected_parts.append(text[cursor : match.start()])
             protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
-            protected_parts.append(f"\x00{len(protected_targets) - 1}\x00{replacement_suffix}")
+            protected_parts.append(f"{placeholder_prefix}{len(protected_targets) - 1}__{replacement_suffix}")
             cursor = replacement_end
 
         protected_parts.append(text[cursor:])
         protected = "".join(protected_parts)
         redacted = redact_evidence_string(protected, max_chars=None)
         for index, target in enumerate(protected_targets):
-            redacted = redacted.replace(f"\x00{index}\x00", target)
+            redacted = redacted.replace(f"{placeholder_prefix}{index}__", target)
         if len(redacted) <= max_chars:
             return redacted
         if max_chars <= 3:

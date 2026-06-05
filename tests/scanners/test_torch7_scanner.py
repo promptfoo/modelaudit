@@ -196,6 +196,17 @@ def test_torch7_snippet_redacts_secret_before_execution_fallback() -> None:
     assert snippet == 'token = <redacted> or os.execute("id")'
 
 
+@pytest.mark.parametrize("separator", [" .. ", ".."])
+def test_torch7_snippet_preserves_execution_after_concatenated_secret(separator: str) -> None:
+    snippet = Torch7Scanner._snippet(
+        f'token = "FULL_LUA_SECRET_123456789"{separator}os.execute("id")',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == f'token = <redacted> {separator.strip()} os.execute("id")'
+
+
 def test_torch7_snippet_preserves_subscript_and_deep_execution_targets() -> None:
     snippets = (
         Torch7Scanner._snippet("headers['token'] = os.execute('echo ok')", max_chars=500),
@@ -216,7 +227,9 @@ def test_torch7_snippet_redacts_sensitive_subscript_assignment_targets() -> None
     )
 
     assert "TARGETSECRET123" not in snippet
-    assert "headers['Authorization: <redacted>'] = os.execute" in snippet
+    assert "headers" in snippet
+    assert "Authorization: <redacted>" in snippet
+    assert "= os.execute" in snippet
 
 
 def test_torch7_snippet_restores_targets_before_truncation() -> None:

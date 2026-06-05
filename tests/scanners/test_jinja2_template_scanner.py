@@ -991,7 +991,7 @@ class TestJinja2TemplateScannerEdgeCases:
         tokenizer_file = tmp_path / "tokenizer_config.json"
         tokenizer_file.write_text(json.dumps({"chat_template": payload}), encoding="utf-8")
 
-        scanner = Jinja2TemplateScanner({"max_template_size": 128})
+        scanner = Jinja2TemplateScanner({"max_template_size": 128, "sandbox_render_timeout_seconds": 2})
         result = scanner.scan(str(tokenizer_file))
 
         assert result.has_warnings or result.has_errors
