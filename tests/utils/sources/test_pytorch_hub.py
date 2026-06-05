@@ -1044,10 +1044,14 @@ def test_open_directory_fd_closes_on_exception(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: 123)
     monkeypatch.setattr(os, "close", closed.append)
 
-    with pytest.raises(RuntimeError, match="stop"):  # noqa: SIM117 - keep exception scopes explicit
+    try:
         with _open_directory_fd("cache", 0) as fd:
             assert fd == 123
             raise RuntimeError("stop")
+    except RuntimeError as exc:
+        assert str(exc) == "stop"
+    else:
+        pytest.fail("expected directory descriptor context to propagate the exception")
 
     assert closed == [123]
 
