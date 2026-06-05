@@ -409,7 +409,7 @@ def _r_delimited_expression_can_start_call(
         return False
     if all(character.isalnum() or character in "._" for character in expression):
         return _r_token_can_start_call(expression)
-    if expression.endswith("]") and _r_expression_before_position_is_obviously_non_callable(
+    if _r_expression_before_position_is_obviously_non_callable(
         text,
         closer_position,
         non_code_spans,
