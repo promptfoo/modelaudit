@@ -1,12 +1,16 @@
+import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import BinaryIO
+from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
 import pytest
 
 from modelaudit.utils.sources.pytorch_hub import (
+    _append_owned_fd,
     _artifact_download_paths,
     _extract_weight_urls,
+    _open_binary_fd,
     _open_destination_file,
     _safe_destination_path,
     download_pytorch_hub_model,
@@ -181,7 +185,94 @@ def test_download_pytorch_hub_model_strips_query_from_local_filename(
 
     assert (tmp_path / "resnet50.onnx").read_bytes() == b"abc"
     assert not (tmp_path / "resnet50.onnx?download=1").exists()
-    mock_get.assert_any_call(weight_url, stream=True, timeout=30)
+    mock_get.assert_any_call(weight_url, stream=True, timeout=30, allow_redirects=False)
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_external_artifact_redirect(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/resnet50.onnx"
+    mock_extensions.return_value = {".onnx"}
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">onnx</a>'
+    html_resp.raise_for_status = lambda: None
+    redirect_resp = MagicMock()
+    redirect_resp.__enter__.return_value = redirect_resp
+    redirect_resp.status_code = 302
+    redirect_resp.headers = {"location": "https://example.com/resnet50.onnx"}
+    mock_get.side_effect = [html_resp, redirect_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    with pytest.raises(ValueError, match="Unsafe PyTorch Hub model URL"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    mock_get.assert_has_calls(
+        [
+            call("https://pytorch.org/hub/pytorch_vision_resnet/", timeout=10),
+            call(weight_url, stream=True, timeout=30, allow_redirects=False),
+        ]
+    )
+    assert not (tmp_path / "resnet50.onnx").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_follows_trusted_artifact_redirect(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/resnet50.onnx"
+    redirected_url = "https://download.pytorch.org/models/releases/resnet50.onnx"
+    mock_extensions.return_value = {".onnx"}
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">onnx</a>'
+    html_resp.raise_for_status = lambda: None
+    redirect_resp = MagicMock()
+    redirect_resp.__enter__.return_value = redirect_resp
+    redirect_resp.status_code = 302
+    redirect_resp.headers = {"location": "/models/releases/resnet50.onnx"}
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.status_code = 200
+    file_resp.iter_content.return_value = [b"model"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, redirect_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "5"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert result == tmp_path
+    assert (tmp_path / "resnet50.onnx").read_bytes() == b"model"
+    mock_get.assert_any_call(redirected_url, stream=True, timeout=30, allow_redirects=False)
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
@@ -516,3 +607,39 @@ def test_open_destination_file_accepts_symlinked_cache_root(tmp_path: Path) -> N
         handle.write(b"model")
 
     assert (real_cache / "model.onnx").read_bytes() == b"model"
+
+
+def test_append_owned_fd_closes_descriptor_when_ownership_transfer_fails(tmp_path: Path) -> None:
+    class FailingFDList(list[int]):
+        def append(self, fd: int) -> None:
+            del fd
+            raise RuntimeError("append failed")
+
+    path = tmp_path / "descriptor.bin"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+
+    with pytest.raises(RuntimeError, match="append failed"):
+        _append_owned_fd(FailingFDList(), fd)
+
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_open_binary_fd_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "descriptor.bin"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+
+    def fail_fdopen(fd_to_open: int, mode: str) -> BinaryIO:
+        del fd_to_open, mode
+        raise RuntimeError("fdopen failed")
+
+    monkeypatch.setattr(os, "fdopen", fail_fdopen)
+
+    with pytest.raises(RuntimeError, match="fdopen failed"), _open_binary_fd(fd):
+        pass
+
+    with pytest.raises(OSError):
+        os.fstat(fd)

@@ -10,7 +10,7 @@ from contextlib import contextmanager, suppress
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
-from urllib.parse import unquote, urldefrag, urlsplit
+from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 
 import click
 import requests
@@ -23,6 +23,8 @@ _PYTORCH_MODEL_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MAX_MODEL_URL_DECODE_ROUNDS = 4
+_MAX_ARTIFACT_REDIRECTS = 5
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"\\|?*')
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
@@ -118,6 +120,18 @@ def _weight_relative_path(url: str) -> Path:
     return Path(*(_safe_local_component(part) for part in relative_parts))
 
 
+def _is_supported_model_url(url: str, model_extensions: set[str] | None = None) -> bool:
+    normalized_path = _normalized_model_path(url)
+    if normalized_path is None:
+        return False
+    extensions = (
+        model_extensions
+        if model_extensions is not None
+        else {extension.lower() for extension in _get_model_extensions()}
+    )
+    return any(normalized_path.lower().endswith(extension) for extension in extensions)
+
+
 def _path_collision_key(path: Path) -> tuple[str, ...]:
     return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
 
@@ -201,6 +215,49 @@ def _supports_secure_dir_fd_open() -> bool:
     )
 
 
+def _append_owned_fd(directory_fds: list[int], fd: int) -> None:
+    try:
+        directory_fds.append(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def _open_binary_fd(fd: int) -> Iterator[BinaryIO]:
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        yield handle
+
+
+@contextmanager
+def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
+    """Open an artifact while keeping every redirect inside the trusted model path."""
+    current_url = url
+    for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
+        if not _is_supported_model_url(current_url):
+            raise ValueError(f"Unsafe PyTorch Hub model URL: {current_url}")
+
+        with requests.get(current_url, stream=True, timeout=30, allow_redirects=False) as response:
+            status_code = response.status_code if isinstance(response.status_code, int) else 200
+            if status_code not in _REDIRECT_STATUS_CODES:
+                response.raise_for_status()
+                yield response
+                return
+
+            location = response.headers.get("location")
+            if not isinstance(location, str) or not location:
+                response.raise_for_status()
+                raise ValueError(f"PyTorch Hub artifact redirect has no location: {current_url}")
+            current_url = urljoin(current_url, location)
+
+    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
+
+
 @contextmanager
 def _open_destination_file(dest_dir: Path, relative_path: Path) -> Iterator[BinaryIO]:
     """Open an artifact without following replaceable symlink path components."""
@@ -212,13 +269,14 @@ def _open_destination_file(dest_dir: Path, relative_path: Path) -> Iterator[Bina
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(dest_file, flags, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        with _open_binary_fd(fd) as handle:
             yield handle
         return
 
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    directory_fds = [os.open(dest_dir.resolve(), directory_flags)]
+    directory_fds: list[int] = []
+    _append_owned_fd(directory_fds, os.open(dest_dir.resolve(), directory_flags))
     try:
         for part in relative_path.parent.parts:
             parent_fd = directory_fds[-1]
@@ -228,14 +286,15 @@ def _open_destination_file(dest_dir: Path, relative_path: Path) -> Iterator[Bina
                 with suppress(FileExistsError):
                     os.mkdir(part, mode=0o700, dir_fd=parent_fd)
                 child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-            directory_fds.append(child_fd)
+            _append_owned_fd(directory_fds, child_fd)
 
         fd = os.open(relative_path.name, file_flags, 0o600, dir_fd=directory_fds[-1])
-        with os.fdopen(fd, "wb") as handle:
+        with _open_binary_fd(fd) as handle:
             yield handle
     finally:
         for directory_fd in reversed(directory_fds):
-            os.close(directory_fd)
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def is_pytorch_hub_url(url: str) -> bool:
@@ -261,10 +320,7 @@ def _extract_weight_urls(html: str) -> list[str]:
             url = urldefrag(decoded_candidate).url
             parsed_url = urlsplit(url)
             url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
-            normalized_path = _normalized_model_path(url)
-            if normalized_path is not None and any(
-                normalized_path.lower().endswith(extension) for extension in model_extensions
-            ):
+            if _is_supported_model_url(url, model_extensions):
                 if url not in seen:
                     weight_urls.append(url)
                     seen.add(url)
@@ -314,12 +370,13 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     for weight_url, relative_path in _artifact_download_paths(weight_urls):
         try:
             _safe_destination_path(dest_dir, relative_path)
-            with requests.get(weight_url, stream=True, timeout=30) as resp:
-                resp.raise_for_status()
-                with _open_destination_file(dest_dir, relative_path) as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+            with (
+                _open_trusted_artifact_response(weight_url) as resp,
+                _open_destination_file(dest_dir, relative_path) as f,
+            ):
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
         except ValueError:
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
@@ -374,12 +431,13 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
                 click.echo(f"⬇️  Downloading {relative_path.as_posix()}")
 
             try:
-                with requests.get(weight_url, stream=True, timeout=30) as resp:
-                    resp.raise_for_status()
-                    with _open_destination_file(temp_dir, relative_path) as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
+                with (
+                    _open_trusted_artifact_response(weight_url) as resp,
+                    _open_destination_file(temp_dir, relative_path) as f,
+                ):
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
             except Exception as e:
                 raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
