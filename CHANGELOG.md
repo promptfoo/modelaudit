@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bind cache writes to complete file and pathname identities captured before scanning
+- detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
@@ -70,6 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
+- redact secret-bearing JAX/Orbax, JIT, PyTorch ZIP, and explicit model-network evidence before serializing findings
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - include content-routed renamed JFrog folder artifacts in selective downloads with fail-closed bounded probes
 - strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
@@ -95,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
 - inspect mixed dict/list Keras HDF5 Lambda bytecode with bounded, marshal-aware analysis
+- fail closed on malformed Keras HDF5 Lambda functions, code-loading callbacks, and non-allowlisted framework references
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
@@ -126,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
-- fail closed and cap downstream scanning and metadata listings when PyTorch ZIP archives exceed the configured entry limit, preserve parent structure attribution across nested limits, and retain deadline and prefixed-layout metadata handling
+- fail closed and cap downstream scanning, metadata listings, and version metadata probes for PyTorch ZIP archives, preserve parent structure attribution across nested entry limits, and retain deadline and prefixed-layout metadata handling
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - include supported non-PT artifacts linked from PyTorch Hub model pages while rejecting format-changing redirects and non-artifact responses
 - enforce `--max-size` while streaming PyTorch Hub model weights
@@ -830,7 +833,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** add exact dangerous helper coverage for validated torch and NumPy refs such as `numpy.f2py.crackfortran.getlincoef`, `torch._dynamo.guards.GuardBuilder.get`, and `torch.utils.collect_env.run`
 - **security:** add exact dangerous-global coverage for `numpy.load`, `site.main`, `_io.FileIO`, `test.support.script_helper.assert_python_ok`, `_osx_support._read_output`, `_aix_support._read_cmd_output`, `_pyrepl.pager.pipe_pager`, `torch.serialization.load`, and `torch._inductor.codecache.compile_file` (9 PickleScan-only loader and execution primitives)
 - **security:** treat legacy `httplib` pickle globals the same as `http.client`, including import-only and `REDUCE` findings in standalone and archived payloads
-- **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructor imports and avoiding mislabeling executed call chains as import-only
+- **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructors, legacy Python 2 aliases, keyword-only `NEWOBJ_EX` analysis, and large native extension scans
 - **security:** fail closed on malformed `STACK_GLOBAL` operands when memo lookups are missing or operand types are non-string, while keeping simple truncation-only context informational
 - **security:** remove `builtins.hasattr` / `__builtin__.hasattr` from the pickle safe-global allowlist so attribute-access primitives stay flagged as dangerous builtins
 - **security:** harden pickle blocklist enforcement by removing `_pickle.Unpickler`/`_pickle.Pickler` from safe globals, adding `copyreg.add_extension`/`copyreg.remove_extension` to suspicious globals, and limiting functools warning downgrades to `partial`/`partialmethod` so `functools.reduce` findings stay CRITICAL
