@@ -2,8 +2,9 @@
 
 import math
 import os
+import re
 import struct
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
@@ -21,7 +22,107 @@ class PyTorchBinaryScanner(BaseScanner):
     name = "pytorch_binary"
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
+    MAX_EXECUTABLE_SIGNATURE_FINDINGS: ClassVar[int] = 10
     SHEBANG_CONTEXT_BYTES: ClassVar[int] = 50
+    MACHO_HEADER_LAYOUTS: ClassVar[dict[bytes, tuple[Literal["big", "little"], int]]] = {
+        b"\xfe\xed\xfa\xce": ("big", 28),
+        b"\xce\xfa\xed\xfe": ("little", 28),
+        b"\xfe\xed\xfa\xcf": ("big", 32),
+        b"\xcf\xfa\xed\xfe": ("little", 32),
+    }
+    SECURITY_CODE_REGEX_MAX_MATCH_BYTES: ClassVar[int] = len(b"ctypes.windll.LoadLibrary(") + 5 * 8
+    SECURITY_CODE_PATTERNS: ClassVar[frozenset[bytes]] = frozenset(
+        {
+            b"eval(",
+            b"exec(",
+            b"__import__",
+            b"execfile(",
+            b"os.system",
+            b"subprocess.call",
+            b"subprocess.Popen",
+            b"socket.socket",
+            b"ctypes.CDLL",
+            b"ctypes.cdll",
+            b"ctypes.windll",
+            b"ctypes.WinDLL",
+            b"ffi.dlopen",
+            b"dlopen(",
+            b"LoadLibrary",
+            b"posix\nsystem",
+            b"posix\npopen",
+            b"nt\nsystem",
+            b"nt\npopen",
+        }
+    )
+    SECURITY_CODE_REGEX_PATTERNS: ClassVar[tuple[tuple[bytes, re.Pattern[bytes]], ...]] = (
+        (b"eval(", re.compile(rb"(?<![\w.])eval[ \t\r\n]{0,8}\(")),
+        (b"exec(", re.compile(rb"(?<![\w.])exec[ \t\r\n]{0,8}\(")),
+        (b"__import__", re.compile(rb"(?<![\w.])__import__[ \t\r\n]{0,8}\(")),
+        (b"execfile(", re.compile(rb"(?<![\w.])execfile[ \t\r\n]{0,8}\(")),
+        (
+            b"os.system",
+            re.compile(rb"(?<![\w.])os[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}system[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"subprocess.call",
+            re.compile(rb"(?<![\w.])subprocess[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}call[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"subprocess.Popen",
+            re.compile(rb"(?<![\w.])subprocess[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}Popen[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"socket.socket",
+            re.compile(rb"(?<![\w.])socket[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}socket[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ctypes.CDLL",
+            re.compile(rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}CDLL[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ctypes.cdll",
+            re.compile(
+                rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}cdll"
+                rb"[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}LoadLibrary[ \t\r\n]{0,8}\("
+            ),
+        ),
+        (
+            b"ctypes.windll",
+            re.compile(
+                rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}windll"
+                rb"[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}LoadLibrary[ \t\r\n]{0,8}\("
+            ),
+        ),
+        (
+            b"ctypes.WinDLL",
+            re.compile(rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}WinDLL[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ffi.dlopen",
+            re.compile(rb"(?<![\w.])ffi[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}dlopen[ \t\r\n]{0,8}\("),
+        ),
+        (b"dlopen(", re.compile(rb"(?<![\w.])dlopen[ \t\r\n]{0,8}\(")),
+        (b"LoadLibrary", re.compile(rb"(?<![\w.])LoadLibrary[ \t\r\n]{0,8}\(")),
+    )
+    SECURITY_CODE_REGEX_PATTERN_LABELS: ClassVar[frozenset[bytes]] = frozenset(
+        {
+            b"eval(",
+            b"exec(",
+            b"__import__",
+            b"execfile(",
+            b"os.system",
+            b"subprocess.call",
+            b"subprocess.Popen",
+            b"socket.socket",
+            b"ctypes.CDLL",
+            b"ctypes.cdll",
+            b"ctypes.windll",
+            b"ctypes.WinDLL",
+            b"ffi.dlopen",
+            b"dlopen(",
+            b"LoadLibrary",
+        }
+    )
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -145,6 +246,8 @@ class PyTorchBinaryScanner(BaseScanner):
             chunk_size = 1024 * 1024  # 1MB chunks
             previous_chunk_tail = b""
             chunk_overlap = self._get_chunk_overlap_size(chunk_size)
+            reported_executable_signatures: set[tuple[str, int]] = set()
+            executable_findings_reported = 0
 
             with open(path, "rb") as f:
                 while True:
@@ -176,11 +279,16 @@ class PyTorchBinaryScanner(BaseScanner):
                         )
 
                     # Check for executable file signatures
-                    self._check_for_executable_signatures(
-                        chunk,
-                        result,
-                        chunk_offset,
-                    )
+                    if executable_findings_reported < self.MAX_EXECUTABLE_SIGNATURE_FINDINGS:
+                        executable_findings_reported += self._check_for_executable_signatures(
+                            scan_window,
+                            result,
+                            window_offset,
+                            file_size=file_size,
+                            reported_signatures=reported_executable_signatures,
+                            finding_budget=self.MAX_EXECUTABLE_SIGNATURE_FINDINGS - executable_findings_reported,
+                            overlap_prefix_len=overlap_prefix_len,
+                        )
                     previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
 
             result.bytes_scanned = bytes_scanned
@@ -210,6 +318,7 @@ class PyTorchBinaryScanner(BaseScanner):
         longest_pattern = max(
             [
                 self.SHEBANG_CONTEXT_BYTES,
+                self.SECURITY_CODE_REGEX_MAX_MATCH_BYTES + 1,
                 *(len(pattern) for pattern in BINARY_CODE_PATTERNS),
                 *(len(pattern.encode("utf-8")) for pattern in (self.blacklist_patterns or []) if pattern),
                 *(len(signature) for signature in EXECUTABLE_SIGNATURES),
@@ -226,8 +335,49 @@ class PyTorchBinaryScanner(BaseScanner):
         overlap_prefix_len: int = 0,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
-        # Common patterns that might indicate embedded Python code
         found_suspicious = False
+        reported_matches: set[tuple[bytes, int]] = set()
+
+        def add_pattern_finding(
+            pattern: bytes,
+            pos: int,
+            *,
+            end_pos: int | None = None,
+            severity: IssueSeverity | None = None,
+        ) -> None:
+            nonlocal found_suspicious
+            if (end_pos if end_pos is not None else pos + len(pattern)) <= overlap_prefix_len:
+                return
+            absolute_offset = offset + pos
+            match_key = (pattern, absolute_offset)
+            if match_key in reported_matches:
+                return
+            reported_matches.add(match_key)
+            finding_severity = severity or (
+                IssueSeverity.WARNING if pattern in self.SECURITY_CODE_PATTERNS else IssueSeverity.INFO
+            )
+            result.add_check(
+                name="Embedded Code Pattern Detection",
+                passed=False,
+                message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
+                rule_code="S902",
+                severity=finding_severity,
+                location=f"{self.current_file_path} (offset: {absolute_offset})",
+                details={
+                    "pattern": pattern.decode("ascii", errors="ignore"),
+                    "offset": absolute_offset,
+                    "pattern_confidence": (
+                        "high" if finding_severity == IssueSeverity.WARNING else "context_dependent"
+                    ),
+                },
+            )
+            found_suspicious = True
+
+        for pattern, regex in self.SECURITY_CODE_REGEX_PATTERNS:
+            for match in regex.finditer(chunk):
+                add_pattern_finding(pattern, match.start(), end_pos=match.end(), severity=IssueSeverity.WARNING)
+                break
+
         for pattern in BINARY_CODE_PATTERNS:
             search_start = 0
             while True:
@@ -235,21 +385,17 @@ class PyTorchBinaryScanner(BaseScanner):
                 if pos == -1:
                     break
                 search_start = pos + 1
-                if pos + len(pattern) <= overlap_prefix_len:
+                if (
+                    pattern in self.SECURITY_CODE_REGEX_PATTERN_LABELS
+                    and pos > 0
+                    and (chunk[pos - 1 : pos].isalnum() or chunk[pos - 1 : pos] == b"_")
+                ):
                     continue
-                result.add_check(
-                    name="Embedded Code Pattern Detection",
-                    passed=False,
-                    message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
-                    rule_code="S902",
-                    severity=IssueSeverity.INFO,
-                    location=f"{self.current_file_path} (offset: {offset + pos})",
-                    details={
-                        "pattern": pattern.decode("ascii", errors="ignore"),
-                        "offset": offset + pos,
-                    },
+                add_pattern_finding(
+                    pattern,
+                    pos,
+                    severity=(IssueSeverity.INFO if pattern in self.SECURITY_CODE_REGEX_PATTERN_LABELS else None),
                 )
-                found_suspicious = True
                 break
 
         if not found_suspicious and offset == 0:  # Only record success on first chunk
@@ -348,14 +494,26 @@ class PyTorchBinaryScanner(BaseScanner):
                 # Get character right after interpreter
                 next_char = snippet[interp_len : interp_len + 1]
 
-                # Valid next characters: newline, space, tab, or / (for /usr/bin/env python)
-                if next_char in (b"\n", b"\r", b" ", b"\t", b"/"):
+                # Valid next characters: newline or whitespace before interpreter arguments.
+                if next_char in (b"\n", b"\r", b" ", b"\t"):
                     return True
 
         return False
 
-    def _is_valid_embedded_pe(self, data: bytes, offset_in_chunk: int, absolute_offset: int) -> bool:
+    def _is_valid_embedded_pe(
+        self,
+        data: bytes,
+        offset_in_chunk: int,
+        absolute_offset: int,
+        *,
+        file_size: int | None = None,
+    ) -> bool:
         """Validate a non-leading DOS header before reporting embedded PE content."""
+        if file_size is None:
+            file_size = self.get_file_size(self.current_file_path)
+        if absolute_offset < 0 or absolute_offset + 0x40 > file_size:
+            return False
+
         pointer_offset = offset_in_chunk + 0x3C
         if pointer_offset + 4 <= len(data):
             pe_pointer = data[pointer_offset : pointer_offset + 4]
@@ -371,6 +529,8 @@ class PyTorchBinaryScanner(BaseScanner):
         pe_offset = int.from_bytes(pe_pointer, "little")
         if pe_offset < 0x40:
             return False
+        if absolute_offset + pe_offset + 4 > file_size:
+            return False
         signature_offset = offset_in_chunk + pe_offset
         if signature_offset + 4 <= len(data):
             return data[signature_offset : signature_offset + 4] == b"PE\x00\x00"
@@ -381,30 +541,119 @@ class PyTorchBinaryScanner(BaseScanner):
         except OSError:
             return False
 
+    def _read_embedded_header(
+        self,
+        data: bytes,
+        offset_in_chunk: int,
+        absolute_offset: int,
+        header_size: int,
+        *,
+        file_size: int,
+    ) -> bytes:
+        if absolute_offset < 0 or absolute_offset + header_size > file_size:
+            return b""
+        if offset_in_chunk >= 0 and offset_in_chunk + header_size <= len(data):
+            return data[offset_in_chunk : offset_in_chunk + header_size]
+        try:
+            with open(self.current_file_path, "rb") as f:
+                f.seek(absolute_offset)
+                return f.read(header_size)
+        except OSError:
+            return b""
+
+    def _is_valid_embedded_elf(
+        self,
+        data: bytes,
+        offset_in_chunk: int,
+        absolute_offset: int,
+        *,
+        file_size: int,
+    ) -> bool:
+        """Validate a late ELF magic before reporting embedded executable content."""
+        header = self._read_embedded_header(
+            data,
+            offset_in_chunk,
+            absolute_offset,
+            24,
+            file_size=file_size,
+        )
+        if len(header) != 24 or not header.startswith(b"\x7fELF"):
+            return False
+
+        elf_class = header[4]
+        byte_order = header[5]
+        if elf_class not in {1, 2} or byte_order not in {1, 2} or header[6] != 1:
+            return False
+
+        endian: Literal["little", "big"] = "little" if byte_order == 1 else "big"
+        object_type = int.from_bytes(header[16:18], endian)
+        machine = int.from_bytes(header[18:20], endian)
+        object_version = int.from_bytes(header[20:24], endian)
+        return object_type in {2, 3} and machine != 0 and object_version == 1
+
+    def _is_valid_embedded_macho(
+        self,
+        data: bytes,
+        offset_in_chunk: int,
+        absolute_offset: int,
+        signature: bytes,
+        *,
+        file_size: int,
+    ) -> bool:
+        """Validate a late thin Mach-O magic before reporting executable content."""
+        layout = self.MACHO_HEADER_LAYOUTS.get(signature)
+        if layout is None:
+            return False
+        byte_order, header_size = layout
+        header = self._read_embedded_header(
+            data,
+            offset_in_chunk,
+            absolute_offset,
+            header_size,
+            file_size=file_size,
+        )
+        if len(header) != header_size or not header.startswith(signature):
+            return False
+
+        cpu_type = int.from_bytes(header[4:8], byte_order)
+        file_type = int.from_bytes(header[12:16], byte_order)
+        load_command_count = int.from_bytes(header[16:20], byte_order)
+        load_command_bytes = int.from_bytes(header[20:24], byte_order)
+        bytes_after_header = file_size - absolute_offset - header_size
+        return (
+            cpu_type != 0
+            and 1 <= file_type <= 12
+            and 1 <= load_command_count <= 65_535
+            and load_command_count * 8 <= load_command_bytes <= bytes_after_header
+        )
+
     def _check_for_executable_signatures(
         self,
         chunk: bytes,
         result: ScanResult,
         offset: int,
-    ) -> None:
+        *,
+        file_size: int,
+        reported_signatures: set[tuple[str, int]],
+        finding_budget: int,
+        overlap_prefix_len: int = 0,
+    ) -> int:
         """Check for executable file signatures with context-aware detection"""
         from modelaudit.utils.helpers.ml_context import (
             analyze_binary_for_ml_context,
             should_ignore_executable_signature,
         )
 
-        # RULE 1: Only scan first 64KB - real executables have signatures at start
-        if offset > 65536:
-            return
-
-        # Analyze ML context for this chunk
-        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+        if finding_budget <= 0:
+            return 0
 
         # Count patterns for density analysis
-        pattern_counts = {}
+        pattern_counts: dict[bytes, tuple[list[int], str]] = {}
 
         # Common executable signatures
         for sig, description in EXECUTABLE_SIGNATURES.items():
+            if sig.startswith(b"#!/") and sig != b"#!/":
+                continue
             if sig in chunk:
                 # Count all occurrences
                 positions = []
@@ -413,16 +662,23 @@ class PyTorchBinaryScanner(BaseScanner):
                     pos = chunk.find(sig, pos)
                     if pos == -1:
                         break
-                    positions.append(offset + pos)
+                    if pos + len(sig) > overlap_prefix_len or sig == b"#!/":
+                        positions.append(offset + pos)
                     pos += len(sig)
 
                 if positions:
                     pattern_counts[sig] = (positions, description)
 
+        if not pattern_counts:
+            return 0
+
+        ml_context = analyze_binary_for_ml_context(chunk, file_size)
+        new_findings = 0
+
         # Process findings with context-aware filtering
         for sig, (positions, description) in pattern_counts.items():
             # Calculate pattern density more reasonably for small files
-            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            file_size_mb = file_size / (1024 * 1024)
             # Use at least 1MB for density calculation to avoid inflated densities in small files
             effective_size_mb = max(file_size_mb, 1.0)
             pattern_density = len(positions) / effective_size_mb
@@ -433,7 +689,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
             for pos in positions:
                 # For shell shebangs, verify they have valid interpreter context
-                if sig == b"#!/":
+                if sig.startswith(b"#!/"):
                     # Calculate position within chunk
                     pos_in_chunk = pos - offset
                     if not self._verify_shebang_context(chunk, pos_in_chunk):
@@ -442,7 +698,43 @@ class PyTorchBinaryScanner(BaseScanner):
 
                 # Middle-of-file MZ pairs are common in weights; retain only
                 # structurally validated embedded PE images.
-                if sig == b"MZ" and pos != 0 and not self._is_valid_embedded_pe(chunk, pos - offset, pos):
+                if (
+                    sig == b"MZ"
+                    and pos != 0
+                    and not self._is_valid_embedded_pe(
+                        chunk,
+                        pos - offset,
+                        pos,
+                        file_size=file_size,
+                    )
+                ):
+                    ignored_count += 1
+                    continue
+
+                if (
+                    sig == b"\x7fELF"
+                    and pos != 0
+                    and not self._is_valid_embedded_elf(
+                        chunk,
+                        pos - offset,
+                        pos,
+                        file_size=file_size,
+                    )
+                ):
+                    ignored_count += 1
+                    continue
+
+                if (
+                    sig in self.MACHO_HEADER_LAYOUTS
+                    and pos != 0
+                    and not self._is_valid_embedded_macho(
+                        chunk,
+                        pos - offset,
+                        pos,
+                        sig,
+                        file_size=file_size,
+                    )
+                ):
                     ignored_count += 1
                     continue
 
@@ -459,7 +751,10 @@ class PyTorchBinaryScanner(BaseScanner):
                 filtered_positions.append(pos)
 
             # Report significant patterns that weren't filtered out
-            for pos in filtered_positions[:10]:  # Limit to first 10
+            for pos in filtered_positions:
+                signature_key = (sig.hex(), pos)
+                if signature_key in reported_signatures:
+                    continue
                 result.add_check(
                     name="Executable Signature Detection",
                     passed=False,
@@ -476,6 +771,10 @@ class PyTorchBinaryScanner(BaseScanner):
                         "ml_context_confidence": ml_context.get("weight_confidence", 0),
                     },
                 )
+                reported_signatures.add(signature_key)
+                new_findings += 1
+                if new_findings >= finding_budget:
+                    return new_findings
 
             # Add debug note about ignored patterns (only shown in verbose mode)
             if ignored_count > 0 and len(positions) > 5:
@@ -498,6 +797,8 @@ class PyTorchBinaryScanner(BaseScanner):
                     why=f"These patterns were likely false positives in ML weight data. {explanation}",
                     rule_code=None,  # Passing check
                 )
+
+        return new_findings
 
     def _validate_tensor_structure(self, path: str, result: ScanResult) -> None:
         """Validate that the file appears to have valid tensor structure"""

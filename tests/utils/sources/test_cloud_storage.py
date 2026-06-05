@@ -876,13 +876,82 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     mock_fs.side_effect = [first_meta, downloader, second_meta]
 
     first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
-    second = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    second = download_from_cloud(url, cache_dir=tmp_path, max_size=4, show_progress=False)
 
     assert isinstance(first, Path)
     assert second == first
     assert first.read_bytes() == b"data"
     downloader.get.assert_called_once()
     assert mock_fs.call_count == 3
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_does_not_reuse_cached_file_over_max_size(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/model.pt"
+
+    first_meta = make_fs_mock()
+    first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    first_downloader = make_fs_mock()
+    first_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    first_downloader.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    second_meta = make_fs_mock()
+    second_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    second_downloader = make_fs_mock()
+    second_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    second_downloader.open.return_value = BytesIO(b"data")
+
+    mock_fs.side_effect = [first_meta, first_downloader, second_meta, second_downloader]
+
+    first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    assert isinstance(first, Path)
+    first.write_bytes(b"oversized")
+
+    second = download_from_cloud(url, cache_dir=tmp_path, max_size=4, show_progress=False)
+
+    assert second == first
+    assert second.read_bytes() == b"data"
+    second_downloader.open.assert_called_once_with(url, "rb")
+    assert mock_fs.call_count == 4
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_replaces_symlinked_cached_file_with_max_size(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/model.pt"
+
+    first_meta = make_fs_mock()
+    first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    first_downloader = make_fs_mock()
+    first_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    first_downloader.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    second_meta = make_fs_mock()
+    second_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    second_downloader = make_fs_mock()
+    second_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    second_downloader.open.return_value = BytesIO(b"safe")
+
+    mock_fs.side_effect = [first_meta, first_downloader, second_meta, second_downloader]
+
+    first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    assert isinstance(first, Path)
+    decoy = first.parent / "decoy.bin"
+    decoy.write_bytes(b"keep")
+    first.unlink()
+    first.symlink_to(decoy.name)
+
+    second = download_from_cloud(url, cache_dir=tmp_path, max_size=4, show_progress=False)
+
+    assert second == first
+    assert not second.is_symlink()
+    assert second.read_bytes() == b"safe"
+    assert decoy.read_bytes() == b"keep"
+    second_downloader.open.assert_called_once_with(url, "rb")
+    assert mock_fs.call_count == 4
 
 
 @patch("fsspec.filesystem")
@@ -913,6 +982,49 @@ def test_download_from_cloud_clears_stale_directory_cache(mock_fs: MagicMock, tm
     assert isinstance(result, Path)
     assert not (result / "old-model.bin").exists()
     assert (result / "new-model.bin").read_bytes() == b"new"
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_replaces_symlinked_directory_cache_without_touching_target(
+    mock_fs: MagicMock, tmp_path: Path
+) -> None:
+    url = "s3://bucket/models"
+    cache = GCSCache(cache_dir=tmp_path / "cache")
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "old-model.bin").write_bytes(b"old")
+    cache.cache_file(url, stale_dir, etag="etag-v1")
+    cached_path = cache.get_cached_path(url, etag="etag-v1")
+    assert cached_path is not None
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_marker = outside_dir / "keep.txt"
+    outside_marker.write_text("keep", encoding="utf-8")
+    (cached_path / "old-model.bin").unlink()
+    cached_path.rmdir()
+    cached_path.symlink_to(outside_dir, target_is_directory=True)
+
+    fs_meta = make_fs_mock()
+    fs_meta.info.return_value = {"type": "directory", "ETag": "etag-v2"}
+    fs_meta.glob.return_value = ["s3://bucket/models/new-model.bin"]
+    fs_meta.info.side_effect = [
+        {"type": "directory", "ETag": "etag-v2"},
+        {"type": "file", "size": 3, "ETag": "file-etag-v2"},
+    ]
+
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 3}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"new")
+
+    mock_fs.side_effect = [fs_meta, fs]
+
+    result = download_from_cloud(url, cache_dir=tmp_path / "cache", show_progress=False, selective=False)
+
+    assert isinstance(result, Path)
+    assert not result.is_symlink()
+    assert (result / "new-model.bin").read_bytes() == b"new"
+    assert outside_marker.read_text(encoding="utf-8") == "keep"
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)

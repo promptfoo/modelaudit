@@ -3415,45 +3415,49 @@ def _has_bounded_flax_msgpack_state_root(
     return has_checkpoint_root
 
 
-def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
-    """Inspect streamed maps, returning None when safe routing cannot complete."""
+def _probe_flax_msgpack_checkpoint_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    sample_is_prefix: bool = False,
+) -> bool | None:
+    """Inspect streamed maps, preserving recognized roots in truncated prefixes."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
     inline_scalars_seen = 0
     recognized_checkpoint_root = [False]
     try:
-        with path.open("rb") as stream:
-            while stream.tell() < file_size:
-                marker = _read_msgpack_probe_bytes(stream, 1)[0]
-                map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
-                if map_count is None and _is_inline_msgpack_probe_scalar(marker):
-                    inline_scalars_seen += 1
-                    if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
-                        raise _MsgpackProbeLimit
-                    continue
+        while stream.tell() < file_size:
+            marker = _read_msgpack_probe_bytes(stream, 1)[0]
+            map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+            if map_count is None and _is_inline_msgpack_probe_scalar(marker):
+                inline_scalars_seen += 1
+                if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+                    raise _MsgpackProbeLimit
+                continue
 
-                _consume_msgpack_probe_node(remaining_nodes)
-                if map_count is None:
-                    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
-                    continue
-                has_checkpoint_root = False
-                for _ in range(map_count):
-                    key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
-                    if key in _FLAX_MSGPACK_ROUTING_KEYS:
-                        recognized_checkpoint_root[0] = True
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            _consume_msgpack_probe_node(remaining_nodes)
+            if map_count is None:
+                _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
+                continue
+            has_checkpoint_root = False
+            for _ in range(map_count):
+                key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
+                if key in _FLAX_MSGPACK_ROUTING_KEYS:
+                    recognized_checkpoint_root[0] = True
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                    has_checkpoint_root = True
+                if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
+                    if _has_bounded_flax_msgpack_state_root(
+                        stream,
+                        file_size,
+                        remaining_nodes,
+                        recognized_checkpoint_root,
+                    ):
                         has_checkpoint_root = True
-                    if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
-                        if _has_bounded_flax_msgpack_state_root(
-                            stream,
-                            file_size,
-                            remaining_nodes,
-                            recognized_checkpoint_root,
-                        ):
-                            has_checkpoint_root = True
-                    elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
-                if has_checkpoint_root:
-                    return True
+                elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            if has_checkpoint_root:
+                return True
     except _MsgpackProbeLimit:
         # Once a root is recognized, run the scanner so it can analyze sibling
         # security fields even if routing validation exhausts its budget.
@@ -3461,8 +3465,17 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
     except OSError:
         return None
     except _MsgpackProbeInvalid:
-        return False
+        return sample_is_prefix and recognized_checkpoint_root[0]
     return False
+
+
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+    """Inspect streamed maps, returning None when safe routing cannot complete."""
+    try:
+        with path.open("rb") as stream:
+            return _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+    except OSError:
+        return None
 
 
 def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:
@@ -3635,17 +3648,35 @@ def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle:
     except OSError:
         return ()
 
+    return _detect_trusted_flax_foreign_content_routes(
+        file_path,
+        size,
+        include_unvalidated_pickle=include_unvalidated_pickle,
+    )
+
+
+def _detect_trusted_flax_foreign_content_routes(
+    file_path: Path,
+    file_size: int,
+    *,
+    include_unvalidated_pickle: bool = False,
+) -> tuple[str, ...]:
+    """Return strict foreign content routes that can safely override or supplement Flax suffixes."""
     prefix = read_magic_bytes(
-        path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+        str(file_path),
+        min(
+            file_size,
+            max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES),
+        ),
     )
     routes: list[str] = []
-    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, prefix[:16])
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, prefix[:16])
     if (
         (include_unvalidated_pickle and _looks_like_binary_pickle_protocol(prefix[:4]))
         or _has_bounded_binary_pickle_security_signal(pickle_probe_sample)
         or _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
-            sample_is_prefix=size > len(pickle_probe_sample),
+            sample_is_prefix=file_size > len(pickle_probe_sample),
         )
     ):
         routes.append("pickle")
@@ -3661,12 +3692,19 @@ def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle:
 
 
 def _resolve_inconclusive_flax_foreign_overlap(file_path: Path) -> str | None:
-    """Prefer a proven foreign owner when renamed Flax routing is only ambiguous."""
-    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+    """Prefer a proven foreign owner when Flax ownership is not structurally confirmed."""
+    probe_state = _probe_flax_msgpack_checkpoint_file(file_path)
+    if probe_state is True:
         return None
-    if _probe_flax_msgpack_checkpoint_file(file_path) is not None:
+    if probe_state is False and file_path.suffix.lower() not in _FLAX_MSGPACK_NATIVE_SUFFIXES:
         return None
-    return next(iter(detect_flax_msgpack_overlap_routes(str(file_path))), None)
+    try:
+        if not file_path.is_file():
+            return None
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+    return next(iter(_detect_trusted_flax_foreign_content_routes(file_path, size)), None)
 
 
 def detect_format_from_magic_bytes(
