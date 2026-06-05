@@ -1350,6 +1350,7 @@ def _filter_scannable_cloud_files(
     scannable_filenames: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
     max_sniff_bytes: int | None = None,
+    sniff_budget: _CloudContentSniffBudget | None = None,
 ) -> list[dict[str, Any]]:
     scannable = filter_scannable_files(
         files,
@@ -1360,7 +1361,8 @@ def _filter_scannable_cloud_files(
         return scannable
 
     scannable_by_path = {str(file["path"]): file for file in scannable}
-    sniff_budget = _CloudContentSniffBudget(max_sniff_bytes) if max_sniff_bytes else None
+    if sniff_budget is None and max_sniff_bytes:
+        sniff_budget = _CloudContentSniffBudget(max_sniff_bytes)
     scanner_policy = (
         policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection}) if scanner_selection is not None else None
     )
@@ -1460,9 +1462,15 @@ def _cached_path_within_size_limit(path: Path, max_size: int) -> bool:
         return False
 
 
-def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size: int) -> int:
+def _selected_cloud_download_size(
+    fs: Any,
+    files: list[dict[str, Any]],
+    max_size: int,
+    *,
+    acquired_bytes: int = 0,
+) -> int:
     """Return the late-bound size of selected objects, failing closed on unknown sizes."""
-    total_size = 0
+    selected_size = 0
     for file_info in files:
         file_url = str(file_info["path"])
         try:
@@ -1477,12 +1485,13 @@ def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size
                 "Unable to enforce maximum cloud download size for selected object "
                 f"{redact_url_for_display(file_url)} because its size could not be determined"
             )
-        total_size += file_size
-        if total_size > max_size:
+        selected_size += file_size
+        if acquired_bytes + selected_size > max_size:
             raise ValueError(
-                f"File size ({format_size(total_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+                f"File size ({format_size(acquired_bytes + selected_size)}) exceeds maximum allowed size "
+                f"({format_size(max_size)})"
             )
-    return total_size
+    return selected_size
 
 
 class _CloudDownloadBudgetExceeded(ValueError):
@@ -1644,6 +1653,7 @@ def download_from_cloud(
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         files: list[dict[str, Any]] | None = None
+        content_sniff_budget = _CloudContentSniffBudget(max_size) if max_size else None
         if metadata["type"] == "directory":
             raw_files = metadata.get("files")
             if raw_files is None:
@@ -1661,7 +1671,7 @@ def download_from_cloud(
                     scannable_extensions=scannable_extensions,
                     scannable_filenames=scannable_filenames,
                     scanner_selection=scanner_selection,
-                    max_sniff_bytes=max_size,
+                    sniff_budget=content_sniff_budget,
                 )
                 if show_progress:
                     total = metadata.get("file_count", 0)
@@ -1675,8 +1685,18 @@ def download_from_cloud(
 
         # Check available disk space before downloading
         object_size: int | None
+        acquired_probe_bytes = (
+            content_sniff_budget.max_bytes - content_sniff_budget.remaining_bytes
+            if content_sniff_budget is not None
+            else 0
+        )
         if max_size and files is not None:
-            object_size = _selected_cloud_download_size(fs, files, max_size)
+            object_size = _selected_cloud_download_size(
+                fs,
+                files,
+                max_size,
+                acquired_bytes=acquired_probe_bytes,
+            )
         else:
             try:
                 object_size = get_cloud_object_size(fs, url, strict=True)
@@ -1723,6 +1743,8 @@ def download_from_cloud(
 
             # Download files
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
+            if download_budget is not None:
+                download_budget.consume(acquired_probe_bytes)
             for file_info in files:
                 file_url = file_info["path"]
                 local_path = _build_safe_local_path(url, file_url, download_path)
@@ -1842,6 +1864,7 @@ def download_from_cloud_streaming(
     fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     # Get list of files to download
+    content_sniff_budget = _CloudContentSniffBudget(max_size) if max_size else None
     if metadata["type"] == "directory":
         raw_files = metadata.get("files")
         if raw_files is None:
@@ -1858,7 +1881,7 @@ def download_from_cloud_streaming(
                 scannable_extensions=scannable_extensions,
                 scannable_filenames=scannable_filenames,
                 scanner_selection=scanner_selection,
-                max_sniff_bytes=max_size,
+                sniff_budget=content_sniff_budget,
             )
             if show_progress and files:
                 click.echo(f"Found {len(files)} scannable files to stream")
@@ -1869,8 +1892,16 @@ def download_from_cloud_streaming(
         # Single file
         files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
+    acquired_probe_bytes = (
+        content_sniff_budget.max_bytes - content_sniff_budget.remaining_bytes if content_sniff_budget is not None else 0
+    )
     if max_size:
-        _selected_cloud_download_size(fs, files, max_size)
+        _selected_cloud_download_size(
+            fs,
+            files,
+            max_size,
+            acquired_bytes=acquired_probe_bytes,
+        )
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
@@ -1879,6 +1910,8 @@ def download_from_cloud_streaming(
         # Download files one at a time
         total_files = len(files)
         download_budget = _CloudDownloadBudget(max_size) if max_size else None
+        if download_budget is not None:
+            download_budget.consume(acquired_probe_bytes)
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
