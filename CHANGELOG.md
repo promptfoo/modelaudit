@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - report embedded Keras HDF5 external references even when archive metadata claims a fixed version
+- validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
 - omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
 - block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
