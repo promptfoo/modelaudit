@@ -7002,11 +7002,20 @@ def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
 
 
-@pytest.mark.parametrize("filename", ["README.md", "README", "model_card"])
+@pytest.mark.parametrize(
+    ("filename", "scanner_name", "failure_reason"),
+    [
+        ("README.md", "text", "text_content_read_failed"),
+        ("README", "metadata", "metadata_read_failed"),
+        ("model_card", "metadata", "metadata_read_failed"),
+    ],
+)
 def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
+    scanner_name: str,
+    failure_reason: str,
 ) -> None:
     readme_path = tmp_path / filename
     readme_path.write_text("# metadata\n", encoding="utf-8")
@@ -7017,13 +7026,14 @@ def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
     monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
     monkeypatch.setattr("modelaudit.scanners.metadata_scanner.open", raise_read_error, raising=False)
+    monkeypatch.setattr("modelaudit.scanners.text_scanner.open", raise_read_error, raising=False)
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
+    assert result.scanner_name == scanner_name
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
-    assert result.metadata["operational_error_reason"] == "metadata_read_failed"
+    assert result.metadata["operational_error_reason"] == failure_reason
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 

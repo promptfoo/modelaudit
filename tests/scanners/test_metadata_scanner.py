@@ -82,7 +82,7 @@ class TestMetadataScanner:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Unreadable routed metadata should fail closed without a fabricated security issue."""
-        readme_path = tmp_path / "README.md"
+        readme_path = tmp_path / "README"
         readme_path.write_text("# Model Card\n\nThis README is benign.\n")
         cache_dir = tmp_path / "cache"
 

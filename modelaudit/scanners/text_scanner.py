@@ -56,10 +56,28 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[rubfRUBF]*[\"']?$")
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_ENCLOSING_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,4096}$")
+DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:url|uri|endpoint|host|server|callback|webhook)(?:[_-][A-Za-z0-9_.-]+)*\s*:\s*[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
+    rb"<(?:url|uri|endpoint|host|server|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+)*>\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_LAMBDA_PATTERN = re.compile(rb"\blambda\b[^:\n]{0,256}:\s*[^\n]*$", re.IGNORECASE)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
     rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
-    rb"(?:curl|fetch|invoke-webrequest|iwr|powershell(?:\.exe)?|pwsh|wget)\b",
+    rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'])"
+    rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
+    rb"(?:^|[;&|]\s*)(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'])"
+    rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
@@ -80,7 +98,8 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
 )
 GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
 REQUIREMENTS_URL_DIRECTIVE_PATTERN = re.compile(
-    rb"^(?:(?:--index-url|--extra-index-url|--find-links|-i|-f)\s+|--trusted-host\s+)",
+    rb"^(?:(?:--index-url|--extra-index-url|--find-links)(?:\s+|=)"
+    rb"|(?:-i|-f)(?:\s+|(?=[A-Za-z][A-Za-z0-9+.-]*://)))",
     re.IGNORECASE,
 )
 REQUIREMENTS_DIRECT_REFERENCE_PATTERN = re.compile(
@@ -195,19 +214,18 @@ class TextScanner(BaseScanner):
         stripped = line.lstrip()
         return (
             DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or stripped.startswith((b"import ", b"from ", b"def ", b"class ", b"if "))
-            or stripped.startswith((b'"', b"'"))
-            or b";" in line
-            or b"lambda " in line
+            or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_LAMBDA_PATTERN.search(prefix) is not None
+            or stripped.startswith((b"import ", b"from ", b"def ", b"class "))
         )
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
-        if finding.get("severity") in {"HIGH", "CRITICAL"}:
-            return True
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
@@ -220,7 +238,37 @@ class TextScanner(BaseScanner):
         return (
             DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
         )
+
+    @classmethod
+    def _retarget_documentation_finding(
+        cls,
+        payload: bytes,
+        lowered_payload: bytes,
+        finding: dict[str, Any],
+    ) -> dict[str, Any]:
+        finding_type = finding.get("type")
+        token = finding.get("function") if finding_type == "network_function" else finding.get("pattern")
+        if finding_type not in {"network_function", "cc_pattern"} or not isinstance(token, str) or not token:
+            return finding
+
+        token_bytes = token.encode().lower()
+        search_start = 0
+        while True:
+            position = lowered_payload.find(token_bytes, search_start)
+            if position < 0:
+                return finding
+            candidate = {**finding, "position": position}
+            if finding_type == "network_function":
+                actionable = not cls._documentation_network_function_is_prose(payload, candidate)
+            else:
+                actionable = not cls._documentation_cc_finding_is_benign_prose(payload, candidate)
+            if actionable:
+                candidate.pop("snippet", None)
+                return candidate
+            search_start = position + len(token_bytes)
 
     @classmethod
     def _documentation_network_function_is_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -237,10 +285,12 @@ class TextScanner(BaseScanner):
         while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
             cursor += 1
         return (
-            cursor >= len(line) or line[cursor : cursor + 1] != b"("
-        ) and not cls._documentation_line_is_code_shaped(
-            line,
-            position,
+            (cursor >= len(line) or line[cursor : cursor + 1] != b"(")
+            and not cls._documentation_line_is_code_shaped(
+                line,
+                position,
+            )
+            and DOCUMENTATION_ENCLOSING_CALL_PATTERN.search(line[:position]) is None
         )
 
     @classmethod
@@ -254,8 +304,8 @@ class TextScanner(BaseScanner):
         ):
             return False
         line, position = line_parts
-        return not cls._documentation_line_is_code_shaped(line, position) and bool(
-            BENIGN_DOCUMENTATION_CC_PATTERN.search(line)
+        return not cls._documentation_line_is_code_shaped(line, position) and any(
+            match.start() <= position < match.end() for match in BENIGN_DOCUMENTATION_CC_PATTERN.finditer(line)
         )
 
     @classmethod
@@ -268,10 +318,14 @@ class TextScanner(BaseScanner):
         url = finding.get("url")
         domain = finding.get("domain")
         try:
-            hostname = urlsplit(url).hostname if isinstance(url, str) else domain if isinstance(domain, str) else None
+            parsed_url = urlsplit(url) if isinstance(url, str) else None
+            hostname = parsed_url.hostname if parsed_url is not None else domain if isinstance(domain, str) else None
+            url_port = parsed_url.port if parsed_url is not None else None
         except ValueError:
             return False
         if hostname is None or hostname.casefold() not in TRUSTED_REQUIREMENTS_HOSTS:
+            return False
+        if parsed_url is not None and (parsed_url.scheme.casefold() != "https" or url_port not in {None, 443}):
             return False
         stripped = line.strip()
         return (
@@ -373,12 +427,16 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        return [
-            {**finding, "severity": "INFO"}
-            if cls._sidecar_network_finding_is_informational(path, payload, finding)
-            else finding
-            for finding in findings
-        ]
+        classified_findings: list[dict[str, Any]] = []
+        documentation_sidecar = cls._is_documentation_sidecar(path)
+        lowered_payload = payload.lower() if documentation_sidecar else b""
+        for finding in findings:
+            if documentation_sidecar:
+                finding = cls._retarget_documentation_finding(payload, lowered_payload, finding)
+            if cls._sidecar_network_finding_is_informational(path, payload, finding):
+                finding = {**finding, "severity": "INFO"}
+            classified_findings.append(finding)
+        return classified_findings
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
