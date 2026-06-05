@@ -48,6 +48,13 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{20,}={0,2})(?![A-Za-z0-9+/_=-])")
+_BASE64_LITERAL_PART_PATTERN = re.compile(
+    r"(?is)(?:[rubf]{0,3})(?P<quote>[\"'])(?P<payload>[A-Za-z0-9+/_-]{2,}={0,2})(?P=quote)"
+)
+_SPLIT_BASE64_EVIDENCE_PATTERN = re.compile(
+    r"(?is)(?:(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"'](?:\s+|\s*\+\s*))+"
+    r"(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"']"
+)
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
     r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
@@ -112,6 +119,19 @@ def _neutralize_existing_redaction_markers(text: str) -> str:
     )
 
 
+def _sanitize_decoded_reversible_evidence(decoded_text: str, original_text: str) -> str:
+    decoded_text = _neutralize_existing_redaction_markers(decoded_text)
+    standalone_redacted = _redact_standalone_secret_tokens(decoded_text)
+    redacted_decoded = redact_evidence_string(standalone_redacted, max_chars=160)
+    baseline = decoded_text if len(decoded_text) <= 160 else f"{decoded_text[:157]}..."
+    redaction_changed = standalone_redacted != decoded_text or redacted_decoded != baseline
+    if redaction_changed and (
+        REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded
+    ):
+        return redacted_decoded
+    return original_text
+
+
 def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
     if depth >= 2:
         return text
@@ -121,19 +141,37 @@ def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
         if not decoded_text:
             return match.group(0)
 
-        decoded_text = _neutralize_existing_redaction_markers(decoded_text)
         decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
-        standalone_redacted = _redact_standalone_secret_tokens(decoded_text)
-        redacted_decoded = redact_evidence_string(standalone_redacted, max_chars=160)
-        baseline = decoded_text if len(decoded_text) <= 160 else f"{decoded_text[:157]}..."
-        redaction_changed = standalone_redacted != decoded_text or redacted_decoded != baseline
-        if redaction_changed and (
-            REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded
-        ):
-            return redacted_decoded
-        return match.group(0)
+        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
 
     return _BASE64_EVIDENCE_TOKEN_PATTERN.sub(replace_payload, text)
+
+
+def _redact_split_base64_evidence(text: str) -> str:
+    """Decode adjacent or concatenated base64 string literals before display."""
+
+    def replace_payload(match: re.Match[str]) -> str:
+        payload = "".join(part.group("payload") for part in _BASE64_LITERAL_PART_PATTERN.finditer(match.group(0)))
+        if len(payload) < 20:
+            return match.group(0)
+        decoded_text = _decode_base64_evidence_payload(payload)
+        if not decoded_text:
+            return match.group(0)
+        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
+
+    return _SPLIT_BASE64_EVIDENCE_PATTERN.sub(replace_payload, text)
+
+
+def _redact_reversible_hex_evidence(text: str) -> str:
+    """Decode and sanitize reversible hex-escaped evidence before display."""
+
+    def replace_payload(match: re.Match[str]) -> str:
+        decoded_text = _decode_hex_escape_payload(match.group(0))
+        if not decoded_text:
+            return match.group(0)
+        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
+
+    return _HEX_ESCAPE_PATTERN.sub(replace_payload, text)
 
 
 def _redact_standalone_secret_tokens(text: str) -> str:
@@ -172,6 +210,8 @@ def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
         _MAX_ENCODED_EVIDENCE_CHARS,
     )
     text = text[:evidence_budget]
+    text = _redact_reversible_hex_evidence(text)
+    text = _redact_split_base64_evidence(text)
     text = _redact_reversible_base64_evidence(text)
     text = _redact_standalone_secret_tokens(_redact_urls_for_display(text))
     text = redact_evidence_string(text, max_chars=max_chars)

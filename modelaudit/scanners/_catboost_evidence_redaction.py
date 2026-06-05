@@ -12,6 +12,9 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunspli
 from ._evidence_redaction import (
     AUTHORIZATION_ALIAS_ASSIGNMENT_KEY as SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY,
 )
+from ._evidence_redaction import (
+    STANDALONE_SECRET_RE as SHARED_STANDALONE_SECRET_RE,
+)
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
@@ -43,7 +46,7 @@ PYTHON_LITERAL_JOINED_FRAGMENT_RE: Final[str] = (
     rf"(?:(?:\s+|\s*\+\s*|\s*%\s*\(?\s*){PYTHON_STRING_LITERAL_FRAGMENT_RE}\s*\)?)"
 )
 PYTHON_RESIDUAL_LITERAL_OPERATOR_RE: Final[str] = r"(?:[\(\.,+*/%]|\b(?:or|and|if|else)\b)"
-QUOTED_KEY_CONTENT_PATTERN: Final[str] = rf"(?:[^\\\"']|\\[\s\S]){{0,{MAX_KEY_EXPRESSION_CHARS}}}"
+QUOTED_KEY_CONTENT_PATTERN: Final[str] = rf"(?:[^\\\"']|\\[\s\S]){{0,{MAX_KEY_EXPRESSION_CHARS}}}?"
 SERIALIZED_BACKSLASH_ESCAPE_TOKEN: Final[str] = (
     r"\\+(?:u+005c|x5c|134|U0000005c|u\{0*5c\}|N\{(?:reverse solidus|backslash)\})"
 )
@@ -62,6 +65,10 @@ SERIALIZED_BACKSLASH_ESCAPED_QUOTE_RE: Final[re.Pattern[str]] = re.compile(
 )
 SERIALIZED_SLASH_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\\(?:x2f|u+002f|U0000002f|u\{0*2f\}|0?57|N\{solidus\})"
+)
+SERIALIZED_ASSIGNMENT_SEPARATOR_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\\+(?:x(?:3a|3d)|u+(?:003a|003d)|U000000(?:3a|3d)|u\{0*(?:3a|3d)\}|0?(?:72|75)|"
+    r"N\{(?:colon|equals sign)\})"
 )
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -160,7 +167,7 @@ KEY_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 UNQUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b((?:[a-z0-9_-]|{KEY_ESCAPE_TOKEN_PATTERN})+)(\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?i)(?<![a-z0-9_])((?:[a-z0-9_-]|{KEY_ESCAPE_TOKEN_PATTERN})+)(\s*{ASSIGNMENT_SEPARATOR}\s*)"
 )
 SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*|"
@@ -175,12 +182,10 @@ COMMAND_CONTEXT_LITERAL_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
 )
 COMMAND_BARE_SENSITIVE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b[A-Za-z0-9_.+/=-]*(?:api[_-]?key|client[_-]?secret|credential|password|passwd|private[_-]?key|"
-    r"secret|signature|token)[A-Za-z0-9_.+/=-]*\b"
+    rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
 )
 COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?<![-/\w.])(?![-/])[A-Za-z0-9_.+/=-]*(?:api[_-]?key|client[_-]?secret|credential|password|passwd|"
-    r"private[_-]?key|secret|signature|token)[A-Za-z0-9_.+/=-]*(?![/\w.-])"
+    rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
     rf"(?![\"']?\s*[:=]\s*[\"']?{re.escape(REDACTED_EVIDENCE_VALUE)})"
 )
 COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
@@ -190,7 +195,14 @@ COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
     r"proxy-tls-?password|tls-?password|"
     r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
-    r"(?:=|\s+))(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
+    r"(?:=|\s+))(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+)
+COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?P<option>((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|"
+    r"proxy-pass|proxy-tls-?password|tls-?password|ftp-password|http-password|oauth2-bearer|client[_-]?secret|"
+    r"api[_-]?key|token|secret)|(?<!\w)-b)(?:=|\s+))"
+    r"(?P<prefix>\$?)(?P<slashes>\\+)(?P<quote>[\"'])(?:(?!(?<!\\)(?P=slashes)(?P=quote))[\s\S])*?"
+    r"(?<!\\)(?P=slashes)(?P=quote)"
 )
 COMMAND_CERT_PASSWORD_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>((?<!\w)--(?:proxy-)?cert|(?<!\w)-E)(?:=|\s+))"
@@ -208,6 +220,25 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
     rf"(?P<key_quote>[\"'])(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
+)
+COMPOSED_SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*"
+    rf"(?P<key>(?:{PYTHON_STRING_LITERAL_FRAGMENT_RE}(?:\s*[+%]\s*|\s+))+"
+    rf"{PYTHON_STRING_LITERAL_FRAGMENT_RE})\s*,\s*)"
+)
+SENSITIVE_SETTER_CALL_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<callee>(?:[A-Za-z_][A-Za-z0-9_]*\.)*set_(?P<key>{SENSITIVE_ASSIGNMENT_KEY}))\s*\(\s*"
+)
+SENSITIVE_ARGV_PAIR_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?P<collection_prefix>[\[(,])\s*(?:{PYTHON_STRING_PREFIX_RE})?(?P<key_quote>[\"'])"
+    rf"(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
+    rf"(?P<value_prefix>{PYTHON_STRING_PREFIX_RE})(?P<value_quote>[\"'])"
+    rf"(?P<value>(?:\\.|(?!(?P=value_quote))[\s\S]){{0,{EVIDENCE_REDACTION_LOOKAHEAD_CHARS}}})"
+    rf"(?P=value_quote)"
+)
+SERIALIZED_STRUCTURED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?:^|[{{,])\s*)(?P<slashes>\\+)(?P<quote>[\"'])"
+    rf"(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=slashes)(?P=quote)\s*:\s*"
 )
 FUNCTION_KEYWORD_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
@@ -232,7 +263,8 @@ STRUCTURED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?:^|[{{,])\s*[\"'](?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})[\"']\s*:"
 )
 REDACTED_STRUCTURED_VALUE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
-    rf"^\s*(?P<quote>[\"']){re.escape(REDACTED_EVIDENCE_VALUE)}(?P=quote)\s*(?=[,}}])"
+    rf"^\s*(?P<slashes>\\*)(?P<quote>[\"']){re.escape(REDACTED_EVIDENCE_VALUE)}"
+    rf"(?P=slashes)(?P=quote)\s*(?=[,}}]|$)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
@@ -280,7 +312,7 @@ QUOTED_BEARER_START_RE: Final[re.Pattern[str]] = re.compile(
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*)"
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
-    rf"(?=[;&|\n]|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
+    rf"(?=,|;|}}|\]|&|\||\n|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
 )
 TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\3\4\3\4[\s\S]*?\3\4\3\4\3\4"
@@ -290,6 +322,11 @@ TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"']).*?\3\4"
+)
+STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<container_prefix>(?:^|[{{,])\s*)\b"
+    rf"(?P<prefix>({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?P<slashes>\\*)(?P<quote>[\"'])(?P<value>.*?)(?P=slashes)(?P=quote)(?=\s*[,}}])"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])"
@@ -468,6 +505,16 @@ def _normalize_serialized_url_slashes(text: str) -> str:
     return text
 
 
+def _normalize_serialized_assignment_separators(text: str) -> str:
+    """Restore escaped ':' and '=' separators before sensitive-key matching."""
+
+    def replace_separator(match: re.Match[str]) -> str:
+        token = match.group(0).lower()
+        return ":" if "3a" in token or "72" in token or "colon" in token else "="
+
+    return SERIALIZED_ASSIGNMENT_SEPARATOR_ESCAPE_RE.sub(replace_separator, text)
+
+
 def _escape_evidence_controls(text: str) -> str:
     """Render control and format characters inert before evidence is persisted."""
     escaped: list[str] = []
@@ -491,6 +538,17 @@ def _redact_quoted_assignment(match: re.Match[str]) -> str:
     slash = match.group(3)
     quote = match.group(4)
     return f"{match.group(1)}{slash}{quote}{REDACTED_EVIDENCE_VALUE}{slash}{quote}"
+
+
+def _redact_structured_quoted_assignment(match: re.Match[str]) -> str:
+    value = match.group("value")
+    safe_value = (
+        _redact_sensitive_command_value(value) if COMMAND_EVIDENCE_RE.search(value) else REDACTED_EVIDENCE_VALUE
+    )
+    return (
+        f"{match.group('container_prefix')}{match.group('prefix')}{match.group('slashes')}{match.group('quote')}"
+        f"{safe_value}{match.group('slashes')}{match.group('quote')}"
+    )
 
 
 def _redact_quoted_authorization(match: re.Match[str]) -> str:
@@ -541,6 +599,18 @@ def _normalize_quoted_sensitive_keys(text: str) -> str:
 
     text = COMPOSED_QUOTED_KEY_RE.sub(replace_composed_key, text)
     return QUOTED_KEY_RE.sub(replace_key, text)
+
+
+def _normalize_serialized_structured_sensitive_keys(text: str) -> str:
+    """Normalize escaped quoted keys that follow JSON/object delimiters."""
+
+    def replace_key(match: re.Match[str]) -> str:
+        normalized_key = _normalize_sensitive_key(_decode_key_escapes(match.group("key")))
+        if normalized_key is None:
+            return match.group(0)
+        return f"{match.group('prefix')}{normalized_key}="
+
+    return SERIALIZED_STRUCTURED_QUOTED_KEY_RE.sub(replace_key, text)
 
 
 def _normalize_unquoted_sensitive_keys(text: str) -> str:
@@ -598,6 +668,16 @@ def _sensitive_key_from_safe_expression(expression: str) -> str | None:
     except SyntaxError:
         value = None
     return _normalize_sensitive_key(value) if isinstance(value, str) else None
+
+
+def _sensitive_function_key_from_safe_expression(expression: str) -> str | None:
+    if not expression or len(expression) > MAX_KEY_EXPRESSION_CHARS or not _has_sensitive_literal_signal(expression):
+        return None
+    try:
+        value = _safe_eval_string_expr(ast.parse(expression, mode="eval"))
+    except SyntaxError:
+        return None
+    return _normalize_sensitive_function_key(value) if isinstance(value, str) else None
 
 
 def _subscript_target_start(text: str, bracket_start: int) -> int:
@@ -665,9 +745,21 @@ def _normalize_sensitive_key(decoded_key: str) -> str | None:
     return None
 
 
+def _redact_standalone_secret_tokens(text: str) -> str:
+    """Redact shared provider tokens plus CatBoost's generic opaque-token forms."""
+    return STANDALONE_SECRET_TOKEN_RE.sub(
+        REDACTED_EVIDENCE_VALUE,
+        _redact_shared_provider_tokens(text),
+    )
+
+
+def _redact_shared_provider_tokens(text: str) -> str:
+    return SHARED_STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, text)
+
+
 def _is_composed_key_fragment(text: str, start: int) -> bool:
     prefix = text[:start].rstrip()
-    return bool(prefix) and (prefix[-1] == "+" or prefix[-1] in {"'", '"'})
+    return bool(prefix) and (prefix[-1] in {"+", "%", "'", '"'})
 
 
 def _safe_eval_string_expr(node: ast.AST) -> EvaluatedStringValue | None:
@@ -1422,6 +1514,17 @@ def _normalize_expression_sensitive_keys(text: str) -> str:
     replacements: list[tuple[int, int, str]] = []
     parse_attempts = 0
     for separator in re.finditer(r":\s*", text):
+        quoted_key_start = max(0, separator.start() - MAX_KEY_EXPRESSION_CHARS - 8)
+        quoted_key_match = next(
+            (
+                match
+                for match in QUOTED_KEY_RE.finditer(text, quoted_key_start, separator.end())
+                if match.end() == separator.end() and not _is_composed_key_fragment(text, match.start())
+            ),
+            None,
+        )
+        if quoted_key_match is not None:
+            continue
         window_start = max(0, separator.start() - MAX_KEY_EXPRESSION_CHARS)
         window_start = _last_unquoted_statement_boundary(text, window_start, separator.start())
         if not _has_sensitive_literal_signal(text[window_start : separator.start()]):
@@ -1802,7 +1905,11 @@ def _redact_residual_expression_literals(text: str) -> str:
 def _redact_unquoted_sensitive_assignment(match: re.Match[str]) -> str:
     value = match.group(3)
     stripped_value = value.lstrip()
-    if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(stripped_value):
+    structured_value = REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(stripped_value)
+    if structured_value is not None and structured_value.group("slashes"):
+        leading_whitespace = value[: len(value) - len(stripped_value)]
+        return f"{match.group(1)}{leading_whitespace}{REDACTED_EVIDENCE_VALUE}"
+    if structured_value is not None:
         return match.group(0)
     if stripped_value.startswith(REDACTED_EVIDENCE_VALUE):
         command_tail = stripped_value[len(REDACTED_EVIDENCE_VALUE) :]
@@ -1844,6 +1951,13 @@ def _redact_quoted_certificate_password(match: re.Match[str]) -> str:
     return (
         f"{match.group('option')}{match.group('prefix')}{match.group('quote')}"
         f"{match.group('certificate')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+    )
+
+
+def _redact_serialized_command_option(match: re.Match[str]) -> str:
+    return (
+        f"{match.group('option')}{match.group('prefix')}{match.group('slashes')}{match.group('quote')}"
+        f"{REDACTED_EVIDENCE_VALUE}{match.group('slashes')}{match.group('quote')}"
     )
 
 
@@ -1910,11 +2024,55 @@ def _redact_sensitive_function_value(raw_value: str) -> str:
     return f"{leading}{safe_value}{trailing}"
 
 
+def _redact_sensitive_argv_pairs(text: str) -> str:
+    """Redact adjacent quoted option/value pairs such as ['--api-key', 'secret']."""
+
+    def replace_pair(match: re.Match[str]) -> str:
+        if match.group("collection_prefix") == ",":
+            inside_list = text.rfind("[", 0, match.start()) > text.rfind("]", 0, match.start())
+            inside_tuple = text.rfind("(", 0, match.start()) > text.rfind(")", 0, match.start())
+            if not inside_list and not inside_tuple:
+                return match.group(0)
+        if _normalize_sensitive_function_key(_decode_key_escapes(match.group("key"))) is None:
+            return match.group(0)
+        quote = match.group("value_quote")
+        return f"{match.group('prefix')}{match.group('value_prefix')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+
+    return SENSITIVE_ARGV_PAIR_RE.sub(replace_pair, text)
+
+
+def _redact_sensitive_setter_arguments(text: str) -> str:
+    """Redact the first value passed to setter methods named for sensitive keys."""
+    replacements: list[tuple[int, int, str]] = []
+    covered_until = 0
+    for match in SENSITIVE_SETTER_CALL_RE.finditer(text):
+        if match.start() < covered_until or _normalize_sensitive_key(match.group("key")) is None:
+            continue
+        argument_start = match.end()
+        argument_end = _find_function_argument_end(text, argument_start)
+        raw_argument = text[argument_start:argument_end]
+        if raw_argument.strip():
+            replacements.append((argument_start, argument_end, _redact_sensitive_function_value(raw_argument)))
+        covered_until = argument_end + 1
+
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
+
+
 def _redact_sensitive_function_arguments(text: str) -> str:
     replacements: list[tuple[int, int, str]] = []
     covered_until = 0
-    for match in SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text):
-        if match.start() < covered_until or _normalize_sensitive_function_key(match.group("key")) is None:
+    prefix_matches: list[tuple[re.Match[str], str | None]] = [
+        (match, _normalize_sensitive_function_key(match.group("key")))
+        for match in SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text)
+    ]
+    prefix_matches.extend(
+        (match, _sensitive_function_key_from_safe_expression(match.group("key")))
+        for match in COMPOSED_SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text)
+    )
+    for match, normalized_key in sorted(prefix_matches, key=lambda item: item[0].start()):
+        if match.start() < covered_until or normalized_key is None:
             continue
 
         declaration_call = match.group("callee").rsplit(".", 1)[-1].lower() == "add_argument"
@@ -2061,6 +2219,7 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SENSITIVE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE.sub(_redact_serialized_command_option, redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, redacted)
     redacted = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, redacted)
@@ -2068,12 +2227,12 @@ def _redact_command_evidence_text(text: str) -> str:
     pieces: list[str] = []
     cursor = 0
     for match in COMMAND_URL_CONTEXT_RE.finditer(redacted):
-        chunk = STANDALONE_SECRET_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor : match.start()])
+        chunk = _redact_standalone_secret_tokens(redacted[cursor : match.start()])
         chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk)
         pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
         pieces.append(match.group(0))
         cursor = match.end()
-    chunk = STANDALONE_SECRET_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor:])
+    chunk = _redact_standalone_secret_tokens(redacted[cursor:])
     chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk)
     pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
     return "".join(pieces)
@@ -2113,8 +2272,13 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_serialized_url_slashes(redacted)
     redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
-    redacted = _redact_command_context_tokens(redacted)
+    redacted = _normalize_serialized_assignment_separators(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
+    redacted = _normalize_serialized_structured_sensitive_keys(redacted)
+    redacted = STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_structured_quoted_assignment, redacted)
+    redacted = _redact_command_context_tokens(redacted)
+    redacted = _redact_sensitive_argv_pairs(redacted)
+    redacted = _redact_sensitive_setter_arguments(redacted)
     redacted = _redact_sensitive_function_arguments(redacted)
     redacted = _normalize_expression_sensitive_keys(redacted)
     redacted = _normalize_quoted_sensitive_keys(redacted)
@@ -2136,4 +2300,5 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
+    redacted = _redact_shared_provider_tokens(redacted)
     return _truncate(_escape_evidence_controls(redacted), max_chars)
