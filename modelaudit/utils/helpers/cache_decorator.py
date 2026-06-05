@@ -119,12 +119,9 @@ def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
     has_embedded_keras_hdf5 = _has_embedded_keras_hdf5_weights(file_path)
     if not is_hdf5 and not has_embedded_keras_hdf5:
         return False
-    if has_embedded_keras_hdf5:
-        return True
     if not _h5py_runtime_available():
         return True
-
-    if not is_hdf5:
+    if has_embedded_keras_hdf5:
         return False
 
     try:

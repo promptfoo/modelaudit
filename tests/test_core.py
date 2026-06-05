@@ -2830,13 +2830,20 @@ def test_scan_file_honors_zip_only_selection_for_large_hdf5_userblock(tmp_path: 
     assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+@pytest.mark.parametrize(
+    "zip_signature",
+    [b"PK\x03\x04", b"PK\x01\x02", b"PK\x06\x06", b"PK\x06\x07", b"PK\x07\x08"],
+    ids=["local-header", "central-directory", "zip64-eocd", "zip64-locator", "data-descriptor"],
+)
 def test_scan_file_fails_closed_for_corrupt_hdf5_userblock_zip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    zip_signature: bytes,
 ) -> None:
     polyglot = tmp_path / "corrupt-zip-userblock.h5"
-    polyglot.write_bytes(b"PK\x03\x04" + bytes(64))
+    polyglot.write_bytes(zip_signature + bytes(64))
     signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "zip"
     supplemental_result = ScanResult(scanner_name="keras_h5")
     supplemental_result.finish(success=True)
 
@@ -2865,6 +2872,33 @@ def test_scan_file_fails_closed_for_corrupt_hdf5_userblock_zip(
     )
     aggregate = scan_model_directory_or_file(str(polyglot), config={"cache_scan_results": False})
     assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    "zip_marker",
+    [b"PK\x06\x06", b"PK\x06\x07", b"PK\x07\x08"],
+    ids=["zip64-eocd", "zip64-locator", "data-descriptor"],
+)
+def test_scan_file_preserves_benign_nonleading_zip_marker_in_hdf5_userblock(
+    tmp_path: Path,
+    zip_marker: bytes,
+) -> None:
+    model_path = tmp_path / "benign-userblock-marker.h5"
+    model_path.write_bytes(b"benign user block data " + zip_marker + bytes(64))
+    signature_offset = _append_hdf5_userblock_candidate(model_path, plausible=True)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(model_path),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    assert result.success is True
+    assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
 
 
 @pytest.mark.parametrize(

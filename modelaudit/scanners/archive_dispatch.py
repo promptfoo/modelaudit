@@ -87,6 +87,14 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
 _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS = 16
+_ZIP_LEADING_SIGNATURES: tuple[bytes, ...] = (
+    b"PK\x03\x04",
+    b"PK\x01\x02",
+    b"PK\x05\x06",
+    b"PK\x06\x06",
+    b"PK\x06\x07",
+    b"PK\x07\x08",
+)
 
 
 def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
@@ -445,7 +453,11 @@ def merge_hdf5_userblock_zip_findings(
                     raise OSError("HDF5 user block ended before its validated signature offset")
                 candidate_bytes = carry + chunk
                 candidate_base = bytes_read - len(carry)
-                if b"PK\x03\x04" in candidate_bytes or b"PK\x01\x02" in candidate_bytes:
+                if (
+                    b"PK\x03\x04" in candidate_bytes
+                    or b"PK\x01\x02" in candidate_bytes
+                    or (bytes_read == 0 and candidate_bytes.startswith(_ZIP_LEADING_SIGNATURES))
+                ):
                     saw_zip_record = True
                 search_offset = 0
                 while True:

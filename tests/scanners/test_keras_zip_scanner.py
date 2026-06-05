@@ -976,8 +976,24 @@ class TestKerasZipScanner:
 
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
-    def test_embedded_hdf5_weights_bypass_cache_when_h5py_is_available(self, tmp_path: Path) -> None:
-        """Target-specific HDF5 read support must be revalidated on every scan."""
+    def test_embedded_hdf5_cache_bypass_depends_on_runtime_h5py(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        keras_path = tmp_path / "embedded-weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", "{}")
+            archive.writestr("model.weights.h5", b"placeholder")
+
+        monkeypatch.setattr(cache_decorator_module, "_h5py_runtime_available", lambda: True)
+        assert cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis(str(keras_path)) is False
+
+        monkeypatch.setattr(cache_decorator_module, "_h5py_runtime_available", lambda: False)
+        assert cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis(str(keras_path)) is True
+
+    def test_embedded_hdf5_weights_use_cache_when_h5py_is_available(self, tmp_path: Path) -> None:
+        """Fully analyzed embedded HDF5 weights should retain normal cache behavior."""
         keras_path = create_configured_keras_zip(
             tmp_path,
             {"class_name": "Sequential", "config": {"layers": []}},
@@ -996,7 +1012,7 @@ class TestKerasZipScanner:
                 )
                 assert determine_exit_code(result) == 0
 
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
         finally:
             reset_cache_manager()
 
