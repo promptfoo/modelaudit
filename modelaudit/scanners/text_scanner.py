@@ -67,10 +67,16 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
-    rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
+    rb"(?:^|[\r\n{[(,;])[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
+    rb"<(?:iframe\b[^<>]{0,4096}\bsrc|link\b[^<>]{0,4096}\bhref|script\b[^<>]{0,4096}\bsrc)"
+    rb"\s*=\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
@@ -140,20 +146,25 @@ DOCUMENTATION_PRIVILEGE_WRAPPER = (
     rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
-DOCUMENTATION_POSIX_SHELL_OPTION = rb"(?:--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?|-[A-Za-z]{1,8})"
-DOCUMENTATION_POSIX_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
+DOCUMENTATION_POSIX_LAUNCHER_WRAPPER = rb"(?:(?:(?:command|exec|nohup)\s+){0,2})"
+DOCUMENTATION_SHELL_OPTION = rb"--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
+DOCUMENTATION_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
 DOCUMENTATION_CMD_OPTION = rb"/[A-Za-z](?::[^\s]+)?"
 DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = (
     rb"(?:(?:(?:bash|sh|zsh)(?:\s+"
-    + DOCUMENTATION_POSIX_SHELL_OPTION
+    + DOCUMENTATION_SHELL_OPTION
     + rb"){0,8}\s+"
-    + DOCUMENTATION_POSIX_SHELL_COMMAND_OPTION
-    + rb"\s+[\"']?\s*)|(?:cmd(?:\.exe)?(?:\s+"
+    + DOCUMENTATION_SHELL_COMMAND_OPTION
+    + rb"|cmd(?:\.exe)?(?:\s+"
     + DOCUMENTATION_CMD_OPTION
-    + rb"){0,8}\s+/(?:c|k)\s+[\"']?\s*))?"
+    + rb"){0,8}\s+/(?:c|k)|eval)\s+[\"']?\s*)?"
 )
 DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
-    DOCUMENTATION_SHELL_WRAPPERS + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER + DOCUMENTATION_SHELL_WRAPPERS
+    DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
+    + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER
+    + DOCUMENTATION_SHELL_WRAPPERS
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
 )
 DOCUMENTATION_SHELL_PROMPT = rb"(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])\s*)?"
 DOCUMENTATION_INLINE_CODE_OPEN = rb"(?:`{1,3}\s*)?"
@@ -162,12 +173,45 @@ DOCUMENTATION_DOCKER_RUN_OPTION = rb"--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
 DOCUMENTATION_DOCKER_RUN = rb"(?:RUN(?:\s+" + DOCUMENTATION_DOCKER_RUN_OPTION + rb"){0,8}\s+)?"
 DOCUMENTATION_COMMAND_CONTEXT = DOCUMENTATION_COMMAND_LABEL + DOCUMENTATION_DOCKER_RUN
 DOCUMENTATION_SHELL_LINE_PREFIX = (
-    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?"
+    rb"^\s*(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){0,8}"
     + DOCUMENTATION_INLINE_CODE_OPEN
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
 )
-DOCUMENTATION_DOWNLOADER_COMMAND = rb"(?:(?:curl|wget)(?:\.exe)?|fetch|invoke-restmethod|invoke-webrequest|irm|iwr)"
+DOCUMENTATION_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?"
+DOCUMENTATION_DOWNLOADER_COMMAND = (
+    DOCUMENTATION_COMMAND_PATH_PREFIX + rb"(?:curl|fetch|invoke-restmethod|invoke-webrequest|irm|iwr|wget)(?:\.exe)?"
+)
+DOCUMENTATION_COMMAND_ARRAY_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"(?:RUN|CMD|ENTRYPOINT|command)\s*(?::|=)?\s*\[\s*[\"']?"
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b[\"']?\s*,\s*[\"']?"
+    + rb"(?:$|--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\\])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"(?:RUN|CMD|ENTRYPOINT|command)\s*(?::|=)?\s*\[\s*[\"']?"
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"(?:bash|sh|zsh)[\"']?\s*,\s*[\"']?"
+    + DOCUMENTATION_SHELL_COMMAND_OPTION
+    + rb"[\"']?\s*,\s*[\"']?"
+    + DOCUMENTATION_POSIX_LAUNCHER_WRAPPER
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+",
+    re.IGNORECASE,
+)
+DOCUMENTATION_XARGS_DOWNLOADER_PATTERN = re.compile(
+    rb"\|\s*xargs(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + rb"ADD(?:\s+--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+"
+    + rb"(?:$|[A-Za-z][A-Za-z0-9+.-]*://)",
+    re.IGNORECASE,
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
@@ -193,9 +237,29 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
+DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
+    rb"--(?:cache-dir|cert|client-cert|exists-action|keyring-provider|log|proxy|python|retries|"
+    rb"resume-retries|root-user-action|timeout|trusted-host|use-deprecated|use-feature)"
+)
+DOCUMENTATION_PIP_OPTION_WITHOUT_ARGUMENT = (
+    rb"(?:-[vq]{1,3}|--(?:debug|disable-pip-version-check|isolated|no-cache-dir|no-color|no-input|"
+    rb"no-python-version-warning|quiet|require-virtualenv|verbose))"
+)
+DOCUMENTATION_PIP_OPTION = (
+    rb"(?:"
+    + DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT
+    + rb"(?:="
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb"|\s+"
+    + DOCUMENTATION_ENV_OPTION_ARGUMENT
+    + rb")|"
+    + DOCUMENTATION_PIP_OPTION_WITHOUT_ARGUMENT
+    + rb")"
+)
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
-    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
+    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?"
+    rb"(?:\s+" + DOCUMENTATION_PIP_OPTION + rb"){0,8}\s+install"
     rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
     rb"|(?:conda|mamba|micromamba)\s+install"
@@ -517,9 +581,53 @@ class TextScanner(BaseScanner):
                 before_previous = previous
                 previous = current
         except (IndentationError, tokenize.TokenError):
-            # Incomplete prefixes are expected; keep the delimiter stack built before tokenization stopped.
+            # Incomplete prefixes are expected; the partial stack still identifies an open call.
             return any(opening == "(" and is_call for opening, is_call in stack)
         return any(opening == "(" and is_call for opening, is_call in stack)
+
+    @staticmethod
+    def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
+        """Return whether a bounded finding position is inside an HTML or C-style block comment."""
+        context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if context_start > 0 and payload[context_start - 1 : context_start] not in {b"\n", b"\r"}:
+            return False
+        prefix = payload[context_start:position]
+        comment_close: bytes | None = None
+        quote: int | None = None
+        escaped = False
+        cursor = 0
+        while cursor < len(prefix):
+            if comment_close is not None:
+                if prefix.startswith(comment_close, cursor):
+                    cursor += len(comment_close)
+                    comment_close = None
+                else:
+                    cursor += 1
+                continue
+            value = prefix[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if quote is not None:
+                if value == ord("\\") and quote != ord("'"):
+                    escaped = True
+                elif value == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if value in {ord("'"), ord('"'), ord("`")}:
+                quote = value
+                cursor += 1
+            elif prefix.startswith(b"<!--", cursor):
+                comment_close = b"-->"
+                cursor += 4
+            elif prefix.startswith(b"/*", cursor):
+                comment_close = b"*/"
+                cursor += 2
+            else:
+                cursor += 1
+        return comment_close is not None
 
     @staticmethod
     def _documentation_shell_comment_before_position(line: bytes, position: int) -> bool:
@@ -586,8 +694,13 @@ class TextScanner(BaseScanner):
         if (
             DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
             or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_COMMAND_ARRAY_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
+            or DOCUMENTATION_DOCKER_ADD_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
             or cls._documentation_suspicious_label_is_actionable(prefix)
             or (
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
@@ -603,7 +716,9 @@ class TextScanner(BaseScanner):
 
         statements = cls._documentation_python_statements(line)
         return any(
-            isinstance(node, (ast.Call, ast.Lambda)) for statement in statements for node in ast.walk(statement)
+            isinstance(node, (ast.AnnAssign, ast.Assign, ast.AugAssign, ast.Call, ast.Lambda, ast.NamedExpr))
+            for statement in statements
+            for node in ast.walk(statement)
         ) or any(
             isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Import, ast.ImportFrom))
             for statement in statements
@@ -678,6 +793,11 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0 or position > len(payload):
+            return False
+        if cls._documentation_comment_contains_position(payload, position):
+            return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
@@ -687,9 +807,6 @@ class TextScanner(BaseScanner):
                 return False
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
-        position = finding.get("position")
-        if not isinstance(position, int) or position < 0 or position > len(payload):
-            return False
         if cls._documentation_previous_line_continues_command(payload, position):
             return True
         if cls._documentation_python_definition_contains_finding(payload, position):
@@ -736,6 +853,10 @@ class TextScanner(BaseScanner):
         )
         return tuple(token.encode().lower() for token in dict.fromkeys(tokens) if isinstance(token, str) and token)
 
+    @staticmethod
+    def _find_documentation_token(payload: bytes, token_bytes: bytes, start: int) -> int:
+        return payload.find(token_bytes, start)
+
     @classmethod
     def _retarget_documentation_finding(
         cls,
@@ -758,13 +879,15 @@ class TextScanner(BaseScanner):
             if isinstance(original_position, int) and original_position >= 0
             else 0
         )
+        next_positions = {
+            token_bytes: cls._find_documentation_token(lowered_payload, token_bytes, search_start)
+            for token_bytes in token_bytes_options
+        }
         while True:
             if remaining_occurrences <= 0:
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
             matches = (
-                (position, token_bytes)
-                for token_bytes in token_bytes_options
-                if (position := lowered_payload.find(token_bytes, search_start)) >= 0
+                (position, token_bytes) for token_bytes, position in next_positions.items() if position >= search_start
             )
             next_match = min(matches, default=None, key=lambda match: match[0])
             if next_match is None:
@@ -777,7 +900,9 @@ class TextScanner(BaseScanner):
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
-            if finding_type == "network_function":
+            if cls._documentation_comment_contains_position(payload, position):
+                actionable = False
+            elif finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
             elif finding_type == "network_library":
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
@@ -789,10 +914,11 @@ class TextScanner(BaseScanner):
                 candidate.pop("snippet", None)
                 return candidate, False, remaining_occurrences
             search_start = match_position + len(token_bytes)
+            for option, next_position in next_positions.items():
+                if 0 <= next_position < search_start:
+                    next_positions[option] = cls._find_documentation_token(lowered_payload, option, search_start)
             if remaining_occurrences <= 0:
-                if allow_exhaustion_probe and not any(
-                    lowered_payload.find(option, search_start) >= 0 for option in token_bytes_options
-                ):
+                if allow_exhaustion_probe and not any(position >= search_start for position in next_positions.values()):
                     return candidate, False, 0
                 return {**finding, "position": None, "severity": "INFO"}, True, 0
 
@@ -1007,6 +1133,9 @@ class TextScanner(BaseScanner):
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
+            position = finding.get("position")
+            if isinstance(position, int) and cls._documentation_comment_contains_position(payload, position):
+                return True
             return (
                 (
                     finding_type in PASSIVE_NETWORK_FINDING_TYPES
