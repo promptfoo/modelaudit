@@ -9,6 +9,10 @@ import unicodedata
 from typing import Final, TypeAlias
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
+from ._evidence_redaction import (
+    AUTHORIZATION_ALIAS_ASSIGNMENT_KEY as SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY,
+)
+
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
@@ -69,6 +73,14 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "api_key",
         "api-key",
         "apikey",
+        "aws_access_key_id",
+        "aws-secret-access-key",
+        "aws_secret_access_key",
+        "aws-session-token",
+        "aws_session_token",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "awssessiontoken",
         "auth_token",
         "auth-token",
         "client_secret",
@@ -82,6 +94,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "pwd",
         "private_key",
         "private-key",
+        "proxy-authorization",
+        "proxy_authorization",
+        "proxyauthorization",
         "refresh_token",
         "refresh-token",
         "sas",
@@ -101,12 +116,15 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "x-amz-signature",
     }
 )
-SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
     r"(?:access[_-]?key(?:[_-]?id)?|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
     r"cookie|credential|jwt|passphrase|password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|"
     r"secret[_-]?key|session[_-]?(?:id|token)|sessionid|signature|sig|token)"
 )
+AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY: Final[str] = r"(?-i:(?:awsAccessKeyId|awsSecretAccessKey|awsSessionToken))"
+SENSITIVE_ASSIGNMENT_KEY: Final[str] = rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|{AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY})"
+AUTHORIZATION_KEY_PATTERN: Final[str] = SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
 ASSIGNMENT_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\s*{ASSIGNMENT_SEPARATOR}\s*")
 KNOWN_AUTHORIZATION_SCHEME_PATTERN: Final[str] = (
@@ -115,7 +133,7 @@ KNOWN_AUTHORIZATION_SCHEME_PATTERN: Final[str] = (
 COMPOUND_AUTHORIZATION_SCHEME_PATTERN: Final[str] = r"(?:digest|aws4-hmac-sha256)"
 AUTHORIZATION_SCHEME_PATTERN: Final[str] = rf"(?:{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)?"
 SENSITIVE_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{SENSITIVE_ASSIGNMENT_KEY}$")
-AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^authorization$")
+AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{AUTHORIZATION_KEY_PATTERN}$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
 )
@@ -139,7 +157,7 @@ UNQUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
 )
 SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*|"
-    rf"\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}|\bbearer\s+)"
+    rf"\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}|\bbearer\s+)"
 )
 COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|"
@@ -179,34 +197,34 @@ COMMAND_SENSITIVE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
+    rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
     r"([^\"'\s;&|]+)"
 )
 COMPOUND_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{COMPOUND_AUTHORIZATION_SCHEME_PATTERN}\s+)"
+    rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{COMPOUND_AUTHORIZATION_SCHEME_PATTERN}\s+)"
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
     rf"(?=[\"';&|\n]|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
 )
 BARE_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*)"
     rf"(?!{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)[^\"'\s;&|]+"
 )
 UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*)"
     rf"(?!{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
     rf"([^\"'\s;&|]+)(\s+)(?!{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR})([^\"'\s;&|]+)"
 )
 TRIPLE_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3[\s\S]*?\2\3\2\3\2\3"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3[\s\S]*?\2\3\2\3\2\3"
 )
 TRIPLE_QUOTED_AUTHORIZATION_START_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3"
 )
 QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"']).*?\2\3"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"']).*?\2\3"
 )
 QUOTED_AUTHORIZATION_START_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[^\"'\s;&|]+")
 TRIPLE_QUOTED_BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
@@ -224,7 +242,7 @@ QUOTED_BEARER_START_RE: Final[re.Pattern[str]] = re.compile(
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*)"
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
-    rf"(?=[;&|\n]|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\bauthorization\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
+    rf"(?=[;&|\n]|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
 )
 TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\3\4\3\4[\s\S]*?\3\4\3\4\3\4"
@@ -239,7 +257,7 @@ QUOTED_SENSITIVE_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])"
 )
 ADJACENT_LITERAL_AUTHORIZATION_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN})[^\s;&|]*{re.escape(REDACTED_EVIDENCE_VALUE)}[^\s;&|]*(?:{PYTHON_LITERAL_JOINED_FRAGMENT_RE})+"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN})[^\s;&|]*{re.escape(REDACTED_EVIDENCE_VALUE)}[^\s;&|]*(?:{PYTHON_LITERAL_JOINED_FRAGMENT_RE})+"
 )
 ADJACENT_LITERAL_BEARER_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bbearer\s+)[^\s;&|]*{re.escape(REDACTED_EVIDENCE_VALUE)}[^\s;&|]*(?:{PYTHON_LITERAL_JOINED_FRAGMENT_RE})+"
@@ -248,7 +266,7 @@ ADJACENT_LITERAL_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*)[^\s;&|]*{re.escape(REDACTED_EVIDENCE_VALUE)}[^\s;&|]*(?:{PYTHON_LITERAL_JOINED_FRAGMENT_RE})+"
 )
 RESIDUAL_LITERAL_AUTHORIZATION_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN})[^;&|\n]*?{re.escape(REDACTED_EVIDENCE_VALUE)}[^;&|\n]*{PYTHON_RESIDUAL_LITERAL_OPERATOR_RE}[^;&|\n]*{PYTHON_STRING_LITERAL_FRAGMENT_RE}[^;&|\n]*"
+    rf"(?i)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN})[^;&|\n]*?{re.escape(REDACTED_EVIDENCE_VALUE)}[^;&|\n]*{PYTHON_RESIDUAL_LITERAL_OPERATOR_RE}[^;&|\n]*{PYTHON_STRING_LITERAL_FRAGMENT_RE}[^;&|\n]*"
 )
 RESIDUAL_LITERAL_BEARER_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bbearer\s+)[^;&|\n]*?{re.escape(REDACTED_EVIDENCE_VALUE)}[^;&|\n]*{PYTHON_RESIDUAL_LITERAL_OPERATOR_RE}[^;&|\n]*{PYTHON_STRING_LITERAL_FRAGMENT_RE}[^;&|\n]*"

