@@ -42,7 +42,7 @@ from modelaudit.utils.file.detection import (
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.helpers import cache_decorator
-from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
+from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
@@ -1173,11 +1173,9 @@ def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
 
     result = core_module.scan_model_directory_or_file(str(tmp_path), max_total_size=1)
 
-    all_file_hashes = [core_module._calculate_file_hash(str(model_path)) for model_path in model_files]
-    scanned_file_hashes = [core_module._calculate_file_hash(path) for path in calls]
     assert len(calls) == 1
-    assert result.content_hash == compute_aggregate_hash(scanned_file_hashes)
-    assert result.content_hash != compute_aggregate_hash(all_file_hashes)
+    assert result.content_hash is None
+    assert result.success is False
 
 
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
