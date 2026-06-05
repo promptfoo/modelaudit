@@ -143,7 +143,7 @@ def test_change_clock_probe_allows_coarse_filesystem_tick(
         cache._advance_change_clock(
             str(file_path),
             probe,
-            1,
+            newest_token,
             ancestor_identity,
         )
 
