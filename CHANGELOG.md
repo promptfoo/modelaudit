@@ -7,12 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
 
-
 ### Bug Fixes
 
-* bind cache reads and writes to scanned file identity ([#1458](https://github.com/promptfoo/modelaudit/issues/1458)) ([860adab](https://github.com/promptfoo/modelaudit/commit/860adabe039437fcee6811a9cef561816ba25e74))
-* redact MetaGraph evidence previews ([#1473](https://github.com/promptfoo/modelaudit/issues/1473)) ([58139d9](https://github.com/promptfoo/modelaudit/commit/58139d98cd6c20ddadc379ee476f2e51aa4b798e))
-* redact Torch7 evidence examples ([#1467](https://github.com/promptfoo/modelaudit/issues/1467)) ([646857b](https://github.com/promptfoo/modelaudit/commit/646857bdd54f78334e79eb38896d3e0991810fca))
+- bind cache reads and writes to scanned file identity ([#1458](https://github.com/promptfoo/modelaudit/issues/1458)) ([860adab](https://github.com/promptfoo/modelaudit/commit/860adabe039437fcee6811a9cef561816ba25e74))
+- redact MetaGraph evidence previews ([#1473](https://github.com/promptfoo/modelaudit/issues/1473)) ([58139d9](https://github.com/promptfoo/modelaudit/commit/58139d98cd6c20ddadc379ee476f2e51aa4b798e))
+- redact Torch7 evidence examples ([#1467](https://github.com/promptfoo/modelaudit/issues/1467)) ([646857b](https://github.com/promptfoo/modelaudit/commit/646857bdd54f78334e79eb38896d3e0991810fca))
 
 ## [0.2.46](https://github.com/promptfoo/modelaudit/compare/v0.2.45...v0.2.46) (2026-06-05)
 
