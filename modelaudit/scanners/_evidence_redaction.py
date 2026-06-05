@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import json
 import re
@@ -1749,6 +1750,62 @@ def _ast_contains_dangerous_call(node: ast.AST) -> bool:
     )
 
 
+def _fstring_literal_ends_sensitive_assignment(value: str) -> bool:
+    separators = list(re.finditer(SCALAR_ASSIGNMENT_OPERATOR_PATTERN, value))
+    if not separators:
+        return False
+    target = value[: separators[-1].start()].rstrip()
+    return bool(SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) or QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target))
+
+
+def _redact_ast_literal_values(node: ast.AST) -> None:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Constant) or isinstance(child.value, (bool, type(None))):
+            continue
+        child.value = REDACTED_EVIDENCE_VALUE.encode() if isinstance(child.value, bytes) else REDACTED_EVIDENCE_VALUE
+
+
+def _redact_fstring_formatted_value(node: ast.FormattedValue) -> None:
+    if _ast_contains_dangerous_call(node.value):
+        _redact_ast_literal_values(node.value)
+    else:
+        node.value = ast.Constant(REDACTED_EVIDENCE_VALUE)
+    node.conversion = -1
+    node.format_spec = None
+
+
+def _redacted_sensitive_fstring(node: ast.JoinedStr) -> str | None:
+    redacted = copy.deepcopy(node)
+    changed = False
+    for index, value in enumerate(redacted.values[:-1]):
+        next_value = redacted.values[index + 1]
+        if (
+            not isinstance(value, ast.Constant)
+            or not isinstance(value.value, str)
+            or not isinstance(next_value, ast.FormattedValue)
+            or not _fstring_literal_ends_sensitive_assignment(value.value)
+        ):
+            continue
+        value.value = REDACTED_EVIDENCE_VALUE
+        _redact_fstring_formatted_value(next_value)
+        changed = True
+    for index, key_value in enumerate(redacted.values[:-2]):
+        separator = redacted.values[index + 1]
+        candidate_value = redacted.values[index + 2]
+        if (
+            not isinstance(key_value, ast.FormattedValue)
+            or not _is_sensitive_literal_key(_static_string_literal_value(key_value.value))
+            or not isinstance(separator, ast.Constant)
+            or not isinstance(separator.value, str)
+            or re.fullmatch(r"\s*[:=]\s*", separator.value) is None
+            or not isinstance(candidate_value, ast.FormattedValue)
+        ):
+            continue
+        _redact_fstring_formatted_value(candidate_value)
+        changed = True
+    return ast.unparse(redacted) if changed else None
+
+
 def _is_literal_container_open(tokens: list[tokenize.TokenInfo], open_index: int) -> bool:
     prefix_keywords = {
         "and",
@@ -1788,6 +1845,11 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
 
     if tree is not None:
         for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                replacement = _redacted_sensitive_fstring(node)
+                if replacement is not None:
+                    _append_ast_node_replacement(text, offsets, node, replacements, replacement)
+                continue
             value_node: ast.expr | None = None
             assignment_targets: list[ast.expr] = []
             assignment_value: ast.expr | None = None
@@ -1986,6 +2048,44 @@ def _keyed_call_argument(
     return positional_arguments[positional_index]
 
 
+def _append_token_literal_replacements(
+    text: str,
+    offsets: list[int],
+    tokens: list[tokenize.TokenInfo],
+    replacements: list[tuple[int, int, str]],
+) -> None:
+    for token in _significant_tokens(tokens):
+        if token.type != tokenize.STRING:
+            continue
+        replacement = _redacted_python_string_source(token.string)
+        replacements.append(
+            (
+                _position_offset(offsets, token.start, len(text)),
+                _position_offset(offsets, token.end, len(text)),
+                replacement or repr(REDACTED_EVIDENCE_VALUE),
+            )
+        )
+
+
+def _append_token_value_replacement(
+    text: str,
+    offsets: list[int],
+    tokens: list[tokenize.TokenInfo],
+    replacements: list[tuple[int, int]],
+    literal_replacements: list[tuple[int, int, str]],
+) -> None:
+    significant = _significant_tokens(tokens)
+    if _tokens_contain_dangerous_call(significant):
+        _append_token_literal_replacements(text, offsets, significant, literal_replacements)
+        return
+    replacements.append(
+        (
+            _position_offset(offsets, tokens[0].start, len(text)),
+            _position_offset(offsets, tokens[-1].end, len(text)),
+        )
+    )
+
+
 def _redact_sensitive_keyed_calls(text: str) -> str:
     """Redact credential values/defaults in bounded key/value call patterns."""
     token_input = text.replace("\x00", " ")
@@ -2049,16 +2149,12 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
             if keyword in {"auth", "cookie", "cookies"} and argument_value_tokens:
                 significant_value_tokens = _significant_tokens(argument_value_tokens)
                 if _tokens_contain_dangerous_call(significant_value_tokens):
-                    for value_token in significant_value_tokens:
-                        if value_token.type == tokenize.STRING:
-                            replacement = _redacted_python_string_source(value_token.string)
-                            literal_replacements.append(
-                                (
-                                    _position_offset(offsets, value_token.start, len(text)),
-                                    _position_offset(offsets, value_token.end, len(text)),
-                                    replacement or repr(REDACTED_EVIDENCE_VALUE),
-                                )
-                            )
+                    _append_token_literal_replacements(
+                        text,
+                        offsets,
+                        significant_value_tokens,
+                        literal_replacements,
+                    )
                     continue
                 replacements.append(
                     (
@@ -2080,11 +2176,12 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
             None,
         )
         if generic_key_tokens is not None and generic_value_tokens:
-            replacements.append(
-                (
-                    _position_offset(offsets, generic_value_tokens[0].start, len(text)),
-                    _position_offset(offsets, generic_value_tokens[-1].end, len(text)),
-                )
+            _append_token_value_replacement(
+                text,
+                offsets,
+                generic_value_tokens,
+                replacements,
+                literal_replacements,
             )
 
         if token.string in {"add_argument", "option"}:
@@ -2096,11 +2193,12 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
                 argument_value_tokens for keyword, argument_value_tokens in arguments if keyword is None
             ]
             if default_tokens and any(_literal_sensitive_option(value_tokens) for value_tokens in positional_arguments):
-                replacements.append(
-                    (
-                        _position_offset(offsets, default_tokens[0].start, len(text)),
-                        _position_offset(offsets, default_tokens[-1].end, len(text)),
-                    )
+                _append_token_value_replacement(
+                    text,
+                    offsets,
+                    default_tokens,
+                    replacements,
+                    literal_replacements,
                 )
 
         if argument_spec is None:
@@ -2114,9 +2212,13 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
             continue
         if not value_tokens:
             continue
-        value_start = _position_offset(offsets, value_tokens[0].start, len(text))
-        value_end = _position_offset(offsets, value_tokens[-1].end, len(text))
-        replacements.append((value_start, value_end))
+        _append_token_value_replacement(
+            text,
+            offsets,
+            value_tokens,
+            replacements,
+            literal_replacements,
+        )
 
     combined_replacements = [
         *((start, end, REDACTED_EVIDENCE_VALUE) for start, end in replacements),
@@ -2173,6 +2275,7 @@ def _redact_sensitive_comparisons(text: str) -> str:
     offsets = _line_offsets(text)
     text_length = len(text)
     replacements: list[tuple[int, int]] = []
+    literal_replacements: list[tuple[int, int, str]] = []
     ignored_value_tokens = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}
     for index, token in enumerate(tokens):
         is_symbol_comparison = token.type == tokenize.OP and token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
@@ -2215,7 +2318,10 @@ def _redact_sensitive_comparisons(text: str) -> str:
         while value_end > value_start and text[value_end - 1].isspace():
             value_end -= 1
         if left_target_is_sensitive and any(value_token.type == tokenize.STRING for value_token in significant):
-            replacements.append((value_start, value_end))
+            if _tokens_contain_dangerous_call(significant):
+                _append_token_literal_replacements(text, offsets, significant, literal_replacements)
+            else:
+                replacements.append((value_start, value_end))
             continue
 
         right_target = text[value_start:value_end]
@@ -2230,8 +2336,12 @@ def _redact_sensitive_comparisons(text: str) -> str:
                     )
                 )
 
-    for start, end in reversed(_merge_replacement_ranges(replacements)):
-        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    combined_replacements = [
+        *((start, end, REDACTED_EVIDENCE_VALUE) for start, end in replacements),
+        *literal_replacements,
+    ]
+    for start, end, replacement in reversed(_merge_ast_replacements(combined_replacements)):
+        text = f"{text[:start]}{replacement}{text[end:]}"
     return text
 
 

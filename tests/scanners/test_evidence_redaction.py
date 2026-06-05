@@ -1,5 +1,6 @@
 """Tests for scanner evidence redaction helpers."""
 
+import ast
 import json
 from urllib.parse import quote
 
@@ -1679,6 +1680,32 @@ def test_redacts_sensitive_getter_defaults_and_keyword_setters() -> None:
     assert 'settings.get("region", "VISIBLE")' in redacted
 
 
+def test_sensitive_keyed_calls_preserve_dangerous_value_operations() -> None:
+    """Executable credential values should retain call shape without literal data."""
+    text = (
+        'value = os.getenv("CLIENT_SECRET", eval("GETTERSECRET1234567890")); '
+        'headers.setdefault("api_key", exec("SETTERSECRET1234567890")); '
+        'Field(key="client_secret", value=compile("COMPILESECRET1234567890", "file", "exec")); '
+        'parser.add_argument("--api-key", default=eval("OPTIONSECRET1234567890")); '
+        'settings.get("region", eval("VISIBLEDEFAULT1234567890"))'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (
+        "GETTERSECRET1234567890",
+        "SETTERSECRET1234567890",
+        "COMPILESECRET1234567890",
+        "OPTIONSECRET1234567890",
+    ):
+        assert secret not in redacted
+    assert 'os.getenv("CLIENT_SECRET", eval("<redacted>"))' in redacted
+    assert 'headers.setdefault("api_key", exec("<redacted>"))' in redacted
+    assert 'Field(key="client_secret", value=compile("<redacted>", "<redacted>", "<redacted>"))' in redacted
+    assert 'parser.add_argument("--api-key", default=eval("<redacted>"))' in redacted
+    assert 'settings.get("region", eval("VISIBLEDEFAULT1234567890"))' in redacted
+
+
 def test_redacts_sensitive_comparison_literals_without_losing_context() -> None:
     """Sensitive comparisons should remove literals and preserve dangerous calls."""
     text = (
@@ -1704,6 +1731,23 @@ def test_redacts_sensitive_comparison_literals_without_losing_context() -> None:
     assert 'tokenizer == "visible"' in redacted
     assert 'if api_key: eval("5 + 5")' in redacted
     assert "api_key_count == 1" in redacted
+
+
+def test_sensitive_comparisons_preserve_dangerous_operand_calls() -> None:
+    """Executable comparison operands should stay visible after literal redaction."""
+    text = (
+        'if api_key == eval("COMPARESECRET1234567890"): pass\n'
+        'if client_secret in exec("MEMBERSHIPSECRET1234567890"): pass\n'
+        'if tokenizer == eval("VISIBLECOMPARE1234567890"): pass'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COMPARESECRET1234567890" not in redacted
+    assert "MEMBERSHIPSECRET1234567890" not in redacted
+    assert 'api_key == eval("<redacted>")' in redacted
+    assert 'client_secret in exec("<redacted>")' in redacted
+    assert 'tokenizer == eval("VISIBLECOMPARE1234567890")' in redacted
 
 
 def test_redacts_non_operator_sensitive_comparisons_without_losing_context() -> None:
@@ -1734,6 +1778,31 @@ def test_redacts_non_operator_sensitive_comparisons_without_losing_context() -> 
     assert 'tokenizer.startswith("visible-prefix")' in redacted
     assert 'case "visible-match":' in redacted
     assert 'eval("4")' in redacted
+
+
+def test_redacts_sensitive_fstring_interpolations_without_losing_calls() -> None:
+    """Credential-shaped f-strings should not leak or hide executable expressions."""
+    text = (
+        'first = f\'api_key={"FSTRINGSECRET1234567890"}\'; eval("1")\n'
+        "second = f'client_secret={exec(\"FSTRINGCALLSECRET1234567890\")} status={status}'\n"
+        'third = f\'{"api_key"}={"DYNAMICKEYSECRET1234567890"}\'\n'
+        'fourth = f\'{"client_secret"}: {eval("DYNAMICKEYCALLSECRET1234567890")}\'\n'
+        "visible = f'tokenizer={value} api_key_count={count}'\n"
+        "dynamic_visible = f'{\"tokenizer\"}={value}'"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FSTRINGSECRET1234567890" not in redacted
+    assert "FSTRINGCALLSECRET1234567890" not in redacted
+    assert "DYNAMICKEYSECRET1234567890" not in redacted
+    assert "DYNAMICKEYCALLSECRET1234567890" not in redacted
+    assert "exec('<redacted>')" in redacted
+    assert "eval('<redacted>')" in redacted
+    assert "f'tokenizer={value} api_key_count={count}'" in redacted
+    assert "f'{\"tokenizer\"}={value}'" in redacted
+    assert 'eval("1")' in redacted
+    ast.parse(redacted)
 
 
 def test_python_annotations_and_block_headers_are_not_assignments() -> None:
