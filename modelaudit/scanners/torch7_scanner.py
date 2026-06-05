@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import _is_torch7_signature as is_torch7_signature
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, is_sensitive_evidence_key, redact_evidence_string
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -30,6 +30,10 @@ EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)(?:\(\s*)*\b{EXEC_PRIMITIVE_NAME
 EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
     r"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*(?:\s*\[[^\]\n]{1,120}\])*\s*=\s*)"
 )
+EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN = re.compile(
+    r"(?is)^(?:(?:[a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(\s*|\(\s*)*(?:function\s*\(\s*\)\s*return\s*)?$"
+)
+COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN = re.compile(r"(?is)^\s*(?P<value>.+?)\s+(?P<operator>or|and)\s*$")
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
     r"https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?\s+/c|"
@@ -223,15 +227,41 @@ class Torch7Scanner(BaseScanner):
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
         protected_targets: list[str] = []
+        protected_parts: list[str] = []
+        cursor = 0
 
-        def protect_execution_target(match: re.Match[str]) -> str:
+        for match in EXECUTION_ASSIGNMENT_TARGET_PATTERN.finditer(text):
+            if match.start() < cursor:
+                continue
             statement_end = Torch7Scanner._statement_end(text, match.end())
-            if EXEC_PRIMITIVE_CALL_PATTERN.search(text, match.end(), statement_end) is None:
-                return match.group(0)
-            protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
-            return f"\x00{len(protected_targets) - 1}\x00"
+            execution_match = EXEC_PRIMITIVE_CALL_PATTERN.search(text, match.end(), statement_end)
+            if execution_match is None:
+                continue
 
-        protected = EXECUTION_ASSIGNMENT_TARGET_PATTERN.sub(protect_execution_target, text)
+            value_prefix = text[match.end() : execution_match.start()]
+            leading_execution_parentheses = re.match(r"(?:\(\s*)*", execution_match.group(0))
+            wrapper_prefix = value_prefix + (
+                leading_execution_parentheses.group(0) if leading_execution_parentheses is not None else ""
+            )
+            replacement_end = match.end()
+            replacement_suffix = ""
+            if EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN.fullmatch(wrapper_prefix) is None:
+                compound_match = COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN.fullmatch(value_prefix)
+                target_name = match.group("target").rsplit("=", 1)[0].strip()
+                if target_name.lower().startswith("local "):
+                    target_name = target_name[6:].strip()
+                if compound_match is None or not is_sensitive_evidence_key(target_name):
+                    continue
+                replacement_end = execution_match.start()
+                replacement_suffix = f"{REDACTED_EVIDENCE_VALUE} {compound_match.group('operator').lower()} "
+
+            protected_parts.append(text[cursor : match.start()])
+            protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
+            protected_parts.append(f"\x00{len(protected_targets) - 1}\x00{replacement_suffix}")
+            cursor = replacement_end
+
+        protected_parts.append(text[cursor:])
+        protected = "".join(protected_parts)
         redacted = redact_evidence_string(protected, max_chars=None)
         for index, target in enumerate(protected_targets):
             redacted = redacted.replace(f"\x00{index}\x00", target)

@@ -609,15 +609,7 @@ def _active_quote_before(text: str, end: int) -> str | None:
 
 def _source_literal_suffix_for_url_match(match: re.Match[str], raw_url: str) -> str:
     consumed_suffix = match.group(0)[len(raw_url) :]
-    if not consumed_suffix.startswith("'"):
-        return ""
-
-    suffix = "'"
-    for character in consumed_suffix[1:]:
-        if character not in ")]}":
-            break
-        suffix += character
-    return suffix
+    return consumed_suffix if consumed_suffix.startswith("'") else ""
 
 
 def _shell_operator_suffix(value: str) -> tuple[int, str] | None:
@@ -645,6 +637,8 @@ def _redact_url_query_value(value: str, url_depth: int) -> str:
 def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     raw_url = _url_text_for_match(match)
     source_literal_suffix = _source_literal_suffix_for_url_match(match, raw_url)
+    if source_literal_suffix:
+        source_literal_suffix = _redact_url_query_value(source_literal_suffix, url_depth)
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
@@ -1199,6 +1193,11 @@ def _is_sensitive_detail_key(key: str) -> bool:
             for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES
         )
     )
+
+
+def is_sensitive_evidence_key(key: str) -> bool:
+    """Return whether a field name identifies a credential-bearing value."""
+    return _is_sensitive_detail_key(key)
 
 
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:

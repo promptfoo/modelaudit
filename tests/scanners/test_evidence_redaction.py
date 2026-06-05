@@ -477,6 +477,25 @@ def test_preserves_compact_shell_operators_in_query_and_fragment_without_secrets
     assert fragment.endswith("#<redacted>|sh")
 
 
+def test_preserves_compact_source_suffix_after_single_quoted_url() -> None:
+    text = "os.execute('curl https://example.test/?token=QUERYSECRET');rm"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "QUERYSECRET" not in redacted
+    assert redacted.endswith("?token=<redacted>');rm")
+
+
+def test_redacts_credentials_in_restored_single_quote_suffix() -> None:
+    text = "os.execute('curl https://example.test/public');https://user:CHAINEDPASSWORD@evil.test/?token=CHAINEDSECRET"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "CHAINEDPASSWORD" not in redacted
+    assert "CHAINEDSECRET" not in redacted
+    assert "https://<credentials-redacted>@evil.test/?token=<redacted>" in redacted
+
+
 def test_redacts_compound_lua_sensitive_assignments() -> None:
     """Boolean and concatenated Lua expressions must not expose reconstructible secret values."""
     boolean_expression = 'token = false or "FULL_LUA_SECRET_123456789"; os.execute("id")'

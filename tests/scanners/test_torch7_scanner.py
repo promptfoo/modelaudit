@@ -186,6 +186,16 @@ def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() 
     assert "<redacted>" not in snippet
 
 
+def test_torch7_snippet_redacts_secret_before_execution_fallback() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = "FULL_LUA_SECRET_123456789" or os.execute("id")',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == 'token = <redacted> or os.execute("id")'
+
+
 def test_torch7_snippet_preserves_subscript_and_deep_execution_targets() -> None:
     snippets = (
         Torch7Scanner._snippet("headers['token'] = os.execute('echo ok')", max_chars=500),
