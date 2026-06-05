@@ -234,7 +234,10 @@ class LightGBMScanner(BaseScanner):
                         critical_command_hits.append(hit)
                     break
 
-            for url in _URL_PATTERN.findall(line):
+            url_spans: list[tuple[int, int]] = []
+            for url_match in _URL_PATTERN.finditer(line):
+                url = url_match.group(0)
+                url_spans.append(url_match.span())
                 if not self._is_trusted_url(url) or has_command_indicator:
                     network_hits.append(
                         {
@@ -244,9 +247,18 @@ class LightGBMScanner(BaseScanner):
                         }
                     )
 
-            for candidate_ip in _IP_PATTERN.findall(line):
+            for ip_match in _IP_PATTERN.finditer(line):
+                if any(start <= ip_match.start() and ip_match.end() <= end for start, end in url_spans):
+                    continue
+                candidate_ip = ip_match.group(0)
                 if self._is_public_ip(candidate_ip):
-                    network_hits.append({"line": str(line_number), "type": "public_ip", "value": candidate_ip})
+                    network_hits.append(
+                        {
+                            "line": str(line_number),
+                            "type": "public_ip",
+                            "value_omitted": _EXCERPT_OMITTED_REASON,
+                        }
+                    )
 
             if not safe_prefix and self._looks_like_external_reference(line):
                 path_hits.append({"line": str(line_number), "excerpt_omitted": _EXCERPT_OMITTED_REASON})

