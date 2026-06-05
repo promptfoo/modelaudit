@@ -4262,7 +4262,14 @@ def test_scan_bytes_warns_when_inert_source_imports_transitively_shadowable_stdl
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
         for finding in report.findings
     )
-    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    load_payload = (
+        "import importlib, pickle, sys; "
+        f"sys.path.insert(0, {str(tmp_path)!r}); "
+        f"sys.modules.pop({stdlib_module!r}, None); "
+        f"sys.modules.pop({shadow_module!r}, None); "
+        "importlib.invalidate_caches(); "
+        f"pickle.loads({payload!r})"
+    )
     subprocess.run([sys.executable, "-c", load_payload], check=True)
     assert marker.read_text(encoding="utf-8") == "owned"
 
@@ -4378,14 +4385,14 @@ def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     py_compile.compile(
         str(source_path),
         doraise=True,
         invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
     )
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -4418,7 +4425,7 @@ def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     py_compile.compile(
         str(source_path),
@@ -4426,7 +4433,7 @@ def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
         optimize=1,
         invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
     )
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -4457,12 +4464,12 @@ def test_scan_bytes_warns_when_higher_optimized_cache_overrides_inert_source(
     benign_source = "class Gadget:\n    pass\n"
     benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
     fixed_mtime = 1_700_000_000
-    source_path.write_text(malicious_source, encoding="utf-8")
+    source_path.write_bytes(malicious_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     compile_module = f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import {module_name}"
     subprocess.run([sys.executable, "-OOO", "-c", compile_module], check=True)
     marker.unlink()
-    source_path.write_text(benign_source, encoding="utf-8")
+    source_path.write_bytes(benign_source.encode())
     os.utime(source_path, (fixed_mtime, fixed_mtime))
     monkeypatch.syspath_prepend(str(tmp_path))
     payload = f"c{module_name}\nGadget\n.".encode()
@@ -5263,8 +5270,8 @@ def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
 
 def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
-        lambda _module_name: None,
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
     )
     _clear_source_sensitive_caches()
     try:

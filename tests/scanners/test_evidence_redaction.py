@@ -4,6 +4,9 @@ import ast
 import json
 from urllib.parse import quote
 
+import pytest
+
+from modelaudit.scanners import _evidence_redaction as evidence_redaction
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
@@ -1249,6 +1252,205 @@ def test_redacts_oversized_and_deep_structured_evidence() -> None:
     assert large_redacted == REDACTED_EVIDENCE_VALUE
     assert REDACTED_EVIDENCE_VALUE in deep_redacted
     assert len(deep_redacted) <= 500
+
+
+def test_preserves_azure_authority_container_while_redacting_object_path_token() -> None:
+    """A valid Azure authority container is identity, not userinfo."""
+    token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+    redacted = redact_evidence_string(
+        f"wasbs://container@account.blob.core.windows.net/{token}/model.bin",
+        max_chars=500,
+    )
+
+    assert redacted == f"wasbs://container@account.blob.core.windows.net/{REDACTED_EVIDENCE_VALUE}/model.bin"
+
+
+def test_redacts_azure_authority_userinfo_that_is_not_a_valid_container() -> None:
+    """Azure authority credentials must not be mistaken for a container name."""
+    redacted = redact_evidence_string(
+        "wasbs://container:secret@account.blob.core.windows.net/model.bin",
+        max_chars=500,
+    )
+
+    assert redacted == f"wasbs://{REDACTED_URL_CREDENTIALS}@account.blob.core.windows.net/model.bin"
+
+
+def test_redacts_azure_style_authority_on_non_azure_host() -> None:
+    """Container syntax alone must not exempt userinfo on an unrelated host."""
+    redacted = redact_evidence_string("wasbs://accesskey@example.com/model.bin", max_chars=500)
+
+    assert redacted == f"wasbs://{REDACTED_URL_CREDENTIALS}@example.com/model.bin"
+
+
+def test_preserves_valid_azure_container_url_nested_in_query() -> None:
+    """A nested Azure container URL without secrets should remain actionable."""
+    nested_url = "wasbs://container@account.blob.core.windows.net/model.bin"
+    text = f"https://example.com/hook?next={quote(nested_url, safe='')}"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+    assert REDACTED_URL_CREDENTIALS not in redacted
+    assert "next=wasbs%3A%2F%2Fcontainer%40account.blob.core.windows.net%2Fmodel.bin" in redacted
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "ghp_" + "a" * 36,
+        "gho_" + "a" * 36,
+        "ghu_" + "a" * 36,
+        "ghs_" + "a" * 36,
+        "ghr_" + "a" * 36,
+        "AIza" + "a" * 35,
+        "glpat-" + "a" * 20,
+        "hf_" + "a" * 34,
+        "npm_" + "a" * 36,
+        "sq0atp-" + "a" * 22,
+        "sq0csp-" + "a" * 43,
+        "stripe_live_" + "a" * 24,
+        "sk_live_" + "a" * 24,
+        "rk_live_" + "a" * 24,
+        "sk-proj-" + "abc_def-" * 4,
+    ],
+)
+def test_redacts_standalone_secret_token_shapes(token: str) -> None:
+    """Secret-shaped strings should be redacted even without assignment syntax."""
+    redacted = redact_evidence_string(f"metadata key: {token}", max_chars=500)
+
+    assert redacted == f"metadata key: {REDACTED_EVIDENCE_VALUE}"
+
+
+@pytest.mark.parametrize(
+    "encoded_token",
+    [
+        "ghp%5F" + "a" * 36,
+        "ghp%255F" + "a" * 36,
+        "%67%68%70%5F" + "%61" * 36,
+        "ghp%2525255F" + "a" * 36,
+    ],
+)
+def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) -> None:
+    """Percent encoding must not make a standalone secret safe to serialize."""
+    redacted = redact_evidence_string(f"metadata key: {encoded_token}", max_chars=500)
+
+    assert redacted == f"metadata key: {REDACTED_EVIDENCE_VALUE}"
+
+
+@pytest.mark.parametrize(
+    ("encoded_value", "expected"),
+    [
+        ("api_key%3Dhunter2", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        ("api_key%3DENCODEDSECRET123456", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        ("api_key%253DENCODEDSECRET123456", f"api_key={REDACTED_EVIDENCE_VALUE}"),
+        (
+            "https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb",
+            f"https://{REDACTED_URL_CREDENTIALS}@evil.example/cb",
+        ),
+    ],
+)
+def test_redacts_percent_encoded_credential_evidence(encoded_value: str, expected: str) -> None:
+    redacted = redact_evidence_string(encoded_value, max_chars=500)
+
+    assert redacted == expected
+
+
+def test_preserves_benign_percent_encoded_evidence() -> None:
+    for text in ("version%3D1", "metadata%20label%20value"):
+        assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_bounds_deep_benign_percent_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nested benign encoding must not recursively rescan every remaining layer."""
+    decode_depth = 12
+    encoded = "version=1"
+    for _ in range(decode_depth):
+        encoded = quote(encoded, safe="")
+
+    real_unquote = evidence_redaction.unquote
+    unquote_calls = 0
+
+    def counting_unquote(value: str) -> str:
+        nonlocal unquote_calls
+        unquote_calls += 1
+        return real_unquote(value)
+
+    monkeypatch.setattr(evidence_redaction, "unquote", counting_unquote)
+
+    assert redact_evidence_string(encoded, max_chars=500) == encoded
+    assert unquote_calls <= decode_depth + 1
+
+
+@pytest.mark.parametrize(
+    "near_miss",
+    [
+        "ghp_" + "a" * 35,
+        "hf_" + "a" * 29,
+        "sk_live_" + "a" * 23,
+        "sk-proj-" + "abc_def-" * 2 + "abcdefg",
+        "modelghp_" + "a" * 36,
+        "sk-this-is-a-benign-model-identifier-2026",
+    ],
+)
+def test_preserves_near_miss_standalone_secret_shapes(near_miss: str) -> None:
+    """Nearby non-secret identifiers should remain useful evidence."""
+    text = f"metadata key: {near_miss}"
+
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_preserves_percent_encoded_standalone_secret_near_miss() -> None:
+    """Encoded identifiers that do not meet a token shape should remain actionable."""
+    text = "metadata key: ghp%5F" + "a" * 35
+
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
+@pytest.mark.parametrize("separator", ["\x00", "\t", "\n", "\r", "\u2028", "\u2029", "\u202e"])
+def test_removes_terminal_and_format_controls_before_redaction(separator: str) -> None:
+    """Model-controlled controls must neither render nor split sensitive keys."""
+    secret = "CONTROLSECRET123456789"
+    text = f"api_{separator}key={secret}\x1b[2J\nFORGED\u202e"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert secret not in redacted
+
+
+@pytest.mark.parametrize("encoded_separator", ["%00", "%E2%80%A8", "%E2%80%A9", "%E2%80%AE"])
+def test_redacts_percent_encoded_controls_inside_sensitive_keys(encoded_separator: str) -> None:
+    secret = "ENCODEDCONTROLSECRET123456789"
+
+    redacted = redact_evidence_string(f"api_{encoded_separator}key={secret}", max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert secret not in redacted
+
+
+def test_attacker_supplied_redaction_marker_does_not_hide_control_split_secret() -> None:
+    secret = "MARKERCONFUSIONSECRET123456789"
+    text = f"note={REDACTED_EVIDENCE_VALUE}\napi_\nkey={REDACTED_EVIDENCE_VALUE}{secret}"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "api_key=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        f'loader("{REDACTED_EVIDENCE_VALUE}", "MARKERCONTAINERSECRET123456789")',
+        f'{{"note":"{REDACTED_EVIDENCE_VALUE}","value":"MARKERCONTAINERSECRET123456789"}}',
+    ],
+)
+def test_attacker_supplied_redaction_marker_does_not_hide_control_split_container_secret(value: str) -> None:
+    redacted = redact_evidence_string(f"api_\nkey={value}", max_chars=500)
+
+    assert redacted == "api_key=<redacted>"
+    assert "MARKERCONTAINERSECRET123456789" not in redacted
 
 
 def test_redacts_signed_url_queries_and_capability_path_tokens() -> None:
