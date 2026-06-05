@@ -7205,6 +7205,7 @@ class TestJITScriptDetector:
             b"globals().update(setattr=lambda *args: None)\n",
             b"globals().update(**{'setattr': lambda *args: None})\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
+            b"import builtins\nbuiltins.__dict__.update(setattr=lambda *args: None)\n",
             b"__builtins__.setattr = lambda *args: None\n",
             b"__builtins__['setattr'] = lambda *args: None\n",
         ],
@@ -7271,6 +7272,31 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_keeps_runpy_call_after_destructured_member_restore(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            b"(rp.run_path,) = (original,)\nrp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_destructured_safe_runpy_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nrp.run_path = print\n(rp.run_path,) = (print,)\nrp.run_path('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_overwritten_runpy_capture(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\ncaptured = rp.run_path\ncaptured = print\nrp.run_path = print\ncaptured('safe')\n"
@@ -7297,6 +7323,24 @@ class TestJITScriptDetector:
             ),
             (
                 b"import ctypes, webbrowser\nwebbrowser.CDLL = print\nctypes.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser\nwebbrowser.open_new = print\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nc.PyDLL = print\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n__builtins__.setattr = lambda *args: None\n"
+                b"setattr(c, 'CDLL', print)\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nactual = c\n__builtins__.setattr = lambda *args: None\n"
+                b"setattr(c, 'CDLL', print)\nactual.CDLL('payload.so')\n",
                 "Native library loading detected",
             ),
         ],
