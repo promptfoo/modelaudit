@@ -5,6 +5,33 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.5...modelaudit-picklescan-v0.1.6) (2026-06-05)
+
+### Bug Fixes
+
+- avoid pickle meta-path source probing ([#1493](https://github.com/promptfoo/modelaudit/issues/1493)) ([a31df76](https://github.com/promptfoo/modelaudit/commit/a31df7630614cf35d47031c92e4d735eb049c33e))
+- bound native picklescan state simulation ([#1501](https://github.com/promptfoo/modelaudit/issues/1501)) ([f4c9cdf](https://github.com/promptfoo/modelaudit/commit/f4c9cdf0f13141e31f285d6d9fd249e6af90dd4b))
+- detect dynamic picklescan protocol hooks ([#1375](https://github.com/promptfoo/modelaudit/issues/1375)) ([400c132](https://github.com/promptfoo/modelaudit/commit/400c132628dd4cd31e243e4e9c46cdb5af1db46a))
+- detect newline-separated picklescan calls ([#1481](https://github.com/promptfoo/modelaudit/issues/1481)) ([8dcbbb1](https://github.com/promptfoo/modelaudit/commit/8dcbbb1776e68d1317b0f8c94807ebb20bac24cc))
+- fail closed on encoded nested probe cap ([6633dac](https://github.com/promptfoo/modelaudit/commit/6633dac9d284b4f3bcd994349cb2d16306e01842))
+- fail closed on pickle import reference truncation ([#1449](https://github.com/promptfoo/modelaudit/issues/1449)) ([5ddac28](https://github.com/promptfoo/modelaudit/commit/5ddac28195813e8f5cb425a158b7c1f5d03caa79))
+- fail closed on protocol 5 pickle buffers ([#1450](https://github.com/promptfoo/modelaudit/issues/1450)) ([e696a1f](https://github.com/promptfoo/modelaudit/commit/e696a1ff9452c9b9a7156325a1ff791f8ecd8ac6))
+- flag import-only custom pickle globals ([#1499](https://github.com/promptfoo/modelaudit/issues/1499)) ([ca3a476](https://github.com/promptfoo/modelaudit/commit/ca3a4768b2dd691fb03f98da24d17a655a378162))
+- flag oversized pickle frames as tampered ([#1448](https://github.com/promptfoo/modelaudit/issues/1448)) ([c4758fd](https://github.com/promptfoo/modelaudit/commit/c4758fdc66dd831e346a5445c60a02c55fe6186a))
+- redact Keras evidence secrets ([#1475](https://github.com/promptfoo/modelaudit/issues/1475)) ([37eda4e](https://github.com/promptfoo/modelaudit/commit/37eda4e69404458d14aeba95f64a03de97761891))
+- resolve follow-up quality findings ([#1222](https://github.com/promptfoo/modelaudit/issues/1222)) ([2968961](https://github.com/promptfoo/modelaudit/commit/2968961a40adf5c9e9333d1a2c601cc9aca7fa4e))
+- **routing:** preserve Torch7 findings in Llamafile polyglots ([#1376](https://github.com/promptfoo/modelaudit/issues/1376)) ([2e95c88](https://github.com/promptfoo/modelaudit/commit/2e95c88eb37043a72551a636e30e9df54e72f486))
+- scan raw nested pickles in unicode strings ([#1461](https://github.com/promptfoo/modelaudit/issues/1461)) ([4278da9](https://github.com/promptfoo/modelaudit/commit/4278da93863ae5972de9e79eddc06bd5692974b5))
+- terminate call-graph alias fixpoint on oscillating rebinds ([#1247](https://github.com/promptfoo/modelaudit/issues/1247)) ([#1259](https://github.com/promptfoo/modelaudit/issues/1259)) ([89895a4](https://github.com/promptfoo/modelaudit/commit/89895a4c646feabb98888fece9cf12ef283d351e))
+
+### Performance Improvements
+
+- reuse call graph analysis in directory scans ([#1266](https://github.com/promptfoo/modelaudit/issues/1266)) ([2f01ddf](https://github.com/promptfoo/modelaudit/commit/2f01ddfc88d1b625687867b6745237fe25aa3bb3))
+
+### Documentation
+
+- align picklescan version guidance ([#1279](https://github.com/promptfoo/modelaudit/issues/1279)) ([a53eb11](https://github.com/promptfoo/modelaudit/commit/a53eb112fcbdf4d6baca1ae0124aba8129cb95e1))
+
 ## [0.1.5](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.4...modelaudit-picklescan-v0.1.5) (2026-05-03)
 
 ### Bug Fixes
