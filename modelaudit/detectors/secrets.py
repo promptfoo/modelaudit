@@ -232,6 +232,25 @@ PLACEHOLDER_IDENTIFIER_TERMS = frozenset(
         "your",
     }
 )
+PLACEHOLDER_IDENTIFIER_TERMS_BY_LENGTH = tuple(sorted(PLACEHOLDER_IDENTIFIER_TERMS, key=len, reverse=True))
+
+
+def _split_lowercase_placeholder_compound(segment: str) -> tuple[str, ...]:
+    if not segment.islower() or len(segment) > 128:
+        return ()
+
+    matches: dict[int, tuple[str, ...]] = {0: ()}
+    for start in range(len(segment)):
+        prefix = matches.get(start)
+        if prefix is None:
+            continue
+        for term in PLACEHOLDER_IDENTIFIER_TERMS_BY_LENGTH:
+            if segment.startswith(term, start):
+                matches.setdefault(start + len(term), (*prefix, term))
+    parts = matches.get(len(segment), ())
+    return parts if len(parts) > 1 else ()
+
+
 PLACEHOLDER_MARKER_PATTERN = re.compile(
     r"(?:^|[_-])(?:your|example|sample|placeholder|dummy|fake|changeme|replace(?:_me|_with)?|insert|redacted|here)"
     r"(?=$|[_-])",
@@ -265,8 +284,11 @@ def _is_obvious_placeholder_secret(text: str) -> bool:
     identifier_terms: set[str] = set()
     for segment in re.split(r"[_-]+", candidate):
         segment_terms = re.findall(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[0-9]+", segment)
-        if len(segment_terms) == 1 and segment.casefold() in PLACEHOLDER_COMPOUND_TERMS:
-            identifier_terms.update(PLACEHOLDER_COMPOUND_TERMS[segment.casefold()])
+        compound_terms = PLACEHOLDER_COMPOUND_TERMS.get(segment.casefold()) or _split_lowercase_placeholder_compound(
+            segment
+        )
+        if len(segment_terms) == 1 and compound_terms:
+            identifier_terms.update(compound_terms)
         else:
             identifier_terms.update(term.casefold() for term in segment_terms)
     if not identifier_terms or not (

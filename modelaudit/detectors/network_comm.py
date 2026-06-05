@@ -793,6 +793,20 @@ class NetworkCommDetector:
     # Domain patterns
     DOMAIN_PATTERN = re.compile(rb"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b")
 
+    NETWORK_COMMAND_LINE_PREFIX = (
+        rb"^[ \t]*(?:(?:[-*+>]|[0-9]{1,9}[.)])[ \t]+){0,8}"
+        rb"(?:`{1,3}[ \t]*)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])[ \t]*)?"
+    )
+    NETWORK_COMMAND_LINE_LIMIT = rb"(?=[^\r\n]{1,8192}(?:\r?$))"
+    NETWORK_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?"
+    NETWORK_COMMAND_TERMINATOR = rb"(?=[ \t]*(?:\r?$|[;&|<>#]))"
+    NETWORK_COMMAND_HOST = (
+        rb"(?:"
+        + IPV4_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|"
+        + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|\[(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\])"
+    )
     NETCAT_OPTION_ARGUMENT = rb"[^\s\"']+"
     NETCAT_OPTION_WITH_ARGUMENT = (
         rb"(?:-(?:I|M|O|P|R|T|V|W|X|Z|c|e|i|m|p|q|s|w|x)|"
@@ -815,16 +829,61 @@ class NetworkCommDetector:
         + rb")"
     )
     NETCAT_COMMAND_PATTERN = re.compile(
-        rb"^[ \t]*(?:(?:[-*+>]|[0-9]{1,9}[.)])[ \t]+){0,8}"
-        rb"(?:`{1,3}[ \t]*)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])[ \t]*)?"
-        rb"(?P<command>(?:/(?:usr/)?bin/)?(?:nc|ncat|netcat)(?:\.exe)?)"
+        NETWORK_COMMAND_LINE_PREFIX + rb"(?P<command>" + NETWORK_COMMAND_PATH_PREFIX + rb"(?:nc|ncat|netcat)(?:\.exe)?)"
         rb"(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}[ \t]+"
-        rb"(?P<destination>(?:"
-        + IPV4_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
-        + rb"|"
+        rb"(?P<destination>" + NETWORK_COMMAND_HOST + rb")"
+        rb"[ \t]+(?P<port>[0-9]{1,5})(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}" + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|[ \t]+)?[^\s]{1,4096}"
+    SSH_OPTION_WITHOUT_ARGUMENT = rb"-[46AaCfGgKkMNnqsTtVvXxYy]+"
+    SSH_OPTION = rb"(?:" + SSH_OPTION_WITH_ARGUMENT + rb"|" + SSH_OPTION_WITHOUT_ARGUMENT + rb")"
+    SSH_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX
+        + rb"(?P<command>"
+        + NETWORK_COMMAND_PATH_PREFIX
+        + rb"ssh(?:\.exe)?)(?:[ \t]+"
+        + SSH_OPTION
+        + rb"){0,8}[ \t]+(?P<destination>(?:[A-Za-z0-9._-]+@)?"
+        + NETWORK_COMMAND_HOST
+        + rb")"
+        + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    GIT_CLONE_OPTION_WITH_ARGUMENT = (
+        rb"(?:-(?:b|c|j|o|u)|--(?:branch|config|depth|filter|jobs|origin|reference|reference-if-able|"
+        rb"separate-git-dir|shallow-exclude|shallow-since|template|upload-pack))(?:=|[ \t]+)[^\s]{1,4096}"
+    )
+    GIT_CLONE_OPTION = (
+        rb"(?:" + GIT_CLONE_OPTION_WITH_ARGUMENT + rb"|-[lnqsv]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+    )
+    GIT_CLONE_DESTINATION = (
+        rb"(?:[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]{1,4096}|(?:[A-Za-z0-9._-]+@)?"
+        + NETWORK_COMMAND_HOST
+        + rb":[^\s\"'<>]{1,4096})"
+    )
+    GIT_CLONE_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX
+        + NETWORK_COMMAND_LINE_LIMIT
+        + rb"(?P<command>"
+        + NETWORK_COMMAND_PATH_PREFIX
+        + rb"git(?:\.exe)?)[ \t]+clone"
+        rb"(?:[ \t]+" + GIT_CLONE_OPTION + rb"){0,8}[ \t]+(?:--[ \t]+)?"
+        rb"(?P<destination>" + GIT_CLONE_DESTINATION + rb")"
+        rb"(?:[ \t]+[^\s;&|#]{1,4096})?" + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    DOCKER_PULL_OPTION_WITH_ARGUMENT = rb"--(?:disable-content-trust|platform)(?:=|[ \t]+)[^\s]{1,4096}"
+    DOCKER_PULL_OPTION = (
+        rb"(?:" + DOCKER_PULL_OPTION_WITH_ARGUMENT + rb"|-[aq]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+    )
+    DOCKER_PULL_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX + rb"(?P<command>docker(?:\.exe)?)[ \t]+(?:image[ \t]+)?pull"
+        rb"(?:[ \t]+" + DOCKER_PULL_OPTION + rb"){0,8}[ \t]+"
+        rb"(?P<destination>"
         + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
-        + rb"|\[(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\]))"
-        rb"[ \t]+(?P<port>[0-9]{1,5})(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}(?=[ \t]*(?:$|[;&|<>#]))",
+        + rb"/[^\s\"'<>]{1,4096})"
+        + NETWORK_COMMAND_TERMINATOR,
         re.IGNORECASE | re.MULTILINE,
     )
 
@@ -1116,6 +1175,29 @@ class NetworkCommDetector:
                 }
             ):
                 return
+        for command_type, pattern in (
+            ("SSH", self.SSH_COMMAND_PATTERN),
+            ("Git clone", self.GIT_CLONE_COMMAND_PATTERN),
+            ("Docker pull", self.DOCKER_PULL_COMMAND_PATTERN),
+        ):
+            for match in pattern.finditer(data):
+                command = match.group("command").decode("utf-8", errors="ignore")
+                destination = match.group("destination").decode("utf-8", errors="ignore")
+                safe_destination = redact_url_for_finding(destination) if "://" in destination else destination
+                if not self._record_finding(
+                    {
+                        "type": "network_command",
+                        "severity": "HIGH",
+                        "confidence": 0.9,
+                        "message": f"{command_type} network command detected: {safe_destination}",
+                        "command": command,
+                        "command_type": command_type.casefold().replace(" ", "_"),
+                        "destination": safe_destination,
+                        "position": match.start("destination"),
+                        "context": context,
+                    }
+                ):
+                    return
 
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
@@ -1385,6 +1467,7 @@ class NetworkCommDetector:
                 "ai",
                 "app",
                 "dev",
+                "example",
                 "xyz",
             ]
             if tld not in valid_tlds:

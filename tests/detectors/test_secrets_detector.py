@@ -218,6 +218,8 @@ class TestSecretsDetector:
             "$env:CLIENT_SECRET",
             "dummy_secret_value",
             "clientSecretValue",
+            "clientsecretvalue",
+            "examplepassword",
             "<clientSecretValue>",
             "xxxxxxxxxxxxxxxx",
         ],
