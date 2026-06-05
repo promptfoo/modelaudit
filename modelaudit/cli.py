@@ -423,7 +423,7 @@ def _replace_windows_output_file(output_path: str, temp_fd: int, parent_handle: 
 
     encoded_name = destination_name.encode("utf-16-le")
     file_name_offset = FileRenameInfo.file_name.offset
-    buffer_size = file_name_offset + len(encoded_name) + ctypes.sizeof(wintypes.WCHAR)
+    buffer_size = ctypes.sizeof(FileRenameInfo) + len(encoded_name)
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
     rename_info.replace_if_exists = True
