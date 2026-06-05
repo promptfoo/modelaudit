@@ -336,9 +336,15 @@ def is_pytorch_hub_url(url: str) -> bool:
     return bool(re.match(_PYTORCH_HUB_PATTERN, url, re.IGNORECASE))
 
 
-def _extract_weight_urls(html: str) -> list[str]:
+def _extract_weight_urls(
+    html: str,
+    scannable_extensions: frozenset[str] | None = None,
+) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
-    model_extensions = {extension.lower() for extension in _get_model_extensions()}
+    model_extensions = {
+        extension.lower()
+        for extension in (scannable_extensions if scannable_extensions is not None else _get_model_extensions())
+    }
     weight_urls: list[str] = []
     seen: set[str] = set()
 
@@ -445,6 +451,13 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
     extension = _supported_model_extension(url)
     if extension not in _content_sniff_required_extensions():
         return
+    normalized_path = _normalized_model_path(url)
+    if (
+        extension == ".json"
+        and normalized_path is not None
+        and PurePosixPath(normalized_path).name.lower().endswith("-symbol.json")
+    ):
+        return
 
     from ..file.detection import detect_file_format_from_magic
 
@@ -503,6 +516,20 @@ def _supports_secure_cache_commit() -> bool:
     )
 
 
+@contextmanager
+def _open_directory_fd(
+    path: str | os.PathLike[str],
+    flags: int,
+    *,
+    dir_fd: int | None = None,
+) -> Iterator[int]:
+    fd = os.open(path, flags, dir_fd=dir_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def _open_cache_parent_fd(
     root_fd: int,
     relative_path: Path,
@@ -514,7 +541,7 @@ def _open_cache_parent_fd(
     parent_fd = root_fd
     for part in relative_path.parent.parts:
         try:
-            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            child_fd = fd_stack.enter_context(_open_directory_fd(part, directory_flags, dir_fd=parent_fd))
         except FileNotFoundError:
             try:
                 os.mkdir(part, mode=0o700, dir_fd=parent_fd)
@@ -522,8 +549,7 @@ def _open_cache_parent_fd(
             except FileExistsError:
                 # Another process won the create race; the no-follow open below validates it.
                 pass
-            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-        fd_stack.callback(os.close, child_fd)
+            child_fd = fd_stack.enter_context(_open_directory_fd(part, directory_flags, dir_fd=parent_fd))
         parent_fd = child_fd
     return parent_fd
 
@@ -552,8 +578,7 @@ def _commit_staged_weight_files_secure(
     created_dirs: list[tuple[int, str]] = []
     with ExitStack() as fd_stack:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        root_fd = os.open(dest_dir, directory_flags)
-        fd_stack.callback(os.close, root_fd)
+        root_fd = fd_stack.enter_context(_open_directory_fd(dest_dir, directory_flags))
         try:
             for _, relative_path in artifacts:
                 staged_file = _safe_destination_path(files_dir, relative_path)
@@ -694,6 +719,7 @@ def download_pytorch_hub_model(
     url: str,
     cache_dir: Path | None = None,
     max_size: int | None = None,
+    scannable_extensions: frozenset[str] | None = None,
 ) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
@@ -705,7 +731,7 @@ def download_pytorch_hub_model(
     except Exception as e:  # pragma: no cover - network errors
         raise Exception(f"Failed to fetch PyTorch Hub page {url}: {e!s}") from e
 
-    weight_urls = _extract_weight_urls(page.text)
+    weight_urls = _extract_weight_urls(page.text, scannable_extensions)
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 
@@ -777,6 +803,7 @@ def download_pytorch_hub_model_streaming(
     url: str,
     show_progress: bool = True,
     max_size: int | None = None,
+    scannable_extensions: frozenset[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
@@ -787,6 +814,7 @@ def download_pytorch_hub_model_streaming(
         url: PyTorch Hub model page URL
         show_progress: Whether to show progress messages
         max_size: Maximum total download size in bytes
+        scannable_extensions: Optional selected-scanner suffix filter
 
     Yields:
         Tuples of (file_path, is_last) for each weight file
@@ -800,7 +828,7 @@ def download_pytorch_hub_model_streaming(
     except Exception as e:
         raise Exception(f"Failed to fetch PyTorch Hub page {url}: {e!s}") from e
 
-    weight_urls = _extract_weight_urls(page.text)
+    weight_urls = _extract_weight_urls(page.text, scannable_extensions)
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 

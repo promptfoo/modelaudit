@@ -12,6 +12,7 @@ from modelaudit.utils.sources.pytorch_hub import (
     _extract_weight_urls,
     _get_model_extensions,
     _get_total_size,
+    _open_directory_fd,
     _open_trusted_artifact_response,
     _supports_secure_cache_commit,
     download_pytorch_hub_model,
@@ -92,6 +93,15 @@ def test_extract_weight_urls_includes_supported_non_pt_extensions(mock_extension
         "https://download.pytorch.org/models/resnet50.bin",
         "https://download.pytorch.org/models/resnet50.zip",
     ]
+
+
+def test_extract_weight_urls_honors_selected_scanner_extensions() -> None:
+    html = (
+        '<a href="https://download.pytorch.org/models/model.pkl">pickle</a>'
+        '<a href="https://download.pytorch.org/models/model.onnx">onnx</a>'
+    )
+
+    assert _extract_weight_urls(html, frozenset({".pkl"})) == ["https://download.pytorch.org/models/model.pkl"]
 
 
 def test_extract_weight_urls_excludes_documentation_near_matches() -> None:
@@ -234,6 +244,74 @@ def test_download_pytorch_hub_model_rejects_unrecognized_ambiguous_text_artifact
         )
 
     assert not (tmp_path / "README.txt").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_accepts_canonical_mxnet_symbol_json(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_extensions.return_value = {".json"}
+    weight_url = "https://download.pytorch.org/models/model-symbol.json"
+    payload = b'{"nodes": [], "arg_nodes": [], "heads": []}'
+    html_resp = MagicMock(text=f'<a href="{weight_url}">MXNet</a>')
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [payload]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    mock_head.return_value = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
+    mock_check.return_value = (True, "ok")
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert result == tmp_path
+    assert (tmp_path / "model-symbol.json").read_bytes() == payload
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_generic_unrecognized_json(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_extensions.return_value = {".json"}
+    weight_url = "https://download.pytorch.org/models/metadata.json"
+    payload = b'{"description": "not a model"}'
+    html_resp = MagicMock(text=f'<a href="{weight_url}">metadata</a>')
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [payload]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    mock_head.return_value = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
+    mock_check.return_value = (True, "ok")
+
+    with pytest.raises(ValueError, match="ambiguous suffix"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    assert not (tmp_path / "metadata.json").exists()
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
@@ -945,6 +1023,18 @@ def test_secure_cache_commit_rolls_back_nested_files_on_interruption(
 
     assert (dest_dir / relative_paths[0]).read_bytes() == b"old-first"
     assert (dest_dir / relative_paths[1]).read_bytes() == b"old-second"
+
+
+def test_open_directory_fd_closes_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: 123)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    with pytest.raises(RuntimeError, match="stop"), _open_directory_fd("cache", 0) as fd:
+        assert fd == 123
+        raise RuntimeError("stop")
+
+    assert closed == [123]
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
