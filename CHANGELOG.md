@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
+- bound Keras ZIP HDF5 external-reference inspection and evidence, preserve hard-link cycle traversal, and flag malformed Lambda metadata
 - fail closed on noncanonical Keras ZIP Lambda and external-reference versions
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
@@ -79,7 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
-- detect and safely bound NeMo Hydra network and file-access callable targets, including NumPy and file-opening constructor aliases, that can perform SSRF, local reads, or arbitrary writes
+- detect and safely bound NeMo Hydra process-execution, native-loader, network, and file-access callable targets, including repeated YAML aliases and NumPy/file-opening constructors
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
