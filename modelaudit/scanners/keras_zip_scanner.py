@@ -120,7 +120,11 @@ _DANGEROUS_LAMBDA_FUNCTION_MODULE_ROOTS = {
 _EXACT_DANGEROUS_CONFIG_MODULES = frozenset(
     {
         "_ctypes",
+        "_frozen_importlib",
+        "_frozen_importlib_external",
+        "_imp",
         "_interpreters",
+        "_io",
         "_multiprocessing",
         "_pickle",
         "_posixsubprocess",
