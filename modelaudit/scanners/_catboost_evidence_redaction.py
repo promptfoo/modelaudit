@@ -17,6 +17,7 @@ REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
+MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
 MAX_KEY_EXPRESSION_CHARS: Final[int] = 300
 MAX_KEY_EXPRESSION_PARSE_ATTEMPTS: Final[int] = 64
@@ -321,23 +322,50 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
-def _is_sensitive_query_key(key: str) -> bool:
-    normalized_key = re.sub(r"(?:\[[^\]]*\])+$", "", key)
+def _decode_query_component(value: str) -> tuple[str, bool]:
+    decoded = value
+    for _ in range(MAX_URL_QUERY_DECODE_PASSES):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            return decoded, True
+        decoded = next_decoded
+    return decoded, unquote_plus(decoded) == decoded
+
+
+def _redacted_sensitive_query_key(key: str) -> str | None:
+    decoded_key, decoding_complete = _decode_query_component(key)
+    if not decoding_complete:
+        return "credential"
+
+    assignment_match = re.search(
+        rf"(?is)(?:^|[?&;])(?:amp;)?\s*"
+        rf"(?P<key>{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})\s*[:=]",
+        decoded_key,
+    )
+    if assignment_match is not None:
+        return _normalize_sensitive_key(assignment_match.group("key")) or "credential"
+    if STRUCTURED_SENSITIVE_KEY_RE.search(decoded_key):
+        return "credential"
+
+    normalized_key = re.sub(r"(?:\[[^\]]*\])+$", "", decoded_key)
     compact_key = re.sub(r"[._-]", "", normalized_key.lower())
-    return (
+    if (
         normalized_key.lower() in SENSITIVE_QUERY_KEYS
         or compact_key in COMPACT_SENSITIVE_QUERY_KEYS
         or _normalize_sensitive_key(normalized_key) is not None
-    )
+    ):
+        return decoded_key
+    return None
+
+
+def _is_sensitive_query_key(key: str) -> bool:
+    return _redacted_sensitive_query_key(key) is not None
 
 
 def _query_value_contains_secret(value: str) -> bool:
-    decoded = value
-    for _ in range(3):
-        next_decoded = unquote_plus(decoded)
-        if next_decoded == decoded:
-            break
-        decoded = next_decoded
+    decoded, decoding_complete = _decode_query_component(value)
+    if not decoding_complete:
+        return True
 
     if re.search(rf"(?i)(?:^|[?&;])\s*{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]", decoded):
         return True
@@ -383,8 +411,9 @@ def _redact_url(match: re.Match[str]) -> str:
 
         query_items = []
         for key, value in parse_qsl(part, keep_blank_values=True):
-            is_sensitive = _is_sensitive_query_key(key) or _query_value_contains_secret(value)
-            query_items.append((key, REDACTED_EVIDENCE_VALUE if is_sensitive else value))
+            redacted_key = _redacted_sensitive_query_key(key)
+            is_sensitive = redacted_key is not None or _query_value_contains_secret(value)
+            query_items.append((redacted_key or key, REDACTED_EVIDENCE_VALUE if is_sensitive else value))
         query_parts.append(urlencode(query_items, doseq=True, safe="<>") if query_items else part)
 
     return urlunsplit(

