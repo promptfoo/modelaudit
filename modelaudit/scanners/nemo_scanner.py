@@ -178,6 +178,9 @@ _DANGEROUS_TARGETS = {
     "hydra.core.global_hydra.GlobalHydra.clear",
     "hydra.core.global_hydra.GlobalHydra.initialize",
     "hydra.core.global_hydra.GlobalHydra.set_instance",
+    "hydra.core.utils._save_config",
+    "hydra.core.utils.configure_log",
+    "hydra.core.utils.run_job",
     "importlib.import_module",
     "hydra._internal.utils._locate",
     "hydra.utils._locate",
@@ -309,14 +312,30 @@ _DANGEROUS_TARGETS = {
     "transformers.dynamic_module_utils.get_relative_imports",
     "transformers.dynamic_module_utils.init_hf_modules",
     "transformers.dynamic_module_utils.resolve_trust_remote_code",
+    "transformers.pipelines.audio_classification.ffmpeg_read",
+    "transformers.pipelines.audio_utils.ffmpeg_read",
+    "transformers.testing_utils.run_command",
     "transformers.utils.cached_file",
+    "transformers.utils.hub.PushToHubMixin._create_repo",
     "transformers.utils.hub.PushToHubMixin._upload_modified_files",
     "transformers.utils.hub.cached_file",
     "transformers.utils.hub.cached_files",
+    "transformers.utils.hub.create_branch",
+    "transformers.utils.hub.create_commit",
+    "transformers.utils.hub.create_repo",
     "transformers.utils.hub.create_and_tag_model_card",
+    "transformers.utils.hub.define_sagemaker_information",
+    "transformers.utils.hub.download_url",
+    "transformers.utils.hub.get_file_from_repo",
     "transformers.utils.hub.get_checkpoint_shard_files",
     "transformers.utils.hub.has_file",
+    "transformers.utils.hub.hf_hub_download",
+    "transformers.utils.hub.http_get",
+    "transformers.utils.hub.httpx.get",
     "transformers.utils.hub.list_repo_templates",
+    "transformers.utils.hub.list_repo_tree",
+    "transformers.utils.hub.requests.get",
+    "transformers.utils.hub.snapshot_download",
     "transformers.utils.import_utils._LazyModule._get_module",
     "transformers.utils.import_utils.clear_import_cache",
     "transformers.utils.import_utils.create_import_structure_from_path",
@@ -371,6 +390,8 @@ _DANGEROUS_TARGETS = {
     "numpy.rec.fromfile",
     "numpy.recfromcsv",
     "numpy.recfromtxt",
+    "numpy.distutils.exec_command._exec_command",
+    "numpy.distutils.exec_command.exec_command",
     "numpy.save",
     "numpy.savez",
     "numpy.savez_compressed",
@@ -1046,6 +1067,7 @@ _DANGEROUS_TARGET_PREFIXES = (
 )
 _DANGEROUS_NUMPY_TARGET_SUFFIXES = (".dump", ".tofile")
 _DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES = (".from_pretrained", ".push_to_hub", ".save_pretrained")
+_TARGET_CALL_ALIAS_SUFFIX = ".__call__"
 
 # Patterns in _target_ that are suspicious even if not exact matches
 _SUSPICIOUS_TARGET_PATTERNS = (
@@ -1140,6 +1162,13 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
         if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
             return pattern
     return None
+
+
+def _unwrap_target_call_aliases(target: str) -> str:
+    """Return the underlying callable for trailing ``.__call__`` aliases."""
+    while target.endswith(_TARGET_CALL_ALIAS_SUFFIX):
+        target = target[: -len(_TARGET_CALL_ALIAS_SUFFIX)]
+    return target
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -3173,6 +3202,7 @@ class NemoScanner(BaseScanner):
         display_target = _redact_config_evidence(target)
         display_config_path = _redact_config_evidence(config_path)
         display_config_name = _redact_config_evidence(config_name)
+        callable_target = _unwrap_target_call_aliases(target)
         # Escaped interpolation openers can become active after repeated OmegaConf/Hydra resolution passes.
         if _HYDRA_INTERPOLATION_OPENER in target:
             self._add_interpolated_target_check(target, config_path, config_name, archive_path, result)
@@ -3180,13 +3210,13 @@ class NemoScanner(BaseScanner):
 
         # Check against known dangerous targets (always flag, even if safe prefix)
         if (
-            target in _DANGEROUS_TARGETS
-            or target.startswith(_DANGEROUS_TARGET_PREFIXES)
-            or (target.startswith("numpy.") and target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
+            callable_target in _DANGEROUS_TARGETS
+            or callable_target.startswith(_DANGEROUS_TARGET_PREFIXES)
+            or (callable_target.startswith("numpy.") and callable_target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
             or (
-                target not in _SAFE_TARGETS
-                and target.startswith("transformers.")
-                and target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
+                callable_target not in _SAFE_TARGETS
+                and callable_target.startswith("transformers.")
+                and callable_target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
             )
         ):
             result.add_check(
@@ -3219,8 +3249,10 @@ class NemoScanner(BaseScanner):
             return
 
         # Trusted namespaces can still hide obviously dangerous leaf names.
-        if target in _SAFE_TARGETS or any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
-            pattern = _find_suspicious_safe_prefixed_target_pattern(target)
+        if callable_target in _SAFE_TARGETS or any(
+            callable_target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES
+        ):
+            pattern = _find_suspicious_safe_prefixed_target_pattern(callable_target)
             if pattern is not None:
                 self._add_suspicious_target_check(
                     target,
@@ -3241,7 +3273,7 @@ class NemoScanner(BaseScanner):
             return
 
         # Check for suspicious patterns in target (only for non-safe targets)
-        pattern = _find_suspicious_target_pattern(target)
+        pattern = _find_suspicious_target_pattern(callable_target)
         if pattern is not None:
             self._add_suspicious_target_check(target, pattern, config_path, config_name, archive_path, result)
             return
