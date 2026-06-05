@@ -86,7 +86,7 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[\"']?(?:endpoint|callback|webhook)"
     rb"(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*(?:=|:)\s*"
-    rb"\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
+    rb"\{[^{}]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
@@ -140,7 +140,18 @@ DOCUMENTATION_PRIVILEGE_WRAPPER = (
     rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
-DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+DOCUMENTATION_POSIX_SHELL_OPTION = rb"(?:--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?|-[A-Za-z]{1,8})"
+DOCUMENTATION_POSIX_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
+DOCUMENTATION_CMD_OPTION = rb"/[A-Za-z](?::[^\s]+)?"
+DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = (
+    rb"(?:(?:(?:bash|sh|zsh)(?:\s+"
+    + DOCUMENTATION_POSIX_SHELL_OPTION
+    + rb"){0,8}\s+"
+    + DOCUMENTATION_POSIX_SHELL_COMMAND_OPTION
+    + rb"\s+[\"']?\s*)|(?:cmd(?:\.exe)?(?:\s+"
+    + DOCUMENTATION_CMD_OPTION
+    + rb"){0,8}\s+/(?:c|k)\s+[\"']?\s*))?"
+)
 DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
     DOCUMENTATION_SHELL_WRAPPERS + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER + DOCUMENTATION_SHELL_WRAPPERS
 )
@@ -156,9 +167,10 @@ DOCUMENTATION_SHELL_LINE_PREFIX = (
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
 )
+DOCUMENTATION_DOWNLOADER_COMMAND = rb"(?:(?:curl|wget)(?:\.exe)?|fetch|invoke-restmethod|invoke-webrequest|irm|iwr)"
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
-    rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
@@ -169,13 +181,15 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
     + DOCUMENTATION_SHELL_WRAPPED_COMMAND
-    + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    + rb"(?:(?:\$\(|`)\s*)?(?:"
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
     re.IGNORECASE,
 )
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
-    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
+    rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
@@ -196,6 +210,17 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
 DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
     rb"^\s*(?:(?:if|elif|else|for|while|with|try|except|finally|match|case|def|class)\b"
     rb"|async\s+(?:for|with|def)\b)[^#\n]{0,4096}:\s*$"
+)
+DOCUMENTATION_PYTHON_DEFINITION_BLOCK_PATTERN = re.compile(
+    rb"(?:(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^#\n]{0,2048}\)[^#\n]{0,512}"
+    rb"|class\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^#\n]{0,2048}\))?)\s*:\s*(?:#.*)?$"
+)
+DOCUMENTATION_PYTHON_NESTED_BLOCK_PATTERN = re.compile(
+    rb"(?:(?:async\s+)?(?:for|with)|if|elif|else|while|try|except|finally|match|case)\b"
+    rb"[^#\n]{0,4096}:\s*(?:#.*)?$"
+)
+DOCUMENTATION_PYTHON_BLOCK_VALUE_PREFIX_PATTERN = re.compile(
+    rb"(?:return|yield)(?:\s+from)?\b[\s(\[{\\]{1,4096}[rubfRUBF]*[\"']?$"
 )
 DOCUMENTATION_SEMICOLON_CODE_PREFIX_PATTERN = re.compile(
     rb"(?:^|;)\s*(?:"
@@ -287,10 +312,17 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _is_model_card_documentation_filename(cls, filename: str) -> bool:
+        return filename == "model_card" or (
+            filename.startswith(("model_card.", "modelcard."))
+            and os.path.splitext(filename)[1].lower() in cls.supported_extensions
+        )
+
+    @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if filename == "model_card" or cls._is_readme_documentation_filename(filename):
+        if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
 
         ext = os.path.splitext(path)[1].lower()
@@ -341,7 +373,11 @@ class TextScanner(BaseScanner):
     @classmethod
     def _is_documentation_sidecar(cls, path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return filename in DOCUMENTATION_TEXT_FILENAMES or cls._is_readme_documentation_filename(filename)
+        return (
+            filename in DOCUMENTATION_TEXT_FILENAMES
+            or cls._is_readme_documentation_filename(filename)
+            or cls._is_model_card_documentation_filename(filename)
+        )
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -481,7 +517,8 @@ class TextScanner(BaseScanner):
                 before_previous = previous
                 previous = current
         except (IndentationError, tokenize.TokenError):
-            pass
+            # Incomplete prefixes are expected; keep the delimiter stack built before tokenization stopped.
+            return any(opening == "(" and is_call for opening, is_call in stack)
         return any(opening == "(" and is_call for opening, is_call in stack)
 
     @staticmethod
@@ -605,6 +642,40 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_python_definition_contains_finding(payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if (
+            current_indent == 0
+            or DOCUMENTATION_PYTHON_BLOCK_VALUE_PREFIX_PATTERN.fullmatch(current_line_prefix.lstrip()) is None
+        ):
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        target_indent = current_indent
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if indent < target_indent:
+                    if DOCUMENTATION_PYTHON_DEFINITION_BLOCK_PATTERN.fullmatch(stripped) is not None:
+                        return True
+                    if DOCUMENTATION_PYTHON_NESTED_BLOCK_PATTERN.fullmatch(stripped) is None:
+                        return False
+                    target_indent = indent
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if cls._finding_line_prefix_is_truncated(payload, finding):
@@ -620,6 +691,8 @@ class TextScanner(BaseScanner):
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return False
         if cls._documentation_previous_line_continues_command(payload, position):
+            return True
+        if cls._documentation_python_definition_contains_finding(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
         return (
