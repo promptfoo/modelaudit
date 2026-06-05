@@ -207,6 +207,44 @@ def test_torch7_snippet_preserves_execution_after_concatenated_secret(separator:
     assert snippet == f'token = <redacted> {separator.strip()} os.execute("id")'
 
 
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. pcall(os.execute("id"))',
+            'token = <redacted> .. pcall(os.execute("id"))',
+        ),
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. assert((os.execute("id")))',
+            'token = <redacted> .. assert((os.execute("id")))',
+        ),
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. pcall(function() return os.execute("id") end)',
+            'token = <redacted> .. pcall(function() return os.execute("id") end)',
+        ),
+    ],
+)
+def test_torch7_snippet_preserves_wrapped_execution_after_concatenated_secret(
+    expression: str,
+    expected: str,
+) -> None:
+    snippet = Torch7Scanner._snippet(expression, max_chars=500)
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == expected
+
+
+def test_torch7_snippet_does_not_restore_unvalidated_text_after_compound_secret() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = "FULL_LUA_SECRET_123456789" .. attacker["PUBLIC_WRAPPER"](os.execute("id"))',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert "PUBLIC_WRAPPER" not in snippet
+    assert snippet == "token = <redacted>"
+
+
 def test_torch7_snippet_preserves_subscript_and_deep_execution_targets() -> None:
     snippets = (
         Torch7Scanner._snippet("headers['token'] = os.execute('echo ok')", max_chars=500),

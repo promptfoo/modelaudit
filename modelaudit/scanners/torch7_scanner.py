@@ -34,7 +34,7 @@ EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN = re.compile(
     r"(?is)^(?:(?:[a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(\s*|\(\s*)*(?:function\s*\(\s*\)\s*return\s*)?$"
 )
 COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN = re.compile(
-    r"(?is)^\s*(?P<value>.+?)\s*(?P<operator>(?<!\w)(?:or|and)(?!\w)|\.\.)\s*$"
+    r"(?is)^\s*(?P<value>.+)\s*(?P<operator>(?<!\w)(?:or|and)(?!\w)|\.\.)\s*(?P<wrapper>.*)$"
 )
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
@@ -255,10 +255,22 @@ class Torch7Scanner(BaseScanner):
                 target_name = match.group("target").rsplit("=", 1)[0].strip()
                 if target_name.lower().startswith("local "):
                     target_name = target_name[6:].strip()
-                if compound_match is None or not is_sensitive_evidence_key(target_name):
+                compound_wrapper = (
+                    compound_match.group("wrapper") + leading_execution_parentheses.group(0)
+                    if compound_match is not None and leading_execution_parentheses is not None
+                    else ""
+                )
+                if (
+                    compound_match is None
+                    or not is_sensitive_evidence_key(target_name)
+                    or EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN.fullmatch(compound_wrapper) is None
+                ):
                     continue
                 replacement_end = execution_match.start()
-                replacement_suffix = f"{REDACTED_EVIDENCE_VALUE} {compound_match.group('operator').lower()} "
+                replacement_suffix = (
+                    f"{REDACTED_EVIDENCE_VALUE} {compound_match.group('operator').lower()} "
+                    f"{compound_match.group('wrapper')}"
+                )
 
             protected_parts.append(text[cursor : match.start()])
             protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
