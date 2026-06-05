@@ -3,7 +3,9 @@
 import importlib
 import pickle
 import struct
+import subprocess
 import tarfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator
 from io import BytesIO
@@ -19,6 +21,7 @@ from modelaudit.utils.sources.huggingface import (
     _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
+    _run_huggingface_download_with_deadline,
     download_file_from_hf,
     download_model,
     download_model_streaming,
@@ -1183,6 +1186,79 @@ class TestModelDownload:
         mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._terminate_huggingface_download_process")
+    @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
+    def test_download_worker_is_terminated_at_deadline(
+        self,
+        mock_popen: MagicMock,
+        mock_terminate: MagicMock,
+    ) -> None:
+        """A blocking SDK transfer must not outlive the acquisition deadline."""
+        process = mock_popen.return_value
+        process.args = ["worker"]
+        process.communicate.side_effect = subprocess.TimeoutExpired(process.args, timeout=1)
+
+        with pytest.raises(TimeoutError, match="acquisition timed out"):
+            _run_huggingface_download_with_deadline(
+                "snapshot_download",
+                {"repo_id": "test/model"},
+                time.monotonic() + 1,
+                "test/model",
+            )
+
+        mock_terminate.assert_called_once_with(process)
+
+    @patch("modelaudit.utils.sources.huggingface._terminate_huggingface_download_process")
+    @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
+    def test_download_worker_is_terminated_on_parent_interrupt(
+        self,
+        mock_popen: MagicMock,
+        mock_terminate: MagicMock,
+    ) -> None:
+        """Parent interrupts must not leave a transfer subprocess running."""
+        process = mock_popen.return_value
+        process.communicate.side_effect = KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            _run_huggingface_download_with_deadline(
+                "snapshot_download",
+                {"repo_id": "test/model"},
+                time.monotonic() + 1,
+                "test/model",
+            )
+
+        mock_terminate.assert_called_once_with(process)
+
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model.bin"], _HF_TEST_REVISION, None),
+    )
+    def test_download_model_bounds_snapshot_transfer(
+        self,
+        _mock_list_repo_files: MagicMock,
+        mock_run_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """The snapshot transfer should receive the remaining end-to-end deadline."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.bin").write_bytes(b"weights")
+        mock_run_download.return_value = str(download_path)
+
+        result = download_model(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+            timeout_seconds=30,
+        )
+
+        assert result == download_path
+        operation, kwargs, deadline, repo_id = mock_run_download.call_args.args
+        assert operation == "snapshot_download"
+        assert kwargs["repo_id"] == "test/model"
+        assert deadline > time.monotonic()
+        assert repo_id == "test/model"
+
     @patch("huggingface_hub.HfApi.repo_info")
     def test_list_repo_files_at_revision_returns_matching_sha(self, mock_repo_info: MagicMock) -> None:
         """Capped downloads should keep the listing and transfer on one immutable revision."""
@@ -1594,6 +1670,38 @@ class TestModelDownload:
 
 class TestModelDownloadStreaming:
     """Test streaming model downloads from HuggingFace."""
+
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    def test_download_model_streaming_bounds_each_transfer(
+        self,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        mock_run_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Each streaming transfer should receive the shared acquisition deadline."""
+        downloaded_file = tmp_path / "pytorch_model.bin"
+        downloaded_file.write_bytes(b"weights")
+        mock_run_download.return_value = str(downloaded_file)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                timeout_seconds=30,
+            )
+        )
+
+        assert results == [(downloaded_file, True)]
+        operation, kwargs, deadline, repo_id = mock_run_download.call_args.args
+        assert operation == "hf_hub_download"
+        assert kwargs["filename"] == "pytorch_model.bin"
+        assert deadline > time.monotonic()
+        assert repo_id == "test/model"
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})

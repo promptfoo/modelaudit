@@ -4,8 +4,11 @@ import json
 import logging
 import os
 import struct
+import subprocess
+import sys
 import time
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 from glob import escape as escape_glob
 from io import BytesIO
@@ -33,6 +36,7 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_STREAMING_UNFILTERED_FILES = 128
+_HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 
 __all__ = [
     "download_file_from_hf",
@@ -988,6 +992,85 @@ def _list_repo_files_with_timeout(
     return files, revision, None
 
 
+def _run_huggingface_download_with_deadline(
+    operation: str,
+    download_kwargs: dict[str, Any],
+    deadline: float | None,
+    repo_id: str,
+    *,
+    direct_download: Callable[..., Any] | None = None,
+) -> str:
+    """Run an SDK download directly or in a terminable subprocess when bounded."""
+    if operation not in {"snapshot_download", "hf_hub_download"}:
+        raise ValueError(f"Unsupported Hugging Face download operation: {operation}")
+
+    if deadline is None:
+        if direct_download is None:
+            if operation == "snapshot_download":
+                from huggingface_hub import snapshot_download
+
+                direct_download = snapshot_download
+            else:
+                from huggingface_hub import hf_hub_download
+
+                direct_download = hf_hub_download
+        return str(direct_download(**download_kwargs))
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+
+    payload = json.dumps({"operation": operation, "download_kwargs": download_kwargs})
+    process = subprocess.Popen(
+        [sys.executable, "-m", "modelaudit.utils.sources._huggingface_download_worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=os.name != "nt",
+    )
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout=0)
+        stdout, _stderr = process.communicate(payload, timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_huggingface_download_process(process)
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}") from exc
+    except BaseException:
+        _terminate_huggingface_download_process(process)
+        raise
+
+    result_line = next(
+        (line for line in reversed(stdout.splitlines()) if line.startswith(_HF_DOWNLOAD_WORKER_RESULT_PREFIX)),
+        None,
+    )
+    if result_line is None:
+        raise RuntimeError(f"Hugging Face download worker failed for {repo_id}")
+
+    result = json.loads(result_line.removeprefix(_HF_DOWNLOAD_WORKER_RESULT_PREFIX))
+    if not result.get("ok"):
+        error_type = result.get("error_type", "Exception")
+        error_message = result.get("error", "download failed")
+        raise RuntimeError(f"{error_type}: {error_message}")
+
+    local_path = result.get("path")
+    if not isinstance(local_path, str):
+        raise RuntimeError(f"Hugging Face download worker returned an invalid path for {repo_id}")
+    return local_path
+
+
+def _terminate_huggingface_download_process(process: subprocess.Popen[str]) -> None:
+    """Stop a timed-out download worker without waiting indefinitely for cleanup."""
+    with suppress(ProcessLookupError):
+        process.terminate()
+    try:
+        process.communicate(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            process.kill()
+        process.communicate()
+
+
 def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str], str]:
     """Return repository filenames and the revision that produced the listing."""
     from huggingface_hub import HfApi
@@ -1332,7 +1415,13 @@ def download_model(
         else:
             _raise_no_scannable_hf_files(repo_id)
 
-        local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+        local_path = _run_huggingface_download_with_deadline(
+            "snapshot_download",
+            download_kwargs,
+            deadline,
+            repo_id,
+            direct_download=snapshot_download,
+        )
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
@@ -1495,10 +1584,22 @@ def download_model_streaming(
                 # Use specific cache dir for local placement
                 download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
                 download_kwargs["local_dir"] = str(download_path)
-                local_path = hf_hub_download(**download_kwargs)
+                local_path = _run_huggingface_download_with_deadline(
+                    "hf_hub_download",
+                    download_kwargs,
+                    deadline,
+                    repo_id,
+                    direct_download=hf_hub_download,
+                )
             else:
                 # Use HF default cache
-                local_path = hf_hub_download(**download_kwargs)
+                local_path = _run_huggingface_download_with_deadline(
+                    "hf_hub_download",
+                    download_kwargs,
+                    deadline,
+                    repo_id,
+                    direct_download=hf_hub_download,
+                )
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
