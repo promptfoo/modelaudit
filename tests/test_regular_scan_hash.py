@@ -4,7 +4,7 @@ import hashlib
 import os
 import pickle
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -410,11 +410,16 @@ class TestHashGenerationEdgeCases:
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
 
-        def unsorted_walk(top: str, followlinks: bool = False) -> Iterator[tuple[str, list[str], list[str]]]:
+        def unsorted_walk(
+            top: str,
+            topdown: bool = True,
+            onerror: Callable[[OSError], None] | None = None,
+            followlinks: bool = False,
+        ) -> Iterator[tuple[str, list[str], list[str]]]:
             if Path(top) == tmp_path:
                 yield str(tmp_path), [], ["third.pkl", "first.pkl", "second.pkl"]
                 return
-            yield from original_walk(top, followlinks=followlinks)
+            yield from original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
 
         def track_hash(path: str) -> str:
             hashed_paths.append(path)
