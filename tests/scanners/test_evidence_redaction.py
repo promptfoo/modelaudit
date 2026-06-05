@@ -365,6 +365,21 @@ def test_redacts_iteratively_encoded_query_keys_and_assignments() -> None:
     assert redacted.count("token=<redacted>") == 2
 
 
+def test_redacts_encoded_assignments_used_as_query_keys() -> None:
+    """Decoded assignment values must not be preserved as part of a query key."""
+    text = (
+        "first=https://example.test/?token%3DQUERYKEYSECRET123=1 "
+        "second=https://example.test/?Authorization%3A%20Bearer%20AUTHKEYSECRET456=1"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "QUERYKEYSECRET123" not in redacted
+    assert "AUTHKEYSECRET456" not in redacted
+    assert "?token=<redacted>" in redacted
+    assert "?authorization=<redacted>" in redacted
+
+
 def test_fails_closed_when_query_key_decoding_exceeds_budget() -> None:
     """Excessively encoded key names must not bypass sensitive-key handling."""
     encoded_key = "to%6ben"

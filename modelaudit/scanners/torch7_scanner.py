@@ -24,8 +24,7 @@ EXEC_PRIMITIVE_NAME_PATTERN = r"(?:os\.execute|io\.popen|loadstring|dofile|loadf
 EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)\b{EXEC_PRIMITIVE_NAME_PATTERN}\s*\(")
 EXECUTION_WRAPPER_PREFIX_PATTERN = r"(?:\(\s*)*(?:[a-z_][\w.]*\s*\(\s*(?:\(\s*)*){0,4}"
 EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
-    rf"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*"
-    rf"(?:\s*\[\s*['\"][^'\"]{{1,120}}['\"]\s*\])?\s*=\s*)"
+    rf"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*\s*=\s*)"
     rf"(?={EXECUTION_WRAPPER_PREFIX_PATTERN}{EXEC_PRIMITIVE_NAME_PATTERN}\s*\()"
 )
 NETWORK_OR_SHELL_PATTERN = re.compile(

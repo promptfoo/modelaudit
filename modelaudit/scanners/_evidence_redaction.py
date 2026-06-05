@@ -663,17 +663,16 @@ def _redacted_query_key(key: str) -> str | None:
     decoded, decoding_complete = _decode_query_component(key)
     if not decoding_complete:
         return "credential"
-    if _is_sensitive_detail_key(_normalize_query_key(decoded)):
-        return decoded
 
     assignment_match = NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
-    if assignment_match is None:
-        return None
-    assignment = decoded[assignment_match.start() :].lstrip("?&;")
-    if assignment.lower().startswith("amp;"):
-        assignment = assignment[4:]
-    candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
-    return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
+    if assignment_match is not None:
+        assignment = decoded[assignment_match.start() :].lstrip("?&;")
+        if assignment.lower().startswith("amp;"):
+            assignment = assignment[4:]
+        candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
+        return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
+
+    return decoded if _is_sensitive_detail_key(_normalize_query_key(decoded)) else None
 
 
 def _query_key_is_sensitive(key: str) -> bool:
