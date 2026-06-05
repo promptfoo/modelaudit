@@ -1202,6 +1202,29 @@ class TestDvcSecurity:
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in results.issues
         )
 
+    def test_hardlink_output_aliases_are_scanned_once_without_budget_error(self, tmp_path: Path) -> None:
+        """Hardlink aliases should not consume scan or budget twice."""
+        target = tmp_path / "model.pkl"
+        alias = tmp_path / "model-alias.pkl"
+        target.write_bytes(pickle.dumps({"payload": "x" * 30}))
+        try:
+            alias.hardlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"hardlink creation unavailable: {exc}")
+        dvc_file = tmp_path / "hardlink-alias.dvc"
+        dvc_file.write_text("outs:\n- path: model.pkl\n- path: model-alias.pkl\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+        results = scan_model_directory_or_file(str(dvc_file), max_total_size=target.stat().st_size)
+
+        assert resolution.resolved_paths == (str(target),)
+        assert results.files_scanned == 1
+        assert results.bytes_scanned == target.stat().st_size
+        assert results.success is True
+        assert not any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in results.issues
+        )
+
     @pytest.mark.parametrize(
         "outputs",
         [

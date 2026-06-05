@@ -27,6 +27,17 @@ class DvcResolution:
         return bool(self.unresolved_outputs or self.incomplete_reason)
 
 
+def _matches_resolved_artifact(target: Path, resolved_paths: list[str]) -> bool:
+    """Return whether target aliases an artifact already selected for scanning."""
+    for resolved_path in resolved_paths:
+        try:
+            if target.samefile(resolved_path):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _declared_output_metadata_gap(output: dict[Any, Any], target: Path) -> str | None:
     """Return a definite local coverage gap from DVC size/count lower bounds."""
     declared_size = output.get("size")
@@ -221,7 +232,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
 
             if target_exists:
                 target_str = str(target)
-                if target_str not in resolved_seen:
+                if target_str not in resolved_seen and not _matches_resolved_artifact(target, resolved):
                     resolved.append(target_str)
                     resolved_seen.add(target_str)
                 if metadata_gap := _declared_output_metadata_gap(out, target):
