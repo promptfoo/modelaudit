@@ -1732,6 +1732,47 @@ class TestNetworkCommDetector:
 
         assert url in json.dumps(findings, sort_keys=True)
 
+    def test_whitespace_delimited_sensitive_path_key_redacts_value_in_next_segment(self) -> None:
+        """An encoded-space key suffix must carry sensitivity across the next slash."""
+        secret = "SECRET123"
+        findings = NetworkCommDetector().scan(
+            f"https://evil.example/path%20api_key/{secret}/model.bin".encode(),
+            "hook.py",
+        )
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert secret not in serialized
+        assert "https://evil.example/path%20api_key/<redacted>/model.bin" in serialized
+
+    def test_whitespace_delimited_path_key_near_match_preserves_value(self) -> None:
+        """Encoded whitespace before a benign key suffix must not hide public path data."""
+        url = "https://evil.example/path%20api_key_hint/public/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert url in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize("key_segment", ["api_key=", "api_key%3D"])
+    def test_empty_sensitive_path_assignment_redacts_value_in_next_segment(self, key_segment: str) -> None:
+        """An empty path assignment must carry sensitivity across the next slash."""
+        secret = "SECRET123"
+        findings = NetworkCommDetector().scan(
+            f"https://evil.example/{key_segment}/{secret}/model.bin".encode(),
+            "hook.py",
+        )
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert secret not in serialized
+        assert "https://evil.example/<redacted>/<redacted>/model.bin" in serialized
+
+    def test_empty_path_assignment_near_match_preserves_value(self) -> None:
+        """An empty benign path assignment must not taint the following segment."""
+        url = "https://evil.example/algorithm=/public/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert url in json.dumps(findings, sort_keys=True)
+
     @pytest.mark.parametrize(
         "path",
         [
@@ -2456,6 +2497,43 @@ def test_network_finding_limit_preserves_colon_query_near_match() -> None:
     findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
 
     assert any(finding.get("ip") == ip for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("url", "finding_key", "secret"),
+    [
+        ("https://evil.example/path?api_key/45.33.32.156", "ip", "45.33.32.156"),
+        ("https://evil.example/path?api_key,secret.example.com", "domain", "secret.example.com"),
+    ],
+)
+def test_delimiter_only_query_credentials_do_not_reappear(
+    url: str,
+    finding_key: str,
+    secret: str,
+) -> None:
+    """Endpoint-shaped query credentials must remain absent from secondary findings."""
+    findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+    assert not any(finding.get(finding_key) == secret for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("url", "finding_key", "value"),
+    [
+        ("https://evil.example/path?algorithm/45.33.32.156", "ip", "45.33.32.156"),
+        ("https://evil.example/path?algorithm,public.example.com", "domain", "public.example.com"),
+    ],
+)
+def test_delimiter_only_query_near_matches_preserve_endpoint_findings(
+    url: str,
+    finding_key: str,
+    value: str,
+) -> None:
+    """Ordinary delimiter-separated query fields must keep endpoint signals."""
+    findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+    assert any(finding.get(finding_key) == value for finding in findings)
 
 
 def test_network_finding_limit_does_not_index_url_prefix_before_port(
