@@ -232,6 +232,9 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
 
 def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select the trusted route that owns content before an HDF5 user block."""
+    if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+        return "zip"
+
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
@@ -259,6 +262,16 @@ def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: st
         return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)
+
+
+def _select_hdf5_userblock_supplemental_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    """Preserve the non-HDF5 scanner that owns a user-block prefix or path."""
+    scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
+    if scanner_id is not None:
+        return scanner_id
+
+    path_scanner_id = _registry.get_scanner_id_for_content_routed_filename(path)
+    return path_scanner_id if path_scanner_id != "keras_h5" else None
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -336,6 +349,14 @@ def _preferred_scanner_can_handle(
     path: str,
 ) -> bool:
     """Honor trusted header routing even when scanner can_handle is suffix-gated."""
+    if scanner_id == "keras_h5" and find_hdf5_signature_offset(path) is not None:
+        logger.debug(
+            "Using %s scanner for validated HDF5 file %s",
+            scanner_class.name,
+            path,
+        )
+        return True
+
     if scanner_class.can_handle(path):
         return True
 
@@ -1932,7 +1953,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
-    if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+    if (
+        header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT
+    ) and find_hdf5_signature_offset(path) is None:
         sr = _scan_executable_zip_polyglot(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
@@ -1973,9 +1996,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
+    hdf5_signature_offset = find_hdf5_signature_offset(path) if scanner_id == "keras_h5" else None
     hdf5_userblock_supplemental_scanner_id = (
-        _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
-        if scanner_id == "keras_h5" and header_format != "hdf5"
+        _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext)
+        if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
         else None
     )
     pytorch_binary_supplemental_scanner_id = (

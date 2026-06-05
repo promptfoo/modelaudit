@@ -5,9 +5,11 @@ duplicate caching logic between core.py and scanners/base.py.
 """
 
 import functools
+import io
 import logging
 import os
 import time
+import zipfile
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -91,6 +93,14 @@ def _h5py_availability() -> bool:
     return HAS_H5PY
 
 
+def add_optional_dependency_availability_to_version_context(version_context: dict[str, Any]) -> dict[str, Any]:
+    """Key caches on optional dependencies that change scan coverage."""
+    return {
+        **version_context,
+        "optional_dependency_availability": {"h5py": _h5py_availability()},
+    }
+
+
 def _hdf5_h5py_availability(file_path: str) -> bool | None:
     """Return h5py availability for validated HDF5 files."""
     if find_hdf5_signature_offset(file_path) is None:
@@ -101,6 +111,50 @@ def _hdf5_h5py_availability(file_path: str) -> bool | None:
 def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
     """Bypass stale HDF5 cache entries when Keras H5 analysis is unavailable."""
     return _hdf5_h5py_availability(file_path) is False
+
+
+def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
+    """Bypass HDF5 caches when the owning scanner cannot currently open the file."""
+    is_hdf5 = find_hdf5_signature_offset(file_path) is not None
+    has_embedded_keras_hdf5 = _has_embedded_keras_hdf5_weights(file_path)
+    if not is_hdf5 and not has_embedded_keras_hdf5:
+        return False
+    if not _h5py_runtime_available():
+        return True
+
+    if not is_hdf5:
+        return False
+
+    try:
+        from ...scanners.keras_h5_scanner import KerasH5Scanner
+
+        return not KerasH5Scanner.can_handle(file_path)
+    except Exception:
+        return True
+
+
+def _h5py_runtime_available() -> bool:
+    """Return whether h5py can create and close an in-memory HDF5 file."""
+    if not _h5py_availability():
+        return False
+    try:
+        from ...scanners.keras_h5_scanner import h5py
+
+        with h5py.File(io.BytesIO(), "w"):
+            pass
+    except Exception:
+        return False
+    return True
+
+
+def _has_embedded_keras_hdf5_weights(file_path: str) -> bool:
+    """Return whether a Keras ZIP contains its standard HDF5 weights member."""
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            member_names = {name.replace("\\", "/").strip("/").lower() for name in archive.namelist()}
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return "config.json" in member_names and "model.weights.h5" in member_names
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
@@ -196,7 +250,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 return func(*args, **kwargs)
 
             # Check if file should be cached based on characteristics
-            h5py_available = _h5py_availability()
             try:
                 file_stat = os.stat(file_path)
                 file_ext = os.path.splitext(file_path)[1]
@@ -207,6 +260,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+                    logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
@@ -232,10 +289,9 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
-                version_context = {
-                    **cache_config.get_version_context(),
-                    "optional_dependency_availability": {"h5py": h5py_available},
-                }
+                version_context = add_optional_dependency_availability_to_version_context(
+                    cache_config.get_version_context()
+                )
 
                 def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""

@@ -22,7 +22,7 @@ from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
-from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_missing_h5py
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -534,7 +534,7 @@ def _write_synthetic_hdf5_v2_superblock(
         return value.to_bytes(offset_size, "little")
 
     root_group_address = min(128, file_size - 1)
-    superblock = b"".join(
+    superblock_without_checksum = b"".join(
         (
             HDF5_MAGIC,
             bytes((2, offset_size, length_size, status_flags)),
@@ -544,6 +544,7 @@ def _write_synthetic_hdf5_v2_superblock(
             encode_address(root_group_address),
         )
     )
+    superblock = superblock_without_checksum + hdf5_metadata_checksum(superblock_without_checksum).to_bytes(4, "little")
     path.write_bytes(superblock + bytes(file_size - len(superblock)))
 
 
@@ -584,11 +585,63 @@ def test_hdf5_signature_probe_accepts_supported_field_widths(tmp_path: Path, fie
     assert find_hdf5_signature_offset(str(model_path)) == 0
 
 
+def test_hdf5_metadata_checksum_matches_official_lookup3_vector() -> None:
+    assert hdf5_metadata_checksum(b"\x17") == 0xA209C931
+
+
 def test_hdf5_signature_probe_accepts_legacy_v1_32_byte_addresses(tmp_path: Path) -> None:
     model_path = tmp_path / "legacy_v1_32_byte_addresses.h5"
     _write_synthetic_hdf5_v1_superblock(model_path, field_width=32)
 
     assert find_hdf5_signature_offset(str(model_path)) == 0
+
+
+def test_hdf5_signature_probe_rejects_corrupt_v2_checksum(tmp_path: Path) -> None:
+    model_path = tmp_path / "corrupt_v2_checksum.h5"
+    _write_synthetic_hdf5_v2_superblock(model_path, offset_size=8, length_size=8)
+    payload = bytearray(model_path.read_bytes())
+    payload[44] ^= 0x01
+    model_path.write_bytes(payload)
+
+    assert find_hdf5_signature_offset(str(model_path)) is None
+
+
+def test_h5py_runtime_failure_bypasses_stale_clean_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_h5_file(tmp_path)
+    cache_dir = tmp_path / "runtime-h5py-failure-cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+
+    reset_cache_manager()
+    try:
+        clean_result = KerasH5Scanner(config=config).scan_with_cache(str(model_path))
+        assert clean_result.success is True
+        cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+        assert cache_manager.get_stats()["total_entries"] == 1
+
+        def fail_h5py_open(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("simulated h5py runtime failure")
+
+        monkeypatch.setattr(keras_h5_scanner_module.h5py, "File", fail_h5py_open)
+
+        failed_result = KerasH5Scanner(config=config).scan_with_cache(str(model_path))
+        assert failed_result.success is False
+        assert "keras_h5_scan_failed" in failed_result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "Keras H5 File Scan" for check in failed_result.checks)
+        assert cache_manager.get_stats()["total_entries"] == 1
+
+        audit_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert determine_exit_code(audit_result) == 2
+        assert "keras_h5_scan_failed" in audit_result.file_metadata[str(model_path)]["scan_outcome_reasons"]
+    finally:
+        reset_cache_manager()
 
 
 @pytest.mark.parametrize(
