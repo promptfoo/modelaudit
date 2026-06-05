@@ -471,6 +471,13 @@ struct DynamicTypeCallableAttribute {
     unknown_key_values_overflowed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveFrame {
+    position: usize,
+    payload_start: usize,
+    frame_len: usize,
+}
+
 enum MappingLookup<'a> {
     Found(&'a GlobalRef),
     Shadowed,
@@ -501,6 +508,7 @@ pub(crate) struct ScanState<'a> {
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
     stream_start_offset: usize,
+    active_frame: Option<ActiveFrame>,
     stream_opcode_count: usize,
     stream_proto_version: Option<i64>,
     expansion_state: ExpansionHeuristicState,
@@ -565,6 +573,7 @@ impl<'a> ScanState<'a> {
             bytes_scanned: 0,
             first_pickle_end_pos: None,
             stream_start_offset: position_offset,
+            active_frame: None,
             stream_opcode_count: 0,
             stream_proto_version: None,
             expansion_state: ExpansionHeuristicState::new(0),
@@ -609,6 +618,7 @@ impl<'a> ScanState<'a> {
             let mut parsed_opcode = false;
             let mut saw_stop = false;
             self.stream_start_offset = self.position_offset + stream_start;
+            self.active_frame = None;
             self.stream_opcode_count = 0;
             self.stream_proto_version = None;
 
@@ -6398,10 +6408,14 @@ impl<'a> ScanState<'a> {
         self.seen_notice_keys = self.notices.iter().map(Notice::dedupe_key).collect();
     }
 
+    fn rebuild_seen_finding_keys(&mut self) {
+        self.seen_finding_keys = self.findings.iter().map(Finding::dedupe_key).collect();
+    }
+
     fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         self.stream_opcode_count += 1;
+        self.record_frame_boundary_opcode(opcode, position);
         if opcode.name == "FRAME" {
-            self.record_oversized_frame_notice(opcode, position);
             return;
         }
         if opcode.name != "PROTO" {
@@ -6483,31 +6497,163 @@ impl<'a> ScanState<'a> {
             return;
         };
         let remaining_bytes = self.payload.len().saturating_sub(opcode.next);
-        let oversized_threshold = remaining_bytes.saturating_add(remaining_bytes / 2);
-        if *frame_len <= oversized_threshold {
+        if *frame_len <= remaining_bytes {
             return;
         }
+
+        let details = vec![
+            ("position".to_string(), DetailValue::UInt(position as u64)),
+            (
+                "stream_offset".to_string(),
+                DetailValue::UInt(self.stream_start_offset as u64),
+            ),
+            (
+                "frame_length".to_string(),
+                DetailValue::UInt(*frame_len as u64),
+            ),
+            (
+                "remaining_bytes".to_string(),
+                DetailValue::UInt(remaining_bytes as u64),
+            ),
+        ];
+
+        self.add_finding(Finding {
+            message: "Pickle FRAME length exceeds remaining stream bytes".to_string(),
+            severity: "warning",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            rule_code: Some("STRUCTURAL_TAMPER"),
+            details: {
+                let mut finding_details = vec![(
+                    "tamper_type".to_string(),
+                    DetailValue::String("oversized_frame".to_string()),
+                )];
+                finding_details.extend(details.clone());
+                finding_details
+            },
+            why: Some(
+                "A FRAME length that extends past the available pickle bytes indicates malformed or tampered serialization and can expose parser-differential behavior.",
+            ),
+        });
 
         self.add_notice(Notice {
             message: "Pickle FRAME declares more bytes than remain in the stream".to_string(),
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("oversized_frame"),
-            details: vec![
-                ("position".to_string(), DetailValue::UInt(position as u64)),
-                (
-                    "stream_offset".to_string(),
-                    DetailValue::UInt(self.stream_start_offset as u64),
-                ),
-                (
-                    "frame_length".to_string(),
-                    DetailValue::UInt(*frame_len as u64),
-                ),
-                (
-                    "remaining_bytes".to_string(),
-                    DetailValue::UInt(remaining_bytes as u64),
-                ),
-            ],
+            details,
+        });
+    }
+
+    fn record_frame_boundary_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
+        if let Some(active_frame) = self.active_frame {
+            let frame_end = active_frame
+                .payload_start
+                .saturating_add(active_frame.frame_len);
+            if opcode.pos >= frame_end {
+                self.active_frame = None;
+            } else if opcode.name == "STOP" || opcode.name == "FRAME" {
+                let boundary_end = if opcode.name == "STOP" {
+                    opcode.next
+                } else {
+                    opcode.pos
+                };
+                let remaining_bytes = boundary_end.saturating_sub(active_frame.payload_start);
+                if active_frame.frame_len > remaining_bytes {
+                    let boundary = if opcode.name == "STOP" {
+                        "stop"
+                    } else {
+                        "next_frame"
+                    };
+                    self.record_frame_boundary_overrun(active_frame, remaining_bytes, boundary);
+                }
+                self.active_frame = None;
+            }
+        }
+
+        if opcode.name != "FRAME" {
+            return;
+        }
+        self.record_oversized_frame_notice(opcode, position);
+        if let ArgValue::UInt(frame_len) = &opcode.arg {
+            self.active_frame = Some(ActiveFrame {
+                position,
+                payload_start: opcode.next,
+                frame_len: *frame_len,
+            });
+        }
+    }
+
+    fn record_frame_boundary_overrun(
+        &mut self,
+        active_frame: ActiveFrame,
+        remaining_bytes: usize,
+        boundary: &'static str,
+    ) {
+        let boundary_label = if boundary == "stop" {
+            "STOP opcode"
+        } else {
+            "next FRAME opcode"
+        };
+        let location = Some(format!("{} (pos {})", self.source, active_frame.position));
+        self.findings.retain(|finding| {
+            !(finding.rule_code == Some("STRUCTURAL_TAMPER")
+                && finding.message == "Pickle FRAME length exceeds remaining stream bytes"
+                && finding.location == location)
+        });
+        self.notices.retain(|notice| {
+            !(notice.code == Some("oversized_frame")
+                && notice.message == "Pickle FRAME declares more bytes than remain in the stream"
+                && notice.location == location)
+        });
+        self.rebuild_seen_finding_keys();
+        self.rebuild_seen_notice_keys();
+        let details = vec![
+            (
+                "position".to_string(),
+                DetailValue::UInt(active_frame.position as u64),
+            ),
+            (
+                "stream_offset".to_string(),
+                DetailValue::UInt(self.stream_start_offset as u64),
+            ),
+            (
+                "frame_length".to_string(),
+                DetailValue::UInt(active_frame.frame_len as u64),
+            ),
+            (
+                "remaining_bytes".to_string(),
+                DetailValue::UInt(remaining_bytes as u64),
+            ),
+            (
+                "overrun_boundary".to_string(),
+                DetailValue::String(boundary.to_string()),
+            ),
+        ];
+        self.add_finding(Finding {
+            message: format!("Pickle FRAME length crosses the {boundary_label}"),
+            severity: "warning",
+            location: location.clone(),
+            rule_code: Some("STRUCTURAL_TAMPER"),
+            details: {
+                let mut finding_details = vec![(
+                    "tamper_type".to_string(),
+                    DetailValue::String("oversized_frame".to_string()),
+                )];
+                finding_details.extend(details.clone());
+                finding_details
+            },
+            why: Some(
+                "A FRAME that extends across a logical pickle boundary can make runtimes prefetch bytes from a follow-on stream and indicates malformed or tampered serialization.",
+            ),
+        });
+        self.add_notice(Notice {
+            message: format!(
+                "Pickle FRAME declares more bytes than remain before the {boundary_label}"
+            ),
+            severity: "info",
+            location,
+            code: Some("oversized_frame"),
+            details,
         });
     }
 
@@ -6801,6 +6947,7 @@ impl<'a> ScanState<'a> {
         let tail_end = tail_start
             .saturating_add(self.options.post_budget_scan_bytes)
             .min(self.payload.len());
+        self.scan_post_budget_structural_opcodes(tail_start, tail_end);
         let tail_prefix_len = 0;
         let tail = &self.payload[tail_start..tail_end];
         self.bytes_scanned = self
@@ -6879,6 +7026,21 @@ impl<'a> ScanState<'a> {
         );
         if !expansion_findings.is_empty() {
             self.add_expansion_finding(&expansion_findings, true);
+        }
+    }
+
+    fn scan_post_budget_structural_opcodes(&mut self, read_offset: usize, scan_end: usize) {
+        let mut index = read_offset.min(scan_end);
+        while index < scan_end {
+            let Ok(opcode) = parse_opcode(self.payload, index, scan_end) else {
+                break;
+            };
+            let position = self.position_offset + opcode.pos;
+            self.record_frame_boundary_opcode(&opcode, position);
+            index = opcode.next;
+            if opcode.name == "STOP" {
+                break;
+            }
         }
     }
 
@@ -9707,7 +9869,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frame_lengths_emit_structural_notice() {
+    fn oversized_frame_lengths_emit_structural_tamper_finding() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: DEFAULT_MAX_OPCODES,
@@ -9736,7 +9898,171 @@ mod tests {
             .expect("oversized FRAME notice");
         assert_eq!(detail_usize(&notice.details, "position"), Some(2));
         assert_eq!(detail_usize(&notice.details, "remaining_bytes"), Some(2));
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(
+            detail_usize(&finding.details, "frame_length"),
+            Some(usize::MAX - 1)
+        );
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
+    }
+
+    #[test]
+    fn slightly_oversized_frame_lengths_emit_structural_tamper_finding() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
+        let mut scan = ScanState::new(
+            "slightly-oversized-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("slightly oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
+    }
+
+    #[test]
+    fn frame_crossing_stop_emits_structural_tamper_finding() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x95\x05\x00\x00\x00\x00\x00\x00\x00}.\x80\x04N.";
+        let mut scan = ScanState::new(
+            "frame-crossing-stop.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.rule_code == Some("STRUCTURAL_TAMPER")
+                    && detail_string(&finding.details, "overrun_boundary").as_deref()
+                        == Some("stop")
+            })
+            .expect("FRAME crossing STOP finding");
+        assert_eq!(detail_usize(&finding.details, "frame_length"), Some(5));
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
+    }
+
+    #[test]
+    fn frame_ending_before_stop_is_not_oversized() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x95\x01\x00\x00\x00\x00\x00\x00\x00}.";
+        let mut scan = ScanState::new(
+            "short-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(scan.findings.iter().all(|finding| {
+            detail_string(&finding.details, "tamper_type").as_deref() != Some("oversized_frame")
+        }));
+        assert!(scan
+            .notices
+            .iter()
+            .all(|notice| notice.code != Some("oversized_frame")));
+        assert_eq!(scan.status, ScanStatus::Complete);
         assert_eq!(scan.verdict, "clean");
+    }
+
+    #[test]
+    fn post_budget_tail_reports_oversized_frame_tamper() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
+        let mut scan = ScanState::new(
+            "post-budget-oversized-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("post-budget oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "suspicious");
     }
 
     #[test]
