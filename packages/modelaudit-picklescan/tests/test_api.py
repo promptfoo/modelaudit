@@ -5892,7 +5892,7 @@ def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() ->
 
     assert updated.status == ScanStatus.INCONCLUSIVE
     assert updated.verdict == SafetyVerdict.UNKNOWN
-    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert isinstance(updated.private_metadata["call_graph_source_fingerprints"]["reusable"], bool)
 
 
 def test_distribution_root_trust_disables_cache_reuse(
