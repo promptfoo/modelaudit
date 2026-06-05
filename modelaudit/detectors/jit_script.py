@@ -15,7 +15,7 @@ import json
 import re
 import textwrap
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
@@ -509,14 +509,27 @@ def _priority_import_offsets(
     start_offsets: list[int] | None = None,
 ) -> list[int]:
     lowered = bounded.lower()
-    if start_offsets is None:
-        return [match.start() for match in _PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(lowered)]
-    lowered_view = memoryview(lowered)
-    return [
-        offset
-        for offset in (start_offsets)
-        if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.match(lowered_view[offset:]) is not None
-    ]
+    allowed_offsets = set(start_offsets) if start_offsets is not None else None
+    offsets: list[int] = []
+    matches = iter(_PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(lowered))
+    match = next(matches, None)
+    line_start = 0
+    multiline_quote: bytes | None = None
+    for line in bounded.splitlines(keepends=True):
+        line_end = line_start + len(line)
+        while match is not None and match.start() < line_end:
+            offset = match.start()
+            if multiline_quote is None:
+                prefix = bounded[line_start:offset].rstrip(b" \t\r")
+                source_like_prefix = not prefix or not 0x20 <= prefix[-1] < 0x7F
+                if not source_like_prefix or (allowed_offsets is not None and offset not in allowed_offsets):
+                    match = next(matches, None)
+                    continue
+                offsets.append(offset)
+            match = next(matches, None)
+        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        line_start = line_end
+    return offsets
 
 
 def _span_contains_priority_offset(span: tuple[int, int], priority_offsets: list[int]) -> bool:
@@ -821,6 +834,8 @@ def _simple_priority_forwarding_usage(
         if not structural_line:
             line_start = line_end
             continue
+        if line[:1].isspace() or structural_line.endswith(b":"):
+            return None
         import_match = re.fullmatch(
             rb"import\s+(runpy|webbrowser|ctypes)(?:\s+as\s+([A-Za-z_]\w*))?",
             structural_line,
@@ -2314,6 +2329,14 @@ def _priority_alias_usage_lines(
         )
         if fast_forwarding is not None:
             fast_binding_name, fast_forwarded_dependency, fast_expression = fast_forwarding
+            fast_guard_value = _constant_late_binding_guard_value(
+                candidate,
+                line_start,
+                line,
+                enclosing_headers,
+                exception_type_aliases,
+            )
+            fast_is_scoped = _is_nested_late_state_statement(candidate, line_start, line, enclosing_headers)
             fast_has_evaluated_annotation = (
                 not deferred_annotations and re.match(rb"\s*[A-Za-z_]\w*\s*:", code_line) is not None
             )
@@ -2362,6 +2385,8 @@ def _priority_alias_usage_lines(
                 fast_target_is_new
                 and not fast_has_evaluated_annotation
                 and (fast_direct_runpy_member or fast_dependency_is_tracked)
+                and fast_guard_value is True
+                and not fast_is_scoped
             ):
                 fast_span = (line_start + code_start, line_end)
                 alias_dependency_names_cache[fast_span] = {fast_forwarded_dependency}
@@ -9797,6 +9822,156 @@ def _parsed_real_spans(
     return parsed_spans
 
 
+def _compact_snippet_mutates_module_print(tree: ast.Module) -> bool:
+    namespace_helper_aliases = {"globals", "locals"}
+    dict_descriptor_aliases = {"dict"}
+    module_mapping_aliases: set[str] = set()
+    module_mapping_update_aliases: set[str] = set()
+    module_mapping_setitem_aliases: set[str] = set()
+
+    def is_module_mapping(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id in module_mapping_aliases) or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in namespace_helper_aliases
+            and not node.args
+            and not node.keywords
+        )
+
+    def static_print_key(node: ast.AST) -> bool:
+        return _static_getattr_member_name(node) == "print"
+
+    def update_writes_print(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
+        if any(keyword.arg == "print" for keyword in keywords):
+            return True
+        return any(
+            isinstance(argument, ast.Dict) and any(key is not None and static_print_key(key) for key in argument.keys)
+            for argument in arguments
+        )
+
+    def call_writes_print(call: ast.Call) -> bool:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and is_module_mapping(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name):
+            if call.func.id in module_mapping_update_aliases:
+                method = "update"
+            elif call.func.id in module_mapping_setitem_aliases:
+                method = "__setitem__"
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in dict_descriptor_aliases
+            and call.args
+            and is_module_mapping(call.args[0])
+        ):
+            method = call.func.attr
+            arguments = call.args[1:]
+        if method == "update":
+            return update_writes_print(arguments, call.keywords)
+        return method in {"__setitem__", "setdefault"} and bool(arguments) and static_print_key(arguments[0])
+
+    def target_writes_print(target: ast.AST) -> bool:
+        return isinstance(target, ast.Subscript) and is_module_mapping(target.value) and static_print_key(target.slice)
+
+    def clear_alias(name: str) -> None:
+        namespace_helper_aliases.discard(name)
+        dict_descriptor_aliases.discard(name)
+        module_mapping_aliases.discard(name)
+        module_mapping_update_aliases.discard(name)
+        module_mapping_setitem_aliases.discard(name)
+
+    def bind_alias(name: str, value: ast.AST | None) -> None:
+        helper_reference = _simple_reference_name(value) if value is not None else None
+        mapping_value = value is not None and is_module_mapping(value)
+        update_value = isinstance(value, ast.Attribute) and value.attr == "update" and is_module_mapping(value.value)
+        setitem_value = (
+            isinstance(value, ast.Attribute)
+            and value.attr in {"__setitem__", "setdefault"}
+            and is_module_mapping(value.value)
+        )
+        clear_alias(name)
+        if helper_reference in namespace_helper_aliases:
+            namespace_helper_aliases.add(name)
+        elif helper_reference in dict_descriptor_aliases:
+            dict_descriptor_aliases.add(name)
+        elif mapping_value:
+            module_mapping_aliases.add(name)
+        elif update_value:
+            module_mapping_update_aliases.add(name)
+        elif setitem_value:
+            module_mapping_setitem_aliases.add(name)
+
+    def state_snapshot() -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+        return (
+            set(namespace_helper_aliases),
+            set(dict_descriptor_aliases),
+            set(module_mapping_aliases),
+            set(module_mapping_update_aliases),
+            set(module_mapping_setitem_aliases),
+        )
+
+    def restore_state(state: tuple[set[str], set[str], set[str], set[str], set[str]]) -> None:
+        for current, saved in zip(
+            (
+                namespace_helper_aliases,
+                dict_descriptor_aliases,
+                module_mapping_aliases,
+                module_mapping_update_aliases,
+                module_mapping_setitem_aliases,
+            ),
+            state,
+            strict=True,
+        ):
+            current.clear()
+            current.update(saved)
+
+    def scan_statements(statements: Sequence[ast.stmt]) -> bool:
+        for statement in statements:
+            targets: Sequence[ast.AST] = []
+            value: ast.AST | None = None
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+                value = statement.value
+            elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+                targets = [statement.target]
+                value = statement.value
+            if any(target_writes_print(target) for target in targets):
+                return True
+            for expression in _deterministically_evaluated_statement_expressions(statement):
+                if any(call_writes_print(call) for call in _deterministically_executed_expression_calls(expression)):
+                    return True
+            if isinstance(statement, ast.If) and _static_late_truth_value(statement.test) is None:
+                initial_state = state_snapshot()
+                branch_states: list[tuple[set[str], set[str], set[str], set[str], set[str]]] = []
+                for branch in (statement.body, statement.orelse):
+                    restore_state(initial_state)
+                    if scan_statements(_compact_deterministically_executed_statements(branch)):
+                        return True
+                    branch_states.append(state_snapshot())
+                restore_state(
+                    (
+                        set().union(*(state[0] for state in branch_states)),
+                        set().union(*(state[1] for state in branch_states)),
+                        set().union(*(state[2] for state in branch_states)),
+                        set().union(*(state[3] for state in branch_states)),
+                        set().union(*(state[4] for state in branch_states)),
+                    )
+                )
+                continue
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                bind_alias(targets[0].id, value)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                clear_alias(statement.name)
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    clear_alias(alias.asname or alias.name.split(".", maxsplit=1)[0])
+        return False
+
+    return scan_statements(_compact_deterministically_executed_statements(tree.body))
+
+
 def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = None) -> bool:
     if tree is None:
         try:
@@ -9810,6 +9985,8 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
         for alias in node.names
         if alias.name == "builtins"
     } | {"builtins"}
+    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_print(tree):
+        return True
     if "print" in _late_mutated_truthy_builtin_names(code_str.encode("utf-8"), builtins_aliases, set()):
         return True
     for node in ast.walk(tree):

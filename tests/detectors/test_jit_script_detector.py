@@ -1278,6 +1278,31 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_priority_import_offsets_ignore_non_executable_import_text(self) -> None:
+        source = (
+            b'value = "import os"\n'
+            b"# import runpy\n"
+            b'text = """\nimport subprocess\n"""\n'
+            b"if True:\n    import ctypes as c\n"
+            b"\x00\xffimport os as alias\n"
+        )
+
+        offsets = jit_script_module._priority_import_offsets(source)
+
+        assert offsets == [source.index(b"import ctypes"), source.index(b"import os as alias")]
+
+    def test_scan_model_ignores_priority_import_decoys_before_late_dangerous_import(self) -> None:
+        detector = JITScriptDetector()
+        import_decoys = b"# import os\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 2)
+        source = b"\x00\xff" + import_decoys + b"import os as alias\nalias.system('payload')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
+            for finding in findings
+        )
+
     def test_scan_model_detects_indented_priority_import_after_default_cap(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -2466,6 +2491,33 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
         has_dynamic_finding = any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+        assert has_dynamic_finding is expect_finding
+
+    @pytest.mark.parametrize(
+        ("guard", "expect_finding"),
+        [(b"False", False), (b"True", True), (b"enabled", True)],
+    )
+    def test_scan_model_honors_guarded_forwarded_runpy_alias_after_priority_window(
+        self,
+        guard: bytes,
+        expect_finding: bool,
+    ) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy\n"
+            + b"if "
+            + guard
+            + b":\n    runner = runpy.run_path\nrunner('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+        has_dynamic_finding = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
         )
 
         assert has_dynamic_finding is expect_finding
@@ -7073,6 +7125,56 @@ class TestJITScriptDetector:
         findings = detector.scan_model(data, "pytorch", "payload.py")
 
         assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "module_print_mutation",
+        [
+            b"globals()['print'] = eval\n",
+            b"globals().__setitem__('print', eval)\n",
+            b"globals().setdefault('print', eval)\n",
+            b"dict.__setitem__(globals(), 'print', eval)\n",
+            b"locals().__setitem__('print', eval)\n",
+            b"namespace = globals()\nnamespace['print'] = eval\n",
+            b"put = globals().__setitem__\nput('print', eval)\n",
+            b"update = globals().update\nupdate(print=eval)\n",
+            b"if enabled:\n    globals()['print'] = eval\n",
+        ],
+    )
+    def test_scan_model_keeps_runpy_call_after_module_print_mutation(
+        self,
+        module_print_mutation: bytes,
+    ) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\n" + module_print_mutation + b"rp.run_path = print\nrp.run_path('payload.py')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "module_print_mutation",
+        [
+            b"if False:\n    globals()['print'] = eval\n",
+            b"globals = lambda: {}\nglobals()['print'] = eval\n",
+            b"dict = lambda *args: None\ndict.__setitem__(globals(), 'print', eval)\n",
+        ],
+    )
+    def test_scan_model_keeps_safe_runpy_overwrite_when_module_print_mutation_is_inactive(
+        self,
+        module_print_mutation: bytes,
+    ) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\n" + module_print_mutation + b"rp.run_path = print\nrp.run_path('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
             for finding in findings
         )
