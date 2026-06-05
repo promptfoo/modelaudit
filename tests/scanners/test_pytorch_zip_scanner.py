@@ -1019,8 +1019,12 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
         archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
         raise AssertionError("_initialize_scan() should not open archive member payloads")
 
+    def fail_namelist(self: zipfile.ZipFile) -> list[str]:
+        raise AssertionError("_initialize_scan() should not materialize all archive member names")
+
     monkeypatch.setattr(zipfile.ZipFile, "read", fail_read)
     monkeypatch.setattr(zipfile.ZipFile, "open", fail_open)
+    monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
 
     scanner = PyTorchZipScanner()
     result = scanner._initialize_scan(str(zip_path))
@@ -1057,10 +1061,10 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     """Non-BadZipFile metadata failures are incomplete coverage, not findings."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
-    def fail_namelist(self: zipfile.ZipFile) -> list[str]:
+    def fail_infolist(self: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
         raise OSError("zip metadata unavailable")
 
-    monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
+    monkeypatch.setattr(zipfile.ZipFile, "infolist", fail_infolist)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -6404,13 +6408,43 @@ def test_pytorch_zip_scanner_entry_limit_passes(tmp_path: Path) -> None:
         data = pickle.dumps({"weights": [1, 2, 3]})
         zipf.writestr("data.pkl", data)
 
-    scanner = PyTorchZipScanner()
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 2})
     result = scanner.scan(str(zip_path))
 
-    # Should pass entry limit check - look for passed checks about entry count
-    entry_checks = [c for c in result.checks if "entry" in c.name.lower()]
-    assert len(entry_checks) > 0
-    assert all(c.status == CheckStatus.PASSED for c in entry_checks)
+    entry_checks = [check for check in result.checks if check.name == "Archive Entry Limit"]
+    assert len(entry_checks) == 1
+    assert entry_checks[0].status == CheckStatus.PASSED
+    assert entry_checks[0].details == {"entry_count": 2, "max_entries": 2}
+
+
+def test_pytorch_zip_extract_metadata_caps_listed_entries(tmp_path: Path) -> None:
+    zip_path = tmp_path / "metadata-entry-limit.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("entry_0.txt", "data")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    metadata = PyTorchZipScanner(config={"max_archive_entries": 2}).extract_metadata(str(zip_path))
+
+    assert metadata["total_files"] == 3
+    assert metadata["files"] == ["version", "entry_0.txt"]
+    assert metadata["listed_files"] == 2
+    assert metadata["max_archive_entries"] == 2
+    assert metadata["files_truncated"] is True
+    assert metadata["omitted_files"] == 1
+    assert metadata["metadata_analysis_incomplete"] is True
+    assert metadata["has_data_pkl"] is None
+    assert metadata["has_version"] is True
+
+    complete_metadata = PyTorchZipScanner(config={"max_archive_entries": 3}).extract_metadata(str(zip_path))
+
+    assert complete_metadata["files"] == ["version", "entry_0.txt", "data.pkl"]
+    assert complete_metadata["listed_files"] == 3
+    assert complete_metadata["files_truncated"] is False
+    assert complete_metadata["omitted_files"] == 0
+    assert complete_metadata["metadata_analysis_incomplete"] is False
+    assert complete_metadata["has_data_pkl"] is True
+    assert complete_metadata["has_version"] is True
 
 
 @pytest.mark.parametrize("invalid_limit", [0, -1, False, "10"])
@@ -7218,6 +7252,7 @@ def _assert_pytorch_zip_inconclusive_not_cached(
     *,
     expected_success: bool,
     expected_exit_code: int,
+    **scan_kwargs: Any,
 ) -> None:
     reset_cache_manager()
     try:
@@ -7226,12 +7261,14 @@ def _assert_pytorch_zip_inconclusive_not_cached(
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
         second = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
 
         for aggregate in (first, second):
@@ -7243,6 +7280,24 @@ def _assert_pytorch_zip_inconclusive_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_pytorch_zip_entry_limit_is_exit1_and_not_cached(tmp_path: Path) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "entry-limit.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zipf:
+        zipf.writestr("archive/entry_0.txt", "data")
+        zipf.writestr("archive/entry_1.txt", "data")
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        max_archive_entries = len(zipf.infolist()) - 1
+
+    _assert_pytorch_zip_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "entry-limit-cache",
+        "pytorch_zip_entry_limit",
+        expected_success=True,
+        expected_exit_code=1,
+        max_archive_entries=max_archive_entries,
+    )
 
 
 def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_path: Path) -> None:

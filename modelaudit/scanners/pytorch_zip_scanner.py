@@ -699,9 +699,11 @@ class PyTorchZipScanner(BaseScanner):
             )
 
         try:
-            # Force central directory parsing so malformed ZIPs fail fast here.
-            with zipfile.ZipFile(path, "r") as z:
-                z.namelist()
+            # Opening a ZIP in read mode parses the central directory. Avoid
+            # materializing a second full list of member names before the
+            # archive-entry processing cap is applied.
+            with zipfile.ZipFile(path, "r"):
+                pass
         except zipfile.BadZipFile:
             result.add_check(
                 name="PyTorch ZIP Format Validation",
@@ -3296,15 +3298,24 @@ class PyTorchZipScanner(BaseScanner):
 
         try:
             with zipfile.ZipFile(file_path, "r") as zip_file:
-                file_list = zip_file.namelist()
+                archive_entries = zip_file.infolist()
+                total_files = len(archive_entries)
+                entries_to_process = archive_entries[: self.max_archive_entries]
+                file_list = [entry.filename for entry in entries_to_process]
+                files_truncated = total_files > len(file_list)
 
                 # Analyze ZIP structure
                 metadata.update(
                     {
-                        "total_files": len(file_list),
+                        "total_files": total_files,
                         "files": file_list,
-                        "has_data_pkl": "data.pkl" in file_list,
-                        "has_version": "version" in file_list,
+                        "listed_files": len(file_list),
+                        "max_archive_entries": self.max_archive_entries,
+                        "files_truncated": files_truncated,
+                        "omitted_files": total_files - len(file_list),
+                        "metadata_analysis_incomplete": files_truncated,
+                        "has_data_pkl": True if "data.pkl" in file_list else None if files_truncated else False,
+                        "has_version": True if "version" in file_list else None if files_truncated else False,
                     }
                 )
 
