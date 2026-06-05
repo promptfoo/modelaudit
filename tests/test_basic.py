@@ -251,12 +251,18 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
     result1._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"first": "/tmp/src/first.py"},
+        "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/first.py": "1111"},
     }
     result2 = ScanResult(scanner_name="pickle")
     result2._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"second": "/tmp/src/second.py"},
+        "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/second.py": "2222"},
     }
 
@@ -267,6 +273,12 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
     assert result1.to_dict(include_private_metadata=True)["_private_metadata"]["call_graph_source_fingerprints"] == {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {
+            "first": "/tmp/src/first.py",
+            "second": "/tmp/src/second.py",
+        },
+        "loaded_module_sources": {},
         "fingerprints": {
             "/tmp/src/first.py": "1111",
             "/tmp/src/second.py": "2222",
@@ -280,12 +292,18 @@ def test_merge_scan_results_marks_conflicting_call_graph_source_fingerprints_unr
     result1._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"helper": "/tmp/src/helper.py"},
+        "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/helper.py": "1111"},
     }
     result2 = ScanResult(scanner_name="pickle")
     result2._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"helper": "/tmp/src/helper.py"},
+        "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/helper.py": "2222"},
     }
 
@@ -296,6 +314,36 @@ def test_merge_scan_results_marks_conflicting_call_graph_source_fingerprints_unr
     ]
     assert source_fingerprints["reusable"] is False
     assert source_fingerprints["fingerprints"]["/tmp/src/helper.py"] == "1111"
+
+
+def test_merge_scan_results_marks_conflicting_module_sources_unreusable() -> None:
+    result1 = ScanResult(scanner_name="pytorch_zip")
+    result1._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"helper": "/tmp/src/first.py"},
+        "loaded_module_sources": {"helper": "/tmp/src/first.py"},
+        "fingerprints": {"/tmp/src/first.py": "1111"},
+    }
+    result2 = ScanResult(scanner_name="pickle")
+    result2._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"helper": "/tmp/src/second.py"},
+        "loaded_module_sources": {"helper": "/tmp/src/second.py"},
+        "fingerprints": {"/tmp/src/second.py": "2222"},
+    }
+
+    result1.merge(result2)
+
+    source_fingerprints = result1.to_dict(include_private_metadata=True)["_private_metadata"][
+        "call_graph_source_fingerprints"
+    ]
+    assert source_fingerprints["reusable"] is False
+    assert source_fingerprints["module_sources"]["helper"] == "/tmp/src/first.py"
+    assert source_fingerprints["loaded_module_sources"]["helper"] == "/tmp/src/first.py"
 
 
 def test_blacklist_patterns(tmp_path):

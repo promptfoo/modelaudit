@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import hashlib
+import marshal
 import os
 import sys
 import sysconfig
@@ -29,6 +30,7 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from pathlib import Path
+from types import FunctionType
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
@@ -41,6 +43,10 @@ _MAX_IMPORT_REFERENCES = 32
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
 _MAX_SOURCE_BYTES = 1024 * 1024
+_MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
+_MAX_SOURCE_MODULE_NAME_CHARS = 4096
+_MAX_HOOK_IDENTITY_ITEMS = 16
+_MAX_HOOK_IDENTITY_DEPTH = 4
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
@@ -107,7 +113,10 @@ class _CallGraphAnalysisLimitError(RuntimeError):
 @dataclass
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
+    resolution_context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
     fingerprints: dict[str, bytes | None] = field(default_factory=dict)
+    module_sources: dict[str, str] = field(default_factory=dict)
+    loaded_module_sources: dict[str, str] = field(default_factory=dict)
     generation: int = 0
     reusable: bool = True
     lock: Any = field(default_factory=threading.RLock)
@@ -605,7 +614,10 @@ def shared_source_sensitive_caches() -> Iterator[None]:
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         _clear_source_sensitive_caches_now()
         snapshot_token = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.set(
-            _SharedSourceSnapshot(search_context=_source_search_context())
+            _SharedSourceSnapshot(
+                search_context=_source_search_context(),
+                resolution_context=_source_resolution_context(),
+            )
         )
         token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
         try:
@@ -929,6 +941,90 @@ def _source_search_context() -> tuple[str, ...]:
     return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in sys.path)
 
 
+def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
+    if value is None or isinstance(value, bool | int | float):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value[:256])
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if depth >= _MAX_HOOK_IDENTITY_DEPTH:
+        return f"<{type(value).__module__}.{type(value).__qualname__}>"
+    if isinstance(value, tuple | list):
+        sequence_identity = ",".join(
+            _bounded_hook_value_identity(item, depth + 1) for item in value[:_MAX_HOOK_IDENTITY_ITEMS]
+        )
+        return f"{type(value).__name__}({sequence_identity})"
+    if isinstance(value, dict):
+        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))[:_MAX_HOOK_IDENTITY_ITEMS]
+        return (
+            "dict("
+            + ",".join(
+                f"{_bounded_hook_value_identity(key, depth + 1)}:{_bounded_hook_value_identity(item, depth + 1)}"
+                for key, item in mapping_items
+            )
+            + ")"
+        )
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+
+
+def _hook_type_code(hook_type: type[object]) -> bytes:
+    code_parts: list[bytes] = []
+    for method_name in ("find_spec", "__call__"):
+        for candidate_type in hook_type.__mro__:
+            method = candidate_type.__dict__.get(method_name)
+            if isinstance(method, FunctionType):
+                code_parts.append(marshal.dumps(method.__code__))
+                break
+    return b"".join(code_parts)
+
+
+def _import_hook_identity(hook: object) -> str:
+    if isinstance(hook, FunctionType):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = marshal.dumps(hook.__code__)
+        closure_values: list[object] = []
+        for cell in hook.__closure__ or ():
+            try:
+                closure_values.append(cell.cell_contents)
+            except ValueError:
+                closure_values.append("<empty>")
+        state = _bounded_hook_value_identity(tuple(closure_values))
+    elif isinstance(hook, type):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = _hook_type_code(hook)
+        state = ""
+    else:
+        hook_type = type(hook)
+        module = hook_type.__module__
+        qualname = hook_type.__qualname__
+        code = _hook_type_code(hook_type)
+        try:
+            instance_state = object.__getattribute__(hook, "__dict__")
+        except (AttributeError, TypeError):
+            instance_state = {}
+        state = _bounded_hook_value_identity(instance_state)
+    digest = hashlib.sha256(code + state.encode()).hexdigest()
+    return f"{module}.{qualname}:{digest}"
+
+
+def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    nonstandard_importers = []
+    for entry in sys.path:
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if finder is None or isinstance(finder, (FileFinder, zipimporter)):
+            continue
+        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
+    return (
+        tuple(_import_hook_identity(finder) for finder in sys.meta_path),
+        tuple(_import_hook_identity(hook) for hook in sys.path_hooks),
+        tuple(nonstandard_importers),
+    )
+
+
 def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | None]:
     if not path.is_file():
         return True, None
@@ -944,17 +1040,30 @@ def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | None]:
 
 def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.search_context = _source_search_context()
+    snapshot.resolution_context = _source_resolution_context()
     snapshot.fingerprints.clear()
+    snapshot.module_sources.clear()
+    snapshot.loaded_module_sources.clear()
     snapshot.generation += 1
     snapshot.reusable = True
 
 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
-    if not snapshot.reusable or snapshot.search_context != _source_search_context():
+    if (
+        not snapshot.reusable
+        or snapshot.search_context != _source_search_context()
+        or snapshot.resolution_context != _source_resolution_context()
+    ):
         return False
     for path, expected_fingerprint in snapshot.fingerprints.items():
         reusable, fingerprint = _source_candidate_fingerprint(Path(path))
         if not reusable or fingerprint != expected_fingerprint:
+            return False
+    for module_name, expected_source in snapshot.module_sources.items():
+        if _current_module_source_path(module_name) != expected_source:
+            return False
+    for module_name, expected_source in snapshot.loaded_module_sources.items():
+        if _loaded_module_source_path(module_name) != expected_source:
             return False
     return True
 
@@ -993,11 +1102,25 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
             return {
                 "reusable": False,
                 "search_context": list(snapshot.search_context),
+                "resolution_context": {
+                    "meta_path": list(snapshot.resolution_context[0]),
+                    "path_hooks": list(snapshot.resolution_context[1]),
+                    "path_importers": list(snapshot.resolution_context[2]),
+                },
+                "module_sources": {},
+                "loaded_module_sources": {},
                 "fingerprints": {},
             }
         return {
             "reusable": True,
             "search_context": list(snapshot.search_context),
+            "resolution_context": {
+                "meta_path": list(snapshot.resolution_context[0]),
+                "path_hooks": list(snapshot.resolution_context[1]),
+                "path_importers": list(snapshot.resolution_context[2]),
+            },
+            "module_sources": dict(sorted(snapshot.module_sources.items())),
+            "loaded_module_sources": dict(sorted(snapshot.loaded_module_sources.items())),
             "fingerprints": {
                 path: fingerprint.hex() if fingerprint is not None else None
                 for path, fingerprint in sorted(snapshot.fingerprints.items())
@@ -1009,13 +1132,34 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:
         return
+    estimated_candidate_count = len(parts) * 2 * len(sys.path)
+    module_name_length = sum(len(part) for part in parts) + len(parts) - 1
+    if (
+        estimated_candidate_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        or module_name_length > _MAX_SOURCE_MODULE_NAME_CHARS
+    ):
+        with snapshot.lock:
+            snapshot.reusable = False
+        return
+
     candidates: set[Path] = set()
     for entry in sys.path:
         root = Path(entry or os.getcwd())
-        candidates.add(root.joinpath(*parts).with_suffix(".py").absolute())
-        candidates.add(root.joinpath(*parts, "__init__.py").absolute())
+        for prefix_length in range(1, len(parts) + 1):
+            prefix = parts[:prefix_length]
+            candidates.add(root.joinpath(*prefix).with_suffix(".py").absolute())
+            candidates.add(root.joinpath(*prefix, "__init__.py").absolute())
     with snapshot.lock:
-        if snapshot.search_context != _source_search_context():
+        if (
+            snapshot.search_context != _source_search_context()
+            or snapshot.resolution_context != _source_resolution_context()
+        ):
+            snapshot.reusable = False
+            return
+        if (
+            len(snapshot.fingerprints | {str(candidate): None for candidate in candidates})
+            > _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        ):
             snapshot.reusable = False
             return
         for candidate in candidates:
@@ -1026,7 +1170,7 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
             snapshot.fingerprints[str(candidate)] = fingerprint
 
 
-def _track_shared_source_path(path: Path) -> None:
+def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:
         return
@@ -1035,8 +1179,24 @@ def _track_shared_source_path(path: Path) -> None:
         if snapshot.search_context != _source_search_context():
             snapshot.reusable = False
             return
+        if snapshot.resolution_context != _source_resolution_context():
+            snapshot.reusable = False
+            return
         reusable, fingerprint = _source_candidate_fingerprint(candidate)
         if not reusable:
+            snapshot.reusable = False
+            return
+        existing_source = snapshot.module_sources.get(module_name)
+        if existing_source is not None and existing_source != str(candidate):
+            snapshot.reusable = False
+            return
+        snapshot.module_sources[module_name] = str(candidate)
+        if loaded:
+            snapshot.loaded_module_sources[module_name] = str(candidate)
+        if (
+            str(candidate) not in snapshot.fingerprints
+            and len(snapshot.fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
+        ):
             snapshot.reusable = False
             return
         snapshot.fingerprints[str(candidate)] = fingerprint
@@ -1100,6 +1260,8 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
 
 
 def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
+    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+        return None
     parts = module_name.split(".")
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
@@ -1118,6 +1280,33 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
             return None
         search_path = list(locations)
     return spec
+
+
+def _current_module_source_path(module_name: str) -> str | None:
+    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+        return None
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
+        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+            return str(Path(loaded_spec.origin).absolute())
+        if loaded_spec.origin not in {"built-in", "frozen"}:
+            return None
+
+    spec = _find_standard_filesystem_spec(module_name)
+    if spec is None or not isinstance(spec.origin, str) or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+        return None
+    return str(Path(spec.origin).absolute())
+
+
+def _loaded_module_source_path(module_name: str) -> str | None:
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if not isinstance(loaded_spec, ModuleSpec) or not isinstance(loaded_spec.origin, str):
+        return None
+    if not loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+        return None
+    return str(Path(loaded_spec.origin).absolute())
 
 
 def _matches_loaded_finder_type(finder: object, module_name: str, type_name: str) -> bool:
@@ -1162,7 +1351,10 @@ def _untrusted_meta_path_finder_precedes(target: object, module_name: str) -> bo
 
 
 def _is_standard_path_hook(hook: object) -> bool:
-    return hook is zipimporter or any(hook is trusted_hook for trusted_hook in _TRUSTED_PATH_HOOKS)
+    return hook is zipimporter or any(
+        hook is trusted_hook or _import_hook_identity(hook) == _import_hook_identity(trusted_hook)
+        for trusted_hook in _TRUSTED_PATH_HOOKS
+    )
 
 
 def _has_untrusted_path_hook() -> bool:
@@ -3625,6 +3817,12 @@ def _resolve_import_from_module(module_name: str, is_package: bool, level: int, 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=1024)
 def _resolve_module_source(module_name: str) -> Path | None:
+    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        if snapshot is not None:
+            with snapshot.lock:
+                snapshot.reusable = False
+        return None
     parts = module_name.split(".")
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
@@ -3635,7 +3833,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
         if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
             loaded_source_path = Path(loaded_spec.origin)
             if loaded_source_path.is_file():
-                _track_shared_source_path(loaded_source_path)
+                _track_shared_source_path(module_name, loaded_source_path, loaded=True)
                 return loaded_source_path
         if loaded_spec.origin not in {"built-in", "frozen"}:
             return None
@@ -3646,7 +3844,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
         source_path = Path(spec.origin)
         if source_path.is_file():
-            _track_shared_source_path(source_path)
+            _track_shared_source_path(module_name, source_path, loaded=False)
             return source_path
     return None
 

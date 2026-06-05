@@ -19,7 +19,14 @@ import tarfile
 import uuid
 import warnings
 import zipfile
-from importlib.machinery import ModuleSpec
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    SOURCE_SUFFIXES,
+    FileFinder,
+    ModuleSpec,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import cast
@@ -27,6 +34,7 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -1461,6 +1469,11 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
     assert source_fingerprints["reusable"] is True
     assert str(helper_path.absolute()) in source_fingerprints["fingerprints"]
     assert str(other_path.absolute()) in source_fingerprints["fingerprints"]
+    assert source_fingerprints["module_sources"] == {
+        "helper": str(helper_path.absolute()),
+        "other": str(other_path.absolute()),
+    }
+    assert source_fingerprints["loaded_module_sources"] == {}
 
 
 @pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
@@ -3775,6 +3788,9 @@ def test_with_call_graph_findings_records_source_fingerprint_metadata(
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
+    assert source_fingerprints["module_sources"] == {"safe_module": str(module_path.absolute())}
+    assert source_fingerprints["loaded_module_sources"] == {}
+    assert source_fingerprints["resolution_context"]["meta_path"]
 
 
 def test_with_call_graph_findings_fingerprints_loaded_source_outside_search_path(
@@ -3804,6 +3820,78 @@ def test_with_call_graph_findings_fingerprints_loaded_source_outside_search_path
     source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
+    assert source_fingerprints["module_sources"] == {"loaded_safe_module": str(module_path.absolute())}
+    assert source_fingerprints["loaded_module_sources"] == {"loaded_safe_module": str(module_path.absolute())}
+
+
+def test_with_call_graph_findings_fingerprints_parent_package_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_package = first_root / "fingerprint_pkg"
+    second_package = second_root / "fingerprint_pkg"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    (first_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    (second_package / "__init__.py").write_text("")
+    (second_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(second_root))
+    monkeypatch.syspath_prepend(str(first_root))
+
+    report = PickleReport(
+        source="parent-package-marker.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "fingerprint_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "fingerprint_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    initial = package_api._with_call_graph_findings(report)
+
+    assert initial.verdict == SafetyVerdict.CLEAN
+    source_fingerprints = initial.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["fingerprints"][str((first_package / "__init__.py").absolute())] is None
+
+    (first_package / "__init__.py").write_text("")
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+
+
+def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() -> None:
+    module_name = "m" * 4097
+    report = PickleReport(
+        source="oversized-module-name.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+
+
+def test_equivalent_file_finder_hooks_keep_standard_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+    equivalent_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+    different_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
+    monkeypatch.setattr(call_graph_module, "_TRUSTED_PATH_HOOKS", (trusted_hook,))
+
+    assert call_graph_module._is_standard_path_hook(equivalent_hook)
+    assert not call_graph_module._is_standard_path_hook(different_hook)
 
 
 def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.scan_results_cache import _source_resolution_context
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import ScanResult
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES, SafeTensorsScanner
@@ -133,6 +134,9 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
     fingerprint_metadata = {
         "reusable": True,
         "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+        "resolution_context": _source_resolution_context(),
+        "module_sources": {},
+        "loaded_module_sources": {},
         "fingerprints": {},
     }
 

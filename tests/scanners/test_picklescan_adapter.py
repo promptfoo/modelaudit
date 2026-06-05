@@ -118,6 +118,13 @@ def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_ser
             "call_graph_source_fingerprints": {
                 "reusable": True,
                 "search_context": ["/tmp/src"],
+                "resolution_context": {
+                    "meta_path": ["importlib.PathFinder"],
+                    "path_hooks": [],
+                    "path_importers": [],
+                },
+                "module_sources": {"helper": "/tmp/src/helper.py"},
+                "loaded_module_sources": {},
                 "fingerprints": {"/tmp/src/helper.py": "1111"},
             }
         },
@@ -130,6 +137,13 @@ def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_ser
     assert serialized["_private_metadata"]["call_graph_source_fingerprints"] == {
         "reusable": True,
         "search_context": ["/tmp/src"],
+        "resolution_context": {
+            "meta_path": ["importlib.PathFinder"],
+            "path_hooks": [],
+            "path_importers": [],
+        },
+        "module_sources": {"helper": "/tmp/src/helper.py"},
+        "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/helper.py": "1111"},
     }
     assert "call_graph_source_fingerprints" not in result.to_dict()["metadata"]
@@ -144,6 +158,13 @@ def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_ser
                     "call_graph_source_fingerprints": {
                         "reusable": True,
                         "search_context": ["/tmp/src"],
+                        "resolution_context": {
+                            "meta_path": ["importlib.PathFinder"],
+                            "path_hooks": [],
+                            "path_importers": [],
+                        },
+                        "module_sources": {"other": "/tmp/src/other.py"},
+                        "loaded_module_sources": {},
                         "fingerprints": {"/tmp/src/other.py": "2222"},
                     }
                 },

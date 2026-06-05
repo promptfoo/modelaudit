@@ -3,12 +3,16 @@
 import hashlib
 import json
 import logging
+import marshal
 import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from importlib.machinery import SOURCE_SUFFIXES, FileFinder, ModuleSpec
 from pathlib import Path
+from types import FunctionType
 from typing import Any
+from zipimport import zipimporter
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
@@ -18,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
+_MAX_SOURCE_MODULE_NAME_CHARS = 4096
+_MAX_HOOK_IDENTITY_ITEMS = 16
+_MAX_HOOK_IDENTITY_DEPTH = 4
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
 
@@ -25,6 +32,104 @@ _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdic
 def _is_sampled_fingerprint(value: object) -> bool:
     """Return whether a stored hash represents sampled, incomplete file content."""
     return isinstance(value, str) and value.startswith("fingerprint:")
+
+
+def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
+    if value is None or isinstance(value, bool | int | float):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value[:256])
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if depth >= _MAX_HOOK_IDENTITY_DEPTH:
+        return f"<{type(value).__module__}.{type(value).__qualname__}>"
+    if isinstance(value, tuple | list):
+        sequence_identity = ",".join(
+            _bounded_hook_value_identity(item, depth + 1) for item in value[:_MAX_HOOK_IDENTITY_ITEMS]
+        )
+        return f"{type(value).__name__}({sequence_identity})"
+    if isinstance(value, dict):
+        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))[:_MAX_HOOK_IDENTITY_ITEMS]
+        return (
+            "dict("
+            + ",".join(
+                f"{_bounded_hook_value_identity(key, depth + 1)}:{_bounded_hook_value_identity(item, depth + 1)}"
+                for key, item in mapping_items
+            )
+            + ")"
+        )
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+
+
+def _hook_type_code(hook_type: type[object]) -> bytes:
+    code_parts: list[bytes] = []
+    for method_name in ("find_spec", "__call__"):
+        for candidate_type in hook_type.__mro__:
+            method = candidate_type.__dict__.get(method_name)
+            if isinstance(method, FunctionType):
+                code_parts.append(marshal.dumps(method.__code__))
+                break
+    return b"".join(code_parts)
+
+
+def _import_hook_identity(hook: object) -> str:
+    if isinstance(hook, FunctionType):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = marshal.dumps(hook.__code__)
+        closure_values: list[object] = []
+        for cell in hook.__closure__ or ():
+            try:
+                closure_values.append(cell.cell_contents)
+            except ValueError:
+                closure_values.append("<empty>")
+        state = _bounded_hook_value_identity(tuple(closure_values))
+    elif isinstance(hook, type):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = _hook_type_code(hook)
+        state = ""
+    else:
+        hook_type = type(hook)
+        module = hook_type.__module__
+        qualname = hook_type.__qualname__
+        code = _hook_type_code(hook_type)
+        try:
+            instance_state = object.__getattribute__(hook, "__dict__")
+        except (AttributeError, TypeError):
+            instance_state = {}
+        state = _bounded_hook_value_identity(instance_state)
+    digest = hashlib.sha256(code + state.encode()).hexdigest()
+    return f"{module}.{qualname}:{digest}"
+
+
+def _source_resolution_context() -> dict[str, list[str]]:
+    nonstandard_importers = []
+    for entry in sys.path:
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if finder is None or isinstance(finder, (FileFinder, zipimporter)):
+            continue
+        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
+    return {
+        "meta_path": [_import_hook_identity(finder) for finder in sys.meta_path],
+        "path_hooks": [_import_hook_identity(hook) for hook in sys.path_hooks],
+        "path_importers": nonstandard_importers,
+    }
+
+
+def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
+    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+        return True, None
+
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
+        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+            return True, str(Path(loaded_spec.origin).absolute())
+        if loaded_spec.origin not in {"built-in", "frozen"}:
+            return True, None
+    return False, None
 
 
 @dataclass
@@ -601,6 +706,26 @@ class ScanResultsCache:
             return False
         if fingerprint_metadata.get("search_context") != self._source_search_context():
             return False
+        if fingerprint_metadata.get("resolution_context") != _source_resolution_context():
+            return False
+        module_sources = fingerprint_metadata.get("module_sources")
+        if not isinstance(module_sources, dict):
+            return False
+        for module_name, expected_source in module_sources.items():
+            if not isinstance(module_name, str) or not isinstance(expected_source, str):
+                return False
+            is_overridden, current_source = _loaded_module_source_override(module_name)
+            if is_overridden and current_source != expected_source:
+                return False
+        loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
+        if not isinstance(loaded_module_sources, dict):
+            return False
+        for module_name, expected_source in loaded_module_sources.items():
+            if not isinstance(module_name, str) or not isinstance(expected_source, str):
+                return False
+            is_overridden, current_source = _loaded_module_source_override(module_name)
+            if not is_overridden or current_source != expected_source:
+                return False
         fingerprints = fingerprint_metadata.get("fingerprints")
         if not isinstance(fingerprints, dict):
             return False

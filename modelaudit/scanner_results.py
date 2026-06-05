@@ -48,16 +48,47 @@ def _merge_call_graph_source_fingerprints_metadata(
             fingerprints[path] = _deep_mutable_copy(fingerprint)
     merged["fingerprints"] = fingerprints
 
+    existing_module_sources = existing.get("module_sources")
+    incoming_module_sources = incoming.get("module_sources")
+    module_sources = _deep_mutable_copy(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
+    module_source_conflict = False
+    if isinstance(incoming_module_sources, Mapping):
+        for module_name, source_path in incoming_module_sources.items():
+            if module_name in module_sources and module_sources[module_name] != source_path:
+                module_source_conflict = True
+                continue
+            module_sources[module_name] = _deep_mutable_copy(source_path)
+    merged["module_sources"] = module_sources
+
+    existing_loaded_sources = existing.get("loaded_module_sources")
+    incoming_loaded_sources = incoming.get("loaded_module_sources")
+    loaded_sources = _deep_mutable_copy(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
+    loaded_source_conflict = False
+    if isinstance(incoming_loaded_sources, Mapping):
+        for module_name, source_path in incoming_loaded_sources.items():
+            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
+                loaded_source_conflict = True
+                continue
+            loaded_sources[module_name] = _deep_mutable_copy(source_path)
+    merged["loaded_module_sources"] = loaded_sources
+
     existing_search_context = existing.get("search_context")
     incoming_search_context = incoming.get("search_context")
-    if existing_search_context != incoming_search_context:
+    existing_resolution_context = existing.get("resolution_context")
+    incoming_resolution_context = incoming.get("resolution_context")
+    if existing_search_context != incoming_search_context or existing_resolution_context != incoming_resolution_context:
         merged["reusable"] = False
     else:
         merged["reusable"] = (
-            existing.get("reusable") is True and incoming.get("reusable") is True and not fingerprint_conflict
+            existing.get("reusable") is True
+            and incoming.get("reusable") is True
+            and not fingerprint_conflict
+            and not module_source_conflict
+            and not loaded_source_conflict
         )
         merged["search_context"] = existing_search_context
-    if fingerprint_conflict:
+        merged["resolution_context"] = _deep_mutable_copy(existing_resolution_context)
+    if fingerprint_conflict or module_source_conflict or loaded_source_conflict:
         merged["reusable"] = False
 
     return merged

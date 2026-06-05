@@ -757,16 +757,53 @@ def _merge_call_graph_source_fingerprint_metadata(
             fingerprints[path] = fingerprint
     merged["fingerprints"] = fingerprints
 
+    existing_module_sources = existing.get("module_sources") if existing is not None else None
+    incoming_module_sources = incoming.get("module_sources")
+    module_sources = dict(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
+    module_source_conflict = False
+    if isinstance(incoming_module_sources, Mapping):
+        for module_name, source_path in incoming_module_sources.items():
+            if module_name in module_sources and module_sources[module_name] != source_path:
+                module_source_conflict = True
+                continue
+            module_sources[module_name] = source_path
+    merged["module_sources"] = module_sources
+
+    existing_loaded_sources = existing.get("loaded_module_sources") if existing is not None else None
+    incoming_loaded_sources = incoming.get("loaded_module_sources")
+    loaded_sources = dict(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
+    loaded_source_conflict = False
+    if isinstance(incoming_loaded_sources, Mapping):
+        for module_name, source_path in incoming_loaded_sources.items():
+            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
+                loaded_source_conflict = True
+                continue
+            loaded_sources[module_name] = source_path
+    merged["loaded_module_sources"] = loaded_sources
+
     existing_search_context = existing.get("search_context") if existing is not None else incoming.get("search_context")
     incoming_search_context = incoming.get("search_context")
-    if existing is not None and existing_search_context != incoming_search_context:
+    existing_resolution_context = (
+        existing.get("resolution_context") if existing is not None else incoming.get("resolution_context")
+    )
+    incoming_resolution_context = incoming.get("resolution_context")
+    context_conflict = existing is not None and (
+        existing_search_context != incoming_search_context or existing_resolution_context != incoming_resolution_context
+    )
+    if context_conflict:
         merged["reusable"] = False
     else:
         merged["search_context"] = incoming_search_context
-        merged["reusable"] = incoming.get("reusable") is True and not fingerprint_conflict
+        merged["resolution_context"] = incoming_resolution_context
+        merged["reusable"] = (
+            incoming.get("reusable") is True
+            and not fingerprint_conflict
+            and not module_source_conflict
+            and not loaded_source_conflict
+        )
         if existing is not None:
             merged["reusable"] = merged["reusable"] and existing.get("reusable") is True
-    if fingerprint_conflict:
+    if fingerprint_conflict or module_source_conflict or loaded_source_conflict:
         merged["reusable"] = False
     return merged
 
