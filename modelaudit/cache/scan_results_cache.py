@@ -694,13 +694,14 @@ class ScanResultsCache:
             if existing is not None:
                 return existing[0]
 
-            candidates = [self.cache_dir, Path(tempfile.gettempdir())]
+            candidates = [Path(tempfile.gettempdir())]
             ancestor = Path(os.path.abspath(file_path)).parent
             while True:
                 candidates.append(ancestor)
                 if ancestor.parent == ancestor:
                     break
                 ancestor = ancestor.parent
+            candidates.append(self.cache_dir)
 
             checked: set[Path] = set()
             for candidate in candidates:
@@ -749,7 +750,9 @@ class ScanResultsCache:
         if os.fstat(probe.fileno()).st_dev != file_stat.st_dev:
             raise ValueError(f"Cache identity probe is on a different filesystem: {file_path}")
 
-        captured_tokens = [file_change_token, *(entry[-1] for entry in ancestor_identity)]
+        captured_tokens = [file_change_token]
+        if os.name != "nt":
+            captured_tokens.extend(entry[-1] for entry in ancestor_identity)
         newest_captured_token = max(captured_tokens)
 
         deadline = time.monotonic() + _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS
