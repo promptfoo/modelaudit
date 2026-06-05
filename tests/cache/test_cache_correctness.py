@@ -82,14 +82,15 @@ def test_capture_file_identity_uses_target_filesystem_probe(
     cache._change_clock_probes.clear()
 
 
-def test_change_clock_probe_prefers_system_temp_over_cache_directory(tmp_path: Path) -> None:
+def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
 
     file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
 
     assert ancestor_identity
-    assert cache._change_clock_probes[file_stat.st_dev][1] == Path(tempfile.gettempdir())
+    expected_probe_dir = Path(tempfile.gettempdir()) if os.name == "nt" else cache.cache_dir
+    assert cache._change_clock_probes[file_stat.st_dev][1] == expected_probe_dir
 
 
 def test_windows_change_clock_probe_uses_existing_handle(

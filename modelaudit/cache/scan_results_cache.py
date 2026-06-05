@@ -694,14 +694,18 @@ class ScanResultsCache:
             if existing is not None:
                 return existing[0]
 
-            candidates = [Path(tempfile.gettempdir())]
+            if os.name == "nt":
+                candidates = [Path(tempfile.gettempdir())]
+            else:
+                candidates = [self.cache_dir, Path(tempfile.gettempdir())]
             ancestor = Path(os.path.abspath(file_path)).parent
             while True:
                 candidates.append(ancestor)
                 if ancestor.parent == ancestor:
                     break
                 ancestor = ancestor.parent
-            candidates.append(self.cache_dir)
+            if os.name == "nt":
+                candidates.append(self.cache_dir)
 
             checked: set[Path] = set()
             for candidate in candidates:
@@ -786,6 +790,7 @@ class ScanResultsCache:
         ancestor = Path(os.path.abspath(file_path)).parent
         identity: list[AncestorEntry] = []
         direct_parent = True
+        max_entries = None if sys.platform.startswith("linux") or sys.platform == "win32" else 2
         while True:
             ancestor_path = str(ancestor)
             if ancestor.is_symlink():
@@ -811,6 +816,8 @@ class ScanResultsCache:
                 )
             )
             if not parent_on_same_device:
+                break
+            if max_entries is not None and len(identity) >= max_entries:
                 break
             direct_parent = False
             ancestor = ancestor.parent
