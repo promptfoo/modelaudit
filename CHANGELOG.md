@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
+- detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
@@ -66,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound Jinja sandbox safety probes so render amplification fails closed instead of exhausting scanner resources
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact Flax/JAX MessagePack scanner samples, contexts, key paths, structured fields, metadata, and errors
 - redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
@@ -128,7 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
-- fail closed and cap downstream scanning and metadata listings when PyTorch ZIP archives exceed the configured entry limit, preserve parent structure attribution across nested limits, and retain deadline and prefixed-layout metadata handling
+- fail closed and cap downstream scanning, metadata listings, and version metadata probes for PyTorch ZIP archives, preserve parent structure attribution across nested entry limits, and retain deadline and prefixed-layout metadata handling
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - include supported non-PT artifacts linked from PyTorch Hub model pages while rejecting format-changing redirects and non-artifact responses
 - enforce `--max-size` while streaming PyTorch Hub model weights
