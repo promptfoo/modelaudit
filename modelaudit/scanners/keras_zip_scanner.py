@@ -217,6 +217,7 @@ class KerasZipScanner(BaseScanner):
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
         self._nested_layer_items_scanned = 0
+        self._torchmodule_version_status: bool | None = None
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -437,6 +438,7 @@ class KerasZipScanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._nested_layer_items_scanned = 0
+        self._torchmodule_version_status = None
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -617,7 +619,10 @@ class KerasZipScanner(BaseScanner):
         result.metadata["keras_metadata"] = redact_evidence_value(metadata)
         keras_version = metadata.get("keras_version")
         if isinstance(keras_version, str) and keras_version.strip():
-            result.metadata["keras_version"] = redact_evidence_string(keras_version.strip())
+            raw_keras_version = keras_version.strip()
+            # Classify before evidence truncation can alter a valid long local-version label.
+            self._torchmodule_version_status = self._is_vulnerable_keras_3_11_x(raw_keras_version)
+            result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
 
     def _check_archive_security_members(
         self,
@@ -1263,7 +1268,7 @@ class KerasZipScanner(BaseScanner):
         keras_version = result.metadata.get("keras_version")
         vulnerability_status: bool | None = None
         if isinstance(keras_version, str):
-            vulnerability_status = self._is_vulnerable_keras_3_11_x(keras_version)
+            vulnerability_status = self._torchmodule_version_status
 
         if vulnerability_status is True:
             result.add_check(

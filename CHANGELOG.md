@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - block weight distribution `torch.load` on PyTorch prerelease, dev, and unknown versions before deserialization while preserving final, local, and PEP 440 post-release patched builds
 - fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
-- treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable
+- treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings

@@ -3721,6 +3721,40 @@ class TestCVE202549655TorchModuleWrapper:
         assert "Keras >= 3.11.0 and < 3.11.3" in cve_issues[0].why
 
     @pytest.mark.parametrize(
+        ("keras_version", "expected_critical"),
+        [
+            ("3.11.2+" + ("a" * 256), True),
+            ("3.11.3+" + ("a" * 256), False),
+        ],
+    )
+    def test_long_local_version_classified_before_evidence_truncation(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+        expected_critical: bool,
+    ) -> None:
+        """Long valid local labels must not change public-version CVE attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        assert result.metadata["keras_version"].endswith("...")
+        cve_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("cve_id") == "CVE-2025-49655" and issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert bool(cve_issues) is expected_critical
+        if not expected_critical:
+            risk_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Version Risk Check"]
+            assert len(risk_checks) == 1
+            assert risk_checks[0].details["parse_status"] == "metadata_non_vulnerable"
+
+    @pytest.mark.parametrize(
         ("keras_version", "expected"),
         [
             ("3", False),
