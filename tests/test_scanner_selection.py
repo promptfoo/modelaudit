@@ -733,6 +733,28 @@ def test_remote_prefilters_preserve_selected_extensionless_content_routed_filena
     assert "" not in extensions
     assert ".md" in extensions
     assert filenames == frozenset({"readme", "model_card"})
+    files = [
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/model_card"},
+        {"path": "s3://bucket/LICENSE"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:
