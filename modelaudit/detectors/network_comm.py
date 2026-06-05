@@ -793,6 +793,41 @@ class NetworkCommDetector:
     # Domain patterns
     DOMAIN_PATTERN = re.compile(rb"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b")
 
+    NETCAT_OPTION_ARGUMENT = rb"[^\s\"']+"
+    NETCAT_OPTION_WITH_ARGUMENT = (
+        rb"(?:-(?:I|M|O|P|R|T|V|W|X|Z|c|e|i|m|p|q|s|w|x)|"
+        rb"--(?:append-output|delay|exec|hex-dump|idle-timeout|lua-exec|max-conns|max-rate|output|proxy|"
+        rb"proxy-auth|proxy-type|sh-exec|source|source-port|ssl-alpn|ssl-ciphers|ssl-servername|"
+        rb"ssl-trustfile|wait))"
+    )
+    NETCAT_OPTION_WITHOUT_ARGUMENT = (
+        rb"(?:-[46bCDdFhklNnStUuvz]+|--(?:allow|broker|chat|keep-open|listen|no-shutdown|recv-only|send-only|ssl))"
+    )
+    NETCAT_OPTION = (
+        rb"(?:"
+        + NETCAT_OPTION_WITH_ARGUMENT
+        + rb"(?:="
+        + NETCAT_OPTION_ARGUMENT
+        + rb"|[ \t]+"
+        + NETCAT_OPTION_ARGUMENT
+        + rb")|"
+        + NETCAT_OPTION_WITHOUT_ARGUMENT
+        + rb")"
+    )
+    NETCAT_COMMAND_PATTERN = re.compile(
+        rb"^[ \t]*(?:(?:[-*+>]|[0-9]{1,9}[.)])[ \t]+){0,8}"
+        rb"(?:`{1,3}[ \t]*)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])[ \t]*)?"
+        rb"(?P<command>(?:/(?:usr/)?bin/)?(?:nc|ncat|netcat)(?:\.exe)?)"
+        rb"(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}[ \t]+"
+        rb"(?P<destination>(?:"
+        + IPV4_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|"
+        + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|\[(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\]))"
+        rb"[ \t]+(?P<port>[0-9]{1,5})(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}(?=[ \t]*(?:$|[;&|<>#]))",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
     # Network library imports
     NETWORK_LIBRARIES: ClassVar[list[bytes]] = [
         b"socket",
@@ -999,6 +1034,7 @@ class NetworkCommDetector:
             (
                 self._check_blacklist,
                 self._scan_cc_patterns,
+                self._scan_network_commands,
                 self._scan_network_functions,
                 self._scan_network_libraries,
                 self._scan_suspicious_ports,
@@ -1009,6 +1045,7 @@ class NetworkCommDetector:
             )
             if self.max_findings is not None
             else (
+                self._scan_network_commands,
                 self._scan_urls,
                 self._scan_cloud_storage_urls,
                 self._scan_ip_addresses,
@@ -1051,6 +1088,34 @@ class NetworkCommDetector:
             return False
         self.findings.append(finding)
         return True
+
+    def _scan_network_commands(self, data: bytes, context: str) -> None:
+        """Scan for explicit network client commands with concrete destinations."""
+        for match in self.NETCAT_COMMAND_PATTERN.finditer(data):
+            port = int(match.group("port"))
+            if not 1 <= port <= 65535:
+                continue
+            command = match.group("command").decode("utf-8", errors="ignore")
+            destination = match.group("destination").decode("utf-8", errors="ignore")
+            if ":" in destination:
+                try:
+                    ipaddress.ip_address(destination.removeprefix("[").removesuffix("]"))
+                except ValueError:
+                    continue
+            if not self._record_finding(
+                {
+                    "type": "network_command",
+                    "severity": "HIGH",
+                    "confidence": 0.9,
+                    "message": f"Netcat network command detected: {destination}:{port}",
+                    "command": command,
+                    "destination": destination,
+                    "port": port,
+                    "position": match.start("destination"),
+                    "context": context,
+                }
+            ):
+                return
 
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""

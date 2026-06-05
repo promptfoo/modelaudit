@@ -212,6 +212,20 @@ DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
     + rb"(?:$|[A-Za-z][A-Za-z0-9+.-]*://)",
     re.IGNORECASE,
 )
+DOCUMENTATION_CERTUTIL_OPTION = rb"-[A-Za-z][A-Za-z0-9_-]*"
+DOCUMENTATION_CERTUTIL_DOWNLOAD_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + rb"certutil(?:\.exe)?"
+    + rb"(?:\s+"
+    + DOCUMENTATION_CERTUTIL_OPTION
+    + rb"){0,8}\s+-urlcache"
+    + rb"(?:\s+"
+    + DOCUMENTATION_CERTUTIL_OPTION
+    + rb"){0,8}\s+"
+    + rb"(?:[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})",
+    re.IGNORECASE,
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
@@ -685,21 +699,33 @@ class TextScanner(BaseScanner):
                 return True
         return False
 
+    @staticmethod
+    def _documentation_anchored_network_command_is_actionable(line: bytes) -> bool:
+        return any(
+            pattern.match(line) is not None
+            for pattern in (
+                DOCUMENTATION_SHELL_COMMAND_PATTERN,
+                DOCUMENTATION_COMMAND_ARRAY_PATTERN,
+                DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN,
+                DOCUMENTATION_DOCKER_ADD_PATTERN,
+                DOCUMENTATION_CERTUTIL_DOWNLOAD_PATTERN,
+            )
+        )
+
     @classmethod
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
+        if stripped.startswith(b"#") and cls._documentation_anchored_network_command_is_actionable(stripped):
+            return True
         if cls._documentation_shell_comment_before_position(line, position):
             return False
         if (
-            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            cls._documentation_anchored_network_command_is_actionable(stripped)
             or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
-            or DOCUMENTATION_COMMAND_ARRAY_PATTERN.match(stripped) is not None
-            or DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN.match(stripped) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
             or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
-            or DOCUMENTATION_DOCKER_ADD_PATTERN.match(stripped) is not None
             or DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is not None
             or cls._documentation_suspicious_label_is_actionable(prefix)
             or (
@@ -743,10 +769,12 @@ class TextScanner(BaseScanner):
             previous_line = payload[previous_line_start:previous_line_end].rstrip()
             if not previous_line.endswith(b"\\"):
                 return False
-            if cls._documentation_shell_comment_before_position(previous_line, len(previous_line)):
+            stripped = previous_line.lstrip()
+            if cls._documentation_shell_comment_before_position(previous_line, len(previous_line)) and not (
+                stripped.startswith(b"#") and cls._documentation_anchored_network_command_is_actionable(stripped)
+            ):
                 return False
 
-            stripped = previous_line.lstrip()
             if (
                 DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
                 or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(stripped) is not None
@@ -803,8 +831,6 @@ class TextScanner(BaseScanner):
         line_parts = cls._finding_line_parts(payload, finding)
         if line_parts is not None:
             line, line_position = line_parts
-            if cls._documentation_shell_comment_before_position(line, line_position):
-                return False
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
         if cls._documentation_previous_line_continues_command(payload, position):

