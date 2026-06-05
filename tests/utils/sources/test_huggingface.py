@@ -1285,12 +1285,14 @@ class TestModelDownload:
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None),
     )
+    @patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline", return_value=None)
     @patch("requests.get")
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_deadline_stops_content_probes(
         self,
         mock_snapshot_download: MagicMock,
         mock_requests_get: MagicMock,
+        _mock_get_model_size: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
         _mock_monotonic: MagicMock,
