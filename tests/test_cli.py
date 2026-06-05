@@ -623,7 +623,7 @@ def test_scan_json_output(tmp_path):
         pytest.fail("Output is not valid JSON")
 
 
-def test_scan_output_file(tmp_path):
+def test_scan_output_file(tmp_path: Path) -> None:
     """Test scanning with output to a file."""
     test_file = tmp_path / "test_file.dat"
     test_file.write_bytes(b"test content")
@@ -633,7 +633,8 @@ def test_scan_output_file(tmp_path):
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_file), "--output", str(output_file)])
 
-    # The file should be created regardless of the exit code
+    assert result.exit_code == 0, result.output
+    # Successful report generation must install a non-empty file.
     assert output_file.exists()
     assert output_file.read_text()  # Should not be empty
     assert f"Results written to {output_file}" in result.output
@@ -649,6 +650,7 @@ def test_scan_json_output_to_file(tmp_path):
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--output", str(output_file)])
 
+    assert result.exit_code == 0, result.output
     # The file should be created
     assert output_file.exists()
 

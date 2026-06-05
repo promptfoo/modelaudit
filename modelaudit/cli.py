@@ -415,7 +415,7 @@ def _replace_windows_output_file(output_path: str, temp_fd: int, parent_handle: 
 
     class FileRenameInfo(ctypes.Structure):
         _fields_ = [
-            ("flags", wintypes.DWORD),
+            ("replace_if_exists", wintypes.BOOLEAN),
             ("root_directory", wintypes.HANDLE),
             ("file_name_length", wintypes.DWORD),
             ("file_name", wintypes.WCHAR * 1),
@@ -423,10 +423,10 @@ def _replace_windows_output_file(output_path: str, temp_fd: int, parent_handle: 
 
     encoded_name = destination_name.encode("utf-16-le")
     file_name_offset = FileRenameInfo.file_name.offset
-    buffer_size = ctypes.sizeof(FileRenameInfo) + len(encoded_name)
+    buffer_size = file_name_offset + len(encoded_name) + ctypes.sizeof(wintypes.WCHAR)
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
-    rename_info.flags = 0x00000001
+    rename_info.replace_if_exists = True
     rename_info.root_directory = parent_handle
     rename_info.file_name_length = len(encoded_name)
     ctypes.memmove(ctypes.addressof(rename_buffer) + file_name_offset, encoded_name, len(encoded_name))
