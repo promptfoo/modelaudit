@@ -1,5 +1,10 @@
 """Tests for code validation utilities."""
 
+import tempfile
+from pathlib import Path
+
+import pytest
+
 from modelaudit.utils.helpers.code_validation import (
     extract_dangerous_constructs,
     is_code_potentially_dangerous,
@@ -62,6 +67,20 @@ class MyClass:
         is_valid, error = validate_python_syntax(complex_code)
         assert is_valid is True
         assert error is None
+
+    def test_removes_source_and_bytecode_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        marker = "LAMBDA_VALIDATION_SECRET_C032"
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+        is_valid, error = validate_python_syntax(f"secret = '{marker}'")
+
+        assert is_valid is True
+        assert error is None
+        assert list(tmp_path.rglob("*")) == []
 
 
 class TestExtractDangerousConstructs:

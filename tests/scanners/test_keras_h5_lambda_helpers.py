@@ -10,7 +10,7 @@ def _scan_lambda_config(config: dict[str, object]) -> ScanResult:
     scanner = KerasH5Scanner()
     scanner.current_file_path = "model.h5"
     result = ScanResult(scanner_name=scanner.name, scanner=scanner)
-    scanner._check_lambda_layer(config, result)
+    scanner._check_lambda_layer(config, result, "lambda_1")
     return result
 
 
@@ -63,7 +63,7 @@ def test_dict_format_mask_without_type_marker_is_scanned() -> None:
         check.name == "Lambda Layer Code Analysis"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "dict_mask.mask"
+        and check.details.get("layer_name") == "lambda_1.mask"
         for check in result.checks
     )
 

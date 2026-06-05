@@ -196,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
+- omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; clean up temporary Python compiler artifacts; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
