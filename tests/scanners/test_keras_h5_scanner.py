@@ -1405,6 +1405,8 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     list_secret = "H5_LIST_SECRET"
     invalid_secret = "H5_INVALID_SECRET"
     pycompile_secret = "H5_PYCOMPILE_SECRET"
+    lambda_class_secret = "UNLABELED_LAMBDA_CLASS_VALUE_7F3A9"
+    lambda_config_key_secret = "UNLABELED_LAMBDA_CONFIG_KEY_VALUE_7F3A9"
     top_level_layer_name_secret = "UNLABELED_TOP_LEVEL_LAYER_VALUE_7F3A9"
     layer_name_secret = "UNLABELED_CONFIG_LAYER_VALUE_7F3A9"
     dangerous_module_secret = "UNLABELED_DANGEROUS_MODULE_VALUE_7F3A9"
@@ -1434,10 +1436,11 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                 "name": "redacted_lambda_model",
                 "layers": [
                     {
-                        "class_name": "Lambda",
+                        "class_name": f"keras.{lambda_class_secret}.Lambda",
                         "name": top_level_layer_name_secret,
                         "config": {
                             "name": layer_name_secret,
+                            lambda_config_key_secret: {"payload": "eval"},
                             "function": (
                                 f"lambda *{variadic_identifier}: "
                                 f"(eval('1'), '{direct_secret}', {variadic_identifier})[-1]"
@@ -1494,6 +1497,8 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     )
 
     scanner_result = KerasH5Scanner().scan(str(model_path))
+    scanner_json = json.dumps(scanner_result.to_dict(), default=str)
+    assert scanner_result.metadata["layer_counts"]["Lambda"] == 7
     assert all("code_preview" not in check.details for check in scanner_result.checks)
     assert any(
         check.name == "Lambda Layer Code Analysis"
@@ -1546,6 +1551,8 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         list_secret,
         invalid_secret,
         pycompile_secret,
+        lambda_class_secret,
+        lambda_config_key_secret,
         top_level_layer_name_secret,
         layer_name_secret,
         dangerous_module_secret,
@@ -1554,6 +1561,7 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         safe_function_secret,
         variadic_identifier_secret,
     ):
+        assert secret not in scanner_json
         assert secret not in json_output
         assert secret not in sarif_output
 
@@ -1572,6 +1580,31 @@ def test_lambda_invalid_source_ignores_keyword_substrings_in_other_metadata(tmp_
                             "name": "evaluation_layer",
                             "description": "retrieval quality",
                             "function": "not valid python!",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(check.name == "Lambda Layer Suspicious Keywords Check" for check in result.checks)
+
+
+def test_lambda_invalid_source_does_not_casefold_builtin_names(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "invalid_lambda_uppercase_builtin_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "uppercase_builtin_lambda",
+                            "function": "lambda x: EVAL(x",
                         },
                     }
                 ],
@@ -1617,7 +1650,7 @@ def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_
         if check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "eval"
     ]
     assert len(suspicious_checks) == 1
-    assert suspicious_checks[0].details.get("context") == "Lambda.<mapping>.<mapping>"
+    assert suspicious_checks[0].details.get("context") == "Lambda"
     assert not any(check.name == "Custom Layer Class Detection" for check in scanner_result.checks)
 
     audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)

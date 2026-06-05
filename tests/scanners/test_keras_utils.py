@@ -7,6 +7,7 @@ import pytest
 
 from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import ScanResult
+from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.scanners.keras_utils import (
     check_lambda_list_function,
     check_subclassed_model,
@@ -14,6 +15,27 @@ from modelaudit.scanners.keras_utils import (
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
 )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [("math", "eval"), ("math", "EVAL"), ("numpy", "system")],
+)
+def test_h5_lambda_function_names_require_dangerous_module_context(module_name: str, function_name: str) -> None:
+    """A safe module must not become critical solely from an unresolved attribute name."""
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous(module_name, function_name) is False
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [(None, "eval"), ("", "open"), ("os", "identity"), ("subprocess", "run")],
+)
+def test_h5_lambda_unqualified_dangerous_functions_and_risky_modules_are_flagged(
+    module_name: str | None,
+    function_name: str,
+) -> None:
+    """Unqualified builtins and risky module roots must remain critical."""
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous(module_name, function_name) is True
 
 
 class _LowerCountingText(str):
