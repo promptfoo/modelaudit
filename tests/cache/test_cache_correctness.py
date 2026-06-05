@@ -140,6 +140,34 @@ def test_change_clock_probe_allows_coarse_filesystem_tick(
     assert clock["now"] >= 0.1
 
 
+def test_capture_file_identity_advances_clock_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    clock = {"value": 1}
+    file_token = {"value": 1}
+
+    def change_token(path: str, _file_stat: os.stat_result) -> int:
+        return file_token["value"] if path == str(file_path) else 1
+
+    def advance_probe(_probe: Any) -> int:
+        clock["value"] += 1
+        return clock["value"]
+
+    def mutate_during_hash(_path: str, _file_stat: os.stat_result) -> str:
+        file_token["value"] = clock["value"]
+        return "secure:simulated"
+
+    monkeypatch.setattr(cache, "_get_file_change_token", change_token)
+    monkeypatch.setattr(cache, "_touch_change_clock_probe", advance_probe)
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", mutate_during_hash)
+
+    with pytest.raises(ValueError, match="File changed while capturing cache identity"):
+        cache.capture_file_identity(str(file_path))
+
+
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -268,6 +296,75 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
 
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def test_cache_lookup_rejects_transient_clean_hash_for_malicious_final_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="lookup-race.dat")
+    clean_payload = b"clean:" + (b"x" * 2042)
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    file_path.write_bytes(clean_payload)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"verdict": "clean"}
+    original_stat = file_path.stat()
+
+    assert (
+        cache.store_result(
+            str(file_path),
+            expected,
+            version_context=version_context,
+            **_identity_kwargs(cache, str(file_path)),
+        )
+        is True
+    )
+
+    file_path.write_bytes(malicious_payload)
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    original_hash = cache.hasher.hash_file_with_stat
+    raced = False
+
+    def hash_transient_clean_bytes(path: str, file_stat: os.stat_result) -> str:
+        nonlocal raced
+        if raced:
+            return original_hash(path, file_stat)
+        raced = True
+        Path(path).write_bytes(clean_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        clean_hash = original_hash(path, Path(path).stat())
+        Path(path).write_bytes(malicious_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        return clean_hash
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_transient_clean_bytes)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+    assert file_path.read_bytes() == malicious_payload
+
+
+def test_cache_manager_reuses_lookup_identity_for_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    capture_calls = 0
+    original_capture = cache_manager.cache.capture_file_identity
+
+    def capture_once(path: str) -> Any:
+        nonlocal capture_calls
+        capture_calls += 1
+        return original_capture(path)
+
+    monkeypatch.setattr(cache_manager.cache, "capture_file_identity", capture_once)
+
+    result = cache_manager.cached_scan(str(file_path), lambda _path: {"success": True})
+
+    assert result["success"] is True
+    assert capture_calls == 1
 
 
 def test_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
@@ -1161,6 +1258,57 @@ def test_batch_lookup_returns_cached_entries(tmp_path: Path) -> None:
     cached_results = batch_ops.batch_lookup([str(file_path)], version_context=version_context)
 
     assert cached_results[str(file_path)] == expected
+
+
+def test_batch_lookup_rejects_transient_clean_hash_for_malicious_final_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="batch-lookup-race.dat")
+    clean_payload = b"clean:" + (b"x" * 2042)
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    file_path.write_bytes(clean_payload)
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    cache = cache_manager.cache
+    batch_ops = BatchCacheOperations(cache_manager)
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"verdict": "clean"}
+    original_stat = file_path.stat()
+
+    assert (
+        cache_manager.store_result(
+            str(file_path),
+            expected,
+            version_context=version_context,
+            **_identity_kwargs(cache, str(file_path)),
+        )
+        is True
+    )
+
+    file_path.write_bytes(malicious_payload)
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    original_hash = cache.hasher.hash_file_with_stat
+    raced = False
+
+    def hash_transient_clean_bytes(path: str, file_stat: os.stat_result) -> str:
+        nonlocal raced
+        if raced:
+            return original_hash(path, file_stat)
+        raced = True
+        Path(path).write_bytes(clean_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        clean_hash = original_hash(path, Path(path).stat())
+        Path(path).write_bytes(malicious_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        return clean_hash
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_transient_clean_bytes)
+
+    cached_results = batch_ops.batch_lookup([str(file_path)], version_context=version_context)
+
+    assert cached_results[str(file_path)] is None
+    assert file_path.read_bytes() == malicious_payload
 
 
 def test_batch_lookup_rejects_stale_cache_entries(tmp_path: Path) -> None:

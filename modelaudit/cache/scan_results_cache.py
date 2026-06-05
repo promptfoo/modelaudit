@@ -197,6 +197,7 @@ class AncestorIdentity(tuple[AncestorEntry, ...]):
 ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
 
 _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS = 2.1
+_MAX_IDENTITY_BARRIER_ATTEMPTS = 3
 
 
 def _is_sampled_fingerprint(value: object) -> bool:
@@ -258,14 +259,13 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
-        try:
-            file_stat = os.stat(file_path)
-        except OSError as e:
-            logger.debug(f"Cache lookup failed for {file_path}: {e}")
-            self._record_cache_miss("error")
-            return None
-
-        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
+        cached_result, file_identity = self.get_cached_result_with_identity(
+            file_path,
+            version_context=version_context,
+        )
+        if file_identity is not None:
+            self.release_ancestor_identity(file_identity[-1])
+        return cached_result
 
     def get_cached_result_with_stat(
         self,
@@ -284,36 +284,54 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
-        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
+        cached_result, file_identity = self.get_cached_result_with_identity(
+            file_path,
+            version_context=version_context,
+        )
+        if file_identity is not None:
+            self.release_ancestor_identity(file_identity[-1])
+        return cached_result
 
-    def _get_cached_result_with_known_stat(
+    def get_cached_result_with_identity(
         self,
         file_path: str,
-        file_stat: os.stat_result,
         version_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        """Load and validate a cache entry using a caller-provided stat result."""
+    ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
+        """Return a cache lookup plus the monitored identity reusable by a miss scan."""
         if self._path_has_symlink_component(file_path):
             logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
-            return None
+            return None, None
 
+        file_identity: ScannedFileIdentity | None = None
         try:
-            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
+            file_identity = self.capture_file_identity(file_path)
+            file_stat, file_hash, _change_token, _ancestor_identity = file_identity
+            cache_key, _content_hash = self._generate_cache_key_material(
+                file_path,
+                file_stat=file_stat,
+                version_context=version_context,
+                content_hash=file_hash,
+            )
             if not cache_key:
-                return None
+                return None, file_identity
 
             cache_file_path = self._get_cache_file_path(cache_key)
             if not cache_file_path.exists():
                 self._record_cache_miss("not_found")
-                return None
+                return None, file_identity
 
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
-            if not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat):
+            if not self._is_cache_entry_valid_with_stat(
+                cache_entry,
+                file_path,
+                file_stat,
+                verified_content_hash=file_hash,
+            ):
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
-                return None
+                return None, file_identity
 
             cache_entry["cache_metadata"]["access_count"] += 1
             cache_entry["cache_metadata"]["last_access"] = time.time()
@@ -321,14 +339,18 @@ class ScanResultsCache:
             with open(cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(cache_entry, f, indent=2)
 
+            if not self._file_identity_matches(file_path, file_identity):
+                self._record_cache_miss("changed")
+                return None, file_identity
+
             self._record_cache_hit()
             logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+            return cache_entry["scan_result"], file_identity
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
-            return None
+            return None, file_identity
 
     def get_cached_result_by_key(
         self,
@@ -346,13 +368,35 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found, None otherwise
         """
-        return self._get_cached_result_by_key(cache_key, file_path=file_path, file_stat=file_stat)
+        file_identity: ScannedFileIdentity | None = None
+        try:
+            if file_path is not None:
+                if self._path_has_symlink_component(file_path):
+                    logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
+                    return None
+                if not self._get_cache_file_path(cache_key).exists():
+                    self._record_cache_miss("not_found")
+                    return None
+                file_identity = self.capture_file_identity(file_path)
+                file_stat = file_identity[0]
+            return self._get_cached_result_by_key(
+                cache_key,
+                file_path=file_path,
+                file_stat=file_stat,
+                verified_content_hash=file_identity[1] if file_identity is not None else None,
+                expected_file_identity=file_identity,
+            )
+        finally:
+            if file_identity is not None:
+                self.release_ancestor_identity(file_identity[-1])
 
     def _get_cached_result_by_key(
         self,
         cache_key: str,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        verified_content_hash: str | None = None,
+        expected_file_identity: ScannedFileIdentity | None = None,
     ) -> dict[str, Any] | None:
         """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
         if file_path is not None and self._path_has_symlink_component(file_path):
@@ -378,7 +422,12 @@ class ScanResultsCache:
             if (
                 file_path is not None
                 and file_stat is not None
-                and not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat)
+                and not self._is_cache_entry_valid_with_stat(
+                    cache_entry,
+                    file_path,
+                    file_stat,
+                    verified_content_hash=verified_content_hash,
+                )
             ):
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
@@ -391,6 +440,14 @@ class ScanResultsCache:
             # Write back updated entry (async write would be better but adds complexity)
             with open(cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(cache_entry, f, indent=2)
+
+            if (
+                file_path is not None
+                and expected_file_identity is not None
+                and not self._file_identity_matches(file_path, expected_file_identity)
+            ):
+                self._record_cache_miss("changed")
+                return None
 
             self._record_cache_hit()
             logger.debug(f"Cache hit for key {cache_key[:8]}...")
@@ -569,12 +626,29 @@ class ScanResultsCache:
 
         preliminary_stat = os.stat(file_path)
         probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
+        preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
+        preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)
 
-        if self._path_has_symlink_component(file_path):
-            raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
-        initial_stat = os.stat(file_path)
-        initial_change_token = self._get_file_change_token(file_path, initial_stat)
-        initial_ancestor_identity = self._capture_ancestor_identity(file_path)
+        for _attempt in range(_MAX_IDENTITY_BARRIER_ATTEMPTS):
+            barrier_token = self._advance_change_clock(
+                file_path,
+                probe,
+                preliminary_change_token,
+                preliminary_ancestor_identity,
+            )
+            if self._path_has_symlink_component(file_path):
+                raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
+            initial_stat = os.stat(file_path)
+            initial_change_token = self._get_file_change_token(file_path, initial_stat)
+            initial_ancestor_identity = self._capture_ancestor_identity(file_path)
+            newest_initial_token = max([initial_change_token, *(entry[-1] for entry in initial_ancestor_identity)])
+            if newest_initial_token < barrier_token:
+                break
+            preliminary_change_token = initial_change_token
+            preliminary_ancestor_identity = initial_ancestor_identity
+        else:
+            raise ValueError(f"File kept changing while capturing cache identity: {file_path}")
+
         content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
         verified_stat = os.stat(file_path)
         verified_change_token = self._get_file_change_token(file_path, verified_stat)
@@ -594,7 +668,6 @@ class ScanResultsCache:
                 self._capture_ancestor_identity(file_path),
             ):
                 raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
-            self._advance_change_clock(file_path, probe, verified_change_token, verified_ancestor_identity)
             return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
         except Exception:
             self.release_ancestor_identity(monitored_ancestor_identity)
@@ -656,7 +729,7 @@ class ScanResultsCache:
         probe: BinaryIO,
         file_change_token: int,
         ancestor_identity: AncestorIdentity,
-    ) -> None:
+    ) -> int:
         """Advance the filesystem change clock past the captured identity or decline caching."""
         file_stat = os.stat(file_path)
         if os.fstat(probe.fileno()).st_dev != file_stat.st_dev:
@@ -669,7 +742,7 @@ class ScanResultsCache:
         while time.monotonic() < deadline:
             probe_token = self._touch_change_clock_probe(probe)
             if probe_token > newest_captured_token:
-                return
+                return probe_token
             time.sleep(0.001)
 
         raise ValueError(f"Filesystem change clock did not advance for cache identity: {file_path}")
@@ -744,6 +817,22 @@ class ScanResultsCache:
     @staticmethod
     def _ancestor_monitor_changed(identity: AncestorIdentity) -> bool:
         return identity.monitor is not None and identity.monitor.changed()
+
+    def _file_identity_matches(self, file_path: str, expected: ScannedFileIdentity) -> bool:
+        expected_stat, _expected_hash, expected_change_token, expected_ancestor_identity = expected
+        try:
+            current_stat = os.stat(file_path)
+            return (
+                self._stat_matches(current_stat, expected_stat)
+                and self._get_file_change_token(file_path, current_stat) == expected_change_token
+                and not self._ancestor_monitor_changed(expected_ancestor_identity)
+                and self._ancestor_identity_matches_for_store(
+                    expected_ancestor_identity,
+                    self._capture_ancestor_identity(file_path),
+                )
+            )
+        except (OSError, ValueError):
+            return False
 
     @staticmethod
     def release_ancestor_identity(identity: AncestorIdentity | None) -> None:
@@ -1050,7 +1139,11 @@ class ScanResultsCache:
         return self._is_cache_entry_valid_with_stat(cache_entry, file_path, current_stat)
 
     def _is_cache_entry_valid_with_stat(
-        self, cache_entry: dict[str, Any], file_path: str, file_stat: os.stat_result
+        self,
+        cache_entry: dict[str, Any],
+        file_path: str,
+        file_stat: os.stat_result,
+        verified_content_hash: str | None = None,
     ) -> bool:
         """
         Validate that cache entry is still valid with stat reuse.
@@ -1079,14 +1172,16 @@ class ScanResultsCache:
             if file_stat.st_size != cached_size:
                 return False
 
+            cached_hash = cache_entry["file_info"].get("hash")
+            if verified_content_hash is not None:
+                if cached_hash != verified_content_hash:
+                    return False
             # Metadata-only cache keys must still validate file contents, or an
             # in-place rewrite that restores size/mtime can hit stale entries.
-            if not self.key_generator._should_use_content_hash(file_stat.st_size):
-                cached_hash = cache_entry["file_info"].get("hash")
-                if cached_hash is not None:
-                    current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
-                    if current_hash != cached_hash:
-                        return False
+            elif not self.key_generator._should_use_content_hash(file_stat.st_size) and cached_hash is not None:
+                current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+                if current_hash != cached_hash:
+                    return False
 
             # Check entry isn't too old (30 days default)
             scanned_at = cache_entry["cache_metadata"]["scanned_at"]

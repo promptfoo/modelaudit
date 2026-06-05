@@ -8,7 +8,7 @@ from typing import Any
 
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_policy import cached_scan_result_dependencies_available, should_cache_scan_result
-from .scan_results_cache import AncestorIdentity, ScanResultsCache
+from .scan_results_cache import AncestorIdentity, ScannedFileIdentity, ScanResultsCache
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +50,15 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        cached_result = self.cache.get_cached_result(file_path, version_context=version_context)
-        if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
-            logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
-            return None
-        return cached_result
+        cached_result, file_identity = self.get_cached_result_with_identity(
+            file_path,
+            version_context=version_context,
+        )
+        try:
+            return cached_result
+        finally:
+            if file_identity is not None:
+                self.cache.release_ancestor_identity(file_identity[-1])
 
     def get_cached_result_with_stat(
         self,
@@ -75,15 +79,33 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        cached_result = self.cache.get_cached_result_with_stat(
+        cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
-            stat_result,
+            version_context=version_context,
+        )
+        try:
+            return cached_result
+        finally:
+            if file_identity is not None:
+                self.cache.release_ancestor_identity(file_identity[-1])
+
+    def get_cached_result_with_identity(
+        self,
+        file_path: str,
+        version_context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
+        """Return a cache lookup and retain the monitored identity for a miss scan."""
+        if not self.enabled or not self.cache:
+            return None, None
+
+        cached_result, file_identity = self.cache.get_cached_result_with_identity(
+            file_path,
             version_context=version_context,
         )
         if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
             logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
-            return None
-        return cached_result
+            return None, file_identity
+        return cached_result, file_identity
 
     def store_result(
         self,
@@ -145,40 +167,29 @@ class CacheManager:
         """
         # Try cache first
         start_time = time.time()
-        cached_result = self.get_cached_result(file_path, version_context=version_context)
-
-        if cached_result is not None:
-            cache_lookup_time = (time.time() - start_time) * 1000
-            logger.debug(f"Cache hit for {Path(file_path).name} (lookup: {cache_lookup_time:.1f}ms)")
-
-            # Add cache metadata to result
-            if isinstance(cached_result, dict):
-                cached_result["_cache_info"] = {"cache_hit": True, "lookup_time_ms": cache_lookup_time}
-
-            return cached_result
-
-        # Cache miss - validate file exists before scanning
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        logger.debug(f"Cache miss for {Path(file_path).name}, proceeding with scan")
-        scan_start = time.time()
-
+        pre_scan_identity: ScannedFileIdentity | None = None
         try:
-            pre_scan_stat: os.stat_result | None = None
-            pre_scan_hash: str | None = None
-            pre_scan_change_token: int | None = None
-            pre_scan_ancestor_identity: AncestorIdentity | None = None
-            try:
-                if self.cache is not None:
-                    (
-                        pre_scan_stat,
-                        pre_scan_hash,
-                        pre_scan_change_token,
-                        pre_scan_ancestor_identity,
-                    ) = self.cache.capture_file_identity(file_path)
-            except Exception as e:
-                logger.debug("Bypassing cache store for %s: pre-scan hashing failed: %s", file_path, e)
+            cached_result, pre_scan_identity = self.get_cached_result_with_identity(
+                file_path,
+                version_context=version_context,
+            )
+
+            if cached_result is not None:
+                cache_lookup_time = (time.time() - start_time) * 1000
+                logger.debug(f"Cache hit for {Path(file_path).name} (lookup: {cache_lookup_time:.1f}ms)")
+
+                # Add cache metadata to result
+                if isinstance(cached_result, dict):
+                    cached_result["_cache_info"] = {"cache_hit": True, "lookup_time_ms": cache_lookup_time}
+
+                return cached_result
+
+            # Cache miss - validate file exists before scanning
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            logger.debug(f"Cache miss for {Path(file_path).name}, proceeding with scan")
+            scan_start = time.time()
             scan_result = scanner_func(file_path, *args, **kwargs)
             scan_duration = (time.time() - scan_start) * 1000
 
@@ -187,13 +198,8 @@ class CacheManager:
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
             cacheable_result = should_cache_scan_result(scan_result)
-            if (
-                cacheable_result
-                and pre_scan_stat is not None
-                and pre_scan_hash is not None
-                and pre_scan_change_token is not None
-                and pre_scan_ancestor_identity is not None
-            ):
+            if cacheable_result and pre_scan_identity is not None:
+                pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = pre_scan_identity
                 self.store_result(
                     file_path,
                     scan_result,
@@ -213,8 +219,8 @@ class CacheManager:
             logger.error(f"Scan failed for {file_path}: {e}")
             raise
         finally:
-            if self.cache is not None:
-                self.cache.release_ancestor_identity(pre_scan_ancestor_identity)
+            if self.cache is not None and pre_scan_identity is not None:
+                self.cache.release_ancestor_identity(pre_scan_identity[-1])
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""

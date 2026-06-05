@@ -235,31 +235,26 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 # Use optimized cache lookup with stat reuse
                 logger.debug(f"Attempting cached scan for {file_path}")
 
-                # Try cache first with optimized lookup
-                cached_result = cache_manager.get_cached_result_with_stat(
-                    file_path,
-                    file_stat,
-                    version_context=version_context,
-                )
+                pre_scan_identity = None
+                try:
+                    cached_result, pre_scan_identity = cache_manager.get_cached_result_with_identity(
+                        file_path,
+                        version_context=version_context,
+                    )
 
-                if cached_result is not None:
-                    logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-                    result_dict = cached_result
-                else:
-                    # Cache miss - perform scan
-                    logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
-                    scan_start = time.perf_counter()
-                    try:
-                        (
-                            pre_scan_stat,
-                            pre_scan_hash,
-                            pre_scan_change_token,
-                            pre_scan_ancestor_identity,
-                        ) = cache_manager.cache.capture_file_identity(file_path)
-                    except Exception as e:
-                        logger.debug(f"Bypassing cache store for {file_path}: pre-scan hashing failed: {e}")
-                        return func(*args, **kwargs)
-                    try:
+                    if cached_result is not None:
+                        logger.debug(f"Cache hit for {os.path.basename(file_path)}")
+                        result_dict = cached_result
+                    else:
+                        # Cache miss - perform scan
+                        logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
+                        if pre_scan_identity is None:
+                            logger.debug(f"Bypassing cache store for {file_path}: stable identity unavailable")
+                            return func(*args, **kwargs)
+                        pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = (
+                            pre_scan_identity
+                        )
+                        scan_start = time.perf_counter()
                         result_dict = cached_func_wrapper(file_path)
                         if not isinstance(result_dict, dict):
                             logger.debug(
@@ -282,8 +277,9 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                             logger.debug(
                                 f"Skipping cache store for operational result from {os.path.basename(file_path)}"
                             )
-                    finally:
-                        cache_manager.cache.release_ancestor_identity(pre_scan_ancestor_identity)
+                finally:
+                    if pre_scan_identity is not None:
+                        cache_manager.cache.release_ancestor_identity(pre_scan_identity[-1])
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:
