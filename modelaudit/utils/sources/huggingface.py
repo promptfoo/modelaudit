@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
@@ -82,6 +82,11 @@ class _HuggingFaceProbeBudget:
         if remaining <= 0:
             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
         return min(30.0, remaining)
+
+    def check_deadline(self, repo_id: str) -> None:
+        """Fail when the end-to-end acquisition deadline has expired."""
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
     def record_file_size(self, repo_id: str, filename: str, file_size: int) -> None:
         """Record immutable remote size evidence and reject inconsistent responses."""
@@ -186,6 +191,7 @@ def _read_huggingface_prefix(
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=max_bytes):
+                budget.check_deadline(repo_id)
                 if not chunk:
                     continue
                 chunks.append(chunk)
@@ -813,18 +819,109 @@ def _get_default_hf_streaming_filenames() -> set[str]:
     return filenames
 
 
+def _get_hf_content_route_formats() -> set[str]:
+    """Return every format the bounded Hugging Face content probe may emit."""
+    from modelaudit.utils.file.detection import (
+        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    )
+
+    from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
+
+    content_route_formats = set(EXTENSION_FORMAT_MAP.values())
+    content_route_formats.update(
+        {
+            EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+            LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+            TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+            "coreml",
+            "flax_msgpack",
+            "jax_checkpoint",
+            "mxnet",
+            "onnx",
+            "openvino",
+            "pmml",
+            "tf_metagraph",
+            "tf_savedmodel",
+            "xgboost",
+        }
+    )
+    return content_route_formats
+
+
+def _get_selected_hf_content_route_formats(
+    scannable_extensions: Collection[str] | None,
+    scannable_filenames: Collection[str] | None,
+) -> set[str] | None:
+    """Infer content formats when callers do not provide exact scanner policy."""
+    if scannable_extensions is None and scannable_filenames is None:
+        return None
+
+    from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
+
+    content_route_formats = _get_hf_content_route_formats()
+    selected_extensions = (
+        set() if scannable_extensions is None else {str(extension).lower() for extension in scannable_extensions}
+    )
+    selected_filenames = (
+        set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
+    )
+    selected_formats: set[str] = set()
+    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        scanner_extensions = {
+            str(extension).lower()
+            for key in ("extensions", "content_routed_extensions", "scanner_only_extensions")
+            for extension in scanner_info.get(key, [])
+            if str(extension).lower() not in remote_excluded_extensions
+        }
+        scanner_filenames = {str(filename).lower() for filename in scanner_info.get("content_routed_filenames", [])}
+        matched_extensions = scanner_extensions.intersection(selected_extensions)
+        if not matched_extensions and not scanner_filenames.intersection(selected_filenames):
+            continue
+
+        if scanner_id in content_route_formats:
+            selected_formats.add(scanner_id)
+        selected_formats.update(
+            format_name
+            for value in scanner_info.get("header_formats", [])
+            if (format_name := str(value).lower()) in content_route_formats
+        )
+        selected_formats.update(
+            mapped_format
+            for extension in matched_extensions
+            if (mapped_format := EXTENSION_FORMAT_MAP.get(extension)) is not None
+        )
+    return selected_formats
+
+
 def _select_streamable_hf_files(
     repo_id: str,
     repo_files: list[str],
     revision: str,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
+    scannable_formats: Collection[str] | None = None,
     *,
     include_all_files: bool = False,
     deadline: float | None = None,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
-    sniff_renamed_files = scannable_extensions is None and not include_all_files
+    selected_route_formats: set[str] | None
+    if scannable_formats is not None:
+        selected_route_formats = {str(format_name).lower() for format_name in scannable_formats}.intersection(
+            _get_hf_content_route_formats()
+        )
+    elif scannable_filenames:
+        selected_route_formats = set()
+    else:
+        selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
+    sniff_renamed_files = not include_all_files and (selected_route_formats is None or bool(selected_route_formats))
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -894,7 +991,10 @@ def _select_streamable_hf_files(
                     f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
                 )
             inspected_files += 1
-            if _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget) is None:
+            detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
+            if detected_format is None or (
+                selected_route_formats is not None and detected_format not in selected_route_formats
+            ):
                 continue
             model_files.append(file_name)
             selected_files.add(file_name)
@@ -992,35 +1092,18 @@ def _list_repo_files_with_timeout(
     return files, revision, None
 
 
-def _run_huggingface_download_with_deadline(
+def _run_huggingface_worker_with_deadline(
     operation: str,
-    download_kwargs: dict[str, Any],
-    deadline: float | None,
+    operation_kwargs: dict[str, Any],
+    deadline: float,
     repo_id: str,
-    *,
-    direct_download: Callable[..., Any] | None = None,
-) -> str:
-    """Run an SDK download directly or in a terminable subprocess when bounded."""
-    if operation not in {"snapshot_download", "hf_hub_download"}:
-        raise ValueError(f"Unsupported Hugging Face download operation: {operation}")
-
-    if deadline is None:
-        if direct_download is None:
-            if operation == "snapshot_download":
-                from huggingface_hub import snapshot_download
-
-                direct_download = snapshot_download
-            else:
-                from huggingface_hub import hf_hub_download
-
-                direct_download = hf_hub_download
-        return str(direct_download(**download_kwargs))
-
+) -> dict[str, Any]:
+    """Run one serializable Hugging Face operation in a terminable subprocess."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-    payload = json.dumps({"operation": operation, "download_kwargs": download_kwargs})
+    payload = json.dumps({"operation": operation, "operation_kwargs": operation_kwargs})
     process = subprocess.Popen(
         [sys.executable, "-m", "modelaudit.utils.sources._huggingface_download_worker"],
         stdin=subprocess.PIPE,
@@ -1047,11 +1130,43 @@ def _run_huggingface_download_with_deadline(
     if result_line is None:
         raise RuntimeError(f"Hugging Face download worker failed for {repo_id}")
 
-    result = json.loads(result_line.removeprefix(_HF_DOWNLOAD_WORKER_RESULT_PREFIX))
+    raw_result: object = json.loads(result_line.removeprefix(_HF_DOWNLOAD_WORKER_RESULT_PREFIX))
+    if not isinstance(raw_result, dict):
+        raise RuntimeError(f"Hugging Face download worker returned an invalid result for {repo_id}")
+    result = cast(dict[str, Any], raw_result)
     if not result.get("ok"):
         error_type = result.get("error_type", "Exception")
         error_message = result.get("error", "download failed")
         raise RuntimeError(f"{error_type}: {error_message}")
+
+    return result
+
+
+def _run_huggingface_download_with_deadline(
+    operation: str,
+    download_kwargs: dict[str, Any],
+    deadline: float | None,
+    repo_id: str,
+    *,
+    direct_download: Callable[..., Any] | None = None,
+) -> str:
+    """Run an SDK download directly or in a terminable subprocess when bounded."""
+    if operation not in {"snapshot_download", "hf_hub_download"}:
+        raise ValueError(f"Unsupported Hugging Face download operation: {operation}")
+
+    if deadline is None:
+        if direct_download is None:
+            if operation == "snapshot_download":
+                from huggingface_hub import snapshot_download
+
+                direct_download = snapshot_download
+            else:
+                from huggingface_hub import hf_hub_download
+
+                direct_download = hf_hub_download
+        return str(direct_download(**download_kwargs))
+
+    result = _run_huggingface_worker_with_deadline(operation, download_kwargs, deadline, repo_id)
 
     local_path = result.get("path")
     if not isinstance(local_path, str):
@@ -1093,10 +1208,43 @@ def _get_huggingface_path_sizes(
     *,
     requested_revision: str | None = None,
     resolved_revision: str | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict[str, int | None], str]:
     """Return exact Hugging Face sizes for selected files and the checked revision."""
     if not filenames:
         return {}, ""
+
+    if deadline is not None:
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_path_sizes",
+            {
+                "repo_id": repo_id,
+                "filenames": filenames,
+                "requested_revision": requested_revision,
+                "resolved_revision": resolved_revision,
+            },
+            deadline,
+            repo_id,
+        )
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            raise Exception(f"Cannot enforce max-size for {repo_id}: invalid metadata response")
+        raw_revision = value.get("revision")
+        if not _is_huggingface_commit_sha(raw_revision):
+            raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        assert isinstance(raw_revision, str)
+        raw_sizes = value.get("sizes")
+        if not isinstance(raw_sizes, list):
+            raise Exception(f"Cannot enforce max-size for {repo_id}: file metadata unavailable")
+        worker_sizes: dict[str, int | None] = {}
+        for item in raw_sizes:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            raw_size = item.get("size")
+            worker_sizes[item["path"]] = (
+                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            )
+        return worker_sizes, raw_revision
 
     from huggingface_hub import HfApi
 
@@ -1132,6 +1280,7 @@ def _ensure_huggingface_selection_within_max_size(
     *,
     requested_revision: str | None = None,
     resolved_revision: str | None = None,
+    deadline: float | None = None,
 ) -> tuple[str | None, dict[str, int]]:
     """Preflight selected files and return their pinned revision and verified sizes."""
     size_limit = _normalize_download_size_limit(max_size)
@@ -1144,6 +1293,7 @@ def _ensure_huggingface_selection_within_max_size(
         filenames,
         requested_revision=requested_revision,
         resolved_revision=resolved_revision,
+        deadline=deadline,
     )
     total_size = 0
     for filename in filenames:
@@ -1252,7 +1402,7 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_model_size(repo_id: str) -> int | None:
+def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -1265,7 +1415,10 @@ def get_model_size(repo_id: str) -> int | None:
         from huggingface_hub import HfApi
 
         api = HfApi()
-        model_info = api.model_info(repo_id)
+        model_info_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            model_info_kwargs["timeout"] = timeout_seconds
+        model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Calculate total size from all files
         total_size = 0
@@ -1278,6 +1431,28 @@ def get_model_size(repo_id: str) -> int | None:
     except Exception:
         # If we can't get the size, return None and proceed with download
         return None
+
+
+def _get_model_size_with_deadline(repo_id: str, deadline: float | None) -> int | None:
+    """Return model size without allowing the optional lookup to outlive acquisition."""
+    if deadline is None:
+        return get_model_size(repo_id)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    try:
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_model_size",
+            {"repo_id": repo_id, "request_timeout": min(30.0, remaining)},
+            deadline,
+            repo_id,
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        return None
+    value = worker_result.get("value")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def download_model(
@@ -1315,9 +1490,10 @@ def download_model(
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
-    model_size = get_model_size(repo_id)
+    model_size = _get_model_size_with_deadline(repo_id, deadline)
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -1345,7 +1521,6 @@ def download_model(
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
         size_limit = _normalize_download_size_limit(max_size)
-        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
         # Enable/disable progress bars based on parameter
         if not show_progress:
@@ -1410,6 +1585,7 @@ def download_model(
                 model_files,
                 size_limit,
                 resolved_revision=repo_revision,
+                deadline=deadline,
             )
             download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
         else:
@@ -1464,6 +1640,7 @@ def download_model_streaming(
     timeout_seconds: float | None = None,
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
+    scannable_formats: Collection[str] | None = None,
     include_all_files: bool = False,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
@@ -1479,6 +1656,7 @@ def download_model_streaming(
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        scannable_formats: Optional content formats from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
 
     Yields:
@@ -1539,6 +1717,7 @@ def download_model_streaming(
             repo_revision,
             scannable_extensions,
             scannable_filenames,
+            scannable_formats,
             include_all_files=include_all_files,
             deadline=deadline,
         )
@@ -1547,6 +1726,7 @@ def download_model_streaming(
             model_files,
             size_limit,
             resolved_revision=repo_revision,
+            deadline=deadline,
         )
         download_revision = revision or repo_revision
 

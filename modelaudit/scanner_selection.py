@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
-from .scanner_registry_metadata import get_scanner_registry_metadata
+from .scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
 from .scanner_results import IssueSeverity, ScanResult
 
 ScannerSelectionSkipKind = Literal["preferred", "embedded"]
@@ -368,6 +368,22 @@ def selected_scanner_filenames(
             if os.path.splitext(filename_text)[1] not in remote_excluded_extensions:
                 filenames.add(filename_text)
     return frozenset(filenames)
+
+
+def selected_scanner_content_formats(policy: ScannerSelectionPolicy) -> frozenset[str]:
+    """Return content formats owned by the policy's enabled scanners."""
+    metadata = _scanner_metadata()
+    formats: set[str] = set()
+    for scanner_id in policy.enabled_scanner_ids:
+        scanner_info = metadata.get(scanner_id, {})
+        formats.add(scanner_id)
+        formats.update(str(value).lower() for value in scanner_info.get("header_formats", []))
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, []):
+                mapped_format = EXTENSION_FORMAT_MAP.get(str(extension).lower())
+                if mapped_format is not None:
+                    formats.add(mapped_format)
+    return frozenset(formats)
 
 
 SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"

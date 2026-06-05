@@ -1570,6 +1570,7 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({"", ".exe", ".llamafile"})
+    assert "llamafile" in mock_download_streaming.call_args.kwargs["scannable_formats"]
     assert "include_all_files" not in mock_download_streaming.call_args.kwargs
 
 
@@ -1883,6 +1884,7 @@ def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mo
 
 
 @pytest.mark.parametrize(("malicious", "expected_exit_code"), [(False, 0), (True, 1)])
+@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
 @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
 @patch(
     "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -1893,6 +1895,7 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     mock_hf_hub_download: MagicMock,
     _mock_list_repo_files: MagicMock,
     _mock_get_extensions: MagicMock,
+    mock_run_download: MagicMock,
     tmp_path: Path,
     malicious: bool,
     expected_exit_code: int,
@@ -1900,6 +1903,9 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     """Bounded unknown-suffix files should preserve benign and malicious content routing."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.unknown", malicious=malicious)
     mock_hf_hub_download.return_value = str(model_path)
+    mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
+        direct_download(**download_kwargs)
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1913,6 +1919,7 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     assert parsed["files_scanned"] == 1
     assert (parsed["failed_checks"] > 0) is malicious
     mock_hf_hub_download.assert_called_once()
+    mock_run_download.assert_called_once()
 
 
 @patch("modelaudit.cli.is_huggingface_url")

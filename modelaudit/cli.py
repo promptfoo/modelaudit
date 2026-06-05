@@ -42,6 +42,7 @@ from .scanner_selection import (
     policy_from_config,
     scanner_catalog,
     scanner_selection_config_from_inputs,
+    selected_scanner_content_formats,
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
@@ -132,6 +133,7 @@ class _ScanRuntimeConfig:
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
     scannable_filenames: frozenset[str] | None
+    scannable_formats: frozenset[str] | None
     hf_stream_include_all_files: bool
 
 
@@ -554,6 +556,7 @@ def _resolve_scan_runtime_config(
     scannable_filenames = (
         selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_formats = selected_scanner_content_formats(scanner_policy) if scanner_policy.active else None
     hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
@@ -581,6 +584,7 @@ def _resolve_scan_runtime_config(
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
         scannable_filenames=scannable_filenames,
+        scannable_formats=scannable_formats,
         hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
@@ -1275,6 +1279,8 @@ def _resolve_scan_source_for_path(
                     hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
                 if runtime.scannable_filenames is not None:
                     hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.scannable_formats is not None:
+                    hf_stream_kwargs["scannable_formats"] = runtime.scannable_formats
                 if runtime.hf_stream_include_all_files:
                     hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
