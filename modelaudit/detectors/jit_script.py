@@ -51,6 +51,13 @@ def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
     return JITScriptFinding(**kwargs)
 
 
+def _redact_code_evidence_snippet(code: str, max_chars: int = 200) -> str:
+    """Redact credentials from detector code evidence before serializing it."""
+    from modelaudit.scanners._evidence_redaction import redact_evidence_string
+
+    return redact_evidence_string(code, max_chars=max_chars)
+
+
 # Dangerous TorchScript operations that can execute arbitrary code
 DANGEROUS_TORCH_OPS = [
     # System operations
@@ -10036,15 +10043,15 @@ def _compact_snippet_mutates_module_name(tree: ast.Module, target_name: str) -> 
         if any(keyword.arg == target_name for keyword in keywords):
             return True
         if any(
+            isinstance(argument, ast.Dict) and any(key is not None and static_target_key(key) for key in argument.keys)
+            for argument in arguments
+        ):
+            return True
+        return any(
             keyword.arg is None
             and isinstance(keyword.value, ast.Dict)
             and any(key is not None and static_target_key(key) for key in keyword.value.keys)
             for keyword in keywords
-        ):
-            return True
-        return any(
-            isinstance(argument, ast.Dict) and any(key is not None and static_target_key(key) for key in argument.keys)
-            for argument in arguments
         )
 
     def call_writes_print(call: ast.Call) -> bool:
@@ -10310,26 +10317,144 @@ def _is_compact_module_scope_node(
     return statement is not None and id(statement) in executed_statement_ids
 
 
+def _compact_builtins_mutation_alias_state(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
+    builtins_aliases = {"builtins", "__builtins__"}
+    vars_helper_aliases = {"vars", "builtins.vars", "__builtins__.vars"}
+    dict_descriptor_aliases = {"dict", "builtins.dict", "__builtins__.dict"}
+    mapping_aliases = {"__builtins__"}
+    mapping_update_aliases: set[str] = set()
+    mapping_setitem_aliases: set[str] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_aliases
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in vars_helper_aliases
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_aliases
+            )
+        )
+
+    def clear_name(name: str) -> None:
+        builtins_aliases.discard(name)
+        vars_helper_aliases.difference_update({name, f"{name}.vars"})
+        dict_descriptor_aliases.difference_update({name, f"{name}.dict"})
+        mapping_aliases.discard(name)
+        mapping_update_aliases.discard(name)
+        mapping_setitem_aliases.discard(name)
+
+    def bind_name(name: str, value: ast.AST) -> None:
+        reference = _simple_reference_name(value)
+        aliases_builtins = reference in builtins_aliases
+        aliases_vars = reference in vars_helper_aliases
+        aliases_dict = reference in dict_descriptor_aliases
+        aliases_mapping = is_builtins_mapping(value)
+        aliases_update = (
+            isinstance(value, ast.Attribute) and value.attr == "update" and is_builtins_mapping(value.value)
+        )
+        aliases_setitem = (
+            isinstance(value, ast.Attribute)
+            and value.attr in {"__setitem__", "setdefault"}
+            and is_builtins_mapping(value.value)
+        )
+        clear_name(name)
+        if aliases_builtins:
+            builtins_aliases.add(name)
+            vars_helper_aliases.add(f"{name}.vars")
+            dict_descriptor_aliases.add(f"{name}.dict")
+        if aliases_vars:
+            vars_helper_aliases.add(name)
+        if aliases_dict:
+            dict_descriptor_aliases.add(name)
+        if aliases_mapping:
+            mapping_aliases.add(name)
+        if aliases_update:
+            mapping_update_aliases.add(name)
+        if aliases_setitem:
+            mapping_setitem_aliases.add(name)
+
+    def bind_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            bind_name(target.id, value)
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_target(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                clear_name(target_name)
+
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                clear_name(local_name)
+                if alias.name == "builtins":
+                    builtins_aliases.add(local_name)
+                    vars_helper_aliases.add(f"{local_name}.vars")
+                    dict_descriptor_aliases.add(f"{local_name}.dict")
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                clear_name(alias.asname or alias.name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_target(target, statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_target(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    clear_name(target_name)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            clear_name(statement.name)
+    return (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    )
+
+
 def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = None) -> bool:
     if tree is None:
         try:
             tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
         except (RecursionError, SyntaxError, ValueError):
             return True
-    builtins_aliases = {
-        alias.asname or alias.name.split(".", maxsplit=1)[0]
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name == "builtins"
-    } | {"builtins", "__builtins__"}
     if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "print"):
         return True
+    (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    ) = _compact_builtins_mutation_alias_state(tree)
     if "print" in _late_mutated_truthy_builtin_names(
         code_str.encode("utf-8"),
         builtins_aliases,
         set(),
-        builtin_dict_mapping_aliases={"__builtins__"},
+        builtin_dict_mapping_aliases=mapping_aliases,
+        builtin_dict_descriptor_aliases=dict_descriptor_aliases,
+        builtin_dict_mapping_update_aliases=mapping_update_aliases,
+        builtin_dict_mapping_setitem_aliases=mapping_setitem_aliases,
+        canonical_builtin_helper_aliases=dict.fromkeys(vars_helper_aliases, "vars"),
     ):
         return True
     parents, executed_statement_ids = _compact_module_scope_context(tree)
@@ -10347,29 +10472,94 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
     return False
 
 
-def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
-    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "setattr"):
-        return True
+def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
+    if not isinstance(tree, ast.Module):
+        return {"setattr", "builtins.setattr", "__builtins__.setattr"}
+    local_setattr_shadowed = _compact_snippet_mutates_module_name(tree, "setattr")
+    builtins_setattr_shadowed = False
     parents, executed_statement_ids = _compact_module_scope_context(tree)
-    builtins_aliases = {
-        alias.asname or alias.name.split(".", maxsplit=1)[0]
-        for node in ast.walk(tree)
-        if _is_compact_module_scope_node(node, parents, executed_statement_ids)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name == "builtins"
-    } | {"builtins", "__builtins__"}
+    (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    ) = _compact_builtins_mutation_alias_state(tree)
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_aliases
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in vars_helper_aliases
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_aliases
+            )
+        )
+
+    def update_writes_setattr(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
+        if any(keyword.arg == "setattr" for keyword in keywords):
+            return True
+        if any(
+            isinstance(argument, ast.Dict)
+            and any(key is not None and _static_getattr_member_name(key) == "setattr" for key in argument.keys)
+            for argument in arguments
+        ):
+            return True
+        return any(
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Dict)
+            and any(key is not None and _static_getattr_member_name(key) == "setattr" for key in keyword.value.keys)
+            for keyword in keywords
+        )
+
+    def call_writes_setattr(call: ast.Call) -> bool:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and is_builtins_mapping(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name) and call.func.id in mapping_update_aliases:
+            method = "update"
+        elif isinstance(call.func, ast.Name) and call.func.id in mapping_setitem_aliases:
+            method = "__setitem__"
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and _simple_reference_name(call.func.value) in dict_descriptor_aliases
+            and call.args
+            and is_builtins_mapping(call.args[0])
+        ):
+            method = call.func.attr
+            arguments = call.args[1:]
+        if method == "update":
+            return update_writes_setattr(arguments, call.keywords)
+        return (
+            method in {"__setitem__", "setdefault"}
+            and bool(arguments)
+            and _static_getattr_member_name(arguments[0]) == "setattr"
+        )
+
     for node in ast.walk(tree):
         if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
             continue
+        if isinstance(node, ast.Call) and call_writes_setattr(node):
+            builtins_setattr_shadowed = True
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "setattr":
-            return True
+            local_setattr_shadowed = True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "setattr":
-            return True
+            local_setattr_shadowed = True
         if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
             (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "setattr" for alias in node.names
         ):
-            return True
+            local_setattr_shadowed = True
         if (
             isinstance(node, ast.Attribute)
             and isinstance(node.ctx, ast.Store)
@@ -10377,7 +10567,7 @@ def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
             and isinstance(node.value, ast.Name)
             and node.value.id in builtins_aliases
         ):
-            return True
+            builtins_setattr_shadowed = True
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.ctx, ast.Store)
@@ -10392,8 +10582,17 @@ def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
                 )
             )
         ):
-            return True
-    return False
+            builtins_setattr_shadowed = True
+    shadowed_references: set[str] = set()
+    if local_setattr_shadowed or builtins_setattr_shadowed:
+        shadowed_references.add("setattr")
+    if builtins_setattr_shadowed:
+        shadowed_references.update({"builtins.setattr", "__builtins__.setattr"})
+    return shadowed_references
+
+
+def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
+    return bool(_compact_snippet_shadowed_setattr_references(tree))
 
 
 def _compact_snippet_deleted_print_setdefault_members(
@@ -10661,8 +10860,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
         return set()
     if _compact_snippet_has_shadowed_print(code_str, tree):
         return set()
-    if _compact_snippet_has_shadowed_setattr(tree):
-        return set()
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
     runpy_aliases = set(inherited_runpy_aliases)
     runpy_alias_ids = dict.fromkeys(inherited_runpy_aliases, 0)
     cached_runpy_id: int | None = 0
@@ -10867,6 +11065,25 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 for target_item in target.elts:
                     bind_mapping_target(target_item, ast.Constant(value=None), aliases_before)
 
+    def record_assignment_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Starred):
+            record_assignment_target(target.value, value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)):
+                for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                    record_assignment_target(target_item, value_item)
+            else:
+                for target_item in target.elts:
+                    record_assignment_target(target_item, ast.Constant(value=None))
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and (module_id := runpy_alias_ids.get(target.value.id)) is not None
+        ):
+            record_member_value(module_id, target.attr, value)
+        elif isinstance(target, ast.Subscript) and (module_id := runpy_mapping_id(target.value)) is not None:
+            record_member_value(module_id, _runpy_static_member_key(target.slice), value)
+
     for statement in _deterministically_executed_statements(tree.body):
         runpy_alias_ids_before = dict(runpy_alias_ids)
         mapping_aliases_before = dict(mapping_aliases)
@@ -10913,14 +11130,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                     importlib_aliases_before,
                 )
                 bind_reload_target(target, statement.value, reload_aliases_before, importlib_aliases_before)
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and (module_id := runpy_alias_ids.get(target.value.id)) is not None
-                ):
-                    record_member_value(module_id, target.attr, statement.value)
-                elif isinstance(target, ast.Subscript) and (module_id := runpy_mapping_id(target.value)) is not None:
-                    record_member_value(module_id, _runpy_static_member_key(target.slice), statement.value)
+                record_assignment_target(target, statement.value)
         elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
             bind_runpy_target(statement.target, statement.value, runpy_alias_ids_before)
             bind_mapping_target(statement.target, statement.value, mapping_aliases_before)
@@ -10939,6 +11149,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 reload_aliases_before,
                 importlib_aliases_before,
             )
+            record_assignment_target(statement.target, statement.value)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
                 if isinstance(target, ast.Name):
@@ -11032,7 +11243,8 @@ def _compact_snippet_runpy_print_overwrite_calls(
                     set(active_importlib_aliases),
                 )
                 if (
-                    reference in {"setattr", "builtins.setattr"}
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference not in shadowed_setattr_references
                     and len(node.args) >= 3
                     and isinstance(node.args[0], ast.Name)
                     and (module_id := active_runpy_alias_ids.get(node.args[0].id)) is not None
@@ -11143,8 +11355,8 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
     except (RecursionError, SyntaxError, ValueError):
         return set()
     print_is_shadowed = _compact_snippet_has_shadowed_print(code_str, tree)
-    setattr_is_shadowed = _compact_snippet_has_shadowed_setattr(tree)
-    if not print_is_shadowed and not setattr_is_shadowed:
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    if not print_is_shadowed and not shadowed_setattr_references:
         return set()
     runpy_aliases = set(inherited_runpy_aliases)
     dangerous_members: set[str] = set()
@@ -11169,8 +11381,9 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                         dangerous_members.discard(target.attr)
         for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
             for call in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(call.func)
                 if (
-                    _simple_reference_name(call.func) in {"setattr", "builtins.setattr"}
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
                     and len(call.args) >= 3
                     and isinstance(call.args[0], ast.Name)
                     and call.args[0].id in runpy_aliases
@@ -11178,7 +11391,7 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                     and isinstance(call.args[2], ast.Name)
                     and call.args[2].id == "print"
                 ):
-                    if print_is_shadowed or setattr_is_shadowed:
+                    if print_is_shadowed or reference in shadowed_setattr_references:
                         dangerous_members.add(member_name)
                     else:
                         dangerous_members.discard(member_name)
@@ -11194,6 +11407,84 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
     return high_risk_calls
 
 
+def _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str: str) -> set[tuple[str, str]]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    if not shadowed_setattr_references:
+        return set()
+    typed_aliases: dict[str, str] = {}
+    dangerous_members: set[tuple[str, str]] = set()
+    high_risk_calls: set[tuple[str, str]] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    def bind_typed_alias(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            if (owner := typed_aliases.get(_simple_reference_name(value) or "")) is None:
+                typed_aliases.pop(target.id, None)
+            else:
+                typed_aliases[target.id] = owner
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_typed_alias(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                typed_aliases.pop(target_name, None)
+
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                if alias.name in {"ctypes", "webbrowser"}:
+                    typed_aliases[local_name] = alias.name
+                else:
+                    typed_aliases.pop(local_name, None)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                typed_aliases.pop(alias.asname or alias.name, None)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_typed_alias(target, statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_typed_alias(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    typed_aliases.pop(target_name, None)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            typed_aliases.pop(statement.name, None)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for call in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(call.func)
+                if (
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference in shadowed_setattr_references
+                    and len(call.args) >= 3
+                    and isinstance(call.args[0], ast.Name)
+                    and call.args[0].id in typed_aliases
+                    and isinstance(call.args[2], ast.Name)
+                    and call.args[2].id == "print"
+                ):
+                    member_name = _static_getattr_member_name(call.args[1])
+                    owner = typed_aliases[call.args[0].id]
+                    if member_name is not None and _typed_member_high_risk_call(owner, member_name) is not None:
+                        dangerous_members.add((owner, member_name))
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and (call_owner := typed_aliases.get(call.func.value.id)) is not None
+                    and (call_owner, call.func.attr) in dangerous_members
+                    and (high_risk_call := _typed_member_high_risk_call(call_owner, call.func.attr)) is not None
+                ):
+                    high_risk_calls.add(high_risk_call)
+    return high_risk_calls
+
+
 def _compact_snippet_captured_runpy_high_risk_calls(
     code_str: str,
     inherited_runpy_aliases: frozenset[str] = frozenset(),
@@ -11206,7 +11497,7 @@ def _compact_snippet_captured_runpy_high_risk_calls(
     except (RecursionError, SyntaxError, ValueError):
         return set()
     runpy_aliases = set(inherited_runpy_aliases)
-    setattr_is_active = not _compact_snippet_has_shadowed_setattr(tree)
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
     first_safe_write: dict[str, int] = {}
     captured_members: dict[str, tuple[str, int]] = {}
     dangerous_calls: set[tuple[str, str]] = set()
@@ -11245,10 +11536,17 @@ def _compact_snippet_captured_runpy_high_risk_calls(
                 clear_captured_target(target)
 
     parents, executed_statement_ids = _compact_module_scope_context(tree)
+
     for statement in _compact_deterministically_executed_statements(tree.body):
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
-        if isinstance(statement, ast.Assign):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                captured_members.pop(local_name, None)
+                if alias.name == "runpy":
+                    runpy_aliases.add(local_name)
+        elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 if (
                     isinstance(target, ast.Attribute)
@@ -11281,8 +11579,9 @@ def _compact_snippet_captured_runpy_high_risk_calls(
         for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
             for node in _deterministically_executed_expression_calls(value):
                 if (
-                    setattr_is_active
-                    and _simple_reference_name(node.func) in {"setattr", "builtins.setattr"}
+                    (reference := _simple_reference_name(node.func))
+                    in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference not in shadowed_setattr_references
                     and len(node.args) >= 3
                     and isinstance(node.args[0], ast.Name)
                     and node.args[0].id in runpy_aliases
@@ -11307,9 +11606,9 @@ def _compact_snippet_captured_runpy_high_risk_calls(
 
 def _typed_member_high_risk_call(owner_name: str, member_name: str) -> tuple[str, str] | None:
     if owner_name == "webbrowser" and member_name in {"get", "open", "open_new", "open_new_tab"}:
-        return ("webbrowser.open", "S109")
+        return (f"webbrowser.{member_name}", "S109")
     if owner_name == "ctypes" and member_name in _TYPED_PROOF_MEMBER_NAMES:
-        return ("ctypes.CDLL", "S110")
+        return (f"ctypes.{member_name}", "S110")
     return None
 
 
@@ -11524,7 +11823,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         "ctypes": ("ctypes", 0),
     }
     next_typed_generation = {"webbrowser": 1, "ctypes": 1}
-    builtins_aliases = {"builtins"}
+    builtins_aliases = {"builtins", "__builtins__"}
     executed_statements = _compact_deterministically_executed_statements(tree.body)
     for statement in executed_statements:
         if isinstance(statement, ast.Import):
@@ -11747,7 +12046,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
 
     def is_builtins_mapping(node: ast.AST) -> bool:
         if isinstance(node, ast.Name):
-            return node.id in builtins_mapping_aliases
+            return node.id == "__builtins__" or node.id in builtins_mapping_aliases
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "__dict__"
@@ -11881,6 +12180,27 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             builtins_mapping_update_aliases.add(name)
         elif kind == "setitem":
             builtins_mapping_setitem_aliases.add(name)
+
+    def bind_typed_alias(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: Mapping[str, tuple[str, int]] | None = None,
+    ) -> None:
+        current_aliases = typed_aliases if aliases_before is None else aliases_before
+        if isinstance(target, ast.Name):
+            identity = current_aliases.get(_simple_reference_name(value) or "")
+            typed_aliases.pop(target.id, None)
+            if identity is not None:
+                typed_aliases[target.id] = identity
+        elif isinstance(target, ast.Starred):
+            bind_typed_alias(target.value, ast.Constant(value=None), current_aliases)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_typed_alias(target_item, value_item, current_aliases)
+            else:
+                for target_item in target.elts:
+                    bind_typed_alias(target_item, ast.Constant(value=None), current_aliases)
 
     def record_setattr_shadow(target: ast.AST, value: ast.AST) -> None:
         nonlocal local_setattr_shadowed, builtins_setattr_shadowed
@@ -12040,6 +12360,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             reload_aliases.discard(statement.name)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
+                bind_typed_alias(target, statement.value, typed_aliases_before)
                 record_setattr_shadow(target, statement.value)
                 record_vars_shadow(target, statement.value)
                 record_dict_shadow(target, statement.value)
@@ -12051,11 +12372,6 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     record_member(typed_aliases[target.value.id], target.attr, statement.value)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
-                    canonical_module = typed_aliases.get(value_reference or "")
-                    if canonical_module is None:
-                        typed_aliases.pop(target.id, None)
-                    else:
-                        typed_aliases[target.id] = canonical_module
                     if active_vars_reference(value_reference):
                         vars_helper_aliases.add(target.id)
                     else:
@@ -12089,6 +12405,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                 bind_reload_target(target, statement.value, reload_aliases_before, importlib_aliases_before)
                 bind_mapping_alias(target, statement.value, mapping_aliases_before)
         elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_typed_alias(statement.target, statement.value, typed_aliases_before)
             record_setattr_shadow(statement.target, statement.value)
             record_vars_shadow(statement.target, statement.value)
             record_dict_shadow(statement.target, statement.value)
@@ -12099,11 +12416,6 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             ):
                 record_member(typed_aliases[statement.target.value.id], statement.target.attr, statement.value)
             if isinstance(statement.target, ast.Name):
-                canonical_module = typed_aliases.get(_simple_reference_name(statement.value) or "")
-                if canonical_module is None:
-                    typed_aliases.pop(statement.target.id, None)
-                else:
-                    typed_aliases[statement.target.id] = canonical_module
                 bind_builtins_mapping_alias(statement.target.id, statement.value)
             bind_module_helper_target(
                 statement.target,
@@ -12123,12 +12435,12 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             bind_mapping_alias(statement.target, statement.value)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
-                if isinstance(target, ast.Name):
-                    typed_aliases.pop(target.id, None)
-                    clear_local_mapping_alias(target.id)
-                    clear_module_helper_target(target)
-                    reload_aliases.discard(target.id)
-                elif (
+                for target_name in _assignment_target_names(target):
+                    typed_aliases.pop(target_name, None)
+                    clear_local_mapping_alias(target_name)
+                    clear_module_helper_target(ast.Name(id=target_name))
+                    reload_aliases.discard(target_name)
+                if (
                     isinstance(target, ast.Subscript)
                     and (
                         (isinstance(target.value, ast.Name) and target.value.id in sys_modules_aliases)
@@ -12640,6 +12952,32 @@ def _compact_snippet_inactive_restore_high_risk_calls(
         reload_aliases.discard(name)
         dangerous_runpy_value_names.pop(name, None)
 
+    def dangerous_runpy_member(value: ast.AST) -> str | None:
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in runpy_aliases
+            and value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+            and value.attr not in safe_runpy_members
+        ):
+            return value.attr
+        if isinstance(value, ast.Name):
+            return dangerous_runpy_value_names.get(value.id)
+        return None
+
+    def bind_dangerous_runpy_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            if (member_name := dangerous_runpy_member(value)) is None:
+                dangerous_runpy_value_names.pop(target.id, None)
+            else:
+                dangerous_runpy_value_names[target.id] = member_name
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_dangerous_runpy_target(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                dangerous_runpy_value_names.pop(target_name, None)
+
     for statement in _deterministically_executed_statements(tree.body):
         is_module_scope = _is_compact_module_scope_node(statement, parents, executed_statement_ids)
         if is_module_scope and scoped_binding_names:
@@ -12660,6 +12998,9 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     safe_runpy_members.clear()
                     active_state_members_seen.update(_RUNPY_PRIORITY_MEMBER_NAMES)
                     runpy_cache_evicted = False
+                if alias.name == "runpy":
+                    runpy_aliases.add(local_name)
+                    proven_runpy_aliases.add(local_name)
                 elif alias.name == "importlib":
                     importlib_aliases.add(local_name)
         elif isinstance(statement, ast.ImportFrom):
@@ -12670,6 +13011,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     reload_aliases.add(local_name)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
+                bind_dangerous_runpy_target(target, statement.value)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
                     if not is_module_scope:
@@ -12936,6 +13278,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     and _static_getattr_member_name(target.slice) == "getattr"
                 ):
                     record_builtins_member_value("getattr", statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_dangerous_runpy_target(statement.target, statement.value)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
             if is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
@@ -12953,8 +13297,9 @@ def _compact_snippet_inactive_restore_high_risk_calls(
             clear_local_alias_state(statement.name)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    clear_local_alias_state(target_name)
                 if isinstance(target, ast.Name):
-                    clear_local_alias_state(target.id)
                     if target.id == "vars":
                         vars_shadowed = False
                         vars_helper_names.add("vars")
@@ -12984,6 +13329,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     and (member_name := _runpy_static_member_key(target.slice)) is not None
                 ):
                     record_runpy_delete(member_name)
+        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            dangerous_runpy_value_names.pop(statement.name, None)
         if isinstance(statement, (ast.If, ast.Try, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             _update_compact_runpy_aliases(statement, runpy_aliases)
             _update_compact_runpy_aliases(statement, proven_runpy_aliases, for_suppression=True)
@@ -18941,8 +19288,6 @@ class JITScriptDetector:
         bounded_suppressed_calls: set[tuple[str, str]] = set()
         bounded_builtin_calls: set[str] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
-        snippet_suppressed_calls: set[tuple[str, str]] = set()
-        snippet_explicit_high_risk_calls: set[tuple[str, str]] = set()
         snippet_builtin_calls: set[str] = set()
         inherited_runpy_aliases = _runpy_import_aliases(bounded)
         has_proven_priority_candidate = any(
@@ -18985,6 +19330,9 @@ class JITScriptDetector:
                     if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                 )
                 bounded_explicit_high_risk_calls: set[tuple[str, str]] = set()
+                bounded_explicit_high_risk_calls.update(
+                    _compact_snippet_shadowed_setattr_typed_high_risk_calls(bounded_source)
+                )
                 if "runpy" in bounded_source and any(
                     member_name in bounded_source for member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                 ):
@@ -19027,7 +19375,6 @@ class JITScriptDetector:
                 if probe in match:
                     proven_high_risk_calls.add((call_name, rule_code))
             snippet_high_risk_calls.update(proven_high_risk_calls)
-            snippet_explicit_high_risk_calls.update(proven_high_risk_calls)
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
@@ -19080,7 +19427,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {dangerous_import} import - it can be used maliciously",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=code_str[:200],
+                                code_snippet=_redact_code_evidence_snippet(code_str),
                                 type="dangerous_import",
                                 operation=None,
                                 builtin=None,
@@ -19105,7 +19452,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=code_str[:200],
+                                code_snippet=_redact_code_evidence_snippet(code_str),
                                 type="dangerous_builtin",
                                 operation=None,
                                 builtin=builtin,
@@ -19120,15 +19467,20 @@ class JITScriptDetector:
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     ast_high_risk_calls = set(parsed_high_risk_calls or set())
                     inactive_restore_high_risk_calls: set[tuple[str, str]] = set()
+                    inactive_restore_high_risk_calls.update(
+                        _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str)
+                    )
                     has_proven_high_risk_probe = any(
                         probe in match for _rule_code, (_call_name, probe) in _PROVEN_HIGH_RISK_CALL_PROBES.items()
                     )
                     if not has_proven_high_risk_probe and any(
                         member_name in code_str for member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                     ):
-                        inactive_restore_high_risk_calls = _compact_snippet_inactive_restore_high_risk_calls(
-                            code_str,
-                            inherited_runpy_aliases,
+                        inactive_restore_high_risk_calls.update(
+                            _compact_snippet_inactive_restore_high_risk_calls(
+                                code_str,
+                                inherited_runpy_aliases,
+                            )
                         )
                         inactive_restore_high_risk_calls.update(
                             _compact_snippet_captured_runpy_high_risk_calls(
@@ -19175,8 +19527,6 @@ class JITScriptDetector:
                         candidate_suppressed_calls = set()
                     ast_high_risk_calls.update(inactive_restore_high_risk_calls)
                     ast_high_risk_calls.difference_update(candidate_suppressed_calls)
-                    snippet_suppressed_calls.update(candidate_suppressed_calls)
-                    snippet_explicit_high_risk_calls.update(inactive_restore_high_risk_calls)
                     snippet_high_risk_calls.update(ast_high_risk_calls)
                     snippet_builtin_calls.update(parsed_builtin_calls or set())
                     ast_findings = self._analyze_ast(
@@ -19209,7 +19559,7 @@ class JITScriptDetector:
                     recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                     confidence=0.9,
                     framework=framework,
-                    code_snippet=code_str[:200],
+                    code_snippet=_redact_code_evidence_snippet(code_str),
                     type="dangerous_builtin",
                     operation=None,
                     builtin=builtin,
@@ -19235,7 +19585,6 @@ class JITScriptDetector:
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         resolved_high_risk_calls.difference_update(bounded_suppressed_calls)
-        resolved_high_risk_calls.difference_update(snippet_suppressed_calls - snippet_explicit_high_risk_calls)
         resolved_builtin_calls = (bounded_builtin_calls or set()) | snippet_builtin_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
             raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]

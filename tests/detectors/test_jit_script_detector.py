@@ -1,6 +1,7 @@
 """Tests for JIT/Script code execution detection."""
 
 import ast
+import json
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,54 @@ class TestJITScriptDetector:
         assert any("eval" in getattr(f, "builtin", "") for f in findings)
         assert any("exec" in getattr(f, "builtin", "") for f in findings)
         assert any("__import__" in getattr(f, "builtin", "") for f in findings)
+
+    def test_embedded_python_code_snippets_redact_secret_assignments(self) -> None:
+        detector = JITScriptDetector()
+        secret = "SECRETKEY1234567890"
+        fallback_secret = "FALLBACKSECRET1234567890"
+        data = f"""
+        def payload():
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
+            client_secret = os.getenv("CLIENT_SECRET", "{fallback_secret}")
+            return eval("1 + 1")
+        """.encode()
+
+        findings = detector._extract_and_check_python_code(data, "Test", "payload.pt")
+
+        serialized = json.dumps([finding.model_dump() for finding in findings], sort_keys=True)
+        builtin_finding = next(
+            finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
+        )
+        assert secret not in serialized
+        assert fallback_secret not in serialized
+        assert builtin_finding.code_snippet is not None
+        assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
+        assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
+        assert "client_secret = <redacted>" in builtin_finding.code_snippet
+        assert 'eval("1 + 1' in builtin_finding.code_snippet
+
+    def test_contextual_builtin_fallback_redacts_code_snippet(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        detector = JITScriptDetector()
+        secret = "CONTEXTUALSECRET1234567890"
+        contextual_source = f'api_key = "{secret}"; eval("1 + 1")'
+        monkeypatch.setattr(
+            JITScriptDetector,
+            "_contextual_dangerous_builtin_sources",
+            staticmethod(lambda _data: {"eval": contextual_source}),
+        )
+
+        findings = detector._extract_and_check_python_code(b"\x00", "Test", "payload.pt")
+
+        builtin_finding = next(
+            finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
+        )
+        assert builtin_finding.code_snippet is not None
+        assert secret not in builtin_finding.code_snippet
+        assert 'api_key = "<redacted>"' in builtin_finding.code_snippet
+        assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_dangerous_builtin_alias_assigned_by_tuple_unpacking(self) -> None:
         detector = JITScriptDetector()
@@ -7156,6 +7205,9 @@ class TestJITScriptDetector:
             b"globals().update(setattr=lambda *args: None)\n",
             b"globals().update(**{'setattr': lambda *args: None})\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
+            b"import builtins\nbuiltins.__dict__.update(setattr=lambda *args: None)\n",
+            b"import builtins as b\nv = vars\nv(b).update(setattr=lambda *args: None)\n",
+            b"d = dict\nd.__setitem__(__builtins__, 'setattr', lambda *args: None)\n",
             b"__builtins__.setattr = lambda *args: None\n",
             b"__builtins__['setattr'] = lambda *args: None\n",
         ],
@@ -7180,6 +7232,7 @@ class TestJITScriptDetector:
         [
             "if False:\n    globals()['setattr'] = lambda *args: None\n",
             "globals = lambda: {}\nglobals()['setattr'] = lambda *args: None\n",
+            "v = vars\nv = lambda _value: {}\nv(__builtins__).update(setattr=lambda *args: None)\n",
             "def helper():\n    setattr = lambda *args: None\n",
         ],
     )
@@ -7218,6 +7271,45 @@ class TestJITScriptDetector:
         findings = detector.scan_model(data, "pytorch", "payload.py")
 
         assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_runpy_call_after_destructured_member_restore(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            b"(rp.run_path,) = (original,)\nrp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_destructured_safe_runpy_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nrp.run_path = print\n(rp.run_path,) = (print,)\nrp.run_path('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_uses_explicit_builtins_setattr_after_local_shadow(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import builtins, runpy as rp\nsetattr = print\n"
+            b"builtins.setattr(rp, 'run_path', print)\nrp.run_path('safe')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
             for finding in findings
         )
@@ -7291,6 +7383,34 @@ class TestJITScriptDetector:
                 b"import ctypes, webbrowser\nwebbrowser.CDLL = print\nctypes.CDLL('payload.so')\n",
                 "Native library loading detected",
             ),
+            (
+                b"import webbrowser\nwebbrowser.open_new = print\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nc.PyDLL = print\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n__builtins__.setattr = lambda *args: None\n"
+                b"setattr(c, 'CDLL', print)\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\nactual = c\n__builtins__.setattr = lambda *args: None\n"
+                b"setattr(c, 'CDLL', print)\nactual.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import webbrowser as wb\nactual = wb\n(wb,) = (object(),)\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nm = __builtins__\n"
+                b"m.update(setattr=lambda *args: None)\nsetattr(c, 'CDLL', print)\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
         ],
     )
     def test_scan_model_keeps_typed_call_after_other_owner_safe_overwrite(
@@ -7304,6 +7424,33 @@ class TestJITScriptDetector:
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_extract_python_code_scopes_suppressions_to_each_candidate(self) -> None:
+        detector = JITScriptDetector()
+        safe = b"import webbrowser as wb\nwb.open = print\nwb.open('safe')\n"
+        dangerous = b"import webbrowser as wb\nwb.open('https://example.invalid')\n"
+        dangerous_start = len(safe) + 1
+        data = safe + b"\x00" + dangerous
+        candidates: list[jit_script_module._EmbeddedPythonCandidate] = [
+            (safe, (0, len(safe)), ((0, len(safe)),)),
+            (
+                dangerous,
+                (dangerous_start, dangerous_start + len(dangerous)),
+                ((dangerous_start, dangerous_start + len(dangerous)),),
+            ),
+        ]
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "TorchScript",
+            "payload.py",
+            prioritized_snippets=candidates,
+        )
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
         )
 
     @pytest.mark.parametrize(
@@ -7924,6 +8071,8 @@ class TestJITScriptDetector:
             b"namespace = globals()\nnamespace['print'] = eval\n",
             b"put = globals().__setitem__\nput('print', eval)\n",
             b"update = globals().update\nupdate(print=eval)\n",
+            b"globals().update(**{'print': eval})\n",
+            b"v = vars\nv(__builtins__).update(print=eval)\n",
             b"if enabled:\n    globals()['print'] = eval\n",
             b"__builtins__.print = eval\n",
             b"__builtins__['print'] = eval\n",
@@ -7948,6 +8097,7 @@ class TestJITScriptDetector:
         [
             b"if False:\n    globals()['print'] = eval\n",
             b"globals = lambda: {}\nglobals()['print'] = eval\n",
+            b"v = vars\nv = lambda _value: {}\nv(__builtins__).update(print=eval)\n",
             b"dict = lambda *args: None\ndict.__setitem__(globals(), 'print', eval)\n",
         ],
     )
