@@ -125,8 +125,11 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|client[_.-]?secret|"
     r"cookie|credential|jwt|passphrase|password|passwd|private[_.-]?key|pwd|refresh[_.-]?token|sas|secret|"
     r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
+    r"(?:s|[0-9]+|[_.-]?values?)?"
 )
-AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY: Final[str] = r"(?-i:(?:awsAccessKeyId|awsSecretAccessKey|awsSessionToken))"
+AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    r"(?-i:(?:awsAccessKeyId|awsSecretAccessKey|awsSessionToken)(?:s|[0-9]+|Value|Values)?)"
+)
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|{AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY})"
 AUTHORIZATION_KEY_PATTERN: Final[str] = SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
@@ -203,8 +206,11 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"([^\"'\s;&|)]+)([\"']?)"
 )
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(?P<prefix>\b[A-Za-z_][A-Za-z0-9_.]*\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
-    rf"(?P<key_quote>[\"'])(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})(?P=key_quote)\s*,\s*)"
+    rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
+    rf"(?P<key_quote>[\"'])(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
+)
+FUNCTION_KEYWORD_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
 )
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
@@ -1888,22 +1894,52 @@ def _find_function_argument_end(text: str, start: int) -> int:
     return len(text)
 
 
+def _normalize_sensitive_function_key(key: str) -> str | None:
+    decoded_key = _decode_key_escapes(key)
+    return _normalize_sensitive_key(decoded_key.lstrip("-"))
+
+
+def _redact_sensitive_function_value(raw_value: str) -> str:
+    leading = raw_value[: len(raw_value) - len(raw_value.lstrip())]
+    trailing = raw_value[len(raw_value.rstrip()) :]
+    value = raw_value.strip()
+    if COMMAND_EVIDENCE_RE.search(value):
+        safe_value = _redact_sensitive_command_value(value)
+    else:
+        safe_value = f'"{REDACTED_EVIDENCE_VALUE}"'
+    return f"{leading}{safe_value}{trailing}"
+
+
 def _redact_sensitive_function_arguments(text: str) -> str:
     replacements: list[tuple[int, int, str]] = []
+    covered_until = 0
     for match in SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text):
-        value_end = _find_function_argument_end(text, match.end())
-        raw_value = text[match.end() : value_end]
-        if not raw_value.strip():
+        if match.start() < covered_until or _normalize_sensitive_function_key(match.group("key")) is None:
             continue
-        leading = raw_value[: len(raw_value) - len(raw_value.lstrip())]
-        trailing = raw_value[len(raw_value.rstrip()) :]
-        replacements.append(
-            (
-                match.end(),
-                value_end,
-                f'{leading}"{REDACTED_EVIDENCE_VALUE}"{trailing}',
-            )
-        )
+
+        declaration_call = match.group("callee").rsplit(".", 1)[-1].lower() == "add_argument"
+        argument_start = match.end()
+        redacted_positional_value = False
+        while argument_start < len(text):
+            argument_end = _find_function_argument_end(text, argument_start)
+            raw_argument = text[argument_start:argument_end]
+            keyword_match = FUNCTION_KEYWORD_ARGUMENT_RE.match(raw_argument)
+            if keyword_match is not None:
+                if keyword_match.group("name").lower() == "default":
+                    value_start = argument_start + keyword_match.end()
+                    raw_value = text[value_start:argument_end]
+                    if raw_value.strip():
+                        replacements.append((value_start, argument_end, _redact_sensitive_function_value(raw_value)))
+            elif not declaration_call and not redacted_positional_value and raw_argument.strip():
+                replacements.append((argument_start, argument_end, _redact_sensitive_function_value(raw_argument)))
+                redacted_positional_value = True
+
+            if argument_end >= len(text) or text[argument_end] != ",":
+                covered_until = argument_end + 1
+                break
+            argument_start = argument_end + 1
+        else:
+            covered_until = len(text)
 
     for start, end, replacement in reversed(replacements):
         text = f"{text[:start]}{replacement}{text[end:]}"

