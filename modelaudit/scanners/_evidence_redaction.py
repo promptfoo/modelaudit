@@ -644,7 +644,12 @@ def _redact_percent_encoded_secret_candidate(match: re.Match[str], *, url_depth:
         if STANDALONE_SECRET_RE.search(decoded):
             return REDACTED_EVIDENCE_VALUE
         normalized_decoded = _remove_unsafe_evidence_characters(decoded)
-        redacted_decoded = redact_evidence_string(normalized_decoded, max_chars=None, _url_depth=url_depth)
+        redacted_decoded = redact_evidence_string(
+            normalized_decoded,
+            max_chars=None,
+            _url_depth=url_depth,
+            _decode_percent=False,
+        )
         if redacted_decoded != normalized_decoded:
             return redacted_decoded
     else:
@@ -1043,7 +1048,13 @@ def _redact_quoted_structured_literal(text: str, max_chars: int) -> str | None:
     return _truncate(redacted_unquoted, max_chars)
 
 
-def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth: int = 0) -> str:
+def redact_evidence_string(
+    text: str,
+    max_chars: int | None = 180,
+    *,
+    _url_depth: int = 0,
+    _decode_percent: bool = True,
+) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     text = _remove_unsafe_evidence_characters(text)
     effective_max_chars = len(text) if max_chars is None else max_chars
@@ -1059,10 +1070,11 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), redacted)
     redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
-    redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(
-        lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=_url_depth),
-        redacted,
-    )
+    if _decode_percent:
+        redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(
+            lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=_url_depth),
+            redacted,
+        )
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)

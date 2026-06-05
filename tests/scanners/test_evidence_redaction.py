@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 import pytest
 
+from modelaudit.scanners import _evidence_redaction as evidence_redaction
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
@@ -1284,6 +1285,27 @@ def test_redacts_percent_encoded_credential_evidence(encoded_value: str, expecte
 def test_preserves_benign_percent_encoded_evidence() -> None:
     for text in ("version%3D1", "metadata%20label%20value"):
         assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_bounds_deep_benign_percent_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nested benign encoding must not recursively rescan every remaining layer."""
+    decode_depth = 12
+    encoded = "version=1"
+    for _ in range(decode_depth):
+        encoded = quote(encoded, safe="")
+
+    real_unquote = evidence_redaction.unquote
+    unquote_calls = 0
+
+    def counting_unquote(value: str) -> str:
+        nonlocal unquote_calls
+        unquote_calls += 1
+        return real_unquote(value)
+
+    monkeypatch.setattr(evidence_redaction, "unquote", counting_unquote)
+
+    assert redact_evidence_string(encoded, max_chars=500) == encoded
+    assert unquote_calls <= decode_depth + 1
 
 
 @pytest.mark.parametrize(
