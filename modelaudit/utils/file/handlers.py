@@ -895,11 +895,21 @@ class AdvancedFileHandler:
             logger.debug(f"Model configuration detected: {config_path}")
             # Quick scan of config for metadata
             try:
+                pre_open_stat = os.stat(config_path, follow_symlinks=False)
+                if not stat.S_ISREG(pre_open_stat.st_mode):
+                    raise OSError("Model configuration is not a regular file")
                 flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
                 config_fd = os.open(config_path, flags)
                 try:
-                    if not stat.S_ISREG(os.fstat(config_fd).st_mode):
-                        raise OSError("Model configuration is not a regular file")
+                    opened_stat = os.fstat(config_fd)
+                    post_open_stat = os.stat(config_path, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(opened_stat.st_mode)
+                        or not stat.S_ISREG(post_open_stat.st_mode)
+                        or not os.path.samestat(pre_open_stat, opened_stat)
+                        or not os.path.samestat(opened_stat, post_open_stat)
+                    ):
+                        raise OSError("Model configuration changed while opening")
                     config_content = os.read(config_fd, 10240).decode("utf-8", errors="replace")
                 finally:
                     os.close(config_fd)

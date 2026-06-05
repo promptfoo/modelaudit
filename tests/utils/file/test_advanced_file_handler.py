@@ -584,6 +584,44 @@ class TestShardedModelDetector:
 
         assert ShardedModelDetector.find_model_config(str(model_path)) is None
 
+    def test_sharded_model_rejects_config_symlink_swap_without_nofollow(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Descriptor identity checks must protect platforms without ``O_NOFOLLOW``."""
+        scan_dir = tmp_path / "scan"
+        outside_dir = tmp_path / "outside"
+        scan_dir.mkdir()
+        outside_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        config_path = scan_dir / "config.json"
+        outside_config = outside_dir / "config.json"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        config_path.write_text('{"model_type": "safe"}')
+        outside_config.write_text('{"torch_dtype": "float16"}')
+        original_open = os.open
+        swapped = False
+
+        def swap_before_open(path: str, flags: int) -> int:
+            nonlocal swapped
+            if Path(path) == config_path:
+                config_path.unlink()
+                config_path.symlink_to(outside_config)
+                swapped = True
+            return original_open(path, flags)
+
+        monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+        monkeypatch.setattr(os, "open", swap_before_open)
+
+        result = AdvancedFileHandler(str(shard_one), CompletingShardScanner()).scan()
+
+        assert swapped is True
+        assert not any(check.name == "PyTorch Configuration Detection" for check in result.checks)
+
 
 class TestMemoryMappedHandler:
     """Test memory-mapped scanning."""

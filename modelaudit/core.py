@@ -1272,8 +1272,8 @@ def scan_model_directory_or_file(
                         if is_hf_shard_alias:
                             hf_shard_blob_paths.add(str(resolved_file))
                         dedupe_target_str = (
-                            str(target_path.resolve())
-                            if is_hf_cache_symlink and shard_family_key is None
+                            str(resolved_file)
+                            if is_hf_cache_symlink and target_path == scan_source and shard_family_key is None
                             else target_str
                         )
                         if dedupe_target_str in scanned_paths:

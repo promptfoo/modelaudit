@@ -702,27 +702,27 @@ def test_directory_scan_does_not_reresolve_trusted_hf_alias(
     alias = snapshot / "model.safetensors"
     alias.symlink_to(Path("../../blobs") / blob_path.name)
 
-    original_readlink = os.readlink
-    readlink_calls = 0
+    original_resolve = Path.resolve
+    alias_resolve_calls = 0
 
-    def fail_redundant_readlink(path: Any, *, dir_fd: int | None = None) -> Any:
-        nonlocal readlink_calls
-        readlink_calls += 1
-        if readlink_calls > 1:
-            raise OSError("raw symlink target cannot be resolved again")
-        if dir_fd is None:
-            return original_readlink(path)
-        return original_readlink(path, dir_fd=dir_fd)
+    def fail_redundant_resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal alias_resolve_calls
+        if path == alias:
+            alias_resolve_calls += 1
+            if alias_resolve_calls > 1:
+                raise OSError("trusted alias cannot be resolved again")
+        return original_resolve(path, strict=strict)
 
     def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
         return _mock_sharded_scan_result(blob_path.stat().st_size)
 
-    monkeypatch.setattr(os, "readlink", fail_redundant_readlink)
+    monkeypatch.setattr(Path, "resolve", fail_redundant_resolve)
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
 
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
     assert result.files_scanned == 1
+    assert alias_resolve_calls == 1
     assert result.has_errors is False
     assert not any(issue.message == "Directory entry unavailable during discovery" for issue in result.issues)
 
