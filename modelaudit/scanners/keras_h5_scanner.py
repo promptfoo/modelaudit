@@ -41,14 +41,21 @@ try:
 except ImportError:
     HAS_H5PY = False
 
+_KERAS_VERSION_SEPARATOR = r"[._-]?"
 _KERAS_LOCAL_VERSION_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_KERAS_PRERELEASE_SUFFIX = (
+    rf"{_KERAS_VERSION_SEPARATOR}(?:a|alpha|b|beta|c|rc|pre|preview)"
+    rf"{_KERAS_VERSION_SEPARATOR}\d*"
+)
+_KERAS_POST_SUFFIX = rf"(?:-\d+|{_KERAS_VERSION_SEPARATOR}(?:post|rev|r){_KERAS_VERSION_SEPARATOR}\d*)"
+_KERAS_DEV_SUFFIX = rf"{_KERAS_VERSION_SEPARATOR}dev{_KERAS_VERSION_SEPARATOR}\d*"
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
-    rf"(?i)^[._-]?(?:(?:a|alpha|b|beta|c|rc|pre|preview)\d*"
-    rf"(?:[._-]?(?:post|rev|r)\d*)?(?:[._-]?dev\d*)?|dev\d*)(?:{_KERAS_LOCAL_VERSION_SUFFIX})?$"
+    rf"(?i)^(?:{_KERAS_PRERELEASE_SUFFIX}(?:{_KERAS_POST_SUFFIX})?(?:{_KERAS_DEV_SUFFIX})?|"
+    rf"{_KERAS_DEV_SUFFIX})(?:{_KERAS_LOCAL_VERSION_SUFFIX})?$"
 )
 _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
     rf"(?i)^(?:{_KERAS_LOCAL_VERSION_SUFFIX}|"
-    rf"[._-]?(?:post|rev|r)\d*(?:[._-]?dev\d*)?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
+    rf"{_KERAS_POST_SUFFIX}(?:{_KERAS_DEV_SUFFIX})?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
 )
 
 
