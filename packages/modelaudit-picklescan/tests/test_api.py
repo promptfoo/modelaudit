@@ -10,6 +10,7 @@ import datetime
 import decimal
 import faulthandler
 import functools
+import importlib
 import io
 import logging
 import os
@@ -3421,11 +3422,17 @@ def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
     finally:
         _clear_source_sensitive_caches()
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
         for finding in report.findings
+    )
+    assert any(
+        notice.code == "call_graph_source_unavailable"
+        and notice.details.get("import_reference") == "dill.dump"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
     )
 
 
@@ -3848,6 +3855,47 @@ def test_scan_bytes_allows_source_available_import_only_global_with_inert_initia
     assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
 
 
+def test_scan_bytes_uses_current_import_origin_instead_of_stale_loaded_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stale_loaded_source_{uuid.uuid4().hex}"
+    loaded_dir = tmp_path / "loaded"
+    active_dir = tmp_path / "active"
+    loaded_dir.mkdir()
+    active_dir.mkdir()
+    marker = tmp_path / "stale_loaded_source_marker"
+    (loaded_dir / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    (active_dir / f"{module_name}.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(loaded_dir))
+    importlib.invalidate_caches()
+    imported_module = importlib.import_module(module_name)
+    assert Path(cast(str, imported_module.__file__)).parent == loaded_dir
+    monkeypatch.syspath_prepend(str(active_dir))
+    importlib.invalidate_caches()
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        sys.modules.pop(module_name, None)
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_scan_bytes_allows_inert_source_with_future_import(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4118,6 +4166,46 @@ def test_scan_bytes_warns_when_unchecked_hash_cache_overrides_inert_source(
             and finding.details.get("import_reference") == f"{module_name}.Gadget"
             for finding in report.findings
         )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_checks_source_local_cache_with_pycache_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_prefixed_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "prefixed_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "scanner-cache"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        monkeypatch.setattr(sys, "pycache_prefix", None)
         pickle.loads(payload)
         assert marker.read_text(encoding="utf-8") == "owned"
     finally:
@@ -5241,6 +5329,30 @@ def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import
         ref["import_reference"] == import_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
     )
+
+
+def test_scan_bytes_keeps_copy_reg_compat_alias_clean_when_local_module_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "copy_reg_shadow_marker"
+    (tmp_path / "copy_reg.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n_reconstructor = object()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"ccopy_reg\n_reconstructor\n."
+
+    try:
+        report = scan_bytes(payload, source="copy-reg-compat-shadow.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+        assert marker.exists() is False
+        assert pickle.loads(payload) is vars(copyreg)["_reconstructor"]
+        assert marker.exists() is False
+    finally:
+        sys.modules.pop("copy_reg", None)
 
 
 @pytest.mark.parametrize("module", ["copy_reg", "exceptions"])

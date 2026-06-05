@@ -2251,33 +2251,51 @@ def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bo
         except (NotImplementedError, ValueError):
             return True
         cache_paths.append((cache_path, optimize_level))
-    cache_directory = cache_paths[0][0].parent
-    _track_shared_source_paths(
-        (cache_directory,),
-        read_limit=_MAX_BYTECODE_CACHE_DIRECTORY_BYTES,
-    )
-    try:
-        if cache_directory.is_dir():
-            default_cache_name = cache_paths[0][0].name
-            optimized_prefix = f"{default_cache_name[:-4]}.opt-"
-            expected_cache_names = {cache_path.name for cache_path, _ in cache_paths}
-            for index, candidate in enumerate(cache_directory.iterdir()):
-                if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
-                    return True
-                if not candidate.is_file():
-                    continue
-                if _other_cpython_cache_targets_source(
-                    candidate.name,
-                    source_path,
-                    expected_cache_names,
-                ):
-                    return True
-                if candidate.name.startswith(optimized_prefix) and candidate.name.endswith(".pyc"):
-                    optimization = candidate.name[len(optimized_prefix) : -4]
-                    if optimization.isdecimal() and int(optimization) > 2:
+
+    cache_tag = sys.implementation.cache_tag
+    source_local_cache_paths = [
+        (
+            source_path.parent
+            / "__pycache__"
+            / f"{source_path.stem}.{cache_tag}{f'.opt-{optimization}' if optimization else ''}.pyc",
+            optimize_level,
+        )
+        for optimization, optimize_level in _BYTECODE_CACHE_OPTIMIZATIONS
+    ]
+    for source_local_cache_path in source_local_cache_paths:
+        if source_local_cache_path not in cache_paths:
+            cache_paths.append(source_local_cache_path)
+
+    cache_paths_by_directory: dict[Path, list[Path]] = {}
+    for cache_path, _ in cache_paths:
+        cache_paths_by_directory.setdefault(cache_path.parent, []).append(cache_path)
+    for cache_directory, directory_cache_paths in cache_paths_by_directory.items():
+        _track_shared_source_paths(
+            (cache_directory,),
+            read_limit=_MAX_BYTECODE_CACHE_DIRECTORY_BYTES,
+        )
+        try:
+            if cache_directory.is_dir():
+                default_cache_name = directory_cache_paths[0].name
+                optimized_prefix = f"{default_cache_name[:-4]}.opt-"
+                expected_cache_names = {cache_path.name for cache_path in directory_cache_paths}
+                for index, candidate in enumerate(cache_directory.iterdir()):
+                    if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
                         return True
-    except OSError:
-        return True
+                    if not candidate.is_file():
+                        continue
+                    if _other_cpython_cache_targets_source(
+                        candidate.name,
+                        source_path,
+                        expected_cache_names,
+                    ):
+                        return True
+                    if candidate.name.startswith(optimized_prefix) and candidate.name.endswith(".pyc"):
+                        optimization = candidate.name[len(optimized_prefix) : -4]
+                        if optimization.isdecimal() and int(optimization) > 2:
+                            return True
+        except OSError:
+            return True
     _track_shared_source_paths(
         (cache_path for cache_path, _ in cache_paths),
         read_limit=_MAX_BYTECODE_CACHE_BYTES,
@@ -4507,20 +4525,27 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if parts is None:
         return None
     _track_shared_source_candidates(parts)
+    spec = _find_standard_filesystem_spec(module_name)
     loaded_module = sys.modules.get(module_name)
     loaded_spec = getattr(loaded_module, "__spec__", None)
     if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
         if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
             loaded_source_path = Path(loaded_spec.origin)
-            if loaded_source_path.is_file():
+            current_origin = spec.origin if spec is not None else None
+            try:
+                origin_matches = (
+                    isinstance(current_origin, str) and loaded_source_path.resolve() == Path(current_origin).resolve()
+                )
+            except (OSError, RuntimeError, ValueError):
+                origin_matches = False
+            if origin_matches and loaded_source_path.is_file():
                 _track_shared_source_paths((loaded_source_path,))
                 return loaded_source_path
-        if loaded_spec.origin not in {"built-in", "frozen"}:
+        elif loaded_spec.origin not in {"built-in", "frozen"}:
             return None
     elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
-    spec = _find_standard_filesystem_spec(module_name)
     if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
         source_path = Path(spec.origin)
         _track_shared_source_paths((source_path,))

@@ -78,6 +78,13 @@ _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
+_TRUSTED_REDUCE_REFERENCES = frozenset(
+    {
+        ("string", "Formatter"),
+        ("weakref", "proxy"),
+        ("weakref", "ref"),
+    }
+)
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
 _ZIP_MAX_COMMENT_SIZE = 0xFFFF
@@ -1440,16 +1447,29 @@ def _invocation_references_for_positions(
 
 def _trusted_reconstruction_global_positions(callable_invocations: object) -> frozenset[int]:
     opcodes_by_position: dict[int, set[str]] = {}
+    references_by_position: dict[int, set[tuple[str, str]]] = {}
     for raw_invocation in _sequence(callable_invocations):
         invocation = _mapping(raw_invocation)
         position = _optional_int(invocation.get("global_position"))
         if position is None:
             continue
         opcodes_by_position.setdefault(position, set()).add(str(invocation.get("opcode", "")))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if module and name:
+            references_by_position.setdefault(position, set()).add((module, name))
     return frozenset(
         position
         for position, opcodes in opcodes_by_position.items()
-        if opcodes and opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+        if opcodes
+        and (
+            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+            or (
+                opcodes <= {"REDUCE"}
+                and references_by_position.get(position)
+                and references_by_position[position] <= _TRUSTED_REDUCE_REFERENCES
+            )
+        )
     )
 
 
@@ -1465,7 +1485,11 @@ def _trusted_reconstruction_references(callable_invocations: object) -> frozense
     return frozenset(
         reference
         for reference, opcodes in opcodes_by_reference.items()
-        if opcodes and opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+        if opcodes
+        and (
+            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+            or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_REFERENCES)
+        )
     )
 
 
