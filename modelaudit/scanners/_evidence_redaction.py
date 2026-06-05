@@ -8,7 +8,7 @@ import re
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from typing import Any, Final
-from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from modelaudit.detectors.network_comm import (
     _is_azure_container_authority,
@@ -39,6 +39,7 @@ STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")(?![A-Za-z0-9])"
 )
+PERCENT_ENCODED_SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.+/=-]){20,}")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -626,6 +627,22 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     )
 
 
+def _redact_percent_encoded_secret_candidate(match: re.Match[str]) -> str:
+    raw_value = match.group(0)
+    if "%" not in raw_value:
+        return raw_value
+
+    decoded = raw_value
+    for _ in range(3):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+        if STANDALONE_SECRET_RE.search(decoded):
+            return REDACTED_EVIDENCE_VALUE
+    return raw_value
+
+
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
     """Recognize credential assignments nested inside encoded query values."""
     decoded = value
@@ -1004,6 +1021,7 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), redacted)
     redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
+    redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(_redact_percent_encoded_secret_candidate, redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)

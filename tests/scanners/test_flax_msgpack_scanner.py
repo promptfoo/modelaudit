@@ -1035,6 +1035,18 @@ def test_flax_msgpack_redacts_standalone_secret_shaped_metadata_key(tmp_path: Pa
     assert token not in result.to_json()
 
 
+def test_flax_msgpack_redacts_percent_encoded_secret_metadata_key(tmp_path: Path) -> None:
+    path = tmp_path / "encoded_secret_key.msgpack"
+    encoded_token = "ghp%5F" + "a" * 36
+    create_msgpack_file(path, {encoded_token: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert result.metadata["top_level_keys"] == ["<redacted>"]
+    assert encoded_token not in serialized
+
+
 def test_flax_msgpack_stringifies_extension_metadata_keys(tmp_path: Path) -> None:
     path = tmp_path / "extension_key.msgpack"
     secret = "EXTKEYSECRET123456789"

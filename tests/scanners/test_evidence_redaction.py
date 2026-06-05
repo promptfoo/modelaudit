@@ -1246,6 +1246,21 @@ def test_redacts_standalone_secret_token_shapes(token: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "encoded_token",
+    [
+        "ghp%5F" + "a" * 36,
+        "ghp%255F" + "a" * 36,
+        "%67%68%70%5F" + "%61" * 36,
+    ],
+)
+def test_redacts_percent_encoded_standalone_secret_tokens(encoded_token: str) -> None:
+    """Percent encoding must not make a standalone secret safe to serialize."""
+    redacted = redact_evidence_string(f"metadata key: {encoded_token}", max_chars=500)
+
+    assert redacted == f"metadata key: {REDACTED_EVIDENCE_VALUE}"
+
+
+@pytest.mark.parametrize(
     "near_miss",
     [
         "ghp_" + "a" * 35,
@@ -1256,5 +1271,12 @@ def test_redacts_standalone_secret_token_shapes(token: str) -> None:
 def test_preserves_near_miss_standalone_secret_shapes(near_miss: str) -> None:
     """Nearby non-secret identifiers should remain useful evidence."""
     text = f"metadata key: {near_miss}"
+
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_preserves_percent_encoded_standalone_secret_near_miss() -> None:
+    """Encoded identifiers that do not meet a token shape should remain actionable."""
+    text = "metadata key: ghp%5F" + "a" * 35
 
     assert redact_evidence_string(text, max_chars=500) == text
