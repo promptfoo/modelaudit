@@ -21,6 +21,7 @@ from modelaudit.utils.sources.cloud_storage import (
     get_cloud_object_size,
     is_cloud_url,
     redact_cloud_error_for_display,
+    redact_stream_url_for_display,
     redact_url_for_display,
 )
 
@@ -105,15 +106,17 @@ class TestCloudURLRedaction:
         url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
 
-    def test_redact_url_for_display_handles_invalid_port(self) -> None:
-        """Malformed ports must not disable signed-query and userinfo redaction."""
-        url = "https://user:password@example.com:notaport/model.bin?token=secret"
+    def test_redact_url_for_display_fails_closed_for_invalid_port(self) -> None:
+        url = "https://user:password@example.com:not-a-port/model.bin?token=secret"
+        assert redact_url_for_display(url) == "<cloud URL redacted>"
 
-        redacted = redact_url_for_display(url)
+    def test_redact_url_for_display_preserves_ipv6_authority(self) -> None:
+        url = "https://[2001:db8::1]:8443/model.bin?token=secret"
+        assert redact_url_for_display(url) == "https://[2001:db8::1]:8443/model.bin"
 
-        assert redacted == "https://example.com:notaport/model.bin"
-        assert "password" not in redacted
-        assert "secret" not in redacted
+    def test_redact_stream_url_for_display_fails_closed_without_inner_scheme(self) -> None:
+        url = "bucket/model.bin?redirect=https://safe.example&token=secret"
+        assert redact_stream_url_for_display(url) == "<cloud URL redacted>"
 
     def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
         url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
@@ -137,6 +140,15 @@ class TestCloudURLRedaction:
         assert "token=<redacted>" in redacted
         assert "secret" not in redacted
         assert "abc123" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_semicolon_query_credentials(self) -> None:
+        message = "provider failed: https://example.com/model.bin?visible=yes;token=secret-value"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "visible=yes" in redacted
+        assert "token=<redacted>" in redacted
+        assert "secret-value" not in redacted
 
     def test_redact_cloud_error_for_display_redacts_legacy_aws_access_key_id(self) -> None:
         message = (

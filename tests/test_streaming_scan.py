@@ -317,7 +317,7 @@ def test_streaming_malformed_port_error_is_redacted() -> None:
 
     json_text = result.model_dump_json(exclude_none=True)
     assert determine_exit_code(result) == 2
-    assert "stream://https://example.com:notaport/model.pkl" in json_text
+    assert "stream://<cloud URL redacted>" in json_text
     assert "password" not in json_text
     assert "secret-token" not in json_text
 
@@ -376,6 +376,32 @@ def test_streaming_signed_url_routing_exception_log_is_redacted(caplog: pytest.L
     assert "deadbeef" not in caplog.text
     assert "secret-token" not in caplog.text
     assert "X-Amz-Signature" not in caplog.text
+
+
+def test_streaming_signed_url_with_invalid_port_fails_closed() -> None:
+    """Malformed URL authorities must not make the reporting sanitizer raise or leak."""
+    stream_url = "https://example.com:not-a-port/model.pkl?token=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "secret-token" not in json_text
+    assert "token=" not in json_text
+    assert "<cloud URL redacted>" in json_text
+
+
+def test_streaming_signed_url_without_inner_scheme_fails_closed() -> None:
+    """Malformed stream identifiers must not persist their raw query in error assets."""
+    stream_url = "bucket/model.pkl?redirect=https://safe.example&token=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "secret-token" not in json_text
+    assert "token=" not in json_text
+    assert "stream://<cloud URL redacted>" in json_text
 
 
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:

@@ -102,6 +102,19 @@ class TestFormatSarifOutput:
         assert safe_path in invocation["commandLine"]
         assert invocation["arguments"] == [safe_path]
 
+    def test_malformed_stream_paths_fail_closed(self) -> None:
+        """SARIF invocation and asset paths must not retain malformed stream queries."""
+        raw_path = "stream://bucket/model.pkl?token=secret-token"
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path=raw_path, type="pickle")]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, [raw_path])
+
+        assert "secret-token" not in output
+        assert "token=" not in output
+        assert "stream://<cloud URL redacted>" in output
+
     def test_already_redacted_url_preserves_benign_query_context(self) -> None:
         """Repeated SARIF sanitization must not corrupt safe query context."""
         safe_url = "https://collector.example/upload?visible=yes&token=<redacted>"

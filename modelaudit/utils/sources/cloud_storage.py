@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
-_QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#])(?P<key>[^=\s&#]+)=(?P<value>[^\s&#]*)")
+_QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
@@ -62,22 +62,17 @@ def redact_url_for_display(url: str) -> str:
     """Remove credentials, query strings, and fragments from a URL for display."""
     try:
         parts = urlsplit(url)
-    except Exception:
-        return "<cloud URL redacted>"
+        if not parts.scheme:
+            return url
 
-    if not parts.scheme:
-        return url
-
-    try:
-        netloc = parts.hostname or ""
+        hostname = parts.hostname or ""
+        netloc = f"[{hostname}]" if ":" in hostname else hostname
         if parts.port is not None:
             netloc = f"{netloc}:{parts.port}"
-    except ValueError:
-        # Preserve malformed routing context without allowing invalid ports to
-        # disable redaction. Userinfo is still removed before display.
-        netloc = parts.netloc.rsplit("@", 1)[-1]
 
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except Exception:
+        return "<cloud URL redacted>"
 
 
 def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
@@ -128,6 +123,16 @@ def _is_sensitive_query_param(key: str) -> bool:
         "token",
     )
     return normalized_key in exact_sensitive_keys or normalized_key.endswith(sensitive_suffixes)
+
+
+def redact_stream_url_for_display(url: str) -> str:
+    """Return a fail-closed display identifier for a stream source URL."""
+    try:
+        if not urlsplit(url).scheme:
+            return "<cloud URL redacted>"
+    except Exception:
+        return "<cloud URL redacted>"
+    return redact_url_for_display(url)
 
 
 def _bound_cloud_metadata_error_display(message: str) -> str:

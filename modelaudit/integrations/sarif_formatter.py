@@ -22,6 +22,7 @@ from modelaudit.core_results import (
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
 from modelaudit.utils.sources.cloud_storage import redact_cloud_error_for_display as _redact_cloud_error_for_display
+from modelaudit.utils.sources.cloud_storage import redact_stream_url_for_display as _redact_stream_url_for_display
 from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
 
 _URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
@@ -459,7 +460,7 @@ def _normalize_path_to_uri(path: str) -> str:
 def _redact_path_for_sarif(path: str) -> str:
     """Return a SARIF-safe path without signed URL material."""
     if path.startswith("stream://"):
-        return f"stream://{_redact_url_for_display(path[9:])}"
+        return f"stream://{_redact_stream_url_for_display(path[9:])}"
     return _redact_url_for_display(path)
 
 
