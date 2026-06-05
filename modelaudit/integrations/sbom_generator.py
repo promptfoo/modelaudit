@@ -19,6 +19,7 @@ _MAX_SYMLINK_HOPS = 40
 _DESCRIPTOR_WALK_SUPPORTED = (
     hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "fwalk")
     and os.open in os.supports_dir_fd
     and os.readlink in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
@@ -98,13 +99,26 @@ def _supports_descriptor_walk() -> bool:
     return _DESCRIPTOR_WALK_SUPPORTED
 
 
-def _open_scan_root_fd(scan_root: str) -> int | None:
+def _directory_open_flags(*, readable: bool) -> int:
+    if readable:
+        flags = os.O_RDONLY
+    elif hasattr(os, "O_PATH"):
+        flags = os.O_PATH
+    elif hasattr(os, "O_SEARCH"):
+        flags = os.O_SEARCH
+    else:
+        flags = os.O_RDONLY
+    flags |= os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_scan_root_fd(scan_root: str, *, readable: bool = False) -> int | None:
     if not _supports_descriptor_walk():
         return None
 
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
+    flags = _directory_open_flags(readable=readable)
 
     current_fd = -1
     try:
@@ -120,6 +134,36 @@ def _open_scan_root_fd(scan_root: str) -> int | None:
         if current_fd >= 0:
             os.close(current_fd)
         return None
+
+
+def _iter_scan_root_files(
+    input_path: str,
+    scan_root_fd: int | None,
+    *,
+    require_stable_root: bool,
+) -> Iterable[tuple[str, str]]:
+    """Yield display and root-relative paths from a pinned directory when available."""
+    if scan_root_fd is not None:
+        try:
+            for relative_root, _, files, _ in os.fwalk(
+                os.curdir,
+                follow_symlinks=False,
+                dir_fd=scan_root_fd,
+            ):
+                for filename in files:
+                    relative_path = os.path.normpath(os.path.join(relative_root, filename))
+                    yield os.path.join(input_path, relative_path), relative_path
+        except OSError:
+            return
+        return
+
+    if require_stable_root:
+        return
+
+    for root, _, files in os.walk(input_path):
+        for filename in files:
+            display_path = os.path.join(root, filename)
+            yield display_path, os.path.relpath(display_path, input_path)
 
 
 def _relative_path_parts(path: str) -> list[str] | None:
@@ -365,10 +409,12 @@ def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
         if isinstance(asset, dict):
             asset_path = asset.get("path")
             asset_type = asset.get("type")
+            is_streamed = asset.get("is_streamed")
         else:
             asset_path = getattr(asset, "path", None)
             asset_type = getattr(asset, "type", None)
-        if asset_type == "streaming" and isinstance(asset_path, str):
+            is_streamed = getattr(asset, "is_streamed", None)
+        if (is_streamed is True or asset_type == "streaming") and isinstance(asset_path, str):
             trusted_paths.add(asset_path)
     return trusted_paths
 
@@ -672,30 +718,32 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
-            scan_root_fd = _open_scan_root_fd(scan_root)
+            scan_root_fd = _open_scan_root_fd(scan_root, readable=True)
             try:
-                for root, _, files in os.walk(input_path):
-                    for f in files:
-                        fp = os.path.join(root, f)
-                        if _should_skip_sbom_file(fp):
-                            continue
-                        meta_model = file_meta.get(fp)
-                        # Convert Pydantic model to dict if needed
-                        if meta_model is not None and hasattr(meta_model, "model_dump"):
-                            meta = meta_model.model_dump()
-                        else:
-                            meta = meta_model or {}
-                        component = _component_for_file(
-                            fp,
-                            meta,
-                            issues_dicts,
-                            scan_root,
-                            allow_metadata_fallback=False,
-                            scan_root_fd=scan_root_fd,
-                            relative_path=os.path.relpath(fp, input_path),
-                            require_stable_root=require_stable_root,
-                        )
-                        bom.components.add(component)
+                for fp, relative_path in _iter_scan_root_files(
+                    input_path,
+                    scan_root_fd,
+                    require_stable_root=require_stable_root,
+                ):
+                    if _should_skip_sbom_file(fp):
+                        continue
+                    meta_model = file_meta.get(fp)
+                    # Convert Pydantic model to dict if needed
+                    if meta_model is not None and hasattr(meta_model, "model_dump"):
+                        meta = meta_model.model_dump()
+                    else:
+                        meta = meta_model or {}
+                    component = _component_for_file(
+                        fp,
+                        meta,
+                        issues_dicts,
+                        scan_root,
+                        allow_metadata_fallback=False,
+                        scan_root_fd=scan_root_fd,
+                        relative_path=relative_path,
+                        require_stable_root=require_stable_root,
+                    )
+                    bom.components.add(component)
             finally:
                 if scan_root_fd is not None:
                     os.close(scan_root_fd)
@@ -752,25 +800,27 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
-            scan_root_fd = _open_scan_root_fd(scan_root)
+            scan_root_fd = _open_scan_root_fd(scan_root, readable=True)
             try:
-                for root, _, files in os.walk(input_path):
-                    for f in files:
-                        fp = os.path.join(root, f)
-                        if _should_skip_sbom_file(fp):
-                            continue
-                        metadata = file_metadata.get(fp)
-                        component = _component_for_file_pydantic(
-                            fp,
-                            metadata,
-                            issues,
-                            scan_root,
-                            allow_metadata_fallback=False,
-                            scan_root_fd=scan_root_fd,
-                            relative_path=os.path.relpath(fp, input_path),
-                            require_stable_root=require_stable_root,
-                        )
-                        bom.components.add(component)
+                for fp, relative_path in _iter_scan_root_files(
+                    input_path,
+                    scan_root_fd,
+                    require_stable_root=require_stable_root,
+                ):
+                    if _should_skip_sbom_file(fp):
+                        continue
+                    metadata = file_metadata.get(fp)
+                    component = _component_for_file_pydantic(
+                        fp,
+                        metadata,
+                        issues,
+                        scan_root,
+                        allow_metadata_fallback=False,
+                        scan_root_fd=scan_root_fd,
+                        relative_path=relative_path,
+                        require_stable_root=require_stable_root,
+                    )
+                    bom.components.add(component)
             finally:
                 if scan_root_fd is not None:
                     os.close(scan_root_fd)

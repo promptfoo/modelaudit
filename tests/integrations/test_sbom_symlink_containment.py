@@ -364,7 +364,7 @@ def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
     }
     results = {
         "issues": [],
-        "assets": [{"path": str(streamed_path), "type": "streaming"}],
+        "assets": [{"path": str(streamed_path), "type": "pickle", "is_streamed": True}],
         "file_metadata": {str(streamed_path): metadata},
     }
     real_open = os.open
@@ -389,14 +389,17 @@ def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
     assert _property_value(component, "size") == str(len(recorded_content))
 
 
-def test_sbom_does_not_hash_replaced_scan_root(
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_enumeration_stays_bound_to_replaced_scan_root(
     tmp_path: Path,
     requires_symlinks: None,
     monkeypatch: pytest.MonkeyPatch,
+    use_pydantic: bool,
 ) -> None:
     scan_root = tmp_path / "scan-root"
     scan_root.mkdir()
     (scan_root / "inside.bin").write_bytes(b"original contained file")
+    inside_hash = hashlib.sha256(b"original contained file").hexdigest()
     moved_root = tmp_path / "moved-root"
     outside_root = tmp_path / "outside-root"
     outside_root.mkdir()
@@ -404,21 +407,68 @@ def test_sbom_does_not_hash_replaced_scan_root(
     (outside_root / "secret.bin").write_bytes(outside_content)
     outside_hash = hashlib.sha256(outside_content).hexdigest()
     real_walk = os.walk
+    real_fwalk = os.fwalk
     swapped = False
 
-    def _replace_root_before_walk(path: str) -> Any:
+    def _replace_root() -> None:
         nonlocal swapped
-        if path == str(scan_root) and not swapped:
+        if not swapped:
             swapped = True
             scan_root.rename(moved_root)
             scan_root.symlink_to(outside_root, target_is_directory=True)
+
+    def _replace_root_before_walk(path: str) -> Any:
+        if path == str(scan_root):
+            _replace_root()
         return real_walk(path)
 
+    def _replace_root_before_fwalk(*args: Any, **kwargs: Any) -> Any:
+        _replace_root()
+        return real_fwalk(*args, **kwargs)
+
     monkeypatch.setattr(os, "walk", _replace_root_before_walk)
+    monkeypatch.setattr(os, "fwalk", _replace_root_before_fwalk)
 
-    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
-    component = _component_named(sbom_data, "secret.bin")
+    if use_pydantic:
+        sbom_text = generate_sbom_pydantic([str(scan_root)], create_initial_audit_result())
+    else:
+        sbom_text = generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}})
+    sbom_data: dict[str, Any] = json.loads(sbom_text)
 
-    assert _sha256_values(component) == []
     assert outside_hash not in json.dumps(sbom_data)
-    assert _property_value(component, "size") == "0"
+    if _supports_descriptor_walk():
+        component = _component_named(sbom_data, "inside.bin")
+        assert _sha256_values(component) == [inside_hash]
+        assert all(entry.get("name") != "secret.bin" for entry in sbom_data.get("components", []))
+    else:
+        component = _component_named(sbom_data, "secret.bin")
+        assert _sha256_values(component) == []
+        assert _property_value(component, "size") == "0"
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not (hasattr(os, "O_PATH") or hasattr(os, "O_SEARCH")),
+    reason="execute-only directory descriptors are unavailable",
+)
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_hashes_single_file_beneath_execute_only_parent(
+    tmp_path: Path,
+    use_pydantic: bool,
+) -> None:
+    parent = tmp_path / "execute-only"
+    parent.mkdir()
+    model_file = parent / "model.bin"
+    content = b"readable file beneath an execute-only parent"
+    model_file.write_bytes(content)
+    parent.chmod(0o111)
+    try:
+        if use_pydantic:
+            sbom_text = generate_sbom_pydantic([str(model_file)], create_initial_audit_result())
+        else:
+            sbom_text = generate_sbom([str(model_file)], {"issues": [], "file_metadata": {}})
+    finally:
+        parent.chmod(0o700)
+
+    component = _component_named(json.loads(sbom_text), model_file.name)
+    assert _sha256_values(component) == [hashlib.sha256(content).hexdigest()]
+    assert _property_value(component, "size") == str(len(content))
