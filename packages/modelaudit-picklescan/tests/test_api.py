@@ -3413,6 +3413,10 @@ def test_scan_bytes_warns_when_invoked_dill_dump_origin_is_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._resolve_module_source",
+        lambda _module_name: None,
+    )
+    monkeypatch.setattr(
         "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
         lambda _module_name: None,
     )
