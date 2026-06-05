@@ -4,6 +4,7 @@ import os
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import yaml
@@ -18,6 +19,43 @@ from ..utils._path_hardening import (
 
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
+
+
+def validate_api_host_for_bearer_auth(api_host: str) -> str:
+    """Return a normalized caller-selected or persisted HTTPS API host."""
+    stripped_host = api_host.strip()
+    if (
+        not stripped_host
+        or "\\" in stripped_host
+        or "%" in stripped_host
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in stripped_host)
+    ):
+        raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL")
+
+    try:
+        parsed = urlparse(stripped_host)
+        hostname = parsed.hostname.lower() if parsed.hostname else None
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL") from error
+
+    if parsed.scheme.lower() != "https":
+        raise ValueError("API host for bearer-token authentication must use HTTPS")
+
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError("API host for bearer-token authentication must not include credentials")
+
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("API host for bearer-token authentication must be a base API URL")
+
+    if hostname is None:
+        raise ValueError("API host for bearer-token authentication must include a hostname")
+    if port == 0:
+        raise ValueError("API host for bearer-token authentication must include a valid port")
+
+    normalized_hostname = f"[{hostname}]" if ":" in hostname else hostname
+    normalized_port = f":{port}" if port not in (None, 443) else ""
+    return f"https://{normalized_hostname}{normalized_port}"
 
 
 class GlobalConfig:
@@ -61,13 +99,41 @@ class CloudConfig:
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host."""
-        self.config["apiHost"] = api_host
-        self._save_config()
+        self._persist_config_update(
+            {"apiHost": validate_api_host_for_bearer_auth(api_host)},
+            "Unable to persist cloud API host",
+        )
 
     def set_api_key(self, api_key: str) -> None:
         """Set API key."""
         self.config["apiKey"] = api_key
         self._save_config()
+
+    def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
+        """Persist bearer-token configuration as one atomic cloud update."""
+        self._persist_config_update(
+            {
+                "apiHost": validate_api_host_for_bearer_auth(api_host),
+                "apiKey": api_key,
+                "appUrl": app_url,
+            },
+            "Unable to persist cloud authentication credentials",
+        )
+
+    def _persist_config_update(self, updates: dict[str, Any], failure_message: str) -> None:
+        """Save a cloud config update without exposing uncommitted in-memory state."""
+        previous_config = dict(self.config)
+        expected_config = {**previous_config, **updates}
+        self.config = expected_config
+        try:
+            self._save_config()
+        except Exception:
+            self.config = previous_config
+            raise
+
+        if any(self.config.get(key) != expected_value for key, expected_value in updates.items()):
+            self.config = previous_config
+            raise OSError(failure_message)
 
     def get_api_key(self) -> str | None:
         """Get API key."""

