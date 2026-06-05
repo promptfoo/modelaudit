@@ -279,7 +279,7 @@ def _r_equals_is_named_argument(
                 return False
             closed = stack.pop()
             if closed == target:
-                if target_is_function_formals and not _r_function_body_follows(
+                if target_is_function_formals and not _r_expression_follows(
                     text,
                     cursor + 1,
                     non_code_spans,
@@ -324,7 +324,7 @@ def _r_open_paren_starts_argument_list(
         return (
             not crossed_newline
             and opener_position is not None
-            and _r_open_bracket_starts_subscript(text, opener_position, non_code_spans)
+            and _r_subscript_result_can_start_call(text, opener_position, non_code_spans)
         )
     if character == ")":
         if crossed_newline:
@@ -417,43 +417,135 @@ def _r_grouped_expression_is_obviously_non_callable(expression: str) -> bool:
     return saw_value
 
 
-def _r_function_body_follows(
+def _r_next_code_position(
     text: str,
     position: int,
     non_code_spans: list[tuple[int, int]],
-) -> bool:
+) -> int | None:
     cursor = position
     while cursor < len(text):
         while cursor < len(text) and text[cursor].isspace():
             cursor += 1
         if cursor >= len(text):
-            return False
+            return None
 
         span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
-        if span_index >= 0 and cursor < non_code_spans[span_index][1]:
-            span_start, span_end = non_code_spans[span_index]
-            if text[span_start] != "#":
-                return True
-            cursor = span_end
-            continue
-        if text[cursor] in ";,)]}":
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            return cursor
+        span_start, span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return cursor
+        cursor = span_end
+    return None
+
+
+def _r_expression_follows(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = _r_next_code_position(text, position, non_code_spans)
+    if cursor is None:
+        return False
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        return True
+    if text[cursor] in ";,)]}":
+        return False
+    while text[cursor] in "+-!~?":
+        cursor = _r_next_code_position(text, cursor + 1, non_code_spans)
+        if cursor is None:
             return False
-        while text[cursor] in "+-!~?":
-            cursor += 1
-            while True:
-                while cursor < len(text) and text[cursor].isspace():
-                    cursor += 1
-                if cursor >= len(text):
-                    return False
-                span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
-                if span_index < 0 or cursor >= non_code_spans[span_index][1]:
-                    break
-                span_start, span_end = non_code_spans[span_index]
-                if text[span_start] != "#":
-                    return True
-                cursor = span_end
-        return text[cursor] not in ";,)]}*/^:%<>=&|"
-    return False
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+            return True
+
+    if text[cursor].isalnum() or text[cursor] in "._":
+        token_end = cursor + 1
+        while token_end < len(text) and (text[token_end].isalnum() or text[token_end] in "._"):
+            token_end += 1
+        token = text[cursor:token_end]
+        if token in {"else", "in"}:
+            return False
+        if token in {"break", "next"}:
+            return True
+        if token == "repeat":
+            return _r_expression_follows(text, token_end, non_code_spans)
+        if token in {"for", "function", "if", "while"}:
+            opener_position = _r_next_code_position(text, token_end, non_code_spans)
+            if opener_position is None or text[opener_position] != "(":
+                return False
+            closer_position = _r_matching_close_delimiter_position(text, opener_position, non_code_spans)
+            return closer_position is not None and _r_expression_follows(text, closer_position + 1, non_code_spans)
+        return True
+    return text[cursor] not in ";,)]}*/^:%<>=&|"
+
+
+def _r_expression_before_position_is_obviously_non_callable(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position - 1
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    if cursor < 0:
+        return True
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        return text[non_code_spans[span_index][0]] != "`"
+
+    character = text[cursor]
+    if character == "]":
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        return opener_position is None or _r_expression_before_position_is_obviously_non_callable(
+            text,
+            opener_position,
+            non_code_spans,
+        )
+    if character == ")":
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        if opener_position is None:
+            return True
+        if _r_open_paren_starts_argument_list(text, opener_position, non_code_spans):
+            return False
+        opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
+        if opener_prefix is not None:
+            return not _r_token_can_start_call(opener_prefix)
+        return not _r_delimited_expression_can_start_call(text, opener_position, cursor, non_code_spans)
+    if character == "}":
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        return opener_position is None or not _r_delimited_expression_can_start_call(
+            text,
+            opener_position,
+            cursor,
+            non_code_spans,
+        )
+    if not (character.isalnum() or character in "._"):
+        return False
+
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    return not _r_token_can_start_call(text[cursor + 1 : token_end])
+
+
+def _r_subscript_result_can_start_call(
+    text: str,
+    opener_position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    return _r_open_bracket_starts_subscript(
+        text,
+        opener_position,
+        non_code_spans,
+    ) and not _r_expression_before_position_is_obviously_non_callable(
+        text,
+        opener_position,
+        non_code_spans,
+    )
 
 
 def _r_token_can_start_subscript(token: str) -> bool:
@@ -572,6 +664,39 @@ def _r_matching_open_delimiter_position(
                 return stack[-1][1] if is_matched else None
             if is_matched:
                 stack.pop()
+        cursor += 1
+    return None
+
+
+def _r_matching_close_delimiter_position(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> int | None:
+    if position >= len(text) or text[position] not in "([{":
+        return None
+
+    closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack = [text[position]]
+    cursor = position + 1
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    span_index = max(0, span_index)
+    while cursor < len(text):
+        while span_index < len(non_code_spans) and non_code_spans[span_index][1] <= cursor:
+            span_index += 1
+        if span_index < len(non_code_spans) and non_code_spans[span_index][0] <= cursor:
+            cursor = non_code_spans[span_index][1]
+            continue
+
+        character = text[cursor]
+        if character in closing_delimiters:
+            stack.append(character)
+        elif character in ")]}":
+            if closing_delimiters[stack[-1]] != character:
+                return None
+            stack.pop()
+            if not stack:
+                return cursor
         cursor += 1
     return None
 
