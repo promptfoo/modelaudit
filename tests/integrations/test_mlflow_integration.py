@@ -1,8 +1,9 @@
 import hashlib
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -71,45 +72,77 @@ def test_copy_local_mlflow_artifact_removes_partial_file_when_source_grows(
     source_path = source_root / "model.bin"
     source_path.write_bytes(b"abcd")
     destination = tmp_path / "download" / "model.bin"
-    original_open = Path.open
+    original_read = os.read
+    grew = False
 
-    class GrowingReader:
-        def __init__(self, file_object: Any) -> None:
-            self.file_object = file_object
-            self.grew = False
-
-        def __enter__(self) -> "GrowingReader":
-            self.file_object.__enter__()
-            return self
-
-        def __exit__(self, *args: Any) -> None:
-            self.file_object.__exit__(*args)
-
-        def fileno(self) -> int:
-            return cast(int, self.file_object.fileno())
-
-        def read(self, size: int = -1) -> bytes:
-            data = cast(bytes, self.file_object.read(size))
-            if not self.grew:
-                with original_open(source_path, "ab") as output:
-                    output.write(b"e")
-                self.grew = True
-            return data
-
-    def growing_open(path: Path, *args: Any, **kwargs: Any) -> Any:
-        file_object = original_open(path, *args, **kwargs)
-        mode = args[0] if args else kwargs.get("mode", "r")
-        if path == source_path and mode == "rb":
-            return GrowingReader(file_object)
-        return file_object
+    def growing_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal grew
+        data = original_read(file_descriptor, size)
+        if not grew:
+            with source_path.open("ab") as output:
+                output.write(b"e")
+            grew = True
+        return data
 
     monkeypatch.setattr("modelaudit.integrations.mlflow._MLFLOW_COPY_CHUNK_SIZE", 2)
-    monkeypatch.setattr(Path, "open", growing_open)
+    monkeypatch.setattr(os, "read", growing_read)
 
     with pytest.raises(_MlflowArtifactSizeChangedError) as exc_info:
         _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="model.bin", size=4), destination)
 
     assert exc_info.value.actual_size == 5
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
+def test_copy_local_mlflow_artifact_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    """Special files must be rejected after a nonblocking open."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    os.mkfifo(source_root / "model.bin")
+    destination = tmp_path / "download" / "model.bin"
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="model.bin", size=0), destination)
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(
+    not getattr(os, "O_NOFOLLOW", 0) or os.open not in os.supports_dir_fd,
+    reason="race-resistant descriptor traversal is not supported on this platform",
+)
+def test_copy_local_mlflow_artifact_rejects_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory swapped to a symlink while opening must fail closed."""
+    source_root = tmp_path / "source"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "model.bin").write_bytes(b"SAFE")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "model.bin").write_bytes(b"EVIL")
+    destination = tmp_path / "download" / "model.bin"
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal swapped
+        if path == "nested" and dir_fd is not None and not swapped:
+            preserved = source_root / "preserved"
+            nested.rename(preserved)
+            nested.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(OSError):
+        _copy_local_mlflow_artifact(source_root, _MlflowArtifact(path="nested/model.bin", size=4), destination)
+
+    assert swapped is True
     assert not destination.exists()
 
 
@@ -318,6 +351,46 @@ def test_scan_mlflow_model_downloads_mutable_ref_from_preflight_repo(
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
 
 
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_accepts_empty_local_artifact_directory(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """An empty local artifact is known to be within every finite byte budget."""
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = []
+    source_root = tmp_path / "mlflow_artifacts"
+    source_root.mkdir()
+    download_dir = tmp_path / "modelaudit_mlflow_empty"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+    mock_scan.return_value = {"bytes_scanned": 0, "issues": []}
+
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+
+    assert result == mock_scan.return_value
+    mock_scan.assert_called_once_with(
+        str(download_dir),
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=10,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=None,
+    )
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_rejects_unknown_size_before_download(
@@ -375,7 +448,7 @@ def test_scan_mlflow_model_redacts_header_credentials_from_size_errors(
     """Backend authorization values must not be retained in budget findings."""
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError(
-        "request failed; Authorization: Bearer very-secret-token; api_key=another-secret"
+        "request failed; headers={'Authorization': 'Bearer very-secret-token', \"api_key\": \"another secret\"}"
     )
 
     with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
@@ -384,9 +457,50 @@ def test_scan_mlflow_model_redacts_header_credentials_from_size_errors(
     mock_mkdtemp.assert_not_called()
     mock_scan.assert_not_called()
     reported_error = result.checks[0].details["error"]
-    assert reported_error == "request failed; Authorization: <redacted>; api_key=<redacted>"
+    assert reported_error == "request failed; headers={'Authorization': '<redacted>', \"api_key\": \"<redacted>\"}"
     assert "very-secret-token" not in result.model_dump_json()
-    assert "another-secret" not in result.model_dump_json()
+    assert "another secret" not in result.model_dump_json()
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_file_added_after_preflight(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Files added after metadata validation must not be silently omitted from the scan."""
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = [
+        SimpleNamespace(path="model.pkl", is_dir=False, file_size=4),
+    ]
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 4})
+    download_dir = tmp_path / "modelaudit_mlflow_changed"
+
+    def add_artifact_before_download(*args: Any, **kwargs: Any) -> str:
+        del args, kwargs
+        download_dir.mkdir()
+        _write_local_artifacts(source_root, {"malicious.pkl": 4})
+        return str(download_dir)
+
+    mock_mkdtemp.side_effect = add_artifact_before_download
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+
+    with (
+        patch("modelaudit.integrations.mlflow._local_mlflow_artifact_root", return_value=source_root),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+    ):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=10)
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_set_changed"
+    assert result.checks[0].details["added_artifact_paths"] == ["malicious.pkl"]
 
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
