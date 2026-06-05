@@ -502,6 +502,16 @@ def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
     return len(parts) > 1 and _is_sensitive_path_key(parts[-1])
 
 
+def _empty_sensitive_path_assignment_key(segment: str) -> str | None:
+    """Return the sensitive key when an assignment leaves its value to a later segment."""
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = _decode_path_token(token_candidate)
+    assignment_parts = decoded.split("=")
+    if len(assignment_parts) < 2 or assignment_parts[-1].strip():
+        return None
+    return next((key for key in assignment_parts[:-1] if _is_sensitive_path_key(key)), None)
+
+
 def _redact_sensitive_path_assignment(segment: str, *, preserve_key: bool = False) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = _decode_path_token(token_candidate)
@@ -515,14 +525,6 @@ def _redact_sensitive_path_assignment(segment: str, *, preserve_key: bool = Fals
     if preserve_key and sensitive_key_index == 0:
         return f"{assignment_parts[0]}={_REDACTED_PATH_TOKEN}{trailing_delimiters}"
     return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
-
-
-def _sensitive_path_assignment_awaits_value(segment: str) -> bool:
-    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
-    decoded = _decode_path_token(token_candidate)
-    if not decoded.endswith("="):
-        return False
-    return any(_is_sensitive_path_key(key) for key in decoded[:-1].split("="))
 
 
 def _redact_hostname_tokens(hostname: str) -> str:
@@ -608,7 +610,10 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         sensitive_assignment_redaction = _redact_sensitive_path_assignment(segment)
         if sensitive_assignment_redaction is not None:
             segments[index] = sensitive_assignment_redaction
-            redact_next_value = _sensitive_path_assignment_awaits_value(segment)
+            empty_assignment_key = _empty_sensitive_path_assignment_key(segment)
+            if empty_assignment_key is not None:
+                redact_next_value = True
+                authorization_value_pending = _is_authorization_path_key(empty_assignment_key)
             continue
         encoded_separator_redaction = _redact_encoded_path_separator_tokens(segment)
         if encoded_separator_redaction is not None:
@@ -892,7 +897,7 @@ def _match_starts_inside_percent_escape(data: bytes, match_start: int) -> bool:
         or not all(byte in b"0123456789abcdefABCDEF" for byte in data[match_start : match_start + 2])
     ):
         return False
-    return int(data[match_start : match_start + 2], 16) in b"/=?&#;:@"
+    return int(data[match_start : match_start + 2], 16) in b"/=?&#;:@,'\" \t\r\n"
 
 
 def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
@@ -969,6 +974,24 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
                 return True
 
     field = component[field_start:field_end]
+    decoded_field = _decode_path_token(field)
+    if decoded_field == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
+        return True
+    delimited_parts = [part for part in re.split(r"(?i)&amp;|[/,:;&\s]", decoded_field) if part]
+    redact_next_value = False
+    authorization_value_pending = False
+    for index, part in enumerate(delimited_parts):
+        if redact_next_value:
+            if value_lower in part.lower():
+                return True
+            following_value = next((candidate for candidate in delimited_parts[index + 1 :] if candidate), None)
+            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(part, following_value)
+            authorization_value_pending = False
+            continue
+        if _is_sensitive_path_key(part):
+            redact_next_value = True
+            authorization_value_pending = _is_authorization_path_key(part)
+
     for redacted_field in (
         _redact_encoded_path_separator_tokens(field),
         _redact_colon_delimited_path_tokens(field),
