@@ -127,6 +127,94 @@ def test_download_pytorch_hub_model_streaming_enforces_max_size_while_streaming(
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_enforces_cumulative_actual_size(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    stream_dir = tmp_path / "stream"
+    stream_dir.mkdir()
+    mock_mkdtemp.return_value = str(stream_dir)
+    first_url = "https://download.pytorch.org/models/first.pth"
+    second_url = "https://download.pytorch.org/models/second.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+
+    file_responses = []
+    for payload in (b"abc", b"def"):
+        file_resp = MagicMock()
+        file_resp.__enter__.return_value = file_resp
+        file_resp.headers = {"content-length": "1"}
+        file_resp.iter_content.return_value = [payload]
+        file_resp.raise_for_status = lambda: None
+        file_responses.append(file_resp)
+    mock_get.side_effect = [html_resp, *file_responses]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    generator = download_pytorch_hub_model_streaming(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        show_progress=False,
+        max_size=5,
+    )
+    first_path, is_last = next(generator)
+    assert first_path.read_bytes() == b"abc"
+    assert is_last is False
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        next(generator)
+
+    assert not stream_dir.exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_allows_exact_size_limit(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    stream_dir = tmp_path / "stream"
+    stream_dir.mkdir()
+    mock_mkdtemp.return_value = str(stream_dir)
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "6"}
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "6"}
+    mock_head.return_value = head_resp
+
+    yielded = [
+        (file_path.read_bytes(), is_last)
+        for file_path, is_last in download_pytorch_hub_model_streaming(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            show_progress=False,
+            max_size=6,
+        )
+    ]
+
+    assert yielded == [(b"abcdef", True)]
+    assert not stream_dir.exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
 def test_download_pytorch_hub_model_streaming_deduplicates_links_before_budget_check(
     mock_get: MagicMock,
     mock_head: MagicMock,

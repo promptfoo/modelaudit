@@ -117,6 +117,7 @@ def download_pytorch_hub_model_streaming(
     Args:
         url: PyTorch Hub model page URL
         show_progress: Whether to show progress messages
+        max_size: Maximum cumulative weight download size in bytes
 
     Yields:
         Tuples of (file_path, is_last) for each weight file

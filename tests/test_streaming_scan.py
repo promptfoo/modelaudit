@@ -818,6 +818,12 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
     streamed_file = tmp_path / "streamed.pkl"
     streamed_file.write_bytes(b"payload")
     generator_closed = False
+    clock_calls = 0
+
+    def fake_time() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return 0.0 if clock_calls == 1 else 1.0
 
     def file_generator() -> Iterator[tuple[Path, bool]]:
         nonlocal generator_closed
@@ -827,7 +833,10 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
             generator_closed = True
 
     retained_generator = file_generator()
-    with patch("modelaudit.core.scan_file") as mock_scan:
+    with (
+        patch("modelaudit.core.time.time", side_effect=fake_time),
+        patch("modelaudit.core.scan_file") as mock_scan,
+    ):
         result = scan_model_streaming(
             file_generator=retained_generator,
             timeout=0,
@@ -835,6 +844,7 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
         )
 
     assert result.has_errors is True
+    assert result.success is False
     assert generator_closed is True
     assert not streamed_file.exists()
     mock_scan.assert_not_called()
