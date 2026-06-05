@@ -553,6 +553,85 @@ class TestDvcIntegration:
             issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
         )
 
+    def test_dvc_file_symlink_covered_by_declared_file_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A directory symlink to a separately declared file remains covered and scans once."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        payload = tmp_path / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"covered": True}))
+        (model_dir / "linked.pkl").symlink_to(payload)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n- path: payload.pkl\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert scanned_paths == [str(payload)]
+        assert result.files_scanned == 1
+        assert result.has_errors is False
+        assert result.success is True
+        assert result.content_hash is not None
+        assert not any(issue.message == "Path traversal outside scanned directory" for issue in result.issues)
+        assert not any(
+            issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
+        )
+
+    def test_dvc_file_symlink_next_to_declared_file_remains_uncovered(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Declaring one file must not cover sibling files in the same directory."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        declared_file = tmp_path / "declared.pkl"
+        declared_file.write_bytes(pickle.dumps({"declared": True}))
+        undeclared_file = tmp_path / "undeclared.pkl"
+        undeclared_file.write_bytes(pickle.dumps({"hidden": True}))
+        linked_file = model_dir / "linked.pkl"
+        linked_file.symlink_to(undeclared_file)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n- path: declared.pkl\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert scanned_paths == [str(declared_file)]
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None
+        assert str(linked_file) in incomplete_issue.details["unresolved_outputs"]
+
     def test_internal_dvc_directory_symlinks_cannot_hide_later_escape(
         self,
         tmp_path: Path,

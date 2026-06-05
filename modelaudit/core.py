@@ -1649,9 +1649,7 @@ def scan_model_directory_or_file(
                 if dvc_resolution.analysis_incomplete:
                     aggregate_hash_complete = False
                 target_files = list(dvc_resolution.resolved_paths)
-            dvc_directory_coverage_roots = tuple(
-                str(Path(target).resolve()) for target in target_files if os.path.isdir(target)
-            )
+            dvc_declared_output_roots = tuple(str(Path(target).resolve()) for target in target_files)
             scanned_dvc_paths: set[str] = set()
 
             for _idx, target in enumerate(target_files):
@@ -1715,7 +1713,7 @@ def scan_model_directory_or_file(
                     if is_dvc_pointer:
                         nested_kwargs[_DVC_PARENT_FILE_CONFIG_KEY] = path
                         nested_kwargs[_DVC_EXCLUDED_PATHS_CONFIG_KEY] = tuple(scanned_dvc_paths)
-                        nested_kwargs[_DVC_COVERAGE_ROOTS_CONFIG_KEY] = dvc_directory_coverage_roots
+                        nested_kwargs[_DVC_COVERAGE_ROOTS_CONFIG_KEY] = dvc_declared_output_roots
                     if is_dvc_pointer and max_total_size > 0:
                         nested_kwargs[_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY] = max_total_size - results.bytes_scanned
                         nested_kwargs[_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY] = max_total_size
