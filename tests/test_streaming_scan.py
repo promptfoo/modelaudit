@@ -1549,3 +1549,5 @@ def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> Non
         assert result.success is True
         assert result.files_scanned == len(temp_test_files)
         assert mock_asset.call_count == 3
+        assert result.assets
+        assert all(asset.is_streamed is True for asset in result.assets)

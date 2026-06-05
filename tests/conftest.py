@@ -212,6 +212,7 @@ def pytest_runtest_setup(item):
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
+            "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
         ]
         allowed_test_nodeids = [
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
