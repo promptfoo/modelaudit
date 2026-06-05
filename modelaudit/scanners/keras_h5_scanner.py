@@ -119,13 +119,10 @@ class KerasH5Scanner(BaseScanner):
             "importlib",
             "marshal",
             "multiprocessing",
-            "nt",
-            "operator",
             "os",
             "pdb",
             "pickle",
             "pip",
-            "posix",
             "profile",
             "pty",
             "runpy",
@@ -139,6 +136,26 @@ class KerasH5Scanner(BaseScanner):
             "threading",
             "trace",
             "webbrowser",
+        }
+    )
+    _EXACT_DANGEROUS_LAMBDA_MODULES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "_ctypes",
+            "_frozen_importlib",
+            "_frozen_importlib_external",
+            "_imp",
+            "_interpreters",
+            "_io",
+            "_multiprocessing",
+            "_pickle",
+            "_posixsubprocess",
+            "_signal",
+            "_socket",
+            "_thread",
+            "_winapi",
+            "_xxsubinterpreters",
+            "nt",
+            "posix",
         }
     )
     _DANGEROUS_LAMBDA_FUNCTION_NAMES: ClassVar[frozenset[str]] = frozenset(
@@ -1098,7 +1115,10 @@ class KerasH5Scanner(BaseScanner):
         # Legacy Keras H5 stores named callables in `function` and distinguishes
         # them from serialized Lambda code with `function_type="function"`.
         is_named_function_reference = (
-            function_type == "function" and function_name is None and isinstance(function_str, str)
+            function_type == "function"
+            and function_name is None
+            and isinstance(function_str, str)
+            and bool(function_str.strip())
         )
         reference_function_name = function_name
         if reference_function_name is None and is_named_function_reference:
@@ -1140,7 +1160,10 @@ class KerasH5Scanner(BaseScanner):
 
         # Check if there's actual Python code to validate
         if isinstance(function_str, str) and not is_named_function_reference:
-            is_valid, error = validate_python_syntax(function_str)
+            if function_str.strip():
+                is_valid, error = validate_python_syntax(function_str)
+            else:
+                is_valid, error = False, "Lambda source is empty"
             is_safe_pattern = is_valid and self._is_lambda_source_allowlisted(function_str)
 
             if is_safe_pattern:
@@ -1413,6 +1436,10 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(module_name, str):
             return False
 
+        normalized_module_name = module_name.strip()
+        if normalized_module_name in cls._EXACT_DANGEROUS_LAMBDA_MODULES:
+            return True
+
         module_tokens = {token.strip().lower() for token in re.split(r"[^0-9A-Za-z_]+", module_name) if token.strip()}
         return bool(module_tokens & cls._DANGEROUS_LAMBDA_MODULE_TOKENS)
 
@@ -1444,7 +1471,6 @@ class KerasH5Scanner(BaseScanner):
         args = lambda_node.args
         if (
             len(args.args) != 1
-            or args.args[0].arg != "x"
             or args.posonlyargs
             or args.kwonlyargs
             or args.vararg is not None
@@ -1453,9 +1479,10 @@ class KerasH5Scanner(BaseScanner):
             or args.kw_defaults
         ):
             return False
+        argument_name = args.args[0].arg
 
         body = lambda_node.body
-        if isinstance(body, ast.BinOp) and isinstance(body.left, ast.Name) and body.left.id == "x":
+        if isinstance(body, ast.BinOp) and isinstance(body.left, ast.Name) and body.left.id == argument_name:
             if isinstance(body.op, ast.Mult):
                 return cls._safe_lambda_number(body.right)
             if isinstance(body.op, ast.Div):
@@ -1468,13 +1495,17 @@ class KerasH5Scanner(BaseScanner):
             and isinstance(body.left, ast.BinOp)
             and isinstance(body.left.op, ast.Sub)
             and isinstance(body.left.left, ast.Name)
-            and body.left.left.id == "x"
+            and body.left.left.id == argument_name
         ):
             return cls._safe_lambda_number(body.left.right)
 
         if not isinstance(body, ast.Call) or body.keywords or len(body.args) != 1:
             return False
-        if not isinstance(body.args[0], ast.Name) or body.args[0].id != "x" or not isinstance(body.func, ast.Attribute):
+        if (
+            not isinstance(body.args[0], ast.Name)
+            or body.args[0].id != argument_name
+            or not isinstance(body.func, ast.Attribute)
+        ):
             return False
 
         if isinstance(body.func.value, ast.Name) and body.func.value.id == "K":
