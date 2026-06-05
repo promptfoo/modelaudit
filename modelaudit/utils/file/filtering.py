@@ -204,6 +204,74 @@ def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zi
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=member.file_size > len(sample))
 
 
+def _zip_archive_has_scannable_content(archive: zipfile.ZipFile) -> bool:
+    """Return whether a ZIP archive contains bounded model-bearing signals."""
+    model_archive_signal_extensions = _get_model_archive_signal_extensions()
+    has_keras_config = False
+    has_keras_marker = False
+    has_pytorch_data = False
+    has_pytorch_marker = False
+    processed_members = 0
+    for member in archive.filelist:
+        if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
+            # If we cannot finish classifying the archive within the
+            # prefilter budget, preserve it for full scanning. Office
+            # markers do not prove that later members are benign.
+            return True
+
+        if not member.filename or member.is_dir():
+            continue
+
+        processed_members += 1
+        member_name = member.filename.replace("\\", "/").strip("/")
+        member_basename = Path(member_name).name.lower()
+
+        if member_name == "[Content_Types].xml":
+            continue
+
+        # Preserve Keras, TorchServe, and PyTorch ZIP containers even
+        # when the outer filename uses a skipped suffix.
+        if member_name == "MAR-INF/MANIFEST.json":
+            return True
+
+        if member_name == "config.json":
+            has_keras_config = True
+            continue
+
+        if member_name in {"metadata.json", "model.weights.h5", "variables.h5"}:
+            has_keras_marker = True
+            continue
+
+        if member_name == "data.pkl" or member_name.endswith("/data.pkl"):
+            has_pytorch_data = True
+            continue
+
+        if (
+            member_name == "version"
+            or member_name.endswith("/version")
+            or member_name == "byteorder"
+            or member_name.endswith("/byteorder")
+            or member_name.startswith("data/")
+            or "/data/" in member_name
+        ):
+            has_pytorch_marker = True
+
+        candidate_extensions = _get_candidate_extensions(member_name)
+        if any(candidate in model_archive_signal_extensions for candidate in candidate_extensions):
+            return True
+
+        if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
+            return True
+
+        binary_signal = _zip_member_has_scannable_binary_signal(archive, member)
+        if binary_signal is None:
+            return True
+        if binary_signal:
+            return True
+
+    return (has_keras_config and has_keras_marker) or (has_pytorch_data and has_pytorch_marker)
+
+
 def _has_scannable_content(path: str) -> bool:
     """Return whether on-disk file contents map to a supported format."""
     if not os.path.isfile(path):
@@ -226,77 +294,7 @@ def _has_scannable_content(path: str) -> bool:
         with zipfile.ZipFile(path, "r") as archive:
             if is_keras_zip_archive(path):
                 return True
-
-            model_archive_signal_extensions = _get_model_archive_signal_extensions()
-            has_keras_config = False
-            has_keras_marker = False
-            has_pytorch_data = False
-            has_pytorch_marker = False
-            processed_members = 0
-            for member in archive.filelist:
-                if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
-                    # If we cannot finish classifying the archive within the
-                    # prefilter budget, preserve it for full scanning. Office
-                    # markers do not prove that later members are benign.
-                    return True
-
-                if not member.filename or member.is_dir():
-                    continue
-
-                processed_members += 1
-                member_name = member.filename.replace("\\", "/").strip("/")
-                member_basename = Path(member_name).name.lower()
-
-                if member_name == "[Content_Types].xml":
-                    continue
-
-                # Preserve Keras, TorchServe, and PyTorch ZIP containers even
-                # when the outer filename uses a skipped suffix.
-                if member_name == "MAR-INF/MANIFEST.json":
-                    return True
-
-                if member_name == "config.json":
-                    has_keras_config = True
-                    continue
-
-                if member_name in {"metadata.json", "model.weights.h5", "variables.h5"}:
-                    has_keras_marker = True
-                    continue
-
-                if member_name == "data.pkl" or member_name.endswith("/data.pkl"):
-                    has_pytorch_data = True
-                    continue
-
-                if (
-                    member_name == "version"
-                    or member_name.endswith("/version")
-                    or member_name == "byteorder"
-                    or member_name.endswith("/byteorder")
-                    or member_name.startswith("data/")
-                    or "/data/" in member_name
-                ):
-                    has_pytorch_marker = True
-
-                candidate_extensions = _get_candidate_extensions(member_name)
-                if any(candidate in model_archive_signal_extensions for candidate in candidate_extensions):
-                    return True
-
-                if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
-                    return True
-
-                binary_signal = _zip_member_has_scannable_binary_signal(archive, member)
-                if binary_signal is None:
-                    return True
-                if binary_signal:
-                    return True
-
-            if has_keras_config and has_keras_marker:
-                return True
-
-            if has_pytorch_data and has_pytorch_marker:
-                return True
-
-        return False
+            return _zip_archive_has_scannable_content(archive)
     except Exception as exc:
         logger.debug("Content sniffing failed for %s; preserving file for full scan: %s", path, exc)
         return True

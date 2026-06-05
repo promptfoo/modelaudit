@@ -95,6 +95,15 @@ def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
     )
 
 
+def _is_pickle_ignorable_flax_overlap_issue(issue: Issue) -> bool:
+    """Return whether a Pickle issue is weak evidence inside a trusted Flax stream."""
+    return _is_pickle_parse_only_overlap_issue(issue) or (
+        issue.rule_code == "S902"
+        and issue.details.get("pickle_rule_code") == "STRUCTURAL_TAMPER"
+        and issue.details.get("tamper_type") == "oversized_frame"
+    )
+
+
 def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> bool:
     """Return whether complete Pickle analysis proves no trailing Flax stream exists."""
     if (
@@ -654,7 +663,7 @@ def merge_flax_msgpack_overlap_findings(
                 and overlap_result.metadata.get("failure_reason") == "unknown_opcode_or_format_error"
                 and not any(
                     issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-                    and not _is_pickle_parse_only_overlap_issue(issue)
+                    and not _is_pickle_ignorable_flax_overlap_issue(issue)
                     for issue in overlap_result.issues
                 )
             ):

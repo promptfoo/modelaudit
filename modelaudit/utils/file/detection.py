@@ -1926,6 +1926,49 @@ def is_torchserve_mar_archive(path: str) -> bool:
         return False
 
 
+def _is_keras_zip_archive_content(archive: zipfile.ZipFile, *, allow_config_only: bool = False) -> bool:
+    """Return whether an open ZIP has the minimal Keras archive structure."""
+    member_names: set[str] = set()
+    config_info: zipfile.ZipInfo | None = None
+    for info in archive.infolist():
+        if not info.filename or info.is_dir():
+            continue
+
+        normalized_name = _normalize_archive_member_name(info.filename)
+        member_names.add(normalized_name)
+        if normalized_name == _KERAS_ZIP_REQUIRED_ENTRY:
+            config_info = info
+
+    if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
+        return False
+
+    if allow_config_only:
+        return True
+
+    if any(marker in member_names for marker in _KERAS_ZIP_MARKERS):
+        return True
+
+    if config_info is None:
+        return False
+
+    try:
+        config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
+    except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        if config_info.file_size > _KERAS_ZIP_CONFIG_MAX_BYTES:
+            try:
+                config_prefix = _read_zip_member_prefix(
+                    archive,
+                    config_info,
+                    _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
+                )
+            except (OSError, RuntimeError):
+                return False
+            return _looks_like_keras_config_prefix(config_prefix)
+        return False
+
+    return _looks_like_keras_config(config_data)
+
+
 def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
     """Return whether a ZIP-backed file has the minimal Keras archive structure."""
     file_path = Path(path)
@@ -1934,45 +1977,7 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
 
     try:
         with zipfile.ZipFile(file_path, "r") as archive:
-            member_names: set[str] = set()
-            config_info: zipfile.ZipInfo | None = None
-            for info in archive.infolist():
-                if not info.filename or info.is_dir():
-                    continue
-
-                normalized_name = _normalize_archive_member_name(info.filename)
-                member_names.add(normalized_name)
-                if normalized_name == _KERAS_ZIP_REQUIRED_ENTRY:
-                    config_info = info
-
-            if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
-                return False
-
-            if allow_config_only:
-                return True
-
-            if any(marker in member_names for marker in _KERAS_ZIP_MARKERS):
-                return True
-
-            if config_info is None:
-                return False
-
-            try:
-                config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
-            except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                if config_info.file_size > _KERAS_ZIP_CONFIG_MAX_BYTES:
-                    try:
-                        config_prefix = _read_zip_member_prefix(
-                            archive,
-                            config_info,
-                            _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
-                        )
-                    except (OSError, RuntimeError):
-                        return False
-                    return _looks_like_keras_config_prefix(config_prefix)
-                return False
-
-            return _looks_like_keras_config(config_data)
+            return _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
