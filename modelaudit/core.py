@@ -43,6 +43,7 @@ from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     merge_executable_zip_container_findings,
     merge_flax_msgpack_overlap_findings,
+    merge_hdf5_userblock_zip_findings,
     merge_inconclusive_flax_msgpack_outcome,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
@@ -2283,10 +2284,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         )
 
     if hdf5_userblock_supplemental_scanner_id == "zip" and result.scanner_name != "zip":
-        merge_executable_zip_container_findings(
+        assert hdf5_signature_offset is not None
+        merge_hdf5_userblock_zip_findings(
             path,
             result,
             config,
+            hdf5_signature_offset,
             context="HDF5 user-block ZIP",
         )
     elif (
