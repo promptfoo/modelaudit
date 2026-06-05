@@ -2174,6 +2174,33 @@ def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_stream_verbose_scan_failure_omits_raw_traceback(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Post-download stream failures must not leak the signed URL through tracebacks."""
+    url = "s3://bucket/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+    stream_path = f"stream://{url}"
+    mock_is_cloud.side_effect = lambda candidate: candidate.startswith("s3://")
+    mock_download.return_value = stream_path
+    mock_scan.side_effect = RuntimeError(f"scan failed for {url}")
+    runner = CliRunner()
+
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.pkl" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
 def test_scan_cloud_url_with_issues(
     mock_rmtree: MagicMock,

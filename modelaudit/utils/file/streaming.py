@@ -4,7 +4,7 @@ import inspect
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import click
 
@@ -20,10 +20,15 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
     # Currently support streaming for pickle files
     # Can be extended to other formats that support partial reads
-    parsed = urlparse(url)
-    path = Path(parsed.path)
+    path = Path(stream_source_path(url))
     suffix = path.suffix.lower()
     return suffix in {".pkl", ".pickle", ".joblib"}
+
+
+def stream_source_path(url: str) -> str:
+    """Return the decoded URL path used for scanner routing and file naming."""
+    parsed_path = unquote(urlparse(url).path)
+    return parsed_path or url
 
 
 def _scan_stream_accepts_source_keyword(method: Any) -> bool:
@@ -111,7 +116,8 @@ def stream_analyze_file(
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)
-        temp_file.name = Path(url).name
+        source_path = stream_source_path(url)
+        temp_file.name = Path(source_path).name
 
         issues: list[Issue] = []
         metadata: dict[str, Any] = {}
@@ -151,7 +157,7 @@ def stream_analyze_file(
             metadata.update(scan_result.metadata)
 
         # Fallback manual checks for pickle headers when scanner doesn't support partial scans
-        if scan_result is None and Path(url).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
+        if scan_result is None and Path(source_path).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
             dangerous_patterns = [
                 b"os\nsystem",
                 b"subprocess",

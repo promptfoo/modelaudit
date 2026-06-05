@@ -124,6 +124,44 @@ class TestFormatSarifOutput:
         assert "remaining-secret" not in output
         assert "https://collector.example/upload<redacted>" not in output
 
+    def test_signed_url_rotation_preserves_finding_fingerprint(self) -> None:
+        """Renewing a signed URL must not create a different SARIF finding identity."""
+
+        def _fingerprint(signature: str) -> str:
+            raw_url = f"https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature={signature}"
+            result = create_initial_audit_result()
+            result.issues = [
+                Issue(
+                    message=f"Dangerous payload from {raw_url}",
+                    severity=IssueSeverity.WARNING,
+                    location=raw_url,
+                    timestamp=time.time(),
+                )
+            ]
+            result.finalize_statistics()
+            parsed = json.loads(format_sarif_output(result, [raw_url]))
+            return str(parsed["runs"][0]["results"][0]["partialFingerprints"]["primaryLocationLineHash"])
+
+        assert _fingerprint("first-secret") == _fingerprint("renewed-secret")
+
+    def test_benign_raw_query_context_is_preserved(self) -> None:
+        """SARIF text sanitization should retain non-credential query parameters."""
+        documentation_url = "https://docs.example/help?section=models&lang=en"
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"See {documentation_url}",
+                severity=IssueSeverity.INFO,
+                details={"documentation_url": documentation_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert documentation_url in output
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()

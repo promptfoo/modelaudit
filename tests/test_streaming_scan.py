@@ -15,6 +15,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.integrations.sarif_formatter import format_sarif_output
+from modelaudit.models import LicenseInfoModel
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
@@ -91,7 +92,7 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         result = scan_model_directory_or_file(f"stream://{stream_url}")
 
         args, kwargs = mock_scanner.call_args
-        assert args[0] == stream_url
+        assert args[0] == "/model.pkl"
         assert "config" in kwargs
         mock_stream.assert_called_once_with(stream_url, dummy_scanner)
         assert result.files_scanned == 1
@@ -166,7 +167,8 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
     )
     safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret"
+    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret&password=password-secret"
+    fragment_url = "https://collector.example/callback#access_token=fragment-secret"
     legacy_signed_url = (
         "https://bucket.s3.amazonaws.com/related.pkl?"
         "AWSAccessKeyId=AKIARELATED&Expires=123456&Signature=related-signature"
@@ -177,6 +179,9 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         {
             "source_url": stream_url,
             "related_url": related_url,
+            "fragment_url": fragment_url,
+            "path_url": Path(related_url),
+            "license_info": [LicenseInfoModel(url=related_url)],
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
             "legacy_signed_url": legacy_signed_url,
@@ -192,6 +197,9 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "nested": [stream_url],
             stream_url: {"source": stream_url},
             "related_url": related_url,
+            "fragment_url": fragment_url,
+            "path_url": Path(related_url),
+            "license_info": [LicenseInfoModel(url=related_url)],
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
             "legacy_signed_url": legacy_signed_url,
@@ -230,6 +238,8 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "deadbeef",
         "secret-token",
         "secondary-secret",
+        "password-secret",
+        "fragment-secret",
         "AKIARELATED",
         "related-signature",
         "X-Amz-Signature",
@@ -251,7 +261,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
 def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
     """Stream record sanitization should not depend on the source URL needing redaction."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret"
+    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret&password=password-secret"
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.bytes_scanned = 128
     scan_result.metadata.update({"related_url": related_url})
@@ -276,8 +286,40 @@ def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
     mock_stream.assert_called_once_with(stream_url, dummy_scanner)
     json_text = result.model_dump_json(exclude_none=True)
     assert "secondary-secret" not in json_text
+    assert "password-secret" not in json_text
     assert "token=<redacted>" in json_text
     assert "visible=yes" in json_text
+
+
+def test_streaming_invalid_utf8_metadata_is_replaced_before_reporting() -> None:
+    """Opaque binary metadata must not retain signed URLs or break JSON output."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?token=secret-token"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.metadata["opaque_blob"] = b"\xff" + stream_url.encode()
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "<binary data>" in json_text
+    assert "secret-token" not in json_text
+
+
+def test_streaming_malformed_port_error_is_redacted() -> None:
+    """Malformed stream URLs should produce a safe operational result, not escape error handling."""
+    stream_url = "https://user:password@example.com:notaport/model.pkl?token=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "stream://https://example.com:notaport/model.pkl" in json_text
+    assert "password" not in json_text
+    assert "secret-token" not in json_text
 
 
 def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:

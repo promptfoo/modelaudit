@@ -9,7 +9,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
@@ -254,7 +254,11 @@ def _create_results(
         # Add fingerprints for deduplication
         import hashlib
 
-        fingerprint = hashlib.sha256(f"{issue.message}{issue.location or ''}{issue.severity}".encode()).hexdigest()[:16]
+        fingerprint_message = _redact_text_for_sarif(issue.message)
+        fingerprint_location = _redact_text_for_sarif(issue.location or "")
+        fingerprint = hashlib.sha256(
+            f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
+        ).hexdigest()[:16]
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
@@ -468,7 +472,14 @@ def _redact_url_token_for_sarif(url: str) -> str:
     """Keep already-sanitized query context without weakening raw URL redaction."""
     if "<redacted>" in url:
         return _redact_cloud_error_for_display(url)
-    return _redact_path_for_sarif(url)
+    redacted_url = _redact_cloud_error_for_display(url)
+    if redacted_url == url:
+        return url
+
+    parts = urlsplit(redacted_url)
+    safe_query = "&".join(part for part in parts.query.split("&") if not part.endswith("=<redacted>"))
+    safe_fragment = "" if parts.fragment.endswith("=<redacted>") else parts.fragment
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, safe_query, safe_fragment))
 
 
 def _redact_value_for_sarif(value: Any) -> Any:

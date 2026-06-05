@@ -105,6 +105,16 @@ class TestCloudURLRedaction:
         url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
 
+    def test_redact_url_for_display_handles_invalid_port(self) -> None:
+        """Malformed ports must not disable signed-query and userinfo redaction."""
+        url = "https://user:password@example.com:notaport/model.bin?token=secret"
+
+        redacted = redact_url_for_display(url)
+
+        assert redacted == "https://example.com:notaport/model.bin"
+        assert "password" not in redacted
+        assert "secret" not in redacted
+
     def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
         url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
         message = f"Forbidden while opening {url}"
@@ -140,6 +150,19 @@ class TestCloudURLRedaction:
         assert "Signature=<redacted>" in redacted
         assert "AKIASECRET" not in redacted
         assert "deadbeef" not in redacted
+
+    def test_redact_cloud_error_for_display_handles_encoded_and_fragment_credentials(self) -> None:
+        message = (
+            "provider failed: https://example.com/model?tokenizer=bert&X-Amz-Sign%61ture=secret"
+            "#access_token=fragment-secret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "tokenizer=bert" in redacted
+        assert "X-Amz-Sign%61ture=<redacted>" in redacted
+        assert "access_token=<redacted>" in redacted
+        assert "fragment-secret" not in redacted
 
 
 @patch("modelaudit.utils.helpers.retry.time.sleep")

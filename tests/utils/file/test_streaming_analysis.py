@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import fsspec
 import pytest
@@ -157,6 +158,32 @@ def test_stream_analyze_file_returns_clean_partial_header_result(
     assert result.metadata["analysis_complete"] is False
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
+def test_stream_analyze_file_signed_pickle_url_uses_path_for_header_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signed URL queries must not hide pickle extensions from fallback checks."""
+    file_path = tmp_path / "sample.pkl"
+    file_path.write_bytes(b"os\nsystem")
+    signed_url = f"file://{file_path}?X-Amz-Signature=secret"
+
+    class QueryIgnoringLocalFileSystem(LocalFileSystem):
+        def info(self, path: str, **kwargs: object) -> dict[str, object]:
+            return dict(super().info(urlsplit(path).path, **kwargs))
+
+        def open(self, path: str, mode: str = "rb", **kwargs: object) -> object:
+            return super().open(urlsplit(path).path, mode=mode, **kwargs)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: QueryIgnoringLocalFileSystem())
+
+    result, analysis_complete = streaming.stream_analyze_file(signed_url, HeaderOnlyScanner())
+
+    assert analysis_complete is False
+    assert result is not None
+    assert any(issue.type == "streaming_security_check" for issue in result.issues)
 
 
 def test_stream_analyze_file_returns_incomplete_full_header_result(
