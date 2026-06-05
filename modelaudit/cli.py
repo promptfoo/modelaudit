@@ -358,36 +358,168 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
-def _dvc_target_is_covered(target: Path, *, covered_paths: frozenset[str]) -> bool:
+def _local_path_will_be_scanned(path: str, *, skip_non_model_files: bool) -> bool:
+    """Return whether the local CLI prefilter will scan an explicit file path."""
+    if not skip_non_model_files or not os.path.isfile(path):
+        return True
+
+    extension = Path(path).suffix.lower()
+    if extension in {".py", ".js", ".html", ".css"}:
+        return not should_skip_file(path)
+    if extension != ".txt":
+        return True
+
+    from modelaudit.scanners import SCANNER_REGISTRY
+
+    return any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
+
+
+def _collect_dvc_directory_coverage(
+    directories: set[str],
+    *,
+    skip_non_model_files: bool,
+) -> tuple[set[str], set[str]]:
+    """Collect paths a prospective directory scan will actually visit."""
+    covered_files: set[str] = set()
+    covered_directories: set[str] = set()
+    for directory in directories:
+        base_directory = Path(directory).resolve()
+        walk_errors: list[OSError] = []
+        for root, _dirs, files in os.walk(base_directory, followlinks=False, onerror=walk_errors.append):
+            try:
+                resolved_root = Path(root).resolve()
+            except OSError:
+                continue
+            if not resolved_root.is_relative_to(base_directory):
+                continue
+            covered_directories.add(str(resolved_root))
+            for filename in files:
+                file_path = Path(root) / filename
+                try:
+                    resolved_file = file_path.resolve()
+                except OSError:
+                    continue
+                if not resolved_file.is_relative_to(base_directory):
+                    continue
+                if skip_non_model_files and should_skip_file(str(file_path)):
+                    continue
+                covered_files.add(str(resolved_file))
+        if walk_errors:
+            covered_directories.discard(str(base_directory))
+    return covered_files, covered_directories
+
+
+def _dvc_directory_target_is_covered(
+    target: Path,
+    *,
+    covered_files: frozenset[str],
+    covered_directories: frozenset[str],
+    skip_non_model_files: bool,
+) -> bool:
+    """Return whether every traversable member of a DVC directory will be scanned."""
+    if str(target) not in covered_directories:
+        return False
+
+    walk_errors: list[OSError] = []
+    for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
+        try:
+            resolved_root = Path(root).resolve()
+        except OSError:
+            return False
+        if str(resolved_root) not in covered_directories:
+            return False
+        for directory_name in dirs:
+            try:
+                resolved_directory = (Path(root) / directory_name).resolve()
+            except OSError:
+                return False
+            if str(resolved_directory) not in covered_directories:
+                return False
+        for filename in files:
+            file_path = Path(root) / filename
+            if skip_non_model_files and should_skip_file(str(file_path)):
+                continue
+            try:
+                resolved_file = file_path.resolve()
+            except OSError:
+                return False
+            if str(resolved_file) not in covered_files:
+                return False
+    return not walk_errors
+
+
+def _dvc_target_is_covered(
+    target: Path,
+    *,
+    covered_files: frozenset[str],
+    covered_directories: frozenset[str],
+    skip_non_model_files: bool,
+) -> bool:
     """Return whether a resolved DVC target is in the prospective CLI scan set."""
-    return str(target) in covered_paths
+    target_str = str(target)
+    if target.is_file():
+        return target_str in covered_files
+    if target.is_dir():
+        return _dvc_directory_target_is_covered(
+            target,
+            covered_files=covered_files,
+            covered_directories=covered_directories,
+            skip_non_model_files=skip_non_model_files,
+        )
+    return False
 
 
-def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
+def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, strict: bool = False) -> list[str]:
     """Expand user paths, resolve DVC pointers, warn on unmatched globs, and fail fast if empty."""
     expanded_paths, missing_globs = expand_paths(paths)
-
-    def can_cover_dvc_output(path: str) -> bool:
-        if os.path.isdir(path):
-            return True
-        return os.path.isfile(path) and Path(path).suffix.lower() not in {".css", ".html", ".js", ".py", ".txt"}
-
-    independently_covered_paths = {
-        str(Path(path).resolve()) for path in expanded_paths if not path.endswith(".dvc") and can_cover_dvc_output(path)
+    skip_non_model_files = not strict
+    dvc_resolutions = {
+        path: resolve_dvc_file_with_metadata(path)
+        for path in expanded_paths
+        if os.path.isfile(path) and path.endswith(".dvc")
     }
+
+    independently_covered_files = {
+        str(Path(path).resolve())
+        for path in expanded_paths
+        if not path.endswith(".dvc")
+        and os.path.isfile(path)
+        and _local_path_will_be_scanned(path, skip_non_model_files=skip_non_model_files)
+    }
+    independently_covered_directories = {
+        str(Path(path).resolve()) for path in expanded_paths if not path.endswith(".dvc") and os.path.isdir(path)
+    }
+    all_dvc_targets = [target for resolution in dvc_resolutions.values() for target in resolution.targets]
+    prospective_covered_files = independently_covered_files | {
+        str(Path(target).resolve())
+        for target in all_dvc_targets
+        if os.path.isfile(target) and _local_path_will_be_scanned(target, skip_non_model_files=skip_non_model_files)
+    }
+    prospective_covered_directories = independently_covered_directories | {
+        str(Path(target).resolve()) for target in all_dvc_targets if os.path.isdir(target)
+    }
+    if any(resolution.analysis_incomplete for resolution in dvc_resolutions.values()):
+        directory_covered_files, directory_covered_directories = _collect_dvc_directory_coverage(
+            prospective_covered_directories,
+            skip_non_model_files=skip_non_model_files,
+        )
+        prospective_covered_files.update(directory_covered_files)
+        prospective_covered_directories = directory_covered_directories
 
     dvc_expanded_paths: list[str] = []
     for path in expanded_paths:
         if os.path.isfile(path) and path.endswith(".dvc"):
-            dvc_resolution = resolve_dvc_file_with_metadata(path)
-            prospective_covered_paths = independently_covered_paths | {
-                target for target in dvc_resolution.targets if can_cover_dvc_output(target)
-            }
+            dvc_resolution = dvc_resolutions[path]
             cap_is_covered = dvc_resolution.analysis_incomplete and dvc_omitted_outputs_covered(
                 path,
                 dvc_resolution,
-                partial(_dvc_target_is_covered, covered_paths=frozenset(prospective_covered_paths)),
-                coverage_budget=len(prospective_covered_paths),
+                partial(
+                    _dvc_target_is_covered,
+                    covered_files=frozenset(prospective_covered_files),
+                    covered_directories=frozenset(prospective_covered_directories),
+                    skip_non_model_files=skip_non_model_files,
+                ),
+                coverage_budget=len(prospective_covered_files) + len(prospective_covered_directories),
             )
             if dvc_resolution.analysis_incomplete and not cap_is_covered:
                 dvc_expanded_paths.append(path)
@@ -932,25 +1064,17 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
 
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
     """Return True when the local scan prefilter should skip a non-model file."""
-    if not runtime.skip_non_model_files or not os.path.isfile(scan_path):
+    if _local_path_will_be_scanned(scan_path, skip_non_model_files=runtime.skip_non_model_files):
         return False
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
-    if ext in (".py", ".js", ".html", ".css") and should_skip_file(scan_path):
+    if ext in (".py", ".js", ".html", ".css"):
         if verbose:
             logger.debug(f"Skipped: {scan_path} (non-model file)")
         if runtime.show_styled_output:
             click.echo(f"Skipping non-model file: {scan_path}")
         return True
-
-    if ext != ".txt":
-        return False
-
-    from modelaudit.scanners import SCANNER_REGISTRY
-
-    if any(cls().can_handle(scan_path) for cls in SCANNER_REGISTRY):
-        return False
 
     if verbose:
         logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
@@ -2393,7 +2517,7 @@ def scan_command(
     record_command_used("scan", duration=None, **telemetry_options)
     record_scan_started(list(paths), telemetry_options)
 
-    expanded_paths = _resolve_scan_paths(paths, scan_start_time)
+    expanded_paths = _resolve_scan_paths(paths, scan_start_time, strict=strict)
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,

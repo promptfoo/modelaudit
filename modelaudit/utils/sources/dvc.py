@@ -70,18 +70,37 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
     omitted_output_count = max(declared_output_count - MAX_DVC_OUTPUTS, 0)
     verification_limit = MAX_DVC_OUTPUTS * 2
     outs = declared_outs[:verification_limit]
-    bounded_declared_paths = {out["path"] for out in outs if isinstance(out, dict) and isinstance(out.get("path"), str)}
-    unverified_output_paths: set[str] = set()
+    dvc_dir = path.parent.resolve()
+
+    def canonical_target(output_path: str) -> str | None:
+        try:
+            target = (dvc_dir / output_path).resolve()
+            return str(target) if target.is_relative_to(dvc_dir) else None
+        except (OSError, ValueError):
+            return None
+
+    bounded_declared_targets: set[str] = set()
+    for out in outs:
+        if not isinstance(out, dict) or not isinstance(out.get("path"), str):
+            continue
+        bounded_target = canonical_target(out["path"])
+        if bounded_target is not None:
+            bounded_declared_targets.add(bounded_target)
+    unverified_output_targets: set[str] = set()
     invalid_unverified_output_count = 0
     for out in declared_outs[verification_limit:]:
         if not isinstance(out, dict) or not isinstance(out.get("path"), str):
             invalid_unverified_output_count += 1
-        elif out["path"] not in bounded_declared_paths:
-            unverified_output_paths.add(out["path"])
-        if len(unverified_output_paths) + invalid_unverified_output_count >= MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS:
+        else:
+            unverified_target = canonical_target(out["path"])
+            if unverified_target is None:
+                invalid_unverified_output_count += 1
+            elif unverified_target not in bounded_declared_targets:
+                unverified_output_targets.add(unverified_target)
+        if len(unverified_output_targets) + invalid_unverified_output_count >= MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS:
             break
     unverified_omitted_output_count = min(
-        len(unverified_output_paths) + invalid_unverified_output_count,
+        len(unverified_output_targets) + invalid_unverified_output_count,
         MAX_TRACKED_UNVERIFIED_DVC_OUTPUTS,
     )
     if omitted_output_count:
@@ -94,8 +113,6 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
     omitted_targets: list[str] = []
     unique_omitted_targets: set[str] = set()
     unresolved_omitted_output_count = 0
-    dvc_dir = path.parent.resolve()
-
     for index, out in enumerate(outs):
         is_omitted = index >= MAX_DVC_OUTPUTS
         if not isinstance(out, dict) or "path" not in out:
@@ -209,6 +226,7 @@ def dvc_omitted_outputs_covered(
         return False
 
     dvc_dir = path.parent.resolve()
+    verified_targets: set[str] = set()
     for out in outs[MAX_DVC_OUTPUTS * 2 :]:
         if not isinstance(out, dict):
             return False
@@ -217,8 +235,14 @@ def dvc_omitted_outputs_covered(
             return False
         try:
             target = (dvc_dir / out_path).resolve()
-            if not target.is_relative_to(dvc_dir) or not is_covered(target):
+            target_str = str(target)
+            if not target.is_relative_to(dvc_dir):
                 return False
+            if target_str in verified_targets:
+                continue
+            if len(verified_targets) >= coverage_budget or not is_covered(target):
+                return False
+            verified_targets.add(target_str)
         except (OSError, ValueError):
             return False
     return True

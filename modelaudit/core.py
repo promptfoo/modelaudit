@@ -1484,11 +1484,13 @@ def scan_model_directory_or_file(
         else:
             # Scan a single file or DVC pointer
             target_files = [path]
+            single_dvc_resolution: DvcResolution | None = None
+            dvc_scanned_files: set[str] = set()
+            dvc_scanned_directories: set[str] = set()
             if path.endswith(".dvc"):
-                dvc_resolution = resolve_dvc_file_with_metadata(path)
-                _record_dvc_output_limit_incomplete(results, scan_metadata, path, dvc_resolution)
-                if dvc_resolution.targets:
-                    target_files = dvc_resolution.targets
+                single_dvc_resolution = resolve_dvc_file_with_metadata(path)
+                if single_dvc_resolution.targets:
+                    target_files = single_dvc_resolution.targets
 
             for _idx, target in enumerate(target_files):
                 # Check for interrupts
@@ -1500,6 +1502,12 @@ def scan_model_directory_or_file(
                 if os.path.isdir(target):
                     nested_result = scan_model_directory_or_file(target, **config)
                     results.aggregate_scan_result(nested_result)
+                    for asset in nested_result.assets:
+                        asset_path = Path(asset.path)
+                        if asset_path.is_file():
+                            dvc_scanned_files.add(str(asset_path.resolve()))
+                    for root, _dirs, _files in os.walk(target, followlinks=False):
+                        dvc_scanned_directories.add(str(Path(root).resolve()))
                     if nested_result.has_errors or not nested_result.success:
                         scan_metadata["success"] = False
                         scan_metadata["has_operational_errors"] = bool(
@@ -1550,6 +1558,7 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                dvc_scanned_files.add(str(Path(target).resolve()))
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
@@ -1588,6 +1597,19 @@ def scan_model_directory_or_file(
 
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)
+
+            if single_dvc_resolution is not None:
+                dvc_outputs_covered = _dvc_omitted_outputs_covered_by_directory_walk(
+                    path,
+                    single_dvc_resolution,
+                    dvc_scanned_files,
+                    dvc_scanned_directories,
+                    skip_file_types=skip_file_types,
+                    metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
+                )
+                if not dvc_outputs_covered:
+                    _record_dvc_output_limit_incomplete(results, scan_metadata, path, single_dvc_resolution)
 
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
