@@ -51,7 +51,12 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect dangerous call-like strings split across newline-separated statements
+- scan raw nested pickle payloads carried inside Unicode string literals
+- fail closed on protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
 - detect dynamic `type()` namespaces that can hide callable protocol hooks
+- bound native pickle state simulation for tracked dictionaries, memo clones,
+  dotted globals, and recursive mappings
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
@@ -61,6 +66,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid false positives for inert metadata under dangerous dotted globals
 - detect dangerous positional lookups inside `str.format` replacement fields
 - recognize PyTorch ZIP archives that contain only hidden pickle members
+- fail closed when novel pickle import-reference metadata exceeds the reporting cap without penalizing repeated benign imports
 
 ### Performance Improvements
 

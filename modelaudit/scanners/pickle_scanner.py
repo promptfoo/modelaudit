@@ -1771,6 +1771,13 @@ class PickleScanner(BaseScanner):
             return
         tail = data[tail_start : tail_start + _BINARY_TAIL_SCAN_BYTES]
         self._scan_binary_tail_window(tail, result, source, tail_start)
+        self._mark_binary_tail_window_incomplete_if_needed(
+            result,
+            source,
+            tail_start=tail_start,
+            scanned_tail_bytes=len(tail),
+            total_tail_bytes=max(len(data) - tail_start, 0),
+        )
 
     def _scan_file_binary_tail_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
         if Path(path).suffix.lower() not in _PYTORCH_CONTAINER_EXTENSIONS:
@@ -1781,6 +1788,13 @@ class PickleScanner(BaseScanner):
 
         tail = self._read_file_binary_tail_window(path, tail_start, file_size)
         self._scan_binary_tail_window(tail, result, path, tail_start)
+        self._mark_binary_tail_window_incomplete_if_needed(
+            result,
+            path,
+            tail_start=tail_start,
+            scanned_tail_bytes=len(tail),
+            total_tail_bytes=file_size - tail_start,
+        )
 
     def _scan_seekable_stream_binary_tail_if_needed(
         self,
@@ -1805,23 +1819,49 @@ class PickleScanner(BaseScanner):
             return
         absolute_tail_start = start_position + local_tail_start
         chunks: list[bytes] = []
+        unknown_tail_exceeds_window = False
+        incomplete_reason: str | None = None
+        stream_error: Exception | None = None
+        rewind_error: Exception | None = None
         try:
             file_obj.seek(absolute_tail_start)
             while remaining > 0:
                 self.check_interrupted()
                 if self._check_timeout(allow_partial=True):
+                    incomplete_reason = "pickle_binary_tail_scan_timeout"
                     break
                 chunk = file_obj.read(min(_RAW_READ_CHUNK_BYTES, remaining))
                 if not chunk:
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk)
-        except (AttributeError, OSError, ValueError):
-            return
+            if file_size is None and remaining == 0:
+                unknown_tail_exceeds_window = True
+                with suppress(AttributeError, OSError, ValueError):
+                    unknown_tail_exceeds_window = bool(file_obj.read(1))
+        except (AttributeError, OSError, ValueError) as error:
+            stream_error = error
         finally:
-            with suppress(AttributeError, OSError, ValueError):
+            try:
                 file_obj.seek(start_position)
+            except (AttributeError, OSError, ValueError) as error:
+                rewind_error = error
+        if stream_error is not None or rewind_error is not None:
+            coverage_error = stream_error if stream_error is not None else rewind_error
+            assert coverage_error is not None
+            self._record_stream_coverage_failure(result, source, coverage_error)
+            return
         self._scan_binary_tail_window(b"".join(chunks), result, source, absolute_tail_start)
+        total_tail_bytes = None if file_size is None else max(file_size - local_tail_start, 0)
+        self._mark_binary_tail_window_incomplete_if_needed(
+            result,
+            source,
+            tail_start=absolute_tail_start,
+            scanned_tail_bytes=sum(len(chunk) for chunk in chunks),
+            total_tail_bytes=total_tail_bytes,
+            tail_window_exceeded=unknown_tail_exceeds_window,
+            incomplete_reason=incomplete_reason,
+        )
 
     @staticmethod
     def _binary_tail_start(result: ScanResult) -> int | None:
@@ -1851,6 +1891,52 @@ class PickleScanner(BaseScanner):
                 chunks.append(chunk)
                 remaining -= len(chunk)
         return b"".join(chunks)
+
+    def _mark_binary_tail_window_incomplete_if_needed(
+        self,
+        result: ScanResult,
+        source: str,
+        *,
+        tail_start: int,
+        scanned_tail_bytes: int,
+        total_tail_bytes: int | None,
+        tail_window_exceeded: bool = False,
+        incomplete_reason: str | None = None,
+    ) -> None:
+        if (
+            incomplete_reason is None
+            and not tail_window_exceeded
+            and (total_tail_bytes is None or total_tail_bytes <= scanned_tail_bytes)
+        ):
+            return
+
+        reason = incomplete_reason or "pickle_binary_tail_scan_window_exceeded"
+        message = (
+            "Pickle binary-tail analysis timed out before the bounded scan window was completed"
+            if reason == "pickle_binary_tail_scan_timeout"
+            else (
+                "Pickle binary-tail analysis exceeded the bounded scan window; "
+                "bytes after the inspected window were not analyzed"
+            )
+        )
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="Pickle Binary Tail Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "tail_scan_start": tail_start,
+                "tail_bytes_scanned": scanned_tail_bytes,
+                "tail_bytes_total": total_tail_bytes,
+                "tail_scan_limit_bytes": _BINARY_TAIL_SCAN_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                "timed_out": reason == "pickle_binary_tail_scan_timeout",
+            },
+            rule_code="S902",
+        )
 
     def _scan_binary_tail_window(self, tail: bytes, result: ScanResult, source: str, tail_start: int) -> None:
         if not tail:

@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
@@ -465,6 +466,185 @@ def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
 
     assert determine_exit_code(result) == 1
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object_numpy_only.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+    ]
+    dtype_checks = [
+        check
+        for check in result.checks
+        if check.name == "Data Type Safety Check" and check.details.get("handled_via") == "scanner_selection_skip"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "numpy_object_embedded_pickle_scanner_selection_skip" in reasons
+    assert "numpy_object_embedded_pickle_incomplete" in reasons
+    assert selection_checks
+    assert selection_checks[0].details["analysis_incomplete"] is True
+    assert selection_checks[0].details["scan_outcome_reason"] == "numpy_object_embedded_pickle_scanner_selection_skip"
+    assert dtype_checks
+    assert dtype_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+
+def test_numpy_object_dtype_pickle_exclusion_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object_pickle_excluded.npy"
+    cache_dir = tmp_path / "cache"
+    np.save(path, arr, allow_pickle=True)
+
+    reset_cache_manager()
+    try:
+        results = [
+            scan_model_directory_or_file(
+                str(path),
+                exclude_scanners=["pickle"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        for result in results:
+            metadata = result.file_metadata[str(path)]
+            selection_check = next(
+                check
+                for check in result.checks
+                if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+            )
+
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "numpy_object_embedded_pickle_scanner_selection_skip" in metadata["scan_outcome_reasons"]
+            assert "embedded NumPy object pickle analysis" in selection_check.message
+            assert selection_check.details["analysis_incomplete"] is True
+            assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_numpy_structured_object_field_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    dtype = np.dtype([("payload", object), ("score", np.int64)])
+    arr = np.array([(_ExecPayload(), 7)], dtype=dtype)
+    path = tmp_path / "structured_object_numpy_only.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    dtype_checks = [
+        check
+        for check in result.checks
+        if check.name == "Data Type Safety Check" and check.details.get("handled_via") == "scanner_selection_skip"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "numpy_object_embedded_pickle_scanner_selection_skip" in reasons
+    assert "numpy_object_embedded_pickle_incomplete" in reasons
+    assert dtype_checks
+    assert dtype_checks[0].details["dtype_kind"] == "V"
+    assert dtype_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+
+def test_numpy_numeric_dtype_numpy_only_remains_conclusive(tmp_path: Path) -> None:
+    path = tmp_path / "numeric_numpy_only.npy"
+    np.save(path, np.arange(4))
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object_numpy_and_pickle.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy", "pickle"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+
+    assert determine_exit_code(result) == 1
+    assert metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.rule_code == "S104"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("associated_global") == "builtins.exec"
+        for issue in result.issues
+    )
+
+
+def test_numpy_object_npz_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "malicious_object_numpy_only.npz"
+    np.savez(path, payload=np.array([_ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["zip", "numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_analysis_incomplete" in reasons
+    assert selection_checks
+    assert selection_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
 
 
 def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:

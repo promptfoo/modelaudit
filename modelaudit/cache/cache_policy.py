@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, SCANNER_DEPENDENCY_IDS_METADATA_KEY
 
 _OPERATIONAL_ERROR_INDICATORS = (
     "error during scan",
@@ -60,5 +60,32 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 indicator in message.lower() for indicator in _OPERATIONAL_ERROR_INDICATORS
             ):
                 return False
+
+    return True
+
+
+def cached_scan_result_dependencies_available(scan_result: dict[str, Any]) -> bool:
+    """Return whether every registered scanner required by a cached result still loads."""
+    scanner_ids: set[str] = set()
+    scanner_name = scan_result.get("scanner")
+    if isinstance(scanner_name, str):
+        scanner_ids.add(scanner_name)
+
+    metadata = scan_result.get("metadata")
+    if isinstance(metadata, dict):
+        dependency_ids = metadata.get(SCANNER_DEPENDENCY_IDS_METADATA_KEY)
+        if isinstance(dependency_ids, list):
+            scanner_ids.update(scanner_id for scanner_id in dependency_ids if isinstance(scanner_id, str))
+
+    try:
+        from modelaudit.scanners import _registry
+
+        for scanner_id in scanner_ids:
+            if _registry.get_scanner_info(scanner_id) is None:
+                continue
+            if _registry.load_scanner_by_id(scanner_id) is None:
+                return False
+    except Exception:
+        return False
 
     return True
