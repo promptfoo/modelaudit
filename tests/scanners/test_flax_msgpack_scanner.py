@@ -1214,6 +1214,20 @@ def test_flax_msgpack_detects_suspicious_binary_key(tmp_path: Path) -> None:
     )
 
 
+def test_flax_msgpack_redacts_unsafe_binary_key_finding_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "unsafe_binary_code_key.msgpack"
+    secret = "UNSAFEKEYSECRET123456789"
+    key = b"api_" + b"\xff" + f"key={secret} os.system(1)".encode()
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, key: "safe"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    finding = next(check for check in result.checks if check.name == "Code Pattern Security Check")
+
+    assert finding.details["sample"] == "<redacted>"
+    assert finding.location == "root[key:<redacted>]"
+    assert secret not in result.to_json()
+
+
 def test_flax_msgpack_preserves_benign_short_binary_near_matches(tmp_path: Path) -> None:
     path = tmp_path / "benign_binary_text.msgpack"
     create_msgpack_file(
@@ -1221,6 +1235,21 @@ def test_flax_msgpack_preserves_benign_short_binary_near_matches(tmp_path: Path)
         {
             "params": {"w": [1, 2, 3]},
             b"evaluation_metric": b"evaluation_result",
+        },
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert not any(check.name == "Code Pattern Security Check" for check in result.checks)
+
+
+def test_flax_msgpack_ignores_short_non_textual_binary_code_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "non_textual_binary_code.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {"w": [1, 2, 3]},
+            "payload": b"\x00\xffeval(\x80\x81",
         },
     )
 

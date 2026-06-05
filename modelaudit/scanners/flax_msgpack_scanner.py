@@ -24,11 +24,20 @@ _DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynam
 _EVIDENCE_SAMPLE_CHARS = 200
 _EVIDENCE_LOCATION_CHARS = 300
 _EVIDENCE_REDACTION_INPUT_CHARS = 4096
+_MIN_SHORT_BINARY_TEXT_PERCENT = 85
 
 
 def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
     value_lower = value_str.lower()
     return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
+
+
+def _is_text_like_short_binary(value: bytes | bytearray) -> bool:
+    raw_value = bytes(value)
+    if not raw_value:
+        return False
+    text_bytes = sum(byte in {9, 10, 13} or 32 <= byte <= 126 for byte in raw_value)
+    return text_bytes * 100 >= len(raw_value) * _MIN_SHORT_BINARY_TEXT_PERCENT
 
 
 def _stringify_evidence_fragment(value: Any) -> str:
@@ -485,8 +494,11 @@ class FlaxMsgpackScanner(BaseScanner):
         value: str,
         location: str,
         result: ScanResult,
+        *,
+        evidence_value: Any | None = None,
     ) -> None:
         """Check string values for suspicious patterns that might indicate code injection."""
+        sample_value = value if evidence_value is None else evidence_value
         for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
             if compiled_pattern.search(value):
                 # Determine appropriate rule code based on pattern
@@ -507,7 +519,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     location=_redact_evidence_location(location),
                     details={
                         "pattern": pattern,
-                        "sample": _redact_evidence_sample(value),
+                        "sample": _redact_evidence_sample(sample_value),
                         "full_length": len(value),
                     },
                     rule_code=rule_code,
@@ -771,11 +783,12 @@ class FlaxMsgpackScanner(BaseScanner):
                 decoded = value.decode("utf-8", errors="ignore")
                 if check_string_jax_transform:
                     self._check_jax_transform("", decoded, location, result)
-                self._check_suspicious_strings(
-                    decoded,
-                    f"{location}[decoded_binary]",
-                    result,
-                )
+                if len(decoded) > 50 or _is_text_like_short_binary(value):
+                    self._check_suspicious_strings(
+                        decoded,
+                        f"{location}[decoded_binary]",
+                        result,
+                    )
             except Exception:  # pragma: no cover - encoding edge cases
                 pass
 
@@ -828,20 +841,27 @@ class FlaxMsgpackScanner(BaseScanner):
                 if index >= self.max_items_per_container:
                     break
                 key_str = _stringify_evidence_fragment(k)
+                safe_key_str = _stringify_safe_evidence_fragment(k)
+                key_location = _join_evidence_path(location, k)
                 self._check_jax_transform(
                     key_str,
                     v if isinstance(v, str) else "",
-                    f"{location}/{key_str}",
+                    key_location,
                     result,
                 )
-                self._check_suspicious_keys(key_str, v, f"{location}/{key_str}", result)
+                self._check_suspicious_keys(key_str, v, key_location, result)
 
                 # Check if key itself contains suspicious patterns
-                self._check_suspicious_strings(key_str, f"{location}[key:{key_str}]", result)
+                self._check_suspicious_strings(
+                    key_str,
+                    f"{location}[key:{safe_key_str}]",
+                    result,
+                    evidence_value=safe_key_str,
+                )
 
                 self._analyze_content(
                     v,
-                    f"{location}/{key_str}",
+                    key_location,
                     result,
                     depth + 1,
                     traversal_state,
