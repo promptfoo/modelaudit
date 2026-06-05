@@ -1,6 +1,7 @@
 """Scanner for OCI container image layers containing model artifacts."""
 
 import json
+import math
 import os
 import shutil
 import tarfile
@@ -109,7 +110,8 @@ class OciLayerScanner(BaseScanner):
         """Return a positive float config value, or default for invalid input."""
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             return default
-        return float(value)
+        normalized_value = float(value)
+        return normalized_value if math.isfinite(normalized_value) else default
 
     def _add_layer_budget_check(
         self,
@@ -137,7 +139,12 @@ class OciLayerScanner(BaseScanner):
             rule_code="S902",
         )
 
-    def _gzip_stream_metrics(self, layer_path: str) -> tuple[int | None, int, bool]:
+    def _gzip_stream_metrics(
+        self,
+        layer_path: str,
+        *,
+        stop_after_decompressed: int | None = None,
+    ) -> tuple[int | None, int, bool]:
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         completed_compressed = 0
         completed_decompressed = 0
@@ -152,6 +159,10 @@ class OciLayerScanner(BaseScanner):
                         break
 
                 while data:
+                    decompressed_before = completed_decompressed + member_decompressed
+                    if stop_after_decompressed is not None and decompressed_before >= stop_after_decompressed:
+                        return completed_compressed + member_compressed or None, decompressed_before, False
+
                     try:
                         compressed_input = data
                         withheld = b""
@@ -159,7 +170,10 @@ class OciLayerScanner(BaseScanner):
                             compressed_input = data[: -self._GZIP_TRAILER_BYTES]
                             withheld = data[-self._GZIP_TRAILER_BYTES :]
                         before_len = len(compressed_input)
-                        output = decompressor.decompress(compressed_input, self._GZIP_OUTPUT_CHUNK_BYTES)
+                        output_limit = self._GZIP_OUTPUT_CHUNK_BYTES
+                        if stop_after_decompressed is not None:
+                            output_limit = min(output_limit, stop_after_decompressed - decompressed_before)
+                        output = decompressor.decompress(compressed_input, output_limit)
                     except zlib.error:
                         return (
                             completed_compressed + member_compressed or None,
@@ -170,6 +184,8 @@ class OciLayerScanner(BaseScanner):
                     member_decompressed += len(output)
                     compressed_consumed = completed_compressed + member_compressed
                     decompressed_seen = completed_decompressed + member_decompressed
+                    if stop_after_decompressed is not None and decompressed_seen >= stop_after_decompressed:
+                        return compressed_consumed, decompressed_seen, False
                     if decompressed_seen > self.max_decompressed_bytes:
                         return compressed_consumed, decompressed_seen, True
                     if decompressor.eof:
@@ -504,6 +520,7 @@ class OciLayerScanner(BaseScanner):
                 layer_entry_count = 0
                 layer_payload_size = 0
                 layer_budget_exhausted = False
+                tar_stream_end = 0
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
                         layer_entry_count += 1
@@ -679,6 +696,7 @@ class OciLayerScanner(BaseScanner):
                             fileobj.close()
                             if tmp_path and os.path.exists(tmp_path):
                                 os.unlink(tmp_path)
+                    tar_stream_end = tar.offset
                 if not layer_budget_exhausted:
                     if gzip_decompressed_size_exceeded or gzip_decompressed_size > self.max_decompressed_bytes:
                         scan_complete = False
@@ -699,7 +717,24 @@ class OciLayerScanner(BaseScanner):
                             },
                         )
                     elif compressed_budget_size > 0:
-                        final_ratio = gzip_decompressed_size / compressed_budget_size
+                        ratio_decompressed_size = gzip_decompressed_size
+                        ratio_compressed_size = compressed_budget_size
+                        final_ratio = ratio_decompressed_size / ratio_compressed_size
+                        expected_tar_stream_size = (
+                            (max(tar_stream_end, layer_payload_size) + (2 * tarfile.BLOCKSIZE) + tarfile.RECORDSIZE - 1)
+                            // tarfile.RECORDSIZE
+                        ) * tarfile.RECORDSIZE
+                        if gzip_decompressed_size > expected_tar_stream_size:
+                            tar_compressed_size, _, _ = self._gzip_stream_metrics(
+                                layer_path,
+                                stop_after_decompressed=expected_tar_stream_size,
+                            )
+                            if tar_compressed_size is not None:
+                                tar_ratio = expected_tar_stream_size / tar_compressed_size
+                                if tar_ratio > final_ratio:
+                                    final_ratio = tar_ratio
+                                    ratio_compressed_size = tar_compressed_size
+                                    ratio_decompressed_size = expected_tar_stream_size
                         if final_ratio > self.max_decompression_ratio:
                             scan_complete = False
                             self._add_layer_budget_check(
@@ -712,8 +747,8 @@ class OciLayerScanner(BaseScanner):
                                     f"({final_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
                                 ),
                                 details={
-                                    "decompressed_size": gzip_decompressed_size,
-                                    "compressed_size": compressed_budget_size,
+                                    "decompressed_size": ratio_decompressed_size,
+                                    "compressed_size": ratio_compressed_size,
                                     "max_ratio": self.max_decompression_ratio,
                                     "actual_ratio": final_ratio,
                                     "entries": layer_entry_count,

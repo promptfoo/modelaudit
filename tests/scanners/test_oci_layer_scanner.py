@@ -69,6 +69,12 @@ def _write_delayed_flax_cntk_overlap(path: Path) -> None:
 class TestOciLayerScanner:
     """Comprehensive tests for OCI Layer Scanner."""
 
+    @pytest.mark.parametrize("invalid_ratio", [float("nan"), float("inf"), float("-inf")])
+    def test_invalid_decompression_ratio_uses_safe_default(self, invalid_ratio: float) -> None:
+        scanner = OciLayerScanner({"compressed_max_decompression_ratio": invalid_ratio})
+
+        assert scanner.max_decompression_ratio == scanner._DEFAULT_MAX_DECOMPRESSION_RATIO
+
     def test_can_handle_valid_manifest_with_tar_gz(self, tmp_path: Path) -> None:
         """Test can_handle correctly identifies valid manifest files."""
         manifest_path = tmp_path / "test.manifest"
@@ -969,6 +975,14 @@ class TestOciLayerScanner:
         checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.INFO
+        assert "decompression ratio exceeded" in checks[0].message.lower()
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_decompression_ratio_exceeded",
+            tmp_path / "ratio-cache",
+            compressed_max_decompression_ratio=2.0,
+        )
 
     def test_scan_layer_rejects_padded_decompression_ratio_before_copying(self, tmp_path: Path) -> None:
         """Trailing gzip padding should not dilute the decompression-ratio denominator."""
@@ -1134,6 +1148,70 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].details["actual_ratio"] > 100.0
 
+    @pytest.mark.parametrize("tail_mode", ["same_member", "concatenated_member"])
+    def test_scan_layer_rejects_incompressible_gzip_tail_ratio_dilution(
+        self,
+        tmp_path: Path,
+        tail_mode: str,
+    ) -> None:
+        """Valid gzip data after TAR EOF must not dilute the TAR stream's decompression ratio."""
+        compressible_member = tmp_path / "zeros.bin"
+        compressible_member.write_bytes(b"\x00" * 65536)
+
+        raw_tar_path = tmp_path / "raw-tail-dilution.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(compressible_member, arcname="zeros.bin")
+        raw_tar = raw_tar_path.read_bytes()
+        incompressible_tail = b"".join(hashlib.sha256(str(index).encode()).digest() for index in range(4096))
+
+        layer_path = tmp_path / f"{tail_mode}-tail-dilution.tar.gz"
+        if tail_mode == "same_member":
+            layer_path.write_bytes(gzip.compress(raw_tar + incompressible_tail))
+        else:
+            layer_path.write_bytes(gzip.compress(raw_tar) + gzip.compress(incompressible_tail))
+
+        manifest_path = tmp_path / f"{tail_mode}-tail-dilution.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 2.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["actual_ratio"] > 2.0
+
+    @pytest.mark.parametrize("tail_mode", ["same_member", "concatenated_member"])
+    def test_scan_layer_allows_incompressible_gzip_tail_for_low_ratio_tar(
+        self,
+        tmp_path: Path,
+        tail_mode: str,
+    ) -> None:
+        """Extra gzip data alone must not fail a TAR stream that remains within the ratio policy."""
+        incompressible_payload = b"".join(hashlib.sha256(f"payload-{index}".encode()).digest() for index in range(2048))
+        payload_path = tmp_path / "payload.bin"
+        payload_path.write_bytes(incompressible_payload)
+
+        raw_tar_path = tmp_path / "raw-benign-tail.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload_path, arcname="payload.bin")
+        raw_tar = raw_tar_path.read_bytes()
+        incompressible_tail = b"".join(hashlib.sha256(f"tail-{index}".encode()).digest() for index in range(4096))
+
+        layer_path = tmp_path / f"{tail_mode}-benign-tail.tar.gz"
+        if tail_mode == "same_member":
+            layer_path.write_bytes(gzip.compress(raw_tar + incompressible_tail))
+        else:
+            layer_path.write_bytes(gzip.compress(raw_tar) + gzip.compress(incompressible_tail))
+
+        manifest_path = tmp_path / f"{tail_mode}-benign-tail.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 2.0}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert "oci_layer_decompression_ratio_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
     def test_scan_layer_scans_in_budget_members_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
         """Layer entry exhaustion should preserve findings from members already within budget."""
         layer_path = tmp_path / "many.tar.gz"
@@ -1155,6 +1233,14 @@ class TestOciLayerScanner:
         checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
         assert len(checks) == 1
         assert checks[0].details["entries"] == 3
+        assert "too many entries" in checks[0].message.lower()
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_entry_count_exceeded",
+            tmp_path / "entry-count-cache",
+            max_oci_layer_entries=2,
+        )
 
     def test_scan_layer_reports_early_malicious_member_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
         """Later filler entries should not suppress malicious members scanned before the cap is hit."""
