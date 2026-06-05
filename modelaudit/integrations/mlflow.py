@@ -15,6 +15,7 @@ from typing import Any
 
 from ..detectors.network_comm import _redact_urls_in_text
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
+from ..scanners._evidence_redaction import redact_evidence_string, redact_evidence_value
 from ..utils.sources.cloud_storage import redact_cloud_error_for_display
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,8 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
+    safe_model_uri = redact_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_details = redact_evidence_value(details, max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
 
     why = (
         "ModelAudit cannot safely acquire this MLflow artifact within the configured scan budget. "
@@ -133,8 +136,8 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
             status=CheckStatus.FAILED,
             message=message,
             severity=IssueSeverity.INFO,
-            location=model_uri,
-            details=details,
+            location=safe_model_uri,
+            details=safe_details,
             why=why,
         )
     )
@@ -142,8 +145,8 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
         Issue(
             message=message,
             severity=IssueSeverity.INFO,
-            location=model_uri,
-            details=details,
+            location=safe_model_uri,
+            details=safe_details,
             why=why,
             type="mlflow_download_budget",
         )

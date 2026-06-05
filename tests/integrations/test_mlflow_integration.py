@@ -12,6 +12,7 @@ from modelaudit.core import determine_exit_code
 from modelaudit.integrations.mlflow import (
     _copy_local_mlflow_artifact,
     _local_mlflow_artifact_root,
+    _mlflow_budget_failure_result,
     _MlflowArtifact,
     _MlflowArtifactSizeChangedError,
     scan_mlflow_model,
@@ -540,6 +541,50 @@ def test_scan_mlflow_model_redacts_header_credentials_from_size_errors(
     assert reported_error == "request failed; headers={'Authorization': '<redacted>', \"api_key\": \"<redacted>\"}"
     assert "very-secret-token" not in result.model_dump_json()
     assert "another secret" not in result.model_dump_json()
+
+
+def test_mlflow_budget_failure_redacts_uri_and_artifact_path_evidence() -> None:
+    """Refused downloads must not serialize credentials from source-controlled paths."""
+    model_uri = "https://user:password@example.com/model?token=URI_SECRET"
+    result = _mlflow_budget_failure_result(
+        model_uri,
+        "MLflow artifact download refused",
+        {
+            "model_uri": model_uri,
+            "root_uri": model_uri,
+            "artifact_path": "models/token=PATH_SECRET/model.pkl",
+            "added_artifact_paths": ["models/client_secret=LIST_SECRET/model.pkl"],
+        },
+    )
+
+    serialized_result = result.model_dump_json()
+    assert "user:password" not in serialized_result
+    assert "URI_SECRET" not in serialized_result
+    assert "PATH_SECRET" not in serialized_result
+    assert "LIST_SECRET" not in serialized_result
+    expected_uri = "https://<credentials-redacted>@example.com/model?token=<redacted>"
+    assert result.checks[0].location == expected_uri
+    assert result.checks[0].details["model_uri"] == expected_uri
+    assert result.checks[0].details["artifact_path"] == "models/token=<redacted>"
+
+
+def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
+    result = _mlflow_budget_failure_result(
+        "models:/PublicModel/7",
+        "MLflow artifact download refused",
+        {
+            "model_uri": "models:/PublicModel/7",
+            "root_uri": "models:/PublicModel/7",
+            "artifact_path": "weights/model.pkl",
+        },
+    )
+
+    assert result.checks[0].location == "models:/PublicModel/7"
+    assert result.checks[0].details == {
+        "model_uri": "models:/PublicModel/7",
+        "root_uri": "models:/PublicModel/7",
+        "artifact_path": "weights/model.pkl",
+    }
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
