@@ -121,10 +121,13 @@ DOCUMENTATION_SHELL_INTERPRETER_WRAPPER = rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*
 DOCUMENTATION_SHELL_WRAPPED_COMMAND = (
     DOCUMENTATION_SHELL_WRAPPERS + DOCUMENTATION_SHELL_INTERPRETER_WRAPPER + DOCUMENTATION_SHELL_WRAPPERS
 )
+DOCUMENTATION_SHELL_PROMPT = rb"(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])\s*)?"
+DOCUMENTATION_INLINE_CODE_OPEN = rb"(?:`{1,3}\s*)?"
+DOCUMENTATION_SHELL_LINE_PREFIX = (
+    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?" + DOCUMENTATION_INLINE_CODE_OPEN + DOCUMENTATION_SHELL_PROMPT
+)
 DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
-    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
-    + rb"(?:(?:\$\(|`)\s*)?"
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:(?:\$\(|`)\s*)?"
     rb"(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])"
     rb"|(?:powershell(?:\.exe)?|pwsh)\b\s+-[A-Za-z])",
@@ -132,6 +135,8 @@ DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
 )
 DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
     rb"(?:^|[;&|]\s*)"
+    + DOCUMENTATION_INLINE_CODE_OPEN
+    + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_SHELL_WRAPPED_COMMAND
     + rb"(?:(?:\$\(|`)\s*)?(?:(?:curl|fetch|invoke-webrequest|iwr|wget)\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)"
@@ -144,9 +149,7 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
-    rb"^\s*(?:(?:[-*+]|[0-9]{1,9}[.)])\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
-    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
-    + rb"(?:"
+    DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"(?:"
     rb"(?:(?:python(?:[0-9.]+)?|py(?:\s+-[0-9.]+)?)\s+-m\s+)?pip(?:[0-9.]+)?\s+install"
     rb"|pipx\s+install"
     rb"|uv\s+(?:pip\s+install|add)"
@@ -177,14 +180,16 @@ DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
     rb"[^\n]{0,32}:\s*$",
     re.IGNORECASE,
 )
+GENERIC_CC_BENIGN_TERM_PATTERN = rb"(?:malwares?|backdoors?|trojans?|botnets?|zombies?)"
 BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"(?:"
-    rb"\b(?:not|no|without)\s+(?:a\s+)?(?:known\s+)?(?:malware|backdoor|trojan|botnet|zombie)\b"
-    rb"|\b(?:malware|backdoor|trojan|botnet|zombie)[ -]free\b"
-    rb"|\b(?:malware|backdoor|trojan|botnet|zombie)\s+"
+    rb"\b(?:not|no|without)\s+(?:a\s+)?(?:known\s+)?" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"\b"
+    rb"|\b" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"[ -]free\b"
+    rb"|\b" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"\s+"
     rb"(?:analysis|benchmark|classification|classifier|dataset|defen[cs]e|detection|mitigation|research|resistance|robustness|testing)\b"
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
-    rb"(?:malware|backdoor|trojan|botnet|zombie)\b"
+    + GENERIC_CC_BENIGN_TERM_PATTERN
+    + rb"\b"
     rb")",
     re.IGNORECASE,
 )
@@ -329,18 +334,37 @@ class TextScanner(BaseScanner):
         return position - (payload.rfind(b"\n", 0, position) + 1) > MAX_TEXT_FINDING_CONTEXT_BYTES
 
     @staticmethod
-    def _documentation_line_has_import_statement(line: bytes) -> bool:
-        source = line.lstrip()
+    def _documentation_python_statements(line: bytes) -> list[ast.stmt]:
+        source = line.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
+        for fence_length in (3, 2, 1):
+            fence = b"`" * fence_length
+            if len(source) > fence_length * 2 and source.startswith(fence) and source.endswith(fence):
+                source = source[fence_length:-fence_length].strip()
+                break
         if source.startswith((b">>>", b"...")):
             source = source[3:].lstrip()
         try:
             parsed = ast.parse(source.decode("utf-8"))
         except (SyntaxError, UnicodeDecodeError, ValueError):
-            return False
-        return any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in parsed.body)
+            return []
+        return parsed.body
+
+    @classmethod
+    def _documentation_line_has_import_statement(cls, line: bytes) -> bool:
+        return any(
+            isinstance(statement, (ast.Import, ast.ImportFrom))
+            for statement in cls._documentation_python_statements(line)
+        )
+
+    @classmethod
+    def _documentation_line_has_definition(cls, line: bytes) -> bool:
+        return any(
+            isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef))
+            for statement in cls._documentation_python_statements(line)
+        )
 
     @staticmethod
     def _documentation_shell_comment_before_position(line: bytes, position: int) -> bool:
@@ -414,7 +438,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
             or DOCUMENTATION_LAMBDA_PATTERN.search(prefix) is not None
             or cls._documentation_line_has_import_statement(line)
-            or stripped.startswith((b"def ", b"class "))
+            or cls._documentation_line_has_definition(line)
         )
 
     @classmethod

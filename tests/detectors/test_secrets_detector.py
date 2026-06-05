@@ -217,6 +217,8 @@ class TestSecretsDetector:
             "process.env.CLIENT_SECRET",
             "$env:CLIENT_SECRET",
             "dummy_secret_value",
+            "clientSecretValue",
+            "<clientSecretValue>",
             "xxxxxxxxxxxxxxxx",
         ],
     )
@@ -247,6 +249,7 @@ class TestSecretsDetector:
             "<SECRET_ABCD1234EFGH5678>",
             "${CLIENT_SECRET_Z9Y8X7W6V5U4T3S2R1Q0P9O8}",
             "${OPENAI_API_KEY_Z9Y8X7W6V5U4T3S2R1Q0P9O8}",
+            "clientSecretAbcd1234Efgh5678",
         ],
     )
     def test_bracketed_realistic_client_secret_is_not_treated_as_placeholder(self, secret: str) -> None:

