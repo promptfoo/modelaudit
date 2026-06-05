@@ -650,6 +650,15 @@ class TestNetworkCommDetector:
         assert cloud_finding["url"] == "wasbs://account.blob.core.windows.net/model.bin"
         assert "user%3ASECRET" not in json.dumps(cloud_finding, sort_keys=True)
 
+    def test_wasb_container_shaped_userinfo_on_non_azure_host_is_stripped(self) -> None:
+        """Azure schemes must not preserve userinfo on unrelated hosts."""
+        url = "wasbs://accesskey@example.com/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "wasbs://example.com/model.bin"
+        assert "accesskey" not in redacted
+
     def test_gcs_api_bucket_names_are_preserved(self) -> None:
         """GCS JSON/download API bucket segments live after /b/ rather than at path index 1."""
         detector = NetworkCommDetector()
@@ -697,10 +706,11 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/main/{filename}"
 
-    def test_github_path_tokens_are_redacted(self) -> None:
+    @pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
+    def test_github_path_tokens_are_redacted(self, prefix: str) -> None:
         """Known token formats embedded in URL paths should be removed."""
         detector = NetworkCommDetector()
-        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        github_token = f"{prefix}_abcdefghijklmnopqrstuvwxyz0123456789"
         data = f"https://raw.githubusercontent.com/org/repo/{github_token}/model.py".encode()
 
         findings = detector.scan(data, "model.pkl")
@@ -708,6 +718,23 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://raw.githubusercontent.com/org/repo/<redacted>/model.py"
         assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_huggingface_path_tokens_override_repository_preservation(self) -> None:
+        """Known tokens must be redacted even where public repository names are normally preserved."""
+        token = "hf_" + "a" * 34
+        url = f"https://huggingface.co/{token}/repo/resolve/main/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://huggingface.co/<redacted>/repo/resolve/main/model.bin"
+        assert token not in redacted
+
+    def test_huggingface_path_token_near_miss_is_preserved(self) -> None:
+        """Short hf_-prefixed repository names should remain actionable."""
+        repository_owner = "hf_" + "a" * 29
+        url = f"https://huggingface.co/{repository_owner}/repo/resolve/main/model.bin"
+
+        assert network_comm.redact_url_for_finding(url) == url
 
     def test_benign_short_url_paths_are_preserved(self) -> None:
         """Ordinary URL paths should remain readable after redaction."""
@@ -933,6 +960,31 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
+
+    def test_explicit_ml_model_url_patterns_redact_signed_query_material(self) -> None:
+        detector = NetworkCommDetector()
+        token = "TOP_SECRET_QUERY"
+        signature = "SIGSECRET1234567890"
+        data = f"callback = 'https://collector.example/upload?token={token}&X-Amz-Signature={signature}'".encode()
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        serialized = json.dumps(explicit_finding, sort_keys=True)
+        assert token not in serialized
+        assert signature not in serialized
+        assert explicit_finding["matched_text"] == "https://collector.example/upload"
+        assert explicit_finding["message"] == "Explicit network pattern in ML model: https://collector.example/upload"
+
+    def test_explicit_ml_model_url_patterns_keep_benign_url_context(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"source = https://example.com/models/checkpoint.bin"
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        assert explicit_finding["matched_text"] == "https://example.com/models/checkpoint.bin"
+        assert explicit_finding["message"].endswith("https://example.com/models/checkpoint.bin")
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
