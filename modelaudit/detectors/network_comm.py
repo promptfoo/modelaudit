@@ -279,6 +279,16 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
             changed = True
             continue
 
+        empty_assignment_key = _empty_sensitive_path_assignment_key(part)
+        if empty_assignment_key is not None:
+            redacted_assignment = _redact_sensitive_path_assignment(part, preserve_key=True)
+            assert redacted_assignment is not None
+            parts[index] = redacted_assignment
+            redact_next_value = True
+            authorization_value_pending = _is_authorization_path_key(empty_assignment_key)
+            changed = True
+            continue
+
         if _is_sensitive_path_key(token_candidate):
             redact_next_value = True
             authorization_value_pending = _is_authorization_path_key(token_candidate)
@@ -351,8 +361,22 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
             )
             authorization_value_pending = False
         else:
-            redacted_component, component_changed = _redact_boundary_component(component)
-            if component and _is_sensitive_path_key(token_component) and carries_sensitive_value(following_boundary):
+            empty_assignment_key = _empty_sensitive_path_assignment_key(component)
+            if empty_assignment_key is not None and carries_sensitive_value(following_boundary):
+                redacted_assignment = _redact_sensitive_path_assignment(component, preserve_key=True)
+                assert redacted_assignment is not None
+                redacted_component = redacted_assignment
+                component_changed = True
+                redact_next_value = True
+                authorization_value_pending = _is_authorization_path_key(empty_assignment_key)
+            else:
+                redacted_component, component_changed = _redact_boundary_component(component)
+            if (
+                empty_assignment_key is None
+                and component
+                and _is_sensitive_path_key(token_component)
+                and carries_sensitive_value(following_boundary)
+            ):
                 redact_next_value = True
                 authorization_value_pending = _is_authorization_path_key(token_component)
         redacted_parts.append(redacted_component)
@@ -1736,13 +1760,18 @@ class NetworkCommDetector:
         """Scan for URL patterns."""
         url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_generic_url_contexts(data)
         for url_start, _url_end, url in url_contexts:
+            if self.max_findings is not None:
+                for nested_url in _decoded_nested_urls(url):
+                    if not self._record_url_finding(nested_url, url_start, context):
+                        return
             if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None and not self._record_url_finding(
                 url, url_start, context
             ):
                 return
-            for nested_url in _decoded_nested_urls(url):
-                if not self._record_url_finding(nested_url, url_start, context):
-                    return
+            if self.max_findings is None:
+                for nested_url in _decoded_nested_urls(url):
+                    if not self._record_url_finding(nested_url, url_start, context):
+                        return
 
     def _record_url_finding(self, url: str, position: int, context: str) -> bool:
         safe_url = redact_url_for_finding(url)
@@ -1792,7 +1821,7 @@ class NetworkCommDetector:
                 url = match.group().decode("utf-8", errors="ignore")
                 safe_url = redact_url_for_finding(url)
 
-                if self.max_findings is not None and self.URL_PATTERN.fullmatch(match.group()) is None:
+                if self.max_findings is not None:
                     for nested_url in _decoded_nested_urls(url):
                         if not self._record_url_finding(nested_url, match.start(), context):
                             return

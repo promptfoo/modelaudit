@@ -1805,6 +1805,29 @@ class TestNetworkCommDetector:
     @pytest.mark.parametrize(
         "path",
         [
+            "path;api_key=;SECRET123/model.bin",
+            "path&api_key=&SECRET123/model.bin",
+            "path%26api_key%3D%26SECRET123/model.bin",
+        ],
+    )
+    def test_empty_delimited_path_assignment_redacts_following_value(self, path: str) -> None:
+        """Empty assignments inside one path segment must taint the next component."""
+        findings = NetworkCommDetector().scan(f"https://evil.example/{path}".encode(), "hook.py")
+
+        assert "SECRET123" not in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize("path", ["path;algorithm=;public/model.bin", "path&algorithm=&public/model.bin"])
+    def test_empty_delimited_path_assignment_near_match_preserves_value(self, path: str) -> None:
+        """Empty ordinary assignments must not hide the following public component."""
+        url = f"https://evil.example/{path}"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert any(finding.get("url") == url for finding in findings)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
             "prefix%2Fapi_key=SECRET123/model.bin",
             "prefix:token=SECRET123/model.bin",
             "prefix%252Fapi_key=SECRET123/model.bin",
@@ -2506,6 +2529,32 @@ def test_network_finding_limit_does_not_drain_cloud_uri_prefix(monkeypatch: pyte
     assert findings[0]["type"] == "cloud_storage_url"
     assert findings[-1]["type"] == "detector_finding_limit"
     assert detector._url_contexts == []
+
+
+def test_network_finding_limit_prioritizes_decoded_nested_url() -> None:
+    """A constrained budget must report the encoded destination before its stripped wrapper."""
+    nested_url = "https://evil-c2.com/payload"
+    data = b"https://benign.example/download?next=https%3A%2F%2Fevil-c2.com%2Fpayload"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["truncated_finding"]["url"] == "https://benign.example/download"
+
+
+def test_network_finding_limit_prioritizes_nested_url_in_cloud_wrapper() -> None:
+    """Cloud URL handling must not consume the only slot before its encoded destination."""
+    nested_url = "https://evil-c2.com/payload"
+    data = b"https://storage.googleapis.com/bucket/model?next=https%3A%2F%2Fevil-c2.com%2Fpayload"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["truncated_finding"]["type"] == "cloud_storage_url"
 
 
 @pytest.mark.parametrize("secret", ["45.33.32.156", "secret-value.example.com"])
