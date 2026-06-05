@@ -4,10 +4,13 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
+import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
@@ -59,6 +62,8 @@ class ScanResultsCache:
         self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.hasher = SecureFileHasher()
         self.key_generator = AdaptiveCacheKeyGenerator()
+        self._change_clock_probes: dict[int, tuple[BinaryIO, Path]] = {}
+        self._change_clock_probe_lock = threading.Lock()
 
         self._ensure_metadata_exists()
 
@@ -345,6 +350,11 @@ class ScanResultsCache:
         if self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
+        preliminary_stat = os.stat(file_path)
+        probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
+
+        if self._path_has_symlink_component(file_path):
+            raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
         initial_stat = os.stat(file_path)
         initial_change_token = self._get_file_change_token(file_path, initial_stat)
         initial_ancestor_identity = self._capture_ancestor_identity(file_path)
@@ -360,34 +370,95 @@ class ScanResultsCache:
         ):
             raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-        self._advance_change_clock(file_path, verified_change_token, verified_ancestor_identity)
+        self._advance_change_clock(file_path, probe, verified_change_token, verified_ancestor_identity)
         return verified_stat, content_hash, verified_change_token, verified_ancestor_identity
+
+    def _get_change_clock_probe(self, file_path: str, file_device: int) -> BinaryIO:
+        """Return a reusable probe whose inode lives on the scanned file's filesystem."""
+        with self._change_clock_probe_lock:
+            existing = self._change_clock_probes.get(file_device)
+            if existing is not None:
+                return existing[0]
+
+            candidates = [self.cache_dir, Path(tempfile.gettempdir())]
+            ancestor = Path(os.path.abspath(file_path)).parent
+            while True:
+                candidates.append(ancestor)
+                if ancestor.parent == ancestor:
+                    break
+                ancestor = ancestor.parent
+
+            checked: set[Path] = set()
+            for candidate in candidates:
+                if candidate in checked:
+                    continue
+                checked.add(candidate)
+                if not self._directory_is_on_device(candidate, file_device):
+                    continue
+
+                probe: BinaryIO | None = None
+                try:
+                    # Keep the probe open so nested captures do not mutate ancestor directories.
+                    probe = tempfile.TemporaryFile(  # noqa: SIM115
+                        mode="w+b",
+                        prefix=".modelaudit-cache-clock-",
+                        dir=candidate,
+                    )
+                    if os.fstat(probe.fileno()).st_dev != file_device:
+                        probe.close()
+                        continue
+                    self._change_clock_probes[file_device] = (probe, candidate)
+                    return probe
+                except OSError:
+                    if probe is not None:
+                        with suppress(OSError):
+                            probe.close()
+
+        raise ValueError(f"No writable cache identity probe directory for: {file_path}")
+
+    @staticmethod
+    def _directory_is_on_device(directory: Path, device: int) -> bool:
+        try:
+            return directory.is_dir() and directory.stat().st_dev == device
+        except OSError:
+            return False
 
     def _advance_change_clock(
         self,
         file_path: str,
+        probe: BinaryIO,
         file_change_token: int,
         ancestor_identity: AncestorIdentity,
     ) -> None:
         """Advance the filesystem change clock past the captured identity or decline caching."""
         file_stat = os.stat(file_path)
-        probe_stat = os.stat(self.metadata_file)
-        ancestor_devices = {entry[1] for entry in ancestor_identity}
-        if file_stat.st_dev != probe_stat.st_dev or ancestor_devices != {probe_stat.st_dev}:
+        if os.fstat(probe.fileno()).st_dev != file_stat.st_dev:
             raise ValueError(f"Cache identity probe is on a different filesystem: {file_path}")
 
         captured_tokens = [file_change_token, *(entry[-1] for entry in ancestor_identity)]
         newest_captured_token = max(captured_tokens)
+
         deadline = time.monotonic() + 0.05
         while time.monotonic() < deadline:
-            os.utime(self.metadata_file, None)
-            probe_stat = os.stat(self.metadata_file)
-            probe_token = self._get_file_change_token(str(self.metadata_file), probe_stat)
+            probe_token = self._touch_change_clock_probe(probe)
             if probe_token > newest_captured_token:
                 return
             time.sleep(0.001)
 
         raise ValueError(f"Filesystem change clock did not advance for cache identity: {file_path}")
+
+    def _touch_change_clock_probe(self, probe: BinaryIO) -> int:
+        if os.name != "nt":
+            os.utime(probe.fileno(), None)
+            probe_stat = os.fstat(probe.fileno())
+            return self._get_file_change_token("", probe_stat)
+
+        probe_name = getattr(probe, "name", None)
+        if not isinstance(probe_name, (str, bytes)):
+            raise OSError("Windows cache identity probe has no filesystem path")
+        os.utime(probe_name, None)
+        probe_stat = os.stat(probe_name)
+        return self._get_file_change_token(os.fsdecode(probe_name), probe_stat)
 
     def _capture_ancestor_identity(self, file_path: str) -> AncestorIdentity:
         """Capture same-filesystem lexical ancestors and reject symlinked path components."""
@@ -401,6 +472,8 @@ class ScanResultsCache:
             ancestor_stat = os.stat(ancestor_path)
             if ancestor_stat.st_dev != file_device:
                 break
+            if ancestor.parent == ancestor or os.stat(ancestor.parent).st_dev != file_device:
+                break
             identity.append(
                 (
                     ancestor_path,
@@ -410,8 +483,6 @@ class ScanResultsCache:
                     self._get_file_change_token(ancestor_path, ancestor_stat),
                 )
             )
-            if ancestor.parent == ancestor:
-                break
             ancestor = ancestor.parent
         return tuple(identity)
 

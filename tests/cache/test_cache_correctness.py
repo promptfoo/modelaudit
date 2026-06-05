@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -53,6 +54,55 @@ def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
         "expected_change_token": change_token,
         "expected_ancestor_identity": ancestor_identity,
     }
+
+
+def test_capture_file_identity_uses_target_filesystem_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_device_check = cache._directory_is_on_device
+
+    def simulate_cache_and_system_temp_on_other_devices(directory: Path, device: int) -> bool:
+        if directory in {cache.cache_dir, Path(tempfile.gettempdir())}:
+            return False
+        return original_device_check(directory, device)
+
+    monkeypatch.setattr(cache, "_directory_is_on_device", simulate_cache_and_system_temp_on_other_devices)
+
+    file_stat, file_hash, change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
+
+    assert file_stat == file_path.stat()
+    assert file_hash.startswith("secure:")
+    assert change_token > 0
+    assert ancestor_identity
+    assert cache._change_clock_probes[file_stat.st_dev][1] == file_path.parent
+
+
+def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    outer_identity = _identity_kwargs(cache, str(file_path))
+
+    cache.capture_file_identity(str(file_path))
+
+    assert cache.store_result(str(file_path), {"success": True}, **outer_identity) is True
+
+
+def test_capture_file_identity_excludes_same_filesystem_mount_root(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+
+    _file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
+    tracked_paths = {entry[0] for entry in ancestor_identity}
+    mount_root = file_path.parent
+    file_device = file_path.stat().st_dev
+    while mount_root.parent != mount_root and mount_root.parent.stat().st_dev == file_device:
+        mount_root = mount_root.parent
+
+    assert str(file_path.parent) in tracked_paths
+    assert str(mount_root) not in tracked_paths
 
 
 def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> None:
