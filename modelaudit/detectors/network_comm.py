@@ -446,6 +446,12 @@ def _is_sensitive_path_key(key: str) -> bool:
     )
 
 
+def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
+    """Return whether a compound segment leaves a credential key awaiting its value."""
+    parts = [part for part in re.split(r"(?i)&amp;|[/,:;&]", segment) if part]
+    return len(parts) > 1 and _is_sensitive_path_key(parts[-1])
+
+
 def _redact_sensitive_path_assignment(segment: str, *, preserve_key: bool = False) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = _decode_path_token(token_candidate)
@@ -509,7 +515,9 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             or _is_path_style_cloud_bucket_segment(scheme, hostname, index)
             or _is_gcs_api_bucket_segment(hostname, segments, index)
         )
-        if not is_public_identifier and _is_sensitive_path_key(decoded_segment):
+        if not is_public_identifier and (
+            _is_sensitive_path_key(decoded_segment) or _compound_path_segment_ends_with_sensitive_key(decoded_segment)
+        ):
             redact_next_value = True
             continue
         is_slack_webhook_secret = (
