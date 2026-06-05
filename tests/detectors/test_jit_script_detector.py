@@ -7154,6 +7154,7 @@ class TestJITScriptDetector:
         [
             b"globals()['setattr'] = lambda *args: None\n",
             b"globals().update(setattr=lambda *args: None)\n",
+            b"globals().update(**{'setattr': lambda *args: None})\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
             b"__builtins__.setattr = lambda *args: None\n",
             b"__builtins__['setattr'] = lambda *args: None\n",
@@ -7221,6 +7222,58 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_ignores_overwritten_runpy_capture(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\ncaptured = rp.run_path\ncaptured = print\nrp.run_path = print\ncaptured('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_propagated_runpy_capture_before_safe_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\ncaptured = rp.run_path\nrelay = captured\nrp.run_path = print\nrelay('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_annotation_only_preserves_runpy_capture(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nrunner = rp.run_path\nrunner: object\nrp.run_path = print\nrunner('payload.py')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"import runpy as rp\nrp = object()\nrunner = rp.run_path\nrunner('safe')\n",
+            b"import runpy as rp\nrunner = rp.run_path\ndel runner\nrunner('safe')\n",
+        ],
+    )
+    def test_scan_model_ignores_inactive_runpy_captures_after_rebinding(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_nested_print_parameter_does_not_shadow_module_builtin(self) -> None:
         source = "import runpy as rp\ndef helper(print):\n    pass\nrp.run_path = print\nrp.run_path('safe')\n"
 
@@ -7252,6 +7305,585 @@ class TestJITScriptDetector:
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
         )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\nmapping = wb.__dict__\nmapping = {}\n"
+                b"mapping.update(open=print)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes as c\nmapping = c.__dict__\nmapping = {}\n"
+                b"mapping.update(CDLL=print)\nc.CDLL('payload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_typed_call_after_mapping_alias_reassignment(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_scan_model_keeps_runpy_call_after_module_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nactual = rp\nrp = object()\nrp.run_path = print\nactual.run_path('payload.py')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_preserves_safe_runpy_alias_after_other_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nactual = rp\nactual.run_path = print\nrp = object()\nactual.run_path('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_runpy_call_after_possible_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy\nimport runpy as rp\nif enabled:\n    rp = object()\n"
+            b"rp.run_path = print\nrunpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_runpy_call_after_import_context_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        data = (
+            b"import runpy\nimport runpy as rp\nrp = object()\n"
+            + padding
+            + b"rp.run_path = print\nrunpy.run_path('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import webbrowser\nwebbrowser.open('https://example.invalid')\nwebbrowser.open = print\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import ctypes\nctypes.CDLL('payload.so')\nctypes.CDLL = print\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_typed_call_before_safe_overwrite(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"updates = {'run_path': original}\nrp.__dict__.update(updates)\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"rp.__dict__.update({**{}, 'run_path': original})\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"updates = {'open': original}\nwb.__dict__.update(updates)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_call_after_unproven_mapping_update(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_scan_model_preserves_safe_runpy_member_after_trailing_static_update(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\nupdates = {}\nrp.__dict__.update(updates, run_path=print)\nrp.run_path('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_restored_runpy_member_without_call(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy\noriginal = runpy.run_path\nrunpy.run_path = print\nrunpy.run_path = original\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_stale_runpy_mapping_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            b"namespace = rp.__dict__\nnamespace = {}\nnamespace.update(run_path=original)\nrp.run_path('safe')\n"
+        )
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import runpy\nrunpy.run_path = print\nimport sys\n"
+                b"del sys.modules['runpy']\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser\nwebbrowser.open = print\nimport sys\n"
+                b"del sys.modules['webbrowser']\nimport webbrowser\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, sys\nrunpy.run_path = print\n"
+                b"sys.modules.pop('runpy')\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser, sys\nwebbrowser.open = print\n"
+                b"sys.modules.pop('webbrowser')\nimport webbrowser\n"
+                b"webbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, sys\ns = sys\nrunpy.run_path = print\n"
+                b"s.modules.pop('runpy')\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, sys\nmodules = sys.modules\nrunpy.run_path = print\n"
+                b"modules.pop('runpy')\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, sys\nevict = sys.modules.pop\nrunpy.run_path = print\n"
+                b"evict('runpy')\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy\nfrom sys import modules\nrunpy.run_path = print\n"
+                b"modules.pop('runpy')\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser, sys\nwebbrowser.open = print\n"
+                b"sys.modules.clear()\nimport webbrowser\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, sys\nrunpy.run_path = print\n"
+                b"((s := sys), s.modules.pop(*('runpy',)))\nimport runpy\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, importlib\nrunpy.run_path = print\n"
+                b"importlib.reload(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser, importlib\nwebbrowser.open = print\n"
+                b"importlib.reload(webbrowser)\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_call_after_module_reimport_or_reload(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import webbrowser as wb\nmapping = wb.__dict__\nmapping = {}\nmapping.update(open=print)\n",
+            "import webbrowser as wb\nmapping: dict = wb.__dict__\nmapping: dict = {}\nmapping.update(open=print)\n",
+            "import webbrowser as wb\n(mapping,) = (wb.__dict__,)\n(mapping,) = ({},)\nmapping.update(open=print)\n",
+            "import webbrowser as wb\nmapping = wb.__dict__\n(mapping := {}) or mapping.update(open=print)\n",
+        ],
+    )
+    def test_typed_safe_overwrite_rejects_rebound_mapping_alias(self, source: str) -> None:
+        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == set()
+
+    def test_typed_safe_overwrite_preserves_forwarded_mapping_alias(self) -> None:
+        source = (
+            "import webbrowser as wb\nmapping = wb.__dict__\nalias = mapping\nmapping = {}\nalias.update(open=print)\n"
+        )
+
+        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == {("webbrowser.open", "S109")}
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import runpy as rp\nrp.__dict__.update(rp.run_path('payload.py') or {}, run_path=print)\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\nwb.__dict__.update(wb.open('https://example.invalid') or {}, open=print)\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy as rp\nenabled and rp.__dict__.update(run_path=print)\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\nenabled and wb.__dict__.update(open=print)\n"
+                b"wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, types\nrp = runpy\n(rp := types.SimpleNamespace())\n"
+                b"rp.run_path = print\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, types\nrp = runpy\nfor _ in [1, 2]:\n    rp = types\n"
+                b"rp.run_path = print\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser\nimport webbrowser as wb\nimport types as wb\n"
+                b"wb.open = print\nwebbrowser.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+                b"mapping = rp.__dict__\nupdates = {'run_path': original}\n"
+                b"mapping |= updates\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"mapping = wb.__dict__\nupdates = {'open': original}\n"
+                b"mapping |= updates\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"refresh(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"refresh = (refresh(runpy), print)[1]\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"refresh, callback = print, refresh\ncallback(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\nfrom importlib import reload as refresh\nwb.open = print\n"
+                b"refresh = (refresh(wb), print)[1]\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy\nother = runpy\nfrom importlib import reload as refresh\n"
+                b"runpy.run_path = print\nrunpy = (refresh(runpy), print)[1]\n"
+                b"other.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb\nother = wb\nfrom importlib import reload as refresh\n"
+                b"wb.open = print\nwb = (refresh(wb), print)[1]\n"
+                b"other.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, importlib\nrefresh = importlib\nrunpy.run_path = print\n"
+                b"refresh.reload(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, importlib\nrefresh = print\nrunpy.run_path = print\n"
+                b"((refresh := importlib.reload), refresh(runpy))\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb, importlib\nrefresh = print\nwb.open = print\n"
+                b"((refresh := importlib.reload), refresh(wb))\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, importlib\nrunpy.run_path = print\n"
+                b"((loader := importlib), loader.reload(*(runpy,)))\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb, importlib\nwb.open = print\n"
+                b"importlib.reload(module=wb)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import runpy, importlib\nrunpy.run_path = print\n"
+                b"importlib.reload(**{'module': runpy})\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, importlib\nrefresh = importlib.reload\nrunpy.run_path = print\n"
+                b"(False and (refresh := print), refresh(runpy))\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, importlib\nrefresh = importlib.reload\nrunpy.run_path = print\n"
+                b"(lambda: (refresh := print))\nrefresh(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import runpy, importlib\nrefresh = importlib.reload\nrunpy.run_path = print\n"
+                b"[(refresh := print) for _ in []]\nrefresh(runpy)\nrunpy.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+            ),
+            (
+                b"import webbrowser as wb, importlib\nrefresh = importlib.reload\nwb.open = print\n"
+                b"[(refresh := print) for _ in [1] if False]\n"
+                b"refresh(wb)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nalias = wb\n"
+                b"alias.open('https://example.invalid') or (alias := object())\nwb.open = print\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_keeps_call_across_ordered_state_replay_edges(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (b"import runpy as rp\nif False:\n    rp = object()\nrp.run_path = print\nrp.run_path('safe')\n"),
+            (b"import runpy as rp\nrp.run_path = print\nimport runpy as other\nrp.run_path('safe')\n"),
+            (
+                b"import runpy as rp\nrp.run_path = print\n"
+                b"class Safe:\n    @staticmethod\n    def reload(value):\n        pass\n"
+                b"Safe.reload(rp)\nrp.run_path('safe')\n"
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"(refresh := print)\nrefresh(runpy)\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"for refresh in [print]:\n    pass\nrefresh(runpy)\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy\nfrom importlib import reload as refresh\nrunpy.run_path = print\n"
+                b"((refresh := print), refresh(runpy))\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy, sys, types\nrunpy.run_path = print\n"
+                b"sys = types.SimpleNamespace(modules={})\nsys.modules.pop('runpy', None)\n"
+                b"import runpy\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy, importlib, types\nrunpy.run_path = print\n"
+                b"importlib = types.SimpleNamespace(reload=print)\n"
+                b"importlib.reload(runpy)\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy, importlib\nrefresh = print\nrunpy.run_path = print\n"
+                b"(False and (refresh := importlib.reload), refresh(runpy))\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy as rp, types\nrp.run_path = print\n"
+                b"((rp := types.SimpleNamespace(run_path=print)), rp.run_path('safe'))\n"
+            ),
+            (b"import runpy as rp, types\n(rp := types.SimpleNamespace(run_path=print))\nrp.run_path('safe')\n"),
+            (b"import runpy as rp, types\n[(rp := types.SimpleNamespace(run_path=print)), rp.run_path('safe')]\n"),
+            (
+                b"import runpy, sys, types\nrunpy.run_path = print\ns = sys\n"
+                b"((s := types.SimpleNamespace(modules={})), s.modules.pop('runpy', None))\n"
+                b"import runpy\nrunpy.run_path('safe')\n"
+            ),
+            (
+                b"import runpy, importlib\nrefresh = importlib.reload\nrunpy.run_path = print\n"
+                b"list((refresh := print) for _ in [1])\nrefresh(runpy)\nrunpy.run_path('safe')\n"
+            ),
+        ],
+    )
+    def test_scan_model_preserves_safe_runpy_state_across_benign_replay_edges(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            (
+                b"import webbrowser as wb\nfrom importlib import reload as refresh\nwb.open = print\n"
+                b"(refresh := print)\nrefresh(wb)\nwb.open('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nfrom importlib import reload as refresh\nwb.open = print\n"
+                b"for refresh in [print]:\n    pass\nrefresh(wb)\nwb.open('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nfrom importlib import reload as refresh\nwb.open = print\n"
+                b"((refresh := print), refresh(wb))\nwb.open('safe')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb, importlib\nrefresh = importlib.reload\nwb.open = print\n"
+                b"list((refresh := print) for _ in [1])\nrefresh(wb)\nwb.open('safe')\n",
+                "Web browser launch detected",
+            ),
+        ],
+    )
+    def test_scan_model_preserves_safe_typed_state_after_reload_alias_rebinding(
+        self,
+        source: bytes,
+        expected_pattern: str,
+    ) -> None:
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern", "should_detect"),
+        [
+            (
+                b"import runpy as old, sys\nold.run_path = print\ndel sys.modules['runpy']\n"
+                b"import runpy as fresh\nold.run_path('safe')\n",
+                "Dynamic module execution detected",
+                False,
+            ),
+            (
+                b"import runpy as old, sys\nold.run_path = print\ndel sys.modules['runpy']\n"
+                b"import runpy as fresh\nfresh.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+                True,
+            ),
+            (
+                b"import webbrowser as old, sys\nold.open = print\ndel sys.modules['webbrowser']\n"
+                b"import webbrowser as fresh\nold.open('safe')\n",
+                "Web browser launch detected",
+                False,
+            ),
+            (
+                b"import webbrowser as old, sys\nold.open = print\ndel sys.modules['webbrowser']\n"
+                b"import webbrowser as fresh\nfresh.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                True,
+            ),
+            (
+                b"import runpy as old, sys\nold.run_path = print\nclass Payload:\n"
+                b"    del sys.modules['runpy']\n    import runpy as fresh\n    old.run_path('safe')\n",
+                "Dynamic module execution detected",
+                False,
+            ),
+        ],
+    )
+    def test_scan_model_tracks_module_generations_after_cache_eviction(
+        self,
+        source: bytes,
+        expected_pattern: str,
+        should_detect: bool,
+    ) -> None:
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+        assert detected is should_detect
+
+    def test_typed_safe_overwrite_rejects_cross_dependent_tuple_swap(self) -> None:
+        source = (
+            "import webbrowser as wb\nmapping = wb.__dict__\nalias = {}\n"
+            "alias, mapping = mapping, alias\nmapping.update(open=print)\n"
+        )
+
+        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == set()
 
     @pytest.mark.parametrize(
         "unrelated_delete",
@@ -7286,6 +7918,7 @@ class TestJITScriptDetector:
             b"globals()['print'] = eval\n",
             b"globals().__setitem__('print', eval)\n",
             b"globals().setdefault('print', eval)\n",
+            b"globals().update(**{'print': eval})\n",
             b"dict.__setitem__(globals(), 'print', eval)\n",
             b"locals().__setitem__('print', eval)\n",
             b"namespace = globals()\nnamespace['print'] = eval\n",
