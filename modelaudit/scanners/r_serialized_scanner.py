@@ -120,6 +120,7 @@ _R_OBVIOUS_NONCALLABLE_GROUPED_TOKEN_RE = re.compile(
     """,
     re.VERBOSE,
 )
+_R_INCOMPLETE_EXPRESSION_TRAILING_CHARACTERS = frozenset("+-*/^:!&|<>$@~?%\\")
 
 
 def _r_function_keyword_before_position(
@@ -300,6 +301,62 @@ def _position_is_in_r_suppressing_non_code_span(
     return non_code_spans[span_index][0] not in malformed_raw_span_starts
 
 
+def _r_named_argument_target_kind(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> str | None:
+    """Return the R tag kind immediately before ``=`` when it is syntactically simple."""
+    cursor = position - 1
+    target_kind: str | None = None
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return None
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            break
+        span_start, span_end = non_code_spans[span_index]
+        if text[span_start] == "#":
+            cursor = span_start - 1
+            continue
+        if span_end != cursor + 1:
+            return None
+        if text[span_start] == "`":
+            target_kind = "symbol"
+        elif text[span_start] in "\"'":
+            target_kind = "string"
+        else:
+            return None
+        cursor = span_start - 1
+        break
+
+    if target_kind is None:
+        if not (text[cursor].isalnum() or text[cursor] in "._"):
+            return None
+        while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+            cursor -= 1
+        target_kind = "symbol"
+
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return None
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            break
+        span_start, _span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return None
+        cursor = span_start - 1
+
+    return target_kind if text[cursor] in "([," else None
+
+
 def _r_named_argument_equals_positions(
     text: str,
     positions: set[int],
@@ -350,10 +407,15 @@ def _r_named_argument_equals_positions(
         if target_close is None or outermost[1] not in delimiter_pairs or target[0] not in {"(", "["}:
             continue
 
+        target_kind = _r_named_argument_target_kind(text, position, non_code_spans)
+        if target_kind is None:
+            continue
         target_is_function_formals = target[0] == "(" and (
             _r_function_keyword_before_position(text, target[1], non_code_spans, delimiter_pairs)
             or _r_lambda_shorthand_before_position(text, target[1], non_code_spans, delimiter_pairs)
         )
+        if target_is_function_formals and target_kind != "symbol":
+            continue
         if target[1] not in target_validity:
             target_validity[target[1]] = (
                 _r_open_paren_starts_argument_list(text, target[1], non_code_spans, delimiter_pairs)
@@ -365,11 +427,17 @@ def _r_named_argument_equals_positions(
 
         if target_is_function_formals:
             if target[1] not in function_body_validity:
+                body_start = target_close + 1
                 function_body_validity[target[1]] = _r_expression_follows(
                     text,
-                    target_close + 1,
+                    body_start,
                     non_code_spans,
                     delimiter_pairs,
+                    unterminated_literal_starts,
+                ) and not _r_expression_is_obviously_incomplete(
+                    text,
+                    body_start,
+                    non_code_spans,
                     unterminated_literal_starts,
                 )
             if not function_body_validity[target[1]]:
@@ -544,6 +612,132 @@ def _r_next_code_position(
             return cursor
         cursor = span_end
     return None
+
+
+def _r_expression_is_obviously_incomplete(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+    unterminated_literal_starts: set[int],
+) -> bool:
+    """Reject clear truncation without attempting to parse the full R grammar."""
+    closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    last_code_positions: list[int | None] = [None]
+    saw_code = False
+    cursor = position
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    span_index = max(0, span_index)
+
+    def current_expression_ends_with_operator() -> bool:
+        last_code_position = last_code_positions[-1]
+        return last_code_position is not None and (
+            text[last_code_position] in _R_INCOMPLETE_EXPRESSION_TRAILING_CHARACTERS
+            or (not stack and text[last_code_position] == "=")
+        )
+
+    while cursor < len(text):
+        while span_index < len(non_code_spans) and non_code_spans[span_index][1] <= cursor:
+            span_index += 1
+        if span_index < len(non_code_spans) and non_code_spans[span_index][0] <= cursor:
+            span_start, span_end = non_code_spans[span_index]
+            if text[span_start] == "#":
+                cursor = span_end
+                continue
+            if span_start in unterminated_literal_starts:
+                return True
+            last_code_positions[-1] = span_end - 1
+            saw_code = True
+            cursor = span_end
+            continue
+
+        character = text[cursor]
+        if character.isspace():
+            if character in "\r\n" and not stack:
+                if not saw_code:
+                    cursor += 1
+                    continue
+                if current_expression_ends_with_operator():
+                    cursor += 1
+                    continue
+                return False
+            cursor += 1
+            continue
+        if not stack and character == ";":
+            return current_expression_ends_with_operator()
+        if not stack and character in ",)]}":
+            return current_expression_ends_with_operator()
+        if character in closing_delimiters:
+            last_code_positions[-1] = cursor
+            stack.append(character)
+            last_code_positions.append(None)
+            saw_code = True
+            cursor += 1
+            continue
+        if character in ")]}":
+            if not stack or closing_delimiters[stack[-1]] != character:
+                return True
+            if current_expression_ends_with_operator():
+                return True
+            stack.pop()
+            last_code_positions.pop()
+            last_code_positions[-1] = cursor
+            saw_code = True
+            cursor += 1
+            continue
+
+        last_code_positions[-1] = cursor
+        saw_code = True
+        cursor += 1
+
+    return bool(stack) or current_expression_ends_with_operator()
+
+
+def _r_function_body_awaits_continuation(text: str) -> bool:
+    non_code_spans = _r_non_code_spans(text)
+    closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack: list[tuple[str, int]] = []
+    delimiter_pairs: dict[int, int] = {}
+    cursor = 0
+    span_index = 0
+    while cursor < len(text):
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in closing_delimiters:
+            stack.append((character, cursor))
+        elif character in ")]}" and stack:
+            if closing_delimiters[stack[-1][0]] != character:
+                stack.clear()
+                cursor += 1
+                continue
+            opener, opener_position = stack.pop()
+            if opener == "(":
+                delimiter_pairs[opener_position] = cursor
+                delimiter_pairs[cursor] = opener_position
+        cursor += 1
+
+    unterminated_literal_starts = _r_unterminated_literal_span_starts(text, non_code_spans)
+    for opener_position, closer_position in delimiter_pairs.items():
+        if opener_position > closer_position:
+            continue
+        if not (
+            _r_function_keyword_before_position(text, opener_position, non_code_spans, delimiter_pairs)
+            or _r_lambda_shorthand_before_position(text, opener_position, non_code_spans, delimiter_pairs)
+        ):
+            continue
+        body_start = closer_position + 1
+        if _r_next_code_position(text, body_start, non_code_spans) is None or _r_expression_is_obviously_incomplete(
+            text,
+            body_start,
+            non_code_spans,
+            unterminated_literal_starts,
+        ):
+            return True
+    return False
 
 
 def _r_expression_follows(
@@ -1435,6 +1629,7 @@ class RSerializedScanner(BaseScanner):
                         and (
                             _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
                             or _r_function_keyword_awaits_formals(current_text)
+                            or _r_function_body_awaits_continuation(current_text)
                             or _r_lambda_shorthand_before_position(
                                 current_text,
                                 len(current_text),
