@@ -67,6 +67,7 @@ Each finding carries a `rule_code` so downstream tooling can allowlist, suppress
 | `DANGEROUS_GLOBAL`       | Imports of modules or classes that enable code execution when the pickle is loaded    |
 | `EXTENSION_REF`          | `copyreg.extension` / `EXT1`/`EXT2`/`EXT4` opcodes that resolve through process state |
 | `MALFORMED_STACK_GLOBAL` | `STACK_GLOBAL` operands crafted to bypass naive string-matching scanners              |
+| `NON_ALLOWLISTED_GLOBAL` | Non-allowlisted global references that require manual review before loading           |
 | `PERSISTENT_ID`          | `PERSID` / `BINPERSID` references that delegate object construction to the loader     |
 | `PICKLE_EXPANSION`       | Oversized or amplified pickle structures consistent with zip-bomb-style payloads      |
 | `POST_BUDGET_GLOBAL`     | Dangerous globals observed after the opcode budget, surfaced conservatively           |

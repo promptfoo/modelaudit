@@ -51,6 +51,13 @@ def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
     return JITScriptFinding(**kwargs)
 
 
+def _redact_code_evidence_snippet(code: str, max_chars: int = 200) -> str:
+    """Redact credentials from detector code evidence before serializing it."""
+    from modelaudit.scanners._evidence_redaction import redact_evidence_string
+
+    return redact_evidence_string(code, max_chars=max_chars)
+
+
 # Dangerous TorchScript operations that can execute arbitrary code
 DANGEROUS_TORCH_OPS = [
     # System operations
@@ -17671,7 +17678,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {dangerous_import} import - it can be used maliciously",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=code_str[:200],
+                                code_snippet=_redact_code_evidence_snippet(code_str),
                                 type="dangerous_import",
                                 operation=None,
                                 builtin=None,
@@ -17696,7 +17703,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=code_str[:200],
+                                code_snippet=_redact_code_evidence_snippet(code_str),
                                 type="dangerous_builtin",
                                 operation=None,
                                 builtin=builtin,
@@ -17794,7 +17801,7 @@ class JITScriptDetector:
                     recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                     confidence=0.9,
                     framework=framework,
-                    code_snippet=code_str[:200],
+                    code_snippet=_redact_code_evidence_snippet(code_str),
                     type="dangerous_builtin",
                     operation=None,
                     builtin=builtin,

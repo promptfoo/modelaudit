@@ -1,6 +1,7 @@
 """Tests for JIT/Script code execution detection."""
 
 import ast
+import json
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,54 @@ class TestJITScriptDetector:
         assert any("eval" in getattr(f, "builtin", "") for f in findings)
         assert any("exec" in getattr(f, "builtin", "") for f in findings)
         assert any("__import__" in getattr(f, "builtin", "") for f in findings)
+
+    def test_embedded_python_code_snippets_redact_secret_assignments(self) -> None:
+        detector = JITScriptDetector()
+        secret = "SECRETKEY1234567890"
+        fallback_secret = "FALLBACKSECRET1234567890"
+        data = f"""
+        def payload():
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
+            client_secret = os.getenv("CLIENT_SECRET", "{fallback_secret}")
+            return eval("1 + 1")
+        """.encode()
+
+        findings = detector._extract_and_check_python_code(data, "Test", "payload.pt")
+
+        serialized = json.dumps([finding.model_dump() for finding in findings], sort_keys=True)
+        builtin_finding = next(
+            finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
+        )
+        assert secret not in serialized
+        assert fallback_secret not in serialized
+        assert builtin_finding.code_snippet is not None
+        assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
+        assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
+        assert "client_secret = <redacted>" in builtin_finding.code_snippet
+        assert 'eval("1 + 1' in builtin_finding.code_snippet
+
+    def test_contextual_builtin_fallback_redacts_code_snippet(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        detector = JITScriptDetector()
+        secret = "CONTEXTUALSECRET1234567890"
+        contextual_source = f'api_key = "{secret}"; eval("1 + 1")'
+        monkeypatch.setattr(
+            JITScriptDetector,
+            "_contextual_dangerous_builtin_sources",
+            staticmethod(lambda _data: {"eval": contextual_source}),
+        )
+
+        findings = detector._extract_and_check_python_code(b"\x00", "Test", "payload.pt")
+
+        builtin_finding = next(
+            finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
+        )
+        assert builtin_finding.code_snippet is not None
+        assert secret not in builtin_finding.code_snippet
+        assert 'api_key = "<redacted>"' in builtin_finding.code_snippet
+        assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_dangerous_builtin_alias_assigned_by_tuple_unpacking(self) -> None:
         detector = JITScriptDetector()
