@@ -49,6 +49,12 @@ class BatchCacheOperations:
         # Prepare cache lookups with stat collection
         for file_path in file_paths:
             try:
+                if self.cache_manager.cache is not None and self.cache_manager.cache._path_has_symlink_component(
+                    file_path
+                ):
+                    logger.debug("Bypassing batch cache lookup for symlinked path %s", file_path)
+                    results[file_path] = None
+                    continue
                 stat_result = os.stat(file_path)
                 cache_key = self.cache_manager.cache.generate_cache_key(
                     file_path,
@@ -250,6 +256,10 @@ class BatchCacheOperations:
         # Warm up the key generator's fingerprint cache
         for file_path in file_paths[:50]:  # Limit to avoid memory bloat
             try:
+                if self.cache_manager.cache is not None and self.cache_manager.cache._path_has_symlink_component(
+                    file_path
+                ):
+                    continue
                 stat_result = os.stat(file_path)
                 # This will cache the fingerprint
                 self.cache_manager.key_generator.generate_key_with_stat_reuse(file_path, stat_result)

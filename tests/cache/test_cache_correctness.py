@@ -73,23 +73,24 @@ def test_capture_file_identity_uses_target_filesystem_probe(
 
     monkeypatch.setattr(cache, "_directory_is_on_device", simulate_cache_and_system_temp_on_other_devices)
 
-    file_stat, file_hash, change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
+    file_stat = file_path.stat()
+    probe = cache._get_change_clock_probe(str(file_path), file_stat.st_dev)
 
-    assert file_stat == file_path.stat()
-    assert file_hash.startswith("secure:")
-    assert change_token > 0
-    assert ancestor_identity
+    assert os.fstat(probe.fileno()).st_dev == file_stat.st_dev
     assert cache._change_clock_probes[file_stat.st_dev][1] == file_path.parent
+    probe.close()
+    cache._change_clock_probes.clear()
 
 
-def test_change_clock_probe_prefers_system_temp_over_cache_directory(tmp_path: Path) -> None:
+def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
 
     file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
 
     assert ancestor_identity
-    assert cache._change_clock_probes[file_stat.st_dev][1] == Path(tempfile.gettempdir())
+    expected_probe_dir = Path(tempfile.gettempdir()) if os.name == "nt" else cache.cache_dir
+    assert cache._change_clock_probes[file_stat.st_dev][1] == expected_probe_dir
 
 
 def test_windows_change_clock_probe_uses_existing_handle(
@@ -199,7 +200,7 @@ def test_capture_file_identity_advances_clock_before_hashing(
     monkeypatch.setattr(cache, "_touch_change_clock_probe", advance_probe)
     monkeypatch.setattr(cache.hasher, "hash_file_with_stat", mutate_during_hash)
 
-    with pytest.raises(ValueError, match="File changed while capturing cache identity"):
+    with pytest.raises(ValueError, match=r"File changed while (starting|capturing) cache identity"):
         cache.capture_file_identity(str(file_path))
 
 
@@ -775,6 +776,58 @@ def test_cache_lookup_bypasses_ancestor_symlink(tmp_path: Path, monkeypatch: pyt
     )
 
     assert cache.get_cached_result(str(model_path)) is None
+
+
+def test_batch_lookup_bypasses_symlink_before_key_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target_path = _make_cacheable_file(target_dir)
+    symlink_path = tmp_path / "model.cache"
+    try:
+        symlink_path.symlink_to(target_path)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    batch_ops = BatchCacheOperations(cache_manager)
+    monkeypatch.setattr(
+        cache_manager.cache.key_generator,
+        "generate_key_material_with_stat_reuse",
+        lambda *_args, **_kwargs: pytest.fail("symlinked batch lookup reached cache-key generation"),
+    )
+
+    cached_results = batch_ops.batch_lookup([str(symlink_path)])
+
+    assert cached_results[str(symlink_path)] is None
+
+
+def test_batch_prefetch_bypasses_symlink_before_key_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target_path = _make_cacheable_file(target_dir)
+    symlink_path = tmp_path / "prefetch.cache"
+    try:
+        symlink_path.symlink_to(target_path)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    batch_ops = BatchCacheOperations(cache_manager)
+    assert cache_manager.key_generator is not None
+    monkeypatch.setattr(
+        cache_manager.key_generator,
+        "generate_key_with_stat_reuse",
+        lambda *_args, **_kwargs: pytest.fail("symlinked prefetch reached cache-key generation"),
+    )
+
+    batch_ops.prefetch_cache_metadata([str(symlink_path)])
 
 
 def test_cache_manager_cached_scan_does_not_cache_ancestor_directory_swap(tmp_path: Path) -> None:
@@ -1748,9 +1801,13 @@ def test_store_result_discards_private_entry_when_final_identity_check_fails(
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
     token_calls = 0
     private_entry_observed = False
+    original_get_file_change_token = cache._get_file_change_token
 
-    def changed_on_final_check(_path: str, _stat: os.stat_result | None = None) -> int:
+    def changed_on_final_check(path: str, stat_result: os.stat_result | None = None) -> int:
         nonlocal private_entry_observed, token_calls
+        if Path(path) != file_path:
+            assert stat_result is not None
+            return original_get_file_change_token(path, stat_result)
         token_calls += 1
         private_entry_observed = bool(list(cache.cache_dir.rglob("*.tmp")))
         return expected_change_token + int(private_entry_observed)
