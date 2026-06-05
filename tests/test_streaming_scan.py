@@ -911,7 +911,200 @@ def test_scan_model_streaming_empty_generator():
     assert result.content_hash is None or result.content_hash == compute_aggregate_hash([])
 
 
-def test_scan_model_streaming_scan_error_handling(temp_test_files):
+def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+    generator_closed = False
+    clock_calls = 0
+
+    def fake_time() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return 0.0 if clock_calls == 1 else 1.0
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        nonlocal generator_closed
+        try:
+            yield (streamed_file, True)
+        finally:
+            generator_closed = True
+
+    retained_generator = file_generator()
+    with (
+        patch("modelaudit.core.time.time", side_effect=fake_time),
+        patch("modelaudit.core.scan_file") as mock_scan,
+    ):
+        result = scan_model_streaming(
+            file_generator=retained_generator,
+            timeout=0,
+            delete_after_scan=True,
+        )
+
+    assert result.has_errors is True
+    assert result.success is False
+    assert generator_closed is True
+    assert not streamed_file.exists()
+    mock_scan.assert_not_called()
+
+
+def test_scan_model_streaming_timeout_omits_successful_prefix_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.pkl"
+    second = tmp_path / "second.pkl"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    now = [0.0]
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield first, False
+        now[0] = 2.0
+        yield second, True
+
+    monkeypatch.setattr("modelaudit.core.time.time", lambda: now[0])
+    monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result())
+
+    result = scan_model_streaming(
+        file_generator=file_generator(),
+        timeout=1,
+        delete_after_scan=False,
+    )
+
+    assert result.files_scanned == 1
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert result.content_hash is None
+
+
+def test_scan_model_streaming_interruption_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+    generator_closed = False
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        nonlocal generator_closed
+        try:
+            yield (streamed_file, True)
+        finally:
+            generator_closed = True
+
+    retained_generator = file_generator()
+    with (
+        patch("modelaudit.core.check_interrupted", side_effect=KeyboardInterrupt("interrupted")),
+        pytest.raises(KeyboardInterrupt, match="interrupted"),
+    ):
+        scan_model_streaming(
+            file_generator=retained_generator,
+            delete_after_scan=True,
+        )
+
+    assert generator_closed is True
+    assert not streamed_file.exists()
+
+
+def test_scan_model_streaming_delete_failure_is_operational_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+    original_unlink = Path.unlink
+
+    def fail_streamed_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == streamed_file:
+            raise PermissionError("delete denied")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_streamed_unlink)
+    monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result())
+
+    result = scan_model_streaming(
+        file_generator=iter([(streamed_file, True)]),
+        delete_after_scan=True,
+    )
+
+    assert streamed_file.exists()
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.location == str(streamed_file)
+        and issue.details.get("operational_error") is True
+        and "delete denied" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_accepts_generator_fallback_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+    original_unlink = Path.unlink
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        try:
+            yield streamed_file, True
+        finally:
+            original_unlink(streamed_file)
+
+    def fail_streamed_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == streamed_file:
+            raise PermissionError("delete denied")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_streamed_unlink)
+    monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result())
+
+    result = scan_model_streaming(
+        file_generator=file_generator(),
+        delete_after_scan=True,
+    )
+
+    assert not streamed_file.exists()
+    assert result.has_errors is False
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any("Failed to delete streamed source" in issue.message for issue in result.issues)
+
+
+def test_scan_model_streaming_close_failure_is_operational_error(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+
+    class CloseFails(Iterator[tuple[Path, bool]]):
+        def __init__(self) -> None:
+            self.yielded = False
+
+        def __next__(self) -> tuple[Path, bool]:
+            if self.yielded:
+                raise StopIteration
+            self.yielded = True
+            return streamed_file, True
+
+        def close(self) -> None:
+            raise OSError("close failed")
+
+    with patch("modelaudit.core.scan_file", return_value=create_mock_scan_result()):
+        result = scan_model_streaming(
+            file_generator=CloseFails(),
+            delete_after_scan=False,
+        )
+
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.message == "Failed to close streaming file generator: close failed"
+        and issue.details.get("operational_error") is True
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_scan_error_handling(temp_test_files: list[Path]) -> None:
     """Test that scan errors are handled gracefully in streaming mode."""
 
     def file_generator():
@@ -937,6 +1130,7 @@ def test_scan_model_streaming_scan_error_handling(temp_test_files):
         assert result.has_errors is True
         # Should have scanned 2 files (1st and 3rd)
         assert result.files_scanned == 2
+        assert result.content_hash is None
 
 
 @pytest.mark.slow
@@ -1079,3 +1273,5 @@ def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> Non
         assert result.success is True
         assert result.files_scanned == len(temp_test_files)
         assert mock_asset.call_count == 3
+        assert result.assets
+        assert all(asset.is_streamed is True for asset in result.assets)

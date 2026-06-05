@@ -31,6 +31,7 @@ from modelaudit.scanners.archive_dispatch import (
     _select_nested_scanner_id,
     scan_nested_file,
 )
+from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_source
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import (
@@ -4529,6 +4530,39 @@ def test_scan_zip_empty_loop_target_does_not_hide_later_dangerous_call(tmp_path:
     ]
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_eager_generator_consumer_applies_safe_module_member_overwrite() -> None:
+    source = b"import ctypes as c\nlist(c.__dict__.update(CDLL=print) for _ in [0])\nloader = c.CDLL\nloader('safe')\n"
+
+    assert not any(call.rule_code == "S110" for call in high_risk_python_calls_in_source(source))
+
+
+def test_shadowed_generator_consumer_does_not_apply_module_member_overwrite() -> None:
+    source = (
+        b"import ctypes as c\n"
+        b"list = lambda iterable: None\n"
+        b"list(c.__dict__.update(CDLL=print) for _ in [0])\n"
+        b"loader = c.CDLL\n"
+        b"loader('payload.so')\n"
+    )
+
+    assert any(call.rule_code == "S110" for call in high_risk_python_calls_in_source(source))
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "list(c.__dict__.update(CDLL=print) for _ in [0] if False)",
+        "list(print if True else c.__dict__.update(CDLL=print) for _ in [0])",
+        "any(True if i == 0 else c.__dict__.update(CDLL=print) for i in [0, 1])",
+        "all(False if i == 0 else c.__dict__.update(CDLL=print) for i in [0, 1])",
+    ],
+)
+def test_generator_consumer_does_not_apply_skipped_module_member_overwrite(consumer: str) -> None:
+    source = f"import ctypes as c\n{consumer}\nloader = c.CDLL\nloader('payload.so')\n".encode()
+
+    assert any(call.rule_code == "S110" for call in high_risk_python_calls_in_source(source))
 
 
 def test_scan_zip_nonempty_loop_target_shadows_dangerous_import(tmp_path: Path) -> None:
