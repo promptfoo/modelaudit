@@ -683,6 +683,87 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_reresolve_trusted_hf_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical HF target must not depend on a second raw readlink call."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-model")
+    alias = snapshot / "model.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    original_readlink = os.readlink
+    readlink_calls = 0
+
+    def fail_redundant_readlink(path: Any, *, dir_fd: int | None = None) -> Any:
+        nonlocal readlink_calls
+        readlink_calls += 1
+        if readlink_calls > 1:
+            raise OSError("raw symlink target cannot be resolved again")
+        if dir_fd is None:
+            return original_readlink(path)
+        return original_readlink(path, dir_fd=dir_fd)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        return _mock_sharded_scan_result(blob_path.stat().st_size)
+
+    monkeypatch.setattr(os, "readlink", fail_redundant_readlink)
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.files_scanned == 1
+    assert result.has_errors is False
+    assert not any(issue.message == "Directory entry unavailable during discovery" for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_require_strict_hf_alias_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid relative aliases remain scannable when strict alias resolution is unavailable."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-model")
+    alias = snapshot / "model.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    original_resolve = Path.resolve
+
+    def reject_strict_symlink_resolution(path: Path, strict: bool = False) -> Path:
+        if strict and path.is_symlink():
+            raise OSError("strict relative symlink resolution is unavailable")
+        return original_resolve(path, strict=strict)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        return _mock_sharded_scan_result(blob_path.stat().st_size)
+
+    monkeypatch.setattr(Path, "resolve", reject_strict_symlink_resolution)
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.files_scanned == 1
+    assert result.has_errors is False
+    assert not any("path traversal" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_directory_scan_rejects_symlinked_hf_blobs_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1022,8 +1103,9 @@ def test_directory_scan_handles_broken_hf_shard_alias_per_file(
     assert len(coverage_checks) == 1
     assert result.has_errors is True
     assert any(
-        issue.message == "Directory entry unavailable during discovery"
+        issue.message == "Broken symlink encountered"
         and issue.location == str(snapshot / "model-00002-of-00002.safetensors")
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
         for issue in result.issues
     )
 

@@ -924,9 +924,27 @@ def _resolve_directory_scan_target(
     reported_traversal_targets: set[str] | None = None,
 ) -> tuple[Path | None, bool, bool]:
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
+    is_symlink = file_path.is_symlink()
     try:
-        resolved_file = file_path.resolve(strict=True)
+        # Strict resolution of valid relative file symlinks is unreliable on
+        # some Windows versions. Resolve once and verify that target directly.
+        resolved_file = file_path.resolve()
+        resolved_file.stat()
     except (OSError, RuntimeError) as e:
+        if is_symlink and isinstance(e, OSError):
+            _add_issue_to_model(
+                results,
+                "Broken symlink encountered",
+                severity=IssueSeverity.INFO.value,
+                location=str(file_path),
+                details={
+                    "error": str(e),
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "directory_entry_unavailable",
+                },
+            )
+            return None, False, True
         _add_issue_to_model(
             results,
             "Directory entry unavailable during discovery",
@@ -943,36 +961,10 @@ def _resolve_directory_scan_target(
 
     # Check if this is a HuggingFace cache symlink scenario
     is_hf_cache_symlink = False
-    if file_path.is_symlink() and is_hf_cache and _path_has_part(file_path, "snapshots"):
-        try:
-            link_target = os.readlink(file_path)
-        except OSError as e:
-            _add_issue_to_model(
-                results,
-                "Broken symlink encountered",
-                severity=IssueSeverity.INFO.value,
-                location=str(file_path),
-                details={"error": str(e)},
-            )
-            return None, False, True
-
-        # Resolve the relative link target
-        try:
-            resolved_target = (file_path.parent / link_target).resolve(strict=True)
-        except (OSError, RuntimeError) as e:
-            _add_issue_to_model(
-                results,
-                "Directory entry unavailable during discovery",
-                severity=IssueSeverity.INFO.value,
-                location=str(file_path),
-                details={
-                    "error": str(e),
-                    "analysis_incomplete": True,
-                    "scan_outcome": "inconclusive",
-                    "scan_outcome_reason": "directory_entry_unavailable",
-                },
-            )
-            return None, False, True
+    if is_symlink and is_hf_cache and _path_has_part(file_path, "snapshots"):
+        # Reuse the canonical target resolved above. On Windows, os.readlink()
+        # may expose a device-path spelling that cannot safely be rejoined.
+        resolved_target = resolved_file
         # Check if target is in the blobs directory of the same model cache
         if hf_cache_root is not None:
             blobs_root = _trusted_hf_blobs_root(hf_cache_root)
