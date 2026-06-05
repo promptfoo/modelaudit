@@ -6,6 +6,7 @@ import ast
 import json
 import pickle
 import stat
+import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -732,6 +733,2491 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
 @pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
+        (
+            b"def handle(data, context):\n    module = __import__('os')\n    return getattr(module, 'system')('id')\n",
+            "os.system",
+        ),
+        (
+            b"from importlib import import_module as load\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    runner = getattr(load('os'), 'system')\n"
+            b"    return runner('id')\n",
+            "os.system",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('sub' + 'process').Popen(['id'])\n",
+            "subprocess.Popen",
+        ),
+    ],
+)
+def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
+    tmp_path: Path,
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="dynamic_import_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+    assert dangerous_name in handler_failures[0].details["risky_calls"]
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    return [__import__][0]('os').system('id')\n",
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return list(map(lambda load: load('os').system('id'), [import_module]))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"load = len\n"
+            b"def handle(data, context):\n"
+            b"    def set_loader():\n"
+            b"        global load\n"
+            b"        load = import_module\n"
+            b"    set_loader()\n"
+            b"    return load('os').system('id')\n"
+        ),
+    ],
+)
+def test_scan_detects_dynamic_handler_execution_bypasses(tmp_path: Path, handler_source: bytes) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="dynamic_handler_bypass.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].details["risky_calls"]
+
+
+def test_dynamic_import_getattr_handler_analysis_ignores_safe_attributes() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    sqrt = getattr(module, 'sqrt')\n"
+        b"    return sqrt(4)\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "math.sqrt" not in risky_calls
+    assert risky_calls == {"__import__"}
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('asyncio.subprocess')\n"
+            b"    return module.subprocess.create_subprocess_shell('id')\n",
+            "asyncio.subprocess.create_subprocess_shell",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('ctypes').cdll.LoadLibrary('payload.so')\n",
+            "ctypes.cdll.LoadLibrary",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('ctypes').cdll['payload']()\n",
+            "ctypes.cdll.__getitem__",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('webbrowser').get().open('https://example.com')\n",
+            "webbrowser.open",
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    browser = __import__('webbrowser').get()\n"
+            b"    return browser.open('https://example.com')\n",
+            "webbrowser.open",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_nested_attributes(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    return __import__(('os',)[0]).system('id')\n",
+        b"def handle(data, context):\n    return getattr(__import__('os'), ['system'][0])('id')\n",
+        b"def handle(data, context):\n    return getattr(__import__('os'), {'run': 'system'}['run'])('id')\n",
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_literal_selected_strings(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_ignores_invalid_literal_string_selection() -> None:
+    handler_source = b"def handle(data, context):\n    return getattr(__import__('os'), ['system'][1])('id')\n"
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"from importlib import import_module as load\n\ndef helper(load):\n    return load('os').system('id')\n"),
+        (
+            b"from importlib import import_module as load\n"
+            b"\n"
+            b"def helper():\n"
+            b"    load = len\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (b"def helper(__import__):\n    return __import__('os').system('id')\n"),
+    ],
+)
+def test_dynamic_import_handler_analysis_respects_shadowed_import_helpers(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_restores_local_import_helper() -> None:
+    handler_source = (
+        b"def helper(load):\n"
+        b"    from importlib import import_module as load\n"
+        b"    return load('os').system('id')\n"
+        b"def handle(data, context):\n"
+        b"    return helper(len)\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_possible_branch_aliases() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    if context:\n"
+        b"        module = __import__('os')\n"
+        b"    else:\n"
+        b"        module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_possible_branch_loader_aliases() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    if context:\n"
+        b"        from importlib import import_module as load\n"
+        b"    else:\n"
+        b"        from math import sqrt as load\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_falsey_branch_reachable() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None if context else __import__('math')\n"
+        b"    if module:\n"
+        b"        return []\n"
+        b"    return __import__('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_definitely_truthy_branch_unreachable() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math') if context else __import__('json')\n"
+        b"    if module:\n"
+        b"        return []\n"
+        b"    return __import__('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "loop_source",
+    [
+        (
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            module = __import__('os')\n"
+            b"            break\n"
+            b"        module = __import__('math')\n"
+            b"        break\n"
+        ),
+        (
+            b"    for choice in [context]:\n"
+            b"        if choice:\n"
+            b"            module = __import__('os')\n"
+            b"            break\n"
+            b"        module = __import__('math')\n"
+            b"        break\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_conditional_break_aliases(loop_source: bytes) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n" + loop_source + b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "loop_source",
+    [
+        (
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            module = __import__('math')\n"
+            b"            break\n"
+            b"        module = __import__('json')\n"
+            b"        break\n"
+        ),
+        (
+            b"    for choice in [context]:\n"
+            b"        if choice:\n"
+            b"            module = __import__('math')\n"
+            b"            break\n"
+            b"        module = __import__('json')\n"
+            b"        break\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_replaces_stale_aliases_on_conditional_breaks(loop_source: bytes) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n" + loop_source + b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_applies_finally_before_break_exit() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            module = __import__('os')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_drops_stale_alias_before_finally_break_exit() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize("terminal_statement", [b"return []", b"continue"])
+def test_dynamic_import_handler_analysis_honors_finally_overriding_break(
+    terminal_statement: bytes,
+) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            " + terminal_statement + b"\n"
+        b"    return __import__('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    return module.system('id')\n\nmodule = __import__('os')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    return load('os').system('id')\n"
+            b"\n"
+            b"from importlib import import_module as load\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_late_global_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_leak_nested_import_aliases() -> None:
+    handler_source = (
+        b"def helper():\n"
+        b"    from importlib import import_module as load\n"
+        b"    return load('math').sqrt(4)\n"
+        b"\n"
+        b"def handle(data, context):\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os')]:\n"
+            b"        return getattr(module, 'system')('id')\n"
+        ),
+        (
+            b"from contextlib import nullcontext\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    with nullcontext(__import__('os')) as module:\n"
+            b"        return getattr(module, 'system')('id')\n"
+        ),
+        (
+            b"from contextlib import nullcontext\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    with nullcontext(enter_result=__import__('os')) as module:\n"
+            b"        return getattr(module, 'system')('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    with __import__('contextlib').nullcontext(__import__('os')) as module:\n"
+            b"        return module.system('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_tracks_bound_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    return __import__('asyncio.subprocess', fromlist=['x']).create_subprocess_shell('id')\n",
+            "asyncio.subprocess.create_subprocess_shell",
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        module = __import__('os')\n"
+            b"    except Exception:\n"
+            b"        module = __import__('math')\n"
+            b"    return module.system('id')\n",
+            "os.system",
+        ),
+        (
+            b"def handle(data, context):\n    return getattr(__import__('os'), 'system').__call__('id')\n",
+            "os.system",
+        ),
+        (
+            b"from importlib import *\n\ndef handle(data, context):\n    return import_module('os').system('id')\n",
+            "os.system",
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    ctypes_module = __import__('ctypes')\n"
+            b"    loader = ctypes_module.LibraryLoader(ctypes_module.CDLL)\n"
+            b"    return loader.LoadLibrary('payload.so')\n",
+            "ctypes.LibraryLoader.<dynamic>",
+        ),
+        (
+            b"from typing import TYPE_CHECKING\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+            b"\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('math')\n"
+            b"else:\n"
+            b"    module = __import__('os')\n",
+            "os.system",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_closes_dynamic_execution_bypasses(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module as load\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    load: object\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"from importlib import import_module as load\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    if context:\n"
+            b"        load = len\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+            b"\n"
+            b"if __name__ == '__main__':\n"
+            b"    module = __import__('os')\n"
+        ),
+        (
+            b"from typing import TYPE_CHECKING\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+            b"\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+        ),
+        (
+            b"import typing\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+            b"\n"
+            b"if typing.TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_avoids_non_executing_alias_false_positives(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module as load\n"
+            b"load: object\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    from importlib import import_module as load\n"
+            b"    load: object\n"
+            b"    return load('os').system('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_annotation_only_runtime_bindings(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_treats_match_captures_as_local_bindings() -> None:
+    handler_source = (
+        b"from importlib import import_module as load\n"
+        b"\n"
+        b"def handle(data, context):\n"
+        b"    match context:\n"
+        b"        case load:\n"
+        b"            pass\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_ignores_invalid_ctypes_library_loader_factories() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    ctypes_module = __import__('ctypes')\n"
+        b"    loader = ctypes_module.LibraryLoader(len)\n"
+        b"    return loader.LoadLibrary('payload.so')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "ctypes.LibraryLoader.<dynamic>" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_leak_class_namespace_aliases_into_methods() -> None:
+    handler_source = (
+        b"import importlib\n"
+        b"\n"
+        b"class Handler:\n"
+        b"    load = importlib.import_module\n"
+        b"\n"
+        b"    def handle(self, data, context):\n"
+        b"        return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_preserves_class_body_execution_order() -> None:
+    handler_source = (
+        b"class Handler:\n    runner = load('os').system('id')\n\nfrom importlib import import_module as load\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_replaces_rebound_lifecycle_attributes() -> None:
+    handler_source = (
+        b"class Handler:\n"
+        b"    def initialize(self, context):\n"
+        b"        self.module = __import__('os')\n"
+        b"        self.module = None\n"
+        b"\n"
+        b"    def handle(self, data, context):\n"
+        b"        return self.module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_conditional_lifecycle_attributes() -> None:
+    handler_source = (
+        b"class Handler:\n"
+        b"    def initialize(self, context):\n"
+        b"        self.module = __import__('os')\n"
+        b"        if context:\n"
+        b"            self.module = None\n"
+        b"\n"
+        b"    def handle(self, data, context):\n"
+        b"        return self.module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def outer():\n"
+            b"    load = __import__\n"
+            b"\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"\n"
+            b"    return handle\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    load = __import__\n"
+            b"\n"
+            b"    class Handler:\n"
+            b"        def handle(self, data, context):\n"
+            b"            return load('os').system('id')\n"
+            b"\n"
+            b"    return Handler\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_enclosing_function_closures(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')]]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module]:\n"
+            b"            return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    load = getattr(__import__('importlib'), 'import_module')\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"\n"
+            b"    load = __import__\n"
+            b"    return handle\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    class Handler:\n"
+            b"        def handle(self, data, context):\n"
+            b"            return load('os').system('id')\n"
+            b"\n"
+            b"    load = __import__\n"
+            b"    return Handler\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_closes_iterable_pattern_and_closure_bypasses(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_comprehension_targets_scoped() -> None:
+    handler_source = (
+        b"from importlib import import_module as module\n"
+        b"\n"
+        b"def handle(data, context):\n"
+        b"    [value for module in [len] for value in [module]]\n"
+        b"    return module('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context, module=__import__('os')):\n    return module.system('id')\n"),
+        (
+            b"from importlib import import_module as load\n"
+            b"def handle(data, context, load=load):\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    imp = __import__('importlib')\n"
+            b"    return imp.import_module('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('builtins').__import__('os').system('id')\n"),
+        (b"def handle(data, context):\n    return __builtins__.__import__('os').system('id')\n"),
+        (b"def handle(data, context):\n    return (module := __import__('os')).system('id')\n"),
+        (b"def handle(data, context):\n    resolve = getattr\n    return resolve(__import__('os'), 'system')('id')\n"),
+        (b"def handle(data, context):\n    [(load := __import__) for _ in [0]]\n    return load('os').system('id')\n"),
+        (b"def handle(data, context):\n    return __import__('builtins').getattr(__import__('os'), 'system')('id')\n"),
+    ],
+)
+def test_dynamic_import_handler_analysis_closes_callable_and_walrus_bypasses(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    return [__import__][0]('os').system('id')\n"),
+        (b"def handle(data, context):\n    return {'load': __import__}['load']('os').system('id')\n"),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return list(map(lambda load: load('os').system('id'), [import_module]))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return list(filter(lambda load: load('os').system('id'), [import_module]))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return sorted([import_module], key=lambda load: load('os').system('id'))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return max([import_module], key=lambda load: load('os').system('id'))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return min(import_module, len, key=lambda load: load('os').system('id'))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    values = [import_module]\n"
+            b"    values.sort(key=lambda load: load('os').system('id'))\n"
+            b"    return values\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_closes_literal_helper_and_callback_bypasses(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"def handle(data, context):\n    return list(map(eval, ['1 + 1']))\n", "eval"),
+        (b"def handle(data, context):\n    return list(filter(exec, ['pass']))\n", "exec"),
+        (b"def handle(data, context):\n    return sorted(['1 + 1'], key=eval)\n", "eval"),
+        (b"def handle(data, context):\n    return max(['1 + 1'], key=eval)\n", "eval"),
+        (
+            b"import os\n"
+            b"def handle(data, context):\n"
+            b"    values = ['id']\n"
+            b"    values.sort(key=os.system)\n"
+            b"    return values\n",
+            "os.system",
+        ),
+        (b"def handle(data, context):\n    return list(map(eval, data))\n", "eval"),
+        (
+            b"import functools\n"
+            b"import os\n"
+            b"def handle(data, context):\n"
+            b"    return functools.partial(os.system, 'id')()\n",
+            "os.system",
+        ),
+        (
+            b"from functools import partial\n"
+            b"def handle(data, context):\n"
+            b"    runner = partial(eval, '1 + 1')\n"
+            b"    return runner()\n",
+            "eval",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_tracks_executed_callable_arguments(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"def handle(data, context):\n    return [eval][0]('1 + 1')\n", "eval"),
+        (b"import os\ndef handle(data, context):\n    return [os.system][0]('id')\n", "os.system"),
+    ],
+)
+def test_dynamic_import_handler_analysis_tracks_literal_selected_static_callables(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return list(map(lambda load: load('os').system('id'), []))\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    return list(map(lambda *_: None, [], "
+            b"(__import__('os').system('id') for _ in [1])))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return list(filter(lambda load: load('os').system('id'), []))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    return sorted([], key=lambda load: load('os').system('id'))\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def handle(data, context):\n"
+            b"    values = []\n"
+            b"    values.sort(key=lambda load: load('os').system('id'))\n"
+            b"    return values\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_does_not_execute_callbacks_for_empty_inputs(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_consumes_all_map_inputs_when_nonempty() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    return list(map(lambda *_: None, [0], "
+        b"(__import__('os').system('id') for _ in [1])))\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"def handle(data, context):\n    return list(map(eval, []))\n", "eval"),
+        (b"def handle(data, context):\n    return sorted([], key=eval)\n", "eval"),
+        (
+            b"from functools import partial\n"
+            b"def handle(data, context):\n"
+            b"    runner = partial(eval, '1 + 1')\n"
+            b"    return None\n",
+            "eval",
+        ),
+        (
+            b"def partial(function, *args):\n"
+            b"    return lambda: None\n"
+            b"def handle(data, context):\n"
+            b"    return partial(eval, '1 + 1')()\n",
+            "eval",
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_avoids_unexecuted_callable_argument_false_positives(
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "namespace_helper",
+    ["globals", "vars"],
+)
+def test_dynamic_import_handler_analysis_honors_namespace_subscript_rebinding(
+    namespace_helper: str,
+) -> None:
+    handler_source = (
+        b"class Safe:\n"
+        b"    def system(self, value):\n"
+        b"        return 0\n"
+        b"load = __import__\n"
+        + f"{namespace_helper}()['load'] = lambda name: Safe()\n".encode()
+        + b"def handle(data, context):\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_treat_function_vars_as_globals() -> None:
+    handler_source = (
+        b"load = __import__\n"
+        b"def handle(data, context):\n"
+        b"    vars()['load'] = lambda name: None\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module\n"
+            b"load = len\n"
+            b"def handle(data, context):\n"
+            b"    def set_loader():\n"
+            b"        global load\n"
+            b"        load = import_module\n"
+            b"    set_loader()\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def outer():\n"
+            b"    load = len\n"
+            b"    def set_loader():\n"
+            b"        nonlocal load\n"
+            b"        load = import_module\n"
+            b"    def handle(data, context):\n"
+            b"        set_loader()\n"
+            b"        return load('os').system('id')\n"
+            b"    return handle\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_applies_called_scope_setters(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_merges_conditional_setter_definitions() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def handle(data, context):\n"
+        b"    if context:\n"
+        b"        def set_loader():\n"
+        b"            global load\n"
+        b"            load = import_module\n"
+        b"    else:\n"
+        b"        def set_loader():\n"
+        b"            global load\n"
+        b"            load = len\n"
+        b"    set_loader()\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_replaces_sequential_setter_definition() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def handle(data, context):\n"
+        b"    def set_loader():\n"
+        b"        global load\n"
+        b"        load = import_module\n"
+        b"    def set_loader():\n"
+        b"        global load\n"
+        b"        load = len\n"
+        b"    set_loader()\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module\n"
+            b"def get_loader():\n"
+            b"    return import_module\n"
+            b"def handle(data, context):\n"
+            b"    return get_loader()('os').system('id')\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def identity(value):\n"
+            b"    return value\n"
+            b"def handle(data, context):\n"
+            b"    return identity(import_module)('os').system('id')\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"def get_loader():\n"
+            b"    return import_module\n"
+            b"def handle(data, context):\n"
+            b"    loader_factory = get_loader\n"
+            b"    return loader_factory()('os').system('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_follows_called_function_returns(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_execute_unused_function_return() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"def get_loader():\n"
+        b"    return import_module\n"
+        b"def handle(data, context):\n"
+        b"    return []\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_ignores_unreachable_function_return() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"def get_loader():\n"
+        b"    if False:\n"
+        b"        return import_module\n"
+        b"    return len\n"
+        b"def handle(data, context):\n"
+        b"    return get_loader()('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_ignores_unused_global_setter() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def unused():\n"
+        b"    global load\n"
+        b"    load = import_module\n"
+        b"def handle(data, context):\n"
+        b"    return load([1])\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_leak_called_setter_from_unused_function() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def unused():\n"
+        b"    def set_loader():\n"
+        b"        global load\n"
+        b"        load = import_module\n"
+        b"    set_loader()\n"
+        b"load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_propagates_transitive_global_setter_call() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def set_loader():\n"
+        b"    global load\n"
+        b"    load = import_module\n"
+        b"def outer():\n"
+        b"    load = len\n"
+        b"    set_loader()\n"
+        b"def handle(data, context):\n"
+        b"    outer()\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_persist_globals_from_unexecuted_outer_call() -> None:
+    handler_source = (
+        b"from importlib import import_module\n"
+        b"load = len\n"
+        b"def set_loader():\n"
+        b"    global load\n"
+        b"    load = import_module\n"
+        b"def outer():\n"
+        b"    set_loader()\n"
+        b"def unused():\n"
+        b"    outer()\n"
+        b"load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    call = lambda: call()\n    return call()\n"),
+        (b"def handle(data, context):\n    values = (value for value in values)\n    return list(values)\n"),
+    ],
+)
+def test_dynamic_import_handler_analysis_handles_recursive_lazy_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    call = lambda: (call(), __import__('os').system('id'))\n"
+            b"    return call()\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    values = (value for value in values if __import__('os').system('id'))\n"
+            b"    return list(values)\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_keeps_risks_in_recursive_lazy_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_merges_many_aliases_without_serializing_ast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_lines = ["def handle(data, context):", "    runner = lambda: 0"]
+    for index in range(250):
+        source_lines.extend(
+            [
+                f"    if context[{index}]:",
+                f"        runner = lambda: {index}",
+            ]
+        )
+    source_lines.append("    return runner()")
+    tree = ast.parse("\n".join(source_lines))
+
+    def fail_ast_dump(*args: Any, **kwargs: Any) -> str:
+        pytest.fail("branch alias merging must not serialize accumulated ASTs")
+
+    monkeypatch.setattr(ast, "dump", fail_ast_dump)
+
+    risky_calls = TorchServeMarScanner()._find_dynamic_import_execution_calls(tree)
+
+    assert risky_calls == set()
+
+
+def test_dynamic_import_handler_analysis_follows_called_getattr_defaults() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    return getattr(__import__('os'), 'definitely_missing', __import__('os').system)('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_execute_unused_getattr_defaults() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    runner = getattr(__import__('os'), 'definitely_missing', __import__('os').system)\n"
+        b"    return []\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_call_getattr_default_for_known_attribute() -> None:
+    handler_source = (
+        b"def handle(data, context):\n    return getattr(__import__('math'), 'sqrt', __import__('os').system)(4)\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"module = __import__('os')\ndef handle(data: module.system('id'), context):\n    return []\n"),
+        (
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+            b"Handler.module = __import__('os')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    def __init__(self, module=__import__('os')):\n"
+            b"        self.module = module\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    trigger: __import__('os').system('id')\n"
+            b"    def handle(self, data, context):\n"
+            b"        return []\n"
+        ),
+        (
+            b"module = __import__('math')\n"
+            b"class Handler:\n"
+            b"    module: module.system('id') = __import__('os')\n"
+            b"    def handle(self, data, context):\n"
+            b"        return []\n"
+        ),
+        (
+            b"staticmethod = lambda function: function\n"
+            b"class Handler:\n"
+            b"    module = __import__('os')\n"
+            b"    @staticmethod\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"from importlib import import_module\n"
+            b"load = len\n"
+            b"def clear():\n"
+            b"    global load\n"
+            b"    load = len\n"
+            b"def enable(value):\n"
+            b"    global load\n"
+            b"    load = import_module\n"
+            b"def handle(data, context):\n"
+            b"    enable(clear())\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def enable():\n"
+            b"    globals()['load'] = __import__\n"
+            b"def handle(data, context):\n"
+            b"    enable()\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"from importlib import import_module as load\n"
+            b"def helper(module=load('os')):\n"
+            b"    return module\n"
+            b"load = lambda name: None\n"
+            b"def handle(data, context):\n"
+            b"    return helper().system('id')\n"
+        ),
+        (
+            b"holder = {}\n"
+            b"def handle(data, context):\n"
+            b"    holder['module'] = __import__('os')\n"
+            b"    return holder['module'].system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in iter([__import__('os')]):\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"class Holder:\n"
+            b"    pass\n"
+            b"holder = Holder()\n"
+            b"def handle(data, context):\n"
+            b"    setattr(holder, 'module', __import__('os'))\n"
+            b"    return holder.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match {1: __import__('os')}:\n"
+            b"        case {True: module}:\n"
+            b"            return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    modules = [__import__('os')]\n    return modules[0].system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    modules = [__import__('os')]\n"
+            b"    for module in modules:\n"
+            b"        return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    load = lambda: __import__('os')\n    return load().system('id')\n"),
+    ],
+    ids=[
+        "function-annotation",
+        "post-class-attribute",
+        "constructor-default",
+        "class-annotation",
+        "class-annotation-value-order",
+        "shadowed-staticmethod",
+        "call-argument-order",
+        "globals-write",
+        "definition-time-default",
+        "subscript-write",
+        "iter-wrapper",
+        "setattr-write",
+        "runtime-equal-mapping-key",
+        "literal-container-alias",
+        "iterable-alias",
+        "lambda-module-return",
+    ],
+)
+def test_dynamic_import_handler_analysis_tracks_reachable_runtime_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def unused():\n    return __import__('os').system('id')\ndef handle(data, context):\n    return []\n"),
+        (
+            b"from __future__ import annotations\n"
+            b"module = __import__('os')\n"
+            b"def handle(data: module.system('id'), context):\n"
+            b"    return []\n"
+        ),
+        (
+            b"async def handle(data, context):\n"
+            b"    async for module in [__import__('os')]:\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except Exception:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (
+            b"class PreviousHandler:\n"
+            b"    pass\n"
+            b"Handler = PreviousHandler\n"
+            b"Handler.module = __import__('os')\n"
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    iter = lambda value: [__import__('math')]\n"
+            b"    for module in iter([__import__('os')]):\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def enable():\n"
+            b"    globals = lambda: {}\n"
+            b"    globals()['load'] = __import__\n"
+            b"def handle(data, context):\n"
+            b"    enable()\n"
+            b"    return load('os').system('id')\n"
+        ),
+    ],
+    ids=[
+        "unused-function",
+        "postponed-annotation",
+        "sync-async-for",
+        "terminating-try-else",
+        "pre-definition-class-attribute",
+        "shadowed-iter",
+        "shadowed-globals",
+    ],
+)
+def test_dynamic_import_handler_analysis_ignores_unreachable_runtime_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    return vars(__import__('os')).get('system')('id')\n",
+        b"def handle(data, context):\n    return __import__('os').__dict__.get('system')('id')\n",
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = vars(__import__('math'))\n"
+            b"    return namespace.get('missing', __import__('os').system)('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_namespace_mapping_get_calls(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_respects_shadowed_namespace_mapping_helper() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    vars = lambda value: {'system': lambda command: None}\n"
+        b"    return vars(__import__('os')).get('system')('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"from importlib import import_module as load\n"
+            b"del load\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (b"from importlib import import_module as load\nfn = lambda load: load('os').system('id')\n"),
+    ],
+)
+def test_dynamic_import_handler_analysis_avoids_deleted_and_lambda_alias_false_positives(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_literal_loop_exit_binding() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    for module in [__import__('os'), __import__('math')]:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_evaluates_defaults_at_definition_time() -> None:
+    handler_source = (
+        b"def handle(data, context, module=load('os')):\n"
+        b"    return module.system('id')\n"
+        b"\n"
+        b"from importlib import import_module as load\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_tracks_mapping_rest_captures() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    match {'x': 1, 'module': __import__('os')}:\n"
+        b"        case {'x': 1, **rest}:\n"
+        b"            return rest['module'].system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_excludes_matched_keys_from_mapping_rest() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    match {'module': __import__('os')}:\n"
+        b"        case {'module': _, **rest}:\n"
+        b"            return rest['module'].system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_skips_nonmatching_mapping_patterns() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    match {'module': __import__('os')}:\n"
+        b"        case {'missing': 1, **rest}:\n"
+        b"            return rest['module'].system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_carries_failed_match_guard_side_effects() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    match 1:\n"
+        b"        case 1 if (module := __import__('os')) and False:\n"
+        b"            pass\n"
+        b"        case _:\n"
+        b"            return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_replaces_state_in_failed_match_guards() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    match 1:\n"
+        b"        case 1 if (module := __import__('math')) and False:\n"
+        b"            pass\n"
+        b"        case _:\n"
+        b"            return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_uses_rebound_state_at_explicit_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    try:\n"
+        b"        module = None\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_explicit_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        module = __import__('os')\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_nested_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        if context:\n"
+        b"            module = __import__('os')\n"
+        b"            raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_restore_deleted_alias_at_raise() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    try:\n"
+        b"        del module\n"
+        b"        raise RuntimeError()\n"
+        b"    except RuntimeError:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_merges_exception_group_handler_states() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    try:\n"
+        b"        raise ExceptionGroup('group', [ValueError()])\n"
+        b"    except* ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except* TypeError:\n"
+        b"        module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_chains_exception_group_handler_states() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        raise ExceptionGroup('group', [ValueError(), TypeError()])\n"
+        b"    except* ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except* TypeError:\n"
+        b"        module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_regular_exception_handlers_exclusive() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = None\n"
+        b"    try:\n"
+        b"        might_fail()\n"
+        b"    except ValueError:\n"
+        b"        module = __import__('os')\n"
+        b"    except TypeError:\n"
+        b"        module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
+def test_dynamic_import_handler_analysis_skips_unreachable_exception_group_handler() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    try:\n"
+        b"        pass\n"
+        b"    except* Exception:\n"
+        b"        module = __import__('os')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if context else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if context:\n"
+            b"        from builtins import getattr as resolve\n"
+            b"    else:\n"
+            b"        resolve = getattr\n"
+            b"    return resolve(__import__('os'), 'system')('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    if False:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        module = __import__('math')\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in []:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')] if False]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while False:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        break\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"    return handle\n"
+            b"    load = __import__\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if not True:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    if False and __import__('os').system('id'):\n        pass\n"),
+        (b"def handle(data, context):\n    if True or __import__('os').system('id'):\n        pass\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in '':\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in b'':\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return [module.system('id') for module in []]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while not True:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        return None\n"
+            b"    module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if False else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        raise RuntimeError()\n"
+            b"    except RuntimeError:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return []\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module] if False:\n"
+            b"            module.system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(module='os').system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(name='os', bogus=True).system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module('os', name='math').system('id')\n"
+        ),
+        (
+            b"TYPE_CHECKING = False\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    list = lambda value: []\n"
+            b"    return list(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        if False:\n"
+            b"            break\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        return None\n"
+            b"    except Exception:\n"
+            b"        return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(generator, 1)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return next(generator, None, None)\n"
+        ),
+        (b"def handle(data, context):\n    return getattr(object=__import__('os'), name='system')('id')\n"),
+        (b"def handle(data, context):\n    return getattr(__import__('os'), 'system', None, None)('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    module += []\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module, *rest, final = [__import__('os')]\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [*[]]:\n        __import__('os').system('id')\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system('id') for module in {**{}}]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    if [*[]]:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os', level=1).system('id')\n"),
+        (b"def handle(data, context):\n    with __import__('os') as module:\n        return module.system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') and __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for value in [0]:\n"
+            b"        break\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case _:\n"
+            b"            pass\n"
+            b"        case [module]:\n"
+            b"            module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except Exception:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for value in [0]:\n"
+            b"        return None\n"
+            b"    __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    if context:\n"
+            b"        module = __import__('math')\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    while True:\n        return []\n    __import__('os').system('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    def unused(self):\n"
+            b"        self.module = __import__('os')\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os'), 0]:\n"
+            b"        case [module, 1]:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"from .builtins import __import__ as load\ndef handle(data, context):\n    return load('os').system('id')\n"),
+        (b"def handle(data, context):\n    runner = lambda: __import__('os').system('id')\n    return []\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('math'), __import__('os')])\n"
+            b"    return next(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.module = __import__('os')\n"
+            b"    holder = None\n"
+            b"    return holder.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        return []\n"
+            b"    finally:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except Exception:\n"
+            b"        return []\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return any(call() for call in [lambda: True, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return all(call() for call in [lambda: False, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return (lambda module: module.system('id'))()\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system][1]('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    module = __import__('os')\n"
+            b"\n"
+            b"    @staticmethod\n"
+            b"    def handle(data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    module = __import__('os')\n"
+            b"    module = __import__('math')\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    vars = lambda value: {'system': lambda command: None}\n"
+            b"    return vars(__import__('os'))['system']('id')\n"
+        ),
+        (
+            b"import contextlib\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    with contextlib.nullcontext():\n"
+            b"        return []\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os').__getattribute__('system', None)('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(*(generator, generator))\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.gen = (module.system('id') for module in [__import__('os')])\n"
+            b"    holder = None\n"
+            b"    return list(holder.gen)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('math'), __import__('os')]:\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    match [__import__('math')]:\n"
+            b"        case [module]:\n"
+            b"            pass\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        module = __import__('os')\n"
+            b"        continue\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    runner = lambda module=__import__('os'): module.system('id')\n"
+            b"    return runner(__import__('math'))\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [__import__('os')]:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')] if True]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+            b"        break\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    load = __import__\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"    return handle\n"
+        ),
+        (b"def handle(data, context):\n    if True and __import__('os').system('id'):\n        pass\n"),
+        (b"def handle(data, context):\n    if False or __import__('os').system('id'):\n        pass\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in []:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while False:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if False:\n"
+            b"        return None\n"
+            b"    module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if True else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except RuntimeError:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return list(module.system('id') for module in [__import__('os')])\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if context:\n"
+            b"        generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    else:\n"
+            b"        generator = (value for value in [1])\n"
+            b"    alias = generator\n"
+            b"    return next(alias)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        break\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module] if True:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in {__import__('os'): 1}:\n        module.system('id')\n"),
+        (b"import importlib\ndef handle(data, context):\n    return importlib.import_module(name='os').system('id')\n"),
+        (
+            b"TYPE_CHECKING = True\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    consume = list\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return consume(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        raise RuntimeError()\n"
+            b"    except RuntimeError:\n"
+            b"        return __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [*[__import__('os')]]:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    for module in {**{__import__('os'): 1}}:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    module, *rest = [__import__('os'), 1, 2]\n    return module.system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    first, *rest, module = [1, 2, __import__('os')]\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    (module := __import__('os')) if context else (module := __import__('math'))\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    module = context and __import__('os')\n    return module.system('id')\n"),
+        (b"def handle(data, context):\n    return __import__(*['os']).system('id')\n"),
+        (b"import importlib\ndef handle(data, context):\n    return importlib.import_module(*['os']).system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    (context and (module := __import__('os'))) or (module := __import__('math'))\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+            b"\n"
+            b"    def __init__(self):\n"
+            b"        self.module = __import__('os')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(**{'name': 'os'}).system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__(**{'name': 'os'}).system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    consume = list if context else tuple\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return consume(generator)\n"
+        ),
+        (b"def handle(data, context):\n    return getattr(*[__import__('os'), 'system'])('id')\n"),
+        (b"def handle(data, context):\n    return __import__('os').__dict__['system']('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os'), 1]:\n"
+            b"        case [module, *rest]:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    runner = lambda: __import__('os').system('id')\n    return runner()\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        {**1}\n"
+            b"    except Exception:\n"
+            b"        return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        might_fail()\n"
+            b"    except Exception:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(zip(generator))\n"
+        ),
+        (b"def handle(data, context):\n    return any(call() for call in [lambda: False, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return all(call() for call in [lambda: True, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return (load := __import__)('os').system('id')\n"),
+        (b"def handle(data, context):\n    return (lambda module: module.system('id'))(__import__('os'))\n"),
+        (b"def handle(data, context):\n    return __import__(f'os').system('id')\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system][0]('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+            b"\n"
+            b"    module = __import__('os')\n"
+        ),
+        (b"class Handler(object, marker=__import__('os').system('id')):\n    pass\n"),
+        (b"def handle(data, context):\n    return vars(__import__('os'))['system']('id')\n"),
+        (
+            b"import importlib\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return getattr(importlib, 'import_module')('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os').__getattribute__('system')('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(*(generator,))\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.gen = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(holder.gen)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    match context:\n"
+            b"        case [module]:\n"
+            b"            pass\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            break\n"
+            b"        continue\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    runner = lambda module=__import__('os'): module.system('id')\n"
+            b"    return runner()\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
         (b"import os\ndef handle(data, context):\n    return os.execvpe('/bin/sh', ['sh'], {})\n", "os.execvpe"),
         (
             b"from os import spawnv as run\ndef handle(data, context):\n"
@@ -1132,6 +3618,36 @@ def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_exec
     result = TorchServeMarScanner().scan(str(mar_path))
     non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
     assert non_handler_failures == []
+
+
+def test_import_time_analysis_respects_type_checking_rebinding() -> None:
+    scanner = TorchServeMarScanner()
+    imported_guard = ast.parse(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    __import__('os').system('id')\n"
+    )
+    relative_guard = ast.parse(
+        "from .typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    __import__('os').system('id')\n"
+    )
+    rebound_guard = ast.parse("TYPE_CHECKING = True\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
+    disabled_guard = ast.parse("TYPE_CHECKING = False\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
+
+    assert scanner._has_import_time_execution(imported_guard) is False
+    assert scanner._has_import_time_execution(relative_guard) is True
+    assert scanner._has_import_time_execution(rebound_guard) is True
+    assert scanner._has_import_time_execution(disabled_guard) is False
+
+
+def test_import_time_analysis_checks_selected_guard_else_branches() -> None:
+    scanner = TorchServeMarScanner()
+    false_guard_else = ast.parse(
+        "TYPE_CHECKING = False\nif TYPE_CHECKING:\n    pass\nelse:\n    __import__('os').system('id')\n"
+    )
+    imported_guard_else = ast.parse(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    pass\nelse:\n    __import__('os').system('id')\n"
+    )
+
+    assert scanner._has_import_time_execution(false_guard_else) is True
+    assert scanner._has_import_time_execution(imported_guard_else) is True
 
 
 def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:
