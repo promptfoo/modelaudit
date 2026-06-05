@@ -586,9 +586,9 @@ class OciLayerScanner(BaseScanner):
         else:
             state.seen_paths.add(normalized_name)
 
-        path_components = normalized_name.split("/")
+        raw_path_components = [component for component in name.replace("\\", "/").split("/") if component]
         reserved_whiteout_parent = next(
-            (component for component in path_components[:-1] if component.startswith(".wh.")),
+            (component for component in raw_path_components[:-1] if component.startswith(".wh.")),
             None,
         )
         if reserved_whiteout_parent is not None:

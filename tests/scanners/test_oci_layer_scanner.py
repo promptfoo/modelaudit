@@ -2048,6 +2048,36 @@ class TestOciLayerScanner:
         )
         assert checks[0].details["reserved_component"] == ".wh.deleted"
 
+    @pytest.mark.parametrize(
+        "member_name",
+        [
+            "root/.wh.deleted/../payload.dat",
+            "root\\.wh.deleted\\..\\payload.dat",
+        ],
+    )
+    def test_scan_layer_reports_reserved_whiteout_parent_hidden_by_normalization(
+        self,
+        tmp_path: Path,
+        member_name: str,
+    ) -> None:
+        """Dot segments must not erase a reserved raw whiteout component."""
+        layer_path = tmp_path / "normalized-whiteout-parent.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo(member_name)
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "normalized-whiteout-parent.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].details["reserved_component"] == ".wh.deleted"
+
     def test_scan_layer_allows_whiteout_prefix_near_match_in_parent_component(self, tmp_path: Path) -> None:
         """Ordinary parent directory names that merely start similarly remain valid."""
         layer_path = tmp_path / "whiteout-parent-near-match.tar.gz"
@@ -2058,6 +2088,23 @@ class TestOciLayerScanner:
             tar.addfile(member, io.BytesIO(payload))
 
         manifest_path = tmp_path / "whiteout-parent-near-match.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+
+    def test_scan_layer_allows_normalized_whiteout_prefix_near_match(self, tmp_path: Path) -> None:
+        """Normalization through an ordinary similarly named directory remains benign."""
+        layer_path = tmp_path / "normalized-whiteout-parent-near-match.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.whitehouse/../payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "normalized-whiteout-parent-near-match.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
 
         result = OciLayerScanner().scan(str(manifest_path))
