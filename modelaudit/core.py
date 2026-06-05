@@ -56,10 +56,10 @@ from modelaudit.scanners.xgboost_scanner import (
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import (
     DvcResolution,
+    dvc_omitted_outputs_covered,
     is_within_directory,
     resolve_dvc_file_with_metadata,
     should_skip_file,
-    unverified_dvc_outputs_covered_by_paths,
 )
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
@@ -182,12 +182,55 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
     dvc_path: str,
     resolution: DvcResolution,
     directory_walk_covered_paths: set[str],
+    directory_walk_covered_directories: set[str],
+    *,
+    skip_file_types: bool,
+    metadata_scanner_available: bool,
+    scanner_selection_extensions: frozenset[str] | None,
 ) -> bool:
     """Return whether a directory walk independently covers every bounded omitted DVC target."""
-    return (
-        resolution.unresolved_omitted_output_count == 0
-        and all(target in directory_walk_covered_paths for target in resolution.omitted_targets)
-        and unverified_dvc_outputs_covered_by_paths(dvc_path, resolution, directory_walk_covered_paths)
+
+    def is_covered(target: Path) -> bool:
+        target_str = str(target)
+        if target.is_file():
+            return target_str in directory_walk_covered_paths
+        if not target.is_dir() or target_str not in directory_walk_covered_directories:
+            return False
+
+        walk_errors: list[OSError] = []
+        for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
+            if str(Path(root).resolve()) not in directory_walk_covered_directories:
+                return False
+            for directory_name in dirs:
+                try:
+                    resolved_directory = str((Path(root) / directory_name).resolve())
+                except OSError:
+                    return False
+                if resolved_directory not in directory_walk_covered_directories:
+                    return False
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if _is_huggingface_cache_file(file_path):
+                    continue
+                if skip_file_types and should_skip_file(
+                    file_path,
+                    metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
+                ):
+                    continue
+                try:
+                    resolved_file = str(Path(file_path).resolve())
+                except OSError:
+                    return False
+                if resolved_file not in directory_walk_covered_paths:
+                    return False
+        return not walk_errors
+
+    return dvc_omitted_outputs_covered(
+        dvc_path,
+        resolution,
+        is_covered,
+        coverage_budget=len(directory_walk_covered_paths) + len(directory_walk_covered_directories),
     )
 
 
@@ -1019,6 +1062,7 @@ def scan_model_directory_or_file(
             is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
             directory_walk_covered_paths: set[str] = set()
+            directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
 
@@ -1030,6 +1074,7 @@ def scan_model_directory_or_file(
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, dirs, files in os.walk(path, followlinks=False):
                 dirs.sort()
+                directory_walk_covered_directories.add(str(Path(root).resolve()))
                 for file in sorted(files):
                     file_path = os.path.join(root, file)
 
@@ -1168,6 +1213,10 @@ def scan_model_directory_or_file(
                     dvc_path,
                     dvc_resolution,
                     directory_walk_covered_paths,
+                    directory_walk_covered_directories,
+                    skip_file_types=skip_file_types,
+                    metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
                 ):
                     _record_dvc_output_limit_incomplete(results, scan_metadata, dvc_path, dvc_resolution)
             _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
@@ -1447,6 +1496,20 @@ def scan_model_directory_or_file(
 
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
+
+                if os.path.isdir(target):
+                    nested_result = scan_model_directory_or_file(target, **config)
+                    results.aggregate_scan_result(nested_result)
+                    if nested_result.has_errors or not nested_result.success:
+                        scan_metadata["success"] = False
+                        scan_metadata["has_operational_errors"] = bool(
+                            scan_metadata["has_operational_errors"]
+                            or nested_result.has_errors
+                            or not nested_result.success
+                        )
+                    results.content_hash = None
+                    aggregate_hash_complete = False
+                    continue
 
                 results.files_scanned += 1
 

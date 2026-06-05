@@ -9,6 +9,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -56,7 +57,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import resolve_dvc_file_with_metadata, should_skip_file
+from .utils import dvc_omitted_outputs_covered, resolve_dvc_file_with_metadata, should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -356,15 +357,38 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
+def _dvc_target_is_covered(target: Path, *, covered_paths: frozenset[str]) -> bool:
+    """Return whether a resolved DVC target is in the prospective CLI scan set."""
+    return str(target) in covered_paths
+
+
 def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
     """Expand user paths, resolve DVC pointers, warn on unmatched globs, and fail fast if empty."""
     expanded_paths, missing_globs = expand_paths(paths)
+
+    def can_cover_dvc_output(path: str) -> bool:
+        if os.path.isdir(path):
+            return True
+        return os.path.isfile(path) and Path(path).suffix.lower() not in {".css", ".html", ".js", ".py", ".txt"}
+
+    independently_covered_paths = {
+        str(Path(path).resolve()) for path in expanded_paths if not path.endswith(".dvc") and can_cover_dvc_output(path)
+    }
 
     dvc_expanded_paths: list[str] = []
     for path in expanded_paths:
         if os.path.isfile(path) and path.endswith(".dvc"):
             dvc_resolution = resolve_dvc_file_with_metadata(path)
-            if dvc_resolution.analysis_incomplete:
+            prospective_covered_paths = independently_covered_paths | {
+                target for target in dvc_resolution.targets if can_cover_dvc_output(target)
+            }
+            cap_is_covered = dvc_resolution.analysis_incomplete and dvc_omitted_outputs_covered(
+                path,
+                dvc_resolution,
+                partial(_dvc_target_is_covered, covered_paths=frozenset(prospective_covered_paths)),
+                coverage_budget=len(prospective_covered_paths),
+            )
+            if dvc_resolution.analysis_incomplete and not cap_is_covered:
                 dvc_expanded_paths.append(path)
             elif dvc_resolution.targets:
                 dvc_expanded_paths.extend(dvc_resolution.targets)
@@ -396,7 +420,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
         flush_telemetry()
         sys.exit(2)
 
-    return dvc_expanded_paths
+    return list(dict.fromkeys(dvc_expanded_paths))
 
 
 def _build_user_scan_overrides(

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -164,10 +165,33 @@ def unverified_dvc_outputs_covered_by_paths(
     covered_paths: set[str],
 ) -> bool:
     """Verify an omitted DVC tail with work bounded by already discovered paths."""
+    return dvc_omitted_outputs_covered(
+        file_path,
+        resolution,
+        lambda target: str(target) in covered_paths,
+        coverage_budget=len(covered_paths),
+        verify_bounded_targets=False,
+    )
+
+
+def dvc_omitted_outputs_covered(
+    file_path: str,
+    resolution: DvcResolution,
+    is_covered: Callable[[Path], bool],
+    *,
+    coverage_budget: int,
+    verify_bounded_targets: bool = True,
+) -> bool:
+    """Return whether independently scanned paths cover every omitted DVC output."""
+    if resolution.unresolved_omitted_output_count > 0:
+        return False
+    if verify_bounded_targets and not all(is_covered(Path(target)) for target in resolution.omitted_targets):
+        return False
+
     unverified_count = resolution.unverified_omitted_output_count
     if unverified_count == 0:
         return True
-    if unverified_count > len(covered_paths):
+    if unverified_count > coverage_budget:
         return False
 
     try:
@@ -193,7 +217,7 @@ def unverified_dvc_outputs_covered_by_paths(
             return False
         try:
             target = (dvc_dir / out_path).resolve()
-            if not target.is_relative_to(dvc_dir) or str(target) not in covered_paths:
+            if not target.is_relative_to(dvc_dir) or not is_covered(target):
                 return False
         except (OSError, ValueError):
             return False
