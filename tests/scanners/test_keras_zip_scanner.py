@@ -226,7 +226,7 @@ def _embed_plausible_hdf5_superblock(payload: bytes, signature_offset: int) -> b
     superblock.extend(b"\xff" * 8)
     superblock.extend(len(output).to_bytes(8, "little"))
     superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-    superblock.extend(hdf5_metadata_checksum(superblock).to_bytes(4, "little"))
+    superblock.extend(hdf5_metadata_checksum(bytes(superblock)).to_bytes(4, "little"))
     output[signature_offset : signature_offset + len(superblock)] = superblock
     output[signature_offset + len(superblock) : signature_offset + len(superblock) + 4] = b"OHDR"
     return bytes(output)
@@ -1007,6 +1007,50 @@ class TestKerasZipScanner:
             assert determine_exit_code(second_result) == 2
             assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
             assert reason in metadata.get("scan_outcome_reasons")
+        finally:
+            reset_cache_manager()
+
+    def test_embedded_weights_runtime_h5py_failure_bypasses_stale_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+        cache_dir = tmp_path / "runtime-h5py-failure-cache"
+
+        reset_cache_manager()
+        try:
+            clean_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(clean_result) == 0
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            cached_entries = cache_manager.get_stats()["total_entries"]
+            assert cached_entries > 0
+
+            def fail_h5py_open(*_args: Any, **_kwargs: Any) -> None:
+                raise RuntimeError("simulated h5py runtime failure")
+
+            monkeypatch.setattr(keras_zip_scanner_module.h5py, "File", fail_h5py_open)
+
+            failed_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = failed_result.file_metadata[str(keras_path)]
+
+            assert determine_exit_code(failed_result) == 2
+            assert "keras_zip_scan_failed" in metadata["scan_outcome_reasons"]
+            assert cache_manager.get_stats()["total_entries"] == cached_entries
         finally:
             reset_cache_manager()
 
