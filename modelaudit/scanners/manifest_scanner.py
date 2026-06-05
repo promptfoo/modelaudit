@@ -177,6 +177,7 @@ HASH_INTEGRITY_KEYS = [
 # Regex pattern for hexadecimal strings (used to detect hash values)
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
 JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -971,23 +972,86 @@ class ManifestScanner(BaseScanner):
 
         result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
 
-    @classmethod
-    def _collect_jinja_template_fields(cls, value: Any, path: str = "") -> dict[str, str]:
+    def _collect_jinja_template_fields(self, value: Any, path: str = "") -> dict[str, str]:
+        self._check_timeout()
         if isinstance(value, dict):
             templates: dict[str, str] = {}
             for key, item in value.items():
+                self._check_timeout()
                 child_path = f"{path}.{key}" if path else str(key)
-                if key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip():
-                    templates[child_path] = item
-                templates.update(cls._collect_jinja_template_fields(item, child_path))
+                if key in JINJA_TEMPLATE_FIELD_NAMES:
+                    self._merge_jinja_templates(templates, self._collect_jinja_template_container(item, child_path))
+                    continue
+                self._merge_jinja_templates(templates, self._collect_jinja_template_fields(item, child_path))
             return templates
         if isinstance(value, list):
-            templates = {}
+            list_templates: dict[str, str] = {}
             for index, item in enumerate(value):
+                self._check_timeout()
                 child_path = f"{path}[{index}]" if path else f"[{index}]"
-                templates.update(cls._collect_jinja_template_fields(item, child_path))
-            return templates
+                self._merge_jinja_templates(list_templates, self._collect_jinja_template_fields(item, child_path))
+            return list_templates
         return {}
+
+    def _collect_jinja_template_container(self, value: Any, path: str) -> dict[str, str]:
+        self._check_timeout()
+        if isinstance(value, str):
+            if value.strip() and (
+                path.rsplit(".", 1)[-1] in JINJA_TEMPLATE_FIELD_NAMES or self._looks_like_jinja(value)
+            ):
+                return {path: value}
+            return {}
+
+        if isinstance(value, dict):
+            templates: dict[str, str] = {}
+            for key, item in value.items():
+                self._check_timeout()
+                child_path = f"{path}.{key}"
+                if isinstance(item, str):
+                    if item.strip() and self._looks_like_jinja(item):
+                        self._record_jinja_template(templates, child_path, item)
+                    continue
+                self._merge_jinja_templates(templates, self._collect_jinja_template_container(item, child_path))
+            return templates
+
+        if isinstance(value, list):
+            list_templates: dict[str, str] = {}
+            for index, item in enumerate(value):
+                self._check_timeout()
+                child_path = f"{path}[{index}]"
+                if isinstance(item, str):
+                    if item.strip() and self._looks_like_jinja(item):
+                        self._record_jinja_template(list_templates, child_path, item)
+                    continue
+                self._merge_jinja_templates(
+                    list_templates,
+                    self._collect_jinja_template_container(item, child_path),
+                )
+            return list_templates
+
+        return {}
+
+    @staticmethod
+    def _record_jinja_template(templates: dict[str, str], path: str, value: str) -> None:
+        if path not in templates:
+            templates[path] = value
+            return
+
+        duplicate_index = len(templates) + 1
+        unique_path = f"{path} [duplicate {duplicate_index}]"
+        while unique_path in templates:
+            duplicate_index += 1
+            unique_path = f"{path} [duplicate {duplicate_index}]"
+        templates[unique_path] = value
+
+    @classmethod
+    def _merge_jinja_templates(cls, templates: dict[str, str], collected: dict[str, str]) -> None:
+        for path, value in collected.items():
+            cls._record_jinja_template(templates, path, value)
+
+    @staticmethod
+    def _looks_like_jinja(value: str) -> bool:
+        return any(indicator in value for indicator in JINJA_TEMPLATE_INDICATORS)
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""
