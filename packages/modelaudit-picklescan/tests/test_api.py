@@ -11,8 +11,10 @@ import faulthandler
 import functools
 import io
 import logging
+import marshal
 import os
 import pickle
+import py_compile
 import re
 import sys
 import tarfile
@@ -27,8 +29,9 @@ from importlib.machinery import (
     SourceFileLoader,
     SourcelessFileLoader,
 )
+from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
-from types import ModuleType
+from types import CodeType, ModuleType
 from typing import cast
 
 import pytest
@@ -52,6 +55,7 @@ from modelaudit_picklescan.call_graph import (
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     _is_standard_path_hook,
+    _meta_path_finder_resolution_identity,
     _path_hook_resolution_identity,
     find_startup_hook_write_call_graphs,
 )
@@ -3864,6 +3868,48 @@ def test_with_call_graph_findings_fingerprints_parent_package_markers(
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
 
 
+def test_with_call_graph_findings_fingerprints_sourceless_parent_package_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_package = first_root / "fingerprint_pyc_pkg"
+    second_package = second_root / "fingerprint_pyc_pkg"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    (first_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    (second_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    package_source = tmp_path / "package_init.py"
+    package_source.write_text("")
+    package_marker = second_package / "__init__.pyc"
+    py_compile.compile(str(package_source), cfile=str(package_marker), doraise=True)
+    monkeypatch.syspath_prepend(str(second_root))
+    monkeypatch.syspath_prepend(str(first_root))
+
+    report = PickleReport(
+        source="sourceless-parent-package-marker.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "fingerprint_pyc_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "fingerprint_pyc_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    initial = package_api._with_call_graph_findings(report)
+
+    assert initial.verdict == SafetyVerdict.CLEAN
+    source_fingerprints = initial.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["fingerprints"][str(package_marker.absolute())] is not None
+
+    package_marker.unlink()
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+
+
 def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() -> None:
     module_name = "m" * 4097
     report = PickleReport(
@@ -3883,7 +3929,7 @@ def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() ->
     assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
 
 
-def test_equivalent_file_finder_hooks_keep_standard_resolution(
+def test_recreated_file_finder_hooks_are_not_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
@@ -3891,8 +3937,195 @@ def test_equivalent_file_finder_hooks_keep_standard_resolution(
     different_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
     monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (trusted_hook,))
 
-    assert _is_standard_path_hook(equivalent_hook)
+    assert not _is_standard_path_hook(equivalent_hook)
     assert not _is_standard_path_hook(different_hook)
+
+
+def test_spoofed_equivalent_file_finder_hook_is_not_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_spoofed_file_finder_hook"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+    marker = tmp_path / "evil_loader_called"
+
+    class EvilLoader(SourceFileLoader):
+        def get_code(self, fullname: str) -> CodeType:
+            del fullname
+            return compile(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+                "def entrypoint():\n"
+                "    import os\n"
+                "    return os.system('echo hidden')\n",
+                str(module_path),
+                "exec",
+            )
+
+    EvilLoader.__module__ = SourceFileLoader.__module__
+    EvilLoader.__qualname__ = SourceFileLoader.__qualname__
+    trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+    evil_hook = FileFinder.path_hook((EvilLoader, SOURCE_SUFFIXES))
+    evil_hook.__module__ = trusted_hook.__module__
+    evil_hook.__qualname__ = trusted_hook.__qualname__
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (trusted_hook,))
+    monkeypatch.setattr(sys, "path_hooks", [evil_hook])
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.path_importer_cache.pop(str(tmp_path), None)
+
+    try:
+        assert not _is_standard_path_hook(evil_hook)
+        report = scan_bytes(
+            b"\x80\x04" + _global(module_name.encode(), b"entrypoint") + b")R.",
+            source="spoofed-file-finder-hook.pkl",
+        )
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert not marker.exists()
+
+        __import__(module_name)
+        assert marker.read_text(encoding="utf-8") == "loaded"
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path_importer_cache.pop(str(tmp_path), None)
+
+
+def test_pytest_finder_identity_hashes_state_beyond_legacy_item_limit() -> None:
+    rewrite_module = pytest.importorskip("_pytest.assertion.rewrite")
+    finder_type = rewrite_module.AssertionRewritingHook
+    finder = object.__new__(finder_type)
+    finder._basenames_to_check_rewrite = set()
+    finder.session = None
+    finder.fnpats = ()
+    finder._writing_pyc = False
+    finder._must_rewrite = {*(f"module_{index:02d}" for index in range(16)), "zz_first"}
+
+    initial_identity = _meta_path_finder_resolution_identity(finder)
+    finder._must_rewrite.remove("zz_first")
+    finder._must_rewrite.add("zz_second")
+
+    assert _meta_path_finder_resolution_identity(finder) != initial_identity
+
+
+def test_loaded_parent_package_path_controls_child_source_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_root = tmp_path / "safe"
+    runtime_root = tmp_path / "runtime"
+    safe_package = safe_root / "loaded_parent_pkg"
+    runtime_package = runtime_root / "loaded_parent_pkg"
+    safe_package.mkdir(parents=True)
+    runtime_package.mkdir(parents=True)
+    (safe_package / "__init__.py").write_text("")
+    (safe_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    (runtime_package / "__init__.py").write_text("")
+    (runtime_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    monkeypatch.syspath_prepend(str(safe_root))
+
+    loaded_package = ModuleType("loaded_parent_pkg")
+    loaded_spec = ModuleSpec(
+        "loaded_parent_pkg",
+        loader=None,
+        origin=str(runtime_package / "__init__.py"),
+        is_package=True,
+    )
+    loaded_spec.submodule_search_locations = [str(runtime_package)]
+    loaded_package.__spec__ = loaded_spec
+    loaded_package.__path__ = [str(runtime_package)]
+    monkeypatch.setitem(sys.modules, "loaded_parent_pkg", loaded_package)
+
+    report = PickleReport(
+        source="loaded-parent-package.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "loaded_parent_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "loaded_parent_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+
+
+def test_valid_mismatched_source_bytecode_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "mismatched_cached_bytecode"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n")
+    py_compile.compile(str(module_path), doraise=True)
+    bytecode_path = Path(cache_from_source(str(module_path)))
+    bytecode_header = bytecode_path.read_bytes()[:16]
+    marker = tmp_path / "mismatched_bytecode_loaded"
+    malicious_code = compile(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        "import os\n\ndef entrypoint():\n    return os.system('id')\n",
+        str(module_path),
+        "exec",
+    )
+    bytecode_path.write_bytes(bytecode_header + marshal.dumps(malicious_code))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = PickleReport(
+        source="mismatched-cached-bytecode.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert not marker.exists()
+
+    try:
+        __import__(module_name)
+        assert marker.read_text(encoding="utf-8") == "loaded"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_matching_source_bytecode_remains_analyzable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "matching_cached_bytecode"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n")
+    py_compile.compile(str(module_path), doraise=True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = PickleReport(
+        source="matching-cached-bytecode.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.COMPLETE
+    assert updated.verdict == SafetyVerdict.CLEAN
+    assert updated.findings == ()
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(Path(cache_from_source(str(module_path))).absolute()) in source_fingerprints["fingerprints"]
 
 
 def test_exact_trusted_path_hook_identity_survives_lazy_method_initialization(

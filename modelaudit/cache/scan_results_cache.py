@@ -7,6 +7,7 @@ import marshal
 import os
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from importlib.machinery import SOURCE_SUFFIXES, FileFinder, ModuleSpec
 from pathlib import Path
@@ -105,20 +106,24 @@ def _import_hook_identity(hook: object) -> str:
 
 
 def _path_hook_resolution_identity(hook: object) -> str:
-    """Return the cache identity used for trusted and replacement path hooks."""
+    """Return the cache identity while trusting only the original path-hook objects."""
     for trusted_hook in _TRUSTED_PATH_HOOKS:
         if hook is trusted_hook:
             module = getattr(hook, "__module__", type(hook).__module__)
             qualname = getattr(hook, "__qualname__", type(hook).__qualname__)
             return f"trusted:{module}.{qualname}"
+    return _import_hook_identity(hook)
 
-    hook_identity = _import_hook_identity(hook)
-    for trusted_hook in _TRUSTED_PATH_HOOKS:
-        if hook_identity == _import_hook_identity(trusted_hook):
-            module = getattr(trusted_hook, "__module__", type(trusted_hook).__module__)
-            qualname = getattr(trusted_hook, "__qualname__", type(trusted_hook).__qualname__)
-            return f"trusted:{module}.{qualname}"
-    return hook_identity
+
+def _string_sequence_identity(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    count = 0
+    for value in values:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    return f"{count}:{digest.hexdigest()}"
 
 
 def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
@@ -131,12 +136,12 @@ def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
     session = getattr(finder, "session", None)
     for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
         basenames.add(Path(str(initial_path)).stem)
-    state = _bounded_hook_value_identity(
+    state = "|".join(
         (
-            tuple(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
-            tuple(str(value) for value in getattr(finder, "fnpats", ())),
-            tuple(sorted(basenames)),
-            bool(getattr(finder, "_writing_pyc", False)),
+            _string_sequence_identity(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
+            _string_sequence_identity(str(value) for value in getattr(finder, "fnpats", ())),
+            _string_sequence_identity(sorted(basenames)),
+            repr(bool(getattr(finder, "_writing_pyc", False))),
         )
     )
     digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()

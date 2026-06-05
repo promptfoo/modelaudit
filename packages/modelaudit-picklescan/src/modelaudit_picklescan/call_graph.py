@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import _imp
 import ast
 import fnmatch
 import hashlib
@@ -29,8 +30,9 @@ from importlib.machinery import (
     SourceFileLoader,
     SourcelessFileLoader,
 )
+from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
-from types import FunctionType
+from types import CodeType, FunctionType, ModuleType
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
@@ -45,6 +47,7 @@ _MAX_IMPORT_REFERENCES = 32
 _MAX_SOURCE_BYTES = 1024 * 1024
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
+_SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
 _MAX_CALL_GRAPH_DEPTH = 4
@@ -1011,20 +1014,24 @@ def _import_hook_identity(hook: object) -> str:
 
 
 def _path_hook_resolution_identity(hook: object) -> str:
-    """Return a stable identity for trusted path hooks and hash replacements."""
+    """Return a stable identity while trusting only the original path-hook objects."""
     for trusted_hook in _TRUSTED_PATH_HOOKS:
         if hook is trusted_hook:
             module = getattr(hook, "__module__", type(hook).__module__)
             qualname = getattr(hook, "__qualname__", type(hook).__qualname__)
             return f"trusted:{module}.{qualname}"
+    return _import_hook_identity(hook)
 
-    hook_identity = _import_hook_identity(hook)
-    for trusted_hook in _TRUSTED_PATH_HOOKS:
-        if hook_identity == _import_hook_identity(trusted_hook):
-            module = getattr(trusted_hook, "__module__", type(trusted_hook).__module__)
-            qualname = getattr(trusted_hook, "__qualname__", type(trusted_hook).__qualname__)
-            return f"trusted:{module}.{qualname}"
-    return hook_identity
+
+def _string_sequence_identity(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    count = 0
+    for value in values:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    return f"{count}:{digest.hexdigest()}"
 
 
 def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
@@ -1037,12 +1044,12 @@ def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
     session = getattr(finder, "session", None)
     for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
         basenames.add(Path(str(initial_path)).stem)
-    state = _bounded_hook_value_identity(
+    state = "|".join(
         (
-            tuple(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
-            tuple(str(value) for value in getattr(finder, "fnpats", ())),
-            tuple(sorted(basenames)),
-            bool(getattr(finder, "_writing_pyc", False)),
+            _string_sequence_identity(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
+            _string_sequence_identity(str(value) for value in getattr(finder, "fnpats", ())),
+            _string_sequence_identity(sorted(basenames)),
+            repr(bool(getattr(finder, "_writing_pyc", False))),
         )
     )
     digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()
@@ -1175,7 +1182,7 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:
         return
-    estimated_candidate_count = len(parts) * 2 * len(sys.path)
+    estimated_candidate_count = len(parts) * 2 * (len(_SOURCE_RESOLUTION_SUFFIXES) + 1) * len(sys.path)
     module_name_length = sum(len(part) for part in parts) + len(parts) - 1
     if (
         estimated_candidate_count > _MAX_SOURCE_FINGERPRINT_CANDIDATES
@@ -1190,8 +1197,15 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
         root = Path(entry or os.getcwd())
         for prefix_length in range(1, len(parts) + 1):
             prefix = parts[:prefix_length]
-            candidates.add(root.joinpath(*prefix).with_suffix(".py").absolute())
-            candidates.add(root.joinpath(*prefix, "__init__.py").absolute())
+            module_candidate = root.joinpath(*prefix)
+            package_candidate = root.joinpath(*prefix, "__init__")
+            for suffix in _SOURCE_RESOLUTION_SUFFIXES:
+                candidates.add(module_candidate.with_suffix(suffix).absolute())
+                candidates.add(package_candidate.with_suffix(suffix).absolute())
+            for source_candidate in (module_candidate.with_suffix(".py"), package_candidate.with_suffix(".py")):
+                cache_candidate = _source_cache_path(source_candidate)
+                if cache_candidate is not None:
+                    candidates.add(cache_candidate)
     with snapshot.lock:
         if (
             snapshot.search_context != _source_search_context()
@@ -1313,6 +1327,13 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
     spec: ModuleSpec | None = None
     for index in range(len(parts)):
         qualified_name = ".".join(parts[: index + 1])
+        if index < len(parts) - 1:
+            is_loaded, loaded_search_path = _loaded_package_search_path(qualified_name)
+            if is_loaded:
+                if loaded_search_path is None:
+                    return None
+                search_path = loaded_search_path
+                continue
         spec = _find_standard_path_spec(qualified_name, search_path)
         if spec is None:
             return None
@@ -1323,6 +1344,61 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
             return None
         search_path = list(locations)
     return spec
+
+
+def _loaded_package_search_path(module_name: str) -> tuple[bool, list[str] | None]:
+    if module_name not in sys.modules:
+        return False, None
+    loaded_module: Any = sys.modules[module_name]
+    if not isinstance(loaded_module, ModuleType):
+        return True, None
+    raw_search_path = vars(loaded_module).get("__path__")
+    if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
+        return True, None
+    return True, [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
+
+
+def _source_cache_path(source_path: Path) -> Path | None:
+    optimization = "" if sys.flags.optimize == 0 else str(sys.flags.optimize)
+    try:
+        return Path(cache_from_source(str(source_path), optimization=optimization)).absolute()
+    except (NotImplementedError, ValueError):
+        return None
+
+
+def _effective_bytecode_matches_source(source_path: Path) -> bool:
+    cache_path = _source_cache_path(source_path)
+    if cache_path is None or not cache_path.is_file():
+        return True
+    try:
+        source = source_path.read_bytes()
+        bytecode = cache_path.read_bytes()
+        source_stat = source_path.stat()
+    except OSError:
+        return False
+    if len(source) > _MAX_SOURCE_BYTES or len(bytecode) > _MAX_SOURCE_BYTES * 2 or len(bytecode) < 16:
+        return False
+    if bytecode[:4] != MAGIC_NUMBER:
+        return True
+    flags = int.from_bytes(bytecode[4:8], "little")
+    if flags & ~0b11:
+        return True
+    if flags & 0b1:
+        check_hash_policy = _imp.check_hash_based_pycs
+        should_check_hash = check_hash_policy == "always" or (check_hash_policy == "default" and bool(flags & 0b10))
+        if should_check_hash and bytecode[8:16] != source_hash(source):
+            return True
+    elif (
+        int.from_bytes(bytecode[8:12], "little") != int(source_stat.st_mtime) & 0xFFFFFFFF
+        or int.from_bytes(bytecode[12:16], "little") != source_stat.st_size & 0xFFFFFFFF
+    ):
+        return True
+    try:
+        cached_code = marshal.loads(bytecode[16:])
+        source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
+    except (EOFError, TypeError, ValueError):
+        return False
+    return isinstance(cached_code, CodeType) and cached_code == source_code
 
 
 def _current_module_source_path(module_name: str) -> str | None:
@@ -3884,7 +3960,21 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
         source_path = Path(spec.origin)
         if source_path.is_file():
+            if not _effective_bytecode_matches_source(source_path):
+                snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+                if snapshot is not None:
+                    with snapshot.lock:
+                        snapshot.reusable = False
+                return None
             _track_shared_source_path(module_name, source_path, loaded=False)
+            if any(
+                partial_name in sys.modules
+                for partial_name in (".".join(parts[:index]) for index in range(1, len(parts)))
+            ):
+                snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+                if snapshot is not None:
+                    with snapshot.lock:
+                        snapshot.reusable = False
             return source_path
     return None
 
