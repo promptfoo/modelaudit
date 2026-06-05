@@ -1185,7 +1185,11 @@ def _scan_pickle_payload_native(
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
         report = _report_from_native_dict(raw_report)
         if enrich_call_graph:
-            return report if _call_graph_enrichment_is_redundant(report) else _with_call_graph_findings(report)
+            if _call_graph_enrichment_is_redundant(report):
+                with shared_source_sensitive_caches():
+                    source_fingerprints = shared_source_fingerprint_metadata()
+                return _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
+            return _with_call_graph_findings(report)
         return _with_import_origin_findings(report)
     except Exception as error:
         return _engine_error_report(

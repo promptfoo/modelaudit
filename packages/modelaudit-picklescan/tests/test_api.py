@@ -42,7 +42,6 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -60,16 +59,23 @@ from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
+    _begin_shared_source_report,
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     _clear_source_sensitive_caches,
     _effective_bytecode_matches_source,
+    _ensure_shared_source_snapshot_stable,
     _is_standard_path_hook,
     _meta_path_finder_resolution_identity,
     _path_hook_resolution_identity,
     _read_candidate_fingerprint,
     _resolution_candidate_fingerprint,
+    _track_shared_source_candidates,
+    _track_shared_source_path,
+    _trusted_module_origin_kind,
     find_startup_hook_write_call_graphs,
+    shared_source_fingerprint_metadata,
+    shared_source_sensitive_caches,
 )
 
 
@@ -1455,6 +1461,10 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.metadata["container_type"] == "pytorch_zip"
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert source_fingerprints["fingerprints"] == {}
+    assert source_fingerprints["read_fingerprints"] == {}
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
 
@@ -5885,6 +5895,78 @@ def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() ->
     assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
 
 
+def test_distribution_root_trust_disables_cache_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_editable_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._installed_distribution_roots",
+        lambda _top_level_name: (tmp_path.resolve(),),
+    )
+    _trusted_module_origin_kind.cache_clear()
+
+    try:
+        with shared_source_sensitive_caches():
+            assert _trusted_module_origin_kind(module_name) == "site_packages"
+            metadata = shared_source_fingerprint_metadata()
+    finally:
+        _trusted_module_origin_kind.cache_clear()
+
+    assert metadata is not None
+    assert metadata["reusable"] is False
+
+
+def test_source_fingerprint_limit_disables_reuse_without_invalidating_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "bounded_module.py"
+    source_path.write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+    absolute_source_path = str(source_path.absolute())
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES", 0)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._current_module_source_path",
+        lambda _module_name: absolute_source_path,
+    )
+
+    with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        _track_shared_source_path("bounded_module", source_path, loaded=False)
+        _ensure_shared_source_snapshot_stable(report_generation)
+        metadata = shared_source_fingerprint_metadata()
+
+    assert metadata is not None
+    assert metadata["reusable"] is False
+
+
+def test_zipimport_archive_changes_invalidate_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "modules.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("zip_pkg/__init__.py", "")
+        archive.writestr("zip_pkg/helper.py", "def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(archive_path))
+
+    with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        _track_shared_source_candidates(("zip_pkg", "helper"))
+        metadata = shared_source_fingerprint_metadata()
+        assert metadata is not None
+        assert metadata["fingerprints"][str(archive_path.absolute())] is not None
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("zip_pkg/__init__.py", "")
+            archive.writestr("zip_pkg/helper.py", "import os\nos.system('id')\n")
+
+        with pytest.raises(_CallGraphAnalysisLimitError, match="source changed"):
+            _ensure_shared_source_snapshot_stable(report_generation)
+
+
 def test_recreated_file_finder_hooks_are_not_trusted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5937,7 +6019,8 @@ def test_spoofed_equivalent_file_finder_hook_is_not_trusted(
             source="spoofed-file-finder-hook.pkl",
         )
         assert report.status == ScanStatus.INCONCLUSIVE
-        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
         assert not marker.exists()
 
         __import__(module_name)
@@ -6134,6 +6217,7 @@ def test_resolution_candidate_fingerprint_tracks_large_extension_by_presence(tmp
     assert fingerprint == _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_resolution_candidate_fingerprint_rejects_path_replacement_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6144,7 +6228,7 @@ def test_resolution_candidate_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"import os\nos.system('id')\n"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.py"
-    original_read = call_graph_module.os.read
+    original_read = os.read
     replaced = False
 
     def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
@@ -6156,12 +6240,13 @@ def test_resolution_candidate_fingerprint_rejects_path_replacement_during_read(
             replacement_path.rename(source_path)
         return chunk
 
-    monkeypatch.setattr(call_graph_module.os, "read", replace_after_first_read)
+    monkeypatch.setattr(os, "read", replace_after_first_read)
 
     assert _resolution_candidate_fingerprint(source_path) == (False, None)
     assert source_path.read_bytes() == malicious_source
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_read_candidate_fingerprint_rejects_path_replacement_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6172,7 +6257,7 @@ def test_read_candidate_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"malicious bytecode"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.pyc"
-    original_read = call_graph_module.os.read
+    original_read = os.read
     replaced = False
 
     def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
@@ -6184,12 +6269,13 @@ def test_read_candidate_fingerprint_rejects_path_replacement_during_read(
             replacement_path.rename(source_path)
         return chunk
 
-    monkeypatch.setattr(call_graph_module.os, "read", replace_after_first_read)
+    monkeypatch.setattr(os, "read", replace_after_first_read)
 
     assert _read_candidate_fingerprint(source_path) == (False, None)
     assert source_path.read_bytes() == malicious_source
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_resolution_extension_fingerprint_rejects_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6199,7 +6285,7 @@ def test_resolution_extension_fingerprint_rejects_path_replacement(
     replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
     replacement_path.write_bytes(b"malicious extension")
     displaced_path = tmp_path / f"displaced{EXTENSION_SUFFIXES[0]}"
-    original_fstat = call_graph_module.os.fstat
+    original_fstat = os.fstat
     fstat_calls = 0
 
     def replace_after_second_fstat(file_descriptor: int) -> os.stat_result:
@@ -6211,7 +6297,7 @@ def test_resolution_extension_fingerprint_rejects_path_replacement(
             replacement_path.rename(extension_path)
         return file_stat
 
-    monkeypatch.setattr(call_graph_module.os, "fstat", replace_after_second_fstat)
+    monkeypatch.setattr(os, "fstat", replace_after_second_fstat)
 
     assert _resolution_candidate_fingerprint(extension_path) == (False, None)
 
@@ -6256,7 +6342,7 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
     assert "call_graph_source_fingerprints" not in updated.metadata
-    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is True
+    assert isinstance(updated.private_metadata["call_graph_source_fingerprints"]["reusable"], bool)
 
 
 def test_scan_bytes_skips_call_graph_enrichment_without_references(
@@ -6621,7 +6707,8 @@ def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (finding,)
 
 

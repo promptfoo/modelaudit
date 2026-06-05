@@ -24,7 +24,6 @@ from typing import Any
 import pytest
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
-import modelaudit.cache.scan_results_cache as scan_results_cache_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.optimized_config import (
@@ -1484,6 +1483,7 @@ def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: P
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_source_fingerprint_rejects_path_replacement_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1494,7 +1494,7 @@ def test_source_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"import os\nos.system('id')\n"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.py"
-    original_read = scan_results_cache_module.os.read
+    original_read = os.read
     replaced = False
 
     def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
@@ -1506,7 +1506,7 @@ def test_source_fingerprint_rejects_path_replacement_during_read(
             replacement_path.rename(source_path)
         return chunk
 
-    monkeypatch.setattr(scan_results_cache_module.os, "read", replace_after_first_read)
+    monkeypatch.setattr(os, "read", replace_after_first_read)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_source_fingerprint(source_path)
@@ -1514,6 +1514,7 @@ def test_source_fingerprint_rejects_path_replacement_during_read(
     assert source_path.read_bytes() == malicious_source
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_read_fingerprint_rejects_path_replacement_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1524,7 +1525,7 @@ def test_read_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"malicious bytecode"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.pyc"
-    original_read = scan_results_cache_module.os.read
+    original_read = os.read
     replaced = False
 
     def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
@@ -1536,7 +1537,7 @@ def test_read_fingerprint_rejects_path_replacement_during_read(
             replacement_path.rename(source_path)
         return chunk
 
-    monkeypatch.setattr(scan_results_cache_module.os, "read", replace_after_first_read)
+    monkeypatch.setattr(os, "read", replace_after_first_read)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
@@ -1544,6 +1545,7 @@ def test_read_fingerprint_rejects_path_replacement_during_read(
     assert source_path.read_bytes() == malicious_source
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_extension_fingerprint_rejects_path_replacement_during_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1553,7 +1555,7 @@ def test_extension_fingerprint_rejects_path_replacement_during_validation(
     replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
     replacement_path.write_bytes(b"malicious extension")
     displaced_path = tmp_path / f"displaced{EXTENSION_SUFFIXES[0]}"
-    original_fstat = scan_results_cache_module.os.fstat
+    original_fstat = os.fstat
     fstat_calls = 0
 
     def replace_after_second_fstat(file_descriptor: int) -> os.stat_result:
@@ -1565,7 +1567,7 @@ def test_extension_fingerprint_rejects_path_replacement_during_validation(
             replacement_path.rename(extension_path)
         return file_stat
 
-    monkeypatch.setattr(scan_results_cache_module.os, "fstat", replace_after_second_fstat)
+    monkeypatch.setattr(os, "fstat", replace_after_second_fstat)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_source_fingerprint(extension_path)

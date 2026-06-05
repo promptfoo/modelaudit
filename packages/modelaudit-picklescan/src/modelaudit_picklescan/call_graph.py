@@ -1073,14 +1073,23 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
         return "site_packages"
     top_level_name = parts[0]
     if any(origin.is_relative_to(path) for path in _installed_distribution_roots(top_level_name)):
+        _mark_shared_source_snapshot_unreusable()
         return "site_packages"
     if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
         return "stdlib"
     return None
 
 
+def _mark_shared_source_snapshot_unreusable() -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        with snapshot.lock:
+            snapshot.reusable = False
+
+
 def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
     if len(module_name) > _MAX_MODULE_NAME_CHARS:
+        _mark_shared_source_snapshot_unreusable()
         return None
     parts = tuple(module_name.split("."))
     if (
@@ -1088,6 +1097,7 @@ def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
         or len(parts) > _MAX_MODULE_COMPONENTS
         or any(not part or "/" in part or "\\" in part for part in parts)
     ):
+        _mark_shared_source_snapshot_unreusable()
         return None
     return parts
 
@@ -1952,6 +1962,9 @@ def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     import_suffixes = (*EXTENSION_SUFFIXES, *SOURCE_SUFFIXES, *BYTECODE_SUFFIXES)
     for entry in sys.path:
         root = Path(entry or os.getcwd())
+        archive_path = _zipimport_archive_path(str(root))
+        if archive_path is not None:
+            candidates.add(archive_path)
         for index in range(1, len(parts) + 1):
             module_path = root.joinpath(*parts[:index])
             for suffix in import_suffixes:
@@ -2039,6 +2052,9 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
 
         resolution_candidates: set[Path] = set()
         for entry in considered_entries:
+            archive_path = _zipimport_archive_path(entry)
+            if archive_path is not None:
+                resolution_candidates.add(archive_path)
             module_candidate = Path(entry).joinpath(part)
             package_candidate = module_candidate.joinpath("__init__")
             for suffix in _SOURCE_RESOLUTION_SUFFIXES:
@@ -2152,7 +2168,6 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
             str(candidate) not in snapshot.resolution_fingerprints
             and len(snapshot.resolution_fingerprints) >= _MAX_SOURCE_FINGERPRINT_CANDIDATES
         ):
-            snapshot.stable = False
             snapshot.reusable = False
             return
         snapshot.resolution_fingerprints[str(candidate)] = fingerprint
@@ -2316,18 +2331,18 @@ def _effective_bytecode_matches_source(source_path: Path) -> bool:
 def _current_module_source_path(module_name: str) -> str | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
-    loaded_module = sys.modules.get(module_name)
-    loaded_spec = getattr(loaded_module, "__spec__", None)
-    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
-        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
-            return str(Path(loaded_spec.origin).absolute())
-        if loaded_spec.origin not in {"built-in", "frozen"}:
-            return None
-
     spec = _find_standard_filesystem_spec(module_name)
     if spec is None or not isinstance(spec.origin, str) or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
         return None
     return str(Path(spec.origin).absolute())
+
+
+def _zipimport_archive_path(entry: str) -> Path | None:
+    try:
+        archive = zipimporter(entry).archive
+    except (ImportError, OSError):
+        return None
+    return Path(archive).absolute()
 
 
 def _loaded_module_source_path(module_name: str) -> str | None:
@@ -5172,11 +5187,7 @@ def _resolve_import_from_module(module_name: str, is_package: bool, level: int, 
 def _resolve_module_source(module_name: str) -> Path | None:
     parts = _bounded_module_name_parts(module_name)
     if parts is None or len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
-        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-        if snapshot is not None:
-            with snapshot.lock:
-                snapshot.stable = False
-                snapshot.reusable = False
+        _mark_shared_source_snapshot_unreusable()
         return None
     _track_shared_source_candidates(parts)
     spec = _find_standard_filesystem_spec(module_name)

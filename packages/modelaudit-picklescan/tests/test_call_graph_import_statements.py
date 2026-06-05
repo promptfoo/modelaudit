@@ -181,7 +181,8 @@ def test_trusted_origin_rejects_local_distribution_metadata_outside_trusted_inst
     (dist_info / "METADATA").write_text("Name: pytest\nVersion: 1.0\n", encoding="utf-8")
     (dist_info / "top_level.txt").write_text("_pytest\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(overlay))
-    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
+    for module_name in ("_pytest._py.path", "_pytest._py", "_pytest"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
@@ -222,7 +223,8 @@ def test_trusted_origin_rejects_inactive_lookalike_environment(
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(site_packages))
-    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
+    for module_name in ("_pytest._py.path", "_pytest._py", "_pytest"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
@@ -251,7 +253,8 @@ def test_trusted_origin_recognizes_active_environment_delegated_overlay(
         call_graph._trusted_delegated_site_package_paths(),
     )
     monkeypatch.syspath_prepend(str(overlay_site_packages))
-    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
+    for module_name in ("_pytest._py.path", "_pytest._py", "_pytest"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
@@ -280,7 +283,8 @@ def test_trusted_origin_ignores_nonexecuted_pth_addsitedir(
         call_graph._trusted_delegated_site_package_paths(),
     )
     monkeypatch.syspath_prepend(str(overlay_site_packages))
-    monkeypatch.delitem(sys.modules, "_pytest._py.path", raising=False)
+    for module_name in ("_pytest._py.path", "_pytest._py", "_pytest"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
