@@ -2286,9 +2286,25 @@ def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
             b"from runpy import run_path as run\ndef handle(data, context):\n    return run('payload.py')\n",
             "runpy.run_path",
         ),
+        (b"import ctypes\ndef handle(data, context):\n    return ctypes.CDLL(LIBRARY_PATH)\n", "ctypes.CDLL"),
+        (
+            b"from ctypes import cdll as loader\ndef handle(data, context):\n"
+            b"    return loader.LoadLibrary(LIBRARY_PATH)\n",
+            "ctypes.cdll.LoadLibrary",
+        ),
+        (
+            b"import webbrowser\ndef handle(data, context):\n    return webbrowser.open('https://example.invalid')\n",
+            "webbrowser.open",
+        ),
+        (
+            b"from webbrowser import open_new_tab as launch\ndef handle(data, context):\n"
+            b"    return launch('https://example.invalid')\n",
+            "webbrowser.open_new_tab",
+        ),
     ],
 )
 def test_scan_detects_handler_execution_primitive(tmp_path: Path, handler_source: bytes, dangerous_name: str) -> None:
+    handler_source = handler_source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
         tmp_path,
@@ -2319,6 +2335,31 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
 
     result = TorchServeMarScanner().scan(str(mar_path))
 
+    assert result.success is True
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"from ctypes import CDLL as load\ndef handle(data, context):\n    load = len\n    return load([])\n",
+        b"import ctypes\ndef handle(data, context):\n    ctypes.CDLL = len\n    return ctypes.CDLL([])\n",
+        b"from webbrowser import open as launch\ndef handle(data, context):\n    launch = len\n    return launch([])\n",
+        b"import webbrowser\ndef handle(data, context):\n    webbrowser.open = len\n    return webbrowser.open([])\n",
+    ],
+)
+def test_scan_allows_shadowed_direct_handler_primitives(tmp_path: Path, handler_source: bytes) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="safe_shadowed_direct_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert result.success is True
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
