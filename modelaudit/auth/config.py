@@ -99,8 +99,10 @@ class CloudConfig:
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host."""
-        self.config["apiHost"] = validate_api_host_for_bearer_auth(api_host)
-        self._save_config()
+        self._persist_config_update(
+            {"apiHost": validate_api_host_for_bearer_auth(api_host)},
+            "Unable to persist cloud API host",
+        )
 
     def set_api_key(self, api_key: str) -> None:
         """Set API key."""
@@ -109,13 +111,19 @@ class CloudConfig:
 
     def set_credentials(self, api_host: str, api_key: str, app_url: str) -> None:
         """Persist bearer-token configuration as one atomic cloud update."""
+        self._persist_config_update(
+            {
+                "apiHost": validate_api_host_for_bearer_auth(api_host),
+                "apiKey": api_key,
+                "appUrl": app_url,
+            },
+            "Unable to persist cloud authentication credentials",
+        )
+
+    def _persist_config_update(self, updates: dict[str, Any], failure_message: str) -> None:
+        """Save a cloud config update without exposing uncommitted in-memory state."""
         previous_config = dict(self.config)
-        expected_config = {
-            **previous_config,
-            "apiHost": validate_api_host_for_bearer_auth(api_host),
-            "apiKey": api_key,
-            "appUrl": app_url,
-        }
+        expected_config = {**previous_config, **updates}
         self.config = expected_config
         try:
             self._save_config()
@@ -123,9 +131,9 @@ class CloudConfig:
             self.config = previous_config
             raise
 
-        if any(self.config.get(key) != expected_config[key] for key in ("apiHost", "apiKey", "appUrl")):
+        if any(self.config.get(key) != expected_value for key, expected_value in updates.items()):
             self.config = previous_config
-            raise OSError("Unable to persist cloud authentication credentials")
+            raise OSError(failure_message)
 
     def get_api_key(self) -> str | None:
         """Get API key."""

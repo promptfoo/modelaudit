@@ -297,6 +297,50 @@ def test_cloud_config_set_api_host_accepts_enterprise_https_hosts(
     assert cloud_config.get_api_host() == "https://enterprise.example:8443"
 
 
+def test_cloud_config_set_api_host_rolls_back_in_memory_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def fail_save() -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cloud_config, "_save_config", fail_save)
+
+    with pytest.raises(OSError, match="disk full"):
+        cloud_config.set_api_host("https://new-api.example")
+
+    assert cloud_config.config == old_config
+
+
+def test_cloud_config_set_api_host_detects_silent_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_config = auth_config.CloudConfig.__new__(auth_config.CloudConfig)
+    old_config = {
+        "appUrl": "https://old-app.example",
+        "apiHost": "https://old-api.example",
+        "apiKey": "old-token",
+    }
+    cloud_config.config = dict(old_config)
+
+    def silently_restore_old_config() -> None:
+        cloud_config.config = dict(old_config)
+
+    monkeypatch.setattr(cloud_config, "_save_config", silently_restore_old_config)
+
+    with pytest.raises(OSError, match="Unable to persist cloud API host"):
+        cloud_config.set_api_host("https://new-api.example")
+
+    assert cloud_config.config == old_config
+
+
 def test_validate_and_set_api_token_rejects_untrusted_host_before_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
