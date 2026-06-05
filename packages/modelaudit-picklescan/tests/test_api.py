@@ -5269,13 +5269,15 @@ def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_ana
         source="invoked-trusted-native-global.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
+    source_unavailable = _call_graph_source_unavailable_reason("_xxsubinterpreters") is not None
+    assert report.status == (ScanStatus.INCONCLUSIVE if source_unavailable else ScanStatus.COMPLETE)
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.details.get("import_reference") == "_xxsubinterpreters.create"
         for finding in report.findings
     )
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices) is source_unavailable
 
 
 @pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])

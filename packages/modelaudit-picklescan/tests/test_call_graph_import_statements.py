@@ -13,7 +13,7 @@ import sys
 import threading
 import zipfile
 from contextvars import copy_context
-from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec
+from importlib.machinery import EXTENSION_SUFFIXES, FrozenImporter, ModuleSpec
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -2040,6 +2040,47 @@ def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
 
     assert "builtins.__import__" in calls
     assert call_graph._find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
+
+
+def test_call_graph_treats_proven_frozen_function_body_import_as_safe() -> None:
+    if FrozenImporter.find_spec("ntpath") is None:
+        pytest.skip("ntpath is not frozen on this interpreter")
+
+    assert call_graph._import_module_can_execute_user_code("ntpath") is False
+
+
+def test_call_graph_fails_closed_when_custom_finder_can_shadow_frozen_function_body_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if FrozenImporter.find_spec("ntpath") is None:
+        pytest.skip("ntpath is not frozen on this interpreter")
+    marker = tmp_path / "meta_path_called"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == "ntpath":
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    with monkeypatch.context() as context:
+        context.delitem(sys.modules, "ntpath", raising=False)
+        context.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+        _clear_call_graph_caches()
+
+        try:
+            assert call_graph._import_module_can_execute_user_code("ntpath") is True
+        finally:
+            _clear_call_graph_caches()
+
+    assert not marker.exists()
 
 
 def test_call_graph_keeps_module_dict_dotted_lookup_clean(
