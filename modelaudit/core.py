@@ -87,6 +87,7 @@ from modelaudit.utils.file.handlers import (
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
+from modelaudit.utils.file.hdf5 import find_hdf5_signature_offset
 from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
@@ -232,6 +233,8 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if header_format == "zip":
+        if find_hdf5_signature_offset(path) is not None:
+            return "keras_h5"
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
         if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
@@ -1945,6 +1948,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
+    is_hdf5_userblock_zip = header_format == "zip" and scanner_id == "keras_h5"
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
@@ -2223,6 +2227,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             result,
             config,
             context="strict content owner overlapping ambiguous Flax analysis",
+        )
+
+    if is_hdf5_userblock_zip and result.scanner_name != "zip":
+        merge_executable_zip_container_findings(
+            path,
+            result,
+            config,
+            context="HDF5 user-block ZIP",
         )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":

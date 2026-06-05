@@ -41,6 +41,7 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -442,6 +443,29 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
+
+
+def _append_hdf5_userblock_candidate(path: Path, *, plausible: bool) -> int:
+    """Append an HDF5 signature candidate after a complete ZIP user block."""
+    payload = bytearray(path.read_bytes())
+    signature_offset = 512
+    while signature_offset < len(payload):
+        signature_offset *= 2
+
+    minimum_size = signature_offset + 64
+    payload.extend(bytes(minimum_size - len(payload)))
+    if plausible:
+        superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
+        superblock.extend(signature_offset.to_bytes(8, "little"))
+        superblock.extend(b"\xff" * 8)
+        superblock.extend(len(payload).to_bytes(8, "little"))
+        superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+        superblock.extend(bytes(4))
+    else:
+        superblock = bytearray(HDF5_MAGIC + b"\x03\x01\x01\x00")
+    payload[signature_offset : signature_offset + len(superblock)] = superblock
+    path.write_bytes(payload)
+    return signature_offset
 
 
 def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
@@ -2517,6 +2541,41 @@ def test_scan_file_still_routes_malicious_zip_with_local_header(tmp_path: Path) 
 
     assert result.scanner_name == "zip"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_prefers_hdf5_and_preserves_malicious_zip_userblock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "zip-userblock.h5"
+    _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "zip"
+    assert find_hdf5_signature_offset(str(polyglot)) == signature_offset
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "keras_h5"
+    assert result.success is False
+    assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "H5PY Library Check" for check in result.checks)
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_keeps_malformed_hdf5_zip_near_match_on_zip_route(tmp_path: Path) -> None:
+    near_match = tmp_path / "zip-near-match.h5"
+    _create_misnamed_zip(near_match, {"README.txt": b"benign archive"})
+    _append_hdf5_userblock_candidate(near_match, plausible=False)
+
+    assert file_detection.detect_file_format(str(near_match)) == "zip"
+    assert find_hdf5_signature_offset(str(near_match)) is None
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
 
 def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:
