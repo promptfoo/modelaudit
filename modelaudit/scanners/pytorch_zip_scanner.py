@@ -250,10 +250,13 @@ class PyTorchZipScanner(BaseScanner):
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
+    MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
     BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
+    ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
+    LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -268,7 +271,10 @@ class PyTorchZipScanner(BaseScanner):
             self.config.get("min_compression_bomb_uncompressed_size"),
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
-        self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        self.max_archive_entries = self._normalize_positive_int_config(
+            self.config.get("max_archive_entries"),
+            self.MAX_ARCHIVE_ENTRIES,
+        )
         # ``max_jit_scan_member_bytes`` caps per-member reads during the JIT /
         # network pattern pass to avoid unbounded memory blowup. Non-positive
         # or non-integer values fall back to the default; there is *no*
@@ -695,24 +701,16 @@ class PyTorchZipScanner(BaseScanner):
                 rule_code=None,
             )
 
-        try:
-            # Force central directory parsing so malformed ZIPs fail fast here.
-            with zipfile.ZipFile(path, "r") as z:
-                z.namelist()
-        except zipfile.BadZipFile:
-            result.add_check(
-                name="PyTorch ZIP Format Validation",
-                passed=False,
-                message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"path": path},
-                rule_code="S902",
-            )
-            result.finish(success=False)
-            return result
-
         return result
+
+    @classmethod
+    def _entry_limit_exceeded(cls, result: ScanResult) -> bool:
+        reasons = result.metadata.get("scan_outcome_reasons")
+        return isinstance(reasons, list) and cls.ENTRY_LIMIT_INCONCLUSIVE_REASON in reasons
+
+    @classmethod
+    def _local_entry_limit_exceeded(cls, result: ScanResult) -> bool:
+        return result.metadata.get(cls.LOCAL_ENTRY_LIMIT_METADATA_KEY) is True
 
     def _validate_zip_entries(
         self,
@@ -732,19 +730,43 @@ class PyTorchZipScanner(BaseScanner):
 
         # Check entry count limit (decompression bomb indicator)
         entry_count = len(archive_entries)
+        entry_limit_exceeded = entry_count > self.max_archive_entries
+        entries_to_process = archive_entries
+        entry_summary_details: dict[str, int | bool] = {"entries_checked": entry_count}
+        entry_scope = "archive entries"
         if entry_count > self.max_archive_entries:
+            entries_to_process = archive_entries[: self.max_archive_entries]
+            dropped_entry_count = entry_count - len(entries_to_process)
+            mark_inconclusive_scan_result(result, self.ENTRY_LIMIT_INCONCLUSIVE_REASON)
+            result.metadata[self.LOCAL_ENTRY_LIMIT_METADATA_KEY] = True
+            entry_summary_details = {
+                "entries_checked": len(entries_to_process),
+                "total_entries": entry_count,
+                "analysis_incomplete": True,
+            }
+            entry_scope = "processed archive entries"
             result.add_check(
                 name="Archive Entry Limit",
                 passed=False,
-                message=f"Archive contains {entry_count} entries (max: {self.max_archive_entries})",
+                message=(
+                    f"Archive contains {entry_count} entries (max processed: {self.max_archive_entries}); "
+                    f"{dropped_entry_count} entries were skipped and scan coverage is incomplete"
+                ),
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "entry_count": entry_count,
                     "max_entries": self.max_archive_entries,
+                    "processed_entries": len(entries_to_process),
+                    "dropped_entry_count": dropped_entry_count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.ENTRY_LIMIT_INCONCLUSIVE_REASON,
                     "risk": "Excessive entries may indicate a decompression bomb attack",
                 },
-                why="Archives with excessive entries can exhaust system resources during extraction",
+                why=(
+                    "Archives with excessive entries can exhaust system resources during extraction; "
+                    "entries beyond the processing cap are not inspected."
+                ),
             )
         else:
             result.add_check(
@@ -755,7 +777,8 @@ class PyTorchZipScanner(BaseScanner):
                 details={"entry_count": entry_count, "max_entries": self.max_archive_entries},
             )
 
-        for info in archive_entries:
+        for info in entries_to_process:
+            self._check_timeout()
             name = info.filename
             previous_info = seen_entries.get(name)
             if previous_info is None:
@@ -772,13 +795,15 @@ class PyTorchZipScanner(BaseScanner):
                     (info.external_attr >> 16) & 0o170000,
                 )
                 if current_signature != previous_signature:
+                    coverage_message = (
+                        "all processed copies will be scanned explicitly; later archive entries remain uninspected"
+                        if entry_limit_exceeded
+                        else "all copies will be scanned explicitly"
+                    )
                     result.add_check(
                         name="Duplicate ZIP Entry Collision",
                         passed=False,
-                        message=(
-                            f"Duplicate archive entry {name} has conflicting metadata; "
-                            "all copies will be scanned explicitly"
-                        ),
+                        message=(f"Duplicate archive entry {name} has conflicting metadata; {coverage_message}"),
                         severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
                         details={
@@ -823,7 +848,7 @@ class PyTorchZipScanner(BaseScanner):
                     # Real symlink targets are short filesystem paths.
                     target = self._read_member_prefix(
                         zip_file,
-                        name,
+                        info,
                         4096,
                         phase="symlink_target_validation",
                         result=result,
@@ -892,26 +917,28 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Path Traversal Protection",
                 passed=True,
-                message="All archive entries have safe paths",
+                message=f"All {entry_scope} have safe paths",
                 location=path,
-                details={"entries_checked": len(archive_entries)},
+                details=dict(entry_summary_details),
             )
 
         if not symlink_issues_found and archive_entries:
             result.add_check(
                 name="Symlink Safety Validation",
                 passed=True,
-                message="No symlinks detected in archive",
+                message=f"No symlinks detected in {entry_scope}",
                 location=path,
+                details=dict(entry_summary_details) if entry_limit_exceeded else {},
             )
 
         if not compression_issues_found and archive_entries:
             result.add_check(
                 name="Compression Ratio Check",
                 passed=True,
-                message="All entries have safe compression ratios",
+                message=f"All {entry_scope} have safe compression ratios",
                 location=path,
                 details={
+                    **entry_summary_details,
                     "threshold": self.max_compression_ratio,
                     "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                 },
@@ -921,9 +948,9 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Duplicate ZIP Entry Collision",
                 passed=True,
-                message="No conflicting duplicate archive entries found",
+                message=f"No conflicting duplicate ZIP entries found in {entry_scope}",
                 location=path,
-                details={"entries_checked": len(archive_entries)},
+                details=dict(entry_summary_details),
             )
 
         return safe_entries
@@ -1016,6 +1043,7 @@ class PyTorchZipScanner(BaseScanner):
         scan_failures: list[dict[str, str]] = []
 
         for entry in safe_entries:
+            self._check_timeout()
             if entry.is_dir():
                 continue
 
@@ -1076,6 +1104,9 @@ class PyTorchZipScanner(BaseScanner):
 
                 self._rewrite_nested_result_context(nested_result, temp_path, path, self._get_zip_member_name(entry))
                 self._merge_nested_zip_result(result, nested_result, entry_name)
+                self._check_timeout()
+            except TimeoutError:
+                raise
             except ValueError as exc:
                 size_limited_entries.append(
                     {
@@ -1214,6 +1245,14 @@ class PyTorchZipScanner(BaseScanner):
         parent_metadata = dict(result.metadata)
         result.merge(nested_result)
         result.metadata = parent_metadata
+        if nested_result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+            nested_reasons = nested_result.metadata.get("scan_outcome_reasons")
+            if isinstance(nested_reasons, list) and nested_reasons:
+                for reason in nested_reasons:
+                    if isinstance(reason, str) and reason:
+                        mark_inconclusive_scan_result(result, reason)
+            else:
+                mark_inconclusive_scan_result(result, "pytorch_zip_nested_archive_scan_incomplete")
         nested_scans = result.metadata.setdefault("nested_zip_scans", [])
         if isinstance(nested_scans, list):
             nested_scans.append(
@@ -1862,7 +1901,8 @@ class PyTorchZipScanner(BaseScanner):
 
         # Emit explicit checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            if check_jit:
+            entry_limit_exceeded = self._entry_limit_exceeded(result)
+            if check_jit and (all_jit_findings or not entry_limit_exceeded):
                 self.add_jit_script_findings(
                     all_jit_findings,
                     result,
@@ -1870,7 +1910,7 @@ class PyTorchZipScanner(BaseScanner):
                     context=path,
                 )
 
-            if check_net:
+            if check_net and (all_network_findings or not entry_limit_exceeded):
                 self.add_network_communication_findings(
                     all_network_findings,
                     result,
@@ -1977,7 +2017,8 @@ class PyTorchZipScanner(BaseScanner):
             )
 
         # Add positive checks if no suspicious files found
-        if not python_files_found and safe_entries:
+        entry_limit_exceeded = self._entry_limit_exceeded(result)
+        if not python_files_found and safe_entries and not entry_limit_exceeded:
             result.add_check(
                 name="Python Code File Detection",
                 passed=True,
@@ -1985,7 +2026,7 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-        if not executable_files_found and safe_entries and not executable_probe_failures:
+        if not executable_files_found and safe_entries and not executable_probe_failures and not entry_limit_exceeded:
             result.add_check(
                 name="Executable File Detection",
                 passed=True,
@@ -2043,6 +2084,22 @@ class PyTorchZipScanner(BaseScanner):
         """Validate that the PyTorch model has expected structure"""
         pickle_names = self._get_zip_member_names(pickle_files)
         if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_names]:
+            if self._local_entry_limit_exceeded(result):
+                result.add_check(
+                    name="PyTorch Structure Validation",
+                    passed=False,
+                    message=(
+                        "PyTorch model structure could not be confirmed because archive entries beyond "
+                        "the processing limit were not inspected."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": self.ENTRY_LIMIT_INCONCLUSIVE_REASON,
+                    },
+                )
+                return
             result.add_check(
                 name="PyTorch Structure Validation",
                 passed=False,
@@ -2304,6 +2361,7 @@ class PyTorchZipScanner(BaseScanner):
             severity=IssueSeverity.CRITICAL,
             location=path,
             details={"path": path},
+            rule_code="S902",
         )
         result.finish(success=False)
         return result
@@ -3271,21 +3329,61 @@ class PyTorchZipScanner(BaseScanner):
 
         try:
             with zipfile.ZipFile(file_path, "r") as zip_file:
-                file_list = zip_file.namelist()
+                archive_entries = zip_file.infolist()
+                total_files = len(archive_entries)
+                entries_to_process = archive_entries[: self.max_archive_entries]
+                file_list = [entry.filename for entry in entries_to_process]
+                files_truncated = total_files > len(file_list)
+                member_records = [
+                    (
+                        entry,
+                        entry.filename.replace("\\", "/").lstrip("/"),
+                    )
+                    for entry in entries_to_process
+                ]
+                member_parts = [
+                    (
+                        entry,
+                        normalized_name,
+                        normalized_name.rsplit("/", 1)[-1],
+                        normalized_name.rsplit("/", 1)[0] if "/" in normalized_name else "",
+                    )
+                    for entry, normalized_name in member_records
+                ]
+                data_pkl_prefixes = {parent for _, _, basename, parent in member_parts if basename == "data.pkl"}
+                has_data_pkl = bool(data_pkl_prefixes)
+                has_version = any(
+                    basename == "version" and (not data_pkl_prefixes or parent in data_pkl_prefixes)
+                    for _, _, basename, parent in member_parts
+                )
 
                 # Analyze ZIP structure
                 metadata.update(
                     {
-                        "total_files": len(file_list),
+                        "total_files": total_files,
                         "files": file_list,
-                        "has_data_pkl": "data.pkl" in file_list,
-                        "has_version": "version" in file_list,
+                        "listed_files": len(file_list),
+                        "max_archive_entries": self.max_archive_entries,
+                        "files_truncated": files_truncated,
+                        "omitted_files": total_files - len(file_list),
+                        "metadata_analysis_incomplete": files_truncated,
+                        "has_data_pkl": True if has_data_pkl else None if files_truncated else False,
+                        "has_version": True if has_version else None if files_truncated else False,
                     }
                 )
 
                 # Check for model structure indicators
                 pkl_files = [f for f in file_list if f.endswith(".pkl")]
-                storage_files = [f for f in file_list if f.startswith("data/")]
+                version_prefixes = {parent for _, _, basename, parent in member_parts if basename == "version"}
+                model_prefixes = data_pkl_prefixes or version_prefixes
+                storage_files = [
+                    normalized_name
+                    for _, normalized_name, _, _ in member_parts
+                    if any(
+                        normalized_name.startswith(f"{prefix}/data/" if prefix else "data/")
+                        for prefix in model_prefixes
+                    )
+                ]
 
                 metadata.update(
                     {
@@ -3295,10 +3393,20 @@ class PyTorchZipScanner(BaseScanner):
                 )
 
                 # Try to read version if available
-                if "version" in file_list:
+                version_entry = next(
+                    (
+                        entry
+                        for entry, _, basename, parent in member_parts
+                        if basename == "version" and (not data_pkl_prefixes or parent in data_pkl_prefixes)
+                    ),
+                    None,
+                )
+                if version_entry is not None:
                     with suppress(Exception):
-                        version_data = zip_file.read("version")
-                        metadata["pytorch_version"] = version_data.decode("utf-8").strip()
+                        with zip_file.open(version_entry) as version_file:
+                            version_data = version_file.read(self.MAX_VERSION_METADATA_BYTES + 1)
+                        if len(version_data) <= self.MAX_VERSION_METADATA_BYTES:
+                            metadata["pytorch_version"] = version_data.decode("utf-8").strip()
 
                 # Estimate model complexity from file count and names
                 param_indicators = sum(

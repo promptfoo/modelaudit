@@ -13,7 +13,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult, mark_inconclusive_scan_result
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
@@ -742,6 +742,21 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     )
 
 
+def test_pytorch_zip_scanner_corrupt_pk_zip_keeps_s902(tmp_path: Path) -> None:
+    invalid_path = tmp_path / "corrupt-central-directory.pt"
+    invalid_path.write_bytes(b"PK\x03\x04truncated-local-header")
+
+    result = PyTorchZipScanner().scan(str(invalid_path))
+    format_checks = [check for check in result.checks if check.name == "PyTorch ZIP Format Validation"]
+
+    assert result.success is False
+    assert len(format_checks) == 1
+    assert format_checks[0].status == CheckStatus.FAILED
+    assert format_checks[0].severity == IssueSeverity.CRITICAL
+    assert format_checks[0].rule_code == "S902"
+    assert format_checks[0].message == f"Not a valid zip file: {invalid_path}"
+
+
 def test_pytorch_zip_scanner_missing_data_pkl(tmp_path):
     """Test scanning a PyTorch ZIP file without data.pkl."""
     # Create a ZIP file without data.pkl
@@ -1019,8 +1034,17 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
         archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
         raise AssertionError("_initialize_scan() should not open archive member payloads")
 
+    def fail_namelist(self: zipfile.ZipFile) -> list[str]:
+        raise AssertionError("_initialize_scan() should not materialize all archive member names")
+
+    def fail_zip_file(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("_initialize_scan() should not parse the ZIP central directory")
+
     monkeypatch.setattr(zipfile.ZipFile, "read", fail_read)
     monkeypatch.setattr(zipfile.ZipFile, "open", fail_open)
+    monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
+    monkeypatch.setattr(zipfile, "ZipFile", fail_zip_file)
 
     scanner = PyTorchZipScanner()
     result = scanner._initialize_scan(str(zip_path))
@@ -1057,10 +1081,10 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     """Non-BadZipFile metadata failures are incomplete coverage, not findings."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
-    def fail_namelist(self: zipfile.ZipFile) -> list[str]:
+    def fail_infolist(self: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
         raise OSError("zip metadata unavailable")
 
-    monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
+    monkeypatch.setattr(zipfile.ZipFile, "infolist", fail_infolist)
 
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
@@ -6447,7 +6471,7 @@ def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_pa
     assert any(check.details.get("pickle_filename") == "good/data.pkl" for check in trusted_checks)
 
 
-def test_pytorch_zip_scanner_entry_limit(tmp_path):
+def test_pytorch_zip_scanner_entry_limit(tmp_path: Path) -> None:
     """Test that scanner enforces archive entry count limits."""
     zip_path = tmp_path / "model.pt"
 
@@ -6470,9 +6494,94 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path):
     ]
     assert len(entry_issues) > 0
     assert entry_issues[0].severity == IssueSeverity.WARNING
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_entry_limit" in result.metadata["scan_outcome_reasons"]
+    assert entry_issues[0].details["analysis_incomplete"] is True
+    entry_check = next(check for check in result.checks if check.name == "Archive Entry Limit")
+    assert entry_check.message == (
+        "Archive contains 16 entries (max processed: 10); 6 entries were skipped and scan coverage is incomplete"
+    )
 
 
-def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
+def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> None:
+    """Entries after the configured archive-entry cap should not be processed as covered."""
+    zip_path = tmp_path / "late_symlink_after_entry_limit.pt"
+    symlink_target = tmp_path / "late-target"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("entry_0.txt", "data")
+        zipf.writestr("entry_1.txt", "data")
+        symlink_info = zipfile.ZipInfo("late_symlink")
+        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, str(symlink_target))
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
+    result = scanner.scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_entry_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Archive Entry Limit"
+        and check.status == CheckStatus.FAILED
+        and check.details["processed_entries"] == 3
+        and check.details["dropped_entry_count"] == 1
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Symlink Safety Validation" and "late_symlink" in check.message for check in result.checks
+    )
+
+
+def test_pytorch_zip_entry_validation_checks_timeout_between_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = tmp_path / "entry-validation-timeout.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for index in range(3):
+            symlink_info = zipfile.ZipInfo(f"link_{index}")
+            symlink_info.external_attr = 0o120777 << 16
+            symlink_info.compress_type = zipfile.ZIP_STORED
+            zipf.writestr(symlink_info, str(tmp_path / f"target_{index}"))
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
+    checked_members: list[str] = []
+    timeout_checks = 0
+    original_read_member_prefix = scanner._read_member_prefix
+
+    def track_member_read(
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        checked_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else name)
+        return original_read_member_prefix(zip_file, name, limit, phase=phase, result=result)
+
+    def check_timeout() -> None:
+        nonlocal timeout_checks
+        timeout_checks += 1
+        if timeout_checks == 2:
+            raise TimeoutError("entry validation deadline exceeded")
+
+    monkeypatch.setattr(scanner, "_read_member_prefix", track_member_read)
+    monkeypatch.setattr(scanner, "_check_timeout", check_timeout)
+
+    result = scanner.scan(str(zip_path))
+
+    assert checked_members == ["link_0"]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_timeout" in result.metadata["scan_outcome_reasons"]
+
+
+def test_pytorch_zip_scanner_entry_limit_passes(tmp_path: Path) -> None:
     """Test that scanner passes when entry count is within limits."""
     zip_path = tmp_path / "model.pt"
 
@@ -6481,13 +6590,150 @@ def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
         data = pickle.dumps({"weights": [1, 2, 3]})
         zipf.writestr("data.pkl", data)
 
-    scanner = PyTorchZipScanner()
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 2})
     result = scanner.scan(str(zip_path))
 
-    # Should pass entry limit check - look for passed checks about entry count
-    entry_checks = [c for c in result.checks if "entry" in c.name.lower()]
-    assert len(entry_checks) > 0
-    assert all(c.status == CheckStatus.PASSED for c in entry_checks)
+    entry_checks = [check for check in result.checks if check.name == "Archive Entry Limit"]
+    assert len(entry_checks) == 1
+    assert entry_checks[0].status == CheckStatus.PASSED
+    assert entry_checks[0].details == {"entry_count": 2, "max_entries": 2}
+
+
+def test_pytorch_zip_extract_metadata_caps_listed_entries(tmp_path: Path) -> None:
+    zip_path = tmp_path / "metadata-entry-limit.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("entry_0.txt", "data")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    metadata = PyTorchZipScanner(config={"max_archive_entries": 2}).extract_metadata(str(zip_path))
+
+    assert metadata["total_files"] == 3
+    assert metadata["files"] == ["version", "entry_0.txt"]
+    assert metadata["listed_files"] == 2
+    assert metadata["max_archive_entries"] == 2
+    assert metadata["files_truncated"] is True
+    assert metadata["omitted_files"] == 1
+    assert metadata["metadata_analysis_incomplete"] is True
+    assert metadata["has_data_pkl"] is None
+    assert metadata["has_version"] is True
+
+    complete_metadata = PyTorchZipScanner(config={"max_archive_entries": 3}).extract_metadata(str(zip_path))
+
+    assert complete_metadata["files"] == ["version", "entry_0.txt", "data.pkl"]
+    assert complete_metadata["listed_files"] == 3
+    assert complete_metadata["files_truncated"] is False
+    assert complete_metadata["omitted_files"] == 0
+    assert complete_metadata["metadata_analysis_incomplete"] is False
+    assert complete_metadata["has_data_pkl"] is True
+    assert complete_metadata["has_version"] is True
+
+
+def test_pytorch_zip_extract_metadata_does_not_read_late_duplicate_version(tmp_path: Path) -> None:
+    zip_path = tmp_path / "metadata-late-duplicate-version.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("entry_0.txt", "data")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zipf.writestr("version", "omitted-late-version")
+
+    metadata = PyTorchZipScanner(config={"max_archive_entries": 2}).extract_metadata(str(zip_path))
+
+    assert metadata["files"] == ["version", "entry_0.txt"]
+    assert metadata["files_truncated"] is True
+    assert metadata["pytorch_version"] == "3"
+
+
+def test_pytorch_zip_extract_metadata_recognizes_prefixed_layout(tmp_path: Path) -> None:
+    zip_path = tmp_path / "prefixed-metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("docs/version", "999")
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/0", b"weights")
+
+    metadata = PyTorchZipScanner(config={"max_archive_entries": 4}).extract_metadata(str(zip_path))
+
+    assert metadata["has_data_pkl"] is True
+    assert metadata["has_version"] is True
+    assert metadata["pickle_files"] == ["archive/data.pkl"]
+    assert metadata["storage_files"] == 1
+    assert metadata["pytorch_version"] == "3"
+
+
+def test_pytorch_zip_entry_limit_reads_selected_symlink_duplicate(tmp_path: Path) -> None:
+    zip_path = tmp_path / "symlink-duplicate-after-limit.pt"
+    symlink_target = tmp_path / "selected-target"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        symlink_info = zipfile.ZipInfo("duplicate-entry")
+        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, str(symlink_target))
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zipf.writestr("duplicate-entry", "omitted-late-entry")
+
+    result = PyTorchZipScanner(config={"max_archive_entries": 1}).scan(str(zip_path))
+
+    symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+    assert len(symlink_checks) == 1
+    assert symlink_checks[0].status == CheckStatus.FAILED
+    assert symlink_checks[0].details["target"] == str(symlink_target)
+
+
+def test_pytorch_zip_entry_limit_qualifies_duplicate_coverage(tmp_path: Path) -> None:
+    zip_path = tmp_path / "duplicate-coverage-after-limit.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("duplicate-entry", "first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zipf.writestr("duplicate-entry", "second")
+        zipf.writestr("late-entry", "omitted")
+
+    result = PyTorchZipScanner(config={"max_archive_entries": 2}).scan(str(zip_path))
+
+    duplicate_check = next(check for check in result.checks if check.name == "Duplicate ZIP Entry Collision")
+    assert duplicate_check.status == CheckStatus.FAILED
+    assert duplicate_check.message == (
+        "Duplicate archive entry duplicate-entry has conflicting metadata; "
+        "all processed copies will be scanned explicitly; later archive entries remain uninspected"
+    )
+
+
+def test_pytorch_zip_entry_limit_suppresses_archive_wide_clean_claims(tmp_path: Path) -> None:
+    zip_path = tmp_path / "late-security-content.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("safe.txt", "benign")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("late.py", "import os\nos.system('echo unsafe')")
+        zipf.writestr("late.exe", b"MZ" + (b"\x00" * 1024))
+
+    result = PyTorchZipScanner(config={"max_archive_entries": 2}).scan(str(zip_path))
+
+    structure_checks = [check for check in result.checks if check.name == "PyTorch Structure Validation"]
+    assert len(structure_checks) == 1
+    assert structure_checks[0].status == CheckStatus.FAILED
+    assert structure_checks[0].details["analysis_incomplete"] is True
+    assert "missing_file" not in structure_checks[0].details
+
+    archive_wide_clean_checks = {
+        "JIT/Script Code Execution Detection",
+        "Network Communication Detection",
+        "Python Code File Detection",
+        "Executable File Detection",
+    }
+    assert not [
+        check
+        for check in result.checks
+        if check.name in archive_wide_clean_checks and check.status == CheckStatus.PASSED
+    ]
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1, False, "10"])
+def test_pytorch_zip_scanner_entry_limit_rejects_invalid_overrides(invalid_limit: object) -> None:
+    """Invalid entry limits should fall back to the bounded default."""
+    scanner = PyTorchZipScanner(config={"max_archive_entries": invalid_limit})
+
+    assert scanner.max_archive_entries == scanner.MAX_ARCHIVE_ENTRIES
 
 
 def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
@@ -6661,6 +6907,71 @@ def test_pytorch_zip_scanner_enforces_nested_zip_depth_limit(tmp_path: Path) -> 
     assert "pytorch_zip_nested_archive_depth_limit" in result.metadata["scan_outcome_reasons"]
 
 
+def test_pytorch_zip_nested_inconclusive_reason_propagates_to_parent() -> None:
+    parent_result = ScanResult(scanner_name="pytorch_zip")
+    nested_result = ScanResult(scanner_name="pytorch_zip")
+    mark_inconclusive_scan_result(nested_result, PyTorchZipScanner.ENTRY_LIMIT_INCONCLUSIVE_REASON)
+    nested_result.finish(success=False)
+
+    PyTorchZipScanner._merge_nested_zip_result(parent_result, nested_result, "archive/nested.zip")
+
+    assert parent_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.ENTRY_LIMIT_INCONCLUSIVE_REASON in parent_result.metadata["scan_outcome_reasons"]
+    assert parent_result.metadata["nested_zip_scans"][0]["metadata"]["scan_outcome_reasons"] == [
+        PyTorchZipScanner.ENTRY_LIMIT_INCONCLUSIVE_REASON
+    ]
+
+    scanner = PyTorchZipScanner()
+    scanner.current_file_path = "parent.pt"
+    scanner._validate_pytorch_structure([], parent_result)
+
+    structure_check = next(check for check in parent_result.checks if check.name == "PyTorch Structure Validation")
+    assert structure_check.message == (
+        "PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models."
+    )
+    assert structure_check.details == {"missing_file": "data.pkl"}
+
+
+def test_pytorch_zip_scanner_checks_timeout_between_nested_archives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.txt", "benign")
+
+    zip_path = tmp_path / "multiple_nested.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.writestr("archive/first.zip", nested_zip.read_bytes())
+        zipf.writestr("archive/second.zip", nested_zip.read_bytes())
+
+    nested_scan_calls: list[str] = []
+
+    def scan_nested_member(path: str, config: dict[str, object] | None = None) -> ScanResult:
+        del config
+        nested_scan_calls.append(path)
+        nested_result = ScanResult(scanner_name="zip")
+        nested_result.finish(success=True)
+        return nested_result
+
+    scanner = PyTorchZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member})
+
+    def fail_after_first_nested_scan() -> None:
+        if nested_scan_calls:
+            raise TimeoutError("simulated parent deadline")
+
+    monkeypatch.setattr(scanner, "_check_timeout", fail_after_first_nested_scan)
+
+    result = scanner.scan(str(zip_path))
+
+    assert len(nested_scan_calls) == 1
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_timeout" in result.metadata["scan_outcome_reasons"]
+
+
 def test_pytorch_zip_scanner_small_high_ratio_metadata_stays_clean(tmp_path: Path) -> None:
     """Small repetitive metadata should not fail the compression ratio check."""
     zip_path = create_mock_pytorch_zip(tmp_path / "model.pt")
@@ -6756,20 +7067,20 @@ def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
     assert all(c.status == CheckStatus.PASSED for c in symlink_checks)
 
 
-def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
+def test_pytorch_zip_scanner_combined_security_controls(tmp_path: Path) -> None:
     """Test that multiple security controls fire together without interfering."""
     zip_path = tmp_path / "model.pt"
+    symlink_target = tmp_path / "combined-target"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
-        # Generate enough entries to exceed a low limit
-        for i in range(12):
-            zipf.writestr(f"entry_{i}.txt", "data")
-        # Add a symlink entry
+        # Add a symlink entry before the entry cap, then enough entries to exceed a low limit.
         symlink_info = zipfile.ZipInfo("evil_link")
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
-        zipf.writestr(symlink_info, "/etc/shadow")
+        zipf.writestr(symlink_info, str(symlink_target))
+        for i in range(12):
+            zipf.writestr(f"entry_{i}.txt", "data")
 
     scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
     result = scanner.scan(str(zip_path))
@@ -7287,6 +7598,7 @@ def _assert_pytorch_zip_inconclusive_not_cached(
     *,
     expected_success: bool,
     expected_exit_code: int,
+    **scan_kwargs: Any,
 ) -> None:
     reset_cache_manager()
     try:
@@ -7295,12 +7607,14 @@ def _assert_pytorch_zip_inconclusive_not_cached(
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
         second = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
 
         for aggregate in (first, second):
@@ -7312,6 +7626,24 @@ def _assert_pytorch_zip_inconclusive_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_pytorch_zip_entry_limit_is_exit1_and_not_cached(tmp_path: Path) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "entry-limit.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zipf:
+        zipf.writestr("archive/entry_0.txt", "data")
+        zipf.writestr("archive/entry_1.txt", "data")
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        max_archive_entries = len(zipf.infolist()) - 1
+
+    _assert_pytorch_zip_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "entry-limit-cache",
+        "pytorch_zip_entry_limit",
+        expected_success=True,
+        expected_exit_code=1,
+        max_archive_entries=max_archive_entries,
+    )
 
 
 def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_path: Path) -> None:

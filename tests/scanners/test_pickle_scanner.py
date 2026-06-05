@@ -1119,6 +1119,27 @@ def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_p
     assert not any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
 
 
+def test_oversized_frame_reports_structural_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "oversized-frame.pkl"
+    path.write_bytes(b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.")
+
+    result = PickleScanner().scan(str(path))
+    structural_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Structural Tamper Check" and check.details.get("tamper_type") == "oversized_frame"
+    ]
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert result.success is True
+    assert result.has_warnings is True
+    assert len(structural_checks) == 1
+    assert structural_checks[0].severity == IssueSeverity.WARNING
+    assert structural_checks[0].details["frame_length"] == 3
+    assert structural_checks[0].details["remaining_bytes"] == 2
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_duplicate_proto_same_version_reports_structural_tamper(tmp_path: Path) -> None:
     path = tmp_path / "duplicate-proto.pkl"
     path.write_bytes(b"\x80\x02\x80\x02K\x01.")
