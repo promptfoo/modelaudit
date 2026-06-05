@@ -3876,14 +3876,14 @@ class TestCVE202523304HydraTarget:
                 "os.listdir",
                 {
                     "_target_": "os.listdir",
-                    "_args_": ["/tmp"],
+                    "_args_": ["__MODELAUDIT_TMP__/"],
                 },
             ),
             (
                 "os.scandir",
                 {
                     "_target_": "os.scandir",
-                    "_args_": ["/tmp"],
+                    "_args_": ["__MODELAUDIT_TMP__/"],
                 },
             ),
             (
@@ -4355,6 +4355,11 @@ class TestCVE202523304HydraTarget:
             "hydra.initialize.initialize_config_module",
             "hydra.initialize_config_dir",
             "hydra.initialize_config_module",
+            "hydra.core.config_store.ConfigStore.store",
+            "hydra.core.config_store.ConfigStoreWithProvider.store",
+            "hydra.core.global_hydra.GlobalHydra.clear",
+            "hydra.core.global_hydra.GlobalHydra.initialize",
+            "hydra.core.global_hydra.GlobalHydra.set_instance",
             "hydra._internal.utils._locate",
             "hydra.utils._locate",
             "hydra.utils.get_class",
@@ -4373,6 +4378,7 @@ class TestCVE202523304HydraTarget:
             "omegaconf.omegaconf.OmegaConf.register_resolver",
             "transformers.dynamic_module_utils._compute_local_source_files_hash",
             "transformers.dynamic_module_utils.check_imports",
+            "transformers.dynamic_module_utils.check_python_requirements",
             "transformers.dynamic_module_utils.create_dynamic_module",
             "transformers.dynamic_module_utils.custom_object_save",
             "transformers.dynamic_module_utils.get_cached_module_file",
@@ -4382,6 +4388,7 @@ class TestCVE202523304HydraTarget:
             "transformers.dynamic_module_utils.get_relative_import_files",
             "transformers.dynamic_module_utils.get_relative_imports",
             "transformers.dynamic_module_utils.init_hf_modules",
+            "transformers.dynamic_module_utils.resolve_trust_remote_code",
             "transformers.utils.cached_file",
             "transformers.utils.hub.PushToHubMixin._upload_modified_files",
             "transformers.utils.hub.cached_file",
@@ -4424,9 +4431,11 @@ class TestCVE202523304HydraTarget:
         [
             "hydra.utils.get_original_cwd",
             "hydra.utils.to_absolute_path",
+            "hydra.core.config_store.ConfigStore.list",
+            "hydra.core.global_hydra.GlobalHydra.is_initialized",
             "numpy.recarray.tobytes",
             "omegaconf.OmegaConf.has_resolver",
-            "transformers.dynamic_module_utils.resolve_trust_remote_code",
+            "transformers.utils.PushToHubMixin.save_pretrained",
             "transformers.utils.hub.PushToHubMixin.save_pretrained",
         ],
     )
@@ -4448,9 +4457,13 @@ class TestCVE202523304HydraTarget:
         "target",
         [
             "hydra.compose",
+            "hydra.core.config_store.ConfigStore.store",
+            "hydra.core.global_hydra.GlobalHydra.clear",
             "hydra.utils.get_object",
             "omegaconf.OmegaConf.register_new_resolver",
             "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.dynamic_module_utils.check_python_requirements",
+            "transformers.dynamic_module_utils.resolve_trust_remote_code",
             "transformers.utils.hub.cached_file",
             "transformers.utils.import_utils.direct_transformers_import",
             "transformers.Trainer.push_to_hub",
@@ -4835,7 +4848,7 @@ class TestCVE202523304HydraTarget:
                 "os.listdir",
                 {
                     "_target_": "os.listdir",
-                    "_args_": ["/tmp"],
+                    "_args_": ["__MODELAUDIT_TMP__/"],
                 },
             ),
             (

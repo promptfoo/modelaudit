@@ -65,6 +65,7 @@ _SAFE_TARGET_PREFIXES = (
 # Exact safe _target_ values for utility namespaces that also contain unsafe
 # callables. Keep this list narrow instead of trusting whole namespaces.
 _SAFE_TARGETS = {
+    "transformers.utils.PushToHubMixin.save_pretrained",
     "transformers.utils.hub.PushToHubMixin.save_pretrained",
     "torch.utils.data.BatchSampler",
     "torch.utils.data.ConcatDataset",
@@ -172,6 +173,11 @@ _DANGEROUS_TARGETS = {
     "hydra.initialize.initialize_config_module",
     "hydra.initialize_config_dir",
     "hydra.initialize_config_module",
+    "hydra.core.config_store.ConfigStore.store",
+    "hydra.core.config_store.ConfigStoreWithProvider.store",
+    "hydra.core.global_hydra.GlobalHydra.clear",
+    "hydra.core.global_hydra.GlobalHydra.initialize",
+    "hydra.core.global_hydra.GlobalHydra.set_instance",
     "importlib.import_module",
     "hydra._internal.utils._locate",
     "hydra.utils._locate",
@@ -292,6 +298,7 @@ _DANGEROUS_TARGETS = {
     "transformers.pipeline",
     "transformers.dynamic_module_utils._compute_local_source_files_hash",
     "transformers.dynamic_module_utils.check_imports",
+    "transformers.dynamic_module_utils.check_python_requirements",
     "transformers.dynamic_module_utils.create_dynamic_module",
     "transformers.dynamic_module_utils.custom_object_save",
     "transformers.dynamic_module_utils.get_cached_module_file",
@@ -301,6 +308,7 @@ _DANGEROUS_TARGETS = {
     "transformers.dynamic_module_utils.get_relative_import_files",
     "transformers.dynamic_module_utils.get_relative_imports",
     "transformers.dynamic_module_utils.init_hf_modules",
+    "transformers.dynamic_module_utils.resolve_trust_remote_code",
     "transformers.utils.cached_file",
     "transformers.utils.hub.PushToHubMixin._upload_modified_files",
     "transformers.utils.hub.cached_file",
