@@ -13,7 +13,12 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .file.filtering import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
-from .sources.dvc import DvcResolution, resolve_dvc_file, resolve_dvc_file_with_metadata
+from .sources.dvc import (
+    DvcResolution,
+    resolve_dvc_file,
+    resolve_dvc_file_with_metadata,
+    unverified_dvc_outputs_covered_by_paths,
+)
 
 
 def _absolute_without_resolving(path: str | os.PathLike[str]) -> Path:

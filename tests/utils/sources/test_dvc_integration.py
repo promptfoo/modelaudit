@@ -356,6 +356,46 @@ class TestDvcSecurity:
         )
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
+    def test_directory_scan_accepts_fully_covered_tail_past_verification_window(self, tmp_path: Path) -> None:
+        """A large in-tree DVC tail is covered by the already completed directory walk."""
+        dvc_lines = ["outs:"]
+        for index in range(205):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "directory_large_covered_tail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 205
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_rejects_skipped_tail_past_verification_window(self, tmp_path: Path) -> None:
+        """Tail verification must not treat a filtered path as directory-walk coverage."""
+        dvc_lines = ["outs:"]
+        for index in range(200):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+        skipped_target = tmp_path / "payload.py"
+        skipped_target.write_text("print('not scanned')\n")
+        dvc_lines.append(f"- path: {skipped_target.name}")
+
+        dvc_file = tmp_path / "directory_large_skipped_tail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
     def test_directory_scan_over_limit_dvc_stays_incomplete_for_skipped_output(self, tmp_path: Path) -> None:
         """A filtered omitted output is not covered merely because it lives under the walked root."""
         dvc_lines = ["outs:"]

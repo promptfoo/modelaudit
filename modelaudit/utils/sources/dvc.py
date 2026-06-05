@@ -142,3 +142,45 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         unresolved_omitted_output_count=unresolved_omitted_output_count,
         unverified_omitted_output_count=max(declared_output_count - MAX_DVC_OUTPUTS * 2, 0),
     )
+
+
+def unverified_dvc_outputs_covered_by_paths(
+    file_path: str,
+    resolution: DvcResolution,
+    covered_paths: set[str],
+) -> bool:
+    """Verify an omitted DVC tail with work bounded by already discovered paths."""
+    unverified_count = resolution.unverified_omitted_output_count
+    if unverified_count == 0:
+        return True
+    if unverified_count > len(covered_paths):
+        return False
+
+    try:
+        import yaml
+    except Exception:
+        return False
+
+    path = Path(file_path)
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        return False
+    outs = data.get("outs", [])
+    if not isinstance(outs, list) or len(outs) != resolution.declared_output_count:
+        return False
+
+    dvc_dir = path.parent.resolve()
+    for out in outs[MAX_DVC_OUTPUTS * 2 :]:
+        if not isinstance(out, dict):
+            return False
+        out_path = out.get("path")
+        if not isinstance(out_path, str):
+            return False
+        try:
+            target = (dvc_dir / out_path).resolve()
+            if not target.is_relative_to(dvc_dir) or str(target) not in covered_paths:
+                return False
+        except (OSError, ValueError):
+            return False
+    return True

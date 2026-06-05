@@ -54,7 +54,13 @@ from modelaudit.scanners.xgboost_scanner import (
     configure_content_routed_json_scan,
 )
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
-from modelaudit.utils import DvcResolution, is_within_directory, resolve_dvc_file_with_metadata, should_skip_file
+from modelaudit.utils import (
+    DvcResolution,
+    is_within_directory,
+    resolve_dvc_file_with_metadata,
+    should_skip_file,
+    unverified_dvc_outputs_covered_by_paths,
+)
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -173,14 +179,15 @@ def _record_dvc_output_limit_incomplete(
 
 
 def _dvc_omitted_outputs_covered_by_directory_walk(
+    dvc_path: str,
     resolution: DvcResolution,
     directory_walk_covered_paths: set[str],
 ) -> bool:
     """Return whether a directory walk independently covers every bounded omitted DVC target."""
     return (
         resolution.unresolved_omitted_output_count == 0
-        and resolution.unverified_omitted_output_count == 0
         and all(target in directory_walk_covered_paths for target in resolution.omitted_targets)
+        and unverified_dvc_outputs_covered_by_paths(dvc_path, resolution, directory_walk_covered_paths)
     )
 
 
@@ -1158,6 +1165,7 @@ def scan_model_directory_or_file(
                         files_to_scan.append(target_str)
             for dvc_path, dvc_resolution in pending_dvc_output_limit_checks:
                 if not _dvc_omitted_outputs_covered_by_directory_walk(
+                    dvc_path,
                     dvc_resolution,
                     directory_walk_covered_paths,
                 ):
