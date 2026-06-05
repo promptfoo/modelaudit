@@ -1092,14 +1092,15 @@ def scan_model_directory_or_file(
                         )
 
             def resolve_covered_dvc_file_symlink(file_path: Path) -> Path | None:
-                if not file_path.is_symlink():
+                roots_by_file = get_dvc_directory_roots_by_file()
+                if not roots_by_file or not file_path.is_symlink():
                     return None
                 try:
                     resolved_target = file_path.resolve(strict=True)
-                except OSError:
+                except (OSError, RuntimeError):
                     return None
                 absolute_symlink_path = Path(os.path.abspath(file_path))
-                for output_roots in get_dvc_directory_roots_by_file().values():
+                for output_roots in roots_by_file.values():
                     link_is_declared = any(absolute_symlink_path.is_relative_to(root) for root in output_roots)
                     target_is_declared = any(
                         is_within_directory(str(root), str(resolved_target)) for root in output_roots

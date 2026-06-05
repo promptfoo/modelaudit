@@ -340,6 +340,34 @@ class TestDvcIntegration:
         assert result.content_hash is None
         assert str(linked_dir) in incomplete_issue.details["unresolved_outputs"]
 
+    def test_non_dvc_symlink_bypasses_dvc_resolution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Unrelated cache symlinks must stay on the generic symlink-handling path."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        snapshots = hf_home / "hub" / "models--test" / "snapshots" / "abc"
+        snapshots.mkdir(parents=True)
+        broken_link = snapshots / "model.bin"
+        broken_link.symlink_to(Path("../../blobs/missing"))
+
+        def resolve_without_dvc_strict(self: Path, *args: Any, **kwargs: Any) -> Path:
+            assert kwargs.get("strict") is not True
+            return Path(os.path.abspath(self))
+
+        def fail_readlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> str:
+            raise OSError(f"dangling link: {path!r}")
+
+        monkeypatch.setattr(Path, "resolve", resolve_without_dvc_strict)
+        monkeypatch.setattr(os, "readlink", fail_readlink)
+
+        result = scan_model_directory_or_file(str(snapshots))
+
+        assert any("broken symlink" in issue.message.lower() for issue in result.issues)
+
     def test_escaping_dvc_file_symlink_marks_scan_incomplete(
         self,
         tmp_path: Path,
