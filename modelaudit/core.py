@@ -157,6 +157,7 @@ _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
+_DVC_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON = "dvc_directory_special_file_unscanned"
 _MAX_DVC_DIRECTORY_COVERAGE_GAPS = 100
 _DVC_PARENT_FILE_CONFIG_KEY = "_dvc_parent_file"
 _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
@@ -1090,6 +1091,54 @@ def scan_model_directory_or_file(
                             failed_path,
                         )
 
+            def resolve_covered_dvc_file_symlink(file_path: Path) -> Path | None:
+                if not file_path.is_symlink():
+                    return None
+                try:
+                    resolved_target = file_path.resolve(strict=True)
+                except OSError:
+                    return None
+                absolute_symlink_path = Path(os.path.abspath(file_path))
+                for output_roots in get_dvc_directory_roots_by_file().values():
+                    link_is_declared = any(absolute_symlink_path.is_relative_to(root) for root in output_roots)
+                    target_is_declared = any(
+                        is_within_directory(str(root), str(resolved_target)) for root in output_roots
+                    )
+                    if link_is_declared and target_is_declared:
+                        return resolved_target
+                return None
+
+            def record_uncovered_dvc_file_symlink(file_path: Path, resolved_target: Path | None) -> None:
+                if not file_path.is_symlink():
+                    return
+                absolute_symlink_path = Path(os.path.abspath(file_path))
+                for affected_dvc_file, output_roots in get_dvc_directory_roots_by_file().items():
+                    if not any(absolute_symlink_path.is_relative_to(root) for root in output_roots):
+                        continue
+                    if resolved_target is not None and any(
+                        is_within_directory(str(root), str(resolved_target)) for root in output_roots
+                    ):
+                        continue
+                    record_dvc_directory_coverage_gap(
+                        affected_dvc_file,
+                        _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON,
+                        str(file_path),
+                    )
+
+            def record_dvc_directory_special_file(file_path: Path) -> bool:
+                absolute_path = Path(os.path.abspath(file_path))
+                recorded = False
+                for affected_dvc_file, output_roots in get_dvc_directory_roots_by_file().items():
+                    if not any(absolute_path.is_relative_to(root) for root in output_roots):
+                        continue
+                    record_dvc_directory_coverage_gap(
+                        affected_dvc_file,
+                        _DVC_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+                        str(file_path),
+                    )
+                    recorded = True
+                return recorded
+
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, dirs, files in os.walk(
                 path,
@@ -1106,14 +1155,28 @@ def scan_model_directory_or_file(
                         logger.debug(f"Skipping HuggingFace cache file: {file_path}")
                         continue
 
-                    resolved_file, is_hf_cache_symlink = _resolve_directory_scan_target(
-                        Path(file_path),
-                        base_dir,
-                        is_hf_cache=is_hf_cache,
-                        hf_cache_root=hf_cache_root,
-                        results=results,
-                    )
+                    file_path_obj = Path(file_path)
+                    if (
+                        not file_path_obj.is_file()
+                        and not file_path_obj.is_symlink()
+                        and record_dvc_directory_special_file(file_path_obj)
+                    ):
+                        continue
+                    resolved_file = resolve_covered_dvc_file_symlink(file_path_obj)
+                    is_dvc_covered_file_symlink = resolved_file is not None
+                    is_hf_cache_symlink = False
                     if resolved_file is None:
+                        resolved_file, is_hf_cache_symlink = _resolve_directory_scan_target(
+                            file_path_obj,
+                            base_dir,
+                            is_hf_cache=is_hf_cache,
+                            hf_cache_root=hf_cache_root,
+                            results=results,
+                        )
+                    record_uncovered_dvc_file_symlink(file_path_obj, resolved_file)
+                    if resolved_file is None:
+                        continue
+                    if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
                         continue
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
@@ -1188,7 +1251,11 @@ def scan_model_directory_or_file(
                             continue
                         scanned_paths.add(dedupe_target_str)
 
-                        if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
+                        if (
+                            not is_hf_cache_symlink
+                            and not is_dvc_covered_file_symlink
+                            and not is_within_directory(str(base_dir), str(target_path))
+                        ):
                             _add_issue_to_model(
                                 results,
                                 "Path traversal outside scanned directory",

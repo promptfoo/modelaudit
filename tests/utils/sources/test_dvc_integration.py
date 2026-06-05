@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from modelaudit import core as core_module
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import create_initial_audit_result
 from modelaudit.scanner_results import ScanResult
 from modelaudit.utils.sources.dvc import (
@@ -339,6 +339,191 @@ class TestDvcIntegration:
         assert result.success is False
         assert result.content_hash is None
         assert str(linked_dir) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_escaping_dvc_file_symlink_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A linked file outside the declared output must invalidate coverage and its aggregate hash."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        safe_file = output_dir / "safe.pkl"
+        safe_file.write_bytes(pickle.dumps({"safe": True}))
+        outside_file = tmp_path / "outside.pkl"
+        outside_file.write_bytes(pickle.dumps({"hidden": True}))
+        linked_file = output_dir / "linked.pkl"
+        linked_file.symlink_to(outside_file)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert scanned_paths == [str(safe_file)]
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None
+        assert str(linked_file) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_project_scan_marks_dvc_file_symlink_escape_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A broader project scan must not hide a symlink escape from the declared DVC output."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        safe_file = output_dir / "safe.pkl"
+        safe_file.write_bytes(pickle.dumps({"safe": True}))
+        outside_file = tmp_path / "outside.pkl"
+        outside_file.write_bytes(pickle.dumps({"outside": True}))
+        linked_file = output_dir / "linked.pkl"
+        linked_file.symlink_to(outside_file)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned"
+        )
+
+        assert set(scanned_paths) == {str(safe_file), str(outside_file)}
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None
+        assert str(linked_file) in incomplete_issue.details["unresolved_outputs"]
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+    def test_dvc_directory_special_file_marks_scan_incomplete(self, tmp_path: Path) -> None:
+        """A model-suffixed FIFO must not reach hashing or scanner dispatch."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        fifo = output_dir / "blocked.pkl"
+        os.mkfifo(fifo)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+        incomplete_issue = next(
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == "dvc_directory_special_file_unscanned"
+        )
+
+        assert result.files_scanned == 0
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.content_hash is None
+        assert str(fifo) in incomplete_issue.details["unresolved_outputs"]
+
+    def test_internal_dvc_file_symlink_does_not_create_coverage_gap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """An internal file alias remains covered and is scanned only once."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        payload = output_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"covered": True}))
+        (output_dir / "alias.pkl").symlink_to(payload)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert scanned_paths == [str(payload)]
+        assert result.has_errors is False
+        assert result.success is True
+        assert result.content_hash is not None
+        assert not any(
+            issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
+        )
+
+    def test_dvc_file_symlink_covered_by_another_declared_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A file alias into another declared output remains covered without duplicate scanning."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        linked_target = tmp_path / "linked-target"
+        linked_target.mkdir()
+        payload = linked_target / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"covered": True}))
+        (model_dir / "linked.pkl").symlink_to(payload)
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n- path: linked-target\n")
+        scanned_paths: list[str] = []
+
+        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert scanned_paths == [str(payload)]
+        assert result.files_scanned == 1
+        assert result.has_errors is False
+        assert result.success is True
+        assert result.content_hash is not None
+        assert not any(issue.message == "Path traversal outside scanned directory" for issue in result.issues)
+        assert not any(
+            issue.details.get("incomplete_reason") == "dvc_directory_symlink_unscanned" for issue in result.issues
+        )
 
     def test_internal_dvc_directory_symlinks_cannot_hide_later_escape(
         self,
