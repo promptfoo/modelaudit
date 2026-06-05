@@ -10,6 +10,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import zipfile
 from collections.abc import Collection, Mapping
 from http.cookiejar import CookieJar
 from io import BytesIO
@@ -42,9 +43,6 @@ _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECAS
 _JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
-_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
-    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
-)
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -776,9 +774,11 @@ def format_size(size_bytes: int) -> str:
 def filter_scannable_files(
     files: list[dict[str, Any]],
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
     extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
+    filenames = frozenset(str(filename).lower() for filename in (scannable_filenames or ()))
     scannable = []
     for file in files:
         file_path = file["path"]
@@ -793,6 +793,9 @@ def filter_scannable_files(
         else:
             path = Path(file_path)
 
+        if path.name.lower() in filenames:
+            scannable.append(file)
+            continue
         suffixes = [s.lower() for s in path.suffixes]
         if not suffixes and "" in extensions:
             scannable.append(file)
@@ -802,6 +805,44 @@ def filter_scannable_files(
                 scannable.append(file)
                 break
     return scannable
+
+
+def _matching_scannable_extensions(file_path: str, extensions: Collection[str]) -> frozenset[str]:
+    path = PurePosixPath(urlparse(file_path).path) if file_path.startswith(("http://", "https://")) else Path(file_path)
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    normalized_extensions = frozenset(str(extension).lower() for extension in extensions)
+    if not suffixes:
+        return frozenset({""}) if "" in normalized_extensions else frozenset()
+    return frozenset(
+        candidate
+        for index in range(1, len(suffixes) + 1)
+        if (candidate := "".join(suffixes[-index:])) in normalized_extensions
+    )
+
+
+def _selected_suffix_needs_content_validation(
+    file_path: str,
+    extensions: Collection[str] | None,
+    scanner_selection: Mapping[str, Any] | None,
+) -> bool:
+    if extensions is None or scanner_selection is None:
+        return False
+
+    from modelaudit.scanner_selection import SCANNER_SELECTION_CONFIG_KEY, policy_from_config, scanner_ids_for_extension
+
+    policy = policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection})
+    if not policy.active:
+        return False
+    owners = {
+        scanner_id
+        for extension in _matching_scannable_extensions(file_path, extensions)
+        for scanner_id in scanner_ids_for_extension(extension)
+    }
+    return (
+        bool(owners)
+        and any(policy.allows(scanner_id) for scanner_id in owners)
+        and any(not policy.allows(scanner_id) for scanner_id in owners)
+    )
 
 
 def _build_jfrog_probe_auth_headers(
@@ -955,12 +996,12 @@ def _detect_jfrog_mxnet_symbol_route(
     if not normalized_prefix.lstrip().startswith(b"{"):
         return None
 
+    suffix = PurePosixPath(urlparse(file_url).path).suffix.lower()
     mxnet_route = _detect_mxnet_symbol_prefix_route(
         normalized_prefix,
         sample_is_prefix=(size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES),
-        fail_closed_without_hint=True,
+        fail_closed_without_hint=suffix == ".json",
     )
-    suffix = PurePosixPath(urlparse(file_url).path).suffix.lower()
     if mxnet_route != "mxnet" or (suffix != ".json" and size_hint > MXNET_SYMBOL_SIGNATURE_READ_BYTES):
         return mxnet_route
 
@@ -1060,8 +1101,6 @@ def _detect_jfrog_flax_msgpack_route(prefix: bytes, size_hint: int) -> str | Non
 
 def _detect_jfrog_llamafile_route(prefix: bytes, size_hint: int) -> str | None:
     """Recognize llamafile executable evidence within the bounded remote prefix."""
-    import zipfile
-
     from modelaudit.utils.file.detection import (
         EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_MARKER,
@@ -1080,6 +1119,36 @@ def _detect_jfrog_llamafile_route(prefix: bytes, size_hint: int) -> str | None:
     return None
 
 
+def _detect_jfrog_zip_route(
+    prefix: bytes,
+    *,
+    size_hint: int,
+    probe_limit: int,
+    file_url: str,
+) -> str | None:
+    """Classify a complete bounded ZIP probe or fail closed when it is incomplete."""
+    probe_is_complete = len(prefix) < probe_limit or (size_hint > 0 and size_hint <= len(prefix))
+    if not probe_is_complete:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
+            f"{redact_jfrog_url_for_display(file_url)} within the bounded content inspection budget"
+        )
+
+    from modelaudit.utils.file.detection import _is_keras_zip_archive_content
+    from modelaudit.utils.file.filtering import _zip_archive_has_scannable_content
+
+    try:
+        with zipfile.ZipFile(BytesIO(prefix), "r") as archive:
+            if _is_keras_zip_archive_content(archive) or _zip_archive_has_scannable_content(archive):
+                return "zip"
+            return None
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
+            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+        ) from exc
+
+
 def _detect_jfrog_content_route_format(
     file_info: dict[str, Any],
     *,
@@ -1094,11 +1163,12 @@ def _detect_jfrog_content_route_format(
         raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
     file_url = str(file_info["path"])
     headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
+    probe_limit = min(max_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES)
     prefix, probe_download_url = _read_jfrog_content_prefix(
         file_url,
         headers=headers,
         timeout=timeout,
-        max_bytes=min(max_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES),
+        max_bytes=probe_limit,
     )
     if probe_bytes_counter is not None:
         probe_bytes_counter[0] += len(prefix)
@@ -1178,6 +1248,16 @@ def _detect_jfrog_content_route_format(
         return "tar", probe_download_url
     if detected_format == "unknown" and _is_torch7_signature(prefix):
         return "torch7", probe_download_url
+    if detected_format == "zip":
+        return (
+            _detect_jfrog_zip_route(
+                prefix,
+                size_hint=size_hint,
+                probe_limit=probe_limit,
+                file_url=file_url,
+            ),
+            probe_download_url,
+        )
     if detected_format == "unknown":
         xml_route = _detect_jfrog_xml_model_route(prefix, size_hint)
         if xml_route is not None:
@@ -1203,41 +1283,9 @@ def _detect_jfrog_content_route_format(
 
 
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
-    from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
-    from modelaudit.utils.file.detection import (
-        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
-        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
-        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
-        PROTOBUF_MODEL_CANDIDATE_FORMAT,
-        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
-        XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
-        XML_MODEL_INCONCLUSIVE_FORMAT,
-    )
+    from modelaudit.scanner_selection import scanner_ids_for_detected_format
 
-    scanner_ids: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
-        if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
-            scanner_ids.add(scanner_id)
-    if detected_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
-        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
-    if detected_format in {"tar", "gzip", "bzip2", "xz"}:
-        scanner_ids.add("nemo")
-    if detected_format in {"gzip", "bzip2", "xz"}:
-        scanner_ids.add("tar")
-    if detected_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.add("llamafile")
-        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
-    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
-    if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
-    if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"jax_checkpoint", "mxnet"})
-    if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
-        scanner_ids.add("xgboost")
-    if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
-        scanner_ids.update({"openvino", "pmml"})
-    return scanner_ids
+    return set(scanner_ids_for_detected_format(detected_format))
 
 
 def _jfrog_detected_format_allowed(detected_format: str, scanner_selection: Mapping[str, Any] | None) -> bool:
@@ -1261,26 +1309,38 @@ def _filter_scannable_jfrog_files(
     access_token: str | None = None,
     timeout: int = 30,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
     max_probe_bytes_per_file: int | None = None,
     max_total_probe_bytes: int | None = None,
     probe_bytes_counter: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Select suffix-matching files plus bounded content-routed renamed model files."""
-    scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
-    if scannable_extensions is not None and scanner_selection is None:
+    scannable = filter_scannable_files(
+        files,
+        scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+    )
+    if (scannable_extensions is not None or scannable_filenames is not None) and scanner_selection is None:
         return scannable
 
-    scannable_paths = {str(file["path"]) for file in scannable}
+    scannable_by_path = {str(file["path"]): file for file in scannable}
     probe_count = 0
     if probe_bytes_counter is None:
         probe_bytes_counter = [0]
     for file_info in files:
         file_path = str(file_info["path"])
-        if file_path in scannable_paths:
+        suffix_selected = file_path in scannable_by_path
+        if suffix_selected and not _selected_suffix_needs_content_validation(
+            file_path,
+            scannable_extensions,
+            scanner_selection,
+        ):
             continue
         probe_count += 1
         if probe_count > _MAX_JFROG_CONTENT_PROBES:
+            if suffix_selected:
+                continue
             raise ValueError(
                 "JFrog folder selective filtering incomplete: skipped artifact content probe limit "
                 f"({_MAX_JFROG_CONTENT_PROBES}) exceeded"
@@ -1289,6 +1349,8 @@ def _filter_scannable_jfrog_files(
             max_total_probe_bytes - probe_bytes_counter[0] if max_total_probe_bytes is not None else None
         )
         if remaining_probe_bytes is not None and remaining_probe_bytes <= 0:
+            if suffix_selected:
+                continue
             raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
         probe_limits = [
             limit
@@ -1297,30 +1359,40 @@ def _filter_scannable_jfrog_files(
         ]
         max_probe_bytes = min(probe_limits)
         probe_bytes_before = probe_bytes_counter[0]
-        detected_format, probe_download_url = _detect_jfrog_content_route_format(
-            file_info,
-            api_token=api_token,
-            access_token=access_token,
-            timeout=timeout,
-            max_probe_bytes=max_probe_bytes,
-            probe_bytes_counter=probe_bytes_counter,
-        )
+        try:
+            detected_format, probe_download_url = _detect_jfrog_content_route_format(
+                file_info,
+                api_token=api_token,
+                access_token=access_token,
+                timeout=timeout,
+                max_probe_bytes=max_probe_bytes,
+                probe_bytes_counter=probe_bytes_counter,
+            )
+        except Exception as exc:
+            if suffix_selected:
+                logger.debug("Unable to validate shared JFrog suffix for %s: %s", file_path, exc)
+                continue
+            raise
         if detected_format is None:
             probe_bytes_read = probe_bytes_counter[0] - probe_bytes_before
-            if max_probe_bytes < _JFROG_CONTENT_SNIFF_BYTES and probe_bytes_read >= max_probe_bytes:
+            if (
+                not suffix_selected
+                and max_probe_bytes < _JFROG_CONTENT_SNIFF_BYTES
+                and probe_bytes_read >= max_probe_bytes
+            ):
                 raise ValueError(
                     "JFrog folder selective filtering incomplete: content probe was truncated by the download budget"
                 )
             continue
         if not _jfrog_detected_format_allowed(detected_format, scanner_selection):
+            scannable_by_path.pop(file_path, None)
             continue
         routed_file_info = dict(file_info)
         routed_file_info["content_detected_format"] = detected_format
         routed_file_info["content_probe_download_url"] = probe_download_url
-        scannable.append(routed_file_info)
-        scannable_paths.add(file_path)
+        scannable_by_path[file_path] = routed_file_info
 
-    return scannable
+    return list(scannable_by_path.values())
 
 
 def detect_jfrog_target_type(
@@ -1410,6 +1482,7 @@ def list_jfrog_folder_contents(
     selective: bool = True,
     fetch_sizes: bool = False,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively list all files in a JFrog folder.
 
@@ -1521,7 +1594,11 @@ def list_jfrog_folder_contents(
     _collect_files(base_url)
 
     if selective:
-        files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+        files = filter_scannable_files(
+            files,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+        )
 
     return files
 
@@ -1540,6 +1617,7 @@ def download_jfrog_folder(
     max_file_size: int | None = None,
     max_total_size: int | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -1575,6 +1653,8 @@ def download_jfrog_folder(
     list_kwargs: dict[str, Any] = {}
     if scannable_extensions is not None:
         list_kwargs["scannable_extensions"] = scannable_extensions
+    if scannable_filenames is not None:
+        list_kwargs["scannable_filenames"] = scannable_filenames
     files = list_jfrog_folder_contents(
         url,
         api_token,
@@ -1595,6 +1675,7 @@ def download_jfrog_folder(
             access_token=access_token,
             timeout=timeout,
             scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
             scanner_selection=scanner_selection,
             max_probe_bytes_per_file=per_file_limit,
             max_total_probe_bytes=total_limit,
