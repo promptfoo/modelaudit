@@ -318,7 +318,6 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 URL_PATH_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})\s*[:=]\s*)"
-    r"(?P<value>[\"'](?:\\.|[^\"'\\])*[\"']|[^/;,&#?]+)"
 )
 TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\3\4\3\4[\s\S]*?\3\4\3\4\3\4"
@@ -396,14 +395,10 @@ def _redact_sensitive_url_path(path: str) -> str:
     if not decoding_complete:
         return REDACTED_EVIDENCE_VALUE
 
-    def replace_assignment(match: re.Match[str]) -> str:
-        value = match.group("value")
-        if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
-            return f"{match.group('prefix')}{value[0]}{REDACTED_EVIDENCE_VALUE}{value[-1]}"
-        return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
-
-    redacted_path = URL_PATH_SENSITIVE_ASSIGNMENT_RE.sub(replace_assignment, decoded_path)
-    return path if redacted_path == decoded_path else redacted_path
+    match = URL_PATH_SENSITIVE_ASSIGNMENT_RE.search(decoded_path)
+    if match is None:
+        return path
+    return f"{decoded_path[: match.end()]}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _redacted_sensitive_query_key(key: str) -> str | None:

