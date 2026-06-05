@@ -1567,6 +1567,13 @@ def _static_text_literal_value(expression: ast.expr) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _static_text_contains_sensitive_label(expression: ast.expr) -> bool:
+    value = _static_text_literal_value(expression)
+    if value is None:
+        return False
+    return any(_is_sensitive_detail_key(candidate) for candidate in re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", value))
+
+
 def _subscript_base_supports_identifier_key(expression: ast.expr) -> bool:
     if isinstance(expression, ast.Name):
         return expression.id.lower() in SENSITIVE_IDENTIFIER_SUBSCRIPT_CONTAINERS
@@ -1898,6 +1905,39 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
                 ):
                     for argument in node.args:
                         _append_ast_literal_replacements(text, offsets, argument, replacements)
+                for index, argument in enumerate(node.args[:-1]):
+                    if not _static_text_contains_sensitive_label(argument):
+                        continue
+                    for candidate_value in node.args[index + 1 :]:
+                        _append_sensitive_ast_value_replacement(
+                            text,
+                            offsets,
+                            candidate_value,
+                            replacements,
+                            preserve_executable_calls=True,
+                        )
+                    break
+                if (
+                    call_name == "format"
+                    and isinstance(node.func, ast.Attribute)
+                    and _static_text_contains_sensitive_label(node.func.value)
+                ):
+                    for argument in node.args:
+                        _append_sensitive_ast_value_replacement(
+                            text,
+                            offsets,
+                            argument,
+                            replacements,
+                            preserve_executable_calls=True,
+                        )
+                    for keyword in node.keywords:
+                        _append_sensitive_ast_value_replacement(
+                            text,
+                            offsets,
+                            keyword.value,
+                            replacements,
+                            preserve_executable_calls=True,
+                        )
                 for keyword in node.keywords:
                     if keyword.arg in {"auth", "cookie", "cookies"} and _ast_contains_dangerous_call(keyword.value):
                         _append_ast_literal_replacements(text, offsets, keyword.value, replacements)
@@ -2648,7 +2688,13 @@ def _common_dedent_prefix(text: str, dedented: str) -> str:
 
 def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
     effective_max_chars = max(len(text), len(REDACTED_EVIDENCE_VALUE))
-    structured_redaction = _redact_structured_evidence(text, max_chars=effective_max_chars)
+    parseable_python_evidence = _is_parseable_python_evidence(text)
+    parenthesized_python_evidence = parseable_python_evidence and text.lstrip().startswith("(")
+    structured_redaction = _redact_structured_evidence(
+        text,
+        max_chars=effective_max_chars,
+        fail_closed=not parenthesized_python_evidence,
+    )
     if structured_redaction is not None:
         return structured_redaction
     quoted_structured_redaction = _redact_quoted_structured_literal(text, max_chars=effective_max_chars)
@@ -2656,7 +2702,6 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
         return quoted_structured_redaction
 
     python_evidence = _looks_like_python_evidence(text)
-    parseable_python_evidence = _is_parseable_python_evidence(text)
     r_evidence = _looks_like_r_evidence(text)
     dedented = textwrap.dedent(text) if python_evidence else text
     python_indent = _common_dedent_prefix(text, dedented) if python_evidence else ""
@@ -2832,9 +2877,9 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
         )
     bounded_redacted = _redact_evidence_content(bounded_text, url_depth=_url_depth)
     if len(text) <= limit:
-        return bounded_redacted
+        return _truncate(bounded_redacted, limit)
     if bounded_redacted == REDACTED_EVIDENCE_VALUE:
-        return REDACTED_EVIDENCE_VALUE
+        return _truncate(REDACTED_EVIDENCE_VALUE, limit)
 
     lookahead_redacted = _redact_evidence_content(
         lookahead_text,
@@ -2848,7 +2893,7 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     safe_redacted_prefix = lookahead_redacted[:common_length]
 
     if safe_redacted_prefix == REDACTED_EVIDENCE_VALUE:
-        return REDACTED_EVIDENCE_VALUE
+        return _truncate(REDACTED_EVIDENCE_VALUE, limit)
     if (
         REDACTED_EVIDENCE_VALUE in lookahead_redacted
         and REDACTED_EVIDENCE_VALUE not in safe_redacted_prefix

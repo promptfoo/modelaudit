@@ -1514,7 +1514,7 @@ def test_redacts_sensitive_setter_call_values() -> None:
     assert 'os.putenv("AWS_SECRET_ACCESS_KEY", <redacted>)' in redacted
     assert 'setattr(config, "api_key", <redacted>)' in redacted
     assert 'headers.setdefault("Authorization", <redacted>)' in redacted
-    assert 'logger.info("api_key", "VISIBLE")' in redacted
+    assert 'logger.info("api_key", "<redacted>")' in redacted
     assert 'setattr(config, "timeout", "30")' in redacted
     assert 'eval("1 + 1")' in redacted
 
@@ -1979,7 +1979,7 @@ def test_redacts_concatenated_keys_and_literal_credential_pairs() -> None:
     assert 'authorization_pair = ("Authorization", <redacted>)' in redacted
     assert '("Region", "visible")' in redacted
     assert 'labels = ["tokenizer", "visible"]' in redacted
-    assert 'emit("api_key", "visible")' in redacted
+    assert 'emit("api_key", "<redacted>")' in redacted
     assert 'eval("1 + 1")' in redacted
 
 
@@ -2290,3 +2290,53 @@ def test_redacts_simple_cookie_and_session_assignments() -> None:
     assert "cookie_count = 1" in redacted
     assert "session_timeout = 30" in redacted
     assert 'eval("1")' in redacted
+
+
+def test_redaction_expansion_honors_max_chars() -> None:
+    """Replacement markers must not make bounded evidence exceed its contract."""
+    assignment = redact_evidence_string("api_key=x", max_chars=9)
+    credential_url = "ssh://u:p@h/x"
+    url = redact_evidence_string(credential_url, max_chars=len(credential_url))
+    fail_closed = redact_evidence_string("(" * 20, max_chars=4)
+
+    assert len(assignment) <= 9
+    assert len(url) <= len(credential_url)
+    assert len(fail_closed) <= 4
+    assert "x" not in assignment
+    assert "u:p" not in url
+
+
+def test_redacts_positional_sensitive_label_value_calls() -> None:
+    """Sensitive labels must sanitize adjacent positional and format values."""
+    secrets = [
+        "LOGGERSECRET1234567890",
+        "LOGGERPASSWORD1234567890",
+        "FORMATSECRET1234567890",
+        "EXCEPTIONSECRET1234567890",
+        "CALLSECRET1234567890",
+    ]
+    text = (
+        f'logger.info("api_key=%s password=%s", "{secrets[0]}", "{secrets[1]}"); '
+        f'"api_key={{}}".format("{secrets[2]}"); '
+        f'Exception("Authorization", "{secrets[3]}"); '
+        f'logger.info("client_secret=%s", eval("{secrets[4]}")); '
+        'logger.info("api_key_count=%s", "VISIBLE"); '
+        '"tokenizer={}".format("bert"); eval("1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert all(secret not in redacted for secret in secrets)
+    assert 'logger.info("api_key_count=%s", "VISIBLE")' in redacted
+    assert '"tokenizer={}".format("bert")' in redacted
+    assert 'eval("<redacted>")' in redacted
+    assert 'eval("1")' in redacted
+
+
+def test_preserves_parenthesized_parseable_python_evidence() -> None:
+    """Parenthesized expressions should retain the dangerous call that explains a finding."""
+    direct = redact_evidence_string('(eval("1"))', max_chars=None)
+    lambda_hook = redact_evidence_string("(lambda x: eval(x))", max_chars=None)
+
+    assert 'eval("1")' in direct
+    assert "lambda x: eval(x)" in lambda_hook

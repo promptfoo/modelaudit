@@ -15325,7 +15325,7 @@ class JITScriptDetector:
                     recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                     confidence=0.9,
                     framework=framework,
-                    code_snippet=code_str[:200],
+                    code_snippet=_redact_code_evidence_snippet(code_str),
                     type="dangerous_builtin",
                     operation=None,
                     builtin=builtin,
