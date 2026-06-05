@@ -507,6 +507,18 @@ def test_filter_scannable_cloud_files_routes_within_tiny_sniff_budget() -> None:
     assert transferred == [8]
 
 
+def test_filter_scannable_cloud_files_skips_complete_benign_content_at_exact_sniff_budget() -> None:
+    url = "s3://bucket/models/preview.payload"
+    payload = b"\x89PNG\r\n\x1a\n"
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": "8 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == []
+    assert transferred == [len(payload)]
+
+
 def test_filter_scannable_cloud_files_caps_json_probe_at_shared_sniff_budget() -> None:
     url = "s3://bucket/models/model.payload"
     payload = b"{" + b" " * (64 * 1024)
@@ -572,6 +584,34 @@ def test_filter_scannable_cloud_files_reuses_complete_budgeted_zip_prefix() -> N
         {**files[0], "content_detected_format": "zip"}
     ]
     assert transferred == [len(payload)]
+
+
+@pytest.mark.parametrize(
+    ("model_entry", "expected_format"),
+    [
+        pytest.param({"model.pkl": b"cos\nsystem\n(S'echo pwned'\ntR."}, "zip", id="model-bearing"),
+        pytest.param({}, None, id="benign"),
+    ],
+)
+def test_filter_scannable_cloud_files_reuses_partial_prefix_at_exact_zip_budget(
+    model_entry: dict[str, bytes],
+    expected_format: str | None,
+) -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload(
+        {
+            **{f"docs/{index}.txt": b"benign text" for index in range(120)},
+            **model_entry,
+        }
+    )
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    expected = [] if expected_format is None else [{**files[0], "content_detected_format": expected_format}]
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == expected
+    assert transferred[0] <= len(payload)
 
 
 def test_filter_scannable_cloud_files_handles_short_remote_reads() -> None:

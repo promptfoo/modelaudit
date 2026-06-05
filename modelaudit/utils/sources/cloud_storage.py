@@ -792,12 +792,93 @@ class _CloudContentSniffBudget:
 class _BudgetedCloudContentReader:
     """Expose a seekable cloud stream while charging reads to a sniff budget."""
 
-    def __init__(self, remote_file: Any, budget: _CloudContentSniffBudget):
+    def __init__(
+        self,
+        remote_file: Any,
+        budget: _CloudContentSniffBudget,
+        file_url: str,
+        file_size: int,
+    ):
         self._remote_file = remote_file
         self._budget = budget
+        self._file_size = file_size
+        prefix = budget.cached_prefix(file_url)
+        self._cached_ranges = [(0, prefix)] if prefix else []
+
+    def _cache_range(self, offset: int, data: bytes) -> None:
+        if not data:
+            return
+
+        new_start = offset
+        new_data = data
+        merged: list[tuple[int, bytes]] = []
+        inserted = False
+        for start, cached in self._cached_ranges:
+            end = start + len(cached)
+            new_end = new_start + len(new_data)
+            if end < new_start:
+                merged.append((start, cached))
+                continue
+            if new_end < start:
+                if not inserted:
+                    merged.append((new_start, new_data))
+                    inserted = True
+                merged.append((start, cached))
+                continue
+
+            merged_start = min(start, new_start)
+            merged_end = max(end, new_end)
+            combined = bytearray(merged_end - merged_start)
+            combined[start - merged_start : end - merged_start] = cached
+            combined[new_start - merged_start : new_end - merged_start] = new_data
+            new_start = merged_start
+            new_data = bytes(combined)
+
+        if not inserted:
+            merged.append((new_start, new_data))
+        self._cached_ranges = merged
+
+    def _read_cached(self, offset: int, max_bytes: int) -> bytes:
+        for start, cached in self._cached_ranges:
+            end = start + len(cached)
+            if start <= offset < end:
+                return cached[offset - start : offset - start + max_bytes]
+            if start > offset:
+                break
+        return b""
+
+    def _next_cached_offset(self, offset: int) -> int | None:
+        return next((start for start, _cached in self._cached_ranges if start > offset), None)
 
     def read(self, size: int | None = -1) -> bytes:
-        return self._budget.read_stream(self._remote_file, size)
+        if size == 0:
+            return b""
+
+        offset = self.tell()
+        available = max(self._file_size - offset, 0)
+        remaining = available if size is None or size < 0 else min(size, available)
+        result = bytearray()
+        while remaining > 0:
+            offset = self.tell()
+            cached = self._read_cached(offset, remaining)
+            if cached:
+                result.extend(cached)
+                self._remote_file.seek(offset + len(cached))
+                remaining -= len(cached)
+                continue
+
+            read_size = remaining
+            next_cached_offset = self._next_cached_offset(offset)
+            if next_cached_offset is not None:
+                read_size = min(read_size, next_cached_offset - offset)
+            chunk = self._budget.read_stream(self._remote_file, read_size)
+            if not chunk:
+                break
+            self._cache_range(offset, chunk)
+            result.extend(chunk)
+            remaining -= len(chunk)
+
+        return bytes(result)
 
     def readinto(self, buffer: Any) -> int:
         chunk = self.read(len(buffer))
@@ -1126,7 +1207,9 @@ def _detect_cloud_content_route_format(
                         )
             with fs.open(file_url, "rb") as remote_file:
                 zip_source = (
-                    remote_file if sniff_budget is None else _BudgetedCloudContentReader(remote_file, sniff_budget)
+                    remote_file
+                    if sniff_budget is None
+                    else _BudgetedCloudContentReader(remote_file, sniff_budget, file_url, actual_size)
                 )
                 with zipfile.ZipFile(zip_source, "r") as archive:
                     return (
@@ -1156,6 +1239,12 @@ def _detect_cloud_content_route_format(
         sniff_budget=sniff_budget,
     )
     if shared_detected_format is None and sniff_budget is not None:
+        if (
+            sniff_budget.remaining_bytes == 0
+            and not sniff_budget.prefix_is_complete(file_url)
+            and _get_cloud_content_size_for_routing(fs, file_url) == len(sniff_budget.cached_prefix(file_url))
+        ):
+            return None
         sniff_budget.require_classification_capacity(file_url)
     return shared_detected_format
 
