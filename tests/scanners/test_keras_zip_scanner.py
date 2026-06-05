@@ -1003,16 +1003,29 @@ class TestKerasZipScanner:
 
         reset_cache_manager()
         try:
-            for _ in range(2):
-                result = scan_model_directory_or_file(
-                    str(keras_path),
-                    cache_enabled=True,
-                    cache_dir=str(cache_dir),
-                    min_cache_file_size=0,
-                )
-                assert determine_exit_code(result) == 0
+            first = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(first) == 0
 
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            first_stats = cache_manager.get_stats()
+            assert first_stats["total_entries"] > 0
+
+            second = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(second) == 0
+
+            second_stats = cache_manager.get_stats()
+            assert second_stats["total_entries"] == first_stats["total_entries"]
+            assert second_stats["cache_hits"] > first_stats["cache_hits"]
         finally:
             reset_cache_manager()
 
