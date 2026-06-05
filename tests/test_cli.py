@@ -1421,32 +1421,6 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
-@patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
-@patch("modelaudit.core.scan_model_streaming")
-def test_scan_pytorchhub_streaming_passes_max_download_bytes(
-    mock_scan_streaming: MagicMock,
-    mock_download_streaming: MagicMock,
-    mock_is_ph_url: MagicMock,
-    tmp_path: Path,
-) -> None:
-    mock_is_ph_url.return_value = True
-    streamed_file = tmp_path / "model.pt"
-    streamed_file.write_bytes(b"dummy")
-
-    mock_download_streaming.return_value = iter([(streamed_file, True)])
-    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["scan", "--stream", "--max-size", "5KB", "https://pytorch.org/hub/pytorch_vision_resnet/"],
-    )
-
-    assert result.exit_code == 0
-    assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
-
-
-@patch("modelaudit.cli.is_pytorch_hub_url")
 @patch("modelaudit.cli.download_pytorch_hub_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_pytorchhub_url_passes_max_download_bytes(
@@ -1502,6 +1476,7 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
+    assert mock_download_streaming.call_args.kwargs["timeout"] > 0
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")

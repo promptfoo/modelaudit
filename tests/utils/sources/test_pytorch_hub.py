@@ -1,9 +1,11 @@
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit.utils.sources.pytorch_hub import (
+    _extract_github_source_urls,
     _extract_weight_urls,
     download_pytorch_hub_model,
     download_pytorch_hub_model_streaming,
@@ -632,6 +634,96 @@ def test_download_pytorch_hub_model_streaming_deduplicates_links_before_budget_c
     assert not stream_dir.exists()
     mock_head.assert_called_once_with(weight_url, timeout=10, allow_redirects=True)
     assert mock_get.call_count == 2
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_resolves_view_on_github_source(
+    mock_get: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    stream_dir = tmp_path / "stream"
+    stream_dir.mkdir()
+    mock_mkdtemp.return_value = str(stream_dir)
+    source_url = "https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py"
+    weight_url = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
+    page_resp = MagicMock()
+    page_resp.text = f'<a href="{source_url}">View on GitHub</a>'
+    page_resp.raise_for_status = lambda: None
+    source_resp = MagicMock()
+    source_resp.iter_content.return_value = [f'url = "{weight_url}"'.encode()]
+    source_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {}
+    file_resp.iter_content.return_value = [b"weights"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [page_resp, source_resp, file_resp]
+
+    yielded = [
+        (file_path.read_bytes(), is_last)
+        for file_path, is_last in download_pytorch_hub_model_streaming(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            show_progress=False,
+        )
+    ]
+
+    assert yielded == [(b"weights", True)]
+    assert mock_get.call_args_list[1].args == (
+        "https://raw.githubusercontent.com/pytorch/vision/main/torchvision/models/resnet.py",
+    )
+    assert mock_get.call_args_list[1].kwargs["stream"] is True
+    assert not stream_dir.exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_enforces_acquisition_timeout(
+    mock_get: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream_dir = tmp_path / "stream"
+    stream_dir.mkdir()
+    mock_mkdtemp.return_value = str(stream_dir)
+    now = [0.0]
+    weight_url = "https://download.pytorch.org/models/resnet50.pth"
+    page_resp = MagicMock()
+    page_resp.text = f'<a href="{weight_url}">link</a>'
+    page_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {}
+    file_resp.raise_for_status = lambda: None
+
+    def chunks() -> Iterator[bytes]:
+        now[0] = 2.0
+        yield b"weights"
+
+    file_resp.iter_content.return_value = chunks()
+    mock_get.side_effect = [page_resp, file_resp]
+    monkeypatch.setattr("modelaudit.utils.sources.pytorch_hub.time.monotonic", lambda: now[0])
+
+    with pytest.raises(TimeoutError, match="streaming download timed out"):
+        list(
+            download_pytorch_hub_model_streaming(
+                "https://pytorch.org/hub/pytorch_vision_resnet/",
+                show_progress=False,
+                timeout=1,
+            )
+        )
+
+    assert not stream_dir.exists()
+
+
+def test_extract_github_source_urls_rejects_untrusted_or_non_python_links() -> None:
+    html = (
+        '<a href="https://evil.example/repo/blob/main/model.py">View on GitHub</a>'
+        '<a href="https://github.com/pytorch/vision/blob/main/README.md">View on GitHub</a>'
+    )
+    assert _extract_github_source_urls(html) == []
 
 
 def test_download_pytorch_hub_model_invalid_url():
