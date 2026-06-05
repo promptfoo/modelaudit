@@ -4274,11 +4274,63 @@ class TestCVE202523304HydraTarget:
     @pytest.mark.parametrize(
         "target",
         [
+            "tempfile.NamedTemporaryFile",
+            "tempfile.TemporaryDirectory",
+            "tempfile.TemporaryFile",
+            "tempfile.mkdtemp",
+            "tempfile.mkstemp",
+            "tempfile.mktemp",
+            "ftplib.FTP.connect",
+            "ftplib.FTP_TLS.connect",
+            "imaplib.IMAP4.open",
+            "imaplib.IMAP4_SSL.open",
+            "nntplib.NNTP._create_socket",
+            "nntplib.NNTP_SSL._create_socket",
+            "poplib.POP3._create_socket",
+            "poplib.POP3_SSL._create_socket",
+            "smtplib.LMTP.connect",
+            "smtplib.SMTP.connect",
+            "smtplib.SMTP_SSL.connect",
+            "telnetlib.Telnet.open",
+            "pathlib.Path.iterdir",
+            "pathlib.PosixPath.iterdir",
+            "pathlib.WindowsPath.iterdir",
+            "ctypes.util.find_library",
+        ],
+    )
+    def test_immediate_creator_connection_and_discovery_aliases_are_dangerous(
+        self,
+        tmp_path: Path,
+        target: str,
+    ) -> None:
+        """Immediate filesystem, network, and process-backed aliases must fail security review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
             "custom.ftplib.FTPFactory.SafeBuilder",
             "custom.gzip.GzipFileFactory.SafeBuilder",
             "custom.numpy.fromfile_factory.SafeBuilder",
             "custom.tarfile.open_safe.SafeBuilder",
             "custom.ctypes.PyDLLFactory.SafeBuilder",
+            "custom.tempfile.NamedTemporaryFileFactory.SafeBuilder",
+            "custom.ftplib.FTP.connect_factory.SafeBuilder",
+            "custom.pathlib.Path.iterdir_factory.SafeBuilder",
+            "custom.ctypes.util.find_library_factory.SafeBuilder",
         ],
     )
     def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
@@ -4564,10 +4616,14 @@ class TestCVE202523304HydraTarget:
             "numpy.lib._npyio_impl.load",
             "tarfile.open",
             "ctypes.PyDLL",
+            "ctypes.util.find_library",
+            "ftplib.FTP.connect",
             "os.path.realpath",
             "os.chmod",
+            "pathlib.Path.iterdir",
             "pathlib.Path.resolve",
             "shutil.unpack_archive",
+            "tempfile.NamedTemporaryFile",
         ],
     )
     def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
@@ -4672,10 +4728,10 @@ class TestCVE202523304HydraTarget:
             "httpx.AsyncClient.get",
             "httpx._client.AsyncClient.request",
             "ctypes.LibraryLoader",
+            "tempfile.SpooledTemporaryFile",
             "glob.iglob",
             "os.walk",
             "pathlib.Path.glob",
-            "pathlib.Path.iterdir",
         ],
     )
     def test_non_io_target_invocations_remain_review_only(self, tmp_path: Path, target: str) -> None:
