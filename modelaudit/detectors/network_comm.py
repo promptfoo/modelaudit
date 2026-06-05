@@ -80,6 +80,7 @@ _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
+_URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
@@ -211,18 +212,17 @@ def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
     ):
         return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
 
-    changed = False
-    for index, part in enumerate(parts):
-        if not part:
-            continue
-        redacted_part, part_changed = _redact_boundary_component(part)
-        if part_changed:
-            parts[index] = redacted_part
-            changed = True
+    changed = _redact_delimited_path_components(parts)
 
     if not changed:
         return None
-    if any(part and part != _REDACTED_PATH_TOKEN and not _looks_like_known_artifact_filename(part) for part in parts):
+    if any(
+        part
+        and part != _REDACTED_PATH_TOKEN
+        and not _is_sensitive_path_key(_split_trailing_path_delimiters(part)[0])
+        and not _looks_like_known_artifact_filename(part)
+        for part in parts
+    ):
         return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
     return f"{'%2F'.join(parts)}{trailing_delimiters}"
 
@@ -234,18 +234,37 @@ def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
         return None
 
     parts = decoded.split(":")
-    changed = False
-    for index, part in enumerate(parts):
-        if not part:
-            continue
-        redacted_part, part_changed = _redact_boundary_component(part)
-        if part_changed:
-            parts[index] = redacted_part
-            changed = True
+    changed = _redact_delimited_path_components(parts)
 
     if not changed:
         return None
     return f"{':'.join(parts)}{trailing_delimiters}"
+
+
+def _redact_delimited_path_components(parts: list[str]) -> bool:
+    """Redact assignments and sensitive key/value pairs split by a path delimiter."""
+    changed = False
+    redact_next_value = False
+    for index, part in enumerate(parts):
+        if not part:
+            continue
+
+        token_candidate, trailing_delimiters = _split_trailing_path_delimiters(part)
+        if redact_next_value:
+            parts[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            redact_next_value = False
+            changed = True
+            continue
+
+        if _is_sensitive_path_key(token_candidate):
+            redact_next_value = True
+            continue
+
+        redacted_part, part_changed = _redact_boundary_component(part)
+        if part_changed:
+            parts[index] = redacted_part
+            changed = True
+    return changed
 
 
 def _redact_boundary_component(component: str) -> tuple[str, bool]:
@@ -762,7 +781,40 @@ def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bo
         return value_lower in parsed.netloc.lower() and value_lower not in safe_parsed.netloc.lower()
     if relative_start < path_end:
         return value_lower in parsed.path.lower() and value_lower not in safe_parsed.path.lower()
-    return bool(parsed.query or parsed.fragment)
+
+    if parsed.query:
+        query_start = path_end + 1
+        query_end = query_start + len(parsed.query)
+        if query_start <= relative_start < query_end:
+            return _is_match_redacted_from_url_component(parsed.query, relative_start - query_start, value)
+
+    if parsed.fragment:
+        fragment_start = path_end + (len(parsed.query) + 1 if parsed.query else 0) + 1
+        if fragment_start <= relative_start:
+            return _is_match_redacted_from_url_component(parsed.fragment, relative_start - fragment_start, value)
+    return False
+
+
+def _is_match_redacted_from_url_component(component: str, match_start: int, value: str) -> bool:
+    """Distinguish redacted credential material from nested endpoints in a query or fragment."""
+    value_lower = value.lower()
+    for nested_url_match in _URL_IN_TEXT_PATTERN.finditer(component):
+        if not (nested_url_match.start() <= match_start < nested_url_match.end()):
+            continue
+        safe_nested_url = redact_url_for_finding(nested_url_match.group())
+        return value_lower not in safe_nested_url.lower()
+
+    field_start = 0
+    field_end = len(component)
+    for separator_match in _URL_COMPONENT_SEPARATOR_PATTERN.finditer(component):
+        if separator_match.end() <= match_start:
+            field_start = separator_match.end()
+        elif separator_match.start() > match_start:
+            field_end = separator_match.start()
+            break
+
+    key, separator, _value = component[field_start:field_end].partition("=")
+    return bool(separator and _is_sensitive_path_key(key))
 
 
 def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
