@@ -1237,14 +1237,42 @@ class TestNetworkCommDetector:
         assert secret not in json.dumps(findings, sort_keys=True)
 
     @pytest.mark.parametrize(
-        "prefix",
-        [b"connect %65vil-c2.com", b"endpoint=%65vil-c2.com", b"callback %ab.evil-c2.com"],
+        ("prefix", "expected_domain"),
+        [
+            (b"connect %65vil-c2.com", "65vil-c2.com"),
+            (b"endpoint=%65vil-c2.com", "65vil-c2.com"),
+            (b"callback %ab.evil-c2.com", "ab.evil-c2.com"),
+        ],
     )
-    def test_nonseparator_percent_escapes_do_not_suppress_domain_signals(self, prefix: bytes) -> None:
+    def test_nonseparator_percent_escapes_do_not_suppress_domain_signals(
+        self,
+        prefix: bytes,
+        expected_domain: str,
+    ) -> None:
         """Only encoded URL separators may be discarded as regex artifacts."""
         findings = NetworkCommDetector().scan(prefix, "hook.py")
 
-        assert any(str(finding.get("domain", "")).endswith("vil-c2.com") for finding in findings)
+        assert any(finding.get("domain") == expected_domain for finding in findings)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example/api_key%20SECRET123/model.bin",
+            "https://evil.example/authorization%20Bearer%20SECRET123/model.bin",
+        ],
+    )
+    def test_encoded_whitespace_path_credentials_are_redacted(self, url: str) -> None:
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert "SECRET123" not in json.dumps(findings, sort_keys=True)
+
+    def test_encoded_whitespace_path_near_match_is_preserved(self) -> None:
+        """A nonsensitive path label must not redact the following whitespace-delimited token."""
+        url = "https://evil.example/author%20SECRET123/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert any(finding.get("url") == url for finding in findings)
 
     @pytest.mark.parametrize(
         ("url", "secret"),
@@ -1819,6 +1847,16 @@ class TestNetworkCommDetector:
 
         assert cc_finding["snippet"] == "c2_server https://evil.example/path"
 
+    def test_cc_pattern_snippets_support_triple_quoted_assigned_endpoints(self) -> None:
+        """Triple-quoted C2 assignments should retain only sanitized endpoint context."""
+        data = b'c2_server = """https://evil.example/path?token=SECRET"""'
+
+        findings = NetworkCommDetector().scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+
+        assert cc_finding["snippet"] == "c2_server https://evil.example/path"
+        assert "SECRET" not in json.dumps(cc_finding, sort_keys=True)
+
     def test_cc_pattern_after_single_quoted_url_is_not_treated_as_path_content(self) -> None:
         """Compact source syntax must not make a later C&C token part of the URL span."""
         data = b"'https://docs.example/reference',malware=1"
@@ -2375,12 +2413,49 @@ def test_network_finding_limit_stops_lazy_url_index_after_budget(monkeypatch: py
         yield 26, 51, "https://two.example/path"
         raise AssertionError("URL indexing continued beyond the finding budget")
 
-    monkeypatch.setattr(detector, "_iter_url_contexts", bounded_contexts)
+    monkeypatch.setattr(detector, "_iter_generic_url_contexts", bounded_contexts)
 
     findings = detector.scan(b"", "tokens.txt")
 
     assert findings[0]["type"] == "url_detected"
     assert findings[-1]["type"] == "detector_finding_limit"
+
+
+def test_network_finding_limit_does_not_drain_cloud_uri_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic URL scanning must not index every cloud URI before the cloud scanner runs."""
+    detector = NetworkCommDetector({"max_findings": 1})
+    data = b" ".join(f"s3://bucket-{index}/model.bin".encode() for index in range(10_000))
+    monkeypatch.setattr(
+        detector,
+        "_iter_generic_url_contexts",
+        lambda _data: (_ for _ in ()).throw(AssertionError("generic URL scan ran after the finding budget")),
+    )
+
+    findings = detector.scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "cloud_storage_url"
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert detector._url_contexts == []
+
+
+@pytest.mark.parametrize("secret", ["45.33.32.156", "secret-value.example.com"])
+def test_network_finding_limit_suppresses_colon_query_credentials(secret: str) -> None:
+    """Colon-style query credentials must not reappear through endpoint scanners."""
+    data = f"https://benign.example/download?api_key:{secret}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+def test_network_finding_limit_preserves_colon_query_near_match() -> None:
+    """An ordinary colon-style query field must not suppress an endpoint signal."""
+    ip = "45.33.32.156"
+    data = f"https://benign.example/download?algorithm:{ip}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
+
+    assert any(finding.get("ip") == ip for finding in findings)
 
 
 def test_network_finding_limit_does_not_index_url_prefix_before_port(

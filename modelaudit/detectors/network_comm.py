@@ -36,7 +36,9 @@ _SENSITIVE_PATH_KEY_PATTERN = re.compile(
     r")$",
     re.IGNORECASE,
 )
-_URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(rb"[\"']?\s*[:=]\s*(?:[rRuUbBfF]{0,3})?[\"']?\s*")
+_URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(
+    rb"(?:\"\"\"|'''|[\"'])?\s*[:=]\s*(?:[rRuUbBfF]{0,3})?(?:\"\"\"|'''|[\"'])?\s*"
+)
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
@@ -318,37 +320,46 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
     if _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded) is None:
         return None
 
+    boundary_matches = list(_PATH_TOKEN_BOUNDARY_PATTERN.finditer(decoded))
+    components: list[str] = []
+    cursor = 0
+    for match in boundary_matches:
+        components.append(decoded[cursor : match.start()])
+        cursor = match.end()
+    components.append(decoded[cursor:])
+
+    def carries_sensitive_value(boundary: str) -> bool:
+        return boundary.lower() in {"&", "&amp;", ","} or boundary.isspace()
+
     changed = False
     redacted_parts: list[str] = []
-    cursor = 0
     redact_next_value = False
-    for match in _PATH_TOKEN_BOUNDARY_PATTERN.finditer(decoded):
-        component = decoded[cursor : match.start()]
+    authorization_value_pending = False
+    for index, component in enumerate(components):
+        following_boundary = boundary_matches[index].group() if index < len(boundary_matches) else ""
         token_component, component_delimiters = _split_trailing_path_delimiters(component)
         if redact_next_value and component:
             redacted_component = f"{_REDACTED_PATH_TOKEN}{component_delimiters}"
             component_changed = True
-            redact_next_value = False
+            following_value = next((candidate for candidate in components[index + 1 :] if candidate), None)
+            redact_next_value = (
+                authorization_value_pending
+                and carries_sensitive_value(following_boundary)
+                and _authorization_scheme_has_payload(token_component, following_value)
+            )
+            authorization_value_pending = False
         else:
             redacted_component, component_changed = _redact_boundary_component(component)
-            if _is_sensitive_path_key(token_component):
-                redact_next_value = match.group().lower() in {"&", "&amp;", ","}
+            if component and _is_sensitive_path_key(token_component) and carries_sensitive_value(following_boundary):
+                redact_next_value = True
+                authorization_value_pending = _is_authorization_path_key(token_component)
         redacted_parts.append(redacted_component)
-        redacted_parts.append(match.group())
         changed = changed or component_changed
-        if match.group().lower() not in {"&", "&amp;", ","}:
+        if index < len(boundary_matches):
+            redacted_parts.append(following_boundary)
+        if following_boundary and not carries_sensitive_value(following_boundary):
             redact_next_value = False
-        cursor = match.end()
-
-    component = decoded[cursor:]
-    if redact_next_value and component:
-        _token_component, component_delimiters = _split_trailing_path_delimiters(component)
-        redacted_component = f"{_REDACTED_PATH_TOKEN}{component_delimiters}"
-        component_changed = True
-    else:
-        redacted_component, component_changed = _redact_boundary_component(component)
-    redacted_parts.append(redacted_component)
-    changed = changed or component_changed
+            authorization_value_pending = False
     if not changed:
         return None
     return f"{''.join(redacted_parts)}{trailing_delimiters}"
@@ -946,6 +957,11 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
             if decoded_separator and value_lower in decoded_value.lower() and _is_sensitive_path_key(decoded_key):
                 return True
 
+    field = component[field_start:field_end]
+    redacted_colon_field = _redact_colon_delimited_path_tokens(field)
+    if redacted_colon_field is not None and value_lower in field.lower():
+        return value_lower not in redacted_colon_field.lower()
+
     return bool(separator and _is_sensitive_path_key(key))
 
 
@@ -1508,8 +1524,8 @@ class NetworkCommDetector:
                 self._scan_network_functions,
                 self._scan_network_libraries,
                 self._scan_suspicious_ports,
-                self._scan_urls,
                 self._scan_cloud_storage_urls,
+                self._scan_urls,
                 self._scan_ip_addresses,
                 self._scan_domains,
             )
@@ -1564,6 +1580,15 @@ class NetworkCommDetector:
     @staticmethod
     def _iter_url_contexts(data: bytes) -> Iterator[tuple[int, int, str]]:
         for match in _URL_IN_BYTES_PATTERN.finditer(data):
+            raw_url = match.group().decode("utf-8", errors="ignore")
+            source_quote = _source_quote_before_url(data, match.start())
+            url = _trim_source_literal_url(raw_url, source_quote)
+            yield match.start(), match.start() + len(url.encode("utf-8")), url
+
+    @classmethod
+    def _iter_generic_url_contexts(cls, data: bytes) -> Iterator[tuple[int, int, str]]:
+        """Yield only schemes handled by generic URL findings."""
+        for match in cls.URL_PATTERN.finditer(data):
             raw_url = match.group().decode("utf-8", errors="ignore")
             source_quote = _source_quote_before_url(data, match.start())
             url = _trim_source_literal_url(raw_url, source_quote)
@@ -1656,7 +1681,7 @@ class NetworkCommDetector:
 
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
-        url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_indexed_url_contexts()
+        url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_generic_url_contexts(data)
         for url_start, _url_end, url in url_contexts:
             if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None and not self._record_url_finding(
                 url, url_start, context
@@ -1713,6 +1738,11 @@ class NetworkCommDetector:
             for match in pattern.finditer(data):
                 url = match.group().decode("utf-8", errors="ignore")
                 safe_url = redact_url_for_finding(url)
+
+                if self.max_findings is not None and self.URL_PATTERN.fullmatch(match.group()) is None:
+                    for nested_url in _decoded_nested_urls(url):
+                        if not self._record_url_finding(nested_url, match.start(), context):
+                            return
 
                 # Skip duplicates
                 if url in seen_urls:
