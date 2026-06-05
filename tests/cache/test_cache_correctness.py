@@ -368,6 +368,28 @@ def test_cache_manager_cached_scan_does_not_cache_transient_path_replacement(tmp
     assert calls["count"] == 2
 
 
+def test_ancestor_identity_ignores_unrelated_grandparent_churn(tmp_path: Path) -> None:
+    scan_dir = tmp_path / "scan"
+    scan_dir.mkdir()
+    model_path = _make_cacheable_file(scan_dir, name="model.dat")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+
+    before = cache._capture_ancestor_identity(str(model_path))
+    after = before
+    deadline = time.monotonic() + 1.2
+    attempt = 0
+    while after == before and time.monotonic() < deadline:
+        unrelated = tmp_path / f"unrelated-{attempt}"
+        unrelated.mkdir()
+        unrelated.rmdir()
+        after = cache._capture_ancestor_identity(str(model_path))
+        attempt += 1
+        time.sleep(0.01)
+
+    assert before != after
+    assert cache._ancestor_identity_matches(before, after)
+
+
 def test_cache_manager_cached_scan_does_not_cache_symlink_target_swap(tmp_path: Path) -> None:
     malicious_path = _make_cacheable_file(tmp_path, name="malicious.dat")
     clean_path = _make_cacheable_file(tmp_path, name="clean.dat")

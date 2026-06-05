@@ -18,7 +18,7 @@ from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
 
-AncestorIdentity = tuple[tuple[str, int, int, int, int], ...]
+AncestorIdentity = tuple[tuple[str, int, int, int, int, int], ...]
 ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
 
 
@@ -272,7 +272,10 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
-            if self._capture_ancestor_identity(file_path) != expected_ancestor_identity:
+            if not self._ancestor_identity_matches(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
                 logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
                 return False
 
@@ -287,7 +290,10 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, post_hash_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file changed during verification", file_path)
                 return False
-            if self._capture_ancestor_identity(file_path) != expected_ancestor_identity:
+            if not self._ancestor_identity_matches(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
                 logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
                 return False
             file_stat = post_hash_stat
@@ -366,7 +372,7 @@ class ScanResultsCache:
         if (
             not self._stat_matches(initial_stat, verified_stat)
             or initial_change_token != verified_change_token
-            or initial_ancestor_identity != verified_ancestor_identity
+            or not self._ancestor_identity_matches(initial_ancestor_identity, verified_ancestor_identity)
         ):
             raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
@@ -464,10 +470,10 @@ class ScanResultsCache:
         return self._get_windows_handle_change_token(msvcrt_windows.get_osfhandle(probe.fileno()))
 
     def _capture_ancestor_identity(self, file_path: str) -> AncestorIdentity:
-        """Capture same-filesystem lexical ancestors and reject symlinked path components."""
+        """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
-        identity: list[tuple[str, int, int, int, int]] = []
+        identity: list[tuple[str, int, int, int, int, int]] = []
         while True:
             ancestor_path = str(ancestor)
             if ancestor.is_symlink():
@@ -483,11 +489,32 @@ class ScanResultsCache:
                     ancestor_stat.st_dev,
                     ancestor_stat.st_ino,
                     ancestor_stat.st_mode,
+                    getattr(
+                        ancestor_stat,
+                        "st_mtime_ns",
+                        int(ancestor_stat.st_mtime * 1_000_000_000),
+                    ),
                     self._get_file_change_token(ancestor_path, ancestor_stat),
                 )
             )
             ancestor = ancestor.parent
         return tuple(identity)
+
+    @staticmethod
+    def _ancestor_identity_matches(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
+        if len(expected) != len(current):
+            return False
+        for index, (expected_entry, current_entry) in enumerate(zip(expected, current, strict=True)):
+            if expected_entry[:4] != current_entry[:4]:
+                return False
+            expected_mtime, expected_change_token = expected_entry[-2:]
+            current_mtime, current_change_token = current_entry[-2:]
+            if index == 0:
+                if (expected_mtime, expected_change_token) != (current_mtime, current_change_token):
+                    return False
+            elif expected_change_token != current_change_token and expected_mtime == current_mtime:
+                return False
+        return True
 
     @staticmethod
     def _path_has_symlink_component(file_path: str) -> bool:
