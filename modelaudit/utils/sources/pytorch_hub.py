@@ -75,6 +75,54 @@ def _remove_partial_file(path: Path) -> None:
         path.unlink()
 
 
+def _path_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _remove_path_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _commit_staged_weight_files(weight_urls: list[str], staging_dir: Path, dest_dir: Path) -> None:
+    """Install all staged weights or restore the original cache entries."""
+    backup_dir = staging_dir / ".backups"
+    backup_dir.mkdir()
+    committed: list[tuple[Path, Path, bool]] = []
+    try:
+        for weight_url in weight_urls:
+            filename = weight_url.split("/")[-1]
+            staged_file = staging_dir / filename
+            dest_file = dest_dir / filename
+            backup_file = backup_dir / filename
+            had_existing_entry = _path_entry_exists(dest_file)
+            if dest_file.is_dir() and not dest_file.is_symlink():
+                raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_file}")
+            if had_existing_entry:
+                dest_file.replace(backup_file)
+            try:
+                staged_file.replace(dest_file)
+            except Exception:
+                if had_existing_entry and _path_entry_exists(backup_file):
+                    backup_file.replace(dest_file)
+                raise
+            committed.append((dest_file, backup_file, had_existing_entry))
+    except Exception as commit_error:
+        rollback_errors: list[Exception] = []
+        for dest_file, backup_file, had_existing_entry in reversed(committed):
+            try:
+                _remove_path_entry(dest_file)
+                if had_existing_entry:
+                    backup_file.replace(dest_file)
+            except Exception as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
+        raise
+
+
 def _download_weight_file(weight_url: str, dest_file: Path, downloaded_size: int, max_size: int | None) -> int:
     """Download one weight file atomically and return the cumulative byte count."""
     partial_file: Path | None = None
@@ -155,9 +203,7 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size
                 raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
         if staging_dir is not None:
-            for weight_url in weight_urls:
-                filename = weight_url.split("/")[-1]
-                (staging_dir / filename).replace(dest_dir / filename)
+            _commit_staged_weight_files(weight_urls, staging_dir, dest_dir)
     except Exception:
         if cache_dir is None:
             shutil.rmtree(dest_dir, ignore_errors=True)

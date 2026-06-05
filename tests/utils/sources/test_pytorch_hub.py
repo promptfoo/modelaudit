@@ -33,7 +33,12 @@ class TestPytorchHubURLDetection:
 @patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
-def test_download_pytorch_hub_model_success(mock_get, mock_head, mock_check, tmp_path):
+def test_download_pytorch_hub_model_success(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
     html_resp = MagicMock()
     html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
     html_resp.raise_for_status = lambda: None
@@ -199,6 +204,66 @@ def test_download_pytorch_hub_model_rolls_back_cache_on_cumulative_size_rejectio
             "https://pytorch.org/hub/pytorch_vision_resnet/",
             cache_dir=tmp_path,
             max_size=5,
+        )
+
+    assert first_cache.read_bytes() == b"old-first"
+    assert second_cache.read_bytes() == b"old-second"
+    assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rolls_back_cache_on_commit_failure(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_url = "https://download.pytorch.org/models/first.pth"
+    second_url = "https://download.pytorch.org/models/second.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{first_url}">first</a><a href="{second_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+
+    file_responses = []
+    for payload in (b"new-first", b"new-second"):
+        file_resp = MagicMock()
+        file_resp.__enter__.return_value = file_resp
+        file_resp.headers = {}
+        file_resp.iter_content.return_value = [payload]
+        file_resp.raise_for_status = lambda: None
+        file_responses.append(file_resp)
+    mock_get.side_effect = [html_resp, *file_responses]
+
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    first_cache = tmp_path / "first.pth"
+    second_cache = tmp_path / "second.pth"
+    first_cache.write_bytes(b"old-first")
+    second_cache.write_bytes(b"old-second")
+
+    original_replace = Path.replace
+
+    def _fail_second_commit(path: Path, target: Path) -> Path:
+        target_path = Path(target)
+        if (
+            path.name == "second.pth"
+            and path.parent.name.startswith(".modelaudit_pth_stage_")
+            and target_path == second_cache
+        ):
+            raise OSError("simulated second-file commit failure")
+        return original_replace(path, target_path)
+
+    monkeypatch.setattr(Path, "replace", _fail_second_commit)
+
+    with pytest.raises(OSError, match="simulated second-file commit failure"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=100,
         )
 
     assert first_cache.read_bytes() == b"old-first"
