@@ -17,6 +17,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
@@ -477,6 +478,47 @@ class TestModelDownload:
         assert repo_files == ["config.json"]
         assert revision == _HF_TEST_REVISION
         assert error is None
+        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
+    def test_list_repo_files_deadline_uses_terminable_worker(self, mock_run_worker: MagicMock) -> None:
+        """Deadline-bound listings must be terminable, not only socket-timeout bounded."""
+        mock_run_worker.return_value = {
+            "value": {"files": ["config.json"], "revision": _HF_TEST_REVISION},
+        }
+
+        repo_files, revision, error = _list_repo_files_with_timeout(
+            "test/model",
+            timeout_seconds=7,
+            deadline=123.0,
+        )
+
+        assert repo_files == ["config.json"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_run_worker.assert_called_once_with(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7},
+            123.0,
+            "test/model",
+        )
+
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_download_worker_serializes_repository_listing(self, mock_repo_info: MagicMock) -> None:
+        """The deadline worker should return only serializable listing evidence."""
+        mock_repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="model.bin"), {"path": "config.json"}],
+        )
+
+        result = _run_huggingface_worker_operation(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7},
+        )
+
+        assert result == {
+            "value": {"files": ["model.bin", "config.json"], "revision": _HF_TEST_REVISION},
+        }
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
 
     @pytest.mark.parametrize("revision", [None, "", "main", "g" * 40])
@@ -1156,6 +1198,35 @@ class TestModelDownload:
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
 
+    @pytest.mark.parametrize("blocked_suffix", [".bin", ".meta", ".pb"])
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_preserves_executorch_blocked_suffix_guard(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_get_extensions: MagicMock,
+        blocked_suffix: str,
+        tmp_path: Path,
+    ) -> None:
+        """Remote ExecuTorch probes should match local renamed-binary suffix guards."""
+        filename = f"payload{blocked_suffix}"
+        payload = b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00"
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.safetensors").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["model.safetensors", filename], _HF_TEST_REVISION, None),
+        ):
+            download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
+
     @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_FILES", 1)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -1242,6 +1313,7 @@ class TestModelDownload:
         ):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
         mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
@@ -1334,6 +1406,25 @@ class TestModelDownload:
             )
 
         mock_terminate.assert_called_once_with(process)
+
+    @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
+    def test_download_worker_captures_unredacted_child_stderr(self, mock_popen: MagicMock) -> None:
+        """SDK diagnostics must not bypass the parent's Hugging Face URL redaction."""
+        process = mock_popen.return_value
+        process.communicate.return_value = (
+            'MODELAUDIT_HF_DOWNLOAD_RESULT={"ok": true, "path": "/tmp/model"}\n',
+            "https://cdn.example/model?token=secret",
+        )
+
+        result = _run_huggingface_download_with_deadline(
+            "snapshot_download",
+            {"repo_id": "test/model"},
+            time.monotonic() + 1,
+            "test/model",
+        )
+
+        assert result == "/tmp/model"
+        assert mock_popen.call_args.kwargs["stderr"] is subprocess.PIPE
 
     @patch("modelaudit.utils.sources.huggingface._terminate_huggingface_download_process")
     @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
@@ -1921,6 +2012,7 @@ class TestModelDownloadStreaming:
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 

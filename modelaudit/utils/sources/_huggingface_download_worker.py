@@ -11,6 +11,26 @@ _RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 
 
 def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str, Any]:
+    if operation == "list_repo_files":
+        from huggingface_hub import HfApi
+
+        repo_info = HfApi().repo_info(
+            operation_kwargs["repo_id"],
+            timeout=operation_kwargs.get("request_timeout"),
+            files_metadata=False,
+        )
+        siblings = getattr(repo_info, "siblings", None)
+        files: list[str] | None = None
+        if siblings is not None:
+            files = []
+            for sibling in siblings:
+                if isinstance(sibling, dict):
+                    file_name = sibling.get("rfilename") or sibling.get("path")
+                else:
+                    file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+                if isinstance(file_name, str) and file_name:
+                    files.append(file_name)
+        return {"value": {"files": files, "revision": getattr(repo_info, "sha", None)}}
     if operation == "snapshot_download":
         from huggingface_hub import snapshot_download
 

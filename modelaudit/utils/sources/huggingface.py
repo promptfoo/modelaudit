@@ -630,6 +630,7 @@ def _detect_huggingface_content_route_format(
     from modelaudit.utils.file.detection import (
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
         PROTO0_1_MAX_PROBE_BYTES,
+        _allows_renamed_binary_content_route,
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
@@ -681,17 +682,18 @@ def _detect_huggingface_content_route_format(
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
         ):
             return "pickle"
-    executorch_state = _probe_huggingface_executorch_prefix(
-        prefix,
-        sample_is_prefix=_huggingface_sample_is_prefix(
-            budget,
-            filename,
+    if _allows_renamed_binary_content_route(Path(filename)):
+        executorch_state = _probe_huggingface_executorch_prefix(
             prefix,
-            _HF_CONTENT_SNIFF_BYTES,
-        ),
-    )
-    if executorch_state is not False:
-        return "executorch"
+            sample_is_prefix=_huggingface_sample_is_prefix(
+                budget,
+                filename,
+                prefix,
+                _HF_CONTENT_SNIFF_BYTES,
+            ),
+        )
+        if executorch_state is not False:
+            return "executorch"
 
     torch7_route = _detect_huggingface_torch7_route(repo_id, filename, revision, budget, prefix)
     if torch7_route is not None:
@@ -1111,8 +1113,35 @@ def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name:
 def _list_repo_files_with_timeout(
     repo_id: str,
     timeout_seconds: float = 30,
+    *,
+    deadline: float | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
+    if deadline is not None:
+        try:
+            worker_result = _run_huggingface_worker_with_deadline(
+                "list_repo_files",
+                {"repo_id": repo_id, "request_timeout": timeout_seconds},
+                deadline,
+                repo_id,
+            )
+        except Exception as exc:
+            return None, None, str(exc)
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            return None, None, "repository listing returned an invalid response"
+        raw_files = value.get("files")
+        if raw_files is None:
+            return None, None, "repository listing unavailable"
+        if not isinstance(raw_files, list) or not all(isinstance(file_name, str) for file_name in raw_files):
+            return None, None, "repository listing returned invalid filenames"
+        worker_files = cast(list[str], raw_files)
+        revision = value.get("revision")
+        if not _is_huggingface_commit_sha(revision):
+            return worker_files, None, "repository listing did not include an immutable commit SHA"
+        assert isinstance(revision, str)
+        return worker_files, revision, None
+
     from huggingface_hub import HfApi
 
     try:
@@ -1147,6 +1176,7 @@ def _run_huggingface_worker_with_deadline(
         [sys.executable, "-m", "modelaudit.utils.sources._huggingface_download_worker"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         start_new_session=os.name != "nt",
     )
@@ -1575,7 +1605,11 @@ def download_model(
             listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
             if listing_timeout <= 0:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id, listing_timeout)
+        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+            repo_id,
+            listing_timeout,
+            deadline=deadline,
+        )
         if repo_files is None:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
@@ -1739,7 +1773,11 @@ def download_model_streaming(
             listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
             if listing_timeout <= 0:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id, listing_timeout)
+        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+            repo_id,
+            listing_timeout,
+            deadline=deadline,
+        )
         if repo_files is None:
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
                 raise Exception(f"Timeout listing files in repository {repo_id}")
