@@ -8777,6 +8777,7 @@ class TestJITScriptDetector:
         "source",
         [
             "callbacks = [f for f in [eval]]\ncallbacks[0]('1+1')",
+            "callbacks = {name: callback for name, callback in [('run', eval)]}\ncallbacks['run']('1+1')",
             "for _x, callback in zip([0], [eval]):\n    callback('1+1')",
             (
                 "class Base:\n"
@@ -8801,6 +8802,10 @@ class TestJITScriptDetector:
         [
             "callbacks = [f for f in [len]]\ncallbacks[0]([])\nunused = eval",
             "callbacks = [f for f in [eval] if False]\ncallbacks[0]('1+1')",
+            (
+                "callbacks = {name: callback for name, callback in [('run', eval)]}\n"
+                "callbacks['run'] = len\ncallbacks['run']([])"
+            ),
             "for _x, callback in zip([0], [len]):\n    callback([])\nunused = eval",
             (
                 "class Base:\n"
@@ -8819,6 +8824,14 @@ class TestJITScriptDetector:
         findings = JITScriptDetector._dangerous_builtin_calls_in_tree(ast.parse(source))
 
         assert "eval" not in findings
+
+    def test_dangerous_builtin_analysis_handles_deep_folded_getattr_without_recursion(self) -> None:
+        member_expression = " + ".join(["'ev'", *(["''"] * 1_000), "'al'"])
+        tree = ast.parse(f"getattr(__builtins__, {member_expression})('1+1')")
+
+        findings = JITScriptDetector._dangerous_builtin_calls_in_tree(tree)
+
+        assert "eval" in findings
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""

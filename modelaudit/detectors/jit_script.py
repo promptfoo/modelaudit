@@ -10743,13 +10743,8 @@ class JITScriptDetector:
                     binding = self._comprehension_result_binding(node.generators, node.elt)
                     return self._sequence_binding([binding])[2] if binding is not None else {}
                 if isinstance(node, ast.DictComp):
-                    binding = self._comprehension_result_binding(node.generators, node.value)
-                    key_resolved, key = self._constant_container_key(node.key)
-                    return (
-                        self._mapping_binding({key: binding})[2]
-                        if binding is not None and key_resolved and isinstance(key, str)
-                        else {}
-                    )
+                    binding = self._dict_comprehension_binding(node)
+                    return dict(binding[2]) if binding is not None else {}
                 if isinstance(node, (ast.List, ast.Tuple)):
                     resolved: dict[tuple[object, ...], str | None] = {}
                     for index, element in enumerate(node.elts):
@@ -10885,13 +10880,8 @@ class JITScriptDetector:
                     binding = self._comprehension_result_binding(node.generators, node.elt)
                     return self._sequence_binding([binding])[3] if binding is not None else {}
                 if isinstance(node, ast.DictComp):
-                    binding = self._comprehension_result_binding(node.generators, node.value)
-                    key_resolved, key = self._constant_container_key(node.key)
-                    return (
-                        self._mapping_binding({key: binding})[3]
-                        if binding is not None and key_resolved and isinstance(key, str)
-                        else {}
-                    )
+                    binding = self._dict_comprehension_binding(node)
+                    return dict(binding[3]) if binding is not None else {}
                 if isinstance(node, (ast.List, ast.Tuple)):
                     resolved: dict[tuple[object, ...], tuple[tuple[str, int], ...]] = {}
                     for index, element in enumerate(node.elts):
@@ -11204,12 +11194,20 @@ class JITScriptDetector:
                             return set(sorted(candidates)[: self._MAX_CONSTANT_STRING_CANDIDATES])
                     return candidates
                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                    combined: set[str] = set()
-                    for left in self._constant_strings(node.left):
-                        for right in self._constant_strings(node.right):
-                            combined.add(left + right)
-                            if len(combined) >= self._MAX_CONSTANT_STRING_CANDIDATES:
-                                return combined
+                    operands: list[ast.AST] = []
+                    pending: list[ast.AST] = [node]
+                    while pending:
+                        operand = pending.pop()
+                        if isinstance(operand, ast.BinOp) and isinstance(operand.op, ast.Add):
+                            pending.extend((operand.right, operand.left))
+                        else:
+                            operands.append(operand)
+                    combined = {""}
+                    for part_node in operands:
+                        parts = self._constant_strings(part_node)
+                        combined = {prefix + part for prefix in combined for part in parts}
+                        if not combined or len(combined) > self._MAX_CONSTANT_STRING_CANDIDATES:
+                            return set(sorted(combined)[: self._MAX_CONSTANT_STRING_CANDIDATES])
                     return combined
                 if isinstance(node, ast.IfExp):
                     truth = self._constant_truth(node.test)
@@ -13733,6 +13731,23 @@ class JITScriptDetector:
                 finally:
                     self._pop_scope()
 
+            def _dict_comprehension_binding(self, node: ast.DictComp) -> _BuiltinAliasBinding | None:
+                if not node.generators:
+                    return None
+                self._push_scope(kind="comprehension")
+                try:
+                    for generator in node.generators:
+                        if self._constant_iterable_truth(generator.iter) is False:
+                            return None
+                        self._bind_loop_target_from_iterable(generator.target, generator.iter)
+                        if any(self._constant_truth(condition) is False for condition in generator.ifs):
+                            return None
+                    key_binding = self._binding_from_expression(node.key)
+                    value_binding = self._binding_from_expression(node.value)
+                    return self._mapping_binding(dict.fromkeys(key_binding[4], value_binding))
+                finally:
+                    self._pop_scope()
+
             def _visit_comprehension(
                 self,
                 generators: list[ast.comprehension],
@@ -14068,6 +14083,15 @@ class JITScriptDetector:
                 self._bind_container_mutation_call(node)
                 self._bind_runtime_namespace_update_call(node)
 
+            def visit_BinOp(self, node: ast.BinOp) -> None:
+                pending: list[ast.AST] = [node]
+                while pending:
+                    operand = pending.pop()
+                    if isinstance(operand, ast.BinOp):
+                        pending.extend((operand.right, operand.left))
+                    else:
+                        self.visit(operand)
+
         def method_receiver_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
             positional_arguments = [*node.args.posonlyargs, *node.args.args]
             return positional_arguments[0].arg if positional_arguments else None
@@ -14138,6 +14162,9 @@ class JITScriptDetector:
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
                 self.findings.update(class_instance_builtin_findings(node))
                 self.generic_visit(node)
+
+            def visit_BinOp(self, node: ast.BinOp) -> None:
+                return
 
         visitor = DangerousBuiltinCallVisitor()
         visitor.visit(tree)
