@@ -10202,7 +10202,60 @@ class JITScriptDetector:
                     if (summary := self._function_summary_for_node(allocator)) is not None:
                         return summary[1]
                 summary = self._function_summary_for_node(node.func)
-                return summary[1] if summary is not None else None
+                if summary is None:
+                    return None
+                if summary[1] is not None and self._binding_has_tracked_value(summary[1]):
+                    return summary[1]
+                resolved_returns: list[_BuiltinAliasBinding] = []
+                for function_id, positional_offset in summary[2]:
+                    function_node = self.function_nodes.get(function_id)
+                    if function_node is None:
+                        continue
+                    if isinstance(function_node, ast.Lambda):
+                        direct_return = function_node.body if isinstance(function_node.body, ast.Name) else None
+                        body_nodes: list[ast.AST] = [function_node.body]
+                    else:
+                        body_nodes = list(function_node.body)
+                        executable_statements = [
+                            statement
+                            for statement in function_node.body
+                            if not (
+                                isinstance(statement, ast.Expr)
+                                and isinstance(statement.value, ast.Constant)
+                                and isinstance(statement.value.value, str)
+                            )
+                        ]
+                        direct_return = (
+                            executable_statements[0].value
+                            if len(executable_statements) == 1
+                            and isinstance(executable_statements[0], ast.Return)
+                            and isinstance(executable_statements[0].value, ast.Name)
+                            else None
+                        )
+                    if direct_return is None:
+                        continue
+                    default_bindings = self._argument_default_bindings(function_node.args)
+                    global_names = (
+                        set()
+                        if isinstance(function_node, ast.Lambda)
+                        else self._outer_binding_declarations(body_nodes)[0]
+                    )
+                    self._push_scope(
+                        function_node.args,
+                        default_bindings,
+                        self._local_binding_names(body_nodes),
+                        global_names=global_names,
+                    )
+                    try:
+                        self._bind_call_arguments(
+                            function_node.args,
+                            node,
+                            positional_offset=positional_offset,
+                        )
+                        resolved_returns.append(self._binding_from_expression(direct_return))
+                    finally:
+                        self._pop_scope()
+                return self._merge_bindings(resolved_returns) or summary[1]
 
             def _property_return_binding(self, node: ast.AST) -> _BuiltinAliasBinding | None:
                 if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Call):
@@ -10780,6 +10833,8 @@ class JITScriptDetector:
                                 dict_resolved[(key, *path)] = nested_builtin
                     return dict_resolved
                 if isinstance(node, ast.Call):
+                    if popitem_binding := self._mapping_popitem_binding(node):
+                        return dict(popitem_binding[2])
                     if (
                         any(self._is_builtin_helper(node.func, name) for name in ("list", "set", "tuple"))
                         and len(node.args) == 1
@@ -10921,6 +10976,8 @@ class JITScriptDetector:
                             resolved[(key, *path)] = functions
                     return resolved
                 if isinstance(node, ast.Call):
+                    if popitem_binding := self._mapping_popitem_binding(node):
+                        return dict(popitem_binding[3])
                     if (
                         any(self._is_builtin_helper(node.func, name) for name in ("list", "set", "tuple"))
                         and len(node.args) == 1
@@ -11277,6 +11334,62 @@ class JITScriptDetector:
                 default_node = arguments[1] if method in {"get", "setdefault"} and len(arguments) >= 2 else None
                 return container_node, key_node, method, default_node
 
+            def _mapping_popitem_binding(self, node: ast.Call) -> _BuiltinAliasBinding | None:
+                if not isinstance(node.func, ast.Attribute) or node.func.attr != "popitem" or node.keywords:
+                    return None
+                owner = node.func.value
+                if self._is_builtin_helper(owner, "dict"):
+                    if len(node.args) != 1:
+                        return None
+                    container_node = node.args[0]
+                else:
+                    if node.args:
+                        return None
+                    container_node = owner
+                container = self._resolve_builtin_container(container_node)
+                function_container = self._resolve_function_container(container_node)
+                keys = list(
+                    dict.fromkeys(
+                        path[0]
+                        for tracked_container in (container, function_container)
+                        for path in tracked_container
+                        if path
+                    )
+                )
+                if not keys:
+                    return None
+                key = keys[-1]
+                found, builtin, nested = self._container_child_binding(container, key)
+                found_functions, functions, nested_functions = self._container_child_function_binding(
+                    function_container,
+                    key,
+                )
+                if not found and not found_functions:
+                    return None
+                value_binding: _BuiltinAliasBinding = (
+                    builtin,
+                    False,
+                    nested,
+                    nested_functions,
+                    set(),
+                    {},
+                    None,
+                    None,
+                    functions,
+                )
+                key_binding: _BuiltinAliasBinding = (
+                    None,
+                    False,
+                    {},
+                    {},
+                    {key} if isinstance(key, str) else set(),
+                    {},
+                    None,
+                    None,
+                    (),
+                )
+                return self._sequence_binding([key_binding, value_binding])
+
             def _resolve_builtin(self, node: ast.AST) -> str | None:
                 if isinstance(node, ast.Name):
                     return self._lookup_alias(node.id)
@@ -11537,6 +11650,14 @@ class JITScriptDetector:
                     attribute_key = self._attribute_alias_key(target)
                     if attribute_key is not None:
                         self._bind_attribute_key(attribute_key, None)
+                elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                    self._bind_container_mutation_call(
+                        ast.Call(
+                            func=ast.Attribute(value=target.value, attr="pop", ctx=ast.Load()),
+                            args=[target.slice],
+                            keywords=[],
+                        )
+                    )
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for element in target.elts:
                         self._unbind_target(element)
@@ -13918,7 +14039,37 @@ class JITScriptDetector:
                 container = dict(self._lookup_container_alias(container_name))
                 function_container = dict(self._lookup_container_functions(container_name))
                 bindings = self._sequence_container_element_bindings(container, function_container)
-                if node.func.attr == "update" and len(node.args) <= 1:
+                sequence_mutation = False
+                if (
+                    node.func.attr == "pop"
+                    and container_identity not in self.mutable_sequence_identities
+                    and 1 <= len(node.args) <= 2
+                    and not node.keywords
+                ):
+                    key_resolved, key = self._constant_container_key(node.args[0])
+                    if not key_resolved:
+                        return
+                    self._replace_mapping_container_entries(container, {}, {key})
+                    self._replace_mapping_container_entries(function_container, {}, {key})
+                elif (
+                    node.func.attr == "popitem"
+                    and container_identity not in self.mutable_sequence_identities
+                    and not node.args
+                    and not node.keywords
+                ):
+                    keys = list(
+                        dict.fromkeys(
+                            path[0]
+                            for tracked_container in (container, function_container)
+                            for path in tracked_container
+                            if path
+                        )
+                    )
+                    if not keys:
+                        return
+                    self._replace_mapping_container_entries(container, {}, {keys[-1]})
+                    self._replace_mapping_container_entries(function_container, {}, {keys[-1]})
+                elif node.func.attr == "update" and len(node.args) <= 1:
                     replacement = self._resolve_builtin_container(node.args[0]) if node.args else {}
                     replacement_functions = self._resolve_function_container(node.args[0]) if node.args else {}
                     for keyword in node.keywords:
@@ -13951,14 +14102,17 @@ class JITScriptDetector:
                     return
                 elif node.func.attr == "append" and len(node.args) == 1:
                     bindings.append(self._binding_from_expression(node.args[0]))
+                    sequence_mutation = True
                 elif node.func.attr == "insert" and len(node.args) == 2:
                     key_resolved, key = self._constant_container_key(node.args[0])
                     if not key_resolved or not isinstance(key, int):
                         return
                     index = max(0, len(bindings) + key) if key < 0 else min(key, len(bindings))
                     bindings.insert(index, self._binding_from_expression(node.args[1]))
+                    sequence_mutation = True
                 elif node.func.attr == "extend" and len(node.args) == 1:
                     bindings.extend(self._iterator_element_bindings(node.args[0]))
+                    sequence_mutation = True
                 elif node.func.attr == "pop" and len(node.args) <= 1 and bindings:
                     if node.args:
                         key_resolved, key = self._constant_container_key(node.args[0])
@@ -13970,9 +14124,10 @@ class JITScriptDetector:
                     if not 0 <= index < len(bindings):
                         return
                     bindings.pop(index)
+                    sequence_mutation = True
                 else:
                     return
-                if node.func.attr != "update":
+                if sequence_mutation:
                     sequence_binding = self._sequence_binding(bindings)
                     container = sequence_binding[2]
                     function_container = sequence_binding[3]
