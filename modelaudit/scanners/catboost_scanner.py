@@ -10,7 +10,12 @@ import struct
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
-from ._catboost_evidence_redaction import REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS, redact_evidence_string
+from ._catboost_evidence_redaction import (
+    EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
+    REDACTED_EVIDENCE_VALUE,
+    REDACTED_URL_CREDENTIALS,
+    redact_evidence_string,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
@@ -98,6 +103,14 @@ def _decode_base64_evidence_payload(payload: str) -> str:
         return ""
 
 
+def _neutralize_existing_redaction_markers(text: str) -> str:
+    """Prevent attacker-controlled markers from being mistaken for sanitizer output."""
+    return text.replace(REDACTED_URL_CREDENTIALS, "[credentials-redacted marker]").replace(
+        REDACTED_EVIDENCE_VALUE,
+        "[redacted marker]",
+    )
+
+
 def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
     if depth >= 2:
         return text
@@ -107,9 +120,15 @@ def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
         if not decoded_text:
             return match.group(0)
 
+        decoded_text = _neutralize_existing_redaction_markers(decoded_text)
         decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
-        redacted_decoded = redact_evidence_string(_redact_standalone_secret_tokens(decoded_text), max_chars=160)
-        if REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded:
+        standalone_redacted = _redact_standalone_secret_tokens(decoded_text)
+        redacted_decoded = redact_evidence_string(standalone_redacted, max_chars=160)
+        baseline = decoded_text if len(decoded_text) <= 160 else f"{decoded_text[:157]}..."
+        redaction_changed = standalone_redacted != decoded_text or redacted_decoded != baseline
+        if redaction_changed and (
+            REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded
+        ):
             return redacted_decoded
         return match.group(0)
 
@@ -147,6 +166,11 @@ def _redact_urls_for_display(text: str) -> str:
 
 
 def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
+    evidence_budget = max(0, max_chars) + max(
+        EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
+        _MAX_ENCODED_EVIDENCE_CHARS,
+    )
+    text = text[:evidence_budget]
     text = _redact_reversible_base64_evidence(text)
     text = _redact_standalone_secret_tokens(_redact_urls_for_display(text))
     text = redact_evidence_string(text, max_chars=max_chars)

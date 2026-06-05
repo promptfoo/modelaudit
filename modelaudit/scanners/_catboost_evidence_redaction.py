@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunspli
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
+EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
 MAX_KEY_EXPRESSION_CHARS: Final[int] = 300
 MAX_KEY_EXPRESSION_PARSE_ATTEMPTS: Final[int] = 64
@@ -24,8 +25,8 @@ EvaluatedStringValue: TypeAlias = str | EvaluatedStringSequence
 ComparableLiteral: TypeAlias = bool | int | EvaluatedStringValue
 MembershipContainer: TypeAlias = str | list[object] | tuple[object, ...] | frozenset[object]
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
-COMMAND_URL_CONTEXT_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"']+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+")
+COMMAND_URL_CONTEXT_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"']+")
 PYTHON_STRING_PREFIX_RE: Final[str] = r"[rubf]{0,3}"
 PYTHON_LITERAL_OPEN_RE: Final[str] = r"(?:\s*\(\s*)*"
 PYTHON_STRING_LITERAL_FRAGMENT_RE: Final[str] = (
@@ -54,10 +55,15 @@ SERIALIZED_QUOTE_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
 SERIALIZED_BACKSLASH_ESCAPED_QUOTE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)((?:{SERIALIZED_BACKSLASH_ESCAPE_TOKEN})+)(\\+)([\"'])"
 )
+SERIALIZED_SLASH_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\\(?:x2f|u+002f|U0000002f|u\{0*2f\}|0?57|N\{solidus\})"
+)
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
         "access-key",
+        "access_key_id",
+        "access-key-id",
         "access_token",
         "access-token",
         "api_key",
@@ -67,9 +73,13 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "auth-token",
         "client_secret",
         "client-secret",
+        "cookie",
         "credential",
+        "jwt",
+        "passphrase",
         "password",
         "passwd",
+        "pwd",
         "private_key",
         "private-key",
         "refresh_token",
@@ -78,6 +88,11 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "secret",
         "secret_key",
         "secret-key",
+        "session_id",
+        "session-id",
+        "session_token",
+        "session-token",
+        "sessionid",
         "sig",
         "signature",
         "token",
@@ -88,8 +103,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:access[_-]?key(?:[_-]?id)?|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
+    r"cookie|credential|jwt|passphrase|password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|"
+    r"secret[_-]?key|session[_-]?(?:id|token)|sessionid|signature|sig|token)"
 )
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
 ASSIGNMENT_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\s*{ASSIGNMENT_SEPARATOR}\s*")
@@ -145,12 +161,13 @@ COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
 )
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)((?<!\w)--(?:password|passwd|pass|proxy-password|proxy-pass|proxy-tls-?password|tls-?password|"
+    r"(?i)((?<!\w)--(?:password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
+    r"proxy-tls-?password|tls-?password|"
     r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)"
-    r"(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s\"';&|)]+)"
+    r"(?:=|\s+))(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
 COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)([\"']?)([^:\s\"';&|]+:)"
+    r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)(\$?[\"']?)([^:\s\"';&|]+:)"
     r"([^\"'\s;&|)]+)([\"']?)"
 )
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
@@ -159,7 +176,7 @@ STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
 HIGH_ENTROPY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_+/=-]{24,})\b")
 COMMAND_SENSITIVE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*:\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s\"';&|)]+)"
+    r"(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
@@ -296,6 +313,11 @@ def _redact_url(match: re.Match[str]) -> str:
     netloc = parsed.netloc
     if "@" in netloc:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
+    elif ":" in netloc:
+        try:
+            _ = parsed.port
+        except ValueError:
+            netloc = REDACTED_URL_CREDENTIALS
 
     query_parts: list[str] = []
     for part in re.split(r"([&;])", parsed.query):
@@ -343,6 +365,35 @@ def _normalize_serialized_quote_escapes(text: str) -> str:
 
     text = SERIALIZED_BACKSLASH_ESCAPED_QUOTE_RE.sub(replace_backslash_quote, text)
     return SERIALIZED_QUOTE_ESCAPE_RE.sub(replace_escape, text)
+
+
+def _normalize_serialized_url_slashes(text: str) -> str:
+    """Restore serialized slash escapes so URL credentials cannot evade parsing."""
+    for _ in range(3):
+        normalized = SERIALIZED_SLASH_ESCAPE_RE.sub("/", text.replace(r"\/", "/"))
+        if normalized == text:
+            break
+        text = normalized
+    return text
+
+
+def _escape_evidence_controls(text: str) -> str:
+    """Render control and format characters inert before evidence is persisted."""
+    escaped: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char == "\n":
+            escaped.append(r"\n")
+        elif char == "\r":
+            escaped.append(r"\r")
+        elif char == "\t":
+            escaped.append(r"\t")
+        elif category in {"Cc", "Cf", "Cs"} or not char.isprintable():
+            codepoint = ord(char)
+            escaped.append(f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
@@ -1446,6 +1497,8 @@ def _has_sensitive_literal_signal(expression: str) -> bool:
 def _sensitive_key_from_compact(compact: str) -> str | None:
     if "authorization" in compact:
         return "Authorization"
+    if "accesskeyid" in compact:
+        return "access_key_id"
     if "client" in compact and "secret" in compact:
         return "client_secret"
     if "api" in compact and "key" in compact:
@@ -1456,9 +1509,16 @@ def _sensitive_key_from_compact(compact: str) -> str | None:
         "refresh_token",
         "access_token",
         "auth_token",
+        "session_token",
+        "session_id",
+        "sessionid",
+        "passphrase",
         "password",
         "passwd",
+        "cookie",
         "credential",
+        "jwt",
+        "pwd",
         "signature",
         "secret",
         "sig",
@@ -1832,10 +1892,13 @@ def _truncate(text: str, max_chars: int) -> str:
 
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    redacted = _redact_command_context_tokens(text)
-    redacted = URL_RE.sub(_redact_url, redacted)
     redaction_budget = max(0, max_chars) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS
+    url_budget = max(0, max_chars) + EVIDENCE_URL_LOOKAHEAD_CHARS
+    redacted = _escape_evidence_controls(text[:url_budget])
+    redacted = _normalize_serialized_url_slashes(redacted)
+    redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
+    redacted = _redact_command_context_tokens(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
     redacted = _normalize_expression_sensitive_keys(redacted)
     redacted = _normalize_quoted_sensitive_keys(redacted)

