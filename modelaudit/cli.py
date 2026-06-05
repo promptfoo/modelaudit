@@ -133,6 +133,7 @@ class _ScanRuntimeConfig:
     scannable_extensions: frozenset[str] | None
     pytorch_hub_scannable_extensions: frozenset[str] | None
     scannable_filenames: frozenset[str] | None
+    scannable_scanner_ids: frozenset[str] | None
     hf_stream_include_all_files: bool
 
 
@@ -556,6 +557,7 @@ def _resolve_scan_runtime_config(
     scannable_filenames = (
         selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_scanner_ids = scanner_policy.enabled_scanner_ids if scanner_policy.active else None
     hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
@@ -584,6 +586,7 @@ def _resolve_scan_runtime_config(
         scannable_extensions=scannable_extensions,
         pytorch_hub_scannable_extensions=pytorch_hub_scannable_extensions,
         scannable_filenames=scannable_filenames,
+        scannable_scanner_ids=scannable_scanner_ids,
         hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
@@ -1283,6 +1286,8 @@ def _resolve_scan_source_for_path(
                     hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
                 if runtime.scannable_filenames is not None:
                     hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.scannable_scanner_ids is not None:
+                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
                 if runtime.hf_stream_include_all_files:
                     hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
@@ -1290,6 +1295,7 @@ def _resolve_scan_source_for_path(
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
+                    timeout_seconds=runtime.timeout,
                     **hf_stream_kwargs,
                 )
 
@@ -1340,6 +1346,7 @@ def _resolve_scan_source_for_path(
                 cache_dir=hf_cache_dir,
                 show_progress=show_progress,
                 max_size=runtime.max_download_bytes,
+                timeout_seconds=runtime.timeout,
             )
             download_duration = time.time() - download_start
             try:
