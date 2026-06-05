@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import IO, Any
 
 import pytest
+from modelaudit_picklescan.call_graph import import_only_module_requires_origin_review
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
@@ -1490,6 +1491,63 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     ]
     assert jit_failures
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
+
+
+def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    secret = "SECRETKEY1234567890"
+    payload = f"""
+    def payload():
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
+        return eval("1 + 1")
+    """.encode()
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    serialized = result.to_json()
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert secret not in serialized
+    assert any(
+        check.details.get("code_snippet")
+        and 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in check.details["code_snippet"]
+        and 'eval("1 + 1")' in check.details["code_snippet"]
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_redacts_signed_urls_in_explicit_network_findings(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    token = "TOP_SECRET_QUERY"
+    signature = "SIGSECRET1234567890"
+    payload = f"callback = 'https://collector.example/upload?token={token}&X-Amz-Signature={signature}'\n"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/code/__torch__/payload.py", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    serialized = result.to_json()
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    explicit_failure = next(
+        check for check in network_failures if check.details.get("type") == "explicit_network_pattern"
+    )
+    assert token not in serialized
+    assert signature not in serialized
+    assert explicit_failure.details["matched_text"] == "https://collector.example/upload"
+    assert explicit_failure.message == "Explicit network pattern in ML model: https://collector.example/upload"
 
 
 @pytest.mark.parametrize(
@@ -7549,7 +7607,7 @@ def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_p
     )
 
 
-def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path: Path) -> None:
+def test_pytorch_zip_tensor_metadata_truncation_preserves_origin_warning_precedence(tmp_path: Path) -> None:
     max_pkl_read = 10 * 1024 * 1024
     payload = b"A" * (max_pkl_read + 1024)
     zip_path = tmp_path / "late_tensor_metadata.pt"
@@ -7566,12 +7624,13 @@ def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path
         )
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
+    requires_origin_review = import_only_module_requires_origin_review("torch._utils", "_rebuild_tensor_v2")
     _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "truncation-cache",
         "pytorch_zip_tensor_metadata_validation_truncated",
-        expected_success=False,
-        expected_exit_code=2,
+        expected_success=requires_origin_review,
+        expected_exit_code=1 if requires_origin_review else 2,
     )
 
 

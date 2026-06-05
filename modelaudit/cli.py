@@ -142,6 +142,7 @@ class _ScanRuntimeConfig:
     scanner_selection: dict[str, Any] | None
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
+    pytorch_hub_scannable_extensions: frozenset[str] | None
     scannable_filenames: frozenset[str] | None
     hf_stream_include_all_files: bool
 
@@ -562,6 +563,16 @@ def _resolve_scan_runtime_config(
     scannable_extensions = (
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    pytorch_hub_scannable_extensions = scannable_extensions
+    # Header-routed and generic container scanners must see every supported Hub
+    # artifact; suffix filtering here would create selection-specific false negatives.
+    if (
+        scanner_policy.active
+        and pytorch_hub_scannable_extensions is None
+        and scanner_policy.exclude_scanner_ids
+        and not scanner_policy.exact_scanner_ids
+    ):
+        pytorch_hub_scannable_extensions = selected_scanner_extensions(scanner_policy)
     scannable_filenames = (
         selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
     )
@@ -591,6 +602,7 @@ def _resolve_scan_runtime_config(
         scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
+        pytorch_hub_scannable_extensions=pytorch_hub_scannable_extensions,
         scannable_filenames=scannable_filenames,
         hf_stream_include_all_files=hf_stream_include_all_files,
     )
@@ -1417,6 +1429,7 @@ def _resolve_scan_source_for_path(
                     path,
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
+                    scannable_extensions=runtime.pytorch_hub_scannable_extensions,
                     timeout=runtime.timeout,
                 )
                 streaming_result = scan_model_streaming(
@@ -1453,6 +1466,7 @@ def _resolve_scan_source_for_path(
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
                 max_size=runtime.max_download_bytes,
+                scannable_extensions=runtime.pytorch_hub_scannable_extensions,
             )
             download_duration = time.time() - download_start
             try:

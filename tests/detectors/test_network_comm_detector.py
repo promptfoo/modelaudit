@@ -934,6 +934,31 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
 
+    def test_explicit_ml_model_url_patterns_redact_signed_query_material(self) -> None:
+        detector = NetworkCommDetector()
+        token = "TOP_SECRET_QUERY"
+        signature = "SIGSECRET1234567890"
+        data = f"callback = 'https://collector.example/upload?token={token}&X-Amz-Signature={signature}'".encode()
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        serialized = json.dumps(explicit_finding, sort_keys=True)
+        assert token not in serialized
+        assert signature not in serialized
+        assert explicit_finding["matched_text"] == "https://collector.example/upload"
+        assert explicit_finding["message"] == "Explicit network pattern in ML model: https://collector.example/upload"
+
+    def test_explicit_ml_model_url_patterns_keep_benign_url_context(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"source = https://example.com/models/checkpoint.bin"
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        assert explicit_finding["matched_text"] == "https://example.com/models/checkpoint.bin"
+        assert explicit_finding["message"].endswith("https://example.com/models/checkpoint.bin")
+
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
         detector = NetworkCommDetector()
