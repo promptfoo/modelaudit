@@ -2665,7 +2665,7 @@ def test_lambda_dict_output_shape_is_scanned_without_legacy_type_marker(tmp_path
     )
 
 
-def test_lambda_dict_mask_without_legacy_type_marker_is_not_treated_as_executable(tmp_path: Path) -> None:
+def test_lambda_dict_mask_without_legacy_type_marker_is_scanned(tmp_path: Path) -> None:
     encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
     model_path = create_custom_h5_file(
         tmp_path,
@@ -2697,13 +2697,44 @@ def test_lambda_dict_mask_without_legacy_type_marker_is_not_treated_as_executabl
     result = KerasH5Scanner().scan(str(model_path))
 
     assert any(
-        check.name == "Lambda Layer Module Reference Check"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("function") == "relu"
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "dict_mask.mask"
         for check in result.checks
     )
-    assert not any(
-        check.details.get("callback_field") == "mask" or check.details.get("layer_name") == "dict_mask.mask"
+
+
+def test_trusted_keras_submodule_lambda_path_scans_dict_bytecode(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "qualified_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "tensorflow.keras.layers.core.Lambda",
+                        "config": {
+                            "name": "qualified_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="qualified_lambda.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "qualified_lambda"
         for check in result.checks
     )
 

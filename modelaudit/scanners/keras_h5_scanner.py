@@ -104,17 +104,12 @@ class KerasH5Scanner(BaseScanner):
         "tensorflow.python.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
         "tf_keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
     }
-    _QUALIFIED_LAMBDA_LAYER_CLASSES: ClassVar[frozenset[str]] = frozenset(
-        {
-            "keras.layers.Lambda",
-            "keras.layers.core.Lambda",
-            "keras.src.layers.core.lambda_layer.Lambda",
-            "tensorflow.keras.layers.Lambda",
-            "tensorflow.python.keras.layers.core.Lambda",
-            "tf.keras.layers.Lambda",
-            "tf_keras.layers.Lambda",
-            "tf_keras.src.layers.core.lambda_layer.Lambda",
-        }
+    _TRUSTED_LAMBDA_LAYER_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "keras.",
+        "tensorflow.keras.",
+        "tensorflow.python.keras.",
+        "tf.keras.",
+        "tf_keras.",
     )
     _DANGEROUS_LAMBDA_MODULE_TOKENS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1152,6 +1147,7 @@ class KerasH5Scanner(BaseScanner):
         callback_details = {"layer_class": "Lambda", "callback_field": callback_field}
         encoded_function_handled = False
         function_requires_review = False
+        nested_callable_reference: tuple[Any, Any] | None = None
         if isinstance(function_str, dict):
             encoded_function_handled = check_lambda_dict_function(
                 function_str,
@@ -1160,21 +1156,23 @@ class KerasH5Scanner(BaseScanner):
                 callback_layer_name,
             )
             if not encoded_function_handled:
-                function_requires_review = True
-                result.add_check(
-                    name="Lambda Layer Code Analysis",
-                    passed=False,
-                    message="Lambda layer contains unrecognized dict-format function metadata",
-                    severity=IssueSeverity.WARNING,
-                    location=self.current_file_path,
-                    details={
-                        **callback_details,
-                        "function_format": "dict",
-                        "parse_status": "unrecognized",
-                    },
-                    why="Unrecognized Lambda function metadata cannot be safely classified.",
-                    rule_code="S507",
-                )
+                nested_callable_reference = self._lambda_callable_dict_reference(function_str)
+                if nested_callable_reference is None:
+                    function_requires_review = True
+                    result.add_check(
+                        name="Lambda Layer Code Analysis",
+                        passed=False,
+                        message="Lambda layer contains unrecognized dict-format function metadata",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            **callback_details,
+                            "function_format": "dict",
+                            "parse_status": "unrecognized",
+                        },
+                        why="Unrecognized Lambda function metadata cannot be safely classified.",
+                        rule_code="S507",
+                    )
         elif isinstance(function_str, list):
             encoded_function_handled = check_lambda_list_function(
                 function_str,
@@ -1278,28 +1276,42 @@ class KerasH5Scanner(BaseScanner):
             )
             function_requires_review = True
 
-        module_reference_values = (module_name, reference_function_name)
-        has_invalid_module_reference = any(
-            value is not None and not isinstance(value, str) for value in module_reference_values
-        )
-        has_module_reference = any(isinstance(value, str) and bool(value.strip()) for value in module_reference_values)
-        if has_module_reference or has_invalid_module_reference:
-            # Module/function reference - check for dangerous imports
-            if self._is_lambda_module_reference_dangerous(module_name, reference_function_name):
+        module_references: list[tuple[Any, Any, str]] = []
+        if module_name is not None or reference_function_name is not None:
+            module_references.append((module_name, reference_function_name, "layer_config"))
+        if nested_callable_reference is not None:
+            module_references.append((*nested_callable_reference, "function_dict"))
+
+        allowlisted_references: list[tuple[str, str, str]] = []
+        reference_requires_review = encoded_function_handled or function_requires_review
+        for reference_module, reference_function, reference_source in module_references:
+            module_reference_values = (reference_module, reference_function)
+            has_invalid_module_reference = any(
+                value is not None and not isinstance(value, str) for value in module_reference_values
+            )
+            has_module_reference = any(
+                isinstance(value, str) and bool(value.strip()) for value in module_reference_values
+            )
+            if not has_module_reference and not has_invalid_module_reference:
+                continue
+
+            if self._is_lambda_module_reference_dangerous(reference_module, reference_function):
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
-                    message=f"Lambda layer references potentially dangerous module: {module_name}",
+                    message=f"Lambda layer references potentially dangerous module: {reference_module}",
                     severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module": module_name,
-                        "function": reference_function_name,
+                        "module": reference_module,
+                        "function": reference_function,
+                        "reference_source": reference_source,
                     },
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
                 )
+                reference_requires_review = True
             elif has_invalid_module_reference:
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
@@ -1309,28 +1321,16 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module_type": type(module_name).__name__,
-                        "function_type": type(reference_function_name).__name__,
+                        "module_type": type(reference_module).__name__,
+                        "function_type": type(reference_function).__name__,
+                        "reference_source": reference_source,
                     },
                     why="Malformed Lambda module references cannot be safely classified.",
                     rule_code="S1103",
                 )
-            elif encoded_function_handled or function_requires_review:
-                pass
-            elif self._is_lambda_module_reference_allowlisted(module_name, reference_function_name):
-                result.add_check(
-                    name="Lambda Layer Module Reference Check",
-                    passed=True,
-                    message="Lambda layer module reference is allowlisted",
-                    location=self.current_file_path,
-                    details={
-                        **callback_details,
-                        "module": module_name,
-                        "function": reference_function_name,
-                        "allowlist_status": "allowlisted",
-                    },
-                    rule_code=None,  # Passing check
-                )
+                reference_requires_review = True
+            elif self._is_lambda_module_reference_allowlisted(reference_module, reference_function):
+                allowlisted_references.append((reference_module, reference_function, reference_source))
             else:
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
@@ -1340,20 +1340,37 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module": module_name,
-                        "function": reference_function_name,
+                        "module": reference_module,
+                        "function": reference_function,
+                        "reference_source": reference_source,
                         "allowlist_status": "not_allowlisted",
                     },
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
                 )
+                reference_requires_review = True
+
+        if not reference_requires_review:
+            for reference_module, reference_function, reference_source in allowlisted_references:
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=True,
+                    message="Lambda layer module reference is allowlisted",
+                    location=self.current_file_path,
+                    details={
+                        **callback_details,
+                        "module": reference_module,
+                        "function": reference_function,
+                        "reference_source": reference_source,
+                        "allowlist_status": "allowlisted",
+                    },
+                    rule_code=None,
+                )
         if callback_field == "function":
             for auxiliary_field in ("output_shape", "mask"):
                 auxiliary_value = layer_config.get(auxiliary_field)
                 is_serialized_lambda = (
-                    auxiliary_field == "output_shape"
-                    and isinstance(auxiliary_value, dict)
-                    and auxiliary_value.get("class_name") == "__lambda__"
+                    isinstance(auxiliary_value, dict) and auxiliary_value.get("class_name") == "__lambda__"
                 )
                 if layer_config.get(f"{auxiliary_field}_type") in {"function", "lambda"} or is_serialized_lambda:
                     self._check_lambda_layer(
@@ -1371,7 +1388,17 @@ class KerasH5Scanner(BaseScanner):
 
         if layer_class == "Lambda":
             return True
-        return layer_class in KerasH5Scanner._QUALIFIED_LAMBDA_LAYER_CLASSES
+        return layer_class.endswith(".Lambda") and layer_class.startswith(KerasH5Scanner._TRUSTED_LAMBDA_LAYER_PREFIXES)
+
+    @staticmethod
+    def _lambda_callable_dict_reference(function_dict: dict[str, Any]) -> tuple[Any, Any] | None:
+        """Extract a module/function pair from a serialized callable dictionary."""
+        if "function_name" in function_dict:
+            return function_dict.get("module"), function_dict.get("function_name")
+        function_config = function_dict.get("config")
+        if "module" in function_dict and isinstance(function_config, str):
+            return function_dict.get("module"), function_config
+        return None
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
