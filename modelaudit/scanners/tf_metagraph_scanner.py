@@ -14,7 +14,12 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_D
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
-from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, is_sensitive_evidence_key, redact_evidence_string
+from ._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+    REDACTION_LOOKAHEAD_CHARS,
+    is_sensitive_evidence_key,
+    redact_evidence_string,
+)
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
@@ -89,8 +94,13 @@ _FUNCTION_ATTRIBUTE_SUFFIX = ".func.name"
 
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
-    sanitized = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, text)
-    return redact_evidence_string(sanitized, max_chars=max_chars)
+    secret_redacted = redact_evidence_string(text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
+    payload_redacted = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, secret_redacted)
+    if len(payload_redacted) <= max_chars:
+        return payload_redacted
+    if max_chars <= 3:
+        return payload_redacted[:max_chars]
+    return f"{payload_redacted[: max_chars - 3]}..."
 
 
 def _attribute_context_name(attr_name: str) -> str:

