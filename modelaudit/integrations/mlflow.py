@@ -23,12 +23,13 @@ _MLFLOW_DOWNLOAD_BUDGET_CHECK = "MLflow Download Size Check"
 _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES = 10000
 _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
-_MLFLOW_AUTH_VALUE_RE = re.compile(
-    r"(?i)(\b(?:authorization|proxy-authorization)\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s,;]+"
-)
+_OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:access[_-]?key|access[_-]?token|api[_-]?key|credential|password|secret|token)"
-    r"\s*[:=]\s*)[^\s,;]+"
+    r"(?ix)"
+    r"(?P<prefix>(?<![\w-])[\"']?"
+    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credential|password|secret|token)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;}\]]+)"
 )
 
 
@@ -50,12 +51,27 @@ class _MlflowDownloadPlan:
     artifacts: tuple[_MlflowArtifact, ...]
     root_uri: str
     local_artifact_root: Path
+    artifact_path: str | None
+    max_artifact_entries: int
 
 
 class _MlflowArtifactSizeChangedError(Exception):
-    def __init__(self, actual_size: int) -> None:
+    def __init__(self, actual_size: int, *, artifact_path: str | None = None, expected_size: int | None = None) -> None:
         super().__init__(f"artifact size changed to {actual_size} bytes")
         self.actual_size = actual_size
+        self.artifact_path = artifact_path
+        self.expected_size = expected_size
+
+
+class _MlflowArtifactListingExceededError(Exception):
+    pass
+
+
+class _MlflowArtifactSetChangedError(Exception):
+    def __init__(self, added_paths: set[str], removed_paths: set[str]) -> None:
+        super().__init__("artifact file set changed after preflight")
+        self.added_paths = added_paths
+        self.removed_paths = removed_paths
 
 
 def _finite_budget(max_file_size: int, max_total_size: int) -> bool:
@@ -138,8 +154,13 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
 
 def _redact_mlflow_error_for_display(error: object) -> str:
     redacted = redact_cloud_error_for_display(_redact_urls_in_text(str(error)))
-    redacted = _MLFLOW_AUTH_VALUE_RE.sub(r"\1<redacted>", redacted)
-    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(r"\1<redacted>", redacted)
+
+    def _replace_sensitive_value(match: re.Match[str]) -> str:
+        value = match.group("value")
+        quote = value[0] if value[:1] in {'"', "'"} else ""
+        return f"{match.group('prefix')}{quote}<redacted>{quote}"
+
+    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
     if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
         return redacted
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
@@ -239,46 +260,150 @@ def _copy_local_mlflow_artifact(
     destination: Path,
 ) -> int:
     """Copy one local artifact without writing more than its preflight size."""
-    source_path = source_root
-    for part in PurePosixPath(artifact.path).parts:
-        source_path /= part
-        if source_path.is_symlink():
-            raise ValueError("artifact source path contains a symbolic link")
-
-    resolved_source = source_path.resolve(strict=True)
-    if not resolved_source.is_relative_to(source_root):
-        raise ValueError("artifact source path escaped the repository root")
-
     destination.parent.mkdir(parents=True, exist_ok=True)
     copied_size = 0
+    source_fd: int | None = None
     try:
-        with resolved_source.open("rb") as source:
-            source_stat = os.fstat(source.fileno())
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise ValueError("artifact source path is not a regular file")
-            if source_stat.st_size != artifact.size:
-                raise _MlflowArtifactSizeChangedError(source_stat.st_size)
+        source_fd = _open_local_mlflow_artifact(source_root, artifact.path)
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("artifact source path is not a regular file")
+        if source_stat.st_size != artifact.size:
+            raise _MlflowArtifactSizeChangedError(source_stat.st_size)
 
-            with destination.open("xb") as output:
-                while copied_size < artifact.size:
-                    chunk = source.read(min(_MLFLOW_COPY_CHUNK_SIZE, artifact.size - copied_size))
-                    if not chunk:
-                        break
-                    output.write(chunk)
-                    copied_size += len(chunk)
+        with destination.open("xb") as output:
+            while copied_size < artifact.size:
+                chunk = os.read(source_fd, min(_MLFLOW_COPY_CHUNK_SIZE, artifact.size - copied_size))
+                if not chunk:
+                    break
+                output.write(chunk)
+                copied_size += len(chunk)
 
-                extra_byte = source.read(1)
-                final_source_size = os.fstat(source.fileno()).st_size
-                if copied_size != artifact.size or extra_byte or final_source_size != artifact.size:
-                    actual_size = final_source_size
-                    if actual_size == artifact.size:
-                        actual_size = copied_size + len(extra_byte)
-                    raise _MlflowArtifactSizeChangedError(actual_size)
+            extra_byte = os.read(source_fd, 1)
+            final_source_size = os.fstat(source_fd).st_size
+            if copied_size != artifact.size or extra_byte or final_source_size != artifact.size:
+                actual_size = final_source_size
+                if actual_size == artifact.size:
+                    actual_size = copied_size + len(extra_byte)
+                raise _MlflowArtifactSizeChangedError(actual_size)
     except Exception:
         destination.unlink(missing_ok=True)
         raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
 
     return copied_size
+
+
+def _open_local_mlflow_artifact(source_root: Path, artifact_path: str) -> int:
+    """Open a repository file without following replaceable path components."""
+    parts = PurePosixPath(artifact_path).parts
+    if not parts:
+        raise ValueError("artifact source path is empty")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    supports_secure_walk = nofollow and _OS_OPEN_SUPPORTS_DIR_FD
+
+    if supports_secure_walk:
+        current_fd = os.open(source_root, os.O_RDONLY | directory | nofollow | cloexec)
+        try:
+            for part in parts[:-1]:
+                next_fd = os.open(part, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return os.open(parts[-1], os.O_RDONLY | nofollow | nonblock | cloexec, dir_fd=current_fd)
+        finally:
+            os.close(current_fd)
+
+    source_path = source_root
+    for part in parts:
+        source_path /= part
+        if source_path.is_symlink():
+            raise ValueError("artifact source path contains a symbolic link")
+    resolved_source = source_path.resolve(strict=True)
+    if not resolved_source.is_relative_to(source_root):
+        raise ValueError("artifact source path escaped the repository root")
+    source_fd = os.open(resolved_source, os.O_RDONLY | nofollow | nonblock | cloexec)
+    try:
+        path_stat = resolved_source.stat(follow_symlinks=False)
+        opened_stat = os.fstat(source_fd)
+        if (path_stat.st_dev, path_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
+            raise ValueError("artifact source path changed while opening")
+    except Exception:
+        os.close(source_fd)
+        raise
+    return source_fd
+
+
+def _snapshot_local_mlflow_artifacts(
+    source_root: Path,
+    artifact_path: str | None,
+    max_artifact_entries: int,
+) -> dict[str, int]:
+    """Return the regular files currently present under the requested local artifact."""
+    requested_parts = PurePosixPath(artifact_path).parts if artifact_path else ()
+    requested_path = source_root.joinpath(*requested_parts)
+    if requested_path.is_symlink():
+        raise ValueError("artifact source path contains a symbolic link")
+    resolved_requested_path = requested_path.resolve(strict=True)
+    if not resolved_requested_path.is_relative_to(source_root):
+        raise ValueError("artifact source path escaped the repository root")
+
+    requested_stat = resolved_requested_path.stat(follow_symlinks=False)
+    if stat.S_ISREG(requested_stat.st_mode):
+        if artifact_path is None:
+            raise ValueError("artifact repository root is not a directory")
+        return {artifact_path: requested_stat.st_size}
+    if not stat.S_ISDIR(requested_stat.st_mode):
+        raise ValueError("artifact source path is not a regular file or directory")
+
+    snapshot: dict[str, int] = {}
+    entry_count = 0
+    pending_dirs = [resolved_requested_path]
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
+        with os.scandir(current_dir) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > max_artifact_entries:
+                    raise _MlflowArtifactListingExceededError
+                if entry.is_symlink():
+                    raise ValueError("artifact source path contains a symbolic link")
+                entry_stat = entry.stat(follow_symlinks=False)
+                entry_path = Path(entry.path)
+                relative_path = entry_path.relative_to(source_root).as_posix()
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    pending_dirs.append(entry_path)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    snapshot[relative_path] = entry_stat.st_size
+                else:
+                    raise ValueError(f"artifact source path is not a regular file: {relative_path}")
+    return snapshot
+
+
+def _verify_local_mlflow_artifact_set(plan: _MlflowDownloadPlan) -> None:
+    current_artifacts = _snapshot_local_mlflow_artifacts(
+        plan.local_artifact_root,
+        plan.artifact_path,
+        plan.max_artifact_entries,
+    )
+    expected_artifacts = {artifact.path: artifact.size for artifact in plan.artifacts}
+    added_paths = current_artifacts.keys() - expected_artifacts.keys()
+    removed_paths = expected_artifacts.keys() - current_artifacts.keys()
+    if added_paths or removed_paths:
+        raise _MlflowArtifactSetChangedError(set(added_paths), set(removed_paths))
+    for artifact_path, expected_size in expected_artifacts.items():
+        actual_size = current_artifacts[artifact_path]
+        if actual_size != expected_size:
+            raise _MlflowArtifactSizeChangedError(
+                actual_size,
+                artifact_path=artifact_path,
+                expected_size=expected_size,
+            )
 
 
 def _bounded_artifact_listing(
@@ -521,18 +646,57 @@ def _preflight_mlflow_download_budget(
         )
 
     if file_count == 0:
-        details["reason"] = "artifact_size_unavailable"
-        details["artifact_file_count"] = 0
-        return _mlflow_budget_failure_result(
-            model_uri,
-            "Unable to determine MLflow artifact size before download",
-            details,
-        )
+        try:
+            current_artifacts = _snapshot_local_mlflow_artifacts(
+                local_artifact_root,
+                normalized_initial_path,
+                max_artifact_entries,
+            )
+        except _MlflowArtifactListingExceededError:
+            details.update(
+                {
+                    "reason": "artifact_listing_budget_exceeded",
+                    "artifact_entry_count": max_artifact_entries + 1,
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
+                details,
+            )
+        except (OSError, ValueError) as exc:
+            details.update(
+                {
+                    "reason": "artifact_size_unavailable",
+                    "artifact_file_count": 0,
+                    "error": _redact_mlflow_error_for_display(exc),
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                "Unable to determine MLflow artifact size before download",
+                details,
+            )
+        if current_artifacts:
+            details.update(
+                {
+                    "reason": "artifact_size_unavailable",
+                    "artifact_file_count": 0,
+                    "error": "Artifact listing omitted files present in the local repository",
+                }
+            )
+            return _mlflow_budget_failure_result(
+                model_uri,
+                "Unable to determine MLflow artifact size before download",
+                details,
+            )
 
     return _MlflowDownloadPlan(
         artifacts=tuple(planned_artifacts.values()),
         root_uri=root_uri,
         local_artifact_root=local_artifact_root,
+        artifact_path=normalized_initial_path,
+        max_artifact_entries=max_artifact_entries,
     )
 
 
@@ -554,6 +718,61 @@ def _download_preflighted_mlflow_artifacts(
 
     download_root = Path(download_dir).resolve()
     actual_total_size = 0
+    try:
+        _verify_local_mlflow_artifact_set(plan)
+    except _MlflowArtifactListingExceededError:
+        details.update(
+            {
+                "reason": "artifact_listing_budget_exceeded",
+                "artifact_entry_count": plan.max_artifact_entries + 1,
+                "max_artifact_entries": plan.max_artifact_entries,
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            f"MLflow artifact listing exceeded {plan.max_artifact_entries} entries before download",
+            details,
+        )
+    except _MlflowArtifactSetChangedError as exc:
+        details.update(
+            {
+                "reason": "artifact_download_set_changed",
+                "added_artifact_paths": sorted(exc.added_paths)[:10],
+                "removed_artifact_paths": sorted(exc.removed_paths)[:10],
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "MLflow artifact file set changed after preflight",
+            details,
+        )
+    except _MlflowArtifactSizeChangedError as exc:
+        details.update(
+            {
+                "reason": "artifact_download_size_changed",
+                "artifact_path": exc.artifact_path,
+                "expected_artifact_size": exc.expected_size,
+                "downloaded_artifact_size": exc.actual_size,
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "MLflow artifact size changed after preflight",
+            details,
+        )
+    except (OSError, ValueError) as exc:
+        details.update(
+            {
+                "reason": "artifact_download_verification_failed",
+                "error": _redact_mlflow_error_for_display(exc),
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to verify downloaded MLflow artifact",
+            details,
+        )
+
     for artifact in plan.artifacts:
         local_path = download_root.joinpath(*PurePosixPath(artifact.path).parts)
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -639,6 +858,28 @@ def _download_preflighted_mlflow_artifacts(
                 f"(max: {max_total_size})",
                 details,
             )
+
+    try:
+        _verify_local_mlflow_artifact_set(plan)
+    except (_MlflowArtifactListingExceededError, _MlflowArtifactSetChangedError, _MlflowArtifactSizeChangedError):
+        details["reason"] = "artifact_download_set_changed"
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "MLflow artifact file set changed during download",
+            details,
+        )
+    except (OSError, ValueError) as exc:
+        details.update(
+            {
+                "reason": "artifact_download_verification_failed",
+                "error": _redact_mlflow_error_for_display(exc),
+            }
+        )
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to verify downloaded MLflow artifact",
+            details,
+        )
 
     return str(download_root)
 
