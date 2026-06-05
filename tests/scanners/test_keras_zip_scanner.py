@@ -5629,6 +5629,49 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["module"] == "posix"
 
+    def test_compile_config_serialized_native_function_is_critical(self, tmp_path: Path) -> None:
+        """Compile-time losses and metrics are deserialized and require the same module checks."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense",
+                        "module": "keras.layers",
+                        "config": {"units": 1},
+                    }
+                ]
+            },
+            "compile_config": {
+                "loss": {
+                    "module": "posix",
+                    "class_name": "function",
+                    "config": "system",
+                },
+                "metrics": {
+                    "output": [
+                        {
+                            "module": "nt",
+                            "class_name": "function",
+                            "config": "system",
+                        }
+                    ]
+                },
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert {issue.details["module"] for issue in cve_issues} == {"nt", "posix"}
+        assert all(issue.severity == IssueSeverity.CRITICAL for issue in cve_issues)
+        assert {issue.details["layer_name"] for issue in cve_issues} == {
+            "compile_config.loss",
+            "compile_config.metrics",
+        }
+
     def test_nested_non_object_module_metadata_is_not_flagged(self, tmp_path: Path) -> None:
         """Arbitrary metadata dictionaries should not be treated as serialized Keras objects."""
         scanner = KerasZipScanner()
@@ -5642,7 +5685,11 @@ class TestCVE20251550ModuleReferences:
                         "module": "keras.layers",
                         "config": {
                             "units": 1,
-                            "metadata": {"class_name": "Report", "module": "posix"},
+                            "metadata": {
+                                "class_name": "Report",
+                                "module": "posix",
+                                "config": {"summary": "Runtime compatibility report"},
+                            },
                         },
                     }
                 ]

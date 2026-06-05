@@ -138,6 +138,53 @@ _EXACT_DANGEROUS_CONFIG_MODULES = frozenset(
     }
 )
 
+_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
+    {
+        "activation",
+        "activity_regularizer",
+        "backward_layer",
+        "beta_initializer",
+        "bias_constraint",
+        "bias_initializer",
+        "bias_regularizer",
+        "callable",
+        "cell",
+        "cells",
+        "depthwise_constraint",
+        "depthwise_initializer",
+        "depthwise_regularizer",
+        "embeddings_constraint",
+        "embeddings_initializer",
+        "embeddings_regularizer",
+        "fn",
+        "forward_layer",
+        "function",
+        "gamma_initializer",
+        "kernel_constraint",
+        "kernel_initializer",
+        "kernel_regularizer",
+        "layer",
+        "layers",
+        "loss",
+        "losses",
+        "metric",
+        "metrics",
+        "moving_mean_initializer",
+        "moving_variance_initializer",
+        "optimizer",
+        "output_activation",
+        "pointwise_constraint",
+        "pointwise_initializer",
+        "pointwise_regularizer",
+        "recurrent_activation",
+        "recurrent_constraint",
+        "recurrent_initializer",
+        "recurrent_regularizer",
+        "schedule",
+        "weighted_metrics",
+    }
+)
+
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
@@ -1488,6 +1535,13 @@ class KerasZipScanner(BaseScanner):
             "compile_config.weighted_metrics",
         )
         self._check_custom_loss_config(compile_config.get("loss"), result, "compile_config.loss")
+        for key in ("optimizer", "loss", "metrics", "weighted_metrics"):
+            self._check_nested_serialized_module_references(
+                compile_config.get(key),
+                result,
+                f"compile_config.{key}",
+                trusted_container=True,
+            )
 
     def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
         """Flag custom metrics embedded anywhere in a serialized metric tree."""
@@ -1689,22 +1743,33 @@ class KerasZipScanner(BaseScanner):
 
     def _check_nested_serialized_module_references(
         self,
-        layer_config: dict[str, Any],
+        config_value: Any,
         result: ScanResult,
         layer_name: str,
+        *,
+        trusted_container: bool = False,
     ) -> None:
         """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
-        pending: list[Any] = list(layer_config.values())
+        pending: list[tuple[Any, str | None, bool]] = [(config_value, None, trusted_container)]
         while pending:
-            node = pending.pop()
+            node, parent_key, container_is_trusted = pending.pop()
             if isinstance(node, list):
-                pending.extend(node)
+                pending.extend((item, parent_key, container_is_trusted) for item in node)
                 continue
             if not isinstance(node, dict):
                 continue
 
             object_class = node.get("class_name")
-            if isinstance(object_class, str) and "config" in node:
+            serialized_shape = isinstance(object_class, str) and "config" in node
+            is_serialized_object = serialized_shape and (
+                container_is_trusted
+                or parent_key in _NESTED_SERIALIZED_OBJECT_KEYS
+                or "registered_name" in node
+                or object_class == "function"
+                or self._is_lambda_layer_class(object_class)
+            )
+            if is_serialized_object:
+                assert isinstance(object_class, str)
                 for key in ("module", "fn_module"):
                     module_value = node.get(key)
                     if isinstance(module_value, str) and module_value.strip():
@@ -1716,7 +1781,15 @@ class KerasZipScanner(BaseScanner):
                             result,
                             layer_name,
                         )
-            pending.extend(node.values())
+            elif serialized_shape:
+                continue
+
+            next_container_is_trusted = container_is_trusted and not is_serialized_object
+            pending.extend(
+                (value, str(key).lower(), next_container_is_trusted)
+                for key, value in node.items()
+                if key not in {"module", "fn_module", "class_name", "registered_name"}
+            )
 
     def _check_layer_module_references(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check layer config for dangerous module references (CVE-2025-1550).
