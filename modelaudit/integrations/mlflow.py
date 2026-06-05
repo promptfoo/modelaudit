@@ -232,24 +232,36 @@ def _local_runs_mlflow_sources(
     artifact_path: str | None,
 ) -> tuple[_MlflowLocalSource, ...] | None:
     """Resolve the local repositories that a runs:/ adapter overlays."""
-    run_root = _local_mlflow_artifact_root(getattr(artifact_repository, "repo", None))
+    run_repository = getattr(artifact_repository, "repo", None)
+    run_root = _local_mlflow_artifact_root(run_repository)
     if run_root is None:
         return None
 
-    sources = [_MlflowLocalSource(run_root, artifact_path, artifact_path)]
     get_logged_model_repository = getattr(artifact_repository, "_get_logged_model_artifact_repo", None)
     parse_runs_uri = getattr(artifact_repository, "parse_runs_uri", None)
     wrapper_uri = getattr(artifact_repository, "artifact_uri", None)
-    if not artifact_path and not wrapper_uri:
-        return tuple(sources)
-    if not callable(get_logged_model_repository) or not callable(parse_runs_uri) or not isinstance(wrapper_uri, str):
-        return tuple(sources)
-
-    run_id, wrapper_path = parse_runs_uri(wrapper_uri)
+    run_id: str | None = None
+    wrapper_path: str | None = None
+    if callable(parse_runs_uri) and isinstance(wrapper_uri, str):
+        run_id, wrapper_path = parse_runs_uri(wrapper_uri)
     effective_path = (
         posixpath.join(wrapper_path, artifact_path) if wrapper_path and artifact_path else wrapper_path or artifact_path
     )
-    if not effective_path:
+
+    run_artifact_path = artifact_path
+    if wrapper_path and effective_path:
+        wrapper_parts = tuple(os.path.normcase(part) for part in PurePosixPath(wrapper_path).parts)
+        run_root_suffix = tuple(os.path.normcase(part) for part in run_root.parts[-len(wrapper_parts) :])
+        run_root_is_scoped = (
+            isinstance(getattr(run_repository, "artifact_uri", None), str)
+            and len(run_root.parts) >= len(wrapper_parts)
+            and run_root_suffix == wrapper_parts
+        )
+        if not run_root_is_scoped:
+            run_artifact_path = effective_path
+
+    sources = [_MlflowLocalSource(run_root, run_artifact_path, artifact_path)]
+    if not effective_path or run_id is None or not callable(get_logged_model_repository):
         return tuple(sources)
 
     model_name, separator, model_artifact_path = effective_path.partition("/")
@@ -475,12 +487,17 @@ def _snapshot_local_mlflow_sources(
     """Snapshot local sources using MLflow's model-over-run overlay order."""
     artifacts: dict[str, _MlflowArtifact] = {}
     entry_count = 0
+    source_found = False
     for source in sources:
-        snapshot, source_entry_count = _snapshot_local_mlflow_artifacts(
-            source.root,
-            source.artifact_path,
-            max_artifact_entries - entry_count,
-        )
+        try:
+            snapshot, source_entry_count = _snapshot_local_mlflow_artifacts(
+                source.root,
+                source.artifact_path,
+                max_artifact_entries - entry_count,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        source_found = True
         entry_count += source_entry_count
         for source_path, size in snapshot.items():
             artifact_path = _normalize_mlflow_artifact_path(_map_local_source_path(source, source_path))
@@ -490,6 +507,9 @@ def _snapshot_local_mlflow_sources(
                 source_root=source.root,
                 source_path=source_path,
             )
+
+    if not source_found:
+        raise FileNotFoundError("requested artifact was not present in any local MLflow source")
 
     artifact_paths = set(artifacts)
     for artifact_path in artifact_paths:

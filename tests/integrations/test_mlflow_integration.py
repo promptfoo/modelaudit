@@ -15,6 +15,8 @@ from modelaudit.integrations.mlflow import (
     _mlflow_budget_failure_result,
     _MlflowArtifact,
     _MlflowArtifactSizeChangedError,
+    _MlflowLocalSource,
+    _snapshot_local_mlflow_sources,
     scan_mlflow_model,
 )
 
@@ -24,6 +26,20 @@ def _write_local_artifacts(source_root: Path, artifact_sizes: dict[str, int]) ->
         source_path = source_root.joinpath(*artifact_path.split("/"))
         source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(b"x" * artifact_size)
+
+
+def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path: Path) -> None:
+    source_root = tmp_path / "artifacts"
+    empty_artifact = source_root / "empty"
+    empty_artifact.mkdir(parents=True)
+
+    artifacts, entry_count = _snapshot_local_mlflow_sources(
+        (_MlflowLocalSource(source_root, "empty", "empty"),),
+        max_artifact_entries=10,
+    )
+
+    assert artifacts == {}
+    assert entry_count == 0
 
 
 def test_local_mlflow_artifact_root_preserves_runs_repository(tmp_path: Path) -> None:
@@ -228,6 +244,181 @@ def test_scan_mlflow_model_preserves_local_logged_model_overlay(
     assert (download_dir / "model" / "run-only.bin").read_bytes() == b"xxx"
     assert (download_dir / "model" / "logged-only.bin").read_bytes() == b"xx"
     assert (download_dir / "model" / "shared.bin").read_bytes() == b"xxxxx"
+    mock_scan.assert_called_once()
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_scan_mlflow_model_allows_logged_model_without_run_artifact(tmp_path: Path) -> None:
+    """A missing run-side path must not hide a bounded logged-model artifact."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1"
+
+        def __init__(self, run_repository: object, logged_model_repository: object) -> None:
+            self.repo = run_repository
+            self.logged_model_repository = logged_model_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1"
+            return "run-1", None
+
+        def _get_logged_model_artifact_repo(self, run_id: str, name: str) -> object:
+            assert (run_id, name) == ("run-1", "model")
+            return self.logged_model_repository
+
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    run_root = tmp_path / "run-artifacts"
+    run_root.mkdir()
+    logged_model_root = tmp_path / "logged-model-artifacts"
+    _write_local_artifacts(logged_model_root, {"model.pkl": 4})
+    repository = RunsArtifactRepository(
+        LocalArtifactRepository(run_root),
+        LocalArtifactRepository(logged_model_root),
+    )
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "runs:/run-1",
+        "model",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+                "mlflow.store.artifact.runs_artifact_repo": runs_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model(
+            "runs:/run-1/model",
+            max_file_size=4,
+            max_total_size=4,
+        )
+
+    assert result == scan_result
+    assert (download_dir / "model" / "model.pkl").read_bytes() == b"xxxx"
+    mock_scan.assert_called_once()
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("repository_scoped", [False, True], ids=["unscoped", "scoped"])
+def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, repository_scoped: bool) -> None:
+    """Run repositories must apply the wrapper prefix exactly once."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path, artifact_uri: str | None = None) -> None:
+            self.artifact_dir = artifact_dir
+            self.artifact_uri = artifact_uri
+
+    class ModelsArtifactRepository:
+        pass
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1/model"
+
+        def __init__(self, run_repository: object) -> None:
+            self.repo = run_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1/model"
+            return "run-1", "model"
+
+        @staticmethod
+        def _get_logged_model_artifact_repo(run_id: str, name: str) -> None:
+            assert (run_id, name) == ("run-1", "model")
+            return None
+
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    if repository_scoped:
+        run_root = tmp_path / "run-artifacts" / "model"
+        artifact_sizes = {
+            "subdir/right.bin": 4,
+            "model/subdir/wrong.bin": 3,
+        }
+        artifact_uri = "file:///run-artifacts/model"
+    else:
+        run_root = tmp_path / "run-artifacts"
+        artifact_sizes = {
+            "subdir/wrong.bin": 3,
+            "model/subdir/right.bin": 4,
+        }
+        artifact_uri = None
+    _write_local_artifacts(run_root, artifact_sizes)
+    repository = RunsArtifactRepository(LocalArtifactRepository(run_root, artifact_uri=artifact_uri))
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "runs:/run-1/model",
+        "subdir",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+                "mlflow.store.artifact.runs_artifact_repo": runs_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model(
+            "runs:/run-1/model/subdir",
+            max_file_size=4,
+            max_total_size=4,
+        )
+
+    assert result == scan_result
+    assert (download_dir / "subdir" / "right.bin").read_bytes() == b"xxxx"
+    assert not (download_dir / "subdir" / "wrong.bin").exists()
     mock_scan.assert_called_once()
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
