@@ -9852,9 +9852,16 @@ def _compact_snippet_mutates_module_name(tree: ast.Module, target_name: str) -> 
     def update_writes_target(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
         if any(keyword.arg == target_name for keyword in keywords):
             return True
-        return any(
+        if any(
             isinstance(argument, ast.Dict) and any(key is not None and static_target_key(key) for key in argument.keys)
             for argument in arguments
+        ):
+            return True
+        return any(
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Dict)
+            and any(key is not None and static_target_key(key) for key in keyword.value.keys)
+            for keyword in keywords
         )
 
     def call_writes_print(call: ast.Call) -> bool:
@@ -10486,13 +10493,42 @@ def _compact_snippet_captured_runpy_high_risk_calls(
     captured_members: dict[str, tuple[str, int]] = {}
     dangerous_calls: set[tuple[str, str]] = set()
     parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    def captured_member(value: ast.AST, lineno: int) -> tuple[str, int] | None:
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in runpy_aliases
+            and value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+        ):
+            return (value.attr, lineno)
+        if isinstance(value, ast.Name):
+            return captured_members.get(value.id)
+        return None
+
+    def bind_captured_target(target: ast.AST, value: ast.AST, lineno: int) -> None:
+        if isinstance(target, ast.Name):
+            capture = captured_member(value, lineno)
+            if capture is None:
+                captured_members.pop(target.id, None)
+            else:
+                captured_members[target.id] = capture
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_captured_target(target_item, value_item, lineno)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for name in _assignment_target_names(target):
+                captured_members.pop(name, None)
+
     for statement in _compact_deterministically_executed_statements(tree.body):
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
         if isinstance(statement, ast.Import):
             for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                captured_members.pop(local_name, None)
                 if alias.name == "runpy":
-                    runpy_aliases.add(alias.asname or "runpy")
+                    runpy_aliases.add(local_name)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 if (
@@ -10504,18 +10540,15 @@ def _compact_snippet_captured_runpy_high_risk_calls(
                     and statement.value.id == "print"
                 ):
                     first_safe_write.setdefault(target.attr, statement.lineno)
-                elif (
-                    isinstance(target, ast.Name)
-                    and isinstance(statement.value, ast.Attribute)
-                    and isinstance(statement.value.value, ast.Name)
-                    and statement.value.value.id in runpy_aliases
-                    and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
-                ):
-                    captured_members[target.id] = (statement.value.attr, statement.lineno)
-                elif isinstance(target, ast.Name) and isinstance(statement.value, ast.Name):
-                    captured = captured_members.get(statement.value.id)
-                    if captured is not None:
-                        captured_members[target.id] = captured
+                bind_captured_target(target, statement.value, statement.lineno)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_captured_target(statement.target, statement.value, statement.lineno)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                for name in _assignment_target_names(target):
+                    captured_members.pop(name, None)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            captured_members.pop(statement.name, None)
         for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
             for node in _deterministically_executed_expression_calls(value):
                 if (
@@ -10927,11 +10960,17 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                         record_builtins_helper_assignment(_static_getattr_member_name(dict_key_node), dict_value_node)
 
     def bind_mapping_alias(target: ast.AST, value: ast.AST) -> None:
-        if isinstance(target, ast.Name) and (owner := owner_name(value)) is not None:
-            mapping_aliases[target.id] = owner
+        if isinstance(target, ast.Name):
+            if (owner := owner_name(value)) is None:
+                mapping_aliases.pop(target.id, None)
+            else:
+                mapping_aliases[target.id] = owner
         elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 bind_mapping_alias(target_item, value_item)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for name in _assignment_target_names(target):
+                mapping_aliases.pop(name, None)
 
     def record_setattr_shadow(target: ast.AST, value: ast.AST) -> None:
         nonlocal local_setattr_shadowed, builtins_setattr_shadowed
@@ -11130,6 +11169,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             for target in statement.targets:
                 if isinstance(target, ast.Name):
                     typed_aliases.pop(target.id, None)
+                    mapping_aliases.pop(target.id, None)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
             if is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
@@ -11414,29 +11454,48 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     ):
                         record_runpy_member_value(member_name, dict_value_node, inactive=inactive)
 
+    def dangerous_runpy_member(value: ast.AST) -> str | None:
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in runpy_aliases
+            and value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+            and value.attr not in safe_runpy_members
+        ):
+            return value.attr
+        if isinstance(value, ast.Name):
+            return dangerous_runpy_value_names.get(value.id)
+        return None
+
+    def bind_dangerous_runpy_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            if (member_name := dangerous_runpy_member(value)) is None:
+                dangerous_runpy_value_names.pop(target.id, None)
+            else:
+                dangerous_runpy_value_names[target.id] = member_name
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_dangerous_runpy_target(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                dangerous_runpy_value_names.pop(target_name, None)
+
     for statement in _deterministically_executed_statements(tree.body):
         if isinstance(statement, ast.Import):
             for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                dangerous_runpy_value_names.pop(local_name, None)
                 if alias.name == "builtins":
                     builtins_aliases.add(alias.asname or "builtins")
                 elif alias.name == "runpy":
                     runpy_aliases.add(alias.asname or "runpy")
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                dangerous_runpy_value_names.pop(alias.asname or alias.name, None)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
+                bind_dangerous_runpy_target(target, statement.value)
                 value_reference = _simple_reference_name(statement.value)
-                if isinstance(target, ast.Name):
-                    if (
-                        isinstance(statement.value, ast.Attribute)
-                        and isinstance(statement.value.value, ast.Name)
-                        and statement.value.value.id in runpy_aliases
-                        and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
-                        and statement.value.attr not in safe_runpy_members
-                    ):
-                        dangerous_runpy_value_names[target.id] = statement.value.attr
-                    elif isinstance(statement.value, ast.Name) and statement.value.id in dangerous_runpy_value_names:
-                        dangerous_runpy_value_names[target.id] = dangerous_runpy_value_names[statement.value.id]
-                    else:
-                        dangerous_runpy_value_names.pop(target.id, None)
                 if (
                     isinstance(target, ast.Name)
                     and value_reference is not None
@@ -11674,6 +11733,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     and _static_getattr_member_name(target.slice) == "getattr"
                 ):
                     record_builtins_member_value("getattr", statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_dangerous_runpy_target(statement.target, statement.value)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
             if is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
@@ -11685,6 +11746,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                         record_runpy_member_value(member_name, value_node, inactive=False)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    dangerous_runpy_value_names.pop(target_name, None)
                 if isinstance(target, ast.Name) and target.id == "vars":
                     vars_shadowed = False
                     vars_helper_names.add("vars")
@@ -11707,6 +11770,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     and (member_name := _runpy_static_member_key(target.slice)) is not None
                 ):
                     record_runpy_delete(member_name)
+        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            dangerous_runpy_value_names.pop(statement.name, None)
         if isinstance(statement, (ast.If, ast.Try, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for node in ast.walk(statement):

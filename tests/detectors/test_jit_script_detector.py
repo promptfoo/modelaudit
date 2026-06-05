@@ -7203,6 +7203,7 @@ class TestJITScriptDetector:
         [
             b"globals()['setattr'] = lambda *args: None\n",
             b"globals().update(setattr=lambda *args: None)\n",
+            b"globals().update(**{'setattr': lambda *args: None})\n",
             b"namespace = globals()\nnamespace.__setitem__('setattr', lambda *args: None)\n",
             b"__builtins__.setattr = lambda *args: None\n",
             b"__builtins__['setattr'] = lambda *args: None\n",
@@ -7270,6 +7271,17 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_ignores_overwritten_runpy_capture(self) -> None:
+        detector = JITScriptDetector()
+        data = b"import runpy as rp\ncaptured = rp.run_path\ncaptured = print\nrp.run_path = print\ncaptured('safe')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     def test_nested_print_parameter_does_not_shadow_module_builtin(self) -> None:
         source = "import runpy as rp\ndef helper(print):\n    pass\nrp.run_path = print\nrp.run_path('safe')\n"
 
@@ -7300,6 +7312,20 @@ class TestJITScriptDetector:
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    def test_scan_model_keeps_typed_call_after_mapping_alias_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"import webbrowser as wb\nmapping = wb.__dict__\nmapping = {}\n"
+            b"mapping.update(open=print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
         )
 
     @pytest.mark.parametrize(
@@ -7340,6 +7366,7 @@ class TestJITScriptDetector:
             b"namespace = globals()\nnamespace['print'] = eval\n",
             b"put = globals().__setitem__\nput('print', eval)\n",
             b"update = globals().update\nupdate(print=eval)\n",
+            b"globals().update(**{'print': eval})\n",
             b"if enabled:\n    globals()['print'] = eval\n",
             b"__builtins__.print = eval\n",
             b"__builtins__['print'] = eval\n",
