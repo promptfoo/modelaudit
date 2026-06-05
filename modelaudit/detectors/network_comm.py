@@ -494,6 +494,9 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             redact_next_value = True
             continue
+        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded_segment):
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            continue
 
         is_public_identifier = (
             _is_public_model_repository_segment(hostname, segments, index)
@@ -513,10 +516,6 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         filename_redaction = _redact_known_token_filename(segment)
         if filename_redaction is not None:
             segments[index] = filename_redaction
-            continue
-        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(_decode_path_token(_split_trailing_path_delimiters(segment)[0])):
-            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             continue
         sensitive_assignment_redaction = _redact_sensitive_path_assignment(segment)
         if sensitive_assignment_redaction is not None:
