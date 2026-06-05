@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests
+- validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
+- fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
 - omit raw SafeTensors custom metadata values from security-only output while retaining precise redacted risk flags and rejecting malformed metadata maps
 - block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
 - add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
+- fail closed on malformed Keras version suffixes used for CVE boundary checks
 - fail closed when executable ZIP subtype scanners are unavailable
 - reject local, plaintext, and redirecting JFrog credential targets
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
@@ -91,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- stream Hugging Face files through case-insensitive suffix filtering with bounded extensionless coverage
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
 - classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
 - classify unavailable Joblib reads as inconclusive rather than security findings
