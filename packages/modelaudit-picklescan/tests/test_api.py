@@ -5263,8 +5263,8 @@ def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
 
 def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
-        lambda _module_name: None,
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
     )
     _clear_source_sensitive_caches()
     try:

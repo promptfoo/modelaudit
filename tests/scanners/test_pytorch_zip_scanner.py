@@ -7058,6 +7058,139 @@ def test_pytorch_zip_version_extraction_returns_metadata_when_present(monkeypatc
     assert source == "metadata:config.json:pytorch_version"
 
 
+def test_pytorch_zip_scan_bounds_archive_version_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "oversized-version.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", b"3" + (b" " * 8))
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    monkeypatch.setattr(PyTorchZipScanner, "MAX_VERSION_METADATA_BYTES", 8)
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    limit_check = next(check for check in result.checks if check.name == "PyTorch Version Metadata Limit")
+    assert result.metadata["pytorch_archive_version"] is None
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert limit_check.details["zip_entry"] == "archive/version"
+    assert limit_check.details["file_size"] == 9
+    assert limit_check.details["max_read_bytes"] == 8
+
+
+def test_pytorch_zip_scan_accepts_archive_version_at_metadata_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "bounded-version.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", b"3" + (b" " * 7))
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    monkeypatch.setattr(PyTorchZipScanner, "MAX_VERSION_METADATA_BYTES", 8)
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pytorch_archive_version"] == "3"
+    assert PyTorchZipScanner.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON not in result.metadata.get(
+        "scan_outcome_reasons", []
+    )
+    assert not [check for check in result.checks if check.name == "PyTorch Version Metadata Limit"]
+
+
+def test_pytorch_zip_version_metadata_read_failure_suppresses_fixed_version_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unreadable-version.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    scanner = PyTorchZipScanner()
+    original_read_member_bytes = scanner._read_member_bytes
+
+    def fail_version_probe(*args: Any, **kwargs: Any) -> bytes:
+        if kwargs.get("phase") == "version_probe":
+            raise OSError("simulated version metadata read failure")
+        return original_read_member_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_read_member_bytes", fail_version_probe)
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0")
+
+    result = scanner.scan(str(model_path))
+
+    read_check = next(check for check in result.checks if check.name == "PyTorch Version Metadata Read")
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.VERSION_METADATA_READ_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert read_check.details["zip_entry"] == "archive/version"
+    assert read_check.details["exception_type"] == "OSError"
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "CVE-2026-24747 PyTorch Version Check" and check.status == CheckStatus.PASSED
+    ]
+
+
+def test_pytorch_zip_oversized_json_suppresses_fixed_version_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "oversized-version-json.pt"
+    metadata = json.dumps({"padding": "x" * 32, "pytorch_version": "2.9.0"}).encode()
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("config.json", metadata)
+
+    monkeypatch.setattr(PyTorchZipScanner, "MAX_VERSION_JSON_BYTES", len(metadata) - 1)
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0")
+
+    result = scanner.scan(str(model_path))
+
+    assert PyTorchZipScanner.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "CVE-2026-24747 PyTorch Version Check" and check.status == CheckStatus.PASSED
+    ]
+
+
+def test_pytorch_zip_oversized_json_preserves_vulnerable_local_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "oversized-version-json-vulnerable-local.pt"
+    metadata = json.dumps({"padding": "x" * 32, "pytorch_version": "2.10.0"}).encode()
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("config.json", metadata)
+
+    monkeypatch.setattr(PyTorchZipScanner, "MAX_VERSION_JSON_BYTES", len(metadata) - 1)
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.9.0")
+
+    result = scanner.scan(str(model_path))
+
+    failed_checks = [
+        check
+        for check in result.checks
+        if check.name == "CVE-2026-24747 PyTorch Version Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(failed_checks) == 1
+    assert failed_checks[0].details["detected_pytorch_version"] == "2.9.0"
+    assert failed_checks[0].details["pytorch_version_source"] == "local_environment"
+
+
+@pytest.mark.parametrize("invalid_probe_limit", [0, -1, False, "1024"])
+def test_pytorch_zip_version_probe_rejects_invalid_overrides(invalid_probe_limit: object) -> None:
+    scanner = PyTorchZipScanner(config={"version_probe_bytes": invalid_probe_limit})
+
+    assert scanner.max_version_probe_bytes == scanner.DEFAULT_VERSION_PICKLE_PROBE_BYTES
+
+
 def test_pytorch_zip_version_selection_prefers_local_vulnerable_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7588,6 +7721,25 @@ def test_pytorch_zip_entry_limit_is_exit1_and_not_cached(tmp_path: Path) -> None
         expected_success=True,
         expected_exit_code=1,
         max_archive_entries=max_archive_entries,
+    )
+
+
+def test_pytorch_zip_version_metadata_limit_is_exit2_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = tmp_path / "oversized-version-metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", b"3" + (b" " * 8))
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    monkeypatch.setattr(PyTorchZipScanner, "MAX_VERSION_METADATA_BYTES", 8)
+    _assert_pytorch_zip_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "version-metadata-limit-cache",
+        PyTorchZipScanner.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON,
+        expected_success=False,
+        expected_exit_code=2,
     )
 
 
