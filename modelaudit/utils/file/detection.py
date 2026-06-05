@@ -12,6 +12,7 @@ from typing import Any, BinaryIO, Literal
 from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
+from .hdf5 import find_hdf5_signature_offset
 
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
@@ -4636,11 +4637,11 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
 
         # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
         if ext_format == "keras":
-            return header_format in {"zip", "hdf5"}
+            return header_format in {"zip", "hdf5"} or find_hdf5_signature_offset(path) is not None
 
         # HDF5 files should always match
         if ext_format == "hdf5":
-            return header_format == "hdf5"
+            return header_format == "hdf5" or find_hdf5_signature_offset(path) is not None
 
         # SafeTensors files should always match
         if ext_format == "safetensors":

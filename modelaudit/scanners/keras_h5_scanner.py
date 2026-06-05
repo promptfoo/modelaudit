@@ -23,6 +23,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ..utils.file.hdf5 import find_hdf5_signature_offset
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -115,11 +116,7 @@ class KerasH5Scanner(BaseScanner):
             return False
 
         if not HAS_H5PY:
-            try:
-                with open(path, "rb") as handle:
-                    return handle.read(8) == b"\x89HDF\r\n\x1a\n"
-            except OSError:
-                return False
+            return find_hdf5_signature_offset(path) is not None
 
         # Try to open as HDF5 file
         try:

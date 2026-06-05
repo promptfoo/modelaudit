@@ -25,13 +25,10 @@ from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.keras_zip_scanner import (
-    _HDF5_SIGNATURE_SCAN_MAX_BYTES,
-    KerasZipScanner,
-    _has_get_file_reference,
-)
+from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 try:
@@ -799,7 +796,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Missing h5py must fail closed when a bounded probe cannot rule out a large HDF5 user block."""
         hdf5_signature_offset = 16 * 1024 * 1024
-        assert hdf5_signature_offset > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        assert hdf5_signature_offset > HDF5_SIGNATURE_SCAN_MAX_BYTES
         weights_payload = bytearray(hdf5_signature_offset + 8)
         weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
         keras_path = tmp_path / "oversized_userblock.keras"
@@ -820,7 +817,7 @@ class TestKerasZipScanner:
         assert any(
             check.name == "Embedded Weights HDF5 Signature Probe"
             and check.status == CheckStatus.FAILED
-            and check.details["hdf5_signature_probe_max_bytes"] == _HDF5_SIGNATURE_SCAN_MAX_BYTES
+            and check.details["hdf5_signature_probe_max_bytes"] == HDF5_SIGNATURE_SCAN_MAX_BYTES
             and check.details["scan_outcome_reason"] == reason
             for check in result.checks
         )
@@ -834,7 +831,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Probe-incomplete weights must still report generic pickle findings before failing closed."""
         pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
-        payload_size = _HDF5_SIGNATURE_SCAN_MAX_BYTES + 1
+        payload_size = HDF5_SIGNATURE_SCAN_MAX_BYTES + 1
         weights_payload = pickle_payload + bytes(payload_size - len(pickle_payload))
         keras_path = tmp_path / "oversized_disguised_pickle.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
@@ -870,9 +867,9 @@ class TestKerasZipScanner:
         nested_zip_path = tmp_path / "disguised_weights.zip"
         with zipfile.ZipFile(nested_zip_path, "w") as nested_zip:
             nested_zip.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
-            nested_zip.writestr("padding.bin", bytes(_HDF5_SIGNATURE_SCAN_MAX_BYTES))
+            nested_zip.writestr("padding.bin", bytes(HDF5_SIGNATURE_SCAN_MAX_BYTES))
 
-        assert nested_zip_path.stat().st_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        assert nested_zip_path.stat().st_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
         keras_path = tmp_path / "oversized_disguised_zip.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))

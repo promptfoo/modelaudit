@@ -368,8 +368,49 @@ def test_missing_h5py_invalidates_stale_cache_entries(
             assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
 
         assert cache_manager.get_stats()["total_entries"] == 2
+
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+        for cached_path in (model_path, extensionless_model_path):
+            result = scanner.scan_with_cache(str(cached_path))
+            assert any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+
+        assert cache_manager.get_stats()["total_entries"] == 4
     finally:
         reset_cache_manager()
+
+
+def test_missing_h5py_routes_hdf5_userblock_and_bypasses_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Keras H5 file with a legal user block must retain fail-closed routing."""
+    external_source = tmp_path / "userblock_external_source.h5"
+    with h5py.File(external_source, "w") as h5_file:
+        h5_file.create_dataset("payload", data=[1.0, 2.0])
+
+    model_path = tmp_path / "userblock_model.h5"
+    with h5py.File(model_path, "w", userblock_size=512) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+            }
+        )
+        weights_group = h5_file.require_group("model_weights")
+        weights_group["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    assert model_path.read_bytes()[:8] != b"\x89HDF\r\n\x1a\n"
+    assert model_path.read_bytes()[512:520] == b"\x89HDF\r\n\x1a\n"
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+    assert KerasH5Scanner.can_handle(str(model_path)) is True
+    assert should_bypass_cache_for_missing_h5py(str(model_path)) is True
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_h5py_unavailable",
+        "H5PY Library Check",
+        "h5py is required for Keras H5 scanning",
+    )
 
 
 def test_missing_h5py_cache_bypass_requires_hdf5_content(
@@ -383,12 +424,17 @@ def test_missing_h5py_cache_bypass_requires_hdf5_content(
     zip_model_path = tmp_path / "model.keras"
     with zipfile.ZipFile(zip_model_path, "w") as zip_file:
         zip_file.writestr("config.json", "{}")
+    magic_only_path = tmp_path / "magic_only.h5"
+    magic_only_payload = bytearray(1024)
+    magic_only_payload[512:520] = b"\x89HDF\r\n\x1a\n"
+    magic_only_path.write_bytes(magic_only_payload)
 
     monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
 
     assert should_bypass_cache_for_missing_h5py(str(h5_model_path)) is True
     assert should_bypass_cache_for_missing_h5py(str(extensionless_model_path)) is True
     assert should_bypass_cache_for_missing_h5py(str(zip_model_path)) is False
+    assert should_bypass_cache_for_missing_h5py(str(magic_only_path)) is False
 
 
 def _assert_inconclusive_keras_h5_scan(

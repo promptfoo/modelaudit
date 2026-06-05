@@ -12,10 +12,10 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from ...cache.optimized_config import get_config_extractor
+from ..file.hdf5 import find_hdf5_signature_offset
 
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
-_HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 
 _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
     {
@@ -81,21 +81,21 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
     )
 
 
-def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
-    """Bypass stale HDF5 cache entries when Keras H5 analysis is unavailable."""
-    try:
-        with open(file_path, "rb") as handle:
-            if handle.read(len(_HDF5_MAGIC)) != _HDF5_MAGIC:
-                return False
-    except OSError:
-        return False
-
+def _hdf5_h5py_availability(file_path: str) -> bool | None:
+    """Return h5py availability for validated HDF5 files."""
+    if find_hdf5_signature_offset(file_path) is None:
+        return None
     try:
         from ...scanners.keras_h5_scanner import HAS_H5PY
     except Exception:
         return False
 
-    return not HAS_H5PY
+    return HAS_H5PY
+
+
+def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
+    """Bypass stale HDF5 cache entries when Keras H5 analysis is unavailable."""
+    return _hdf5_h5py_availability(file_path) is False
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
@@ -174,6 +174,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 return func(*args, **kwargs)
 
             # Check if file should be cached based on characteristics
+            hdf5_h5py_available: bool | None = None
             try:
                 file_stat = os.stat(file_path)
                 file_ext = os.path.splitext(file_path)[1]
@@ -186,7 +187,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
                     return func(*args, **kwargs)
 
-                if should_bypass_cache_for_missing_h5py(file_path):
+                hdf5_h5py_available = _hdf5_h5py_availability(file_path)
+                if hdf5_h5py_available is False:
                     logger.debug(f"Bypassing cache for unavailable Keras H5 analysis: {file_path}")
                     return func(*args, **kwargs)
 
@@ -211,6 +213,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 version_context = cache_config.get_version_context()
+                if hdf5_h5py_available is not None:
+                    version_context = {
+                        **version_context,
+                        "optional_dependency_availability": {"h5py": hdf5_h5py_available},
+                    }
 
                 def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""
