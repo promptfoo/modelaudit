@@ -898,6 +898,52 @@ class TestKerasZipScanner:
         assert unknown_checks[0].details["parse_status"] == "unknown"
         assert "is non-canonical" in unknown_checks[0].message
 
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.11.3rc1evil", "3.12.0rc1evil", "3.13.1+bad+tag"],
+    )
+    def test_cve_2026_1669_noncanonical_suffix_inside_vulnerable_range_is_attributed(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Malformed suffixes cannot erase an unambiguously vulnerable numeric release."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
+
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_checks = [check for check in result.checks if check.name.startswith("CVE-2026-1669:")]
+        unknown_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].details["keras_version"] == keras_version
+        assert unknown_checks == []
+
+    @pytest.mark.parametrize("keras_version", ["3.0.x", "3.11.x", "3.11-X", "3.0.*", "3.11.*", "3.11-*"])
+    def test_cve_2026_1669_wildcard_line_entirely_in_vulnerable_range(self, keras_version: str) -> None:
+        """A wildcard cannot hide a minor line whose every release is vulnerable."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is True
+
+    @pytest.mark.parametrize("keras_version", ["3.12.x", "3.13.x", "3.12.*", "3.13.*"])
+    def test_cve_2026_1669_wildcard_line_crossing_fix_boundary_is_unknown(self, keras_version: str) -> None:
+        """Minor lines containing both vulnerable and fixed patches remain unknown."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is None
+
+    @pytest.mark.parametrize("keras_version", ["2.15.x", "3.14.x", "4.0.x", "2.15.*", "3.14.*", "4.0.*"])
+    def test_cve_2026_1669_wildcard_line_outside_vulnerable_range_is_fixed(self, keras_version: str) -> None:
+        """Wildcard lines wholly outside the vulnerable ranges are not attributed to the CVE."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is False
+
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
         scanner = KerasZipScanner()
