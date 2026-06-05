@@ -14,7 +14,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.catboost_scanner import CatBoostScanner
+from modelaudit.scanners.catboost_scanner import CatBoostScanner, _redact_evidence_for_display
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
 
@@ -1439,6 +1439,38 @@ def test_catboost_sarif_redacts_decoded_standalone_base64_secret(tmp_path: Path)
     assert standalone_payload not in sarif
     assert "<redacted>" in failed_details
     assert "<redacted>" in sarif
+
+
+def test_catboost_sarif_redacts_urlsafe_base64_secret(tmp_path: Path) -> None:
+    standalone_secret = "sk-ABCDEFGHIJKL"
+    standalone_payload = base64.urlsafe_b64encode(standalone_secret.encode()).decode().rstrip("=")
+    model_path = tmp_path / "sarif_urlsafe_base64_secret.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f'os.system("id"); blob={standalone_payload}; https://collector.evil.example/upload',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    assert standalone_secret not in failed_details
+    assert standalone_payload not in failed_details
+    assert standalone_secret not in sarif
+    assert standalone_payload not in sarif
+    assert "<redacted>" in failed_details
+    assert "<redacted>" in sarif
+
+
+def test_catboost_preserves_benign_short_urlsafe_base64_evidence() -> None:
+    payload = base64.urlsafe_b64encode(b"ordinary-label1").decode().rstrip("=")
+
+    assert len(payload) == 20
+    assert _redact_evidence_for_display(payload) == payload
 
 
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:

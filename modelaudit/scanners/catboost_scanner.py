@@ -42,7 +42,7 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:import\s+os|import\s+subprocess|from\s+os\s+import)\b", re.IGNORECASE), "python import block"),
 ]
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
-_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{24,}={0,2})(?![A-Za-z0-9+/=])")
+_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{20,}={0,2})(?![A-Za-z0-9+/_=-])")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
@@ -93,7 +93,7 @@ def _decode_base64_evidence_payload(payload: str) -> str:
         return ""
     padded_payload = payload + "=" * ((4 - (len(payload) % 4)) % 4)
     try:
-        return base64.b64decode(padded_payload, validate=True).decode("utf-8", errors="ignore")
+        return base64.b64decode(padded_payload, altchars=b"-_", validate=True).decode("utf-8", errors="ignore")
     except Exception:
         return ""
 

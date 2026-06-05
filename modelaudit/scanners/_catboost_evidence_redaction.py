@@ -7,7 +7,7 @@ import re
 import string
 import unicodedata
 from typing import Final, TypeAlias
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
@@ -145,7 +145,8 @@ COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
 )
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)((?<!\w)--(?:password|passwd|pass|proxy-password|client[_-]?secret|api[_-]?key|token|secret)"
+    r"(?i)((?<!\w)--(?:password|passwd|pass|proxy-password|proxy-pass|proxy-tls-?password|tls-?password|"
+    r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)"
     r"(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s\"';&|)]+)"
 )
 COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
@@ -254,6 +255,37 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
+def _is_sensitive_query_key(key: str) -> bool:
+    normalized_key = re.sub(r"(?:\[[^\]]*\])+$", "", key)
+    return normalized_key.lower() in SENSITIVE_QUERY_KEYS or _normalize_sensitive_key(normalized_key) is not None
+
+
+def _query_value_contains_secret(value: str) -> bool:
+    decoded = value
+    for _ in range(3):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+
+    if re.search(rf"(?i)(?:^|[?&;])\s*{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]", decoded):
+        return True
+
+    for nested_url in URL_RE.finditer(decoded):
+        try:
+            parsed = urlsplit(nested_url.group(0))
+        except ValueError:
+            if "@" in nested_url.group(0):
+                return True
+            continue
+        if "@" in parsed.netloc:
+            return True
+        for part in re.split(r"[&;]", parsed.query):
+            if any(_is_sensitive_query_key(key) for key, _ in parse_qsl(part, keep_blank_values=True)):
+                return True
+    return False
+
+
 def _redact_url(match: re.Match[str]) -> str:
     raw_url = match.group(0)
     try:
@@ -265,19 +297,24 @@ def _redact_url(match: re.Match[str]) -> str:
     if "@" in netloc:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
 
-    query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
-        else:
-            query_items.append((key, value))
+    query_parts: list[str] = []
+    for part in re.split(r"([&;])", parsed.query):
+        if part in {"&", ";"}:
+            query_parts.append(part)
+            continue
+
+        query_items = []
+        for key, value in parse_qsl(part, keep_blank_values=True):
+            is_sensitive = _is_sensitive_query_key(key) or _query_value_contains_secret(value)
+            query_items.append((key, REDACTED_EVIDENCE_VALUE if is_sensitive else value))
+        query_parts.append(urlencode(query_items, doseq=True, safe="<>") if query_items else part)
 
     return urlunsplit(
         (
             parsed.scheme,
             netloc,
             parsed.path,
-            urlencode(query_items, doseq=True, safe="<>"),
+            "".join(query_parts),
             "",
         )
     )
