@@ -7,7 +7,7 @@ import stat
 import tempfile
 import unicodedata
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
@@ -25,6 +25,10 @@ _PYTORCH_MODEL_URL_PATTERN = re.compile(
 _MAX_MODEL_URL_DECODE_ROUNDS = 4
 _MAX_ARTIFACT_REDIRECTS = 5
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_NON_ARTIFACT_SCANNERS = frozenset({"jinja2_template", "manifest", "metadata", "oci_layer", "text"})
+_SCANNER_EXTENSION_KEYS = ("extensions", "content_routed_extensions", "scanner_only_extensions")
+_HTML_CONTENT_TYPES = frozenset({"application/xhtml+xml", "text/html"})
+_HTML_PREFIX_PATTERN = re.compile(rb"^\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", re.IGNORECASE)
 _WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"\\|?*')
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
@@ -70,9 +74,31 @@ class _ModelURLParser(HTMLParser):
 
 
 def _get_model_extensions() -> set[str]:
-    from ..model_extensions import get_model_extensions
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
 
-    return get_model_extensions()
+    metadata = get_scanner_registry_metadata()
+    return {
+        str(extension).lower()
+        for scanner_id, scanner_info in metadata.items()
+        if scanner_id not in _NON_ARTIFACT_SCANNERS
+        for key in _SCANNER_EXTENSION_KEYS
+        for extension in scanner_info.get(key, ())
+        if extension
+    }
+
+
+def _content_sniff_required_extensions() -> set[str]:
+    """Return ambiguous suffixes shared by artifact and non-artifact scanners."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    metadata = get_scanner_registry_metadata()
+    artifact_extensions: set[str] = set()
+    non_artifact_extensions: set[str] = set()
+    for scanner_id, scanner_info in metadata.items():
+        target = non_artifact_extensions if scanner_id in _NON_ARTIFACT_SCANNERS else artifact_extensions
+        for key in _SCANNER_EXTENSION_KEYS:
+            target.update(str(extension).lower() for extension in scanner_info.get(key, ()) if extension)
+    return artifact_extensions & non_artifact_extensions
 
 
 def _display_model_url(url: str) -> str:
@@ -403,6 +429,32 @@ def _response_content_length(response: requests.Response) -> int | None:
         return None
 
 
+def _validate_artifact_response_type(url: str, response: requests.Response) -> None:
+    content_type = response.headers.get("content-type")
+    if isinstance(content_type, str) and content_type.split(";", 1)[0].strip().casefold() in _HTML_CONTENT_TYPES:
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+
+
+def _validate_downloaded_artifact(url: str, path: Path) -> None:
+    """Reject obvious response pages and ambiguous non-model payloads."""
+    with path.open("rb") as handle:
+        prefix = handle.read(4096)
+    if _HTML_PREFIX_PATTERN.match(prefix):
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+
+    extension = _supported_model_extension(url)
+    if extension not in _content_sniff_required_extensions():
+        return
+
+    from ..file.detection import detect_file_format_from_magic
+
+    if detect_file_format_from_magic(str(path)) == "unknown":
+        raise ValueError(
+            "PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: "
+            f"{_display_model_url(url)}"
+        )
+
+
 def _path_entry_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
@@ -454,7 +506,7 @@ def _supports_secure_cache_commit() -> bool:
 def _open_cache_parent_fd(
     root_fd: int,
     relative_path: Path,
-    opened_fds: list[int],
+    fd_stack: ExitStack,
     created_dirs: list[tuple[int, str]],
 ) -> int:
     """Pin a cache parent directory without following replaceable symlinks."""
@@ -468,9 +520,10 @@ def _open_cache_parent_fd(
                 os.mkdir(part, mode=0o700, dir_fd=parent_fd)
                 created_dirs.append((parent_fd, part))
             except FileExistsError:
+                # Another process won the create race; the no-follow open below validates it.
                 pass
             child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-        opened_fds.append(child_fd)
+        fd_stack.callback(os.close, child_fd)
         parent_fd = child_fd
     return parent_fd
 
@@ -496,53 +549,51 @@ def _commit_staged_weight_files_secure(
 ) -> None:
     """Commit staged files through pinned cache directories."""
     committed: list[tuple[int, str, Path, bool]] = []
-    opened_fds: list[int] = []
     created_dirs: list[tuple[int, str]] = []
-    try:
+    with ExitStack() as fd_stack:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         root_fd = os.open(dest_dir, directory_flags)
-        opened_fds.append(root_fd)
-        for _, relative_path in artifacts:
-            staged_file = _safe_destination_path(files_dir, relative_path)
-            backup_file = _safe_destination_path(backup_dir, relative_path)
-            backup_file.parent.mkdir(parents=True, exist_ok=True)
-            parent_fd = _open_cache_parent_fd(root_fd, relative_path, opened_fds, created_dirs)
-            filename = relative_path.name
-            try:
-                destination_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                had_existing_entry = False
-            else:
-                had_existing_entry = True
-                if stat.S_ISDIR(destination_stat.st_mode):
-                    raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_dir / relative_path}")
-
-            committed.append((parent_fd, filename, backup_file, had_existing_entry))
-            if had_existing_entry:
-                os.rename(filename, backup_file, src_dir_fd=parent_fd)
-            os.rename(staged_file, filename, dst_dir_fd=parent_fd)
-    except BaseException as commit_error:
-        rollback_errors: list[BaseException] = []
-        for parent_fd, filename, backup_file, had_existing_entry in reversed(committed):
-            try:
-                if had_existing_entry:
-                    if _path_entry_exists(backup_file):
-                        _remove_path_entry_at(parent_fd, filename)
-                        os.rename(backup_file, filename, dst_dir_fd=parent_fd)
+        fd_stack.callback(os.close, root_fd)
+        try:
+            for _, relative_path in artifacts:
+                staged_file = _safe_destination_path(files_dir, relative_path)
+                backup_file = _safe_destination_path(backup_dir, relative_path)
+                backup_file.parent.mkdir(parents=True, exist_ok=True)
+                parent_fd = _open_cache_parent_fd(root_fd, relative_path, fd_stack, created_dirs)
+                filename = relative_path.name
+                try:
+                    destination_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    had_existing_entry = False
                 else:
-                    _remove_path_entry_at(parent_fd, filename)
-            except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
-                rollback_errors.append(rollback_error)
-        for parent_fd, name in reversed(created_dirs):
-            with suppress(OSError):
-                os.rmdir(name, dir_fd=parent_fd)
-        if rollback_errors:
-            raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
-        raise
-    finally:
-        for fd in reversed(opened_fds):
-            with suppress(OSError):
-                os.close(fd)
+                    had_existing_entry = True
+                    if stat.S_ISDIR(destination_stat.st_mode):
+                        raise IsADirectoryError(
+                            f"PyTorch Hub cache destination is a directory: {dest_dir / relative_path}"
+                        )
+
+                committed.append((parent_fd, filename, backup_file, had_existing_entry))
+                if had_existing_entry:
+                    os.rename(filename, backup_file, src_dir_fd=parent_fd)
+                os.rename(staged_file, filename, dst_dir_fd=parent_fd)
+        except BaseException as commit_error:
+            rollback_errors: list[BaseException] = []
+            for parent_fd, filename, backup_file, had_existing_entry in reversed(committed):
+                try:
+                    if had_existing_entry:
+                        if _path_entry_exists(backup_file):
+                            _remove_path_entry_at(parent_fd, filename)
+                            os.rename(backup_file, filename, dst_dir_fd=parent_fd)
+                    else:
+                        _remove_path_entry_at(parent_fd, filename)
+                except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
+                    rollback_errors.append(rollback_error)
+            for parent_fd, name in reversed(created_dirs):
+                with suppress(OSError):
+                    os.rmdir(name, dir_fd=parent_fd)
+            if rollback_errors:
+                raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
+            raise
 
 
 def _commit_staged_weight_files_path(
@@ -610,6 +661,7 @@ def _download_weight_file(
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         with _open_trusted_artifact_response(weight_url) as response:
+            _validate_artifact_response_type(weight_url, response)
             content_length = _response_content_length(response)
             if content_length is not None:
                 _enforce_max_size(downloaded_size + content_length, max_size)
@@ -627,6 +679,8 @@ def _download_weight_file(
                         _enforce_max_size(downloaded_size + len(chunk), max_size)
                         handle.write(chunk)
                         downloaded_size += len(chunk)
+
+            _validate_downloaded_artifact(weight_url, partial_file)
 
         partial_file.replace(dest_file)
         return downloaded_size

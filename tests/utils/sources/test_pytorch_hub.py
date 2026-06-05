@@ -10,6 +10,7 @@ from modelaudit.utils.sources.pytorch_hub import (
     _artifact_download_paths,
     _commit_staged_weight_files_secure,
     _extract_weight_urls,
+    _get_model_extensions,
     _get_total_size,
     _open_trusted_artifact_response,
     _supports_secure_cache_commit,
@@ -93,6 +94,16 @@ def test_extract_weight_urls_includes_supported_non_pt_extensions(mock_extension
     ]
 
 
+def test_extract_weight_urls_excludes_documentation_near_matches() -> None:
+    html = (
+        '<a href="https://download.pytorch.org/models/README.md">docs</a>'
+        '<a href="https://download.pytorch.org/models/model.onnx">model</a>'
+    )
+
+    assert ".md" not in _get_model_extensions()
+    assert _extract_weight_urls(html) == ["https://download.pytorch.org/models/model.onnx"]
+
+
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
 def test_extract_weight_urls_ignores_unsupported_extensions_and_hosts(mock_extensions: MagicMock) -> None:
     mock_extensions.return_value = {".onnx"}
@@ -155,6 +166,148 @@ def test_download_pytorch_hub_model_downloads_supported_non_pt_links(
 
     assert result == tmp_path
     assert (tmp_path / "resnet50.onnx").read_bytes() == b"abc"
+
+
+@patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_html_artifact_response(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_extensions: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.onnx"
+    mock_extensions.return_value = {".onnx"}
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">onnx</a>'
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-type": "text/html; charset=utf-8"})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [b"<!doctype html><title>Not found</title>"]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": "44"})
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    with pytest.raises(ValueError, match="returned HTML content"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    assert not (tmp_path / "model.onnx").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_rejects_unrecognized_ambiguous_text_artifact(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/README.txt"
+    payload = b"Documentation, not a LightGBM model."
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">docs</a>'
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [payload]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    with pytest.raises(ValueError, match="ambiguous suffix"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+        )
+
+    assert not (tmp_path / "README.txt").exists()
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_accepts_recognized_lightgbm_text_artifact(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    weight_url = "https://download.pytorch.org/models/model.txt"
+    payload = (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1 f2\nfeature_infos=[0:1] [0:1] [0:1]\ntree_sizes=12\n"
+        b"Tree=0\nnum_leaves=2\nsplit_feature=0\nsplit_gain=1.0\nthreshold=0.5\n"
+        b"decision_type=<=\nleft_child=-1\nright_child=-2\nleaf_value=0.1 0.2\n"
+    )
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">LightGBM</a>'
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [payload]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    result = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert result == tmp_path
+    assert (tmp_path / "model.txt").read_bytes() == payload
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_downloaded_hub_pickle_is_scanned_for_malicious_calls(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+
+    weight_url = "https://download.pytorch.org/models/malicious.pkl"
+    payload = b"cos\nsystem\n(S'echo modelaudit'\ntR."
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">pickle</a>'
+    html_resp.raise_for_status = lambda: None
+    artifact_resp = MagicMock(status_code=200, headers={"content-length": str(len(payload))})
+    artifact_resp.__enter__.return_value = artifact_resp
+    artifact_resp.iter_content.return_value = [payload]
+    artifact_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, artifact_resp]
+
+    head_resp = MagicMock(status_code=200, ok=True, headers={"content-length": str(len(payload))})
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    downloaded_dir = download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+    result = scan_model_directory_or_file(str(downloaded_dir / "malicious.pkl"), cache_enabled=False)
+
+    assert determine_exit_code(result) == 1
+    assert any("os.system" in issue.message for issue in result.issues)
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
