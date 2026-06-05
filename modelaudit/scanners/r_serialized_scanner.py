@@ -112,6 +112,18 @@ _R_SIMPLE_NUMERIC_TOKEN_RE = re.compile(
     r"(?i)(?:0x[0-9a-f]+(?:p[+-]?[0-9]+)?|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?"
 )
 _R_DOT_ARGUMENT_TOKEN_RE = re.compile(r"\.\.[0-9]+")
+_R_OBVIOUS_NONCALLABLE_GROUPED_TOKEN_RE = re.compile(
+    r"""
+    \s*(?:
+        (?P<value>
+            (?i:(?:0x[0-9a-f]+(?:p[+-]?[0-9]+)?|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?)
+            |FALSE|Inf|NA_character_|NA_complex_|NA_integer_|NA_real_|NULL|NaN|TRUE|NA
+        )
+        |(?P<operator>%%|%/%|%\*%|%in%|&&|\|\||<=|>=|==|!=|[()+\-*/^:!&|<>])
+    )
+    """,
+    re.VERBOSE,
+)
 
 
 def _r_function_keyword_before_position(
@@ -160,6 +172,28 @@ def _r_function_keyword_awaits_formals(text: str) -> bool:
     return _r_function_keyword_before_position(text, len(text), _r_non_code_spans(text))
 
 
+def _r_lambda_shorthand_before_position(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position - 1
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return False
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            return text[cursor] == "\\"
+        span_start, _span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return False
+        cursor = span_start - 1
+    return False
+
+
 def _position_is_in_r_suppressing_non_code_span(
     position: int,
     non_code_spans: list[tuple[int, int]],
@@ -200,16 +234,17 @@ def _r_equals_is_named_argument(
     if not stack or stack[-1][0] not in {"(", "["}:
         return False
     target = stack[-1]
-    target_is_function_formals = target[0] == "(" and _r_function_keyword_before_position(
-        text,
-        target[1],
-        non_code_spans,
+    required_delimiters = set(stack)
+    target_is_function_formals = target[0] == "(" and (
+        _r_function_keyword_before_position(text, target[1], non_code_spans)
+        or _r_lambda_shorthand_before_position(text, target[1], non_code_spans)
     )
     if target[0] == "(" and not _r_open_paren_starts_argument_list(text, target[1], non_code_spans):
         return False
     if target[0] == "[" and not _r_open_bracket_starts_subscript(text, target[1], non_code_spans):
         return False
 
+    target_closed = False
     while cursor < len(text):
         if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
             cursor = non_code_spans[span_index][1]
@@ -224,11 +259,15 @@ def _r_equals_is_named_argument(
                 return False
             closed = stack.pop()
             if closed == target:
-                return not target_is_function_formals or _r_function_body_follows(
+                if target_is_function_formals and not _r_function_body_follows(
                     text,
                     cursor + 1,
                     non_code_spans,
-                )
+                ):
+                    return False
+                target_closed = True
+            if target_closed and required_delimiters.isdisjoint(stack):
+                return True
         cursor += 1
     return False
 
@@ -238,7 +277,11 @@ def _r_open_paren_starts_argument_list(
     position: int,
     non_code_spans: list[tuple[int, int]],
 ) -> bool:
-    if _r_function_keyword_before_position(text, position, non_code_spans):
+    if _r_function_keyword_before_position(text, position, non_code_spans) or _r_lambda_shorthand_before_position(
+        text,
+        position,
+        non_code_spans,
+    ):
         return True
 
     cursor = position - 1
@@ -334,7 +377,19 @@ def _r_grouped_expression_can_start_call(
         return False
     if all(character.isalnum() or character in "._" for character in expression):
         return _r_token_can_start_call(expression)
-    return True
+    return not _r_grouped_expression_is_obviously_non_callable(expression)
+
+
+def _r_grouped_expression_is_obviously_non_callable(expression: str) -> bool:
+    cursor = 0
+    saw_value = False
+    while cursor < len(expression):
+        token_match = _R_OBVIOUS_NONCALLABLE_GROUPED_TOKEN_RE.match(expression, cursor)
+        if token_match is None:
+            return False
+        saw_value = saw_value or token_match.group("value") is not None
+        cursor = token_match.end()
+    return saw_value
 
 
 def _r_function_body_follows(
@@ -396,8 +451,10 @@ def _r_open_bracket_starts_subscript(
         opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
         if opener_position is None:
             return False
+        if _r_open_paren_starts_argument_list(text, opener_position, non_code_spans):
+            return True
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
-        return opener_prefix is None or _r_token_can_start_subscript(opener_prefix)
+        return opener_prefix is None
     if text[cursor] == "}":
         return _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
 
@@ -963,6 +1020,11 @@ class RSerializedScanner(BaseScanner):
                         and (
                             _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
                             or _r_function_keyword_awaits_formals(current_text)
+                            or _r_lambda_shorthand_before_position(
+                                current_text,
+                                len(current_text),
+                                _r_non_code_spans(current_text),
+                            )
                         )
                     ):
                         current_parts.append(gap.decode("ascii"))
