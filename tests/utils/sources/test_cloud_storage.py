@@ -53,6 +53,17 @@ def configure_remote_open_payloads(fs: MagicMock, payloads: dict[str, bytes]) ->
     fs.open.side_effect = open_side_effect
 
 
+class _CountingBytesIO(io.BytesIO):
+    def __init__(self, payload: bytes, byte_counter: list[int]):
+        super().__init__(payload)
+        self._byte_counter = byte_counter
+
+    def read(self, size: int | None = -1) -> bytes:
+        chunk = super().read(size)
+        self._byte_counter[0] += len(chunk)
+        return chunk
+
+
 def make_tar_payload() -> bytes:
     payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
     output = io.BytesIO()
@@ -482,6 +493,87 @@ def test_filter_scannable_cloud_files_ignores_underreported_size(reported_size: 
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "tflite"}]
 
 
+def test_filter_scannable_cloud_files_routes_within_tiny_sniff_budget() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "model.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=8) == [
+        {**files[0], "content_detected_format": "tflite"}
+    ]
+    assert transferred == [8]
+
+
+def test_filter_scannable_cloud_files_caps_json_probe_at_shared_sniff_budget() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = b"{" + b" " * (64 * 1024)
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "model.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=32) == [
+        {**files[0], "content_detected_format": "mxnet_symbol_routing_inconclusive"}
+    ]
+    assert transferred == [32]
+
+
+def test_filter_scannable_cloud_files_fails_closed_when_shared_sniff_budget_is_exhausted() -> None:
+    first_url = "s3://bucket/models/preview.png"
+    hidden_url = "s3://bucket/models/hidden.payload?X-Amz-Signature=secret"
+    payloads = {
+        first_url: b"\x89PNG\r\n\x1a\n",
+        hidden_url: b" " * (64 * 1024),
+    }
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda path, _mode="rb": _CountingBytesIO(payloads[path], transferred)
+    files = [
+        {"path": first_url, "name": "preview.png", "size": 8, "human_size": "8 B"},
+        {"path": hidden_url, "name": "hidden.payload", "size": 1, "human_size": "1 B"},
+    ]
+
+    with pytest.raises(ValueError) as excinfo:
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=32)
+
+    error = str(excinfo.value)
+    assert "maximum content inspection budget" in error
+    assert "hidden.payload" in error
+    assert "secret" not in error
+    assert transferred == [32]
+
+
+def test_filter_scannable_cloud_files_caps_zip_classification_at_sniff_budget() -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload({"word/document.xml": b"<document />"})
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": 1, "human_size": "1 B"}]
+
+    with pytest.raises(ValueError, match="selective filtering incomplete"):
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=16)
+
+    assert transferred == [16]
+
+
+def test_filter_scannable_cloud_files_reuses_complete_budgeted_zip_prefix() -> None:
+    url = "s3://bucket/models/archive.payload"
+    payload = make_zip_payload({"model.pkl": b"cos\nsystem\n(S'echo pwned'\ntR."})
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "archive.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "zip"}
+    ]
+    assert transferred == [len(payload)]
+
+
 def test_filter_scannable_cloud_files_handles_short_remote_reads() -> None:
     class ShortReadBytesIO(io.BytesIO):
         def read(self, size: int | None = -1) -> bytes:
@@ -754,6 +846,51 @@ def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_
     assert "evil.payload" in error
     assert "X-Amz-Signature" not in error
     assert "secret" not in error
+    fs.get.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_caps_content_sniffing_at_max_size(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    hidden_url = "s3://bucket/models/hidden.payload?X-Amz-Signature=secret"
+    payload = b" " * (64 * 1024)
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": 1,
+        "human_size": "1 B",
+        "estimated_time": "instant",
+        "files": [{"path": hidden_url, "name": "hidden.payload", "size": 1, "human_size": "1 B"}],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        if streaming:
+            list(download_from_cloud_streaming(url, max_size=32, show_progress=False))
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=32,
+                use_cache=False,
+                show_progress=False,
+            )
+
+    error = str(excinfo.value)
+    assert "maximum content inspection budget" in error
+    assert "hidden.payload" in error
+    assert "secret" not in error
+    assert transferred == [32]
     fs.get.assert_not_called()
 
 
