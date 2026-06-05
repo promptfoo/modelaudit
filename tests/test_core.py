@@ -41,7 +41,7 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
-from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -460,7 +460,7 @@ def _append_hdf5_userblock_candidate(path: Path, *, plausible: bool) -> int:
         superblock.extend(b"\xff" * 8)
         superblock.extend(len(payload).to_bytes(8, "little"))
         superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-        superblock.extend(bytes(4))
+        superblock.extend(hdf5_metadata_checksum(superblock).to_bytes(4, "little"))
     else:
         superblock = bytearray(HDF5_MAGIC + b"\x03\x01\x01\x00")
     payload[signature_offset : signature_offset + len(superblock)] = superblock
@@ -489,12 +489,36 @@ def _write_safetensors_hdf5_userblock_candidate(path: Path, *, plausible: bool) 
         superblock.extend(b"\xff" * 8)
         superblock.extend(file_size.to_bytes(8, "little"))
         superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-        superblock.extend(bytes(4))
+        superblock.extend(hdf5_metadata_checksum(superblock).to_bytes(4, "little"))
     else:
         superblock = bytearray(HDF5_MAGIC + b"\x03\x01\x01\x00")
     payload[signature_offset : signature_offset + len(superblock)] = superblock
     path.write_bytes(payload)
     return signature_offset
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (bytes((23,)), 0xA209C931),
+        (bytes(1), 0x8BA9414B),
+        (bytes((23, 187, 98)), 0xCEBDF4F0),
+        (bytes(3), 0x6BD0060F),
+    ],
+)
+def test_hdf5_metadata_checksum_matches_reference_vectors(payload: bytes, expected: int) -> None:
+    assert hdf5_metadata_checksum(payload) == expected
+
+
+def test_hdf5_signature_probe_rejects_corrupted_v2_checksum(tmp_path: Path) -> None:
+    polyglot = tmp_path / "corrupted-checksum.zip"
+    _create_misnamed_zip(polyglot, {"README.txt": b"benign archive"})
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    payload = bytearray(polyglot.read_bytes())
+    payload[signature_offset + 44] ^= 1
+    polyglot.write_bytes(payload)
+
+    assert find_hdf5_signature_offset(str(polyglot)) is None
 
 
 def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:

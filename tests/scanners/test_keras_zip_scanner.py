@@ -29,7 +29,7 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
-from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES
+from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, hdf5_metadata_checksum
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 try:
@@ -226,7 +226,7 @@ def _embed_plausible_hdf5_superblock(payload: bytes, signature_offset: int) -> b
     superblock.extend(b"\xff" * 8)
     superblock.extend(len(output).to_bytes(8, "little"))
     superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-    superblock.extend(b"\x00" * 4)
+    superblock.extend(hdf5_metadata_checksum(superblock).to_bytes(4, "little"))
     output[signature_offset : signature_offset + len(superblock)] = superblock
     output[signature_offset + len(superblock) : signature_offset + len(superblock) + 4] = b"OHDR"
     return bytes(output)

@@ -22,7 +22,7 @@ from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
-from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_missing_h5py
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -534,7 +534,7 @@ def _write_synthetic_hdf5_v2_superblock(
         return value.to_bytes(offset_size, "little")
 
     root_group_address = min(128, file_size - 1)
-    superblock = b"".join(
+    superblock_without_checksum = b"".join(
         (
             HDF5_MAGIC,
             bytes((2, offset_size, length_size, status_flags)),
@@ -544,6 +544,7 @@ def _write_synthetic_hdf5_v2_superblock(
             encode_address(root_group_address),
         )
     )
+    superblock = superblock_without_checksum + hdf5_metadata_checksum(superblock_without_checksum).to_bytes(4, "little")
     path.write_bytes(superblock + bytes(file_size - len(superblock)))
 
 
