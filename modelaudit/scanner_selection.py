@@ -379,7 +379,7 @@ def scanner_ids_for_extension(extension: str) -> frozenset[str]:
     normalized_extension = extension.lower()
     scanner_ids: set[str] = set()
     for scanner_id, scanner_info in _scanner_metadata().items():
-        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+        for key in ("extensions", "content_routed_extensions"):
             if normalized_extension in {str(value).lower() for value in scanner_info.get(key, ())}:
                 scanner_ids.add(scanner_id)
                 break

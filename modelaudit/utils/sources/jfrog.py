@@ -10,6 +10,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import zipfile
 from collections.abc import Collection, Mapping
 from http.cookiejar import CookieJar
 from io import BytesIO
@@ -995,12 +996,12 @@ def _detect_jfrog_mxnet_symbol_route(
     if not normalized_prefix.lstrip().startswith(b"{"):
         return None
 
+    suffix = PurePosixPath(urlparse(file_url).path).suffix.lower()
     mxnet_route = _detect_mxnet_symbol_prefix_route(
         normalized_prefix,
         sample_is_prefix=(size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES),
-        fail_closed_without_hint=True,
+        fail_closed_without_hint=suffix == ".json",
     )
-    suffix = PurePosixPath(urlparse(file_url).path).suffix.lower()
     if mxnet_route != "mxnet" or (suffix != ".json" and size_hint > MXNET_SYMBOL_SIGNATURE_READ_BYTES):
         return mxnet_route
 
@@ -1100,8 +1101,6 @@ def _detect_jfrog_flax_msgpack_route(prefix: bytes, size_hint: int) -> str | Non
 
 def _detect_jfrog_llamafile_route(prefix: bytes, size_hint: int) -> str | None:
     """Recognize llamafile executable evidence within the bounded remote prefix."""
-    import zipfile
-
     from modelaudit.utils.file.detection import (
         EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_MARKER,
@@ -1120,6 +1119,36 @@ def _detect_jfrog_llamafile_route(prefix: bytes, size_hint: int) -> str | None:
     return None
 
 
+def _detect_jfrog_zip_route(
+    prefix: bytes,
+    *,
+    size_hint: int,
+    probe_limit: int,
+    file_url: str,
+) -> str | None:
+    """Classify a complete bounded ZIP probe or fail closed when it is incomplete."""
+    probe_is_complete = len(prefix) < probe_limit or (size_hint > 0 and size_hint <= len(prefix))
+    if not probe_is_complete:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
+            f"{redact_jfrog_url_for_display(file_url)} within the bounded content inspection budget"
+        )
+
+    from modelaudit.utils.file.detection import _is_keras_zip_archive_content
+    from modelaudit.utils.file.filtering import _zip_archive_has_scannable_content
+
+    try:
+        with zipfile.ZipFile(BytesIO(prefix), "r") as archive:
+            if _is_keras_zip_archive_content(archive) or _zip_archive_has_scannable_content(archive):
+                return "zip"
+            return None
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
+            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+        ) from exc
+
+
 def _detect_jfrog_content_route_format(
     file_info: dict[str, Any],
     *,
@@ -1134,11 +1163,12 @@ def _detect_jfrog_content_route_format(
         raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
     file_url = str(file_info["path"])
     headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
+    probe_limit = min(max_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES)
     prefix, probe_download_url = _read_jfrog_content_prefix(
         file_url,
         headers=headers,
         timeout=timeout,
-        max_bytes=min(max_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES),
+        max_bytes=probe_limit,
     )
     if probe_bytes_counter is not None:
         probe_bytes_counter[0] += len(prefix)
@@ -1218,6 +1248,16 @@ def _detect_jfrog_content_route_format(
         return "tar", probe_download_url
     if detected_format == "unknown" and _is_torch7_signature(prefix):
         return "torch7", probe_download_url
+    if detected_format == "zip":
+        return (
+            _detect_jfrog_zip_route(
+                prefix,
+                size_hint=size_hint,
+                probe_limit=probe_limit,
+                file_url=file_url,
+            ),
+            probe_download_url,
+        )
     if detected_format == "unknown":
         xml_route = _detect_jfrog_xml_model_route(prefix, size_hint)
         if xml_route is not None:

@@ -545,6 +545,23 @@ def test_filter_scannable_cloud_files_retains_inconclusive_shared_suffix() -> No
     assert actual == files
 
 
+def test_filter_scannable_cloud_files_keeps_selected_joblib_without_content_probe() -> None:
+    url = "s3://bucket/models/model.joblib"
+    files = [{"path": url, "name": "model.joblib", "size": 8, "human_size": "8 B"}]
+    fs = make_fs_mock()
+    policy = resolve_scanner_selection_policy(scanners=["joblib"])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+        scanner_selection=policy.to_config(),
+    )
+
+    assert actual == files
+    fs.open.assert_not_called()
+
+
 def test_filter_scannable_cloud_files_keeps_custom_extensions_suffix_only_without_selection() -> None:
     url = "s3://bucket/models/weights.payload"
     payload = make_safetensors_payload()
@@ -1045,6 +1062,54 @@ def test_selective_cloud_download_caps_content_sniffing_at_max_size(
     assert "hidden.payload" in error
     assert "secret" not in error
     assert transferred == [32]
+    fs.get.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_counts_content_probes_toward_total_budget(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    model_url = "s3://bucket/models/model.payload"
+    payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": len(payload)}
+    configure_remote_open_payloads(fs, {model_url: payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(payload),
+        "human_size": f"{len(payload)} B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": model_url,
+                "name": "model.payload",
+                "size": len(payload),
+                "human_size": f"{len(payload)} B",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        if streaming:
+            list(download_from_cloud_streaming(url, max_size=(2 * len(payload)) - 1, show_progress=False))
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=(2 * len(payload)) - 1,
+                use_cache=False,
+                show_progress=False,
+            )
+
+    fs.open.assert_called_once_with(model_url, "rb")
     fs.get.assert_not_called()
 
 

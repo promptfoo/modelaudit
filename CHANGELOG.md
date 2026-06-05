@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve selected content-routed and exact-name cloud/JFrog artifacts, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
+- preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
@@ -83,8 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
-- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
-- sniff suffix-skipped cloud objects so content-routed model files are not omitted without rejecting exact-budget benign or model-bearing archives
 - block weight distribution `torch.load` on PyTorch prerelease, dev, and unknown versions before deserialization while preserving final, local, and PEP 440 post-release patched builds
 - fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
