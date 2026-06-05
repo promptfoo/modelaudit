@@ -1608,6 +1608,32 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+def test_scan_file_ignores_oversized_pickle_frame_near_match_in_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "frame-near-match.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({}, use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb(4, use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb([-1, -1, -1, -1, -1], use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    assert "pickle" in file_detection.detect_flax_msgpack_overlap_routes(
+        str(checkpoint),
+        include_unvalidated_pickle=True,
+    )
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert not any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
 @pytest.mark.parametrize("prefix", [b"I1\n.", b"cbuiltins\nstr\n.", b"\x80\x04."])
 def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_path: Path, prefix: bytes) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
