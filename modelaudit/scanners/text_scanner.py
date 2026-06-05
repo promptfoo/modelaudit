@@ -74,6 +74,20 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
 )
+DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])[\"']?(?:endpoint|callback|webhook)"
+    rb"(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*(?:=|:)\s*"
+    rb"\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
+    rb"[ \t]*[\"']?(?:endpoint|callback|webhook)(?:[_-][A-Za-z0-9_.-]{1,128})?[\"']?\s*:\s*",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
+    rb"[ \t]+[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
+    re.IGNORECASE,
+)
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
     rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
     re.IGNORECASE,
@@ -290,6 +304,23 @@ class TextScanner(BaseScanner):
             return False
         return any(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in parsed.body)
 
+    @staticmethod
+    def _documentation_nested_config_is_actionable(prefix: bytes) -> bool:
+        if DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN.search(prefix) is not None:
+            return True
+        lines = prefix.splitlines()
+        if len(lines) < 2:
+            return False
+        parent_line, value_line = lines[-2:]
+        if (
+            DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is None
+            or DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None
+        ):
+            return False
+        parent_indent = len(parent_line) - len(parent_line.lstrip(b" \t"))
+        value_indent = len(value_line) - len(value_line.lstrip(b" \t"))
+        return value_indent > parent_indent
+
     @classmethod
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
@@ -303,6 +334,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
+            or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
             or DOCUMENTATION_LAMBDA_PATTERN.search(prefix) is not None
             or cls._documentation_line_has_import_statement(line)
@@ -324,6 +356,7 @@ class TextScanner(BaseScanner):
             DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
+            or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
         )
 
@@ -336,6 +369,12 @@ class TextScanner(BaseScanner):
         if finding_type == "cc_pattern":
             pattern = finding.get("pattern")
             return (pattern.encode().lower(),) if isinstance(pattern, str) and pattern else ()
+        if finding_type == "suspicious_port":
+            port = finding.get("port")
+            if not isinstance(port, int):
+                return ()
+            port_bytes = str(port).encode()
+            return (b":" + port_bytes, b"port=" + port_bytes, b"port " + port_bytes)
         if finding_type != "network_library":
             return ()
 
@@ -386,8 +425,11 @@ class TextScanner(BaseScanner):
             next_match = min(matches, default=None, key=lambda match: match[0])
             if next_match is None:
                 return finding, False, remaining_occurrences
-            position, token_bytes = next_match
+            match_position, token_bytes = next_match
             remaining_occurrences -= 1
+            position = match_position
+            if finding_type == "suspicious_port":
+                position += len(token_bytes) - len(str(finding["port"]).encode())
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
@@ -395,12 +437,14 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
             elif finding_type == "network_library":
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
+            elif finding_type == "suspicious_port":
+                actionable = cls._documentation_finding_is_actionable(payload, candidate)
             else:
                 actionable = not cls._documentation_cc_finding_is_benign_prose(payload, candidate)
             if actionable:
                 candidate.pop("snippet", None)
                 return candidate, False, remaining_occurrences
-            search_start = position + len(token_bytes)
+            search_start = match_position + len(token_bytes)
             if remaining_occurrences <= 0:
                 if allow_exhaustion_probe and not any(
                     lowered_payload.find(option, search_start) >= 0 for option in token_bytes_options
@@ -539,13 +583,27 @@ class TextScanner(BaseScanner):
         line = cls._finding_line(payload, finding)
         if not line or b"@" in line:
             return False
-        if BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(line):
-            return True
+        finding_type = finding.get("type")
+        if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
+            if BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(line):
+                return True
+            line_text = line.decode("utf-8", errors="ignore").casefold()
+            return any(
+                isinstance(value, str) and line_text == value.casefold()
+                for value in (finding.get("domain"), finding.get("ip"))
+            )
+
         line_text = line.decode("utf-8", errors="ignore").casefold()
-        return any(
-            isinstance(value, str) and line_text == value.casefold()
-            for value in (finding.get("domain"), finding.get("ip"))
-        )
+        candidates: tuple[Any, ...]
+        if finding_type == "cc_pattern":
+            candidates = (finding.get("pattern"),)
+        elif finding_type == "network_function":
+            candidates = (finding.get("function"),)
+        elif finding_type == "network_library":
+            candidates = (finding.get("pattern"), finding.get("library"))
+        else:
+            return False
+        return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
     @staticmethod
     def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
@@ -609,12 +667,12 @@ class TextScanner(BaseScanner):
                 )
                 or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
+                or (
+                    finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
+                )
             )
         if cls._is_passive_data_sidecar(path):
-            return finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES and cls._is_bare_data_network_token(
-                payload,
-                finding,
-            )
+            return cls._is_bare_data_network_token(payload, finding)
         return finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES and cls._standard_requirements_network_finding(
             path,
             payload,

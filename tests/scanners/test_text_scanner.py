@@ -489,6 +489,8 @@ def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_pat
         "endpoint:\n  - https://evil.example/payload\n",
         '{"webhook_urls": ["https://evil.example/payload"]}\n',
         "<endpoint>https://evil.example/payload</endpoint>\n",
+        'endpoint = {"url": "https://evil.example/payload"}\n',
+        "endpoint:\n  url: https://evil.example/payload\n",
     ],
 )
 def test_text_scanner_documentation_endpoint_config_remains_actionable(tmp_path: Path, content: str) -> None:
@@ -539,6 +541,31 @@ def test_text_scanner_generic_quoted_url_mapping_remains_informational(tmp_path:
 def test_text_scanner_generic_url_collection_mapping_remains_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("project_urls:\n  - https://example.com/project\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_generic_nested_url_mapping_remains_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('{"project": {"url": "https://example.com/project"}}\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_unrelated_endpoint_does_not_taint_nested_project_url(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "endpoint:\n  name: inference\nproject:\n  url: https://example.com/project\n",
+        encoding="utf-8",
+    )
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -699,6 +726,46 @@ def test_text_scanner_documentation_cc_markers_remain_actionable(tmp_path: Path)
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "SSH uses port 22.\n",
+        "Local demo: http://localhost:8080\n",
+    ],
+)
+def test_text_scanner_documentation_port_prose_is_informational(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    port_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "suspicious_port"
+    ]
+    assert port_checks
+    assert all(check.severity == IssueSeverity.INFO for check in port_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_documentation_port_assignment_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("PORT=4444\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "suspicious_port"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_requirements_urls_remain_actionable(tmp_path: Path) -> None:
@@ -864,6 +931,62 @@ def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> 
     assert network_checks
     assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("token", "finding_type"),
+    [
+        ("malware", "cc_pattern"),
+        ("backdoor", "cc_pattern"),
+        ("requests.get", "network_function"),
+    ],
+)
+def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
+    tmp_path: Path,
+    token: str,
+    finding_type: str,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(f"safe-token\n{token}\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == finding_type
+    ]
+    assert matching_checks
+    assert all(check.severity == IssueSeverity.INFO for check in matching_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "finding_type"),
+    [
+        ("label=malware\n", "cc_pattern"),
+        ("requests.get(endpoint)\n", "network_function"),
+    ],
+)
+def test_text_scanner_active_vocabulary_context_remains_actionable(
+    tmp_path: Path,
+    content: str,
+    finding_type: str,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == finding_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_vocabulary_url_assignments_remain_actionable(tmp_path: Path) -> None:

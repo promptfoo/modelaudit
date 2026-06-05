@@ -112,6 +112,7 @@ class TestMetadataScanner:
                     cache_enabled=True,
                     cache_dir=str(cache_dir),
                     min_cache_file_size=0,
+                    scanners=["metadata"],
                 )
                 for _ in range(2)
             ]
@@ -131,7 +132,11 @@ class TestMetadataScanner:
         readme_path.write_bytes(b"# Model Card\n\ninvalid text: \xff\n")
 
         direct = MetadataScanner().scan(str(readme_path))
-        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+        aggregate = scan_model_directory_or_file(
+            str(readme_path),
+            cache_scan_results=False,
+            scanners=["metadata"],
+        )
 
         assert direct.success is False
         assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -158,7 +163,11 @@ class TestMetadataScanner:
         monkeypatch.setattr("modelaudit.scanners.base.os.access", inaccessible_owned_path)
 
         direct = MetadataScanner().scan(str(readme_path))
-        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+        aggregate = scan_model_directory_or_file(
+            str(readme_path),
+            cache_scan_results=False,
+            scanners=["metadata"],
+        )
 
         assert direct.success is False
         assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
