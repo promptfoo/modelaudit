@@ -467,8 +467,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     return budget("node_attribute_limit_exceeded", "node_attribute_count")
 
                 for attribute in attributes.values():
-                    attribute_list = getattr(attribute, "list", None)
-                    attribute_string_value_count += len(getattr(attribute_list, "s", []))
+                    value_kind = attribute.WhichOneof("value")
+                    if value_kind == "s":
+                        attribute_string_value_count += 1
+                    elif value_kind == "list":
+                        attribute_string_value_count += len(attribute.list.s)
                     if attribute_string_value_count > _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES:
                         return budget("attribute_string_value_limit_exceeded", "attribute_string_value_count")
 

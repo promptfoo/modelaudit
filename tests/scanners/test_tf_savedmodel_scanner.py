@@ -1407,6 +1407,62 @@ def test_savedmodel_attribute_string_value_budget_marks_scan_inconclusive(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_scalar_attribute_string_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
+                }
+            ],
+            model_name="oversized_scalar_attribute_strings",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "attribute_string_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "attribute_string_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_mixed_attribute_strings_are_allowed_at_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 3)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label": "safe"},
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1"]},
+                }
+            ],
+            model_name="mixed_attribute_strings_at_budget",
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+
+    assert result.success is True
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert not any(check.name == "SavedModel Graph Traversal Budget" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_value_budget_marks_scan_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
