@@ -32,7 +32,12 @@ def test_trusted_keras_submodule_lambda_classes_are_scanned(layer_class: str) ->
     "layer_class",
     [
         "custom.tensorflow.keras.layers.Lambda",
+        "keras.attacker.Lambda",
+        "keras.layers.attacker.Lambda",
+        "keras.src.layers.core.lambda_layer.attacker.Lambda",
         "keras_custom.layers.Lambda",
+        "tensorflow.keras.layers_evil.Lambda",
+        "tensorflow.python.keras.layers.core.attacker.Lambda",
         "tensorflow.keras_custom.layers.Lambda",
         "tf_keras_custom.layers.Lambda",
     ],

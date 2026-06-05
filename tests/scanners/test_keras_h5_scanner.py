@@ -3850,7 +3850,15 @@ class TestCVE20259905H5SafeMode:
         assert cve_issues[0].details["layer_class"] == "Lambda"
         assert cve_issues[0].details["keras_version"] == "3.11.2"
 
-    @pytest.mark.parametrize("layer_class", ["myproject.layers.Lambda", "keras.attacker.Lambda"])
+    @pytest.mark.parametrize(
+        "layer_class",
+        [
+            "myproject.layers.Lambda",
+            "keras.attacker.Lambda",
+            "keras.layers.attacker.Lambda",
+            "tensorflow.keras.layers_evil.Lambda",
+        ],
+    )
     def test_custom_namespace_lambda_layer_not_attributed_to_keras_cve(
         self,
         tmp_path: Path,

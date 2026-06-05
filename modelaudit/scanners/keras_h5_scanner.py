@@ -104,12 +104,27 @@ class KerasH5Scanner(BaseScanner):
         "tensorflow.python.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
         "tf_keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
     }
-    _TRUSTED_LAMBDA_LAYER_PREFIXES: ClassVar[tuple[str, ...]] = (
-        "keras.",
-        "tensorflow.keras.",
-        "tensorflow.python.keras.",
-        "tf.keras.",
-        "tf_keras.",
+    _TRUSTED_LAMBDA_LAYER_CLASSES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "keras.layers.Lambda",
+            "keras.layers.core.Lambda",
+            "keras.layers.experimental.core.Lambda",
+            "keras.src.layers.core.Lambda",
+            "keras.src.layers.core.lambda_layer.Lambda",
+            "tensorflow.keras.layers.Lambda",
+            "tensorflow.keras.layers.core.Lambda",
+            "tensorflow.keras.layers.experimental.core.Lambda",
+            "tensorflow.python.keras.layers.core.Lambda",
+            "tensorflow.python.keras.layers.core.lambda_layer.Lambda",
+            "tensorflow.python.keras.layers.legacy.Lambda",
+            "tf.keras.layers.Lambda",
+            "tf.keras.layers.core.Lambda",
+            "tf.keras.layers.experimental.core.Lambda",
+            "tf_keras.layers.Lambda",
+            "tf_keras.layers.core.Lambda",
+            "tf_keras.src.layers.core.Lambda",
+            "tf_keras.src.layers.core.lambda_layer.Lambda",
+        }
     )
     _DANGEROUS_LAMBDA_MODULE_TOKENS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1386,9 +1401,7 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layer_class, str):
             return False
 
-        if layer_class == "Lambda":
-            return True
-        return layer_class.endswith(".Lambda") and layer_class.startswith(KerasH5Scanner._TRUSTED_LAMBDA_LAYER_PREFIXES)
+        return layer_class == "Lambda" or layer_class in KerasH5Scanner._TRUSTED_LAMBDA_LAYER_CLASSES
 
     @staticmethod
     def _lambda_callable_dict_reference(function_dict: dict[str, Any]) -> tuple[Any, Any] | None:
