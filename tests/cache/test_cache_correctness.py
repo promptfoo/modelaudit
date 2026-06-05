@@ -82,6 +82,16 @@ def test_capture_file_identity_uses_target_filesystem_probe(
     cache._change_clock_probes.clear()
 
 
+def test_change_clock_probe_prefers_system_temp_over_cache_directory(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+
+    file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
+
+    assert ancestor_identity
+    assert cache._change_clock_probes[file_stat.st_dev][1] == Path(tempfile.gettempdir())
+
+
 def test_windows_change_clock_probe_uses_existing_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -138,6 +148,31 @@ def test_change_clock_probe_allows_coarse_filesystem_tick(
         )
 
     assert clock["now"] >= 0.1
+
+
+def test_windows_change_clock_barrier_ignores_ancestor_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    ancestor_identity = AncestorIdentity(
+        [
+            (
+                str(file_path.parent),
+                file_path.stat().st_dev,
+                file_path.parent.stat().st_ino,
+                file_path.parent.stat().st_mode,
+                file_path.parent.stat().st_mtime_ns,
+                10_000,
+            )
+        ]
+    )
+
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(cache, "_touch_change_clock_probe", lambda _probe: 2)
+        assert cache._advance_change_clock(str(file_path), probe, 1, ancestor_identity) == 2
 
 
 def test_capture_file_identity_advances_clock_before_hashing(
@@ -198,6 +233,17 @@ def test_capture_file_identity_ignores_unrelated_ancestor_churn_during_hash(
     identity = cache.capture_file_identity(str(file_path))
 
     assert identity[1].startswith("secure:")
+
+
+def test_missing_file_cache_lookups_return_misses(tmp_path: Path) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    missing_path = tmp_path / "missing.cache"
+
+    assert cache.get_cached_result(str(missing_path)) is None
+    assert cache.get_cached_result_with_identity(str(missing_path)) == (None, None)
+    assert cache.get_cached_result_by_key("missing-key", file_path=str(missing_path)) is None
+    assert cache._get_cached_result_by_key("missing-key", file_path=str(missing_path)) is None
+    assert cache.get_cache_stats()["cache_misses"] == 4
 
 
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
