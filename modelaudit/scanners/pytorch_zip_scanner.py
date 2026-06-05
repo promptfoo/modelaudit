@@ -251,12 +251,16 @@ class PyTorchZipScanner(BaseScanner):
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
+    MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
     BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
     ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
     LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
+    VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_size_limit"
+    VERSION_METADATA_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_read_failed"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -274,6 +278,10 @@ class PyTorchZipScanner(BaseScanner):
         self.max_archive_entries = self._normalize_positive_int_config(
             self.config.get("max_archive_entries"),
             self.MAX_ARCHIVE_ENTRIES,
+        )
+        self.max_version_probe_bytes = self._normalize_positive_int_config(
+            self.config.get("version_probe_bytes"),
+            self.DEFAULT_VERSION_PICKLE_PROBE_BYTES,
         )
         # ``max_jit_scan_member_bytes`` caps per-member reads during the JIT /
         # network pattern pass to avoid unbounded memory blowup. Non-positive
@@ -2384,6 +2392,74 @@ class PyTorchZipScanner(BaseScanner):
         result.finish(success=False)
         return result
 
+    def _read_bounded_version_metadata(
+        self,
+        zipfile_obj: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+        *,
+        max_bytes: int,
+    ) -> bytes | None:
+        """Read version metadata without allowing optional probes to allocate unbounded memory."""
+        name = self._get_zip_member_name(entry)
+        try:
+            return self._read_member_bytes(
+                zipfile_obj,
+                entry,
+                phase="version_probe",
+                result=result,
+                max_bytes=max_bytes,
+            )
+        except ValueError as exc:
+            mark_inconclusive_scan_result(result, self.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="PyTorch Version Metadata Limit",
+                passed=False,
+                message=(
+                    f"Skipped version metadata in {name} because it exceeds the bounded read limit "
+                    f"({entry.file_size} > {max_bytes} bytes)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:{name}",
+                details={
+                    "zip_entry": name,
+                    "file_size": entry.file_size,
+                    "max_read_bytes": max_bytes,
+                    "exception": str(exc),
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON,
+                },
+            )
+            return None
+        except Exception as exc:
+            mark_inconclusive_scan_result(result, self.VERSION_METADATA_READ_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="PyTorch Version Metadata Read",
+                passed=False,
+                message=f"Could not read version metadata in {name}: {exc!s}",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:{name}",
+                details={
+                    "zip_entry": name,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.VERSION_METADATA_READ_INCONCLUSIVE_REASON,
+                },
+            )
+            return None
+
+    @classmethod
+    def _version_metadata_analysis_incomplete(cls, result: ScanResult) -> bool:
+        reasons = result.metadata.get("scan_outcome_reasons")
+        return isinstance(reasons, list) and any(
+            reason in reasons
+            for reason in (
+                cls.VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON,
+                cls.VERSION_METADATA_READ_INCONCLUSIVE_REASON,
+            )
+        )
+
     def _extract_pytorch_version_info(
         self,
         zipfile_obj: zipfile.ZipFile,
@@ -2402,31 +2478,25 @@ class PyTorchZipScanner(BaseScanner):
             version_entry = self._find_zip_entry(safe_entries, "version")
             archive_version_entry = self._find_zip_entry(safe_entries, "archive/version")
             if version_entry is not None:
-                version_data = (
-                    self._read_member_bytes(
-                        zipfile_obj,
-                        version_entry,
-                        phase="version_probe",
-                        result=result,
-                    )
-                    .decode("utf-8", errors="ignore")
-                    .strip()
+                version_bytes = self._read_bounded_version_metadata(
+                    zipfile_obj,
+                    version_entry,
+                    result,
+                    max_bytes=self.MAX_VERSION_METADATA_BYTES,
                 )
-                version_info["pytorch_archive_version"] = version_data
-                version_info["pytorch_version_source"] = "version"
+                if version_bytes is not None:
+                    version_info["pytorch_archive_version"] = version_bytes.decode("utf-8", errors="ignore").strip()
+                    version_info["pytorch_version_source"] = "version"
             elif archive_version_entry is not None:
-                version_data = (
-                    self._read_member_bytes(
-                        zipfile_obj,
-                        archive_version_entry,
-                        phase="version_probe",
-                        result=result,
-                    )
-                    .decode("utf-8", errors="ignore")
-                    .strip()
+                version_bytes = self._read_bounded_version_metadata(
+                    zipfile_obj,
+                    archive_version_entry,
+                    result,
+                    max_bytes=self.MAX_VERSION_METADATA_BYTES,
                 )
-                version_info["pytorch_archive_version"] = version_data
-                version_info["pytorch_version_source"] = "archive/version"
+                if version_bytes is not None:
+                    version_info["pytorch_archive_version"] = version_bytes.decode("utf-8", errors="ignore").strip()
+                    version_info["pytorch_version_source"] = "archive/version"
 
             # Try to extract PyTorch framework version from pickle files
             # Look for torch.__version__ references in pickle GLOBAL opcodes
@@ -2435,12 +2505,10 @@ class PyTorchZipScanner(BaseScanner):
                 if name.endswith(".pkl"):
                     try:
                         # Cap read for version probing to 1MB; adjust via config if needed
-                        cfg = self.config or {}
-                        probe_bytes = cfg.get("version_probe_bytes", 1024 * 1024)  # 1MB default
                         pickle_data = self._read_member_prefix(
                             zipfile_obj,
                             entry,
-                            probe_bytes,
+                            self.max_version_probe_bytes,
                             phase="version_probe",
                             result=result,
                         )
@@ -2461,14 +2529,15 @@ class PyTorchZipScanner(BaseScanner):
                     try:
                         import json
 
-                        meta_data = json.loads(
-                            self._read_member_bytes(
-                                zipfile_obj,
-                                meta_entry,
-                                phase="version_probe",
-                                result=result,
-                            ).decode("utf-8")
+                        metadata_bytes = self._read_bounded_version_metadata(
+                            zipfile_obj,
+                            meta_entry,
+                            result,
+                            max_bytes=self.MAX_VERSION_JSON_BYTES,
                         )
+                        if metadata_bytes is None:
+                            continue
+                        meta_data = json.loads(metadata_bytes.decode("utf-8"))
                         # Look for framework-specific version fields in metadata.
                         # Avoid generic "version" keys, which often describe model/config
                         # schema versions and can cause false CVE attributions.
@@ -2691,7 +2760,7 @@ class PyTorchZipScanner(BaseScanner):
                     "size mismatches, enabling heap layout manipulation and arbitrary code execution."
                 ),
             )
-        else:
+        elif not self._version_metadata_analysis_incomplete(result):
             result.add_check(
                 name="CVE-2026-24747 PyTorch Version Check",
                 passed=True,

@@ -50,6 +50,7 @@ from ..utils.file.detection import (
     is_skops_archive,
     is_torchserve_mar_archive,
 )
+from ..utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES
 from .base import FORMAT_VALIDATION_CONFIG_KEY
 from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from .xgboost_scanner import (
@@ -428,34 +429,30 @@ def merge_hdf5_userblock_zip_findings(
     context: str,
 ) -> None:
     """Merge ZIP findings from a complete HDF5 user block with a logical EOF."""
-    try:
-        if zipfile.is_zipfile(path):
-            if result.scanner_name != "zip":
-                merge_executable_zip_container_findings(path, result, config, context=context)
-            return
-    except OSError:
-        # Fall back to manual user-block ZIP handling below.
-        pass
-
     temp_path: str | None = None
     try:
         eocd_offsets: list[int] = []
+        saw_zip_record = False
         carry = b""
         bytes_read = 0
+        scan_limit = min(signature_offset, HDF5_SIGNATURE_SCAN_MAX_BYTES)
         temp_suffix = Path(path).suffix or ".zip"
         with open(path, "rb") as source:
-            remaining = signature_offset
+            remaining = scan_limit
             while remaining > 0:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("HDF5 user block ended before its validated signature offset")
                 candidate_bytes = carry + chunk
                 candidate_base = bytes_read - len(carry)
+                if b"PK\x03\x04" in candidate_bytes or b"PK\x01\x02" in candidate_bytes:
+                    saw_zip_record = True
                 search_offset = 0
                 while True:
                     match_offset = candidate_bytes.find(b"PK\x05\x06", search_offset)
                     if match_offset < 0:
                         break
+                    saw_zip_record = True
                     eocd_offsets.append(candidate_base + match_offset)
                     if len(eocd_offsets) > 4096:
                         raise OSError("HDF5 user block contains too many ZIP end-record candidates")
@@ -464,9 +461,13 @@ def merge_hdf5_userblock_zip_findings(
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
 
-        logical_zip_ends = _find_valid_zip_logical_ends(path, eocd_offsets, signature_offset)
+        logical_zip_ends = _find_valid_zip_logical_ends(path, eocd_offsets, scan_limit)
         if not logical_zip_ends:
-            raise OSError("HDF5 user block has ZIP-like content without a valid ZIP end record")
+            if saw_zip_record:
+                raise OSError("HDF5 user block has ZIP-like content without a valid ZIP end record")
+            if scan_limit < signature_offset:
+                _mark_hdf5_userblock_zip_probe_incomplete(result, path, signature_offset, scan_limit)
+            return
         if len(logical_zip_ends) > _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS:
             raise OSError("HDF5 user block contains too many complete ZIP segments")
         logical_zip_end = logical_zip_ends[-1]
@@ -474,7 +475,7 @@ def merge_hdf5_userblock_zip_findings(
         has_trailing_content = False
         with open(path, "rb") as source:
             source.seek(logical_zip_end)
-            trailing_bytes = signature_offset - logical_zip_end
+            trailing_bytes = scan_limit - logical_zip_end
             while trailing_bytes > 0:
                 chunk = source.read(min(1024 * 1024, trailing_bytes))
                 if not chunk:
@@ -510,6 +511,8 @@ def merge_hdf5_userblock_zip_findings(
                 rule_code="S902",
             )
             result.finish(success=False)
+        if scan_limit < signature_offset:
+            _mark_hdf5_userblock_zip_probe_incomplete(result, path, signature_offset, scan_limit)
         _deduplicate_exact_merged_findings(result)
     except OSError as exc:
         reason = "hdf5_userblock_zip_scan_failed"
@@ -532,6 +535,33 @@ def merge_hdf5_userblock_zip_findings(
         if temp_path is not None:
             with suppress(OSError):
                 os.unlink(temp_path)
+
+
+def _mark_hdf5_userblock_zip_probe_incomplete(
+    result: ScanResult,
+    path: str,
+    signature_offset: int,
+    scanned_bytes: int,
+) -> None:
+    """Fail closed when bounded ZIP discovery cannot cover the full user block."""
+    reason = "hdf5_userblock_zip_probe_incomplete"
+    mark_inconclusive_scan_result(result, reason)
+    result.add_check(
+        name="HDF5 User Block ZIP Probe",
+        passed=False,
+        message="HDF5 user-block ZIP discovery reached its bounded scan limit.",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome_reason": reason,
+            "hdf5_signature_offset": signature_offset,
+            "zip_probe_bytes_scanned": scanned_bytes,
+            "zip_probe_max_bytes": HDF5_SIGNATURE_SCAN_MAX_BYTES,
+        },
+        rule_code="S902",
+    )
+    result.finish(success=False)
 
 
 def _replace_scan_result_path(result: ScanResult, old_path: str, new_path: str) -> None:

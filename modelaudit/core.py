@@ -1900,6 +1900,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
 
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
@@ -1956,13 +1957,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if (
         header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT
-    ) and find_hdf5_signature_offset(path) is None:
+    ) and hdf5_signature_offset is None:
         sr = _scan_executable_zip_polyglot(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
 
-    if format_probe_error is not None:
+    if hdf5_signature_offset is not None:
+        # A validated HDF5 superblock is stronger evidence than a suffix or
+        # user-block prefix that resembles another format.
+        file_type_valid = True
+    elif format_probe_error is not None:
         # A failed content read is not evidence of spoofing. Let an owning
         # scanner produce a precise read-failure outcome when one exists.
         file_type_valid = True
@@ -1996,10 +2001,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
-    scanner_id = _select_preferred_scanner_id(path, header_format, ext)
-    hdf5_signature_offset = find_hdf5_signature_offset(path) if scanner_id == "keras_h5" else None
+    scanner_id = (
+        "keras_h5" if hdf5_signature_offset is not None else _select_preferred_scanner_id(path, header_format, ext)
+    )
     hdf5_userblock_supplemental_scanner_id = (
-        _select_hdf5_userblock_supplemental_scanner_id(path, header_format, ext)
+        _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext)
         if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
         else None
     )
@@ -2283,7 +2289,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             context="strict content owner overlapping ambiguous Flax analysis",
         )
 
-    if hdf5_userblock_supplemental_scanner_id == "zip":
+    if hdf5_signature_offset not in (None, 0):
         assert hdf5_signature_offset is not None
         merge_hdf5_userblock_zip_findings(
             path,
@@ -2292,8 +2298,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             hdf5_signature_offset,
             context="HDF5 user-block ZIP",
         )
-    elif (
-        hdf5_userblock_supplemental_scanner_id is not None
+    if (
+        hdf5_userblock_supplemental_scanner_id not in (None, "zip")
         and result.scanner_name != hdf5_userblock_supplemental_scanner_id
     ):
         _merge_supplemental_scanner_analysis(
@@ -2551,6 +2557,7 @@ def scan_model_streaming(
                     # Add asset
                     asset = asset_from_scan_result(report_path, scan_result, metadata=metadata_dict)
                     if asset:
+                        asset["is_streamed"] = True
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1

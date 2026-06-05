@@ -371,17 +371,32 @@ def test_missing_h5py_invalidates_stale_cache_entries(
     try:
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
         for cached_path in (model_path, extensionless_model_path):
-            assert cache_manager.store_result(
+            version_context = build_cache_version_context(config)
+            _, file_identity = cache_manager.get_cached_result_with_identity(
                 str(cached_path),
-                {
-                    "scanner": "keras_h5",
-                    "success": True,
-                    "issues": [],
-                    "checks": [],
-                    "metadata": {},
-                },
-                version_context=build_cache_version_context(config),
+                version_context=version_context,
             )
+            assert file_identity is not None
+            assert cache_manager.cache is not None
+            file_stat, file_hash, change_token, ancestor_identity = file_identity
+            try:
+                assert cache_manager.store_result(
+                    str(cached_path),
+                    {
+                        "scanner": "keras_h5",
+                        "success": True,
+                        "issues": [],
+                        "checks": [],
+                        "metadata": {},
+                    },
+                    version_context=version_context,
+                    expected_file_stat=file_stat,
+                    expected_file_hash=file_hash,
+                    expected_change_token=change_token,
+                    expected_ancestor_identity=ancestor_identity,
+                )
+            finally:
+                cache_manager.cache.release_ancestor_identity(ancestor_identity)
 
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
         scanner = KerasH5Scanner(config=config)

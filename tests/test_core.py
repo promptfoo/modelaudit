@@ -48,7 +48,12 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
-from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
+from modelaudit.utils.file.hdf5 import (
+    HDF5_MAGIC,
+    HDF5_SIGNATURE_SCAN_MAX_BYTES,
+    find_hdf5_signature_offset,
+    hdf5_metadata_checksum,
+)
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -2728,6 +2733,54 @@ def test_scan_file_preserves_large_zip_userblock_outside_eocd_tail_window(
     assert str(polyglot) in (pickle_issue.location or "")
 
 
+def test_scan_file_preserves_padded_zip_inside_hdf5_userblock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "padded-zip-userblock.h5"
+    _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
+    _prepend_stub(polyglot, bytes(128))
+    signature_offset = _append_hdf5_userblock_candidate(
+        polyglot,
+        plausible=True,
+        minimum_signature_offset=128 * 1024,
+    )
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    assert zipfile.is_zipfile(polyglot) is False
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "unknown"
+    assert find_hdf5_signature_offset(str(polyglot)) == signature_offset
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_fails_closed_when_hdf5_userblock_zip_probe_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "large-userblock.h5"
+    model_path.write_bytes(b"")
+    signature_offset = _append_hdf5_userblock_candidate(
+        model_path,
+        plausible=True,
+        minimum_signature_offset=16 * 1024 * 1024,
+    )
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "hdf5_userblock_zip_probe_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "HDF5 User Block ZIP Probe"
+        and check.details["hdf5_signature_offset"] == signature_offset
+        and check.details["zip_probe_bytes_scanned"] == HDF5_SIGNATURE_SCAN_MAX_BYTES
+        for check in result.checks
+    )
+
+
 def test_scan_file_honors_zip_only_selection_for_hdf5_userblock(tmp_path: Path) -> None:
     polyglot = tmp_path / "selected-zip-userblock.h5"
     _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
@@ -2814,9 +2867,15 @@ def test_scan_file_fails_closed_for_corrupt_hdf5_userblock_zip(
     assert determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize(
+    ("minimum_signature_offset", "whole_file_is_zip"),
+    [(512, True), (128 * 1024, False)],
+)
 def test_scan_file_fails_closed_for_content_after_hdf5_userblock_zip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    minimum_signature_offset: int,
+    whole_file_is_zip: bool,
 ) -> None:
     polyglot = tmp_path / "trailing-userblock-content.h5"
     _create_misnamed_zip(polyglot, {"README.txt": b"benign archive"})
@@ -2825,8 +2884,9 @@ def test_scan_file_fails_closed_for_content_after_hdf5_userblock_zip(
     signature_offset = _append_hdf5_userblock_candidate(
         polyglot,
         plausible=True,
-        minimum_signature_offset=128 * 1024,
+        minimum_signature_offset=minimum_signature_offset,
     )
+    assert zipfile.is_zipfile(polyglot) is whole_file_is_zip
     supplemental_result = ScanResult(scanner_name="keras_h5")
     supplemental_result.finish(success=True)
 
@@ -2856,9 +2916,15 @@ def test_scan_file_fails_closed_for_content_after_hdf5_userblock_zip(
     assert determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize(
+    ("minimum_signature_offset", "whole_file_is_zip"),
+    [(512, True), (128 * 1024, False)],
+)
 def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    minimum_signature_offset: int,
+    whole_file_is_zip: bool,
 ) -> None:
     malicious_zip = tmp_path / "malicious-first.zip"
     benign_zip = tmp_path / "benign-last.zip"
@@ -2866,7 +2932,12 @@ def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
     _create_misnamed_zip(benign_zip, {"README.txt": b"benign trailing archive"})
     polyglot = tmp_path / "concatenated-zip-userblock.h5"
     polyglot.write_bytes(malicious_zip.read_bytes() + benign_zip.read_bytes())
-    _append_hdf5_userblock_candidate(polyglot, plausible=True, minimum_signature_offset=128 * 1024)
+    _append_hdf5_userblock_candidate(
+        polyglot,
+        plausible=True,
+        minimum_signature_offset=minimum_signature_offset,
+    )
+    assert zipfile.is_zipfile(polyglot) is whole_file_is_zip
     monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
 
     result = scan_file(str(polyglot), config={"cache_scan_results": False})
@@ -2940,6 +3011,7 @@ def test_scan_file_does_not_use_suffix_only_supplemental_scanner_for_hdf5_userbl
     assert result.scanner_name == "keras_h5"
     assert result.success is True
     assert "supplemental_scanners" not in result.metadata
+    assert all(check.name != "Format Validation" for check in result.checks)
 
 
 def test_scan_file_routes_runtime_h5py_failure_for_extensionless_userblock(
