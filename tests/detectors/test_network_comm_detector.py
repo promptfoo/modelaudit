@@ -1670,6 +1670,21 @@ class TestNetworkCommDetector:
         assert "=abc" not in serialized
         assert "https://evil.example/<redacted>/model.bin" in serialized
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://token.blob.core.windows.net/container/model.bin",
+            "https://auth.dfs.core.windows.net/container/model.bin",
+            "https://token.s3.amazonaws.com/model.bin",
+            "https://auth.s3.us-east-1.amazonaws.com/model.bin",
+            "https://token.storage.googleapis.com/model.bin",
+        ],
+    )
+    def test_cloud_authority_identifiers_named_like_sensitive_keys_are_preserved(self, url: str) -> None:
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert any(finding.get("url") == url for finding in findings)
+
     @pytest.mark.parametrize("key", ["api_key", "password", "service_token"])
     def test_paired_sensitive_url_path_segments_redact_the_following_value(self, key: str) -> None:
         """Routes that encode credentials as adjacent key/value segments should redact the value."""
@@ -2561,6 +2576,19 @@ def test_network_finding_limit_prioritizes_decoded_nested_url() -> None:
     """A constrained budget must report the encoded destination before its stripped wrapper."""
     nested_url = "https://evil-c2.com/payload"
     data = b"https://benign.example/download?next=https%3A%2F%2Fevil-c2.com%2Fpayload"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["truncated_finding"]["url"] == "https://benign.example/download"
+
+
+def test_network_finding_limit_prioritizes_raw_nested_url() -> None:
+    """An already decoded nested destination must receive the constrained finding slot."""
+    nested_url = "https://evil-c2.com/payload"
+    data = f"https://benign.example/download?next={nested_url}".encode()
 
     findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
 

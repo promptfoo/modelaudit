@@ -568,6 +568,18 @@ def _redact_sensitive_path_assignment(segment: str, *, preserve_key: bool = Fals
     return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
 
 
+def _is_cloud_authority_identifier(labels: list[str], index: int) -> bool:
+    """Preserve bucket/account labels that are part of known cloud storage authorities."""
+    if index != 0 or len(labels) < 2:
+        return False
+    provider_host = ".".join(labels[1:]).lower()
+    return (
+        provider_host in _PATH_STYLE_CLOUD_HOSTS
+        or provider_host in {suffix.removeprefix(".") for suffix in _AZURE_STORAGE_HOST_SUFFIXES}
+        or _S3_REGIONAL_HOST_PATTERN.fullmatch(provider_host) is not None
+    )
+
+
 def _redact_hostname_tokens(hostname: str) -> str:
     with suppress(ValueError):
         ipaddress.ip_address(hostname)
@@ -578,6 +590,8 @@ def _redact_hostname_tokens(hostname: str) -> str:
     authorization_value_pending = False
     for index, label in enumerate(labels):
         decoded = _decode_path_token(label)
+        if _is_cloud_authority_identifier(labels, index):
+            continue
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
             following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
@@ -1137,8 +1151,6 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
                     decoded = next_decoded
                     decode_limit_exhausted = True
 
-            if decoded == candidate:
-                continue
             found_nested_url = False
             for match in _URI_IN_TEXT_PATTERN.finditer(decoded):
                 nested_url = match.group()
