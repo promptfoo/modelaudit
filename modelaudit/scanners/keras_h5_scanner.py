@@ -784,6 +784,8 @@ class KerasH5Scanner(BaseScanner):
                 continue
             layer_class = layer.get("class_name", "")
             layer_config = layer.get("config", {})
+            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+            layer_count_key = "Lambda" if is_lambda_layer else layer_class
             if not isinstance(layer_config, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
                 result.add_check(
@@ -798,13 +800,12 @@ class KerasH5Scanner(BaseScanner):
                 layer_config = {}
 
             # Update layer count
-            if layer_class in layer_counts:
-                layer_counts[layer_class] += 1
+            if layer_count_key in layer_counts:
+                layer_counts[layer_count_key] += 1
             else:
-                layer_counts[layer_class] = 1
+                layer_counts[layer_count_key] = 1
 
             # Check for suspicious layer types
-            is_lambda_layer = self._is_lambda_layer_class(layer_class)
             if layer_class in self.suspicious_layer_types or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
                 if is_lambda_layer:
@@ -973,7 +974,8 @@ class KerasH5Scanner(BaseScanner):
             self._check_config_for_suspicious_strings(
                 layer_config,
                 result,
-                layer_class,
+                "Lambda" if is_lambda_layer else layer_class,
+                redact_nested_context=is_lambda_layer,
             )
 
             # If there are nested models, scan them recursively
@@ -1115,7 +1117,6 @@ class KerasH5Scanner(BaseScanner):
                     if re.search(
                         r"(?<![0-9A-Za-z_])(?:eval|exec|compile|__import__)(?![0-9A-Za-z_])",
                         function_str,
-                        re.IGNORECASE,
                     ):
                         result.add_check(
                             name="Lambda Layer Suspicious Keywords Check",
@@ -1296,6 +1297,8 @@ class KerasH5Scanner(BaseScanner):
         config: Any,
         result: ScanResult,
         context: str = "",
+        *,
+        redact_nested_context: bool = False,
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
 
@@ -1323,19 +1326,23 @@ class KerasH5Scanner(BaseScanner):
                         )
             elif isinstance(value, dict):
                 # Recursively check nested dictionaries
+                nested_context = context if redact_nested_context else f"{context}.{key}"
                 self._check_config_for_suspicious_strings(
                     value,
                     result,
-                    f"{context}.{key}",
+                    nested_context,
+                    redact_nested_context=redact_nested_context,
                 )
             elif isinstance(value, list):
                 # Check each item in the list
                 for i, item in enumerate(value):
                     if isinstance(item, dict):
+                        nested_context = context if redact_nested_context else f"{context}.{key}[{i}]"
                         self._check_config_for_suspicious_strings(
                             item,
                             result,
-                            f"{context}.{key}[{i}]",
+                            nested_context,
+                            redact_nested_context=redact_nested_context,
                         )
 
     @staticmethod
