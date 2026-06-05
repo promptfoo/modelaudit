@@ -192,6 +192,14 @@ class TestCloudURLRedaction:
         url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
 
+    def test_redact_url_for_display_strips_percent_encoded_query_params(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_preserves_non_structural_path_escapes(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/models/bert%20base%2Fmodel.pkl"
+        assert redact_url_for_display(url) == url
+
     def test_redact_url_for_display_fails_closed_for_invalid_port(self) -> None:
         url = "https://user:password@example.com:not-a-port/model.bin?token=secret"
         assert redact_url_for_display(url) == "<cloud URL redacted>"
@@ -203,6 +211,10 @@ class TestCloudURLRedaction:
     def test_redact_stream_url_for_display_fails_closed_without_inner_scheme(self) -> None:
         url = "bucket/model.bin?redirect=https://safe.example&token=secret"
         assert redact_stream_url_for_display(url) == "<cloud URL redacted>"
+
+    def test_redact_stream_url_for_display_strips_percent_encoded_query_params(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model.pkl%253Fvisible%253Dyes%2526token%253Dsecret"
+        assert redact_stream_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
 
     def test_redact_stream_error_for_display_removes_unknown_malformed_query(self) -> None:
         url = "bucket/model.bin?session=secret-value"
@@ -262,6 +274,34 @@ class TestCloudURLRedaction:
 
         assert redacted == "provider failed: https://collector.example/callback?token=<redacted>"
         assert "ENCODED-SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_percent_encoded_url_delimiters(self) -> None:
+        message = (
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl"
+            "%253Fvisible%253Dyes%2526X-Amz-Signature%253Ddeadbeef%2526token%253Dsecret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl"
+            "?visible=yes&X-Amz-Signature=<redacted>&token=<redacted>"
+        )
+        assert "deadbeef" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_percent_encoded_url_prefix(self) -> None:
+        message = (
+            "provider failed: https%253A%252F%252Fbucket.s3.amazonaws.com%252Fmodel.pkl"
+            "%253Fvisible%253Dyes%2526X-Amz-Signature%253Ddeadbeef"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com%252Fmodel.pkl?visible=yes&X-Amz-Signature=<redacted>"
+        )
+        assert "deadbeef" not in redacted
 
     def test_redact_cloud_error_for_display_redacts_common_credential_aliases(self) -> None:
         message = (

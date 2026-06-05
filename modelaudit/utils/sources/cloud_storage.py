@@ -50,6 +50,15 @@ _ESCAPED_URL_DELIMITER_RE = re.compile(
     r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|x2f|x3f|x3d|x26|x23)",
     re.IGNORECASE,
 )
+_PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
+    r"%(?:25)*(?P<delimiter>3f|3d|26|23|3b)",
+    re.IGNORECASE,
+)
+_PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23)", re.IGNORECASE)
+_PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
+    r"(?P<scheme>[a-z][a-z0-9+.-]*)%(?:25)*3a%(?:25)*2f%(?:25)*2f",
+    re.IGNORECASE,
+)
 _SAFE_DISPLAY_QUERY_KEYS = frozenset(
     {
         "campaign",
@@ -133,7 +142,10 @@ def is_stream_url(url: str) -> bool:
 def redact_url_for_display(url: str) -> str:
     """Remove credentials, query strings, and fragments from a URL for display."""
     try:
-        parts = urlsplit(url)
+        normalized_url = _normalize_percent_encoded_url_delimiters_for_display(
+            normalize_escaped_url_delimiters_for_display(url)
+        )
+        parts = urlsplit(normalized_url)
         if not parts.scheme:
             return url
 
@@ -160,7 +172,7 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
 
 
 def normalize_escaped_url_delimiters_for_display(value: str) -> str:
-    """Expose escaped URL structure so reporting redactors can inspect it."""
+    """Expose backslash-escaped URL structure so reporting redactors can inspect it."""
     replacements = {
         "/": "/",
         "u002f": "/",
@@ -174,15 +186,37 @@ def normalize_escaped_url_delimiters_for_display(value: str) -> str:
         "x26": "&",
         "x23": "#",
     }
-    return _ESCAPED_URL_DELIMITER_RE.sub(
+    normalized = _ESCAPED_URL_DELIMITER_RE.sub(
         lambda match: replacements[match.group("delimiter").lower()],
         value,
     )
+    return _PERCENT_ENCODED_URL_PREFIX_RE.sub(lambda match: f"{match.group('scheme')}://", normalized)
+
+
+def _normalize_percent_encoded_url_delimiters_for_display(url: str) -> str:
+    """Expose encoded query structure without decoding ordinary path escapes."""
+    boundary = _PERCENT_ENCODED_URL_BOUNDARY_RE.search(url)
+    if boundary is None:
+        return url
+
+    percent_replacements = {
+        "3f": "?",
+        "3d": "=",
+        "26": "&",
+        "23": "#",
+        "3b": ";",
+    }
+    encoded_suffix = _PERCENT_ENCODED_URL_DELIMITER_RE.sub(
+        lambda match: percent_replacements[match.group("delimiter").lower()],
+        url[boundary.start() :],
+    )
+    return f"{url[: boundary.start()]}{encoded_suffix}"
 
 
 def _redact_embedded_url_for_display(url: str) -> str:
     if is_stream_url(url):
         return f"stream://{redact_stream_url_for_display(url[9:])}"
+    url = _normalize_percent_encoded_url_delimiters_for_display(url)
     try:
         parts = urlsplit(url)
         safe_base = redact_url_for_display(url)
