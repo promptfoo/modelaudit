@@ -2380,6 +2380,17 @@ def scan_model_streaming(
         "MetadataScanner"
     )
     nearby_license_cache: dict[str, list[str]] = {}
+    pending_delete_failures: dict[Path, Exception] = {}
+
+    def delete_streamed_source(source_path: Path, context: str) -> None:
+        if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
+            return
+        try:
+            source_path.unlink()
+            logger.debug(f"Deleted {source_path} {context}")
+        except Exception as e:
+            logger.warning(f"Failed to delete {source_path} {context}: {e}")
+            pending_delete_failures[source_path] = e
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -2391,13 +2402,19 @@ def scan_model_streaming(
             scan_path = source_path
             report_path = str(source_path)
 
-            # Check for interruption
-            check_interrupted()
+            # Check for interruption before starting work on the yielded file.
+            try:
+                check_interrupted()
+            except KeyboardInterrupt:
+                delete_streamed_source(source_path, "after streaming interruption")
+                raise
 
             # Check timeout
             if time.time() - start_time > timeout:
                 results.has_errors = True
+                aggregate_hash_complete = False
                 logger.error(f"Streaming scan timeout after {timeout}s")
+                delete_streamed_source(source_path, "after streaming timeout")
                 break
 
             try:
@@ -2539,15 +2556,11 @@ def scan_model_streaming(
             except Exception as e:
                 logger.error(f"Error processing {source_path}: {e}", exc_info=True)
                 results.has_errors = True
+                aggregate_hash_complete = False
 
             finally:
                 # Delete file after scanning if requested
-                if delete_after_scan and source_path.exists():
-                    try:
-                        source_path.unlink()
-                        logger.debug(f"Deleted {source_path} after scanning")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {source_path}: {e}")
+                delete_streamed_source(source_path, "after scanning")
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:
@@ -2562,5 +2575,40 @@ def scan_model_streaming(
         logger.error(f"Streaming scan failed: {e}")
         results.has_errors = True
         raise
+    finally:
+        close_generator = getattr(file_generator, "close", None)
+        if callable(close_generator):
+            try:
+                close_generator()
+            except Exception as e:
+                logger.warning(f"Failed to close streaming file generator: {e}")
+                results.has_errors = True
+                results.success = False
+                _add_issue_to_model(
+                    results,
+                    f"Failed to close streaming file generator: {e}",
+                    severity=IssueSeverity.INFO.value,
+                    details={
+                        "analysis_incomplete": True,
+                        "operational_error": True,
+                        "exception_type": type(e).__name__,
+                    },
+                )
+        for source_path, delete_error in pending_delete_failures.items():
+            if not (source_path.exists() or source_path.is_symlink()):
+                continue
+            results.has_errors = True
+            results.success = False
+            _add_issue_to_model(
+                results,
+                f"Failed to delete streamed source {source_path}: {delete_error}",
+                severity=IssueSeverity.INFO.value,
+                location=str(source_path),
+                details={
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "exception_type": type(delete_error).__name__,
+                },
+            )
 
     return results
