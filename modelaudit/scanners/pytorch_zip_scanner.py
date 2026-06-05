@@ -778,6 +778,7 @@ class PyTorchZipScanner(BaseScanner):
             )
 
         for info in entries_to_process:
+            self._check_timeout()
             name = info.filename
             previous_info = seen_entries.get(name)
             if previous_info is None:
@@ -3330,6 +3331,28 @@ class PyTorchZipScanner(BaseScanner):
                 entries_to_process = archive_entries[: self.max_archive_entries]
                 file_list = [entry.filename for entry in entries_to_process]
                 files_truncated = total_files > len(file_list)
+                member_records = [
+                    (
+                        entry,
+                        entry.filename.replace("\\", "/").lstrip("/"),
+                    )
+                    for entry in entries_to_process
+                ]
+                member_parts = [
+                    (
+                        entry,
+                        normalized_name,
+                        normalized_name.rsplit("/", 1)[-1],
+                        normalized_name.rsplit("/", 1)[0] if "/" in normalized_name else "",
+                    )
+                    for entry, normalized_name in member_records
+                ]
+                data_pkl_prefixes = {parent for _, _, basename, parent in member_parts if basename == "data.pkl"}
+                has_data_pkl = bool(data_pkl_prefixes)
+                has_version = any(
+                    basename == "version" and (not data_pkl_prefixes or parent in data_pkl_prefixes)
+                    for _, _, basename, parent in member_parts
+                )
 
                 # Analyze ZIP structure
                 metadata.update(
@@ -3341,14 +3364,23 @@ class PyTorchZipScanner(BaseScanner):
                         "files_truncated": files_truncated,
                         "omitted_files": total_files - len(file_list),
                         "metadata_analysis_incomplete": files_truncated,
-                        "has_data_pkl": True if "data.pkl" in file_list else None if files_truncated else False,
-                        "has_version": True if "version" in file_list else None if files_truncated else False,
+                        "has_data_pkl": True if has_data_pkl else None if files_truncated else False,
+                        "has_version": True if has_version else None if files_truncated else False,
                     }
                 )
 
                 # Check for model structure indicators
                 pkl_files = [f for f in file_list if f.endswith(".pkl")]
-                storage_files = [f for f in file_list if f.startswith("data/")]
+                version_prefixes = {parent for _, _, basename, parent in member_parts if basename == "version"}
+                model_prefixes = data_pkl_prefixes or version_prefixes
+                storage_files = [
+                    normalized_name
+                    for _, normalized_name, _, _ in member_parts
+                    if any(
+                        normalized_name.startswith(f"{prefix}/data/" if prefix else "data/")
+                        for prefix in model_prefixes
+                    )
+                ]
 
                 metadata.update(
                     {
@@ -3358,7 +3390,14 @@ class PyTorchZipScanner(BaseScanner):
                 )
 
                 # Try to read version if available
-                version_entry = self._find_zip_entry(entries_to_process, "version")
+                version_entry = next(
+                    (
+                        entry
+                        for entry, _, basename, parent in member_parts
+                        if basename == "version" and (not data_pkl_prefixes or parent in data_pkl_prefixes)
+                    ),
+                    None,
+                )
                 if version_entry is not None:
                     with suppress(Exception):
                         with zip_file.open(version_entry) as version_file:

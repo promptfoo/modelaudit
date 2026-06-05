@@ -6423,6 +6423,51 @@ def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> N
     )
 
 
+def test_pytorch_zip_entry_validation_checks_timeout_between_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = tmp_path / "entry-validation-timeout.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for index in range(3):
+            symlink_info = zipfile.ZipInfo(f"link_{index}")
+            symlink_info.external_attr = 0o120777 << 16
+            symlink_info.compress_type = zipfile.ZIP_STORED
+            zipf.writestr(symlink_info, str(tmp_path / f"target_{index}"))
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
+    checked_members: list[str] = []
+    timeout_checks = 0
+    original_read_member_prefix = scanner._read_member_prefix
+
+    def track_member_read(
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        checked_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else name)
+        return original_read_member_prefix(zip_file, name, limit, phase=phase, result=result)
+
+    def check_timeout() -> None:
+        nonlocal timeout_checks
+        timeout_checks += 1
+        if timeout_checks == 2:
+            raise TimeoutError("entry validation deadline exceeded")
+
+    monkeypatch.setattr(scanner, "_read_member_prefix", track_member_read)
+    monkeypatch.setattr(scanner, "_check_timeout", check_timeout)
+
+    result = scanner.scan(str(zip_path))
+
+    assert checked_members == ["link_0"]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_timeout" in result.metadata["scan_outcome_reasons"]
+
+
 def test_pytorch_zip_scanner_entry_limit_passes(tmp_path: Path) -> None:
     """Test that scanner passes when entry count is within limits."""
     zip_path = tmp_path / "model.pt"
@@ -6483,6 +6528,23 @@ def test_pytorch_zip_extract_metadata_does_not_read_late_duplicate_version(tmp_p
 
     assert metadata["files"] == ["version", "entry_0.txt"]
     assert metadata["files_truncated"] is True
+    assert metadata["pytorch_version"] == "3"
+
+
+def test_pytorch_zip_extract_metadata_recognizes_prefixed_layout(tmp_path: Path) -> None:
+    zip_path = tmp_path / "prefixed-metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("docs/version", "999")
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/0", b"weights")
+
+    metadata = PyTorchZipScanner(config={"max_archive_entries": 4}).extract_metadata(str(zip_path))
+
+    assert metadata["has_data_pkl"] is True
+    assert metadata["has_version"] is True
+    assert metadata["pickle_files"] == ["archive/data.pkl"]
+    assert metadata["storage_files"] == 1
     assert metadata["pytorch_version"] == "3"
 
 
