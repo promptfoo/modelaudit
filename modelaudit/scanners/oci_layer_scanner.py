@@ -586,6 +586,31 @@ class OciLayerScanner(BaseScanner):
         else:
             state.seen_paths.add(normalized_name)
 
+        path_components = normalized_name.split("/")
+        reserved_whiteout_parent = next(
+            (component for component in path_components[:-1] if component.startswith(".wh.")),
+            None,
+        )
+        if reserved_whiteout_parent is not None:
+            metadata_valid = False
+            if not state.invalid_whiteout_reported:
+                result.add_check(
+                    name="OCI Layer Metadata Validation",
+                    passed=False,
+                    message=(
+                        f"Layer member {name} uses reserved OCI whiteout path component {reserved_whiteout_parent}"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details={
+                        "layer": layer_ref,
+                        "member": name,
+                        "reserved_component": reserved_whiteout_parent,
+                    },
+                    rule_code="S902",
+                )
+                state.invalid_whiteout_reported = True
+
         basename = posixpath.basename(normalized_name)
         if basename.startswith(".wh."):
             valid_whiteout = basename != ".wh." and member.isfile() and member.size == 0

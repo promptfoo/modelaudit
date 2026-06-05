@@ -2026,6 +2026,45 @@ class TestOciLayerScanner:
         mock_scan.assert_not_called()
         assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
 
+    def test_scan_layer_reports_reserved_whiteout_parent_component(self, tmp_path: Path) -> None:
+        """Implicit directories with reserved whiteout names are invalid OCI metadata."""
+        layer_path = tmp_path / "reserved-whiteout-parent.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.wh.deleted/payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "reserved-whiteout-parent.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].message == (
+            "Layer member root/.wh.deleted/payload.dat uses reserved OCI whiteout path component .wh.deleted"
+        )
+        assert checks[0].details["reserved_component"] == ".wh.deleted"
+
+    def test_scan_layer_allows_whiteout_prefix_near_match_in_parent_component(self, tmp_path: Path) -> None:
+        """Ordinary parent directory names that merely start similarly remain valid."""
+        layer_path = tmp_path / "whiteout-parent-near-match.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.whitehouse/payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "whiteout-parent-near-match.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+
     def test_scan_corrupted_tar_layer(self, tmp_path: Path) -> None:
         """Test scanning corrupted tar layer."""
         # Create a file that looks like tar.gz but is corrupted
