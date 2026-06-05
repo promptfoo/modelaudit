@@ -24,6 +24,7 @@ from modelaudit.scanner_selection import (
     resolve_scanner_selection_policy,
     scanner_catalog,
     selected_scanner_extensions,
+    selected_scanner_filenames,
 )
 from modelaudit.scanners.archive_dispatch import scan_nested_file
 from modelaudit.scanners.base import CheckStatus
@@ -721,6 +722,17 @@ def test_remote_prefilters_preserve_selected_extensionless_scanners() -> None:
         {"path": "s3://bucket/model"},
         {"path": "s3://bucket/model.exe"},
     ]
+
+
+def test_remote_prefilters_preserve_selected_extensionless_content_routed_filenames() -> None:
+    policy = resolve_scanner_selection_policy(scanners=["metadata"])
+    extensions = selected_scanner_extensions(policy, conservative=True)
+    filenames = selected_scanner_filenames(policy, conservative=True)
+
+    assert extensions is not None
+    assert "" not in extensions
+    assert ".md" in extensions
+    assert filenames == frozenset({"readme", "model_card"})
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:
