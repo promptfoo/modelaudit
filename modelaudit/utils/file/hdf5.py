@@ -5,7 +5,9 @@ import os
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 HDF5_USERBLOCK_FIRST_OFFSET = 512
 HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
-HDF5_SUPERBLOCK_PROBE_BYTES = 96
+HDF5_SUPERBLOCK_PROBE_BYTES = 128
+_HDF5_SUPPORTED_FIELD_WIDTHS = frozenset({2, 4, 8, 16, 32})
+_HDF5_SUPERBLOCK_STATUS_FLAGS = 0x07
 
 
 def hdf5_signature_offsets(
@@ -53,17 +55,23 @@ def has_plausible_hdf5_superblock(superblock: bytes, signature_offset: int, file
                 return False
         offset_size = superblock[13]
         length_size = superblock[14]
+        status_flags = int.from_bytes(superblock[20:24], "little")
         base_address_offset = fixed_header_bytes
     elif superblock_version in (2, 3):
         if len(superblock) < 12:
             return False
         offset_size = superblock[9]
         length_size = superblock[10]
+        status_flags = superblock[11]
         base_address_offset = 12
     else:
         return False
 
-    if not 1 <= offset_size <= 16 or not 1 <= length_size <= 16:
+    if (
+        offset_size not in _HDF5_SUPPORTED_FIELD_WIDTHS
+        or length_size not in _HDF5_SUPPORTED_FIELD_WIDTHS
+        or status_flags & ~_HDF5_SUPERBLOCK_STATUS_FLAGS
+    ):
         return False
 
     end_of_file_offset = base_address_offset + (2 * offset_size)

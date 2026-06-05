@@ -1,6 +1,9 @@
 import base64
 import json
 import marshal
+import subprocess
+import sys
+import textwrap
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,7 @@ from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_missing_h5py
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -422,16 +426,74 @@ def test_missing_h5py_routes_hdf5_userblock_and_bypasses_cache(
 
     assert model_path.read_bytes()[:8] != b"\x89HDF\r\n\x1a\n"
     assert model_path.read_bytes()[512:520] == b"\x89HDF\r\n\x1a\n"
+    extensionless_model_path = tmp_path / "userblock_model"
+    extensionless_model_path.write_bytes(model_path.read_bytes())
     monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
 
-    assert KerasH5Scanner.can_handle(str(model_path)) is True
-    assert should_bypass_cache_for_missing_h5py(str(model_path)) is True
-    _assert_inconclusive_keras_h5_scan(
-        model_path,
-        "keras_h5_h5py_unavailable",
-        "H5PY Library Check",
-        "h5py is required for Keras H5 scanning",
+    for candidate_path in (model_path, extensionless_model_path):
+        assert KerasH5Scanner.can_handle(str(candidate_path)) is True
+        assert should_bypass_cache_for_missing_h5py(str(candidate_path)) is True
+        _assert_inconclusive_keras_h5_scan(
+            candidate_path,
+            "keras_h5_h5py_unavailable",
+            "H5PY Library Check",
+            "h5py is required for Keras H5 scanning",
+        )
+
+
+def test_broken_h5py_import_still_fails_closed_for_extensionless_userblock(tmp_path: Path) -> None:
+    model_path = tmp_path / "broken_h5py_userblock"
+    with h5py.File(model_path, "w", userblock_size=512) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+            }
+        )
+
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import json
+        import sys
+
+        class BrokenH5pyFinder(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "h5py" or fullname.startswith("h5py."):
+                    raise RuntimeError("simulated h5py binary failure")
+                return None
+
+        sys.meta_path.insert(0, BrokenH5pyFinder())
+
+        from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+
+        model_path = sys.argv[1]
+        result = scan_model_directory_or_file(model_path, cache_enabled=False)
+        metadata = result.file_metadata[model_path]
+        print(
+            json.dumps(
+                {
+                    "success": result.success,
+                    "exit_code": determine_exit_code(result),
+                    "check_names": [check.name for check in result.checks],
+                    "scan_outcome_reasons": metadata.get("scan_outcome_reasons", []),
+                }
+            )
+        )
+        """
     )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["success"] is False
+    assert payload["exit_code"] == 2
+    assert "H5PY Library Check" in payload["check_names"]
+    assert "keras_h5_h5py_unavailable" in payload["scan_outcome_reasons"]
 
 
 def test_missing_h5py_cache_bypass_requires_hdf5_content(
@@ -456,6 +518,115 @@ def test_missing_h5py_cache_bypass_requires_hdf5_content(
     assert should_bypass_cache_for_missing_h5py(str(extensionless_model_path)) is True
     assert should_bypass_cache_for_missing_h5py(str(zip_model_path)) is False
     assert should_bypass_cache_for_missing_h5py(str(magic_only_path)) is False
+
+
+def _write_synthetic_hdf5_v2_superblock(
+    path: Path,
+    *,
+    offset_size: int,
+    length_size: int,
+    status_flags: int = 0,
+) -> None:
+    max_address = (1 << (offset_size * 8)) - 1
+    file_size = min(512, max_address - 1)
+
+    def encode_address(value: int) -> bytes:
+        return value.to_bytes(offset_size, "little")
+
+    root_group_address = min(128, file_size - 1)
+    superblock = b"".join(
+        (
+            HDF5_MAGIC,
+            bytes((2, offset_size, length_size, status_flags)),
+            encode_address(0),
+            encode_address(max_address),
+            encode_address(file_size),
+            encode_address(root_group_address),
+        )
+    )
+    path.write_bytes(superblock + bytes(file_size - len(superblock)))
+
+
+def _write_synthetic_hdf5_v1_superblock(path: Path, *, field_width: int) -> None:
+    file_size = 512
+    undefined_address = (1 << (field_width * 8)) - 1
+
+    def encode_address(value: int) -> bytes:
+        return value.to_bytes(field_width, "little")
+
+    superblock = b"".join(
+        (
+            HDF5_MAGIC,
+            bytes((1, 0, 0, 0, 0, field_width, field_width, 0)),
+            (4).to_bytes(2, "little"),
+            (16).to_bytes(2, "little"),
+            bytes(4),
+            (32).to_bytes(2, "little"),
+            bytes(2),
+            encode_address(0),
+            encode_address(undefined_address),
+            encode_address(file_size),
+            encode_address(undefined_address),
+        )
+    )
+    path.write_bytes(superblock + bytes(file_size - len(superblock)))
+
+
+@pytest.mark.parametrize("field_width", [2, 4, 8, 16, 32])
+def test_hdf5_signature_probe_accepts_supported_field_widths(tmp_path: Path, field_width: int) -> None:
+    model_path = tmp_path / f"field_width_{field_width}.h5"
+    _write_synthetic_hdf5_v2_superblock(
+        model_path,
+        offset_size=field_width,
+        length_size=field_width,
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+
+
+def test_hdf5_signature_probe_accepts_legacy_v1_32_byte_addresses(tmp_path: Path) -> None:
+    model_path = tmp_path / "legacy_v1_32_byte_addresses.h5"
+    _write_synthetic_hdf5_v1_superblock(model_path, field_width=32)
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+
+
+@pytest.mark.parametrize(
+    ("offset_size", "length_size", "status_flags"),
+    [
+        (1, 1, 0),
+        (3, 8, 0),
+        (8, 5, 0),
+        (8, 8, 0x08),
+    ],
+)
+def test_hdf5_signature_probe_rejects_malformed_superblock_fields(
+    tmp_path: Path,
+    offset_size: int,
+    length_size: int,
+    status_flags: int,
+) -> None:
+    model_path = tmp_path / f"malformed_{offset_size}_{length_size}_{status_flags}.h5"
+    _write_synthetic_hdf5_v2_superblock(
+        model_path,
+        offset_size=offset_size,
+        length_size=length_size,
+        status_flags=status_flags,
+    )
+
+    assert find_hdf5_signature_offset(str(model_path)) is None
+
+
+def test_missing_h5py_rejects_malformed_hdf5_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "malformed_near_match.h5"
+    _write_synthetic_hdf5_v2_superblock(model_path, offset_size=1, length_size=1)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+    assert KerasH5Scanner.can_handle(str(model_path)) is False
+    assert should_bypass_cache_for_missing_h5py(str(model_path)) is False
 
 
 def _assert_inconclusive_keras_h5_scan(

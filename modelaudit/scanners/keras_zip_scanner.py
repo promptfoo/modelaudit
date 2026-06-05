@@ -240,7 +240,7 @@ try:
     import h5py
 
     HAS_H5PY = True
-except ImportError:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - optional dependency
     HAS_H5PY = False
 
 

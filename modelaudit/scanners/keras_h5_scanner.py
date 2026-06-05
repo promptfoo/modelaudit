@@ -39,7 +39,7 @@ try:
     import h5py
 
     HAS_H5PY = True
-except ImportError:
+except Exception:
     HAS_H5PY = False
 
 _KERAS_VERSION_SEPARATOR = r"[._-]?"

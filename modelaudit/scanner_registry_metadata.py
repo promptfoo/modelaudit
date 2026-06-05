@@ -131,6 +131,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "KerasH5Scanner",
         "description": "Scans Keras H5 model files for suspicious layer configurations",
         "extensions": [".h5", ".hdf5", ".keras"],
+        "content_routed_extensions": [""],
         "header_formats": ["hdf5", "keras"],
         "priority": 5,
         "dependencies": ["h5py"],
