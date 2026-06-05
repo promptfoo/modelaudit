@@ -1,6 +1,7 @@
 """Tests for cache CLI commands."""
 
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
@@ -35,43 +36,44 @@ class TestCacheCLI:
         assert result.exit_code == 0
         assert "Would clear" in result.output
 
-    def test_cache_clear_with_data(self):
+    def test_cache_clear_with_data(self, tmp_path: Path) -> None:
         """Test cache clear with actual data."""
-        import os
-
         # Reset global cache manager to ensure isolation
         reset_cache_manager()
 
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp_file,
-        ):
-            tmp_file.write(b"test content")
-            tmp_file.flush()
-            tmp_file.close()  # Close file before cache operations (required on Windows)
+        cache_dir = tmp_path / "cache"
+        model_path = tmp_path / "model.pkl"
+        model_path.write_bytes(b"test content")
 
-            try:
-                cache_manager = get_cache_manager(cache_dir=temp_dir, enabled=True)
-                test_result = {"test": "result", "findings": []}
-                cache_manager.store_result(tmp_file.name, test_result, 100)
+        cache_manager = get_cache_manager(cache_dir=str(cache_dir), enabled=True)
+        assert cache_manager.cache is not None
+        file_stat, file_hash, change_token, ancestor_identity = cache_manager.cache.capture_file_identity(
+            str(model_path)
+        )
+        test_result = {"test": "result", "findings": []}
+        cache_manager.store_result(
+            str(model_path),
+            test_result,
+            100,
+            expected_file_stat=file_stat,
+            expected_file_hash=file_hash,
+            expected_change_token=change_token,
+            expected_ancestor_identity=ancestor_identity,
+        )
 
-                # Check stats show entry
-                runner = CliRunner()
-                result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
-                assert "Total entries: 1" in result.output
+        # Check stats show entry
+        runner = CliRunner()
+        result = runner.invoke(cli, ["cache", "stats", "--cache-dir", str(cache_dir)])
+        assert "Total entries: 1" in result.output
 
-                # Clear cache
-                result = runner.invoke(cli, ["cache", "clear", "--cache-dir", temp_dir])
-                assert result.exit_code == 0
-                assert "Cleared 1 cache entries" in result.output
+        # Clear cache
+        result = runner.invoke(cli, ["cache", "clear", "--cache-dir", str(cache_dir)])
+        assert result.exit_code == 0
+        assert "Cleared 1 cache entries" in result.output
 
-                # Verify cleared
-                result = runner.invoke(cli, ["cache", "stats", "--cache-dir", temp_dir])
-                assert "Total entries: 0" in result.output
-            finally:
-                # Clean up temp file
-                if os.path.exists(tmp_file.name):
-                    os.unlink(tmp_file.name)
+        # Verify cleared
+        result = runner.invoke(cli, ["cache", "stats", "--cache-dir", str(cache_dir)])
+        assert "Total entries: 0" in result.output
 
     def test_cache_cleanup_dry_run(self):
         """Test cache cleanup dry run."""
