@@ -344,19 +344,21 @@ class TestDvcIntegration:
         )
 
     def test_exact_dvc_budget_rejects_remaining_nonempty_directory(self, tmp_path: Path) -> None:
-        """The directory probe must fail closed when any additional bytes are scanned."""
+        """An exhausted budget must reject a non-empty directory before scanning it."""
         first = tmp_path / "first.bin"
         nonempty_dir = tmp_path / "nonempty-dir"
         first.write_bytes(b"x")
         nonempty_dir.mkdir()
-        (nonempty_dir / "payload.bin").write_bytes(b"y")
+        payload = nonempty_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"payload": "must-not-be-scanned"}))
         dvc_file = tmp_path / "exact-directory-budget.dvc"
         dvc_file.write_text("outs:\n- path: first.bin\n- path: nonempty-dir\n")
 
         result = scan_model_directory_or_file(str(dvc_file), max_total_size=1)
 
-        assert result.files_scanned == 2
-        assert result.bytes_scanned == 2
+        assert result.files_scanned == 1
+        assert result.bytes_scanned == 1
+        assert not any(Path(asset.path) == payload for asset in result.assets)
         assert result.success is False
         assert result.has_errors is True
         assert any(

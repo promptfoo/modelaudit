@@ -7,7 +7,7 @@ import logging
 import shutil
 import tempfile
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from ..utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
+    format_size,
     redact_jfrog_url_for_display,
 )
 
@@ -36,6 +37,44 @@ def _prepare_download_dir(url: str, cache_dir: str | None) -> tuple[Path, bool]:
     return Path(tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root))), True
 
 
+def _positive_limit(*limits: int | None) -> int | None:
+    positive_limits = [limit for limit in limits if limit is not None and limit > 0]
+    return min(positive_limits) if positive_limits else None
+
+
+def _known_file_size(target_info: Mapping[str, Any]) -> int | None:
+    if target_info.get("size_known") is False:
+        return None
+    size = target_info.get("size")
+    if isinstance(size, bool):
+        return None
+    if isinstance(size, int) and size >= 0:
+        return size
+    return None
+
+
+def _require_known_file_size_within_limit(
+    target_info: Mapping[str, Any],
+    *,
+    limit: int | None,
+    display_url: str,
+) -> None:
+    if limit is None:
+        return
+
+    size = _known_file_size(target_info)
+    if size is None:
+        raise ValueError(
+            f"Cannot verify JFrog artifact size for {display_url}; refusing to download with maximum allowed size "
+            f"{format_size(limit)}"
+        )
+    if size > limit:
+        raise ValueError(
+            f"JFrog artifact size ({format_size(size)}) exceeds maximum allowed size ({format_size(limit)}) "
+            f"for {display_url}"
+        )
+
+
 def scan_jfrog_artifact(
     url: str,
     *,
@@ -45,6 +84,7 @@ def scan_jfrog_artifact(
     blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    max_download_size: int | None = None,
     selective_download: bool = True,
     scannable_extensions: Collection[str] | None = None,
     **kwargs: Any,
@@ -70,6 +110,8 @@ def scan_jfrog_artifact(
         Maximum file size to scan in bytes (0 = unlimited).
     max_total_size:
         Maximum total bytes to scan before stopping (0 = unlimited).
+    max_download_size:
+        Maximum bytes to download before scan-time checks run (None or 0 = unlimited).
     selective_download:
         Whether folder downloads should prefilter to scannable model files.
     **kwargs:
@@ -114,6 +156,8 @@ def scan_jfrog_artifact(
         )
 
         if target_info["type"] == "file":
+            file_download_limit = _positive_limit(max_download_size, max_file_size, max_total_size)
+            _require_known_file_size_within_limit(target_info, limit=file_download_limit, display_url=display_url)
             logger.debug(f"Downloading JFrog file {display_url} to {download_dir}")
             download_path = download_artifact(
                 url,
@@ -121,6 +165,7 @@ def scan_jfrog_artifact(
                 api_token=api_token,
                 access_token=access_token,
                 timeout=timeout,
+                max_size=file_download_limit,
             )
         else:
             logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
@@ -138,6 +183,9 @@ def scan_jfrog_artifact(
                 timeout=timeout,
                 selective=selective_download,
                 show_progress=True,
+                max_size=max_download_size,
+                max_file_size=max_file_size,
+                max_total_size=max_total_size,
                 **folder_download_kwargs,
             )
 
