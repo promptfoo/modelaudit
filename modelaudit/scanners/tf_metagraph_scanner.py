@@ -96,6 +96,7 @@ _FUNCTION_ATTRIBUTE_SUFFIX = ".func.name"
 _ESCAPED_EVIDENCE_ASCII_RE = re.compile(
     r"\\(?:"
     r"(?P<continuation>\r\n|\r|\n)|"
+    r"(?P<mnemonic>[abfnrtv])(?=\Z|[^A-Za-z0-9_])|"
     r"u00(?P<unicode>[0-7][0-9A-Fa-f])|"
     r"U000000(?P<long_unicode>[0-7][0-9A-Fa-f])|"
     r"u\{0{0,4}(?P<braced_unicode>[2-7][0-9A-Fa-f])\}|"
@@ -106,6 +107,7 @@ _ESCAPED_EVIDENCE_ASCII_RE = re.compile(
     r")"
 )
 _UNRESOLVED_ESCAPED_EVIDENCE_RE = re.compile(r"\\(?:u(?:[0-9A-Fa-f]|\{)|U[0-9A-Fa-f]|N\{|x[0-9A-Fa-f]|[0-7])")
+_WINDOWS_PATH_EVIDENCE_RE = re.compile(r"(?i)\A[a-z]:\\[^\r\n]*\Z")
 _MAX_ESCAPED_EVIDENCE_DECODE_PASSES = 8
 _MAX_ESCAPED_EVIDENCE_SEQUENCE_CHARS = 68
 _PLAIN_EVIDENCE_IDENTIFIER_RE = re.compile(r"\A[a-z][a-z0-9_-]{0,63}\Z")
@@ -120,6 +122,8 @@ def _normalize_metagraph_evidence_escapes(text: str) -> str:
     def decode_escape(match: re.Match[str]) -> str:
         if match.group("continuation") is not None:
             return ""
+        if match.group("mnemonic") is not None:
+            return " "
         if match.group("unicode") is not None:
             decoded = chr(int(match.group("unicode"), 16))
         elif match.group("long_unicode") is not None:
@@ -193,13 +197,21 @@ def _redact_encoded_payload_match(match: re.Match[str]) -> str:
 def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
     """Redact stored MetaGraph evidence without changing detection input."""
     normalization_limit = max(0, max_chars) + (2 * REDACTION_LOOKAHEAD_CHARS) + _MAX_ESCAPED_EVIDENCE_SEQUENCE_CHARS
-    normalized_text = _normalize_metagraph_evidence_escapes(text[:normalization_limit])
+    source_text = text[:normalization_limit]
+    normalized_text = _normalize_metagraph_evidence_escapes(source_text)
     if normalized_text == REDACTED_EVIDENCE_VALUE:
         return normalized_text
     if _is_plain_metagraph_evidence(normalized_text):
         return normalized_text[:max_chars]
     secret_redacted = redact_evidence_string(normalized_text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
     payload_redacted = _ENCODED_PAYLOAD_RE.sub(_redact_encoded_payload_match, secret_redacted)
+    if (
+        normalized_text != source_text
+        and payload_redacted == normalized_text
+        and _WINDOWS_PATH_EVIDENCE_RE.fullmatch(source_text) is not None
+    ):
+        secret_redacted = redact_evidence_string(source_text, max_chars=max_chars + REDACTION_LOOKAHEAD_CHARS)
+        payload_redacted = _ENCODED_PAYLOAD_RE.sub(_redact_encoded_payload_match, secret_redacted)
     if payload_redacted == f"{REDACTED_EVIDENCE_VALUE}...":
         return REDACTED_EVIDENCE_VALUE
     if len(payload_redacted) <= max_chars:
@@ -216,6 +228,14 @@ def _attribute_context_name(attr_name: str) -> str:
     while attr_name.endswith(_FUNCTION_ATTRIBUTE_SUFFIX, 0, end):
         end -= suffix_length
     return attr_name[:end]
+
+
+def _is_sensitive_metagraph_evidence_key(key: str) -> bool:
+    """Classify bounded escaped key spellings before storing their values."""
+    if is_sensitive_evidence_key(key):
+        return True
+    normalized_key = _normalize_metagraph_evidence_escapes(key)
+    return normalized_key == REDACTED_EVIDENCE_VALUE or is_sensitive_evidence_key(normalized_key)
 
 
 def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
@@ -612,7 +632,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
                 evidence_location, evidence_node_name = get_evidence_context()
                 evidence_attr_name = _redact_metagraph_evidence(attr_name, max_chars=200)
-                sensitive_attr_value = is_sensitive_evidence_key(
+                sensitive_attr_value = _is_sensitive_metagraph_evidence_key(
                     attr_string.sensitive_context_name or _attribute_context_name(attr_name)
                 )
                 needs_value_preview = bool(library_match or command_match or network_match or encoded_payload_match)
@@ -740,7 +760,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         for key, collection in metagraph.collection_def.items():
             key_lower = key.lower()
             evidence_key: str | None = None
-            sensitive_collection_value = is_sensitive_evidence_key(key)
+            sensitive_collection_value = _is_sensitive_metagraph_evidence_key(key)
 
             if hasattr(collection, "bytes_list"):
                 for idx, value in enumerate(collection.bytes_list.value):

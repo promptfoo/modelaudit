@@ -840,6 +840,13 @@ def test_tf_metagraph_scanner_redacts_escaped_and_container_context_secrets(tmp_
         "named_unicode": "REAL_NAMED_UNICODE_ESCAPE_SECRET",
         "braced_unicode": "REAL_BRACED_UNICODE_ESCAPE_SECRET",
         "short_octal": "REAL_SHORT_OCTAL_ESCAPE_SECRET",
+        "mnemonic_alert": "REAL_ALERT_ESCAPE_SECRET",
+        "mnemonic_backspace": "REAL_BACKSPACE_ESCAPE_SECRET",
+        "mnemonic_form_feed": "REAL_FORM_FEED_ESCAPE_SECRET",
+        "mnemonic_newline": "REAL_NEWLINE_ESCAPE_SECRET",
+        "mnemonic_carriage_return": "REAL_CARRIAGE_RETURN_ESCAPE_SECRET",
+        "mnemonic_tab": "REAL_TAB_ESCAPE_SECRET",
+        "mnemonic_vertical_tab": "REAL_VERTICAL_TAB_ESCAPE_SECRET",
         "line_continuation": "REAL_LINE_CONTINUATION_SECRET",
         "crlf_continuation": "REAL_CRLF_CONTINUATION_SECRET",
         "node": "REAL_NODE_ESCAPE_SECRET",
@@ -866,6 +873,13 @@ def test_tf_metagraph_scanner_redacts_escaped_and_container_context_secrets(tmp_
                             rf"token\N{{EQUALS SIGN}}{escaped_secrets['named_unicode']} "
                             rf"token\u{{3d}}{escaped_secrets['braced_unicode']} "
                             rf"token\75{escaped_secrets['short_octal']} "
+                            rf"token\a={escaped_secrets['mnemonic_alert']} "
+                            rf"token\b={escaped_secrets['mnemonic_backspace']} "
+                            rf"token\f={escaped_secrets['mnemonic_form_feed']} "
+                            rf"token\n={escaped_secrets['mnemonic_newline']} "
+                            rf"token\r={escaped_secrets['mnemonic_carriage_return']} "
+                            rf"token\t={escaped_secrets['mnemonic_tab']} "
+                            rf"token\v={escaped_secrets['mnemonic_vertical_tab']} "
                             f"{line_continuation} {crlf_continuation}"
                         ),
                         "auth": f"python -c curl https://example.com/ {escaped_secrets['auth']}",
@@ -891,6 +905,43 @@ def test_tf_metagraph_scanner_redacts_escaped_and_container_context_secrets(tmp_
     assert previews_by_attribute["auth_header"] == REDACTED_EVIDENCE_VALUE
     assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
     assert all(secret not in serialized_result for secret in escaped_secrets.values())
+
+
+def test_tf_metagraph_scanner_redacts_values_under_escaped_sensitive_keys(tmp_path: Path) -> None:
+    attribute_secret = "OPAQUE_ESCAPED_ATTRIBUTE_SECRET_123456"
+    collection_secret = "OPAQUE_ESCAPED_COLLECTION_SECRET_123456"
+    escaped_key_meta = tmp_path / "escaped-sensitive-keys.meta"
+    escaped_key_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "escaped_key_node",
+                    "op": "PyFunc",
+                    "attrs": {r"to\u006ben": f"python -c curl https://example.com/ {attribute_secret}"},
+                }
+            ],
+            collection_bytes={
+                r"runtime_hook_to\u006ben": [f"python -c curl https://example.com/ {collection_secret}".encode()]
+            },
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(escaped_key_meta))
+    executable_check = next(check for check in result.checks if check.name == "MetaGraph Executable String Check")
+    collection_check = next(check for check in result.checks if check.name == "MetaGraph Collection Executable Pattern")
+
+    assert executable_check.details["attribute"] == "token"
+    assert executable_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
+    assert collection_check.details["collection_key"] == "runtime_hook_token"
+    assert collection_check.details["value_preview"] == REDACTED_EVIDENCE_VALUE
+    assert attribute_secret not in result.to_json()
+    assert collection_secret not in result.to_json()
+
+
+def test_redact_metagraph_evidence_preserves_benign_windows_path_escapes() -> None:
+    windows_path = r"C:\x64\models\plugin.dll"
+
+    assert _redact_metagraph_evidence(windows_path, max_chars=200) == windows_path
 
 
 def test_tf_metagraph_scanner_uses_fast_path_for_plain_finding_contexts(
