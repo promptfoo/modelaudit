@@ -43,6 +43,7 @@ from .scanner_selection import (
     scanner_catalog,
     scanner_selection_config_from_inputs,
     selected_scanner_extensions,
+    selected_scanner_filenames,
 )
 from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
@@ -78,7 +79,12 @@ from .utils.sources.huggingface import (
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
-from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, redact_jfrog_url_for_display
+from .utils.sources.jfrog import (
+    is_jfrog_url,
+    is_jfrog_url_like,
+    redact_jfrog_error_for_display,
+    redact_jfrog_url_for_display,
+)
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
@@ -88,7 +94,7 @@ def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if is_cloud_url(path):
         return redact_url_for_display(path)
-    if is_jfrog_url(path):
+    if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
@@ -124,6 +130,8 @@ class _ScanRuntimeConfig:
     scanner_selection: dict[str, Any] | None
     scanner_selection_metadata: dict[str, Any] | None
     scannable_extensions: frozenset[str] | None
+    scannable_filenames: frozenset[str] | None
+    hf_stream_include_all_files: bool
 
 
 @dataclass
@@ -530,12 +538,20 @@ def _resolve_scan_runtime_config(
     if max_size is not None:
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
+    else:
+        configured_max_file_size = config_values.get("max_file_size", 0)
+        if isinstance(configured_max_file_size, int) and configured_max_file_size > 0:
+            max_download_bytes = configured_max_file_size
 
     scanner_selection = config_values.get(SCANNER_SELECTION_CONFIG_KEY)
     scanner_policy = policy_from_config(config_values)
     scannable_extensions = (
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
+    scannable_filenames = (
+        selected_scanner_filenames(scanner_policy, conservative=True) if scanner_policy.active else None
+    )
+    hf_stream_include_all_files = not scanner_policy.active or scannable_extensions is None
 
     return _ScanRuntimeConfig(
         config=config_values,
@@ -560,6 +576,8 @@ def _resolve_scan_runtime_config(
         scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
         scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
         scannable_extensions=scannable_extensions,
+        scannable_filenames=scannable_filenames,
+        hf_stream_include_all_files=hf_stream_include_all_files,
     )
 
 
@@ -1153,7 +1171,11 @@ def _resolve_scan_source_for_path(
                 hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                 temp_dir = str(hf_cache_dir)
 
-            download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
+            download_path = download_file_from_hf(
+                path,
+                cache_dir=hf_cache_dir,
+                max_size=runtime.max_download_bytes,
+            )
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
             if not runtime.cache_enabled and temp_dir is None:
@@ -1244,10 +1266,19 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                hf_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+                if runtime.scannable_filenames is not None:
+                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+                if runtime.hf_stream_include_all_files:
+                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
+                    max_size=runtime.max_download_bytes,
+                    **hf_stream_kwargs,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -1292,7 +1323,12 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
-            download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
+            download_path = download_model(
+                path,
+                cache_dir=hf_cache_dir,
+                show_progress=show_progress,
+                max_size=runtime.max_download_bytes,
+            )
             download_duration = time.time() - download_start
             try:
                 download_size = sum(
@@ -1687,7 +1723,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if not os.path.exists(path):
-        click.echo(f"Error: Path does not exist: {path}", err=True)
+        click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 
@@ -2967,12 +3003,34 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Directory summary
         output.append(f"Directory: {metadata['directory']}")
         output.append(f"Total Files: {metadata['summary']['total_files']}")
+        if metadata.get("analysis_incomplete"):
+            output.append("\nWarning: Metadata extraction is incomplete")
+            for event in metadata.get("budget_events", []):
+                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
             output.append(f"  {fmt}: {count}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            output.append(f"  {file_meta.get('file', 'unknown')} ({file_meta.get('format', 'unknown')})")
+            file_name = file_meta.get("file", "unknown")
+            if error := file_meta.get("error"):
+                output.append(f"  {file_name} (error: {error})")
+            else:
+                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                for key in (
+                    "has_custom_metadata",
+                    "custom_metadata_entry_count",
+                    "custom_metadata_valid",
+                    "custom_metadata_type",
+                    "custom_metadata_invalid_value_count",
+                    "custom_metadata_security_flags",
+                ):
+                    if key not in file_meta:
+                        continue
+                    value = file_meta[key]
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value)) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:

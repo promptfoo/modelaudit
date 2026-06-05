@@ -26,6 +26,7 @@ import pytest
 
 import modelaudit_picklescan.api as package_api
 from modelaudit_picklescan import (
+    CoverageSummary,
     Finding,
     PickleReport,
     PickleScanner,
@@ -39,6 +40,7 @@ from modelaudit_picklescan import (
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
+    _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     find_startup_hook_write_call_graphs,
 )
@@ -99,6 +101,10 @@ def _global(module: bytes, name: bytes) -> bytes:
 
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _binunicode8(data: bytes) -> bytes:
+    return b"\x8d" + len(data).to_bytes(8, "little") + data
 
 
 def _concrete_pathlib_class_name() -> str:
@@ -929,6 +935,207 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
     )
 
 
+RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
+RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
+UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+BINARY_STACK_GLOBAL_NESTED_PICKLE = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93)R."
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04" + _short_binunicode(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"\x80\x02" + _binunicode(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"\x80\x04" + _binunicode8(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"VAAAAAAcos\\u000asystem\\u000a)R.BBBB\n.",
+    ],
+    ids=["short-binunicode", "binunicode", "binunicode8", "protocol0-unicode"],
+)
+def test_scan_bytes_scans_unicode_opcodes_for_raw_nested_payloads(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-raw-nested.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == RAW_NESTED_PICKLE_SIZE
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04"
+        + _short_binunicode("".join(chr(byte) for byte in BINARY_STACK_GLOBAL_NESTED_PICKLE).encode("utf-8"))
+        + b".",
+        b"V" + b"".join(f"\\u{byte:04x}".encode("ascii") for byte in BINARY_STACK_GLOBAL_NESTED_PICKLE) + b"\n.",
+    ],
+    ids=["short-binunicode", "protocol0-unicode"],
+)
+def test_scan_bytes_decodes_unicode_scalars_before_probing_raw_nested_payloads(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-scalar-raw-nested.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(BINARY_STACK_GLOBAL_NESTED_PICKLE)
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_scans_protocol0_container_starts_in_unicode_literals() -> None:
+    nested_payload = b"(cos\nsystem\n)R."
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(b"AAAAAA" + nested_payload + b"BBBB") + b".",
+        source="unicode-protocol0-container-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(nested_payload)
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_payloads() -> None:
+    nested_payload = b"cos\nsystem\n)R"
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(nested_payload) + b".",
+        source="unicode-malformed-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("nested_has_execution_opcode") is True
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() -> None:
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode("utf-8")) + b".",
+        source="mixed-unicode-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("literal", ["Value " * 65, "I am a value. " * 65, "list " * 65])
+def test_scan_bytes_ignores_repeated_protocol0_prefixes_in_benign_unicode_literals(literal: str) -> None:
+    report = scan_bytes(pickle.dumps(literal, protocol=4), source="benign-protocol0-prefix-prose.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(notice.code != "nested_probe_limit" for notice in report.notices)
+
+
+def test_scan_bytes_ignores_protocol0_inst_like_yaml_text_literals() -> None:
+    literal = "!!python/object/apply:builtins.exec\n- !!python/object/apply:operator.add\n"
+
+    report = scan_bytes(pickle.dumps(literal, protocol=4), source="benign-inst-like-yaml.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "S213" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04" + _short_binunicode(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"\x80\x02" + _binunicode(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"\x80\x04" + _binunicode8(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"VAAAAAAco\\u2603\\u000asafe\\u000a)X.BBBB\n.",
+    ],
+    ids=["short-binunicode", "binunicode", "binunicode8", "protocol0-unicode"],
+)
+def test_scan_bytes_ignores_unicode_scalar_raw_nested_near_matches(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-raw-nested-near-match.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code not in {"S213", "DANGEROUS_CALL"} for finding in report.findings)
+
+
+def test_scan_bytes_scans_unicode_raw_nested_dangerous_globals_without_execution_opcodes() -> None:
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(b"AAAAAAcos\nsystem\n.BBBB") + b".",
+        source="unicode-raw-nested-dangerous-global.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_for_unicode_raw_nested_payload_over_byte_limit() -> None:
+    nested_payload = b"\x80\x04]K\x01aK\x02aK\x03aK\x04a"
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(nested_payload) + b".",
+        source="unicode-raw-nested-oversized.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("payload_size") == len(nested_payload)
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_payload_truncated"
+        and notice.details.get("encoding") == "raw"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
+def test_scan_bytes_fails_closed_when_unicode_raw_nested_probe_limit_is_exceeded() -> None:
+    decoys = b"\x80\x04}." * 65
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(decoys + b"cos\nsystem\n)R.") + b".",
+        source="unicode-raw-nested-probe-limit.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("max_nested_payload_probes") == 64
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_probe_limit" for notice in report.notices)
+
+
 def test_scan_bytes_fails_closed_on_malformed_nested_persid_payload() -> None:
     inner = b"\x80\x04cos\nsystem\nP\nfake_id\n."
     outer = pickle.dumps({"inner": inner}, protocol=4)
@@ -1223,6 +1430,32 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
+
+
+@pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
+def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metadata_key: str) -> None:
+    pickle_entry = zipfile.ZipInfo("archive/data.pkl")
+    member_report = PickleReport(
+        source="model.pt:archive/data.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        coverage=CoverageSummary(bytes_scanned=1, bytes_total=1),
+        metadata={"analysis_incomplete": True, metadata_key: True},
+    )
+
+    report = package_api._combine_pytorch_zip_reports(
+        source="model.pt",
+        size=1,
+        entry_count=1,
+        pickle_entries=[pickle_entry],
+        member_reports=[member_report],
+        extra_notices=(),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata[metadata_key] is True
 
 
 def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:
@@ -3085,9 +3318,20 @@ def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
 
     report = scan_bytes(payload, source="dill-dump.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    source_reason = _call_graph_source_unavailable_reason("dill")
+    if source_reason is None:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+    else:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert any(
+            notice.code == "call_graph_source_unavailable"
+            and notice.details.get("import_reference") == "dill.dump"
+            and notice.details.get("reason") == source_reason
+            for notice in report.notices
+        )
 
 
 def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
@@ -4537,22 +4781,83 @@ def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
 def test_scan_bytes_collapses_protocol5_buffer_opcode_notices() -> None:
     report = scan_bytes(b"\x80\x05\x97\x97\x98\x97\x98.", source="many-buffer-opcodes.pkl")
 
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
     buffer_notices = [notice for notice in report.notices if notice.code == "buffer_opcode"]
     assert len(buffer_notices) == 1
     assert buffer_notices[0].details["buffer_opcode_count"] == 5
     assert buffer_notices[0].details["next_buffer_count"] == 3
     assert buffer_notices[0].details["readonly_buffer_count"] == 2
     assert buffer_notices[0].details["readonly_buffer_empty_stack_count"] == 0
+    assert buffer_notices[0].details["requires_external_buffer_context"] is True
+    assert buffer_notices[0].details["analysis_incomplete"] is True
 
 
 def test_scan_bytes_preserves_readonly_buffer_empty_stack_parity() -> None:
     report = scan_bytes(b"\x80\x05\x98\x93.", source="readonly-empty-stack.pkl")
 
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
     finding = next(finding for finding in report.findings if finding.rule_code == "MALFORMED_STACK_GLOBAL")
     assert finding.details["module_operand"] == "NoneType:None"
     assert finding.details["name_operand"] == "NoneType:None"
     buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
     assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+def test_scan_bytes_fails_closed_for_readonly_buffer_empty_stack() -> None:
+    report = scan_bytes(b"\x80\x05\x98.", source="readonly-empty-stack.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 1
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x05N\x98.",
+        b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.",
+    ],
+    ids=["primitive-none", "opaque-float"],
+)
+def test_scan_bytes_fails_closed_for_non_buffer_readonly_operand(payload: bytes) -> None:
+    report = scan_bytes(payload, source="non-buffer-readonly.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 0
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 1
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+def test_scan_bytes_preserves_complete_coverage_for_in_band_readonly_buffer() -> None:
+    report = scan_bytes(
+        b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.",
+        source="in-band-readonly-buffer.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_count"] == 1
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 0
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is False
 
 
 def test_scan_bytes_records_oversized_frame_notice() -> None:
@@ -4563,6 +4868,35 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
     notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
     assert notice.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
     assert notice.details["remaining_bytes"] == 2
+
+
+def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
+    payload = (b"cmath\nsin\n0" * 10_000) + b"cmath\ncos\n0."
+
+    report = scan_bytes(payload, source="import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata["import_references_truncated"] is True
+    assert len(report.metadata["import_references"]) == 10_000
+    assert not any(reference["name"] == "cos" for reference in report.metadata["import_references"])
+    notice = next(notice for notice in report.notices if notice.code == "import_references_truncated")
+    assert notice.details["analysis_incomplete"] is True
+    assert notice.details["max_import_references"] == 10_000
+
+
+def test_scan_bytes_keeps_duplicate_import_reference_overflow_conclusive() -> None:
+    payload = (b"cmath\nsin\n0" * 10_001) + b"."
+
+    report = scan_bytes(payload, source="duplicate-import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.metadata["import_references_truncated"] is False
+    assert "analysis_incomplete" not in report.metadata
+    assert len(report.metadata["import_references"]) == 10_000
+    assert all(notice.code != "import_references_truncated" for notice in report.notices)
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:
