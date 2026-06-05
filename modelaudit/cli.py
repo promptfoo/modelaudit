@@ -152,20 +152,22 @@ class _ScanPathState:
 
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
+    sbom_paths_resolved: bool = False
 
     def track_streaming_paths_for_sbom(
         self,
         streaming_result: ModelAuditResultModel,
-        fallback_path: str,
+        fallback_path: str | None,
     ) -> None:
         """Track concrete streamed artifact paths so SBOM includes all scanned components."""
+        self.sbom_paths_resolved = True
         added_path = False
         for asset in streaming_result.assets:
             if asset.path:
                 self.scanned_paths.append(asset.path)
                 added_path = True
 
-        if not added_path:
+        if not added_path and fallback_path is not None:
             self.scanned_paths.append(fallback_path)
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
@@ -738,6 +740,8 @@ def _write_scan_sbom(
     )
     if asset_paths and scan_and_delete:
         paths_for_sbom = asset_paths
+    elif path_state.sbom_paths_resolved:
+        paths_for_sbom = path_state.scanned_paths
     else:
         paths_for_sbom = path_state.scanned_paths if path_state.scanned_paths else expanded_paths
 
@@ -1077,7 +1081,7 @@ def _scan_local_or_downloaded_path(
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
         if actual_path.lower().endswith(".dvc"):
-            path_state.track_streaming_paths_for_sbom(scan_results, actual_path)
+            path_state.track_streaming_paths_for_sbom(scan_results, None)
         else:
             path_state.scanned_paths.append(actual_path)
 

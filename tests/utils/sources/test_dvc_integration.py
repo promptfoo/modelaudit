@@ -143,6 +143,7 @@ class TestDvcIntegration:
         assert results.files_scanned == 1
         assert results.has_errors is True
         assert results.success is False
+        assert results.content_hash is None
         assert any("existing_malicious.pkl" in (issue.location or "") for issue in results.issues)
 
         dvc_issues = [
@@ -343,6 +344,26 @@ class TestDvcIntegration:
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues
         )
 
+    def test_exact_dvc_budget_ignores_skipped_non_model_directory_files(self, tmp_path: Path) -> None:
+        """Skipped files must not create a false DVC budget exhaustion error."""
+        first = tmp_path / "first.bin"
+        output_dir = tmp_path / "output"
+        first.write_bytes(b"x")
+        output_dir.mkdir()
+        (output_dir / "empty.pkl").write_bytes(b"")
+        (output_dir / "notes.txt").write_text("not a model" * 100)
+        dvc_file = tmp_path / "exact-directory-budget.dvc"
+        dvc_file.write_text("outs:\n- path: first.bin\n- path: output\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), max_total_size=1)
+
+        assert result.files_scanned == 2
+        assert result.bytes_scanned == 1
+        assert result.success is True
+        assert not any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues
+        )
+
     def test_exact_dvc_budget_rejects_remaining_nonempty_directory(self, tmp_path: Path) -> None:
         """An exhausted budget must reject a non-empty directory before scanning it."""
         first = tmp_path / "first.bin"
@@ -361,11 +382,46 @@ class TestDvcIntegration:
         assert not any(Path(asset.path) == payload for asset in result.assets)
         assert result.success is False
         assert result.has_errors is True
+        assert result.content_hash is None
         assert any(
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
             and issue.details.get("budget_type") == "total_size"
             for issue in result.issues
         )
+
+    def test_dvc_directory_rejects_file_larger_than_remaining_budget(self, tmp_path: Path) -> None:
+        """A directory output must not scan a file larger than the shared remainder."""
+        first = tmp_path / "first.bin"
+        output_dir = tmp_path / "output"
+        first.write_bytes(b"x")
+        output_dir.mkdir()
+        payload = output_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps({"payload": "must-not-be-scanned"}))
+        dvc_file = tmp_path / "bounded-directory.dvc"
+        dvc_file.write_text("outs:\n- path: first.bin\n- path: output\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), max_total_size=2)
+
+        assert result.files_scanned == 1
+        assert result.bytes_scanned == 1
+        assert not any(Path(asset.path) == payload for asset in result.assets)
+        assert result.success is False
+        assert any(issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues)
+
+    def test_incomplete_dvc_directory_scan_omits_partial_content_hash(self, tmp_path: Path) -> None:
+        """Rejected nested files must prevent publication of a partial aggregate hash."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "small.pkl").write_bytes(pickle.dumps({"small": True}))
+        (output_dir / "oversized.pkl").write_bytes(pickle.dumps({"large": "x" * 256}))
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: output\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), max_file_size=64, cache_scan_results=False)
+
+        assert result.has_errors is True
+        assert result.success is False
+        assert result.content_hash is None
 
     def test_dvc_directory_and_file_outputs_all_contribute_to_content_hash(self, tmp_path: Path) -> None:
         """Mutating either a nested directory file or a direct output must change the aggregate hash."""
@@ -428,6 +484,45 @@ class TestDvcSecurity:
 
         resolved = resolve_dvc_file(str(dvc_file))
         assert resolved == []
+
+    def test_wdir_routes_to_declared_artifact_instead_of_decoy(self, tmp_path: Path) -> None:
+        """DVC output paths must be resolved relative to the declared working directory."""
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                return (os.system, ("echo dvc-wdir-malicious",))
+
+        decoy = tmp_path / "model.pkl"
+        decoy.write_bytes(pickle.dumps({"benign": True}))
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        payload = artifacts / "model.pkl"
+        payload.write_bytes(pickle.dumps(MaliciousClass()))
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("wdir: artifacts\nouts:\n- path: model.pkl\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert resolution.resolved_paths == (str(payload),)
+        assert result.files_scanned == 1
+        assert any(Path(asset.path) == payload for asset in result.assets)
+        assert not any(Path(asset.path) == decoy for asset in result.assets)
+        assert any("model.pkl" in (issue.location or "") for issue in result.issues)
+
+    @pytest.mark.parametrize("wdir", ["../outside", "", 123])
+    def test_unsafe_or_invalid_wdir_marks_pointer_incomplete(self, tmp_path: Path, wdir: object) -> None:
+        """Invalid working directories must fail closed instead of changing the trust boundary."""
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text(f"wdir: {json.dumps(wdir)}\nouts:\n- path: model.pkl\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert resolution.analysis_incomplete is True
+        assert result.files_scanned == 0
+        assert result.has_errors is True
+        assert result.success is False
 
     def test_absolute_path_prevention(self, tmp_path):
         """Test that absolute paths are handled safely."""
@@ -511,6 +606,31 @@ class TestDvcSecurity:
             for issue in results.issues
         )
 
+    def test_partially_materialized_directory_output_fails_closed(self, tmp_path: Path) -> None:
+        """Declared DVC file and byte lower bounds must not be silently underfilled."""
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                return (os.system, ("echo dvc-partial-materialization",))
+
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        payload = output_dir / "payload.pkl"
+        payload.write_bytes(pickle.dumps(MaliciousClass()))
+        dvc_file = tmp_path / "partial.dvc"
+        dvc_file.write_text(f"outs:\n- path: model\n  size: {payload.stat().st_size + 100}\n  nfiles: 2\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert resolution.resolved_paths == (str(output_dir),)
+        assert resolution.analysis_incomplete is True
+        assert result.files_scanned == 1
+        assert any(Path(asset.path) == payload for asset in result.assets)
+        assert result.has_errors is True
+        assert result.success is False
+        assert result.content_hash is None
+
     def test_duplicate_outputs_are_scanned_once_without_budget_error(self, tmp_path: Path) -> None:
         """Repeated declarations should not consume scan or budget twice."""
         target = tmp_path / "model.pkl"
@@ -527,6 +647,80 @@ class TestDvcSecurity:
         assert results.success is True
         assert not any(
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in results.issues
+        )
+
+    @pytest.mark.parametrize(
+        "outputs",
+        [
+            ["model", "model/model.pkl"],
+            ["model/model.pkl", "model"],
+        ],
+    )
+    def test_overlapping_directory_and_file_outputs_are_scanned_once(
+        self,
+        tmp_path: Path,
+        outputs: list[str],
+    ) -> None:
+        """Directory and child declarations must not consume the shared budget twice."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        target = output_dir / "model.pkl"
+        target.write_bytes(pickle.dumps({"payload": "x" * 30}))
+        dvc_file = tmp_path / "overlap.dvc"
+        dvc_file.write_text("outs:\n" + "".join(f"- path: {output}\n" for output in outputs))
+
+        result = scan_model_directory_or_file(str(dvc_file), max_total_size=target.stat().st_size)
+
+        assert result.files_scanned == 1
+        assert result.bytes_scanned == target.stat().st_size
+        assert result.success is True
+        assert not any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues
+        )
+
+    def test_scanner_expanded_shards_are_not_rescanned_by_overlapping_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A direct shard scan must cover its siblings for later DVC output deduplication."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        shards = [
+            output_dir / "model-00001-of-00002.safetensors",
+            output_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(b"0123456789")
+        dvc_file = tmp_path / "overlap.dvc"
+        dvc_file.write_text(f"outs:\n- path: model/{shards[0].name}\n- path: model\n")
+        calls: list[str] = []
+
+        def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
+            calls.append(path)
+            result = ScanResult(scanner_name="safetensors")
+            result.bytes_scanned = sum(shard.stat().st_size for shard in shards)
+            result.add_check(
+                name="Sharded Model Detection",
+                passed=True,
+                message="Detected sharded model",
+                details={"shards": [str(shard) for shard in shards]},
+            )
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(
+            str(dvc_file),
+            max_total_size=sum(shard.stat().st_size for shard in shards),
+        )
+
+        assert calls == [str(shards[0])]
+        assert result.bytes_scanned == sum(shard.stat().st_size for shard in shards)
+        assert result.success is True
+        assert not any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues
         )
 
     def test_duplicate_yaml_keys_mark_pointer_incomplete(self, tmp_path: Path) -> None:
@@ -807,7 +1001,7 @@ class TestDvcSecurity:
 class TestDvcCliIntegration:
     """Test DVC integration through CLI."""
 
-    def test_cli_dvc_file_expansion(self, tmp_path):
+    def test_cli_dvc_file_expansion(self, tmp_path: Path) -> None:
         """Test that CLI properly expands DVC files."""
         from click.testing import CliRunner
 
@@ -915,6 +1109,7 @@ class TestDvcCliIntegration:
         assert output_data["bytes_scanned"] == first.stat().st_size
         assert output_data["success"] is False
         assert output_data["has_errors"] is True
+        assert output_data.get("content_hash") is None
         assert any(
             issue["details"].get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
             and issue["details"].get("budget_type") == "total_size"
@@ -942,3 +1137,22 @@ class TestDvcCliIntegration:
         components = {component["name"] for component in json.loads(sbom_file.read_text())["components"]}
         assert target.name in components
         assert dvc_file.name not in components
+
+    def test_cli_sbom_omits_fully_unresolved_dvc_pointer(self, tmp_path: Path) -> None:
+        """An unscanned DVC pointer must not be emitted as an SBOM component."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        dvc_file = tmp_path / "missing.dvc"
+        dvc_file.write_text("outs:\n- path: missing.pkl\n")
+        sbom_file = tmp_path / "missing.sbom.json"
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(dvc_file), "--sbom", str(sbom_file), "--quiet", "--no-cache"],
+        )
+
+        assert result.exit_code == 2
+        components = json.loads(sbom_file.read_text()).get("components", [])
+        assert not any(component["name"] == dvc_file.name for component in components)

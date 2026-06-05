@@ -130,22 +130,6 @@ def _count_files_up_to(path: Path, limit: int) -> int | None:
     return None if count > limit else count
 
 
-def _directory_tree_is_zero_bytes(path: str) -> bool:
-    """Return whether a directory contains only zero-byte regular files."""
-    try:
-        for root, dirs, files in os.walk(path, followlinks=False):
-            root_path = Path(root)
-            if any((root_path / directory).is_symlink() for directory in dirs):
-                return False
-            for filename in files:
-                file_path = root_path / filename
-                if not file_path.is_file() or file_path.stat().st_size != 0:
-                    return False
-    except OSError:
-        return False
-    return True
-
-
 _add_issue_to_model = core_results.add_issue_to_model
 _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
@@ -171,6 +155,10 @@ _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
+_DVC_PARENT_FILE_CONFIG_KEY = "_dvc_parent_file"
+_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
+_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY = "_dvc_total_size_limit"
+_DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 
 
 def _record_incomplete_dvc_resolution(
@@ -910,6 +898,17 @@ def scan_model_directory_or_file(
     """
     # Start timer for timeout
     start_time = time.time()
+    dvc_parent_file = kwargs.pop(_DVC_PARENT_FILE_CONFIG_KEY, None)
+    dvc_remaining_total_size = kwargs.pop(_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY, None)
+    dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
+    dvc_excluded_paths_value = kwargs.pop(_DVC_EXCLUDED_PATHS_CONFIG_KEY, ())
+    if not isinstance(dvc_excluded_paths_value, (list, tuple, set, frozenset)):
+        dvc_excluded_paths_value = ()
+    dvc_excluded_paths = {
+        str(Path(excluded_path).resolve())
+        for excluded_path in dvc_excluded_paths_value
+        if isinstance(excluded_path, str)
+    }
 
     # Initialize results using Pydantic model from the start
     results = create_initial_audit_result()
@@ -1116,6 +1115,8 @@ def scan_model_directory_or_file(
                     if file.lower().endswith(".dvc"):
                         dvc_resolution = resolve_dvc_file_status(file_path)
                         _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
+                        if dvc_resolution.analysis_incomplete:
+                            aggregate_hash_complete = False
                         if dvc_resolution.resolved_paths:
                             target_paths = [Path(t).resolve() for t in dvc_resolution.resolved_paths]
                         else:
@@ -1128,6 +1129,8 @@ def scan_model_directory_or_file(
                             continue
 
                         target_str = str(target_path)
+                        if str(target_path.resolve()) in dvc_excluded_paths:
+                            continue
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         if is_hf_shard_alias:
@@ -1220,6 +1223,36 @@ def scan_model_directory_or_file(
                         continue
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
+
+            if isinstance(dvc_parent_file, str) and isinstance(dvc_remaining_total_size, int):
+                remaining_size = dvc_remaining_total_size
+                bounded_scan_entries: list[_ScanEntry] = []
+                dvc_budget_exhausted = remaining_size < 0
+                for scan_entry in scan_entries:
+                    if dvc_budget_exhausted:
+                        break
+                    try:
+                        entry_size = sum(os.path.getsize(file_path) for file_path in scan_entry[1])
+                    except OSError:
+                        dvc_budget_exhausted = True
+                        break
+                    if entry_size > remaining_size:
+                        dvc_budget_exhausted = True
+                        break
+                    bounded_scan_entries.append(scan_entry)
+                    remaining_size -= entry_size
+
+                scan_entries = bounded_scan_entries
+                if dvc_budget_exhausted:
+                    aggregate_hash_complete = False
+                    limit_reached = True
+                    _record_incomplete_dvc_scan_budget(
+                        results,
+                        scan_metadata,
+                        dvc_parent_file,
+                        budget_type="total_size",
+                        limit=dvc_total_size_limit if isinstance(dvc_total_size_limit, int) else max_total_size,
+                    )
 
             # Second pass: scan every non-shard path independently and every shard
             # family once. Shard scans already expand to sibling shards in the
@@ -1464,11 +1497,18 @@ def scan_model_directory_or_file(
             if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
                 _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
+                if dvc_resolution.analysis_incomplete:
+                    aggregate_hash_complete = False
                 target_files = list(dvc_resolution.resolved_paths)
+            scanned_dvc_paths: set[str] = set()
 
             for _idx, target in enumerate(target_files):
                 # Check for interrupts
                 check_interrupted()
+
+                resolved_target = str(Path(target).resolve())
+                if is_dvc_pointer and resolved_target in scanned_dvc_paths:
+                    continue
 
                 target_timeout = timeout
                 target_max_total_size = max_total_size
@@ -1476,6 +1516,7 @@ def scan_model_directory_or_file(
                 if is_dvc_pointer:
                     target_timeout = timeout - int(time.time() - start_time)
                     if target_timeout <= 0:
+                        aggregate_hash_complete = False
                         _record_incomplete_dvc_scan_budget(
                             results,
                             scan_metadata,
@@ -1490,13 +1531,16 @@ def scan_model_directory_or_file(
                         can_probe_zero_byte_target = False
                         if target_max_total_size == 0:
                             if os.path.isdir(target):
-                                can_probe_zero_byte_target = _directory_tree_is_zero_bytes(target)
+                                # The nested directory scan applies the exact zero-byte
+                                # budget to its filtered scan entries before hashing.
+                                can_probe_zero_byte_target = True
                             elif os.path.isfile(target):
                                 try:
                                     can_probe_zero_byte_target = os.path.getsize(target) == 0
                                 except OSError:
                                     can_probe_zero_byte_target = False
                         if target_max_total_size < 0 or (target_max_total_size == 0 and not can_probe_zero_byte_target):
+                            aggregate_hash_complete = False
                             _record_incomplete_dvc_scan_budget(
                                 results,
                                 scan_metadata,
@@ -1515,6 +1559,13 @@ def scan_model_directory_or_file(
                     target_config["max_total_size"] = target_max_total_size
 
                 if os.path.isdir(target):
+                    nested_kwargs = dict(kwargs)
+                    if is_dvc_pointer and max_total_size > 0:
+                        nested_kwargs[_DVC_PARENT_FILE_CONFIG_KEY] = path
+                        nested_kwargs[_DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY] = max_total_size - results.bytes_scanned
+                        nested_kwargs[_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY] = max_total_size
+                    if is_dvc_pointer:
+                        nested_kwargs[_DVC_EXCLUDED_PATHS_CONFIG_KEY] = tuple(scanned_dvc_paths)
                     nested_result = scan_model_directory_or_file(
                         target,
                         blacklist_patterns=blacklist_patterns,
@@ -1524,9 +1575,16 @@ def scan_model_directory_or_file(
                         strict_license=strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=skip_file_types,
-                        **kwargs,
+                        **nested_kwargs,
                     )
                     results.aggregate_scan_result(nested_result)
+                    scanned_dvc_paths.update(
+                        str(Path(asset.path).resolve()) for asset in nested_result.assets if asset.path
+                    )
+                    if nested_result.has_errors or (
+                        nested_result.files_scanned > 0 and nested_result.content_hash is None
+                    ):
+                        aggregate_hash_complete = False
                     for nested_metadata in nested_result.file_metadata.values():
                         nested_content_hash = nested_metadata.get("content_hash")
                         if (
@@ -1554,6 +1612,7 @@ def scan_model_directory_or_file(
                     except OSError:
                         target_size = 0
                     if target_size > target_max_total_size:
+                        aggregate_hash_complete = False
                         _record_incomplete_dvc_scan_budget(
                             results,
                             scan_metadata,
@@ -1606,6 +1665,16 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                if is_dvc_pointer:
+                    scanned_dvc_paths.add(resolved_target)
+                    for check in file_result.checks:
+                        shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
+                        if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
+                            scanned_dvc_paths.update(
+                                str(Path(shard_path).resolve())
+                                for shard_path in shard_paths
+                                if isinstance(shard_path, str)
+                            )
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
@@ -1706,8 +1775,10 @@ def scan_model_directory_or_file(
     # Set success flag for backward compatibility
     results.success = not _results_should_be_unsuccessful(results)
 
-    # Compute aggregate content hash if we collected file hashes
-    if file_hashes and aggregate_hash_complete:
+    # Compute aggregate content hash only when every declared artifact was covered.
+    if not aggregate_hash_complete:
+        results.content_hash = None
+    elif file_hashes:
         from .utils.helpers.secure_hasher import compute_aggregate_hash
 
         aggregate_hash_started_at = _start_phase_timing(phase_timings)

@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ DVC_ANALYSIS_INCOMPLETE_REASON = "dvc_outputs_unresolved"
 DVC_OUTPUT_LIMIT_EXCEEDED_REASON = "dvc_output_limit_exceeded"
 DVC_POINTER_TOO_LARGE_REASON = "dvc_pointer_too_large"
 MAX_DVC_POINTER_BYTES = 10 * 1024 * 1024
+MAX_DVC_METADATA_VALIDATION_FILES = 100_000
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,51 @@ class DvcResolution:
     def analysis_incomplete(self) -> bool:
         """Return True when declared DVC outputs were not fully resolved."""
         return bool(self.unresolved_outputs or self.incomplete_reason)
+
+
+def _declared_output_metadata_gap(output: dict[Any, Any], target: Path) -> str | None:
+    """Return a definite local coverage gap from DVC size/count lower bounds."""
+    declared_size = output.get("size")
+    declared_nfiles = output.get("nfiles")
+    for field_name, value in (("size", declared_size), ("nfiles", declared_nfiles)):
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            return f"invalid-{field_name}"
+
+    if declared_size is None and declared_nfiles is None:
+        return None
+
+    try:
+        if target.is_file():
+            actual_size = target.stat().st_size
+            if isinstance(declared_size, int) and actual_size < declared_size:
+                return "declared-size-not-materialized"
+            if isinstance(declared_nfiles, int) and declared_nfiles > 1:
+                return "declared-file-count-not-materialized"
+            return None
+
+        actual_size = 0
+        actual_nfiles = 0
+        for root, _dirs, files in os.walk(target, followlinks=False):
+            for filename in files:
+                file_path = Path(root) / filename
+                if not file_path.is_file():
+                    return "metadata-validation-failed"
+                actual_nfiles += 1
+                actual_size += file_path.stat().st_size
+                if actual_nfiles > MAX_DVC_METADATA_VALIDATION_FILES:
+                    return "metadata-validation-limit-exceeded"
+            size_satisfied = not isinstance(declared_size, int) or actual_size >= declared_size
+            count_satisfied = not isinstance(declared_nfiles, int) or actual_nfiles >= declared_nfiles
+            if size_satisfied and count_satisfied:
+                return None
+    except OSError:
+        return "metadata-validation-failed"
+
+    if isinstance(declared_nfiles, int) and actual_nfiles < declared_nfiles:
+        return "declared-file-count-not-materialized"
+    if isinstance(declared_size, int) and actual_size < declared_size:
+        return "declared-size-not-materialized"
+    return None
 
 
 def resolve_dvc_file(file_path: str) -> list[str]:
@@ -89,6 +136,20 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
         logger.warning(f"DVC file {file_path} has invalid 'outs' structure")
         return DvcResolution(incomplete_reason="dvc_invalid_outputs")
 
+    dvc_dir = path.parent.resolve()
+    wdir = data.get("wdir", ".")
+    if not isinstance(wdir, str) or not wdir.strip():
+        logger.warning(f"DVC file {file_path} has invalid 'wdir' value")
+        return DvcResolution(incomplete_reason="dvc_invalid_wdir")
+    try:
+        output_base = (dvc_dir / wdir).resolve()
+        if not output_base.is_relative_to(dvc_dir):
+            logger.warning(f"DVC working directory outside safe boundaries: {file_path} -> {output_base}")
+            return DvcResolution(incomplete_reason="dvc_unsafe_wdir")
+    except (OSError, ValueError):
+        logger.warning(f"Failed to resolve DVC working directory: {file_path} -> {wdir}")
+        return DvcResolution(incomplete_reason="dvc_invalid_wdir")
+
     # Limit number of outputs to prevent resource exhaustion
     MAX_OUTPUTS = 100
     output_limit_exceeded = len(outs) > MAX_OUTPUTS
@@ -99,7 +160,6 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
     resolved: list[str] = []
     resolved_seen: set[str] = set()
     unresolved: list[str] = []
-    dvc_dir = path.parent.resolve()
 
     for out in outs:
         if not isinstance(out, dict) or "path" not in out:
@@ -119,7 +179,7 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
 
         # Security: Resolve target path and validate it's within safe boundaries
         try:
-            target = (dvc_dir / out_path).resolve()
+            target = (output_base / out_path).resolve()
 
             try:
                 is_safe = target.is_relative_to(dvc_dir)
@@ -164,6 +224,14 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
                 if target_str not in resolved_seen:
                     resolved.append(target_str)
                     resolved_seen.add(target_str)
+                if metadata_gap := _declared_output_metadata_gap(out, target):
+                    logger.warning(
+                        "DVC output metadata indicates incomplete local materialization: %s -> %s (%s)",
+                        file_path,
+                        target,
+                        metadata_gap,
+                    )
+                    unresolved.append(f"{target} ({metadata_gap})")
             else:
                 logger.debug(f"DVC target missing: {target}")
                 unresolved.append(str(target))
