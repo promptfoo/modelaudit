@@ -553,6 +553,8 @@ def _resolve_scan_runtime_config(
         selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
     )
     pytorch_hub_scannable_extensions = scannable_extensions
+    # Header-routed and generic container scanners must see every supported Hub
+    # artifact; suffix filtering here would create selection-specific false negatives.
     if (
         scanner_policy.active
         and pytorch_hub_scannable_extensions is None
@@ -1410,6 +1412,7 @@ def _resolve_scan_source_for_path(
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
                     scannable_extensions=runtime.pytorch_hub_scannable_extensions,
+                    timeout=runtime.timeout,
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,

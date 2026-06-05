@@ -5,6 +5,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 import unicodedata
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
@@ -30,6 +31,8 @@ _SCANNER_EXTENSION_KEYS = ("extensions", "content_routed_extensions", "scanner_o
 _HTML_CONTENT_TYPES = frozenset({"application/xhtml+xml", "text/html"})
 _HTML_PREFIX_PATTERN = re.compile(rb"^\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", re.IGNORECASE)
 _WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"\\|?*')
+_MAX_PYTORCH_HUB_SOURCE_BYTES = 2 * 1024 * 1024
+_MAX_PYTORCH_HUB_SOURCE_LINKS = 5
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
     | {f"COM{index}" for index in range(1, 10)}
@@ -296,7 +299,10 @@ def _artifact_redirect_url(current_url: str, response: requests.Response) -> str
 
 
 @contextmanager
-def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
+def _open_trusted_artifact_response(
+    url: str,
+    deadline: float | None = None,
+) -> Iterator[requests.Response]:
     """Open an artifact while keeping every redirect inside the trusted model path."""
     from ...scanner_registry_metadata import get_extension_format_map
 
@@ -306,6 +312,7 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
 
     current_url = url
     for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
+        _check_deadline(deadline)
         current_format = _artifact_format(current_url, model_extensions, extension_format_map)
         if current_format != expected_format:
             raise ValueError(
@@ -313,7 +320,12 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
                 f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
             )
 
-        with requests.get(current_url, stream=True, timeout=30, allow_redirects=False) as response:
+        with requests.get(
+            current_url,
+            stream=True,
+            timeout=_remaining_request_timeout(deadline, 30),
+            allow_redirects=False,
+        ) as response:
             status_code = response.status_code if isinstance(response.status_code, int) else 200
             if status_code not in _REDIRECT_STATUS_CODES:
                 response.raise_for_status()
@@ -331,6 +343,34 @@ def _open_trusted_artifact_response(url: str) -> Iterator[requests.Response]:
     raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
 
 
+class _GithubSourceLinkParser(HTMLParser):
+    """Collect trusted Python source links labeled as the Hub source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._href: str | None = None
+        self._text: list[str] = []
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        self._href = dict(attrs).get("href")
+        self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or self._href is None:
+            return
+        if "view on github" in "".join(self._text).lower():
+            self.links.append(self._href)
+        self._href = None
+        self._text = []
+
+
 def is_pytorch_hub_url(url: str) -> bool:
     """Return True if the URL points to a PyTorch Hub model page."""
     return bool(re.match(_PYTORCH_HUB_PATTERN, url, re.IGNORECASE))
@@ -341,10 +381,12 @@ def _extract_weight_urls(
     scannable_extensions: frozenset[str] | None = None,
 ) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
-    model_extensions = {
-        extension.lower()
-        for extension in (scannable_extensions if scannable_extensions is not None else _get_model_extensions())
-    }
+    artifact_extensions = {extension.lower() for extension in _get_model_extensions()}
+    model_extensions = (
+        artifact_extensions
+        if scannable_extensions is None
+        else artifact_extensions & {extension.lower() for extension in scannable_extensions}
+    )
     weight_urls: list[str] = []
     seen: set[str] = set()
 
@@ -369,7 +411,93 @@ def _extract_weight_urls(
     return weight_urls
 
 
-def _get_total_size(urls: list[str]) -> int:
+def _extract_github_source_urls(html: str) -> list[str]:
+    """Return bounded raw GitHub Python sources linked by a Hub page."""
+    parser = _GithubSourceLinkParser()
+    parser.feed(html)
+    raw_urls: list[str] = []
+    pattern = re.compile(
+        r"^https://github\.com/(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+)/blob/"
+        r"(?P<ref>[\w.-]+)/(?P<path>[\w./-]+\.py)$"
+    )
+    for link in parser.links:
+        match = pattern.fullmatch(link)
+        if match is None or ".." in Path(match.group("path")).parts:
+            continue
+        raw_url = (
+            f"https://raw.githubusercontent.com/{match.group('owner')}/{match.group('repo')}/"
+            f"{match.group('ref')}/{match.group('path')}"
+        )
+        if raw_url not in raw_urls:
+            raw_urls.append(raw_url)
+        if len(raw_urls) >= _MAX_PYTORCH_HUB_SOURCE_LINKS:
+            break
+    return raw_urls
+
+
+def _remaining_request_timeout(deadline: float | None, default: float) -> float:
+    if deadline is None:
+        return default
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("PyTorch Hub streaming download timed out")
+    return min(default, remaining)
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("PyTorch Hub streaming download timed out")
+
+
+def _resolve_weight_urls(
+    html: str,
+    deadline: float | None = None,
+    scannable_extensions: frozenset[str] | None = None,
+) -> list[str]:
+    """Resolve weight URLs directly or from the page's trusted source link."""
+    weight_urls = _extract_weight_urls(html, scannable_extensions)
+    if weight_urls:
+        return weight_urls
+
+    for source_url in _extract_github_source_urls(html):
+        _check_deadline(deadline)
+        source_resp: requests.Response | None = None
+        try:
+            source_resp = requests.get(
+                source_url,
+                stream=True,
+                timeout=_remaining_request_timeout(deadline, 10),
+            )
+            source_resp.raise_for_status()
+            source_bytes = bytearray()
+            for chunk in source_resp.iter_content(chunk_size=64 * 1024):
+                _check_deadline(deadline)
+                if not chunk:
+                    continue
+                source_bytes.extend(chunk)
+                if len(source_bytes) > _MAX_PYTORCH_HUB_SOURCE_BYTES:
+                    source_bytes.clear()
+                    break
+            if not source_bytes:
+                continue
+            weight_urls.extend(
+                _extract_weight_urls(
+                    source_bytes.decode("utf-8", errors="ignore"),
+                    scannable_extensions,
+                )
+            )
+        except TimeoutError:
+            raise
+        except Exception:
+            continue
+        finally:
+            if source_resp is not None:
+                with suppress(Exception):
+                    source_resp.close()
+    return list(dict.fromkeys(weight_urls))
+
+
+def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
     from ...scanner_registry_metadata import get_extension_format_map
 
     model_extensions = {extension.lower() for extension in _get_model_extensions()}
@@ -377,9 +505,11 @@ def _get_total_size(urls: list[str]) -> int:
     total = 0
     for url in urls:
         try:
+            _check_deadline(deadline)
             expected_format = _artifact_format(url, model_extensions, extension_format_map)
             current_url = url
             for _ in range(_MAX_ARTIFACT_REDIRECTS + 1):
+                _check_deadline(deadline)
                 current_format = _artifact_format(current_url, model_extensions, extension_format_map)
                 if current_format != expected_format:
                     raise ValueError(
@@ -387,7 +517,11 @@ def _get_total_size(urls: list[str]) -> int:
                         f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
                     )
 
-                response = requests.head(current_url, timeout=10, allow_redirects=False)
+                response = requests.head(
+                    current_url,
+                    timeout=_remaining_request_timeout(deadline, 10),
+                    allow_redirects=False,
+                )
                 try:
                     status_code = response.status_code if isinstance(response.status_code, int) else 200
                     if status_code in _REDIRECT_STATUS_CODES:
@@ -403,6 +537,8 @@ def _get_total_size(urls: list[str]) -> int:
                         response.close()
             else:
                 raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
+        except TimeoutError:
+            raise
         except Exception:
             continue
     return total
@@ -680,12 +816,14 @@ def _download_weight_file(
     dest_file: Path,
     downloaded_size: int,
     max_size: int | None,
+    deadline: float | None = None,
 ) -> int:
     """Download one weight file atomically and return the cumulative byte count."""
     partial_file: Path | None = None
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with _open_trusted_artifact_response(weight_url) as response:
+        _check_deadline(deadline)
+        with _open_trusted_artifact_response(weight_url, deadline) as response:
             _validate_artifact_response_type(weight_url, response)
             content_length = _response_content_length(response)
             if content_length is not None:
@@ -700,6 +838,7 @@ def _download_weight_file(
             ) as handle:
                 partial_file = Path(handle.name)
                 for chunk in response.iter_content(chunk_size=8192):
+                    _check_deadline(deadline)
                     if chunk:
                         _enforce_max_size(downloaded_size + len(chunk), max_size)
                         handle.write(chunk)
@@ -731,7 +870,7 @@ def download_pytorch_hub_model(
     except Exception as e:  # pragma: no cover - network errors
         raise Exception(f"Failed to fetch PyTorch Hub page {url}: {e!s}") from e
 
-    weight_urls = _extract_weight_urls(page.text, scannable_extensions)
+    weight_urls = _resolve_weight_urls(page.text, scannable_extensions=scannable_extensions)
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 
@@ -804,6 +943,7 @@ def download_pytorch_hub_model_streaming(
     show_progress: bool = True,
     max_size: int | None = None,
     scannable_extensions: frozenset[str] | None = None,
+    timeout: int | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
@@ -815,6 +955,7 @@ def download_pytorch_hub_model_streaming(
         show_progress: Whether to show progress messages
         max_size: Maximum total download size in bytes
         scannable_extensions: Optional selected-scanner suffix filter
+        timeout: Maximum total acquisition time in seconds
 
     Yields:
         Tuples of (file_path, is_last) for each weight file
@@ -822,22 +963,28 @@ def download_pytorch_hub_model_streaming(
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")
 
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
     try:
-        page = requests.get(url, timeout=10)
+        _check_deadline(deadline)
+        page = requests.get(url, timeout=_remaining_request_timeout(deadline, 10))
         page.raise_for_status()
+    except TimeoutError:
+        raise
     except Exception as e:
         raise Exception(f"Failed to fetch PyTorch Hub page {url}: {e!s}") from e
 
-    weight_urls = _extract_weight_urls(page.text, scannable_extensions)
+    weight_urls = _resolve_weight_urls(page.text, deadline, scannable_extensions)
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
-    total_size = _get_total_size(weight_urls)
-    if total_size > 0:
-        _enforce_max_size(total_size, max_size)
+    if max_size is not None and max_size > 0:
+        total_size = _get_total_size(weight_urls, deadline)
+        if total_size > 0:
+            _enforce_max_size(total_size, max_size)
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))
@@ -854,8 +1001,14 @@ def download_pytorch_hub_model_streaming(
                 click.echo(f"⬇️  Downloading {relative_path.as_posix()}")
 
             try:
-                downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
-            except ValueError:
+                downloaded_size = _download_weight_file(
+                    weight_url,
+                    dest_file,
+                    downloaded_size,
+                    max_size,
+                    deadline,
+                )
+            except (TimeoutError, ValueError):
                 raise
             except Exception as e:
                 raise Exception(

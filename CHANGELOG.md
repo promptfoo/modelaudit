@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
@@ -125,6 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed and cap downstream scanning and metadata listings when PyTorch ZIP archives exceed the configured entry limit, preserve parent structure attribution across nested limits, and retain deadline and prefixed-layout metadata handling
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - include supported non-PT artifacts linked from PyTorch Hub model pages while rejecting format-changing redirects and non-artifact responses
+- enforce `--max-size` while streaming PyTorch Hub model weights
 - enforce `--max-size` while downloading PyTorch Hub models in normal acquisition mode
 - detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
