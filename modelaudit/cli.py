@@ -78,7 +78,12 @@ from .utils.sources.huggingface import (
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
-from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, redact_jfrog_url_for_display
+from .utils.sources.jfrog import (
+    is_jfrog_url,
+    is_jfrog_url_like,
+    redact_jfrog_error_for_display,
+    redact_jfrog_url_for_display,
+)
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
@@ -88,7 +93,7 @@ def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if is_cloud_url(path):
         return redact_url_for_display(path)
-    if is_jfrog_url(path):
+    if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
@@ -1256,6 +1261,7 @@ def _resolve_scan_source_for_path(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
+                    max_size=runtime.max_download_bytes,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -1300,7 +1306,12 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
-            download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
+            download_path = download_model(
+                path,
+                cache_dir=hf_cache_dir,
+                show_progress=show_progress,
+                max_size=runtime.max_download_bytes,
+            )
             download_duration = time.time() - download_start
             try:
                 download_size = sum(
@@ -1689,7 +1700,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if not os.path.exists(path):
-        click.echo(f"Error: Path does not exist: {path}", err=True)
+        click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 
@@ -2969,12 +2980,34 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Directory summary
         output.append(f"Directory: {metadata['directory']}")
         output.append(f"Total Files: {metadata['summary']['total_files']}")
+        if metadata.get("analysis_incomplete"):
+            output.append("\nWarning: Metadata extraction is incomplete")
+            for event in metadata.get("budget_events", []):
+                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
             output.append(f"  {fmt}: {count}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            output.append(f"  {file_meta.get('file', 'unknown')} ({file_meta.get('format', 'unknown')})")
+            file_name = file_meta.get("file", "unknown")
+            if error := file_meta.get("error"):
+                output.append(f"  {file_name} (error: {error})")
+            else:
+                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                for key in (
+                    "has_custom_metadata",
+                    "custom_metadata_entry_count",
+                    "custom_metadata_valid",
+                    "custom_metadata_type",
+                    "custom_metadata_invalid_value_count",
+                    "custom_metadata_security_flags",
+                ):
+                    if key not in file_meta:
+                        continue
+                    value = file_meta[key]
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value)) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:

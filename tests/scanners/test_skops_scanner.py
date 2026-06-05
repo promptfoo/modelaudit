@@ -715,6 +715,42 @@ class TestSkopsScannerEdgeCases:
         )
         assert determine_exit_code(result) == 1
 
+    def test_python_member_getattribute_high_risk_call_is_reported(self, tmp_path: Path) -> None:
+        """Skops nested ZIP analysis must catch active code recovered through __getattribute__."""
+        skops_file = tmp_path / "getattribute_payload.skops"
+        source = "import os\nresolve = os.__getattribute__\nrunner = resolve('sys' + 'tem')\nrunner('echo hidden')\n"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("handler.py", source)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        python_issues = [
+            issue
+            for issue in result.issues
+            if issue.message == "High-risk Python code found in ZIP member handler.py: high-risk calls: os.system"
+            and issue.details.get("entry") == "handler.py"
+            and issue.details.get("reason") == "high-risk calls: os.system"
+        ]
+        assert len(python_issues) == 1
+        assert python_issues[0].severity == IssueSeverity.WARNING
+        assert determine_exit_code(result) == 1
+
+    def test_python_member_benign_getattribute_remains_quiet(self, tmp_path: Path) -> None:
+        """Benign attribute retrieval in Skops Python members should not become a finding."""
+        skops_file = tmp_path / "benign_getattribute.skops"
+        source = "import os\nresolve = os.__getattribute__\ncurrent_dir = resolve('getcwd')\ncurrent_dir()\n"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("handler.py", source)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 0
+        assert not any(
+            issue.message.startswith("High-risk Python code found in ZIP member handler.py") for issue in result.issues
+        )
+
     @pytest.mark.parametrize(
         ("exception_type", "message"),
         [
