@@ -179,7 +179,7 @@ def _redact_encoded_payload_match(match: re.Match[str]) -> str:
     if url_prefix_match is not None:
         authority_prefix = url_prefix_match.group(0).partition("://")[2]
         authority_tail, separator, _path = raw_value.partition("/")
-        if separator and "/" not in authority_prefix:
+        if separator and "/" not in authority_prefix and _ENCODED_PAYLOAD_RE.fullmatch(authority_tail) is None:
             trailing_separator = "/" if raw_value.endswith("/") else ""
             return f"{authority_tail}/{REDACTED_EVIDENCE_VALUE}{trailing_separator}"
     return REDACTED_EVIDENCE_VALUE
