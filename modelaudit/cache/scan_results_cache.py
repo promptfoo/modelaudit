@@ -453,12 +453,15 @@ class ScanResultsCache:
             probe_stat = os.fstat(probe.fileno())
             return self._get_file_change_token("", probe_stat)
 
-        probe_name = getattr(probe, "name", None)
-        if not isinstance(probe_name, (str, bytes)):
-            raise OSError("Windows cache identity probe has no filesystem path")
-        os.utime(probe_name, None)
-        probe_stat = os.stat(probe_name)
-        return self._get_file_change_token(os.fsdecode(probe_name), probe_stat)
+        import msvcrt
+
+        probe.seek(0)
+        probe.truncate(0)
+        probe.write(b"\0")
+        probe.flush()
+        os.fsync(probe.fileno())
+        msvcrt_windows: Any = msvcrt
+        return self._get_windows_handle_change_token(msvcrt_windows.get_osfhandle(probe.fileno()))
 
     def _capture_ancestor_identity(self, file_path: str) -> AncestorIdentity:
         """Capture same-filesystem lexical ancestors and reject symlinked path components."""
@@ -505,15 +508,6 @@ class ScanResultsCache:
         import ctypes
         from ctypes import wintypes
 
-        class FileBasicInfo(ctypes.Structure):
-            _fields_ = [
-                ("creation_time", ctypes.c_longlong),
-                ("last_access_time", ctypes.c_longlong),
-                ("last_write_time", ctypes.c_longlong),
-                ("change_time", ctypes.c_longlong),
-                ("file_attributes", wintypes.DWORD),
-            ]
-
         win_dll = ctypes.WinDLL  # type: ignore[attr-defined]
         get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
         win_error = ctypes.WinError  # type: ignore[attr-defined]
@@ -551,17 +545,45 @@ class ScanResultsCache:
             raise win_error(get_last_error())
 
         try:
-            basic_info = FileBasicInfo()
-            if not kernel32.GetFileInformationByHandleEx(
-                handle,
-                0,
-                ctypes.byref(basic_info),
-                ctypes.sizeof(basic_info),
-            ):
-                raise win_error(get_last_error())
-            return int(basic_info.change_time)
+            return ScanResultsCache._get_windows_handle_change_token(handle)
         finally:
             kernel32.CloseHandle(handle)
+
+    @staticmethod
+    def _get_windows_handle_change_token(handle: int) -> int:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("creation_time", ctypes.c_longlong),
+                ("last_access_time", ctypes.c_longlong),
+                ("last_write_time", ctypes.c_longlong),
+                ("change_time", ctypes.c_longlong),
+                ("file_attributes", wintypes.DWORD),
+            ]
+
+        win_dll = ctypes.WinDLL  # type: ignore[attr-defined]
+        get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
+        win_error = ctypes.WinError  # type: ignore[attr-defined]
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+
+        basic_info = FileBasicInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            0,
+            ctypes.byref(basic_info),
+            ctypes.sizeof(basic_info),
+        ):
+            raise win_error(get_last_error())
+        return int(basic_info.change_time)
 
     @staticmethod
     def _stat_matches(left: os.stat_result, right: os.stat_result) -> bool:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -78,6 +80,35 @@ def test_capture_file_identity_uses_target_filesystem_probe(
     assert change_token > 0
     assert ancestor_identity
     assert cache._change_clock_probes[file_stat.st_dev][1] == file_path.parent
+
+
+def test_windows_change_clock_probe_uses_existing_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    msvcrt = ModuleType("msvcrt")
+    msvcrt.get_osfhandle = lambda file_descriptor: file_descriptor + 100  # type: ignore[attr-defined]
+    observed_handles: list[int] = []
+
+    def record_change_token_handle(handle: int) -> int:
+        observed_handles.append(handle)
+        return 123
+
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(os, "utime", lambda *_args, **_kwargs: pytest.fail("probe path was reopened"))
+        monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+        monkeypatch.setattr(
+            cache,
+            "_get_windows_handle_change_token",
+            record_change_token_handle,
+        )
+
+        assert cache._touch_change_clock_probe(probe) == 123
+        probe.seek(0)
+        assert probe.read() == b"\0"
+        assert observed_handles == [probe.fileno() + 100]
 
 
 def test_nested_identity_capture_does_not_invalidate_outer_identity(tmp_path: Path) -> None:
