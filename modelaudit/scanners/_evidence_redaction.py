@@ -303,12 +303,12 @@ def _iter_r_raw_string_spans(text: str) -> Iterator[tuple[int, int, int, int, bo
         closing_delimiter = R_RAW_STRING_CLOSING_DELIMITERS[prefix_match.group("delimiter")]
         closing_sequence = f'{closing_delimiter}{dashes}"'
         content_end = text.find(closing_sequence, content_start)
-        next_prefix_match = R_RAW_STRING_PREFIX_RE.search(text, content_start)
-        if content_end < 0 and next_prefix_match is not None:
-            yield literal_start, next_prefix_match.start(), content_start, next_prefix_match.start(), False
-            cursor = next_prefix_match.start()
-            continue
         if content_end < 0:
+            next_prefix_match = R_RAW_STRING_PREFIX_RE.search(text, content_start)
+            if next_prefix_match is not None:
+                yield literal_start, next_prefix_match.start(), content_start, next_prefix_match.start(), False
+                cursor = next_prefix_match.start()
+                continue
             yield literal_start, len(text), content_start, len(text), False
             return
 
