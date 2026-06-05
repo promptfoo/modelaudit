@@ -1510,11 +1510,11 @@ class KerasH5Scanner(BaseScanner):
     def _is_lambda_module_reference_dangerous(cls, module_name: Any, function_name: Any) -> bool:
         """Return True when a Lambda module/function reference resolves to a risky symbol."""
         if isinstance(function_name, str):
-            normalized_function_name = function_name.strip()
+            normalized_function_name = function_name.strip().lower()
             function_tokens = {
                 token.strip() for token in re.split(r"[^0-9A-Za-z_]+", normalized_function_name) if token.strip()
             }
-            if {token.lower() for token in function_tokens} & cls._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES:
+            if function_tokens & cls._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES:
                 return True
             if (
                 not isinstance(module_name, str) or not module_name.strip()

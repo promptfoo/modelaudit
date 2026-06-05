@@ -3259,6 +3259,44 @@ def test_lambda_legacy_named_function_reference_fails_closed(
 
 
 @pytest.mark.parametrize(
+    ("function_name", "expected_severity"),
+    [("subprocess.Popen", IssueSeverity.CRITICAL), ("subprocess.PopenSafe", IssueSeverity.WARNING)],
+)
+def test_lambda_moduleless_legacy_function_reference_is_case_insensitive(
+    tmp_path: Path,
+    function_name: str,
+    expected_severity: IssueSeverity,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "moduleless_legacy_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": function_name, "function_type": "function"},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="moduleless_legacy_function_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].severity == expected_severity
+
+
+@pytest.mark.parametrize(
     ("module_name", "function_name"),
     [
         ("keras.attacker", "identity"),
