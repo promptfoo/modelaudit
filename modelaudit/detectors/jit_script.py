@@ -348,7 +348,8 @@ def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0
         code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
         if _parse_embedded_python_snippet(code_str) is not None:
             return True
-        if _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate):
+        unambiguous_start = _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate)
+        if unambiguous_start is not None and not unambiguous_start.group(0).rstrip().endswith(b"="):
             return True
     return False
 
@@ -9334,6 +9335,8 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
 def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:
     first_line_end = data.find(b"\n")
     if first_line_end < 0 or not any(marker in data[first_line_end + 1 :] for marker in (b"\x00", b"\xff")):
+        return []
+    if b"import" not in data or not _priority_import_offsets(data):
         return []
     potential_framed_calls: list[tuple[int, bytes, bytes]] = []
     offset = 0

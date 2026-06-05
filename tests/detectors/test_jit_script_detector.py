@@ -5944,6 +5944,24 @@ class TestJITScriptDetector:
         assert windows
         assert priority_context_checks <= 1
 
+    def test_contextual_priority_windows_skip_binary_without_priority_import(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def unexpected_structural_scan(_line: bytes) -> bytes:
+            raise AssertionError("binary lines should not be structurally scanned without a priority import")
+
+        monkeypatch.setattr(jit_script_module, "_python_structural_line_bytes", unexpected_structural_scan)
+        data = b"header\n\x00" + (b"benign binary payload\n" * 4096)
+
+        assert jit_script_module._contextual_priority_framed_windows(data) == []
+
+    def test_source_like_start_rejects_binary_assignment_opcode(self) -> None:
+        binary_payload = b"\x80\x04K=\x94M:\x01M;\x01M<\x01M=\x01"
+
+        assert jit_script_module._has_source_like_embedded_python_start(binary_payload) is False
+        assert jit_script_module._has_source_like_embedded_python_start(b"\x00sink = eval\nsink('1+1')\n") is True
+
     def test_scan_model_does_not_flag_builtin_substring_inside_identifier(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00\xffdef benign_weight_marker():\n    opened = 1\n    file_count = opened\n    return file_count\n"
