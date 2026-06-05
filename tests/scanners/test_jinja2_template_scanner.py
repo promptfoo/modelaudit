@@ -991,7 +991,7 @@ class TestJinja2TemplateScannerEdgeCases:
         tokenizer_file = tmp_path / "tokenizer_config.json"
         tokenizer_file.write_text(json.dumps({"chat_template": payload}), encoding="utf-8")
 
-        scanner = Jinja2TemplateScanner({"max_template_size": 128, "sandbox_render_timeout_seconds": 2})
+        scanner = Jinja2TemplateScanner({"max_template_size": 128, "enable_sandbox_test": False})
         result = scanner.scan(str(tokenizer_file))
 
         assert result.has_warnings or result.has_errors
@@ -2030,7 +2030,7 @@ class TestJinja2TemplateScannerConfiguration:
         template_file = tmp_path / "test.jinja"
         template_file.write_text("{% for item in items %}{{ item }}{% endfor %}")
 
-        scanner = Jinja2TemplateScanner(config={"sensitivity_level": "high"})
+        scanner = Jinja2TemplateScanner(config={"sensitivity_level": "high", "enable_sandbox_test": False})
         result = scanner.scan(str(template_file))
 
         # High sensitivity should still complete
@@ -2041,7 +2041,7 @@ class TestJinja2TemplateScannerConfiguration:
         template_file = tmp_path / "test.jinja"
         template_file.write_text("{% for item in items %}{{ item }}{% endfor %}")
 
-        scanner = Jinja2TemplateScanner(config={"sensitivity_level": "low"})
+        scanner = Jinja2TemplateScanner(config={"sensitivity_level": "low", "enable_sandbox_test": False})
         result = scanner.scan(str(template_file))
 
         # Low sensitivity should still complete

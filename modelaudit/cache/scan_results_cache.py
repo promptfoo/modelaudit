@@ -835,8 +835,20 @@ class ScanResultsCache:
 
     @staticmethod
     def _ancestor_identity_matches(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
+        def exact_match_required(ancestor_path: str) -> bool:
+            try:
+                ancestor = os.path.realpath(ancestor_path)
+                temp_root = os.path.realpath(tempfile.gettempdir())
+                common_path = os.path.commonpath([ancestor, temp_root])
+            except (OSError, ValueError):
+                return True
+            return ancestor != temp_root and common_path != ancestor
+
         return len(expected) == len(current) and all(
-            expected_entry == current_entry for expected_entry, current_entry in zip(expected, current, strict=True)
+            expected_entry == current_entry
+            if exact_match_required(expected_entry[0])
+            else expected_entry[:4] == current_entry[:4]
+            for expected_entry, current_entry in zip(expected, current, strict=True)
         )
 
     @staticmethod
