@@ -4223,6 +4223,39 @@ class TestCVE202523304HydraTarget:
             "shutil.disk_usage",
             "shutil.make_archive",
             "shutil.unpack_archive",
+            "tarfile.TarFile.extract",
+            "tarfile.TarFile.extractall",
+            "zipfile.ZipFile.extract",
+            "zipfile.ZipFile.extractall",
+            "torch.save",
+            "torch.serialization.save",
+            "transformers.pipeline",
+            "transformers.AutoModel.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
+            "socket.socket",
+            "socket.SocketType",
+            "socket.socketpair",
+            "_socket.socket",
+            "_socket.SocketType",
+            "_socket.socketpair",
+            "os.pipe",
+            "posix.pipe",
+            "nt.pipe",
+            "os.pipe2",
+            "posix.pipe2",
+            "nt.pipe2",
+            "os.close",
+            "posix.close",
+            "nt.close",
+            "os.closerange",
+            "posix.closerange",
+            "nt.closerange",
+            "os.dup",
+            "posix.dup",
+            "nt.dup",
+            "os.dup2",
+            "posix.dup2",
+            "nt.dup2",
             "logging.config.dictConfig",
             "logging.config.fileConfig",
             "site.addpackage",
@@ -4284,6 +4317,21 @@ class TestCVE202523304HydraTarget:
     )
     def test_non_io_omegaconf_targets_remain_safe(self, tmp_path: Path, target: str) -> None:
         """Exact OmegaConf I/O overrides must not invalidate the broader safe namespace."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    def test_transformers_factory_without_loading_remains_safe(self, tmp_path: Path) -> None:
+        """The from_pretrained override must not invalidate safe Transformers factories."""
+        target = "transformers.AutoModel"
         path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
 
         result = NemoScanner().scan(str(path))
@@ -4805,6 +4853,14 @@ class TestCVE202523304HydraTarget:
             "site.addsitedir",
             "logging.FileHandler",
             "linecache.getline",
+            "torch.save",
+            "tarfile.TarFile.extractall",
+            "os.close",
+            "sys.modules.clear",
+            "transformers.pipeline",
+            "transformers.AutoModel.from_pretrained",
+            "socket.socket",
+            "os.pipe",
         ],
     )
     def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
@@ -4935,6 +4991,14 @@ class TestCVE202523304HydraTarget:
             "sys.path.__delitem__",
             "sys.path.__iadd__",
             "sys.path.__imul__",
+            "sys.modules.clear",
+            "sys.modules.pop",
+            "sys.modules.popitem",
+            "sys.modules.setdefault",
+            "sys.modules.update",
+            "sys.modules.__setitem__",
+            "sys.modules.__delitem__",
+            "sys.modules.__ior__",
             "resource.setrlimit",
             "resource.prlimit",
             "os.add_dll_directory",
@@ -4995,6 +5059,13 @@ class TestCVE202523304HydraTarget:
             "custom.os.environ.update_factory.SafeBuilder",
             "custom.os.environb.clear_factory.SafeBuilder",
             "custom.sys.path.append_factory.SafeBuilder",
+            "custom.sys.modules.clear_factory.SafeBuilder",
+            "custom.os.close_factory.SafeBuilder",
+            "custom.torch.save_factory.SafeBuilder",
+            "custom.tarfile.TarFile.extractall_factory.SafeBuilder",
+            "custom.transformers.pipeline_factory.SafeBuilder",
+            "custom.socket.socket_factory.SafeBuilder",
+            "custom.os.pipe_factory.SafeBuilder",
             "custom.resource.setrlimit_factory.SafeBuilder",
             "custom.os.add_dll_directory_factory.SafeBuilder",
             "custom.multiprocessing.PoolFactory.SafeBuilder",
