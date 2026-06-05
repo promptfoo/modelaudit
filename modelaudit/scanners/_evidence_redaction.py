@@ -101,7 +101,7 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     rf"{AUTHORIZATION_ALIAS_ASSIGNMENT_KEY})(?:s|[0-9]+)?"
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = (
-    rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|auth|basic[_-]?auth|authorization|cookie|set[_-]?cookie|"
+    rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|auth|basic[_-]?auth|authorization|cookies?|set[_-]?cookie|"
     rf"session[_-]?id|sessionid)"
 )
 SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY: Final[str] = (
@@ -354,7 +354,8 @@ ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 TOKEN_ONLY_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(?:auth|basic[_-]?auth)(?:\s*:\s*{PYTHON_ANNOTATION_PATTERN})?\s*$",
+    rf"\b(?:auth|basic[_-]?auth|cookies?|set[_-]?cookie|session[_-]?id|sessionid)"
+    rf"(?:\s*:\s*{PYTHON_ANNOTATION_PATTERN})?\s*$",
     re.IGNORECASE,
 )
 
@@ -1707,6 +1708,21 @@ def _ast_node_references_sensitive_value(text: str, node: ast.AST) -> bool:
     )
 
 
+def _ast_assignment_target_is_sensitive(text: str, node: ast.AST) -> bool:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return any(_ast_assignment_target_is_sensitive(text, child) for child in node.elts)
+    return _ast_node_references_sensitive_value(text, node)
+
+
+def _string_annotation_looks_sensitive(node: ast.AST) -> bool:
+    value = _static_text_literal_value(node) if isinstance(node, ast.expr) else None
+    if value is None:
+        return False
+    return any(character.isdigit() for character in value) or (
+        len(value) >= 12 and any(character.isalpha() for character in value) and value.upper() == value
+    )
+
+
 def _append_sensitive_ast_value_replacement(
     text: str,
     offsets: list[int],
@@ -1773,6 +1789,23 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
     if tree is not None:
         for node in ast.walk(tree):
             value_node: ast.expr | None = None
+            assignment_targets: list[ast.expr] = []
+            assignment_value: ast.expr | None = None
+            if isinstance(node, ast.Assign):
+                assignment_targets = node.targets
+                assignment_value = node.value
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                assignment_targets = [node.target]
+                assignment_value = node.value
+
+            if assignment_targets and any(
+                _ast_assignment_target_is_sensitive(text, target) for target in assignment_targets
+            ):
+                if isinstance(node, ast.AnnAssign) and _string_annotation_looks_sensitive(node.annotation):
+                    _append_ast_literal_replacements(text, offsets, node.annotation, replacements)
+                if assignment_value is not None and _ast_contains_dangerous_call(assignment_value):
+                    _append_ast_literal_replacements(text, offsets, assignment_value, replacements)
+
             if isinstance(node, ast.Call):
                 call_name = (
                     node.func.attr.lower()
@@ -2272,9 +2305,7 @@ def _redact_python_expression_assignments(text: str) -> str:
             is_lambda_default=is_lambda_default,
         )
         value_start = _position_offset(offsets, tokens[value_index].start, text_length)
-        preserves_executable_value = _tokens_contain_dangerous_call(significant) and (
-            stripped_target.lower() in {"auth", "basic_auth", "cookie", "cookies"} or literal_target_is_sensitive
-        )
+        preserves_executable_value = _tokens_contain_dangerous_call(significant)
         if preserves_executable_value:
             continue
         is_simple_value = _is_simple_sensitive_assignment_tokens(significant) or (
@@ -2287,7 +2318,7 @@ def _redact_python_expression_assignments(text: str) -> str:
             and significant[0].type == tokenize.OP
             and significant[0].string in {"(", "[", "{"}
         )
-        if generic_detail_container_value:
+        if generic_detail_container_value and REDACTED_EVIDENCE_VALUE in text[value_start:value_end]:
             continue
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
         requires_token_redaction = (
@@ -2540,6 +2571,15 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
     def redact_scalar_assignment(match: re.Match[str]) -> str:
         if parseable_python_evidence and ":" in match.group("prefix") and "=" not in match.group("prefix"):
             return match.group(0)
+        if parseable_python_evidence:
+            value_start = match.start() + len(match.group("prefix"))
+            value_end, _continued = _unparseable_assignment_value_end(match.string, value_start)
+            try:
+                value_tokens = list(tokenize.generate_tokens(io.StringIO(match.string[value_start:value_end]).readline))
+            except (IndentationError, tokenize.TokenError):
+                value_tokens = []
+            if _tokens_contain_dangerous_call(value_tokens):
+                return match.group(0)
         return _redact_scalar_unquoted_assignment(match)
 
     redacted = QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_quoted_assignment, redacted)

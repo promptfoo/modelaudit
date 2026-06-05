@@ -799,7 +799,7 @@ class TestKerasZipScanner:
             findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
 
         assert len(findings) == 1
-        assert findings[0]["segments"][0]["filename"] == "long_externa"
+        assert findings[0]["segments"][0]["filename"] == "long_exte..."
         assert findings[0]["segments"][0]["filename_truncated"] is True
 
     @pytest.mark.parametrize(

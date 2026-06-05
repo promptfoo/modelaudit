@@ -2156,3 +2156,53 @@ def test_redacts_triple_quoted_and_escaped_quote_secret_assignments() -> None:
     assert "TAILSECRET456" not in redacted
     assert 'TOKEN = """<redacted>"""' in redacted
     assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in redacted
+
+
+def test_redacts_detail_sensitive_container_assignments() -> None:
+    text = 'credentials = ["CONTAINERSECRET1234567890"]; credentials_map = {"value": "visible"}; eval("1")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "CONTAINERSECRET1234567890" not in redacted
+    assert "credentials = <redacted>" in redacted
+    assert 'credentials_map = {"value": "visible"}' in redacted
+    assert 'eval("1")' in redacted
+
+
+def test_redacts_sensitive_string_annotations() -> None:
+    text = 'api_key: "ANNOTATIONSECRET1234567890"\napi_key_count: "visible"\neval("1")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ANNOTATIONSECRET1234567890" not in redacted
+    assert 'api_key: "<redacted>"' in redacted
+    assert 'api_key_count: "visible"' in redacted
+    assert 'eval("1")' in redacted
+
+
+def test_sensitive_assignments_preserve_dangerous_rhs_calls() -> None:
+    text = 'client_secret = eval("RHSSECRET1234567890")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "RHSSECRET1234567890" not in redacted
+    assert redacted == 'client_secret = eval("<redacted>")'
+
+
+def test_redacts_simple_cookie_and_session_assignments() -> None:
+    text = (
+        'cookie = "COOKIESECRET1234567890"; cookies = "COOKIESSECRET1234567890"; '
+        'session_id = "SESSIONSECRET1234567890"; cookie_count = 1; session_timeout = 30; eval("1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COOKIESECRET1234567890" not in redacted
+    assert "COOKIESSECRET1234567890" not in redacted
+    assert "SESSIONSECRET1234567890" not in redacted
+    assert "cookie = <redacted>" in redacted
+    assert "cookies = <redacted>" in redacted
+    assert "session_id = <redacted>" in redacted
+    assert "cookie_count = 1" in redacted
+    assert "session_timeout = 30" in redacted
+    assert 'eval("1")' in redacted
