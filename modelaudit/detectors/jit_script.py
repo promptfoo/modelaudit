@@ -529,7 +529,8 @@ def _priority_import_offsets(
             if multiline_quote is None:
                 prefix = bounded[line_start:offset].rstrip(b" \t\r")
                 structural_prefix = _python_structural_line_bytes(prefix).rstrip()
-                source_like_prefix = not prefix or not 0x20 <= prefix[-1] < 0x7F or structural_prefix.endswith(b";")
+                binary_prefix = bool(prefix) and structural_prefix == prefix and not 0x20 <= prefix[-1] < 0x7F
+                source_like_prefix = not prefix or binary_prefix or structural_prefix.endswith(b";")
                 if not source_like_prefix or (allowed_offsets is not None and offset not in allowed_offsets):
                     match = next(matches, None)
                     continue
@@ -10472,6 +10473,48 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
     return False
 
 
+def _compact_snippet_shadowed_print_statement_ids(statements: Sequence[ast.stmt]) -> set[int]:
+    """Return statements at or after the first deterministic module-scope print mutation."""
+    if not statements:
+        return set()
+    tree = ast.Module(body=list(statements), type_ignores=[])
+    source = ast.unparse(tree)
+    if not _compact_snippet_has_shadowed_print(source, tree):
+        return set()
+
+    def directly_shadows_print(statement: ast.stmt) -> bool:
+        statement_tree = ast.Module(body=[statement], type_ignores=[])
+        parents, executed_statement_ids = _compact_module_scope_context(statement_tree)
+        for node in ast.walk(statement):
+            if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
+                return True
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
+                return True
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in node.names
+            ):
+                return True
+        return False
+
+    direct_shadow_indexes = [index for index, statement in enumerate(statements) if directly_shadows_print(statement)]
+    if not direct_shadow_indexes:
+        return {id(statement) for statement in statements}
+
+    direct_shadow_index_set = set(direct_shadow_indexes)
+    non_direct_statements = [
+        statement for index, statement in enumerate(statements) if index not in direct_shadow_index_set
+    ]
+    if non_direct_statements:
+        non_direct_tree = ast.Module(body=non_direct_statements, type_ignores=[])
+        if _compact_snippet_has_shadowed_print(ast.unparse(non_direct_tree), non_direct_tree):
+            return {id(statement) for statement in statements}
+
+    first_shadow_index = direct_shadow_indexes[0]
+    return {id(statement) for statement in statements[first_shadow_index:]}
+
+
 def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
     if not isinstance(tree, ast.Module):
         return {"setattr", "builtins.setattr", "__builtins__.setattr"}
@@ -10862,8 +10905,6 @@ def _compact_snippet_runpy_print_overwrite_calls(
         tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    if _compact_snippet_has_shadowed_print(code_str, tree):
-        return set()
     shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
     runpy_aliases = set(inherited_runpy_aliases)
     runpy_alias_ids = dict.fromkeys(inherited_runpy_aliases, 0)
@@ -10879,6 +10920,8 @@ def _compact_snippet_runpy_print_overwrite_calls(
     sys_modules_aliases: set[str] = set()
     sys_modules_pop_aliases: set[str] = set()
     sys_modules_clear_aliases: set[str] = set()
+    class_mutated_module_ids: set[int] = set()
+    current_print_is_shadowed = False
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
 
     def clear_reload_target(target: ast.AST) -> None:
@@ -11012,13 +11055,26 @@ def _compact_snippet_runpy_print_overwrite_calls(
             return
         member_key = (module_id, member_name)
         if isinstance(value, ast.Name) and value.id == "print":
-            if not conditional:
+            if not conditional and not current_print_is_shadowed and module_id not in class_mutated_module_ids:
                 safe_members.add(member_key)
         else:
             safe_members.discard(member_key)
 
     def invalidate_module(module_id: int) -> None:
         safe_members.difference_update({member for member in safe_members if member[0] == module_id})
+
+    def record_module_attribute_value(
+        module_id: int,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if member_name == "__class__":
+            class_mutated_module_ids.add(module_id)
+            invalidate_module(module_id)
+            return
+        record_member_value(module_id, member_name, value, conditional=conditional)
 
     def record_update(module_id: int, call: ast.Call, *, conditional: bool) -> None:
         def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
@@ -11084,11 +11140,14 @@ def _compact_snippet_runpy_print_overwrite_calls(
             and isinstance(target.value, ast.Name)
             and (module_id := runpy_alias_ids.get(target.value.id)) is not None
         ):
-            record_member_value(module_id, target.attr, value)
+            record_module_attribute_value(module_id, target.attr, value)
         elif isinstance(target, ast.Subscript) and (module_id := runpy_mapping_id(target.value)) is not None:
             record_member_value(module_id, _runpy_static_member_key(target.slice), value)
 
-    for statement in _deterministically_executed_statements(tree.body):
+    executed_statements = _deterministically_executed_statements(tree.body)
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    for statement in executed_statements:
+        current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
         runpy_alias_ids_before = dict(runpy_alias_ids)
         mapping_aliases_before = dict(mapping_aliases)
         reload_aliases_before = frozenset(reload_aliases)
@@ -11253,7 +11312,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                     and isinstance(node.args[0], ast.Name)
                     and (module_id := active_runpy_alias_ids.get(node.args[0].id)) is not None
                 ):
-                    record_member_value(
+                    record_module_attribute_value(
                         module_id,
                         _runpy_static_member_key(node.args[1]),
                         node.args[2],
@@ -11316,7 +11375,12 @@ def _compact_snippet_runpy_print_overwrite_calls(
                         )
                         continue
                     if node.func.attr == "__setitem__" and len(node.args) >= 2:
-                        record_member_value(module_id, _runpy_static_member_key(node.args[0]), node.args[1])
+                        record_member_value(
+                            module_id,
+                            _runpy_static_member_key(node.args[0]),
+                            node.args[1],
+                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                        )
                         continue
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -11366,7 +11430,9 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
     dangerous_members: set[str] = set()
     high_risk_calls: set[tuple[str, str]] = set()
     parents, executed_statement_ids = _compact_module_scope_context(tree)
-    for statement in _compact_deterministically_executed_statements(tree.body):
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    for statement in executed_statements:
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
         if isinstance(statement, ast.Assign):
@@ -11379,7 +11445,7 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                     and isinstance(statement.value, ast.Name)
                     and statement.value.id == "print"
                 ):
-                    if print_is_shadowed:
+                    if id(statement) in shadowed_print_statement_ids:
                         dangerous_members.add(target.attr)
                     else:
                         dangerous_members.discard(target.attr)
@@ -11395,7 +11461,7 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                     and isinstance(call.args[2], ast.Name)
                     and call.args[2].id == "print"
                 ):
-                    if print_is_shadowed or reference in shadowed_setattr_references:
+                    if id(statement) in shadowed_print_statement_ids or reference in shadowed_setattr_references:
                         dangerous_members.add(member_name)
                     else:
                         dangerous_members.discard(member_name)
@@ -11863,8 +11929,6 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    if _compact_snippet_has_shadowed_print(code_str, tree):
-        return set()
     typed_aliases: dict[str, tuple[str, int]] = {}
     cached_typed_identities: dict[str, tuple[str, int]] = {
         "webbrowser": ("webbrowser", 0),
@@ -11898,6 +11962,8 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
     sys_modules_aliases: set[str] = set()
     sys_modules_pop_aliases: set[str] = set()
     sys_modules_clear_aliases: set[str] = set()
+    class_mutated_owners: set[tuple[str, int]] = set()
+    current_print_is_shadowed = False
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
     local_vars_shadowed = False
@@ -12122,7 +12188,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             return
         member_key = (owner, member_name)
         if isinstance(value, ast.Name) and value.id == "print":
-            if not conditional:
+            if not conditional and not current_print_is_shadowed and owner not in class_mutated_owners:
                 safe_members.add(member_key)
         elif (
             isinstance(value, ast.Attribute)
@@ -12133,6 +12199,19 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             return
         else:
             safe_members.discard(member_key)
+
+    def record_attribute(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if owner is not None and member_name == "__class__":
+            class_mutated_owners.add(owner)
+            safe_members.difference_update({member for member in safe_members if member[0] == owner})
+            return
+        record_member(owner, member_name, value, conditional=conditional)
 
     def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
         def invalidate_owner() -> None:
@@ -12352,7 +12431,9 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
             elif isinstance(node, ast.NamedExpr):
                 invalidate_target(node.target)
 
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
     for statement in executed_statements:
+        current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
         typed_aliases_before = dict(typed_aliases)
         mapping_aliases_before = dict(mapping_aliases)
         reload_aliases_before = frozenset(reload_aliases)
@@ -12417,7 +12498,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     and isinstance(target.value, ast.Name)
                     and target.value.id in typed_aliases
                 ):
-                    record_member(typed_aliases[target.value.id], target.attr, statement.value)
+                    record_attribute(typed_aliases[target.value.id], target.attr, statement.value)
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
                     if active_vars_reference(value_reference):
@@ -12462,7 +12543,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                 and isinstance(statement.target.value, ast.Name)
                 and statement.target.value.id in typed_aliases
             ):
-                record_member(typed_aliases[statement.target.value.id], statement.target.attr, statement.value)
+                record_attribute(typed_aliases[statement.target.value.id], statement.target.attr, statement.value)
             if isinstance(statement.target, ast.Name):
                 bind_builtins_mapping_alias(statement.target.id, statement.value)
             bind_module_helper_target(
@@ -12679,10 +12760,11 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     and isinstance(node.args[0], ast.Name)
                     and node.args[0].id in active_typed_aliases
                 ):
-                    record_member(
+                    record_attribute(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
                     )
                     continue
                 if (
@@ -12697,7 +12779,11 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     )
                     is not None
                 ):
-                    record_update(update_owner, node)
+                    record_update(
+                        update_owner,
+                        node,
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
                     if (
@@ -12707,7 +12793,12 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                             active_typed_aliases,
                         )
                     ) is not None:
-                        record_member(setitem_owner, _static_getattr_member_name(node.args[1]), node.args[2])
+                        record_member(
+                            setitem_owner,
+                            _static_getattr_member_name(node.args[1]),
+                            node.args[2],
+                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                        )
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -12740,7 +12831,12 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     is not None
                     and len(node.args) >= 2
                 ):
-                    record_member(setitem_owner, _static_getattr_member_name(node.args[0]), node.args[1])
+                    record_member(
+                        setitem_owner,
+                        _static_getattr_member_name(node.args[0]),
+                        node.args[1],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
     return {
         high_risk_call
         for owner, member_name in safe_members
