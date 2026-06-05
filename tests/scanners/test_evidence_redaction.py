@@ -2333,10 +2333,33 @@ def test_redacts_positional_sensitive_label_value_calls() -> None:
     assert 'eval("1")' in redacted
 
 
+def test_redacts_percent_formatted_sensitive_values() -> None:
+    """Alternative positional formatting must not bypass sensitive-label redaction."""
+    percent_secret = "PERCENTSECRET1234567890"
+    call_secret = "PERCENTCALLSECRET1234567890"
+    text = (
+        f'logger.info("api_key=%s" % "{percent_secret}"); '
+        f'logger.info("client_secret=%s" % eval("{call_secret}")); '
+        'logger.info("api_key_count=%s" % "VISIBLE"); '
+        'logger.info("tokenizer=%s" % "bert"); eval("1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert percent_secret not in redacted
+    assert call_secret not in redacted
+    assert 'eval("<redacted>")' in redacted
+    assert 'logger.info("api_key_count=%s" % "VISIBLE")' in redacted
+    assert 'logger.info("tokenizer=%s" % "bert")' in redacted
+    assert 'eval("1")' in redacted
+
+
 def test_preserves_parenthesized_parseable_python_evidence() -> None:
     """Parenthesized expressions should retain the dangerous call that explains a finding."""
     direct = redact_evidence_string('(eval("1"))', max_chars=None)
     lambda_hook = redact_evidence_string("(lambda x: eval(x))", max_chars=None)
+    sensitive_tuple = redact_evidence_string('("Authorization", eval("SECRET1234567890"))', max_chars=None)
 
     assert 'eval("1")' in direct
     assert "lambda x: eval(x)" in lambda_hook
+    assert 'eval("<redacted>")' in sensitive_tuple

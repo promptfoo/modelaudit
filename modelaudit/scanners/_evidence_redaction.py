@@ -1867,6 +1867,19 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
                 if replacement is not None:
                     _append_ast_node_replacement(text, offsets, node, replacements, replacement)
                 continue
+            if (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Mod)
+                and _static_text_contains_sensitive_label(node.left)
+            ):
+                _append_sensitive_ast_value_replacement(
+                    text,
+                    offsets,
+                    node.right,
+                    replacements,
+                    preserve_executable_calls=True,
+                )
+                continue
             value_node: ast.expr | None = None
             assignment_targets: list[ast.expr] = []
             assignment_value: ast.expr | None = None
@@ -1981,7 +1994,16 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
                 continue
             if value_node.end_lineno is None or value_node.end_col_offset is None:
                 continue
-            _append_ast_node_replacement(text, offsets, value_node, replacements)
+            if _ast_contains_dangerous_call(value_node):
+                _append_sensitive_ast_value_replacement(
+                    text,
+                    offsets,
+                    value_node,
+                    replacements,
+                    preserve_executable_calls=True,
+                )
+            else:
+                _append_ast_node_replacement(text, offsets, value_node, replacements)
     else:
         token_input = text.replace("\x00", " ")
         try:
