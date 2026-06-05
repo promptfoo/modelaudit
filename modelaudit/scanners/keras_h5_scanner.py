@@ -98,6 +98,10 @@ class KerasH5Scanner(BaseScanner):
         "tensorflow": frozenset({"abs", "identity", "sigmoid", "tanh"}),
         "tensorflow.math": frozenset({"abs", "sigmoid", "tanh"}),
         "tensorflow.nn": _SAFE_TF_NN_LAMBDA_FUNCTIONS,
+        "tensorflow.python.keras.activations": frozenset(
+            {"elu", "gelu", "hard_sigmoid", "relu", "selu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
+        ),
+        "tensorflow.python.keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
         "tf_keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
     }
     _DANGEROUS_LAMBDA_MODULE_TOKENS: ClassVar[frozenset[str]] = frozenset(
@@ -1414,6 +1418,8 @@ class KerasH5Scanner(BaseScanner):
 
     @staticmethod
     def _safe_lambda_number(node: ast.AST, *, allow_zero: bool = True) -> bool:
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return KerasH5Scanner._safe_lambda_number(node.operand, allow_zero=allow_zero)
         if (
             not isinstance(node, ast.Constant)
             or isinstance(node.value, bool)
