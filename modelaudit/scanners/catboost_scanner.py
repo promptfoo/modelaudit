@@ -50,7 +50,8 @@ _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{20,}={0,2})(?![A-Za-z0-9+/_=-])")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
-    r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
+    r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
+    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-]))"
 )
 _MAX_ENCODED_EVIDENCE_CHARS = 8192
 

