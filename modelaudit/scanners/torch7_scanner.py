@@ -15,17 +15,20 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 TORCH7_SIGNATURE_READ_BYTES = 4096
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 5000
+PRINTABLE_TEXT_OVERLAP_CHARS = 64
 MIN_TORCH7_SIZE = 8
 CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
-EXEC_PRIMITIVE_NAME_PATTERN = r"(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)"
-EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)\b{EXEC_PRIMITIVE_NAME_PATTERN}\s*\(")
-EXECUTION_WRAPPER_PREFIX_PATTERN = r"(?:\(\s*)*(?:[a-z_][\w.]*\s*\(\s*(?:\(\s*)*){0,4}"
+EXEC_PRIMITIVE_NAME_PATTERN = (
+    r"(?:os\s*(?:\.\s*execute|\[\s*['\"]execute['\"]\s*\])|"
+    r"io\s*(?:\.\s*popen|\[\s*['\"]popen['\"]\s*\])|"
+    r"loadstring|dofile|loadfile|setfenv|getfenv)"
+)
+EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)(?:\(\s*)*\b{EXEC_PRIMITIVE_NAME_PATTERN}\s*(?:\)\s*)*\(")
 EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
-    rf"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*\s*=\s*)"
-    rf"(?={EXECUTION_WRAPPER_PREFIX_PATTERN}{EXEC_PRIMITIVE_NAME_PATTERN}\s*\()"
+    r"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*(?:\s*\[[^\]\n]{1,120}\])*\s*=\s*)"
 )
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
@@ -214,6 +217,7 @@ class Torch7Scanner(BaseScanner):
             payload,
             PRINTABLE_TEXT_PATTERN,
             self.max_extracted_strings,
+            overlap_chars=PRINTABLE_TEXT_OVERLAP_CHARS,
         )
 
     @staticmethod
@@ -221,7 +225,10 @@ class Torch7Scanner(BaseScanner):
         protected_targets: list[str] = []
 
         def protect_execution_target(match: re.Match[str]) -> str:
-            protected_targets.append(match.group("target"))
+            statement_end = Torch7Scanner._statement_end(text, match.end())
+            if EXEC_PRIMITIVE_CALL_PATTERN.search(text, match.end(), statement_end) is None:
+                return match.group(0)
+            protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
             return f"\x00{len(protected_targets) - 1}\x00"
 
         protected = EXECUTION_ASSIGNMENT_TARGET_PATTERN.sub(protect_execution_target, text)
@@ -233,6 +240,31 @@ class Torch7Scanner(BaseScanner):
         if max_chars <= 3:
             return redacted[:max_chars]
         return f"{redacted[: max_chars - 3]}..."
+
+    @staticmethod
+    def _statement_end(text: str, start: int) -> int:
+        quote: str | None = None
+        escaped = False
+        depth = 0
+        for index in range(start, len(text)):
+            character = text[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+            elif character in "([{":
+                depth += 1
+            elif character in ")]}" and depth > 0:
+                depth -= 1
+            elif character in ";\r\n" and depth == 0:
+                return index
+        return len(text)
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []

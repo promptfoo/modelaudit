@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- redact credential-shaped values from Torch7 evidence examples
+- redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
