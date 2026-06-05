@@ -65,6 +65,7 @@ _SAFE_TARGET_PREFIXES = (
 # Exact safe _target_ values for utility namespaces that also contain unsafe
 # callables. Keep this list narrow instead of trusting whole namespaces.
 _SAFE_TARGETS = {
+    "transformers.utils.hub.PushToHubMixin.save_pretrained",
     "torch.utils.data.BatchSampler",
     "torch.utils.data.ConcatDataset",
     "torch.utils.data.DataLoader",
@@ -163,7 +164,21 @@ _DANGEROUS_TARGETS = {
     "builtins.eval",
     "builtins.exec",
     "builtins.__import__",
+    "hydra.compose",
+    "hydra.compose.compose",
+    "hydra.initialize",
+    "hydra.initialize.initialize",
+    "hydra.initialize.initialize_config_dir",
+    "hydra.initialize.initialize_config_module",
+    "hydra.initialize_config_dir",
+    "hydra.initialize_config_module",
     "importlib.import_module",
+    "hydra._internal.utils._locate",
+    "hydra.utils._locate",
+    "hydra.utils.get_class",
+    "hydra.utils.get_method",
+    "hydra.utils.get_object",
+    "hydra.utils.get_static_method",
     "importlib.machinery.SourceFileLoader.load_module",
     "importlib.machinery.SourceFileLoader.exec_module",
     "importlib.machinery.SourcelessFileLoader.load_module",
@@ -204,8 +219,18 @@ _DANGEROUS_TARGETS = {
     "logging.handlers.WatchedFileHandler",
     "omegaconf.OmegaConf.load",
     "omegaconf.OmegaConf.save",
+    "omegaconf.OmegaConf.clear_resolver",
+    "omegaconf.OmegaConf.clear_resolvers",
+    "omegaconf.OmegaConf.legacy_register_resolver",
+    "omegaconf.OmegaConf.register_new_resolver",
+    "omegaconf.OmegaConf.register_resolver",
     "omegaconf.omegaconf.OmegaConf.load",
     "omegaconf.omegaconf.OmegaConf.save",
+    "omegaconf.omegaconf.OmegaConf.clear_resolver",
+    "omegaconf.omegaconf.OmegaConf.clear_resolvers",
+    "omegaconf.omegaconf.OmegaConf.legacy_register_resolver",
+    "omegaconf.omegaconf.OmegaConf.register_new_resolver",
+    "omegaconf.omegaconf.OmegaConf.register_resolver",
     "tokenize.open",
     "bz2.BZ2File",
     "bz2.open",
@@ -265,6 +290,30 @@ _DANGEROUS_TARGETS = {
     "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
     "transformers.pipeline",
+    "transformers.dynamic_module_utils._compute_local_source_files_hash",
+    "transformers.dynamic_module_utils.check_imports",
+    "transformers.dynamic_module_utils.create_dynamic_module",
+    "transformers.dynamic_module_utils.custom_object_save",
+    "transformers.dynamic_module_utils.get_cached_module_file",
+    "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+    "transformers.dynamic_module_utils.get_class_in_module",
+    "transformers.dynamic_module_utils.get_imports",
+    "transformers.dynamic_module_utils.get_relative_import_files",
+    "transformers.dynamic_module_utils.get_relative_imports",
+    "transformers.dynamic_module_utils.init_hf_modules",
+    "transformers.utils.cached_file",
+    "transformers.utils.hub.PushToHubMixin._upload_modified_files",
+    "transformers.utils.hub.cached_file",
+    "transformers.utils.hub.cached_files",
+    "transformers.utils.hub.create_and_tag_model_card",
+    "transformers.utils.hub.get_checkpoint_shard_files",
+    "transformers.utils.hub.has_file",
+    "transformers.utils.hub.list_repo_templates",
+    "transformers.utils.import_utils._LazyModule._get_module",
+    "transformers.utils.import_utils.clear_import_cache",
+    "transformers.utils.import_utils.create_import_structure_from_path",
+    "transformers.utils.import_utils.define_import_structure",
+    "transformers.utils.import_utils.direct_transformers_import",
     "tensorflow.load_op_library",
     "numpy.fromfile",
     "numpy.fromregex",
@@ -987,6 +1036,8 @@ _DANGEROUS_TARGET_PREFIXES = (
     "ctypes.pydll.",
     "ctypes.windll.",
 )
+_DANGEROUS_NUMPY_TARGET_SUFFIXES = (".dump", ".tofile")
+_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES = (".from_pretrained", ".push_to_hub", ".save_pretrained")
 
 # Patterns in _target_ that are suspicious even if not exact matches
 _SUSPICIOUS_TARGET_PATTERNS = (
@@ -3123,7 +3174,12 @@ class NemoScanner(BaseScanner):
         if (
             target in _DANGEROUS_TARGETS
             or target.startswith(_DANGEROUS_TARGET_PREFIXES)
-            or (target.startswith("transformers.") and target.endswith(".from_pretrained"))
+            or (target.startswith("numpy.") and target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
+            or (
+                target not in _SAFE_TARGETS
+                and target.startswith("transformers.")
+                and target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
+            )
         ):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",

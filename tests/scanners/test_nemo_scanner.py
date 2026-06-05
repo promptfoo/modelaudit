@@ -4347,6 +4347,132 @@ class TestCVE202523304HydraTarget:
     @pytest.mark.parametrize(
         "target",
         [
+            "hydra.compose",
+            "hydra.compose.compose",
+            "hydra.initialize",
+            "hydra.initialize.initialize",
+            "hydra.initialize.initialize_config_dir",
+            "hydra.initialize.initialize_config_module",
+            "hydra.initialize_config_dir",
+            "hydra.initialize_config_module",
+            "hydra._internal.utils._locate",
+            "hydra.utils._locate",
+            "hydra.utils.get_class",
+            "hydra.utils.get_method",
+            "hydra.utils.get_object",
+            "hydra.utils.get_static_method",
+            "omegaconf.OmegaConf.clear_resolver",
+            "omegaconf.OmegaConf.clear_resolvers",
+            "omegaconf.OmegaConf.legacy_register_resolver",
+            "omegaconf.OmegaConf.register_new_resolver",
+            "omegaconf.OmegaConf.register_resolver",
+            "omegaconf.omegaconf.OmegaConf.clear_resolver",
+            "omegaconf.omegaconf.OmegaConf.clear_resolvers",
+            "omegaconf.omegaconf.OmegaConf.legacy_register_resolver",
+            "omegaconf.omegaconf.OmegaConf.register_new_resolver",
+            "omegaconf.omegaconf.OmegaConf.register_resolver",
+            "transformers.dynamic_module_utils._compute_local_source_files_hash",
+            "transformers.dynamic_module_utils.check_imports",
+            "transformers.dynamic_module_utils.create_dynamic_module",
+            "transformers.dynamic_module_utils.custom_object_save",
+            "transformers.dynamic_module_utils.get_cached_module_file",
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.dynamic_module_utils.get_class_in_module",
+            "transformers.dynamic_module_utils.get_imports",
+            "transformers.dynamic_module_utils.get_relative_import_files",
+            "transformers.dynamic_module_utils.get_relative_imports",
+            "transformers.dynamic_module_utils.init_hf_modules",
+            "transformers.utils.cached_file",
+            "transformers.utils.hub.PushToHubMixin._upload_modified_files",
+            "transformers.utils.hub.cached_file",
+            "transformers.utils.hub.cached_files",
+            "transformers.utils.hub.create_and_tag_model_card",
+            "transformers.utils.hub.get_checkpoint_shard_files",
+            "transformers.utils.hub.has_file",
+            "transformers.utils.hub.list_repo_templates",
+            "transformers.utils.import_utils._LazyModule._get_module",
+            "transformers.utils.import_utils.clear_import_cache",
+            "transformers.utils.import_utils.create_import_structure_from_path",
+            "transformers.utils.import_utils.define_import_structure",
+            "transformers.utils.import_utils.direct_transformers_import",
+            "numpy.char.chararray.dump",
+            "numpy.char.chararray.tofile",
+            "numpy.ma.MaskedArray.dump",
+            "numpy.ma.MaskedArray.tofile",
+            "numpy.matrix.dump",
+            "numpy.matrix.tofile",
+            "numpy.recarray.dump",
+            "numpy.recarray.tofile",
+        ],
+    )
+    def test_safe_namespace_side_effect_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Broad trusted namespaces must not hide import, global-state, network, or file side effects."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "hydra.utils.get_original_cwd",
+            "hydra.utils.to_absolute_path",
+            "numpy.recarray.tobytes",
+            "omegaconf.OmegaConf.has_resolver",
+            "transformers.dynamic_module_utils.resolve_trust_remote_code",
+            "transformers.utils.hub.PushToHubMixin.save_pretrained",
+        ],
+    )
+    def test_safe_namespace_side_effect_near_matches_remain_safe(self, tmp_path: Path, target: str) -> None:
+        """Exact helpers and method suffixes must not promote similarly named safe-namespace callables."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "hydra.compose",
+            "hydra.utils.get_object",
+            "omegaconf.OmegaConf.register_new_resolver",
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.utils.hub.cached_file",
+            "transformers.utils.import_utils.direct_transformers_import",
+            "transformers.Trainer.push_to_hub",
+            "transformers.PreTrainedModel.save_pretrained",
+            "numpy.recarray.tofile",
+        ],
+    )
+    def test_safe_namespace_side_effect_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """Representative trusted-namespace side effects must retain security exit-code precedence."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        "target",
+        [
             "ftplib.FTP",
             "ftplib.FTP_TLS",
             "ftplib.FTP.connect",
