@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
-from .cache_policy import should_cache_scan_result
+from .cache_policy import cached_scan_result_dependencies_available, should_cache_scan_result
 from .scan_results_cache import ScanResultsCache
 
 logger = logging.getLogger(__name__)
@@ -52,11 +52,15 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        return self.cache.get_cached_result(
+        cached_result = self.cache.get_cached_result(
             file_path,
             version_context=version_context,
             include_private_metadata=include_private_metadata,
         )
+        if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
+            logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
+            return None
+        return cached_result
 
     def get_cached_result_with_stat(
         self,
@@ -79,12 +83,16 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        return self.cache.get_cached_result_with_stat(
+        cached_result = self.cache.get_cached_result_with_stat(
             file_path,
             stat_result,
             version_context=version_context,
             include_private_metadata=include_private_metadata,
         )
+        if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
+            logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
+            return None
+        return cached_result
 
     def store_result(
         self,

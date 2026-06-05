@@ -255,6 +255,27 @@ def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_finger
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_invalidates_legacy_pytorch_zip_metadata_without_fingerprints(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pt")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "pickle_source": str(file_path),
+            "container_type": "pytorch_zip",
+            "member_reports": [{"source": "model.pt:data.pkl", "status": "complete", "verdict": "clean"}],
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -334,6 +355,33 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     assert cached_result == expected_cached_result
     assert "_private_metadata" not in cached_result
     assert "call_graph_source_fingerprints" not in cached_result["metadata"]
+
+    source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_validates_private_fingerprints_without_public_metadata(tmp_path: Path) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_text("def entrypoint():\n    return 1\n")
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()},
+            }
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
 
@@ -946,6 +994,79 @@ def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypa
     cache_entry = json.loads(cache_file_path.read_text(encoding="utf-8"))
 
     assert cache_entry["file_info"]["hash"] == expected_hash
+
+
+def test_sampled_large_file_fingerprint_result_is_not_cached(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="sampled-large.cache")
+    file_path.write_bytes(b"x" * (16 * 1024 * 1024))
+    original_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    cache.key_generator.hasher.full_hash_threshold = 1024
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    sampled_fingerprint = cache.key_generator.hasher.hash_file(str(file_path))
+    assert sampled_fingerprint.startswith("fingerprint:")
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is False
+
+    with file_path.open("r+b") as f:
+        f.seek(6 * 1024 * 1024)
+        f.write(b"evil")
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert cache.key_generator.hasher.hash_file(str(file_path)) == sampled_fingerprint
+    assert cache.generate_cache_key(str(file_path), version_context=version_context) is None
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_legacy_sampled_large_file_cache_entry_is_rejected_by_key(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="legacy-sampled-large.cache")
+    file_path.write_bytes(b"x" * (16 * 1024 * 1024))
+    original_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    cache.key_generator.hasher.full_hash_threshold = 1024
+    sampled_fingerprint = cache.key_generator.hasher.hash_file(str(file_path))
+    cache_key = "legacy_sampled_cache_key"
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    cache_file_path.parent.mkdir(parents=True, exist_ok=True)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    cache_file_path.write_text(
+        json.dumps(
+            {
+                "cache_key": cache_key,
+                "file_info": {
+                    "hash": sampled_fingerprint,
+                    "size": original_stat.st_size,
+                    "mtime": original_stat.st_mtime,
+                    "mtime_ns": original_stat.st_mtime_ns,
+                },
+                "version_info": {},
+                "scan_result": expected,
+                "cache_metadata": {
+                    "scanned_at": time.time(),
+                    "last_access": time.time(),
+                    "access_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with file_path.open("r+b") as f:
+        f.seek(6 * 1024 * 1024)
+        f.write(b"evil")
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert cache.key_generator.hasher.hash_file(str(file_path)) == sampled_fingerprint
+    assert (
+        cache.get_cached_result_by_key(
+            cache_key,
+            file_path=str(file_path),
+            file_stat=file_path.stat(),
+        )
+        is None
+    )
+    assert not cache_file_path.exists()
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:

@@ -22,6 +22,11 @@ _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invoca
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
 
 
+def _is_sampled_fingerprint(value: object) -> bool:
+    """Return whether a stored hash represents sampled, incomplete file content."""
+    return isinstance(value, str) and value.startswith("fingerprint:")
+
+
 @dataclass
 class CacheEntry:
     """Data class for cache entries."""
@@ -201,6 +206,11 @@ class ScanResultsCache:
             # Load cache entry
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
+
+            if _is_sampled_fingerprint(cache_entry.get("file_info", {}).get("hash")):
+                cache_file_path.unlink()
+                self._record_cache_miss("invalid")
+                return None
 
             if file_path is not None and file_stat is not None:
                 is_valid = self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat)
@@ -397,11 +407,16 @@ class ScanResultsCache:
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
-            if file_stat is not None:
-                file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
-            else:
-                file_key = self.key_generator.generate_key(file_path)
-                content_hash = None
+            if file_stat is None:
+                file_stat = os.stat(file_path)
+
+            file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
+            if _is_sampled_fingerprint(content_hash):
+                logger.debug(
+                    "Skipping scan-result cache key for %s: sampled large-file fingerprints are not cacheable",
+                    file_path,
+                )
+                return None, None
 
             resolved_version_info = (
                 version_info if version_info is not None else self._get_version_info(version_context)
@@ -569,16 +584,14 @@ class ScanResultsCache:
 
     def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
         scan_result = cache_entry.get("scan_result")
-        if not isinstance(scan_result, dict):
-            return True
-        metadata = scan_result.get("metadata")
-        if not isinstance(metadata, dict):
-            return True
+        metadata = scan_result.get("metadata") if isinstance(scan_result, dict) else None
         cache_metadata = cache_entry.get("cache_metadata")
         fingerprint_metadata = (
             cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
         )
         if fingerprint_metadata is None:
+            if not isinstance(metadata, dict):
+                return True
             if _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY not in metadata:
                 return not self._legacy_pickle_call_graph_metadata_requires_fingerprints(metadata)
             fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
@@ -607,7 +620,9 @@ class ScanResultsCache:
 
     @staticmethod
     def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:
-        return bool(_PICKLE_RESULT_METADATA_KEYS.intersection(metadata)) and any(
+        if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
+            return False
+        return metadata.get("container_type") == "pytorch_zip" or any(
             key in metadata for key in _PICKLE_CALL_GRAPH_INPUT_KEYS
         )
 

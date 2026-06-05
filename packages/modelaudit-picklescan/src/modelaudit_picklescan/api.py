@@ -686,6 +686,28 @@ def _combine_pytorch_zip_reports(
         report.coverage.opcode_count for report in member_reports if report.coverage.opcode_count is not None
     ]
     private_metadata = _combine_call_graph_source_fingerprint_private_metadata(member_reports)
+    metadata: dict[str, Any] = {
+        "container_type": "pytorch_zip",
+        "archive_size_bytes": size,
+        "archive_entry_count": entry_count,
+        "pickle_files": [entry.filename for entry in pickle_entries],
+        "member_reports": [
+            {
+                "source": report.source,
+                "status": report.status.value,
+                "verdict": report.verdict.value,
+                "finding_count": len(report.findings),
+                "notice_count": len(report.notices),
+                "error_count": len(report.errors),
+                "bytes_scanned": report.coverage.bytes_scanned,
+                "opcode_count": report.coverage.opcode_count,
+            }
+            for report in member_reports
+        ],
+    }
+    for metadata_key in ("analysis_incomplete", "import_references_truncated", "callable_invocations_truncated"):
+        if any(report.metadata.get(metadata_key) is True for report in member_reports):
+            metadata[metadata_key] = True
     return PickleReport(
         source=source,
         status=status,
@@ -700,25 +722,7 @@ def _combine_pytorch_zip_reports(
             raw_scan_complete=status == ScanStatus.COMPLETE,
             opcode_scan_complete=status == ScanStatus.COMPLETE,
         ),
-        metadata={
-            "container_type": "pytorch_zip",
-            "archive_size_bytes": size,
-            "archive_entry_count": entry_count,
-            "pickle_files": [entry.filename for entry in pickle_entries],
-            "member_reports": [
-                {
-                    "source": report.source,
-                    "status": report.status.value,
-                    "verdict": report.verdict.value,
-                    "finding_count": len(report.findings),
-                    "notice_count": len(report.notices),
-                    "error_count": len(report.errors),
-                    "bytes_scanned": report.coverage.bytes_scanned,
-                    "opcode_count": report.coverage.opcode_count,
-                }
-                for report in member_reports
-            ],
-        },
+        metadata=metadata,
         private_metadata=private_metadata,
         duration_s=sum(report.duration_s for report in member_reports),
     )

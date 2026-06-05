@@ -12,6 +12,7 @@ from modelaudit.detectors.suspicious_symbols import (
     KNOWN_SAFE_MODEL_CLASSES,
 )
 
+from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import IssueSeverity, ScanResult
 
 # Dangerous patterns to look for inside decoded Lambda bytecode / source
@@ -69,11 +70,58 @@ _EXTRA_SAFE_KERAS_METRIC_IDENTIFIERS: frozenset[str] = frozenset(
         "tp",
     }
 )
+_TRUSTED_KERAS_ROOT_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras",
+        "tensorflow.keras",
+        "tensorflow.python.keras",
+        "tf.keras",
+        "tf_keras",
+    }
+)
+_TRUSTED_KERAS_LAYER_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras.layers",
+        "tensorflow.keras.layers",
+        "tensorflow.python.keras.layers",
+        "tf.keras.layers",
+        "tf_keras.layers",
+    }
+)
+_TRUSTED_KERAS_MODEL_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras.models",
+        "tensorflow.keras.models",
+        "tensorflow.python.keras.models",
+        "tf.keras.models",
+        "tf_keras.models",
+    }
+)
 
 
 def _normalize_keras_identifier(value: str) -> str:
     """Normalize serialized Keras identifiers for allowlist lookups."""
     return value.strip().lower()
+
+
+def normalize_keras_layer_class(value: str) -> str:
+    """Normalize Keras layer class names while preserving custom namespaces."""
+    normalized = value.strip()
+    module_path, _, class_name = normalized.rpartition(".")
+    normalized_module_path = module_path.lower()
+    if class_name and (
+        (
+            class_name in KNOWN_SAFE_MODEL_CLASSES
+            and normalized_module_path in (_TRUSTED_KERAS_ROOT_CLASS_MODULES | _TRUSTED_KERAS_MODEL_CLASS_MODULES)
+        )
+        or (
+            class_name in KNOWN_SAFE_KERAS_LAYER_CLASSES
+            and class_name not in KNOWN_SAFE_MODEL_CLASSES
+            and normalized_module_path in _TRUSTED_KERAS_LAYER_CLASS_MODULES
+        )
+    ):
+        return class_name
+    return normalized
 
 
 def _camel_to_snake(value: str) -> str:
@@ -119,7 +167,10 @@ _SAFE_KERAS_METRIC_IDENTIFIERS = _build_safe_identifier_index(
 
 def is_known_safe_keras_layer_class(layer_class: Any) -> bool:
     """Return True when a serialized Keras layer class is known-safe."""
-    return isinstance(layer_class, str) and _normalize_keras_identifier(layer_class) in _SAFE_KERAS_LAYER_CLASSES
+    return (
+        isinstance(layer_class, str)
+        and _normalize_keras_identifier(normalize_keras_layer_class(layer_class)) in _SAFE_KERAS_LAYER_CLASSES
+    )
 
 
 def is_known_safe_keras_loss(identifier: Any) -> bool:
@@ -212,13 +263,17 @@ def _check_custom_object_config(
             continue
         seen_identifiers.add(normalized_identifier)
 
+        redacted_identifier = redact_evidence_string(identifier)
         result.add_check(
             name=check_name,
             passed=False,
-            message=f"Model contains custom {object_kind}: {identifier}",
+            message=f"Model contains custom {object_kind}: {redacted_identifier}",
             severity=IssueSeverity.WARNING,
             location=location,
-            details={details_key: raw_object, "identifier": identifier},
+            details={
+                details_key: redact_evidence_value(raw_object),
+                "identifier": redacted_identifier,
+            },
             rule_code="S305",
         )
 
@@ -268,19 +323,24 @@ def check_lambda_dict_function(
     if class_name != "__lambda__":
         return False
 
+    redacted_layer_name = redact_evidence_string(str(layer_name))
     config = function_dict.get("config")
     if not isinstance(config, dict):
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses malformed dict-format function metadata (config is not a dict)",
+            message=(
+                f"Lambda layer '{redacted_layer_name}' uses malformed dict-format function metadata "
+                "(config is not a dict)"
+            ),
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict",
                 "parse_status": "invalid_config",
+                "function_payload_omitted": "malformed_lambda_config_may_contain_sensitive_payload",
                 "config_type": type(config).__name__,
             },
             why="Malformed dict-format Lambda metadata is suspicious and prevents bytecode inspection.",
@@ -293,11 +353,11 @@ def check_lambda_dict_function(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses dict-format function with no code field",
+            message=f"Lambda layer '{redacted_layer_name}' uses dict-format function with no code field",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict",
             },
@@ -328,15 +388,16 @@ def check_lambda_list_function(
     layer_name: str,
 ) -> bool:
     """Check legacy Keras list-format Lambda function bytecode."""
+    redacted_layer_name = redact_evidence_string(str(layer_name))
     if not function_data:
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses list-format function with no encoded code field",
+            message=f"Lambda layer '{redacted_layer_name}' uses list-format function with no encoded code field",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "list",
             },
@@ -349,11 +410,11 @@ def check_lambda_list_function(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses list-format function with no encoded code field",
+            message=f"Lambda layer '{redacted_layer_name}' uses list-format function with no encoded code field",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "list",
                 "code_type": type(code_b64).__name__,
@@ -386,17 +447,18 @@ def _add_lambda_code_size_limit_check(
     *,
     function_format: str,
 ) -> None:
+    redacted_layer_name = redact_evidence_string(str(layer_name))
     result.add_check(
         name="Lambda Layer Detection",
         passed=False,
         message=(
-            f"Lambda layer '{layer_name}' contains {function_format}-format code "
+            f"Lambda layer '{redacted_layer_name}' contains {function_format}-format code "
             "that exceeds the bounded analysis limit"
         ),
         severity=IssueSeverity.WARNING,
         location=location,
         details={
-            "layer_name": layer_name,
+            "layer_name": redacted_layer_name,
             "layer_class": "Lambda",
             "function_format": function_format,
             "analysis_status": "code_size_limit_exceeded",
@@ -417,6 +479,7 @@ def _check_lambda_encoded_code(
     bytecode_format: str,
     format_label: str,
 ) -> None:
+    redacted_layer_name = redact_evidence_string(str(layer_name))
     try:
         decoded = base64.b64decode(code_b64)
         decoded_str = decoded.decode("utf-8", errors="replace")
@@ -424,11 +487,11 @@ def _check_lambda_encoded_code(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' contains non-decodable {function_format}-format code",
+            message=f"Lambda layer '{redacted_layer_name}' contains non-decodable {function_format}-format code",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": function_format,
             },
@@ -443,16 +506,17 @@ def _check_lambda_encoded_code(
             name="Lambda Layer Code Analysis",
             passed=False,
             message=(
-                f"Lambda layer '{layer_name}' contains dangerous patterns in bytecode: {', '.join(found_patterns)}"
+                f"Lambda layer '{redacted_layer_name}' contains dangerous patterns in bytecode: "
+                f"{', '.join(found_patterns)}"
             ),
             severity=IssueSeverity.CRITICAL,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "dangerous_patterns": found_patterns,
                 "function_format": bytecode_format,
-                "code_preview": decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str,
+                "code_preview_omitted": "opaque_bytecode_may_contain_sensitive_constants",
             },
             why=(
                 "Lambda layers can execute arbitrary Python code during model inference. "
@@ -464,13 +528,13 @@ def _check_lambda_encoded_code(
             name="Lambda Layer Code Analysis",
             passed=False,
             message=(
-                f"Lambda layer '{layer_name}' contains embedded bytecode ({format_label}) with no dangerous "
+                f"Lambda layer '{redacted_layer_name}' contains embedded bytecode ({format_label}) with no dangerous "
                 "text patterns detected"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": bytecode_format,
                 "analysis_status": "opaque_bytecode",
@@ -497,15 +561,17 @@ def check_subclassed_model(
         result: ScanResult to add the check to.
         location: File path for the check location.
     """
-    if model_class and model_class not in KNOWN_SAFE_MODEL_CLASSES:
+    normalized_model_class = normalize_keras_layer_class(model_class)
+    redacted_model_class = redact_evidence_string(model_class)
+    if model_class and normalized_model_class not in KNOWN_SAFE_MODEL_CLASSES:
         result.add_check(
             name="Subclassed Model Detection",
             passed=False,
-            message=f"Subclassed Keras model detected: {model_class}",
+            message=f"Subclassed Keras model detected: {redacted_model_class}",
             severity=IssueSeverity.INFO,
             location=location,
             details={
-                "model_class": model_class,
+                "model_class": redacted_model_class,
                 "known_safe_classes": sorted(KNOWN_SAFE_MODEL_CLASSES),
                 "risk": "Subclassed models require external Python code to load, which should be reviewed",
             },
@@ -516,11 +582,11 @@ def check_subclassed_model(
                 "Functional, Model) use declarative layer configurations and load without custom code."
             ),
         )
-    elif model_class in KNOWN_SAFE_MODEL_CLASSES:
+    elif normalized_model_class in KNOWN_SAFE_MODEL_CLASSES:
         result.add_check(
             name="Subclassed Model Detection",
             passed=True,
-            message=f"Standard Keras model class: {model_class}",
+            message=f"Standard Keras model class: {redacted_model_class}",
             location=location,
-            details={"model_class": model_class},
+            details={"model_class": redacted_model_class},
         )

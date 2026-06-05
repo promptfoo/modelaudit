@@ -16,6 +16,7 @@ INCONCLUSIVE_SCAN_OUTCOME: Final[str] = "inconclusive"
 SCAN_OUTCOME_METADATA_KEY: Final[str] = "scan_outcome"
 SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
 SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
+SCANNER_DEPENDENCY_IDS_METADATA_KEY: Final[str] = "scanner_dependency_ids"
 OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
 UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
 CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
@@ -204,7 +205,9 @@ class ScanResult:
         self.end_time: float | None = None
         self.bytes_scanned: int = 0
         self.success: bool = True
-        self.metadata: dict[str, Any] = {}
+        self.metadata: dict[str, Any] = {
+            SCANNER_DEPENDENCY_IDS_METADATA_KEY: [scanner_name],
+        }
         self._private_metadata: dict[str, Any] = {}
         self._metadata_restored_critical: bool = False
         self._merged_children_success: bool = True
@@ -367,7 +370,11 @@ class ScanResult:
         self._merged_children_success = self._merged_children_success and other.success
         self.success = self.success and other.success
         # Merge metadata dictionaries
-        list_union_metadata_keys = {SCAN_OUTCOME_REASONS_METADATA_KEY, "skipped_scanner_ids"}
+        list_union_metadata_keys = {
+            SCAN_OUTCOME_REASONS_METADATA_KEY,
+            SCANNER_DEPENDENCY_IDS_METADATA_KEY,
+            "skipped_scanner_ids",
+        }
         for key, value in other.metadata.items():
             if (
                 key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
