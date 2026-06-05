@@ -3387,22 +3387,73 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
-    def test_numpy_load_without_pickle_is_safe_target(self, tmp_path: Path) -> None:
-        """Default numpy.load calls should not be treated as pickle deserialization."""
-        config = {"model": {"_target_": "numpy.load", "file": "weights.npy"}}
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "numpy.fromfile",
+            "numpy.fromregex",
+            "numpy.genfromtxt",
+            "numpy.lib._datasource.DataSource._cache",
+            "numpy.lib._datasource.DataSource._findfile",
+            "numpy.lib._datasource.DataSource.exists",
+            "numpy.lib._datasource.DataSource.open",
+            "numpy.lib._datasource.open",
+            "numpy.lib._format_impl.open_memmap",
+            "numpy.lib._npyio_impl.fromregex",
+            "numpy.lib._npyio_impl.genfromtxt",
+            "numpy.lib._npyio_impl.load",
+            "numpy.lib._npyio_impl.loadtxt",
+            "numpy.lib._npyio_impl.save",
+            "numpy.lib._npyio_impl.savez",
+            "numpy.lib._npyio_impl.savez_compressed",
+            "numpy.lib._npyio_impl.savetxt",
+            "numpy.lib.format.open_memmap",
+            "numpy.lib.npyio.DataSource._cache",
+            "numpy.lib.npyio.DataSource._findfile",
+            "numpy.lib.npyio.DataSource.exists",
+            "numpy.lib.npyio.DataSource.open",
+            "numpy.lib.npyio.fromregex",
+            "numpy.lib.npyio.genfromtxt",
+            "numpy.lib.npyio.load",
+            "numpy.lib.npyio.loadtxt",
+            "numpy.lib.npyio.recfromcsv",
+            "numpy.lib.npyio.recfromtxt",
+            "numpy.lib.npyio.save",
+            "numpy.lib.npyio.savez",
+            "numpy.lib.npyio.savez_compressed",
+            "numpy.lib.npyio.savetxt",
+            "numpy.load",
+            "numpy.loadtxt",
+            "numpy.memmap",
+            "numpy._core.memmap.memmap",
+            "numpy._core.multiarray.fromfile",
+            "numpy._core.records.fromfile",
+            "numpy.core.memmap.memmap",
+            "numpy.core.multiarray.fromfile",
+            "numpy.core.records.fromfile",
+            "numpy.ndarray.dump",
+            "numpy.ndarray.tofile",
+            "numpy.rec.fromfile",
+            "numpy.recfromcsv",
+            "numpy.recfromtxt",
+            "numpy.save",
+            "numpy.savez",
+            "numpy.savez_compressed",
+            "numpy.savetxt",
+        ],
+    )
+    def test_numpy_file_io_targets_override_safe_namespace(self, tmp_path: Path, target: str) -> None:
+        """NumPy file I/O callables must not be hidden by the trusted numpy namespace."""
+        config = {"model": {"_target_": target}}
         path = _create_nemo_file(tmp_path, config)
 
         result = NemoScanner().scan(str(path))
 
-        assert not [
-            check
-            for check in result.checks
-            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
-        ]
         assert any(
-            check.name == "Hydra _target_ Safety Check"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("target") == "numpy.load"
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
             for check in result.checks
         )
 
@@ -3419,7 +3470,7 @@ class TestCVE202523304HydraTarget:
         tmp_path: Path,
         model_config: dict[str, Any],
     ) -> None:
-        """numpy.load becomes a pickle sink only when allow_pickle is enabled."""
+        """Pickle-enabled numpy.load calls remain dangerous file-access targets."""
         path = _create_nemo_file(tmp_path, {"model": model_config})
 
         result = NemoScanner().scan(str(path))
@@ -4176,12 +4227,19 @@ class TestCVE202523304HydraTarget:
             "smtplib.SMTP_SSL",
             "telnetlib.Telnet",
             "bz2.open",
+            "bz2.BZ2File",
             "dbm.open",
             "gzip.open",
+            "gzip.GzipFile",
             "lzma.open",
+            "lzma.LZMAFile",
             "shelve.open",
             "sqlite3.connect",
+            "sqlite3.Connection",
             "tarfile.open",
+            "tarfile.TarFile",
+            "tarfile.TarFile.open",
+            "zipfile.PyZipFile",
             "zipfile.ZipFile",
             "_ctypes.dlopen",
             "ctypes.OleDLL",
@@ -4217,6 +4275,8 @@ class TestCVE202523304HydraTarget:
         "target",
         [
             "custom.ftplib.FTPFactory.SafeBuilder",
+            "custom.gzip.GzipFileFactory.SafeBuilder",
+            "custom.numpy.fromfile_factory.SafeBuilder",
             "custom.tarfile.open_safe.SafeBuilder",
             "custom.ctypes.PyDLLFactory.SafeBuilder",
         ],
@@ -4499,6 +4559,9 @@ class TestCVE202523304HydraTarget:
             "http.client.HTTPConnection.endheaders",
             "socket.socket.sendfile",
             "smtplib.SMTP",
+            "gzip.GzipFile",
+            "numpy.lib._datasource.DataSource.open",
+            "numpy.lib._npyio_impl.load",
             "tarfile.open",
             "ctypes.PyDLL",
             "os.path.realpath",

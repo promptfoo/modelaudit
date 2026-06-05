@@ -134,13 +134,20 @@ _DANGEROUS_TARGETS = {
     "io.FileIO",
     "_io.FileIO",
     "codecs.open",
+    "bz2.BZ2File",
     "bz2.open",
     "dbm.open",
+    "gzip.GzipFile",
     "gzip.open",
+    "lzma.LZMAFile",
     "lzma.open",
     "shelve.open",
+    "sqlite3.Connection",
     "sqlite3.connect",
+    "tarfile.TarFile",
+    "tarfile.TarFile.open",
     "tarfile.open",
+    "zipfile.PyZipFile",
     "zipfile.ZipFile",
     "pickle.loads",
     "pickle.load",
@@ -169,6 +176,56 @@ _DANGEROUS_TARGETS = {
     "torch.utils.cpp_extension.load",
     "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
+    "numpy.fromfile",
+    "numpy.fromregex",
+    "numpy.genfromtxt",
+    "numpy.lib._datasource.DataSource._cache",
+    "numpy.lib._datasource.DataSource._findfile",
+    "numpy.lib._datasource.DataSource.exists",
+    "numpy.lib._datasource.DataSource.open",
+    "numpy.lib._datasource.open",
+    "numpy.lib._format_impl.open_memmap",
+    "numpy.lib._npyio_impl.fromregex",
+    "numpy.lib._npyio_impl.genfromtxt",
+    "numpy.lib._npyio_impl.load",
+    "numpy.lib._npyio_impl.loadtxt",
+    "numpy.lib._npyio_impl.save",
+    "numpy.lib._npyio_impl.savez",
+    "numpy.lib._npyio_impl.savez_compressed",
+    "numpy.lib._npyio_impl.savetxt",
+    "numpy.lib.format.open_memmap",
+    "numpy.lib.npyio.DataSource._cache",
+    "numpy.lib.npyio.DataSource._findfile",
+    "numpy.lib.npyio.DataSource.exists",
+    "numpy.lib.npyio.DataSource.open",
+    "numpy.lib.npyio.fromregex",
+    "numpy.lib.npyio.genfromtxt",
+    "numpy.lib.npyio.load",
+    "numpy.lib.npyio.loadtxt",
+    "numpy.lib.npyio.recfromcsv",
+    "numpy.lib.npyio.recfromtxt",
+    "numpy.lib.npyio.save",
+    "numpy.lib.npyio.savez",
+    "numpy.lib.npyio.savez_compressed",
+    "numpy.lib.npyio.savetxt",
+    "numpy.load",
+    "numpy.loadtxt",
+    "numpy.memmap",
+    "numpy._core.memmap.memmap",
+    "numpy._core.multiarray.fromfile",
+    "numpy._core.records.fromfile",
+    "numpy.core.memmap.memmap",
+    "numpy.core.multiarray.fromfile",
+    "numpy.core.records.fromfile",
+    "numpy.ndarray.dump",
+    "numpy.ndarray.tofile",
+    "numpy.rec.fromfile",
+    "numpy.recfromcsv",
+    "numpy.recfromtxt",
+    "numpy.save",
+    "numpy.savez",
+    "numpy.savez_compressed",
+    "numpy.savetxt",
     "urllib.request.urlopen",
     "urllib.request.urlretrieve",
     "requests.request",
@@ -761,11 +818,6 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
         if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
             return pattern
     return None
-
-
-def _is_runtime_truthy(value: Any) -> bool:
-    """Return whether a Hydra argument would be truthy when passed to Python."""
-    return bool(value)
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -2765,9 +2817,9 @@ class NemoScanner(BaseScanner):
         path_prefix: str = "",
     ) -> None:
         """Check _target_ values in Hydra config within shared traversal bounds."""
-        for config_path, value, parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
+        for config_path, value, _parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, config_path, config_name, archive_path, result, parent)
+                self._evaluate_target(value, config_path, config_name, archive_path, result)
 
     def _evaluate_target(
         self,
@@ -2776,7 +2828,6 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
-        target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
         display_target = _redact_config_evidence(target)
@@ -2788,11 +2839,7 @@ class NemoScanner(BaseScanner):
             return
 
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if (
-            target in _DANGEROUS_TARGETS
-            or target.startswith(_DANGEROUS_TARGET_PREFIXES)
-            or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config))
-        ):
+        if target in _DANGEROUS_TARGETS or target.startswith(_DANGEROUS_TARGET_PREFIXES):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
@@ -2939,18 +2986,3 @@ class NemoScanner(BaseScanner):
                 "remediation": CVE_2025_23304_REMEDIATION,
             },
         )
-
-    @staticmethod
-    def _numpy_load_allows_pickle(target_config: dict[str, Any] | None) -> bool:
-        """Return whether a Hydra numpy.load target enables pickle loading."""
-        if not isinstance(target_config, dict):
-            return False
-
-        if "allow_pickle" in target_config:
-            return _is_runtime_truthy(target_config["allow_pickle"])
-
-        positional_args = target_config.get("_args_")
-        if isinstance(positional_args, list) and len(positional_args) >= 3:
-            return _is_runtime_truthy(positional_args[2])
-
-        return False
