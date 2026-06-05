@@ -2210,18 +2210,17 @@ class KerasZipScanner(BaseScanner):
                 }
             )
 
-        if isinstance(keras_version, str):
+        cve_2026_1669_status = (
+            self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+        )
+        if cve_2026_1669_status is True:
             details["keras_version"] = keras_version
-            if not self._is_vulnerable_to_cve_2026_1669(keras_version):
-                details["parse_status"] = "untrusted_artifact_version"
-                details["version_source"] = "metadata_json"
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
                 passed=False,
                 message=(
-                    "CVE-2026-1669: embedded Keras weights use HDF5 external references that can disclose "
-                    "arbitrary local file contents during model loading; archive-controlled metadata claims "
-                    f"Keras {keras_version}"
+                    f"CVE-2026-1669: embedded Keras {keras_version} weights use HDF5 external references that can "
+                    "disclose arbitrary local file contents during model loading"
                 ),
                 severity=IssueSeverity.WARNING,
                 location=location,
@@ -2230,18 +2229,48 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
+        if cve_2026_1669_status is False:
+            result.add_check(
+                name="HDF5 External Weight Reference Metadata Check",
+                passed=False,
+                message=(
+                    "Embedded HDF5 external references detected in weights, and archive metadata claims "
+                    f"Keras {keras_version} outside the known CVE-2026-1669 vulnerable ranges; "
+                    "metadata-only assessment is inconclusive without runtime verification"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details=details
+                | {
+                    "keras_version": keras_version,
+                    "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                    "metadata_only_assessment": True,
+                    "parse_status": "metadata_non_vulnerable",
+                },
+                why=get_cve_2026_1669_explanation("hdf5_external_reference"),
+            )
+            return
+
+        version_context = (
+            f"keras_version '{keras_version}' is non-canonical"
+            if isinstance(keras_version, str)
+            else "keras_version is unavailable"
+        )
+        if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
             passed=False,
             message=(
-                "Embedded HDF5 external references detected in weights, but keras_version is unavailable; cannot "
-                "confidently attribute CVE-2026-1669 without version context"
+                f"Embedded HDF5 external references detected in weights, but {version_context}; cannot confidently "
+                "attribute CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
             details=details
             | {
                 "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                "parse_status": "unknown",
             },
         )
 
@@ -3111,6 +3140,9 @@ class KerasZipScanner(BaseScanner):
 
         suffix = (version_match.group(4) or "").strip().lower()
         suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
+        if suffix_status is None:
+            return None
+
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True

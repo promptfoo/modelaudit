@@ -297,8 +297,12 @@ class TestKerasZipScanner:
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == "3.12.1"
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
-        assert cve_issues[0].details["version_source"] == "metadata_json"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert any(
+            check.name == "HDF5 External Weight Reference Metadata Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
         assert not any(
             check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
             for check in result.checks
@@ -461,7 +465,8 @@ class TestKerasZipScanner:
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
         assert len(cve_issues) == 1
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
         assert cve_issues[0].details["external_references"][0]["kind"] == expected_kind
         assert determine_exit_code(aggregate_result) == 1
 
@@ -782,6 +787,8 @@ class TestKerasZipScanner:
         "keras_version",
         [
             "3.12.1rc1",
+            "3.12.1-rc.1",
+            "3.12.1_rc_1",
             "3.12.1rc.post",
             "3.12.1rc1.post1",
             "3.12.1rc1.post.dev",
@@ -824,19 +831,9 @@ class TestKerasZipScanner:
             "3.13.2",
             "3.13.2.post1",
             "3.13.2+dev0",
-            "3.12.1rc1evil",
-            "3.12.1rc1.evil",
-            "3.12.1rc1+cpu+cuda",
-            "3.12.1--rc1",
-            "3.12.1candidate",
-            "3.12.1+",
-            "3.12.1+cpu+cuda",
-            "3.13.2.postevil",
-            "keras-3.12.1",
-            "keras-3.13.2",
         ],
     )
-    def test_embedded_hdf5_external_references_fixed_or_unparseable_metadata_still_warn(
+    def test_embedded_hdf5_external_references_fixed_metadata_still_warn(
         self, tmp_path: Path, keras_version: str
     ) -> None:
         """Metadata.json version text is archive-controlled context, not a suppression guard."""
@@ -854,7 +851,52 @@ class TestKerasZipScanner:
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == keras_version
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert any(
+            check.name == "HDF5 External Weight Reference Metadata Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.12.1rc1evil",
+            "3.12.1rc1.evil",
+            "3.12.1rc1+cpu+cuda",
+            "3.12.1--rc1",
+            "3.12.1candidate",
+            "3.12.1+",
+            "3.12.1+cpu+cuda",
+            "3.13.2.postevil",
+            "keras-3.12.1",
+            "keras-3.13.2",
+            "3.13.x",
+        ],
+    )
+    def test_embedded_hdf5_external_references_unparseable_metadata_warns_unknown(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Malformed archive metadata must not claim vulnerable or fixed runtime behavior."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        unknown_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
+        ]
+        assert len(unknown_checks) == 1
+        assert unknown_checks[0].status == CheckStatus.FAILED
+        assert unknown_checks[0].severity == IssueSeverity.WARNING
+        assert unknown_checks[0].details["keras_version"] == keras_version
+        assert unknown_checks[0].details["parse_status"] == "unknown"
+        assert "is non-canonical" in unknown_checks[0].message
 
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
@@ -1606,7 +1648,8 @@ class TestKerasZipScanner:
         cve_issues = [issue for issue in security_issues if issue.details.get("cve_id") == "CVE-2026-1669"]
         assert len(cve_issues) == 1
         assert cve_issues[0].details["keras_version"] == "3.12.1"
-        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
         assert determine_exit_code(aggregate_result) == 1
 
     def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
