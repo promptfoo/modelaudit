@@ -21,7 +21,12 @@ class DvcResolution:
 
     @property
     def analysis_incomplete(self) -> bool:
-        return self.omitted_output_count > 0
+        if self.omitted_output_count == 0:
+            return False
+        if self.unresolved_omitted_output_count > 0 or self.unverified_omitted_output_count > 0:
+            return True
+        resolved_targets = set(self.targets)
+        return any(target not in resolved_targets for target in self.omitted_targets)
 
 
 def resolve_dvc_file(file_path: str) -> list[str]:
@@ -70,7 +75,9 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         outs = outs[: MAX_DVC_OUTPUTS * 2]
 
     resolved: list[str] = []
+    resolved_targets: set[str] = set()
     omitted_targets: list[str] = []
+    unique_omitted_targets: set[str] = set()
     unresolved_omitted_output_count = 0
     dvc_dir = path.parent.resolve()
 
@@ -109,8 +116,14 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
                 continue
 
             if target.exists():
-                target_list = resolved if index < MAX_DVC_OUTPUTS else omitted_targets
-                target_list.append(str(target))
+                target_str = str(target)
+                if index < MAX_DVC_OUTPUTS:
+                    if target_str not in resolved_targets:
+                        resolved.append(target_str)
+                        resolved_targets.add(target_str)
+                elif target_str not in resolved_targets and target_str not in unique_omitted_targets:
+                    omitted_targets.append(target_str)
+                    unique_omitted_targets.add(target_str)
             else:
                 logger.debug(f"DVC target missing: {target}")
                 unresolved_omitted_output_count += int(is_omitted)

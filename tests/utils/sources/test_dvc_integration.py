@@ -261,6 +261,53 @@ class TestDvcSecurity:
         assert determine_exit_code(cached_result) == 2
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in cached_result.issues)
 
+    def test_duplicate_dvc_outputs_do_not_exhaust_cap_or_fail_closed(self, tmp_path: Path) -> None:
+        """Duplicate declarations do not omit any unique artifact or trigger repeated scans."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        dvc_file = tmp_path / "duplicate_outputs.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 101)
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(target)]
+        assert resolution.omitted_output_count == 1
+        assert resolution.omitted_targets == []
+        assert resolution.analysis_incomplete is False
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_dvc_outputs_cannot_hide_unique_late_output(self, tmp_path: Path) -> None:
+        """Duplicate padding must not discharge a unique output beyond the declaration cap."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "duplicate_padding.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late_malicious.pkl\n")
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(benign)]
+        assert resolution.omitted_targets == [str(late_malicious)]
+        assert resolution.analysis_incomplete is True
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
     def test_directory_scan_accepts_over_limit_dvc_when_walk_covers_omitted_outputs(self, tmp_path: Path) -> None:
         """Directory traversal should discharge the cap when it scans the omitted in-tree output."""
         dvc_lines = ["outs:"]
