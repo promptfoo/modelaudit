@@ -956,7 +956,11 @@ def _r_expression_has_obvious_adjacent_values(
                 token_end += 1
             token = text[cursor:token_end]
             if operator_name_required:
-                if _r_unquoted_named_argument_target_kind(token) != "symbol":
+                if (
+                    _r_unquoted_named_argument_target_kind(token) != "symbol"
+                    or token == "..."
+                    or _R_DOT_ARGUMENT_TOKEN_RE.fullmatch(token) is not None
+                ):
                     return True
                 operator_name_required = False
                 expects_value = False
@@ -2099,6 +2103,31 @@ def _contains_r_expression_credential_assignment(text: str) -> bool:
     return False
 
 
+def _contains_r_credential_assignment(text: str) -> bool:
+    return (
+        _contains_r_quoted_credential_assignment(text)
+        or _contains_r_raw_credential_assignment(text)
+        or _contains_r_expression_credential_assignment(text)
+    )
+
+
+def _contains_r_credential_assignment_in_complete_statements(text: str) -> bool:
+    """Preserve completed detections when another statement exceeds the depth budget."""
+    non_code_spans = _r_non_code_spans(text)
+    statement_starts = _r_statement_starts(text, non_code_spans)
+    if len(statement_starts) < 2:
+        return False
+    for index, statement_start in enumerate(statement_starts):
+        statement_end = statement_starts[index + 1] - 1 if index + 1 < len(statement_starts) else len(text)
+        statement = text[statement_start:statement_end]
+        try:
+            if _contains_r_credential_assignment(statement):
+                return True
+        except _RExpressionDepthExceeded:
+            continue
+    return False
+
+
 def _redact_url_for_display(url: str) -> str:
     """Return a URL safe for scan output while preserving routing context."""
     try:
@@ -2532,12 +2561,20 @@ class RSerializedScanner(BaseScanner):
                         and continuation_active
                         and (current_length > _R_CONTINUATION_ANALYSIS_MAX_CHARS)
                     ):
-                        incomplete_reason = _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                        incomplete_reason = (
+                            _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                            if append_current_run()
+                            else _STRING_EXTRACTION_INCONCLUSIVE_REASON
+                        )
                         break
                     if is_newline_whitespace_gap and current_length <= _R_CONTINUATION_ANALYSIS_MAX_CHARS:
                         continuation_analysis_work += current_length
                         if continuation_analysis_work > _R_CONTINUATION_ANALYSIS_MAX_WORK:
-                            incomplete_reason = _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                            incomplete_reason = (
+                                _CONTINUATION_ANALYSIS_INCONCLUSIVE_REASON
+                                if append_current_run()
+                                else _STRING_EXTRACTION_INCONCLUSIVE_REASON
+                            )
                             break
                         current_text = "".join(current_parts)
                         non_code_spans = _r_non_code_spans(current_text)
@@ -2655,14 +2692,10 @@ class RSerializedScanner(BaseScanner):
                 if pattern.search(text):
                     credential_hits.add(name)
             try:
-                has_credential_assignment = (
-                    _contains_r_quoted_credential_assignment(text)
-                    or _contains_r_raw_credential_assignment(text)
-                    or _contains_r_expression_credential_assignment(text)
-                )
+                has_credential_assignment = _contains_r_credential_assignment(text)
             except _RExpressionDepthExceeded:
                 expression_analysis_incomplete = True
-                has_credential_assignment = False
+                has_credential_assignment = _contains_r_credential_assignment_in_complete_statements(text)
             except RecursionError:
                 # Ambiguous deeply nested R syntax must not turn into lost coverage.
                 has_credential_assignment = True

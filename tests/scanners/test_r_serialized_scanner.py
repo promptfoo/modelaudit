@@ -1172,6 +1172,10 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'list(token = x@ + "MISSING_SLOT_SECRET")',
         'list(token = x::1 + "NUMERIC_NS_NAME_SECRET")',
         'list(token = x$TRUE + "RESERVED_MEMBER_NAME_SECRET")',
+        'list(token = object$..1 + "DOT_DOT_MEMBER_NAME_SECRET")',
+        'list(token = object@... + "ELLIPSIS_SLOT_NAME_SECRET")',
+        'list(token = package::..2 + "DOT_DOT_NAMESPACE_NAME_SECRET")',
+        'list(token = package:::... + "ELLIPSIS_INTERNAL_NAMESPACE_NAME_SECRET")',
         'list(token = base::foo::bar + "CHAINED_NAMESPACE_SECRET")',
         'list(token = x$foo::bar + "MEMBER_NAMESPACE_SECRET")',
         'x base::list(token = r"(NAMESPACE_BOUNDARY_SECRET)")',
@@ -1243,6 +1247,23 @@ def test_scan_expression_depth_ceiling_is_inconclusive(tmp_path: Path) -> None:
     assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_expression_depth_incomplete"
 
 
+def test_scan_expression_depth_ceiling_preserves_earlier_credential_detection(tmp_path: Path) -> None:
+    path = tmp_path / "deep-expression-after-visible-secret.rds"
+    nested_value = "if (TRUE) " * 130 + '"standard"'
+    _write_raw_r_serialized(
+        path,
+        f'token = paste0("VISIBLE_DEPTH_SECRET"); list(secret = {nested_value})',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    assert "r_serialized_expression_depth_incomplete" in result.metadata["scan_outcome_reasons"]
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+
+
 def test_scan_deep_subscript_nesting_does_not_raise_recursion_error(tmp_path: Path) -> None:
     path = tmp_path / "deep-subscript.rds"
     _write_raw_r_serialized(path, "x" + "[" * 1_100 + 'token = "standard"' + "]" * 1_100)
@@ -1267,6 +1288,20 @@ def test_scan_continuation_analysis_ceiling_is_inconclusive(tmp_path: Path) -> N
     assert len(ceiling_checks) == 1
     assert "continuation-analysis ceiling" in ceiling_checks[0].message
     assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_continuation_analysis_incomplete"
+
+
+def test_scan_continuation_ceiling_preserves_visible_credential_assignment(tmp_path: Path) -> None:
+    path = tmp_path / "continued-function-with-secret.rds"
+    comment_lines = "".join(f"#{'a' * 250}\n" for _ in range(80))
+    _write_raw_r_serialized(path, f'function(token = "VISIBLE_CEILING_SECRET")\n{comment_lines}')
+
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    assert "r_serialized_continuation_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
