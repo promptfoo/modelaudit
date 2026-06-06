@@ -924,7 +924,7 @@ class ScanResultsCache:
 
     @staticmethod
     def _is_stable_platform_symlink_component(path: Path) -> bool:
-        if sys.platform != "darwin":
+        if getattr(sys, "platform", "") != "darwin":
             return False
         expected_target = _DARWIN_STABLE_SYMLINK_ALIASES.get(str(path))
         return expected_target is not None and os.path.realpath(path) == expected_target
