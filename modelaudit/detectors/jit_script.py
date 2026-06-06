@@ -8844,6 +8844,9 @@ def _line_indent_width(line: bytes) -> int:
 
 def _compound_header_keyword(structural_line: bytes) -> bytes | None:
     stripped = structural_line.lstrip()
+    header_match = _COMPOUND_HEADER_MATCH_PATTERN.search(structural_line)
+    if header_match is not None and _is_embedded_top_level_prefix(structural_line[: header_match.start()]):
+        stripped = structural_line[header_match.start() :].lstrip()
     for keyword in (b"async def", b"elif", b"else", b"except", b"finally", b"if", b"for", b"while", b"try"):
         if stripped == keyword + b":" or stripped.startswith(keyword + b" ") or stripped.startswith(keyword + b":"):
             return keyword
@@ -8988,6 +8991,7 @@ def _previous_header_context_segments(
     before_line_start: int,
     indent: int,
     keywords: set[bytes],
+    continuation_keywords: set[bytes] | None = None,
 ) -> list[tuple[int, int]]:
     search_end = before_line_start
     while search_end > 0:
@@ -9004,6 +9008,10 @@ def _previous_header_context_segments(
         if previous_indent != indent:
             continue
         framed_header_start = _same_line_compound_header_start(structural_line, previous_line_start)
+        if framed_header_start is not None and not structural_line[: framed_header_start - previous_line_start].strip(
+            b" \t\r"
+        ):
+            framed_header_start = None
         header_line = (
             structural_line[framed_header_start - previous_line_start :]
             if framed_header_start is not None
@@ -9011,7 +9019,9 @@ def _previous_header_context_segments(
         )
         keyword = _compound_header_keyword(header_line)
         if keyword not in keywords or not header_line.endswith(b":"):
-            continue
+            if keyword in (continuation_keywords or set()) and header_line.endswith(b":"):
+                continue
+            return []
         header_start = framed_header_start or _compound_header_start(previous_line_start, structural_line)
         header_segment = (header_start, previous_line_start + len(previous_line))
         body_segment = _first_body_statement_segment(candidate, previous_line_start + len(previous_line), indent)
@@ -9023,7 +9033,13 @@ def _previous_header_context_segments(
 
 def _try_else_context_segments(candidate: bytes, clause_line_start: int, indent: int) -> list[tuple[int, int]]:
     except_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"except"})
-    try_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    try_context = _previous_header_context_segments(
+        candidate,
+        clause_line_start,
+        indent,
+        {b"try"},
+        {b"except"},
+    )
     if try_context and except_context:
         return [*try_context, *except_context]
     return []
@@ -9036,13 +9052,26 @@ def _matching_clause_context_segments(
     clause_keyword: bytes | None,
 ) -> list[tuple[int, int]]:
     if clause_keyword in {b"else", b"elif"}:
-        context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"if", b"for", b"while"})
+        context = _previous_header_context_segments(
+            candidate,
+            clause_line_start,
+            indent,
+            {b"if", b"for", b"while"},
+            {b"elif"},
+        )
         if context:
             return context
         if clause_keyword == b"else":
             return _try_else_context_segments(candidate, clause_line_start, indent)
     if clause_keyword in {b"except", b"finally"}:
-        return _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+        continuation_keywords = {b"except", b"else"} if clause_keyword == b"finally" else {b"except"}
+        return _previous_header_context_segments(
+            candidate,
+            clause_line_start,
+            indent,
+            {b"try"},
+            continuation_keywords,
+        )
     return []
 
 

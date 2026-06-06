@@ -1449,7 +1449,7 @@ class TestJITScriptDetector:
             is should_detect
         )
 
-    @pytest.mark.parametrize("clause", [b"else:", b"elif flag:", b"except Exception:"])
+    @pytest.mark.parametrize("clause", [b"else:", b"elif flag:", b"except Exception:", b"finally:"])
     def test_scan_model_keeps_priority_import_after_standalone_continuation_header(self, clause: bytes) -> None:
         detector = JITScriptDetector()
         leading_starts = b"".join(
@@ -1464,6 +1464,37 @@ class TestJITScriptDetector:
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_probes_import_after_detached_continuation_header(self) -> None:
+        source = (
+            b"\x00\xffif True:\n"
+            b"    pass\n"
+            b"marker = 1\n"
+            b"else: from webbrowser import open as opener; opener('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_probes_import_after_duplicate_else_header(self) -> None:
+        source = (
+            b"\x00\xffif True:\n"
+            b"    pass\n"
+            b"else:\n"
+            b"    pass\n"
+            b"else: from webbrowser import open as opener; opener('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
