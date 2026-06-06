@@ -207,6 +207,24 @@ class KerasH5Scanner(BaseScanner):
             "system",
         }
     )
+    _ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "eagerpyfunc",
+            "load_file_system_library",
+            "load_library",
+            "load_op_library",
+            "numpy_function",
+            "py_func",
+            "py_function",
+            "pyfunc",
+            "pyfuncstateless",
+        }
+    )
+    _DANGEROUS_LAMBDA_MODULE_FUNCTION_PAIRS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
+        {
+            ("io", "open"),
+        }
+    )
     _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
     _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
     _MAX_HDF5_LAYOUT_PROBE_ITEMS: ClassVar[int] = 4096
@@ -872,6 +890,7 @@ class KerasH5Scanner(BaseScanner):
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
+        lambda_layer_count = 0
 
         # Check each layer
         for layer in layers:
@@ -889,6 +908,8 @@ class KerasH5Scanner(BaseScanner):
                 continue
             layer_class = layer.get("class_name", "")
             layer_config = layer.get("config", {})
+            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+            layer_count_key = "Lambda" if is_lambda_layer else layer_class
             if not isinstance(layer_config, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
                 result.add_check(
@@ -903,21 +924,18 @@ class KerasH5Scanner(BaseScanner):
                 layer_config = {}
 
             # Update layer count
-            if layer_class in layer_counts:
-                layer_counts[layer_class] += 1
+            if layer_count_key in layer_counts:
+                layer_counts[layer_count_key] += 1
             else:
-                layer_counts[layer_class] = 1
+                layer_counts[layer_count_key] = 1
 
             # Check for suspicious layer types
-            is_lambda_layer = self._is_lambda_layer_class(layer_class)
             if layer_class in self.suspicious_layer_types or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
                 if is_lambda_layer:
-                    raw_layer_name = layer.get("name")
-                    if not raw_layer_name and isinstance(layer_config, dict):
-                        raw_layer_name = layer_config.get("name")
-                    layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
-                    self._check_lambda_layer(layer_config, result)
+                    lambda_layer_count += 1
+                    layer_name = f"lambda_{lambda_layer_count}"
+                    self._check_lambda_layer(layer_config, result, layer_name)
                     keras_version = result.metadata.get("keras_version")
 
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
@@ -1080,7 +1098,9 @@ class KerasH5Scanner(BaseScanner):
             self._check_config_for_suspicious_strings(
                 layer_config,
                 result,
-                layer_class,
+                "Lambda" if is_lambda_layer else layer_class,
+                redact_nested_context=is_lambda_layer,
+                case_sensitive=is_lambda_layer,
             )
 
             # If there are nested models, scan them recursively
@@ -1100,7 +1120,8 @@ class KerasH5Scanner(BaseScanner):
                         details={"layer_class": layer_class, "expected_key": "config.layers"},
                     )
 
-            self._scan_wrapped_layer_config(layer_config, result)
+            if not is_lambda_layer:
+                self._scan_wrapped_layer_config(layer_config, result)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
@@ -1134,6 +1155,7 @@ class KerasH5Scanner(BaseScanner):
         self,
         layer_config: dict[str, Any],
         result: ScanResult,
+        layer_name: str,
         *,
         callback_field: str = "function",
     ) -> None:
@@ -1166,7 +1188,6 @@ class KerasH5Scanner(BaseScanner):
         if reference_function_name is None and is_named_function_reference:
             reference_function_name = function_str
 
-        layer_name = layer_config.get("name", "lambda")
         callback_layer_name = layer_name if callback_field == "function" else f"{layer_name}.{callback_field}"
         callback_details = {"layer_class": "Lambda", "callback_field": callback_field}
         encoded_function_handled = False
@@ -1204,14 +1225,13 @@ class KerasH5Scanner(BaseScanner):
                 self.current_file_path,
                 callback_layer_name,
             )
-
         # Check if there's actual Python code to validate
         if isinstance(function_str, str) and not is_named_function_reference:
             normalized_function_source = function_str.strip()
             if normalized_function_source:
-                is_valid, error = validate_python_syntax(normalized_function_source)
+                is_valid, _ = validate_python_syntax(normalized_function_source)
             else:
-                is_valid, error = False, "Lambda source is empty"
+                is_valid = False
             is_safe_pattern = is_valid and self._is_lambda_source_allowlisted(normalized_function_source)
 
             if is_safe_pattern:
@@ -1229,7 +1249,7 @@ class KerasH5Scanner(BaseScanner):
             else:
                 if is_valid:
                     # It's valid Python! Check if it's dangerous
-                    is_dangerous, risk_desc = is_code_potentially_dangerous(normalized_function_source, "low")
+                    is_dangerous, _ = is_code_potentially_dangerous(normalized_function_source, "low")
 
                     # Check if code is dangerous
                     if is_dangerous:
@@ -1241,8 +1261,8 @@ class KerasH5Scanner(BaseScanner):
                             location=self.current_file_path,
                             details={
                                 **callback_details,
-                                "code_analysis": risk_desc,
-                                "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
+                                "code_analysis_omitted": "lambda_code_analysis_may_contain_sensitive_identifiers",
+                                "code_preview_omitted": "lambda_code_may_contain_sensitive_literals",
                             },
                             rule_code="S507",  # Python embedded code
                         )
@@ -1258,7 +1278,8 @@ class KerasH5Scanner(BaseScanner):
                             details={
                                 **callback_details,
                                 "validation_status": "valid_python",
-                                "code_analysis": risk_desc,
+                                "code_analysis_omitted": "lambda_code_analysis_may_contain_sensitive_identifiers",
+                                "code_preview_omitted": "lambda_code_may_contain_sensitive_literals",
                                 "allowlist_status": "not_allowlisted",
                             },
                             rule_code="S507",  # Python embedded code
@@ -1274,7 +1295,7 @@ class KerasH5Scanner(BaseScanner):
                         details={
                             **callback_details,
                             "validation_status": "invalid_python",
-                            "validation_error": error,
+                            "validation_error_omitted": "lambda_code_may_contain_sensitive_literals",
                         },
                         why="Malformed Lambda source cannot be safely classified.",
                         rule_code="S507",
@@ -1294,6 +1315,7 @@ class KerasH5Scanner(BaseScanner):
                 details={
                     **callback_details,
                     "function_type": type(function_str).__name__,
+                    "function_payload_omitted": "malformed_lambda_function_may_contain_sensitive_payload",
                 },
                 why="Lambda function metadata must be source text or a recognized serialized function structure.",
                 rule_code="S507",
@@ -1323,13 +1345,13 @@ class KerasH5Scanner(BaseScanner):
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
-                    message=f"Lambda layer references potentially dangerous module: {reference_module}",
+                    message="Lambda layer references a potentially dangerous module or function",
                     severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module": reference_module,
-                        "function": reference_function,
+                        "module_omitted": "artifact_controlled_lambda_reference",
+                        "function_omitted": "artifact_controlled_lambda_reference",
                         "reference_source": reference_source,
                     },
                     why=get_pattern_explanation("lambda_layer"),
@@ -1364,8 +1386,8 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module": reference_module,
-                        "function": reference_function,
+                        "module_omitted": "artifact_controlled_lambda_reference",
+                        "function_omitted": "artifact_controlled_lambda_reference",
                         "reference_source": reference_source,
                         "allowlist_status": "not_allowlisted",
                     },
@@ -1375,7 +1397,7 @@ class KerasH5Scanner(BaseScanner):
                 reference_requires_review = True
 
         if not reference_requires_review:
-            for reference_module, reference_function, reference_source in allowlisted_references:
+            for _reference_module, _reference_function, reference_source in allowlisted_references:
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=True,
@@ -1383,8 +1405,8 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         **callback_details,
-                        "module": reference_module,
-                        "function": reference_function,
+                        "module_omitted": "artifact_controlled_lambda_reference",
+                        "function_omitted": "artifact_controlled_lambda_reference",
                         "reference_source": reference_source,
                         "allowlist_status": "allowlisted",
                     },
@@ -1400,6 +1422,7 @@ class KerasH5Scanner(BaseScanner):
                     self._check_lambda_layer(
                         layer_config,
                         result,
+                        layer_name,
                         callback_field=auxiliary_field,
                     )
         # Don't flag Lambda layers without code - they might just be placeholders
@@ -1498,15 +1521,18 @@ class KerasH5Scanner(BaseScanner):
         """Return True when a Lambda module/function reference resolves to a risky symbol."""
         if isinstance(function_name, str):
             normalized_function_name = function_name.strip().lower()
-            if normalized_function_name in cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
-                return True
-
             function_tokens = {
-                token.strip().lower()
-                for token in re.split(r"[^0-9A-Za-z_]+", normalized_function_name)
-                if token.strip()
+                token.strip() for token in re.split(r"[^0-9A-Za-z_]+", normalized_function_name) if token.strip()
             }
-            if function_tokens & cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
+            normalized_module_name = module_name.strip().lower() if isinstance(module_name, str) else ""
+            function_leaf = normalized_function_name.rsplit(".", 1)[-1]
+            if (normalized_module_name, function_leaf) in cls._DANGEROUS_LAMBDA_MODULE_FUNCTION_PAIRS:
+                return True
+            if function_tokens & cls._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES:
+                return True
+            if (
+                not isinstance(module_name, str) or not module_name.strip()
+            ) and function_tokens & cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
                 return True
 
         if not isinstance(module_name, str):
@@ -1624,6 +1650,9 @@ class KerasH5Scanner(BaseScanner):
         config: Any,
         result: ScanResult,
         context: str = "",
+        *,
+        redact_nested_context: bool = False,
+        case_sensitive: bool = False,
     ) -> None:
         """Recursively check a configuration dictionary for suspicious strings"""
 
@@ -1636,7 +1665,11 @@ class KerasH5Scanner(BaseScanner):
             if isinstance(value, str):
                 # Check for suspicious strings
                 for suspicious_term in self.suspicious_config_props:
-                    if self._contains_suspicious_config_term(value, suspicious_term):
+                    if self._contains_suspicious_config_term(
+                        value,
+                        suspicious_term,
+                        case_sensitive=case_sensitive,
+                    ):
                         result.add_check(
                             name="Suspicious Configuration String Check",
                             passed=False,
@@ -1651,38 +1684,51 @@ class KerasH5Scanner(BaseScanner):
                         )
             elif isinstance(value, dict):
                 # Recursively check nested dictionaries
+                nested_context = context if redact_nested_context else f"{context}.{key}"
                 self._check_config_for_suspicious_strings(
                     value,
                     result,
-                    f"{context}.{key}",
+                    nested_context,
+                    redact_nested_context=redact_nested_context,
+                    case_sensitive=case_sensitive,
                 )
             elif isinstance(value, list):
                 # Check each item in the list
                 for i, item in enumerate(value):
                     if isinstance(item, dict):
+                        nested_context = context if redact_nested_context else f"{context}.{key}[{i}]"
                         self._check_config_for_suspicious_strings(
                             item,
                             result,
-                            f"{context}.{key}[{i}]",
+                            nested_context,
+                            redact_nested_context=redact_nested_context,
+                            case_sensitive=case_sensitive,
                         )
 
     @staticmethod
-    def _contains_suspicious_config_term(value: str, suspicious_term: str) -> bool:
+    def _contains_suspicious_config_term(
+        value: str,
+        suspicious_term: str,
+        *,
+        case_sensitive: bool = False,
+    ) -> bool:
         """Match suspicious config terms without substring hits inside benign identifiers."""
-        normalized_term = suspicious_term.strip().lower()
+        normalized_term = suspicious_term.strip()
         if not normalized_term:
             return False
 
-        normalized_value = value.lower()
+        if not case_sensitive:
+            normalized_term = normalized_term.lower()
+            value = value.lower()
         if normalized_term.replace("_", "").isalnum():
             normalized_core_term = normalized_term.strip("_")
             if not normalized_core_term:
                 return False
 
             pattern = rf"(?<![0-9A-Za-z])_*{re.escape(normalized_core_term)}_*(?![0-9A-Za-z])"
-            return re.search(pattern, normalized_value) is not None
+            return re.search(pattern, value) is not None
 
-        return normalized_term in normalized_value
+        return normalized_term in value
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract Keras H5 model metadata."""
