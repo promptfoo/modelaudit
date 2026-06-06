@@ -4284,18 +4284,22 @@ def test_scan_bytes_warns_when_meta_path_finder_shadows_framework_reference(
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
 
-    report = scan_bytes(payload, source="meta-path-shadowed-framework.pkl")
+    try:
+        report = scan_bytes(payload, source="meta-path-shadowed-framework.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-        for finding in report.findings
-    )
-    pickle.loads(payload)
-    assert marker.read_text(encoding="utf-8") == "owned"
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop("torch._utils", None)
+        sys.modules.pop("torch", None)
 
 
 @pytest.mark.skipif(not EXTENSION_SUFFIXES, reason="Python runtime has no native extension suffix")
