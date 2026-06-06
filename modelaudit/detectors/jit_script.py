@@ -5207,8 +5207,10 @@ def _deterministically_executed_expression_nodes(
                     continue
                 outer = argument.generators[0]
                 pending.extend(reversed(outer.ifs))
-                if _static_late_iter_truth(outer.iter) is False or any(
-                    _static_late_truth_value(condition) is False for condition in outer.ifs
+                if any(
+                    _static_late_iter_truth(generator.iter) is False
+                    or any(_static_late_truth_value(condition) is False for condition in generator.ifs)
+                    for generator in argument.generators
                 ):
                     continue
                 pending.append(argument.elt)
@@ -8436,13 +8438,21 @@ def _static_call_argument(call: ast.Call, position: int, keyword: str | None = N
     return None
 
 
-def _deterministic_named_expressions(expression: ast.AST) -> list[ast.NamedExpr]:
+def _deterministic_named_expressions(
+    expression: ast.AST,
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
+) -> list[ast.NamedExpr]:
     return sorted(
         (
             node
             for node in _deterministically_executed_expression_nodes(
                 expression,
-                eager_generator_consumers=_canonical_eager_generator_consumer_aliases(),
+                eager_generator_consumers=(
+                    _canonical_eager_generator_consumer_aliases()
+                    if eager_generator_consumers is None
+                    else eager_generator_consumers
+                ),
             )
             if isinstance(node, ast.NamedExpr)
         ),
@@ -10627,10 +10637,34 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
     ):
         return True
     parents, executed_statement_ids = _compact_module_scope_context(tree)
+    deterministic_named_expression_ids = {
+        id(named_expression)
+        for statement in _compact_deterministically_executed_statements(tree.body)
+        for expression in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not _source_defers_annotations(code_str.encode("utf-8")),
+        )
+        for named_expression in _deterministic_named_expressions(expression)
+    }
     for node in ast.walk(tree):
         if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
+            parent = parents.get(node)
+            if isinstance(parent, ast.NamedExpr) and id(parent) not in deterministic_named_expression_ids:
+                ancestor: ast.AST = parent
+                enclosing_generator: ast.GeneratorExp | None = None
+                while ancestor in parents:
+                    ancestor = parents[ancestor]
+                    if isinstance(ancestor, ast.GeneratorExp):
+                        enclosing_generator = ancestor
+                        break
+                if enclosing_generator is None or any(
+                    _static_late_iter_truth(generator.iter) is False
+                    or any(_static_late_truth_value(condition) is False for condition in generator.ifs)
+                    for generator in enclosing_generator.generators
+                ):
+                    continue
             return True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
             return True
@@ -12518,6 +12552,59 @@ def _compact_snippet_typed_print_overwrite_replay(
     builtins_dict_shadowed = False
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
 
+    def active_eager_generator_consumer_aliases(
+        aliases: Collection[str] | None = None,
+    ) -> dict[str, str]:
+        active_aliases = active_print_builtins_aliases if aliases is None else aliases
+        return {
+            **{consumer: consumer for consumer in _EAGER_LATE_GENERATOR_CONSUMERS},
+            **{
+                f"{alias}.{consumer}": consumer
+                for alias in active_aliases
+                for consumer in _EAGER_LATE_GENERATOR_CONSUMERS
+            },
+        }
+
+    def is_conditionally_evaluated_typed_call(node: ast.AST) -> bool:
+        if not _is_conditionally_evaluated_expression(node, parents):
+            return False
+        current = node
+        while current in parents:
+            current = parents[current]
+            if not isinstance(current, ast.GeneratorExp):
+                continue
+            outer_call = parents.get(current)
+            if isinstance(outer_call, ast.Call):
+                expression: ast.AST = outer_call
+                while expression in parents and not isinstance(parents[expression], ast.stmt):
+                    expression = parents[expression]
+                active_builtins_aliases: Collection[str] = _name_aliases_before_call(
+                    expression,
+                    outer_call,
+                    dict.fromkeys(active_print_builtins_aliases, True),
+                ).keys()
+            else:
+                active_builtins_aliases = ()
+            eager_consumer = (
+                _eager_generator_consumer_name(
+                    outer_call.func,
+                    active_eager_generator_consumer_aliases(active_builtins_aliases),
+                )
+                if isinstance(outer_call, ast.Call) and current in outer_call.args
+                else None
+            )
+            if (
+                eager_consumer is not None
+                and eager_consumer not in mutated_truthy_builtins
+                and all(
+                    _static_late_iter_truth(generator.iter) is True
+                    and all(_static_late_truth_value(condition) is True for condition in generator.ifs)
+                    for generator in current.generators
+                )
+            ):
+                return False
+        return True
+
     def class_scope_path(node: ast.AST) -> tuple[ast.ClassDef, ...]:
         path: list[ast.ClassDef] = []
         current = node
@@ -12696,9 +12783,12 @@ def _compact_snippet_typed_print_overwrite_replay(
     def active_dict_update_reference(reference: str | None) -> bool:
         if reference in dict_update_aliases:
             return True
-        if reference is None or not reference.endswith(".update"):
+        if reference is None:
             return False
-        return active_dict_reference(reference.removesuffix(".update"))
+        for suffix in (".update", ".__ior__"):
+            if reference.endswith(suffix):
+                return active_dict_reference(reference.removesuffix(suffix))
+        return False
 
     def active_dict_setitem_reference(reference: str | None) -> bool:
         if reference in dict_setitem_aliases:
@@ -13580,13 +13670,15 @@ def _compact_snippet_typed_print_overwrite_replay(
 
             def visit_For(self, node: ast.For) -> None:
                 self.visit(node.iter)
-                invalidate_rebound_target(node.target)
+                if _static_late_iter_truth(node.iter) is not False:
+                    invalidate_rebound_target(node.target)
                 for child in [*node.body, *node.orelse]:
                     self.visit(child)
 
             def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
                 self.visit(node.iter)
-                invalidate_rebound_target(node.target)
+                if _static_late_iter_truth(node.iter) is not False:
+                    invalidate_rebound_target(node.target)
                 for child in [*node.body, *node.orelse]:
                     self.visit(child)
 
@@ -13942,7 +14034,8 @@ def _compact_snippet_typed_print_overwrite_replay(
                     invalidate_target_owner,
                 )
         elif isinstance(statement, (ast.For, ast.AsyncFor)):
-            invalidate_rebound_target(statement.target)
+            if _static_late_iter_truth(statement.iter) is not False:
+                invalidate_rebound_target(statement.target)
         elif isinstance(statement, (ast.With, ast.AsyncWith)):
             for item in statement.items:
                 if item.optional_vars is not None:
@@ -13965,7 +14058,11 @@ def _compact_snippet_typed_print_overwrite_replay(
             expression_mapping_aliases = (
                 mapping_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else mapping_aliases
             )
-            for node in _deterministically_executed_expression_calls(value):
+            eager_generator_consumers = active_eager_generator_consumer_aliases()
+            for node in _deterministically_executed_expression_calls(
+                value,
+                eager_generator_consumers=eager_generator_consumers,
+            ):
                 reference = _simple_reference_name(node.func)
                 active_typed_aliases = _name_aliases_before_call(value, node, expression_typed_aliases)
                 active_typed_member_callable_aliases = _name_aliases_before_call(
@@ -14090,7 +14187,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14104,7 +14201,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.func.value.id],
                         _static_getattr_member_name(node.args[0]),
                         node.args[1],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14117,7 +14214,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14130,7 +14227,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14143,7 +14240,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.func.value.id],
                         _static_getattr_member_name(node.args[0]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14155,7 +14252,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14174,7 +14271,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_update(
                         update_owner,
                         node,
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
@@ -14198,7 +14295,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                                 setitem_owner,
                                 member_name,
                                 node.args[2],
-                                conditional=_is_conditionally_evaluated_expression(node, parents),
+                                conditional=is_conditionally_evaluated_typed_call(node),
                             )
                     continue
                 if active_dict_setdefault_reference(reference) and len(node.args) >= 3:
@@ -14206,7 +14303,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         owner_name(node.args[0], active_mapping_aliases, active_typed_aliases),
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14239,7 +14336,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_update(
                         update_owner,
                         node,
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14268,7 +14365,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                             setitem_owner,
                             member_name,
                             node.args[1],
-                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                            conditional=is_conditionally_evaluated_typed_call(node),
                         )
                     continue
                 if (
@@ -14288,7 +14385,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         setdefault_owner,
                         _static_getattr_member_name(node.args[0]),
                         node.args[1],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -14303,11 +14400,14 @@ def _compact_snippet_typed_print_overwrite_replay(
                     )
                     is not None
                     and node.args
-                    and not _is_conditionally_evaluated_expression(node, parents)
+                    and not is_conditionally_evaluated_typed_call(node)
                 ):
                     record_member_delete(delete_owner, _static_getattr_member_name(node.args[0]))
                     continue
-            for named_expression in _deterministic_named_expressions(value):
+            for named_expression in _deterministic_named_expressions(
+                value,
+                eager_generator_consumers=eager_generator_consumers,
+            ):
                 target_name = named_expression.target.id
                 canonical_module = expression_typed_aliases.get(_simple_reference_name(named_expression.value) or "")
                 if canonical_module is None:

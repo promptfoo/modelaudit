@@ -8790,6 +8790,45 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_rejects_lazy_consumer_after_same_expression_builtins_rebind(self) -> None:
+        source = (
+            b"import builtins as bi\nimport ctypes as c\n"
+            b"class Lazy:\n    @staticmethod\n    def list(values):\n        return values\n"
+            b"((bi := Lazy), bi.list(c.__dict__.update(CDLL=print) for _ in [0]))\n"
+            b"loader = c.CDLL\nloader('libpayload.so')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_alias_when_eager_generator_inner_iterable_is_empty(self) -> None:
+        source = (
+            b"import builtins as bi\nimport ctypes as c\nloader = c.CDLL\n"
+            b"bi.list((loader := print) for _ in [0] for __ in [])\n"
+            b"loader('libpayload.so')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_accepts_builtin_print_after_statically_empty_generator_walrus(self) -> None:
+        source = b"import ctypes as c\nunused = ((print := eval) for _ in [])\nc.CDLL = print\nc.CDLL('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         "mutation",
         [
