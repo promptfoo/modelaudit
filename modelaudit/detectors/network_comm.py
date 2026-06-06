@@ -11,6 +11,8 @@ from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
+from functools import lru_cache
+from importlib.resources import files
 from typing import Any, ClassVar
 from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
@@ -125,37 +127,7 @@ _NON_CREDENTIAL_AUTHORIZATION_VALUES = frozenset(
     }
 )
 _RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
-_COMMON_SINGLE_LABEL_PUBLIC_SUFFIXES = frozenset({"com", "edu", "gov", "int", "mil", "net", "org"})
-_COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
-_COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
-    {
-        "akamaized.net",
-        "appspot.com",
-        "azureedge.net",
-        "azurewebsites.net",
-        "blob.core.windows.net",
-        "blogspot.com",
-        "cloudfront.net",
-        "fastly.net",
-        "firebaseapp.com",
-        "gitbook.io",
-        "github.io",
-        "gitlab.io",
-        "googleusercontent.com",
-        "gradio.app",
-        "herokuapp.com",
-        "netlify.app",
-        "pages.dev",
-        "readthedocs.io",
-        "rtfd.io",
-        "sourceforge.net",
-        "s3.amazonaws.com",
-        "storage.googleapis.com",
-        "streamlit.io",
-        "vercel.app",
-        "web.app",
-    }
-)
+_PUBLIC_SUFFIX_LIST_PATH = ("config", "data", "public_suffix_list.dat")
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9])"
     rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
@@ -707,20 +679,43 @@ def _authorization_scheme_has_payload(scheme: str, following_value: str | None) 
     return not _looks_like_known_artifact_filename(following_value)
 
 
+@lru_cache(maxsize=1)
+def _public_suffix_rules() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    exact_rules: set[str] = set()
+    wildcard_rules: set[str] = set()
+    exception_rules: set[str] = set()
+    resource = files("modelaudit")
+    for path_component in _PUBLIC_SUFFIX_LIST_PATH:
+        resource = resource.joinpath(path_component)
+    for raw_line in resource.read_text(encoding="utf-8").splitlines():
+        rule = raw_line.partition("//")[0].strip().casefold()
+        if not rule:
+            continue
+        if rule.startswith("!"):
+            exception_rules.add(rule[1:])
+        elif rule.startswith("*."):
+            wildcard_rules.add(rule[2:])
+        else:
+            exact_rules.add(rule)
+    return frozenset(exact_rules), frozenset(wildcard_rules), frozenset(exception_rules)
+
+
 def _hostname_public_suffix_label_count(normalized_labels: list[str]) -> int:
-    suffix_labels = (
-        1 if len(normalized_labels) == 1 or normalized_labels[-1] in _COMMON_SINGLE_LABEL_PUBLIC_SUFFIXES else 2
-    )
-    if (
-        len(normalized_labels) >= 2
-        and len(normalized_labels[-1]) == 2
-        and normalized_labels[-2] in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS
-    ):
-        suffix_labels = 2
-    for public_suffix in _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES:
-        public_suffix_labels = public_suffix.split(".")
-        if normalized_labels[-len(public_suffix_labels) :] == public_suffix_labels:
-            suffix_labels = max(suffix_labels, len(public_suffix_labels))
+    labels = normalized_labels[:-1] if normalized_labels and not normalized_labels[-1] else normalized_labels
+    if not labels:
+        return 1
+
+    exact_rules, wildcard_rules, exception_rules = _public_suffix_rules()
+    suffix_labels = 1
+    for start_index in range(len(labels)):
+        suffix = ".".join(labels[start_index:])
+        rule_label_count = len(labels) - start_index
+        if suffix in exception_rules:
+            return max(1, rule_label_count - 1)
+        if suffix in exact_rules:
+            suffix_labels = max(suffix_labels, rule_label_count)
+        if start_index + 1 < len(labels) and ".".join(labels[start_index + 1 :]) in wildcard_rules:
+            suffix_labels = max(suffix_labels, rule_label_count)
     return suffix_labels
 
 
@@ -737,17 +732,19 @@ def _hostname_authorization_scheme_has_payload(
         return True
 
     normalized_labels = [label.casefold() for label in labels]
+    if normalized_labels and not normalized_labels[-1]:
+        normalized_labels.pop()
     remaining_hostname = ".".join(normalized_labels[scheme_index + 1 :])
     public_suffix_labels = _hostname_public_suffix_label_count(normalized_labels)
-    labels_after_scheme = len(labels) - (scheme_index + 1)
+    labels_after_scheme = len(normalized_labels) - (scheme_index + 1)
     if scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES:
         if remaining_hostname in _RESERVED_EXAMPLE_DOMAINS:
             return False
         return not (public_suffix_labels > 1 and labels_after_scheme == public_suffix_labels + 1)
 
-    # Without a bundled PSL, retain one registrable label plus the bounded
-    # public/private suffix estimate before treating an earlier label as payload.
-    labels_after_payload = len(labels) - (scheme_index + 2)
+    # Retain one registrable label plus the PSL suffix before treating an earlier
+    # label as an authorization payload.
+    labels_after_payload = len(normalized_labels) - (scheme_index + 2)
     return labels_after_payload >= public_suffix_labels + 1
 
 
@@ -812,6 +809,7 @@ def _looks_like_hostname_credential_value(label: str) -> bool:
     return (
         _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded) is not None
         or _looks_like_capability_path_token(decoded)
+        or any(character.isdigit() for character in decoded)
         or any(normalized.startswith(marker) or normalized.endswith(marker) for marker in sensitive_markers)
     )
 

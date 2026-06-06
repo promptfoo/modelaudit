@@ -160,22 +160,67 @@ class TestNetworkCommDetector:
             "https://auth.<redacted>.bucket.s3.amazonaws.com/path",
         ]
 
-    def test_authorization_hostname_conservatively_preserves_unlisted_public_suffix_context(self) -> None:
-        """Unknown two-label suffixes must retain their registrable hostname label."""
-        url = "https://auth.token.example.workers.dev/path"
+    @pytest.mark.parametrize("scheme", ["token", "Bearer"])
+    def test_authorization_hostname_preserves_psl_private_suffix_context(self, scheme: str) -> None:
+        """Private PSL suffixes must retain their registrable hostname label."""
+        url = f"https://auth.{scheme}.example.workers.dev/path"
 
         redacted = network_comm.redact_url_for_finding(url)
-        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
 
         assert redacted == "https://auth.<redacted>.example.workers.dev/path"
-        assert any(finding.get("url") == redacted for finding in findings)
 
-    def test_authorization_hostname_unknown_suffix_still_redacts_credential_shaped_payload(self) -> None:
-        url = "https://auth.token.SECRET123.workers.dev/path"
+    def test_authorization_hostname_psl_context_survives_full_scan(self) -> None:
+        url = "https://auth.token.example.workers.dev/path"
+
+        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://auth.<redacted>.example.workers.dev/path" in serialized
+        assert "auth.<redacted>.<redacted>.workers.dev" not in serialized
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://auth.token.hunter2.co.uk/path",
+            "https://auth.Bearer.hunter2.pages.dev/path",
+            "https://auth.token.hunter2.workers.dev/path",
+        ],
+    )
+    def test_authorization_hostname_redacts_low_entropy_payload_before_psl_suffix(self, url: str) -> None:
+        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "hunter2" not in serialized
+
+    @pytest.mark.parametrize("scheme", ["token", "Bearer"])
+    def test_authorization_hostname_preserves_psl_context_with_root_dot(self, scheme: str) -> None:
+        url = f"https://auth.{scheme}.example.workers.dev./path"
 
         redacted = network_comm.redact_url_for_finding(url)
 
-        assert redacted == "https://auth.<redacted>.<redacted>.workers.dev/path"
+        assert redacted == "https://auth.<redacted>.example.workers.dev./path"
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (
+                "https://auth.token.example.foo.ck/path",
+                "https://auth.<redacted>.example.foo.ck/path",
+            ),
+            (
+                "https://auth.token.payload.example.www.ck/path",
+                "https://auth.<redacted>.<redacted>.example.www.ck/path",
+            ),
+        ],
+    )
+    def test_authorization_hostname_applies_psl_wildcard_and_exception_rules(
+        self,
+        url: str,
+        expected: str,
+    ) -> None:
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == expected
 
     def test_authorization_hostname_redacts_ambiguous_payload_with_extra_domain_context(self) -> None:
         """Ambiguous schemes still carry redaction when enough hostname context remains."""
