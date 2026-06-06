@@ -3177,6 +3177,43 @@ def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_pa
     )
 
 
+def test_lambda_nested_config_suspicious_terms_remain_case_insensitive(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "uppercase_nested_lambda_config",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "lambda x: x",
+                            "metadata": {"callback": "OS.SYSTEM", "runner": "SubProcess"},
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="uppercase_nested_lambda_config.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    suspicious_terms = {
+        check.details.get("suspicious_term")
+        for check in result.checks
+        if check.name == "Suspicious Configuration String Check" and check.status == CheckStatus.FAILED
+    }
+    assert {"system", "subprocess"}.issubset(suspicious_terms)
+    assert all(
+        check.details.get("context") == "Lambda"
+        for check in result.checks
+        if check.name == "Suspicious Configuration String Check" and check.status == CheckStatus.FAILED
+    )
+
+
 def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,

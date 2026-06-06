@@ -4,26 +4,51 @@ import inspect
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import click
 
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
-from modelaudit.utils.sources.cloud_storage import get_fs_protocol
+from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud_error_for_display
 
 from .detection import _has_zip_magic
+
+_MAX_STREAM_SOURCE_PATH_DECODE_PASSES = 4
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
     # Currently support streaming for pickle files
     # Can be extended to other formats that support partial reads
-    parsed = urlparse(url)
-    path = Path(parsed.path)
+    path = Path(stream_source_path(url))
     suffix = path.suffix.lower()
     return suffix in {".pkl", ".pickle", ".joblib"}
+
+
+def stream_source_path(url: str) -> str:
+    """Return the decoded URL path used for scanner routing and file naming."""
+    parsed_path = urlparse(url).path
+    for _ in range(_MAX_STREAM_SOURCE_PATH_DECODE_PASSES):
+        decoded_path = unquote(parsed_path)
+        if decoded_path == parsed_path:
+            break
+        parsed_path = decoded_path
+
+    fallback_prefix: str | None = None
+    for index, character in enumerate(parsed_path):
+        if character not in "?#":
+            continue
+        prefix = parsed_path[:index]
+        encoded_suffix = parsed_path[index + 1 :]
+        if Path(prefix).suffix:
+            return prefix or url
+        if fallback_prefix is None and any(delimiter in encoded_suffix for delimiter in "=&;"):
+            fallback_prefix = prefix
+    if fallback_prefix is not None:
+        return fallback_prefix or url
+    return parsed_path or url
 
 
 def _scan_stream_accepts_source_keyword(method: Any) -> bool:
@@ -111,7 +136,8 @@ def stream_analyze_file(
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)
-        temp_file.name = Path(url).name
+        source_path = stream_source_path(url)
+        temp_file.name = Path(source_path).name
 
         issues: list[Issue] = []
         metadata: dict[str, Any] = {}
@@ -151,7 +177,7 @@ def stream_analyze_file(
             metadata.update(scan_result.metadata)
 
         # Fallback manual checks for pickle headers when scanner doesn't support partial scans
-        if scan_result is None and Path(url).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
+        if scan_result is None and Path(source_path).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
             dangerous_patterns = [
                 b"os\nsystem",
                 b"subprocess",
@@ -250,7 +276,7 @@ def stream_analyze_file(
         try:
             ctx = click.get_current_context(silent=True)
             if ctx and ctx.params.get("verbose"):
-                click.echo(f"Streaming analysis failed: {e}")
+                click.echo(f"Streaming analysis failed: {redact_cloud_error_for_display(e, url)}")
         except Exception:
             # Not in a Click context, just log silently
             pass
