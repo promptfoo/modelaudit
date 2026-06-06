@@ -1599,6 +1599,154 @@ def test_encoded_nested_url_path_near_match_is_preserved() -> None:
     assert REDACTED_EVIDENCE_VALUE not in redacted
 
 
+def test_encoded_nested_url_query_value_secret_is_redacted() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3Dapi_key%253Dhunter2"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize("header", ["Authorization", "Proxy-Authorization"])
+def test_encoded_nested_url_query_authorization_value_is_redacted(header: str) -> None:
+    text = f"https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3D{header}%253ABearer%2520hunter2"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_nested_url_query_value_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3Dapi_key_hint%253Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+def test_encoded_nested_url_query_authorization_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3DAuthorizationPolicy%253Apublic"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+@pytest.mark.parametrize(
+    "nested_reference",
+    [
+        "%2F%2Fnested.evil%2F%3Ffoo%3Dapi_key%253Dhunter2",
+        "%2Fredirect%3Ffoo%3Dapi_key%253Dhunter2",
+        "%3Ffoo%3Dapi_key%253Dhunter2",
+    ],
+)
+def test_encoded_nested_relative_query_value_secret_is_redacted(nested_reference: str) -> None:
+    text = f"https://collector.evil/upload?next={nested_reference}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    ("nested_reference", "secret"),
+    [
+        ("%2F%2Falice%3Ahunter2%40nested.evil%2Fpath", "hunter2"),
+        ("%2Fapi_key%253Dhunter3", "hunter3"),
+    ],
+)
+def test_encoded_nested_relative_reference_secrets_are_redacted(
+    nested_reference: str,
+    secret: str,
+) -> None:
+    text = f"https://collector.evil/upload?next={nested_reference}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    "nested_reference",
+    [
+        "%2F%2Fnested.evil%2Fpublic",
+        "%2Fapi_key_hint%253Dpublic",
+    ],
+)
+def test_encoded_nested_relative_reference_near_matches_are_preserved(nested_reference: str) -> None:
+    text = f"https://collector.evil/upload?next={nested_reference}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+@pytest.mark.parametrize(
+    ("nested_reference", "secret"),
+    [
+        ("https%3A%2F%2Fnested.evil%2F%23api_key%253Dhunter4", "hunter4"),
+        ("%23api_key%253Dhunter5", "hunter5"),
+    ],
+)
+def test_encoded_nested_fragment_secrets_are_redacted(nested_reference: str, secret: str) -> None:
+    text = f"https://collector.evil/upload?next={nested_reference}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_nested_fragment_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?next=%23api_key_hint%253Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+@pytest.mark.parametrize(
+    ("nested_reference", "secret"),
+    [
+        ("https%3A%2F%2Fnested.evil%3Aapi_key%253Dhunter6%2Fpath", "hunter6"),
+        ("https%3A%2F%2F%5Binvalid%2Fapi_key%253Dhunter7", "hunter7"),
+    ],
+)
+def test_encoded_nested_malformed_authority_is_redacted(nested_reference: str, secret: str) -> None:
+    text = f"https://collector.evil/upload?next={nested_reference}"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_nested_url_query_bearer_value_is_redacted() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3DBearer%2520hunter2"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_nested_url_query_bearer_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2F%3Ffoo%3DBearerPolicy%2520public"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
 @pytest.mark.parametrize(
     "text",
     [

@@ -9,7 +9,7 @@ import string
 import tokenize
 import unicodedata
 from typing import Final, TypeAlias
-from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from ._evidence_redaction import (
     AUTHORIZATION_ALIAS_ASSIGNMENT_KEY as SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY,
@@ -26,6 +26,7 @@ REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
 MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
+MAX_NESTED_URL_QUERY_DEPTH: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
 MAX_KEY_EXPRESSION_CHARS: Final[int] = 300
 MAX_KEY_EXPRESSION_PARSE_ATTEMPTS: Final[int] = 64
@@ -488,29 +489,83 @@ def _is_sensitive_query_key(key: str) -> bool:
     return _redacted_sensitive_query_key(key) is not None
 
 
-def _query_value_contains_secret(value: str) -> bool:
+def _url_authority_contains_secret(parsed: SplitResult) -> bool:
+    if "@" in parsed.netloc:
+        return True
+    if ":" not in parsed.netloc:
+        return False
+    try:
+        _ = parsed.port
+    except ValueError:
+        return True
+    return False
+
+
+def _query_contains_secret(query: str, *, nested_depth: int) -> bool:
+    for part in re.split(r"[&;]", query):
+        for key, nested_value in parse_qsl(part, keep_blank_values=True):
+            if _is_sensitive_query_key(key):
+                return True
+            if nested_depth >= MAX_NESTED_URL_QUERY_DEPTH:
+                return True
+            if _query_value_contains_secret(nested_value, nested_depth=nested_depth + 1):
+                return True
+    return False
+
+
+def _query_value_contains_secret(value: str, *, nested_depth: int = 0) -> bool:
     decoded, decoding_complete = _decode_query_component(value)
     if not decoding_complete:
         return True
 
-    if re.search(rf"(?i)(?:^|[?&;])\s*{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]", decoded):
+    if re.search(
+        rf"(?i)(?:^|[?&;])\s*(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})\s*[:=]",
+        decoded,
+    ):
+        return True
+    if BEARER_VALUE_RE.search(decoded):
         return True
     if STRUCTURED_SENSITIVE_KEY_RE.search(decoded):
         return True
+
+    try:
+        parsed_reference = urlsplit(decoded)
+    except ValueError:
+        return True
+    if parsed_reference is not None:
+        if _url_authority_contains_secret(parsed_reference):
+            return True
+        if _redact_sensitive_url_path(parsed_reference.path) != parsed_reference.path:
+            return True
+        if parsed_reference.query and _query_contains_secret(
+            parsed_reference.query,
+            nested_depth=nested_depth,
+        ):
+            return True
+        if parsed_reference.fragment:
+            if nested_depth >= MAX_NESTED_URL_QUERY_DEPTH:
+                return True
+            if _query_value_contains_secret(
+                parsed_reference.fragment,
+                nested_depth=nested_depth + 1,
+            ):
+                return True
 
     for nested_url in URL_RE.finditer(decoded):
         try:
             parsed = urlsplit(nested_url.group(0))
         except ValueError:
-            if "@" in nested_url.group(0):
-                return True
-            continue
-        if "@" in parsed.netloc:
+            return True
+        if _url_authority_contains_secret(parsed):
             return True
         if _redact_sensitive_url_path(parsed.path) != parsed.path:
             return True
-        for part in re.split(r"[&;]", parsed.query):
-            if any(_is_sensitive_query_key(key) for key, _ in parse_qsl(part, keep_blank_values=True)):
+        if _query_contains_secret(parsed.query, nested_depth=nested_depth):
+            return True
+        if parsed.fragment:
+            if nested_depth >= MAX_NESTED_URL_QUERY_DEPTH:
+                return True
+            if _query_value_contains_secret(parsed.fragment, nested_depth=nested_depth + 1):
                 return True
     return False
 

@@ -1127,8 +1127,8 @@ def test_catboost_sarif_redacts_computed_auth_and_falsy_key_evidence_preserving_
     assert "CATBOOST_EMPTYDICT_RAW_SECRET" not in sarif
     assert "client_secret = os.system" in failed_details
     assert "client_secret=(os.system" in failed_details
-    assert "client_secret = os.system" in sarif
-    assert "client_secret=(os.system" in sarif
+    assert "client_secret = <redacted>" in sarif
+    assert "client_secret=<redacted>" in sarif
 
 
 def test_catboost_sarif_redacts_subscript_auth_token_and_bare_key_evidence(tmp_path: Path) -> None:
@@ -1386,9 +1386,9 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
     assert "touch /tmp/pwned" in failed_details
     assert "subprocess" in sarif
     assert "bash -c" in sarif
-    assert "curl --password" in sarif
-    assert "curl --user" in sarif
-    assert "curl -ualice:" in sarif
+    assert "--password <redacted>" in sarif
+    assert "--user 'alice:<redacted>'" in sarif
+    assert "-ualice:<redacted>" in sarif
     assert "collector.evil.example" in sarif
     assert "touch /tmp/pwned" in sarif
 
