@@ -554,6 +554,44 @@ class TestShardedModelDetector:
         assert b"outside" not in scanned_payloads
         assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
 
+    def test_shard_same_size_rewrite_after_detection_fails_before_scan(self, tmp_path: Path) -> None:
+        """A same-size rewrite cannot replace the validated shard before its worker opens it."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"safe")
+        scanned_payloads: list[bytes] = []
+
+        class RecordingScanner:
+            name = "recording_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                result = ScanResult(scanner_name=self.name)
+                result.finish(success=True)
+                return result
+
+        handler = AdvancedFileHandler(str(shard_one), RecordingScanner())
+        original_stat = shard_two.stat()
+        shard_two.write_bytes(b"evil")
+        os.utime(
+            shard_two,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000),
+        )
+
+        result = handler.scan()
+
+        assert b"evil" not in scanned_payloads
+        assert result.success is False
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Shard Scan"
+            and check.status == CheckStatus.FAILED
+            and check.location == str(shard_two)
+            and check.details["exception_type"] == "OSError"
+            for check in result.checks
+        )
+
     def test_shard_target_swap_during_scan_discards_clean_result(
         self,
         tmp_path: Path,

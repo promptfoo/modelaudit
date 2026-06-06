@@ -984,6 +984,8 @@ class ParallelShardHandler:
                 expected_device = target.get("device")
                 expected_inode = target.get("inode")
                 expected_size = target.get("size")
+                expected_mtime_ns = target.get("mtime_ns")
+                expected_ctime_ns = target.get("ctime_ns")
                 if not isinstance(resolved_path, str):
                     raise OSError(f"Missing validated target for shard {Path(shard_path).name}")
 
@@ -1006,6 +1008,10 @@ class ParallelShardHandler:
                         raise OSError(f"Validated shard identity changed {phase}: {Path(shard_path).name}")
                     if isinstance(expected_size, int) and current_stat.st_size != expected_size:
                         raise OSError(f"Validated shard size changed {phase}: {Path(shard_path).name}")
+                    if (isinstance(expected_mtime_ns, int) and current_stat.st_mtime_ns != expected_mtime_ns) or (
+                        isinstance(expected_ctime_ns, int) and current_stat.st_ctime_ns != expected_ctime_ns
+                    ):
+                        raise OSError(f"Validated shard timestamp changed {phase}: {Path(shard_path).name}")
                     return current_stat
 
                 target_validator = _validate_target
