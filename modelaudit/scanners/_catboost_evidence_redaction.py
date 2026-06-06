@@ -214,11 +214,12 @@ COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
 )
-COMMAND_SECRET_LONG_OPTION_PATTERN: Final[str] = (
-    r"--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
+COMMAND_SECRET_LONG_OPTION_NAME_PATTERN: Final[str] = (
+    r"(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
     r"proxy-tls-?password|tls-?password|ftp-account|ftp-password|http-password|oauth2-bearer|"
     r"client[_-]?secret|api[_-]?key|token|secret)"
 )
+COMMAND_SECRET_LONG_OPTION_PATTERN: Final[str] = rf"--{COMMAND_SECRET_LONG_OPTION_NAME_PATTERN}"
 COMMAND_SECRET_OPTION_PREFIX_PATTERN: Final[str] = (
     rf"(?:(?<!\w){COMMAND_SECRET_LONG_OPTION_PATTERN}|(?<!\w)-b)(?:=|\s+)"
 )
@@ -301,6 +302,22 @@ COMMAND_NETRC_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_TOKEN_SEPARATOR: Final[str] = r"(?:[\"']?\s*,\s*[\"']?|\s+)"
 COMMAND_POSITIONAL_VALUE_SEPARATOR: Final[str] = r"(?:\s*=|\s+|[\"']?\s*,\s*)"
 COMMAND_POSITIONAL_SECRET_VALUE: Final[str] = r"(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|),\]]+)"
+COMMAND_CONFIG_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?<![?&/\w-]){COMMAND_SECRET_LONG_OPTION_NAME_PATTERN}(?![\w-])"
+    rf"\s*(?:=|:|\s+)\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
+NPMRC_SCOPED_AUTH_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?:^|[\s\"'])//[^\s\"';&|)=]+/:"
+    rf"(?:(?:_auth(?:token)?|_password)|username)\s*=\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
+MYSQL_ATTACHED_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?s)(?P<prefix>(?i:\bmysql\b)(?:(?![;&|\n]).){0,1024}?(?<![\w-])-p)"
+    r"(?P<value>[^\s\"';&|),\]]+)"
+)
+MYSQL_SEPARATED_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?s)(?P<prefix>(?i:\bmysql\b)(?:(?![;&|\n]).){{0,1024}}?(?<![\w-])-p(?![\w-])"
+    rf"{COMMAND_POSITIONAL_VALUE_SEPARATOR})(?P<value>(?!\$?[\"']?-){COMMAND_POSITIONAL_SECRET_VALUE})"
+)
 DOCKER_LOGIN_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\bdocker{COMMAND_TOKEN_SEPARATOR}login\b"
     rf"[^;&|\n]{{0,1024}}?(?<!\w)-p(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
@@ -313,7 +330,9 @@ AWS_CONFIGURE_SET_SECRET_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_PROGRAM_SHORT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?:(?:sshpass\b[^;&|\n]{{0,1024}}?(?<!\w)-p)|"
-    rf"(?:redis-cli\b[^;&|\n]{{0,1024}}?(?<!\w)-a))(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?:redis-cli\b[^;&|\n]{{0,1024}}?(?<!\w)-a)|"
+    rf"(?:twine{COMMAND_TOKEN_SEPARATOR}upload\b[^;&|\n]{{0,1024}}?(?<!\w)-(?-i:p)))"
+    rf"(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
     rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
@@ -2364,6 +2383,7 @@ def _redact_inline_curl_config_passwords(text: str) -> str:
         else:
             fragment = COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
             fragment = COMMAND_CONFIG_USER_PASSWORD_RE.sub(_redact_command_user_password, fragment)
+            fragment = COMMAND_CONFIG_SECRET_OPTION_RE.sub(_redact_command_positional_secret, fragment)
         text = f"{text[:start]}{fragment}{text[end:]}"
     return text
 
@@ -2851,9 +2871,12 @@ def _redact_command_string_literals(text: str) -> str:
 
 def _redact_command_evidence_text(text: str) -> str:
     redacted = _redact_inline_curl_config_passwords(text)
+    redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
     redacted = DOCKER_LOGIN_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = AWS_CONFIGURE_SET_SECRET_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = MYSQL_ATTACHED_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = MYSQL_SEPARATED_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_PROGRAM_SHORT_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", redacted)
     redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
@@ -2953,5 +2976,6 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
+    redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = _redact_shared_provider_tokens(redacted)
     return _truncate(_escape_evidence_controls(redacted), max_chars)

