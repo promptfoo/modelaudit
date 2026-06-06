@@ -4691,6 +4691,95 @@ class TestJITScriptDetector:
                 b"except RuntimeError:\n    pass\nopener = wb.open\nopener('https://example.invalid')\n",
                 "Web browser launch detected",
             ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nif condition:\n    wb = Holder\n"
+                b"else:\n    wb.open = original\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nif condition:\n    wb.open = original\n"
+                b"    opener = wb.open\nopener('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"",
+                b"import builtins as bi\nimport webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"(bi.list((opener := original) for _ in [0]), opener('https://example.invalid'))\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins as bi\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\n"
+                b"(bi.list((opener := original) for _ in [0]), opener('https://example.invalid'))\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nsetattr((bi := builtins), 'print', original)\n"
+                b"wb.open = bi.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ndel builtins.__dict__['print']\n"
+                b"dict.setdefault(builtins.__dict__, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"",
+                b"import builtins\nimport webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"((bi := builtins), bi.list((opener := original) for _ in [0]), "
+                b"opener('https://example.invalid'))\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\nbuiltins.__dict__.pop('print')\n"
+                b"dict.setdefault(builtins.__dict__, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ndelattr(builtins, 'print')\n"
+                b"dict.setdefault(builtins.__dict__, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nwb.open = print\ndelete = dict.__delitem__\n"
+                b"delete(builtins.__dict__, 'print')\n"
+                b"dict.setdefault(builtins.__dict__, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"original = wb.open\nif condition:\n    del builtins.__dict__['print']\n"
+                b"dict.setdefault(builtins.__dict__, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"safe_print = print\noriginal = wb.open\nbuiltins.print = original\n"
+                b"if condition:\n    del builtins.__dict__['print']\n"
+                b"dict.setdefault(builtins.__dict__, 'print', safe_print)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import builtins\nimport webbrowser as wb\n",
+                b"safe_print = print\noriginal = wb.open\nbuiltins.print = original\n"
+                b"try:\n    setattr(builtins.__dict__, 'print', safe_print)\n"
+                b"except AttributeError:\n    pass\nwb.open = builtins.print\n"
+                b"wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
         ],
     )
     def test_scan_model_preserves_dangerous_typed_member_captured_before_safe_overwrite(
@@ -8890,6 +8979,118 @@ class TestJITScriptDetector:
         )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("setup", "default"),
+        [
+            (b"", b"original"),
+            (b"original_print = builtins.print\ndel builtins.__dict__['print']\n", b"original_print"),
+        ],
+    )
+    def test_scan_model_ignores_safe_builtin_print_setdefault(self, setup: bytes, default: bytes) -> None:
+        source = (
+            b"import builtins\nimport webbrowser as wb\n"
+            b"original = wb.open\nwb.open = print\n"
+            + setup
+            + b"dict.setdefault(builtins.__dict__, 'print', "
+            + default
+            + b")\n"
+            b"wb.open = builtins.print\nwb.open('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_accepts_safe_else_after_uncertain_typed_alias_rebind(self) -> None:
+        source = (
+            b"import webbrowser as wb\nwb.open = print\n"
+            b"if condition:\n    wb = Holder\nelse:\n    wb.open = print\n"
+            b"wb.open('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("setup", "target"),
+        [
+            (b"", b"builtins.__dict__"),
+            (b"mapping = builtins.__dict__\n", b"mapping"),
+            (b"", b"vars(builtins)"),
+        ],
+    )
+    def test_scan_model_rejects_failed_setattr_on_builtin_mapping(self, setup: bytes, target: bytes) -> None:
+        source = (
+            b"import builtins\nimport webbrowser as wb\nsafe_print = print\n"
+            b"original = wb.open\nbuiltins.print = original\n"
+            + setup
+            + b"try:\n    setattr("
+            + target
+            + b", 'print', safe_print)\nexcept AttributeError:\n    pass\n"
+            b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_failed_dangerous_setattr_on_builtin_mapping(self) -> None:
+        source = (
+            b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+            b"try:\n    setattr(builtins.__dict__, 'print', original)\n"
+            b"except AttributeError:\n    pass\nwb.open = builtins.print\nwb.open('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_rebound_inherited_eager_builtin_alias(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport builtins as bi\nimport webbrowser as wb\n"
+            + padding
+            + b"class Lazy:\n    @staticmethod\n    def list(values):\n        return values\n"
+            b"bi = Lazy\noriginal = wb.open\nwb.open = print\n"
+            b"(bi.list((opener := original) for _ in [0]), opener('safe'))\n" + padding
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_rebound_inherited_typed_alias(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport builtins as bi\nimport webbrowser as wb\n"
+            + padding
+            + b"class Holder:\n    open = print\nwb = Holder\noriginal = wb.open\nwb.open = print\n"
+            b"(bi.list((opener := original) for _ in [0]), opener('safe'))\n" + padding
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
 
         assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
