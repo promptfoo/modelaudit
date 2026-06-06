@@ -213,6 +213,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - prevent sharded-model scans from accepting changed family membership, stale shard identities, or unsafe aliases
+- validate OCI layer member and link metadata without suppressing regular-file payload scans, while preserving valid container-root symlinks
+- prevent cache identity checks from accepting temporary higher-ancestor path swaps
 - preflight MLflow artifact sizes and copy supported local repositories under hard byte limits, rejecting unsafe paths, size drift, and backends that cannot enforce the configured download budget
 - omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; clean up temporary Python compiler artifacts; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
 - fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
@@ -229,6 +231,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - omit sensitive LightGBM model excerpts and network values from finding evidence
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets
 - restrict bearer-token authentication to validated HTTPS base API hosts before requests and preserve prior credential routing when config persistence fails
+- redact credential-bearing and unrelated URL context from network and C&C finding snippets while preserving nested query and fragment endpoints
 - enforce JFrog file and folder download size budgets before and during remote artifact transfer, and bound Storage API metadata responses
 - validate and bound OCI gzip framing and raw TAR metadata before parsing layers, preventing decompression-budget dilution and malformed-trailer bypasses
 - fail closed on embedded Keras HDF5 weights when `h5py` is unavailable while preserving full-payload, generic, and concatenated user-block security findings
