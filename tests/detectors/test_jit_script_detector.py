@@ -9246,6 +9246,36 @@ class TestJITScriptDetector:
 
         assert "bi" in aliases
 
+    def test_prefix_alias_rebinding_fallback_skips_parseable_tail_lines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\nimport webbrowser as wb\n" + padding + b"bi = holder\nwb = holder\n"
+        calls = 0
+        original = jit_script_module._has_late_alias_rebinding
+
+        def track_fallback(candidate: bytes, alias: str) -> bool:
+            nonlocal calls
+            calls += 1
+            return original(candidate, alias)
+
+        monkeypatch.setattr(jit_script_module, "_has_late_alias_rebinding", track_fallback)
+
+        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+
+        assert "bi" not in builtins_aliases
+        assert "wb" not in typed_aliases
+        assert calls == 0
+
+    def test_prefix_alias_rebinding_fallback_handles_malformed_tail_lines(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\nimport webbrowser as wb\n" + padding + b"bi = holder +\nwb = holder +\n"
+
+        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+
+        assert "bi" not in builtins_aliases
+        assert "wb" not in typed_aliases
+
     def test_prefix_typed_aliases_discover_module_import_in_tail(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = padding + b"import webbrowser as wb\nalias = wb.open\n"

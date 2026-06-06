@@ -850,9 +850,10 @@ def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
 
     tail = candidate[prefix_end:]
     for line, statements in _compact_tail_module_lines(tail):
-        for alias in list(aliases):
-            if _has_late_alias_rebinding(line, alias):
-                aliases.discard(alias)
+        if not statements:
+            for alias in list(aliases):
+                if _has_late_alias_rebinding(line, alias):
+                    aliases.discard(alias)
         for statement in statements:
             _update_compact_builtins_aliases(statement, aliases)
     return frozenset(aliases - {"builtins", "__builtins__"})
@@ -905,9 +906,10 @@ def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
 
     tail = candidate[prefix_end:]
     for line, statements in _compact_tail_module_lines(tail):
-        for alias_name in list(aliases):
-            if _has_late_alias_rebinding(line, alias_name):
-                aliases.pop(alias_name, None)
+        if not statements:
+            for alias_name in list(aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    aliases.pop(alias_name, None)
         for statement in statements:
             _update_compact_typed_import_aliases(statement, aliases)
     return aliases
