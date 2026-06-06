@@ -136,9 +136,18 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     re.sub(r"[._-]", "", key.lower()) for key in SENSITIVE_QUERY_KEYS
 )
+COMPACT_SENSITIVE_KEY_PREFIX: Final[str] = (
+    r"(?:db|database|pg|postgres(?:ql)?|mysql|mariadb|mongo(?:db)?|redis|github|gitlab|bitbucket|slack|stripe|"
+    r"npm|pypi|docker|registry|huggingface|hf|openai|anthropic|azure|gcp|google)"
+)
+COMPACT_PREFIXED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?:{COMPACT_SENSITIVE_KEY_PREFIX}(?:password|token|secret)|"
+    r"(?-i:[A-Z0-9]+(?:PASSWORD|TOKEN|SECRET)))"
+)
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
-    r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|"
+    rf"(?:{COMPACT_PREFIXED_SENSITIVE_ASSIGNMENT_KEY}|"
+    r"access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|"
     r"aws(?:accesskeyid|secretaccesskey|sessiontoken)|auth[_.-]?token|client[_.-]?secret|"
     r"auth|basic[_.-]?auth|cookie|credential|google[_.-]?access[_.-]?id|jwt|passphrase|password|passwd|"
     r"private[_.-]?key|pwd|"
@@ -205,11 +214,29 @@ COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
 )
+COMMAND_SECRET_LONG_OPTION_PATTERN: Final[str] = (
+    r"--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
+    r"proxy-tls-?password|tls-?password|ftp-account|ftp-password|http-password|oauth2-bearer|"
+    r"client[_-]?secret|api[_-]?key|token|secret)"
+)
+COMMAND_SECRET_OPTION_PREFIX_PATTERN: Final[str] = (
+    rf"(?:(?<!\w){COMMAND_SECRET_LONG_OPTION_PATTERN}|(?<!\w)-b)(?:=|\s+)"
+)
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
-    r"proxy-tls-?password|tls-?password|"
-    r"ftp-account|ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
-    r"(?:=|\s+))(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+    rf"(?i)({COMMAND_SECRET_OPTION_PREFIX_PATTERN})"
+    r"(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+)
+CURL_COMMAND_TRANSITION_PATTERN: Final[str] = (
+    r"(?<![-/\w.])(?:bash|sh|cmd\.exe|powershell(?:\.exe)?|wget|nc|netcat|sshpass|redis-cli|docker|aws|curl)"
+    r"(?=\s+-)"
+)
+CURL_ATTACHED_COOKIE_OPTION_PREFIX_PATTERN: Final[str] = (
+    rf"\bcurl\b(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,2048}}?"
+    r"(?<=[\s\"'])-[A-Za-z]*?b"
+)
+CURL_ATTACHED_COOKIE_OPTION_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)({CURL_ATTACHED_COOKIE_OPTION_PREFIX_PATTERN})"
+    r"(?:\$?\"(?:\\.|[^\"\\,])*\"|\$?'(?:\\.|[^'\\,])*'|[^\s\"';&|)]+)"
 )
 COMMAND_BODY_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>(?<!\w)(?:(?:-d|-F)(?:=|\s*)|"
@@ -222,10 +249,13 @@ COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<value>\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|(?!\\+[\"'])[^\s\"';&|)]+)"
 )
 COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?is)(?P<option>((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|"
-    r"proxy-pass|proxy-tls-?password|tls-?password|ftp-account|ftp-password|http-password|oauth2-bearer|client[_-]?secret|"
-    r"api[_-]?key|token|secret)|(?<!\w)-b)(?:=|\s+))"
+    rf"(?is)(?P<option>{COMMAND_SECRET_OPTION_PREFIX_PATTERN})"
     r"(?P<prefix>\$?)(?P<slashes>\\+)(?P<quote>[\"'])(?:(?!(?<!\\)(?P=slashes)(?P=quote))[\s\S])*?"
+    r"(?<!\\)(?P=slashes)(?P=quote)"
+)
+CURL_ATTACHED_COOKIE_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>{CURL_ATTACHED_COOKIE_OPTION_PREFIX_PATTERN})"
+    r"(?P<prefix>\$?)(?P<slashes>\\+)(?P<quote>[\"'])(?:(?!(?<!\\)(?P=slashes)(?P=quote)|,)[\s\S])*?"
     r"(?<!\\)(?P=slashes)(?P=quote)"
 )
 COMMAND_CERT_PASSWORD_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
@@ -312,6 +342,10 @@ SENSITIVE_ARGV_PAIR_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<value_prefix>{PYTHON_STRING_PREFIX_RE})(?P<value_quote>[\"'])"
     rf"(?P<value>(?:\\.|(?!(?P=value_quote))[\s\S]){{0,{EVIDENCE_REDACTION_LOOKAHEAD_CHARS}}})"
     rf"(?P=value_quote)"
+)
+CURL_SHORT_COOKIE_OPTION_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^-[a-z]*b$")
+PYTHON_CURL_ARGV_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)^\s*(?:{PYTHON_STRING_PREFIX_RE})?(?P<quote>[\"'])curl(?P=quote)(?:\s*,|\s*$)"
 )
 SERIALIZED_STRUCTURED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?:^|[{{,])\s*)(?P<slashes>\\+)(?P<quote>[\"'])"
@@ -2424,13 +2458,29 @@ def _redact_sensitive_argv_pairs(text: str) -> str:
             if not inside_list and not inside_tuple:
                 search_start = match.start() + 1
                 continue
-        if _normalize_sensitive_function_key(_decode_key_escapes(match.group("key"))) is not None:
+        decoded_key = _decode_key_escapes(match.group("key"))
+        sensitive_key = _normalize_sensitive_function_key(decoded_key) is not None
+        curl_cookie_option = CURL_SHORT_COOKIE_OPTION_RE.fullmatch(decoded_key) is not None and _argv_pair_is_for_curl(
+            text,
+            match.start(),
+        )
+        if sensitive_key or curl_cookie_option:
             replacements.append((match.start("value"), match.end("value")))
         search_start = match.start() + 1
 
     for start, end in reversed(replacements):
         text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
     return text
+
+
+def _argv_pair_is_for_curl(text: str, pair_start: int) -> bool:
+    list_start = text.rfind("[", 0, pair_start)
+    tuple_start = text.rfind("(", 0, pair_start)
+    collection_start = max(list_start, tuple_start)
+    if collection_start < 0:
+        return False
+    collection_prefix = text[collection_start + 1 : pair_start]
+    return PYTHON_CURL_ARGV_START_RE.match(collection_prefix) is not None
 
 
 def _redact_sensitive_setter_arguments(text: str) -> str:
@@ -2813,6 +2863,8 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SENSITIVE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = CURL_ATTACHED_COOKIE_SERIALIZED_QUOTED_RE.sub(_redact_serialized_command_option, redacted)
+    redacted = CURL_ATTACHED_COOKIE_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE.sub(_redact_serialized_command_option, redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_BODY_OPTION_RE.sub(_redact_command_body_option, redacted)
