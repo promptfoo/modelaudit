@@ -126,6 +126,7 @@ def pytest_runtest_setup(item):
             "test_license_checker.py",  # License metadata and nearby-license caching tests
             "test_license_integration.py",  # End-to-end license metadata integration tests
             "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
+            "tests/utils/sources/test_dvc_integration.py",  # DVC fail-closed resolution tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
             "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
             "test_flax_msgpack_scanner.py",  # Flax msgpack scanner performance and safety tests
@@ -179,7 +180,6 @@ def pytest_runtest_setup(item):
             "test_huggingface.py",  # HuggingFace provenance and cache path tests
             "test_pytorch_hub.py",  # PyTorch Hub artifact URL and download budget regression tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
-            "tests/utils/sources/test_dvc_integration.py",  # DVC output-cap fail-closed regressions
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
             "test_mlflow_integration.py",  # MLflow integration tests

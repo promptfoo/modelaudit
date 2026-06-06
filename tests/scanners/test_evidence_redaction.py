@@ -2,6 +2,7 @@
 
 import ast
 import json
+import time
 from urllib.parse import quote, unquote_plus
 
 import pytest
@@ -11,9 +12,75 @@ from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
     REDACTED_URL_CREDENTIALS,
     REDACTION_LOOKAHEAD_CHARS,
+    is_sensitive_evidence_key,
     redact_evidence_string,
     redact_evidence_value,
 )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "auth",
+        "basic_auth",
+        "cookie",
+        "set_cookie",
+        "session_id",
+        "sessionid",
+        "runtime_auth",
+        "runtime_hook_cookie",
+        "auth_header",
+        "authentication_header",
+        "cookie_header",
+        "set_cookie_header",
+        "session_id_header",
+        "runtime_hook_cookie_header",
+    ],
+)
+def test_sensitive_evidence_key_recognizes_credential_containers(key: str) -> None:
+    assert is_sensitive_evidence_key(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["auth_timeout", "cookie_count", "session_timeout", "authorization_status", "oauth", "runtime_oauth"],
+)
+def test_sensitive_evidence_key_preserves_benign_near_matches(key: str) -> None:
+    assert not is_sensitive_evidence_key(key)
+
+
+@pytest.mark.parametrize("key", ["runtime\uff3fauth", "runtime\u200b auth", "runtime\u2027cookie header"])
+def test_sensitive_evidence_key_normalizes_unicode_separators(key: str) -> None:
+    assert is_sensitive_evidence_key(key)
+
+
+@pytest.mark.parametrize("key", ["runtime\uff3foauth", "cookie\uff3fcount", "session\u2027timeout"])
+def test_sensitive_evidence_key_preserves_unicode_near_matches(key: str) -> None:
+    assert not is_sensitive_evidence_key(key)
+
+
+def test_sensitive_evidence_key_fails_closed_before_long_key_regexes() -> None:
+    long_near_match = ("a." * 10_000) + "oauthx"
+
+    start = time.perf_counter()
+    sensitive = is_sensitive_evidence_key(long_near_match)
+    elapsed = time.perf_counter() - start
+
+    assert sensitive
+    assert elapsed < 1.0
+
+
+def test_redaction_handles_unicode_tokenizer_errors() -> None:
+    secret = "REAL_UNICODE_TOKENIZER_SECRET"
+    comparison_secret = "REAL_UNICODE_COMPARISON_SECRET"
+
+    redacted = redact_evidence_string(f"curl https://example.com/?token={secret}\rو", max_chars=200)
+    comparison_redacted = redact_evidence_string(f"token == '{comparison_secret}'\rو", max_chars=200)
+
+    assert secret not in redacted
+    assert comparison_secret not in comparison_redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert REDACTED_EVIDENCE_VALUE in comparison_redacted
 
 
 def test_redacts_compound_credential_assignments() -> None:
@@ -344,13 +411,15 @@ def test_redacts_bracketed_sensitive_query_parameters() -> None:
 
 def test_redacts_malformed_userinfo_url() -> None:
     """Malformed userinfo URLs should fail closed instead of returning raw evidence."""
-    text = "download=https://user:LEAKY-PASS@[::1/path?token=QUERYSECRET"
+    path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    text = f"download=https://user:LEAKY-PASS@[::1/{path_token}/model.so?token=QUERYSECRET"
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "user:LEAKY-PASS" not in redacted
     assert "QUERYSECRET" not in redacted
-    assert "https://<credentials-redacted>@[::1/path" in redacted
+    assert path_token not in redacted
+    assert "https://<credentials-redacted>@[::1/<redacted>/model.so" in redacted
 
 
 def test_redacts_malformed_userinfo_url_path_tokens() -> None:
@@ -553,6 +622,145 @@ def test_redacts_token_only_userinfo_across_network_url_schemes() -> None:
     assert redacted.count("<credentials-redacted>@") == 6
 
 
+def test_redacts_legacy_signed_url_access_identifiers() -> None:
+    """Legacy AWS and Google signed URL identifiers should not persist."""
+    text = (
+        "https://storage.example/model.so?"
+        "AWSAccessKeyId=AKIAEXAMPLEACCESSKEY&Signature=AWSSECRET&"
+        "GoogleAccessId=service-account%40example.iam.gserviceaccount.com"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIAEXAMPLEACCESSKEY" not in redacted
+    assert "AWSSECRET" not in redacted
+    assert "service-account" not in redacted
+    assert "AWSAccessKeyId=<redacted>" in redacted
+    assert "Signature=<redacted>" in redacted
+    assert "GoogleAccessId=<redacted>" in redacted
+
+
+def test_redacts_legacy_access_identifier_assignments() -> None:
+    """Legacy access identifiers should also be sanitized outside URLs."""
+    text = "AWSAccessKeyId=AKIAEXAMPLEACCESSKEY google_access_id=service-account@example.iam.gserviceaccount.com"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIAEXAMPLEACCESSKEY" not in redacted
+    assert "service-account" not in redacted
+    assert "AWSAccessKeyId=<redacted>" in redacted
+    assert "google_access_id=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gho_" + ("a" * 36),
+        "ghu_" + ("a" * 36),
+        "ghr_" + ("a" * 36),
+        "sk-proj-" + ("a" * 32),
+        "sk-proj-" + ("a_b-" * 8),
+        "npm_" + ("a" * 36),
+        "xoxb-" + ("a" * 24),
+    ],
+)
+def test_redacts_standalone_secret_tokens(secret: str) -> None:
+    redacted = redact_evidence_string(f"prefix {secret} suffix", max_chars=None)
+
+    assert redacted == f"prefix {REDACTED_EVIDENCE_VALUE} suffix"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gho%5F" + ("a" * 36),
+        "gho%255F" + ("a" * 36),
+        "gho%2525255F" + ("a" * 36),
+        "".join(f"%{ord(char):02X}" for char in ("gho_" + ("a" * 36))),
+    ],
+)
+def test_redacts_percent_encoded_standalone_secret_tokens_with_context(secret: str) -> None:
+    redacted = redact_evidence_string(f"prefix {secret} suffix", max_chars=None)
+
+    assert redacted == f"prefix {REDACTED_EVIDENCE_VALUE} suffix"
+
+
+def test_redacts_multiple_percent_encoded_secrets_without_losing_context() -> None:
+    github_token = "gho%5F" + ("a" * 36)
+    npm_token = "npm%5F" + ("b" * 36)
+    text = f"left-{github_token}-middle-{npm_token}-right"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert redacted == f"left-{REDACTED_EVIDENCE_VALUE}-middle-{REDACTED_EVIDENCE_VALUE}-right"
+
+
+def test_percent_encoded_span_redaction_keeps_other_secret_detection() -> None:
+    github_token = "gho%5F" + ("a" * 36)
+    text = f"left/{github_token}/middle/api_key%3DSUPERSECRET"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert redacted == f"left/{REDACTED_EVIDENCE_VALUE}/middle/api_key={REDACTED_EVIDENCE_VALUE}"
+    assert "SUPERSECRET" not in redacted
+
+
+@pytest.mark.parametrize(
+    ("text_template", "expected_template"),
+    [
+        ("prefix-{secret}-suffix", "prefix-{redacted}-suffix"),
+        ("id={secret}.log", "id={redacted}.log"),
+        ("left/{secret}/right", "left/{redacted}/right"),
+    ],
+)
+def test_percent_encoded_secret_redaction_preserves_surrounding_context(
+    text_template: str,
+    expected_template: str,
+) -> None:
+    secret = "gho%5F" + ("a" * 36)
+    text = text_template.format(secret=secret)
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert redacted == expected_template.format(redacted=REDACTED_EVIDENCE_VALUE)
+
+
+def test_percent_encoded_secret_redaction_fails_closed_beyond_decode_budget() -> None:
+    secret = "gho_" + ("a" * 36)
+    deeply_encoded = secret
+    for _ in range(10):
+        deeply_encoded = deeply_encoded.replace("%", "%25").replace("_", "%5F")
+
+    assert redact_evidence_string(deeply_encoded, max_chars=None) == REDACTED_EVIDENCE_VALUE
+
+
+def test_preserves_deeply_percent_encoded_benign_value_within_decode_budget() -> None:
+    benign = "public_identifier_1234567890"
+    deeply_encoded = benign
+    for _ in range(4):
+        deeply_encoded = deeply_encoded.replace("%", "%25").replace("_", "%5F")
+
+    assert redact_evidence_string(deeply_encoded, max_chars=None) == deeply_encoded
+
+
+@pytest.mark.parametrize(
+    "near_match",
+    [
+        "gho_" + ("a" * 35),
+        "prefixgho_" + ("a" * 36),
+        "sk-" + ("a" * 23),
+        "sk-proj-example",
+        "npm_" + ("a" * 35),
+        "xoxb-" + ("a" * 19),
+        "gho%5F" + ("a" * 35),
+    ],
+)
+def test_preserves_standalone_secret_near_matches(near_match: str) -> None:
+    text = f"prefix {near_match} suffix"
+
+    assert redact_evidence_string(text, max_chars=None) == text
+
+
 def test_existing_token_assignment_redaction_still_applies() -> None:
     """Canonical token assignments should keep their existing redaction behavior."""
     redacted = redact_evidence_string("token=CANONICALTOKEN123", max_chars=500)
@@ -572,6 +780,22 @@ def test_redacts_r_assignment_operators() -> None:
     assert "R_PASSWORD_SECRET" not in redacted
     assert f"token <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f"password <<- {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_redacts_access_identifier_r_assignments() -> None:
+    google_secret = "service-account@example.iam.gserviceaccount.com"
+    aws_secret = "AKIAEXAMPLEACCESSKEY"
+    text = (
+        f"google_access_id <- '{google_secret}' GoogleAccessId <<- \"{google_secret}\" access_key_id <- '{aws_secret}'"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert google_secret not in redacted
+    assert aws_secret not in redacted
+    assert f"google_access_id <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f'GoogleAccessId <<- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"access_key_id <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
 
 
 def test_redacts_r_rightward_assignment_operators() -> None:
