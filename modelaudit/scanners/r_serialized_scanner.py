@@ -140,6 +140,13 @@ def _r_function_keyword_before_position(
     non_code_spans: list[tuple[int, int]],
     delimiter_pairs: dict[int, int] | None = None,
 ) -> bool:
+    def has_complete_infix_operator_ending_at(operator_end: int) -> bool:
+        operator_start = text.rfind("%", 0, operator_end)
+        if operator_start < 0 or any(character.isspace() for character in text[operator_start + 1 : operator_end]):
+            return False
+        span_index = bisect_right(non_code_spans, operator_start, key=lambda span: span[0]) - 1
+        return span_index < 0 or operator_start >= non_code_spans[span_index][1]
+
     cursor = position - 1
     while cursor >= 0:
         while cursor >= 0 and text[cursor].isspace():
@@ -173,6 +180,8 @@ def _r_function_keyword_before_position(
         if span_index < 0 or cursor >= non_code_spans[span_index][1]:
             character = text[cursor]
             if crossed_newline:
+                if character == "%":
+                    return has_complete_infix_operator_ending_at(cursor)
                 return character not in "$@:"
             if character in "$@:":
                 return False
@@ -194,6 +203,8 @@ def _r_function_keyword_before_position(
                 if character != ")":
                     return False
                 return _r_identifier_before_position(text, opener_position, non_code_spans) in {"for", "if", "while"}
+            if character == "%":
+                return has_complete_infix_operator_ending_at(cursor)
             return character in "([{,;=<>+-*/^!&|~"
         span_start, _span_end = non_code_spans[span_index]
         if text[span_start] != "#":
@@ -572,7 +583,7 @@ def _r_named_argument_value_is_complete(
     continuation = _r_next_code_position(text, span_end, non_code_spans)
     if continuation is None or continuation >= target_close or text[continuation] in ",)]":
         return True
-    return text[continuation] in "+-*/^:!&|<>$@~?%(["
+    return text[continuation] in "+-*/^:!&|<>$@~?%([="
 
 
 def _r_pipe_placeholder_value_is_complete(
@@ -1052,7 +1063,7 @@ def _r_expression_has_obvious_adjacent_values(
             member_receiver_is_valid = False
             cursor = operator_end + 1
             continue
-        if character in "+-":
+        if character in "+-" and not text.startswith("->", cursor):
             if native_pipe_call_required:
                 return True
             expects_value = True
@@ -1074,9 +1085,22 @@ def _r_expression_has_obvious_adjacent_values(
             cursor += 1
             continue
         if character == "=":
-            if cursor + 1 >= stop or text[cursor + 1] != "=":
-                return True
-            operator = "=="
+            if cursor + 1 < stop and text[cursor + 1] == "=":
+                operator = "=="
+            else:
+                assignment_target = _r_identifier_before_position(text, cursor, non_code_spans)
+                if (
+                    expects_value
+                    or native_pipe_call_required
+                    or assignment_target is None
+                    or _r_unquoted_named_argument_target_kind(assignment_target) != "symbol"
+                ):
+                    return True
+                expects_value = True
+                namespace_receiver_is_valid = False
+                member_receiver_is_valid = False
+                cursor += 1
+                continue
         else:
             operator = next(
                 (
