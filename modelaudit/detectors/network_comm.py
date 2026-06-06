@@ -104,6 +104,26 @@ _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.
 _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
     {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
 )
+_CHAINABLE_AUTHORIZATION_SCHEMES = _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES | {"api-key", "apikey", "jwt", "token"}
+_NON_CREDENTIAL_AUTHORIZATION_VALUES = frozenset(
+    {
+        "anonymous",
+        "auto",
+        "default",
+        "disabled",
+        "enabled",
+        "false",
+        "inherit",
+        "no",
+        "none",
+        "null",
+        "off",
+        "optional",
+        "required",
+        "true",
+        "yes",
+    }
+)
 _RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
 _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
 _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
@@ -339,10 +359,12 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
         if redact_next_value:
             parts[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                token_candidate, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(token_candidate)
+                and _authorization_scheme_has_payload(token_candidate, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             changed = True
             continue
 
@@ -368,6 +390,7 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
             following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
             if authorization_scheme is not None:
                 redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
+                authorization_value_pending = redact_next_value
             changed = True
     return changed
 
@@ -428,9 +451,10 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
             redact_next_value = (
                 authorization_value_pending
                 and carries_sensitive_value(following_boundary)
+                and _is_chainable_authorization_scheme(token_component)
                 and _authorization_scheme_has_payload(token_component, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
         else:
             empty_assignment_key = _empty_sensitive_path_assignment_key(component)
             if empty_assignment_key is not None and carries_sensitive_value(following_boundary):
@@ -450,6 +474,7 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
                     and carries_sensitive_value(following_boundary)
                 ):
                     redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
+                    authorization_value_pending = redact_next_value
             if (
                 empty_assignment_key is None
                 and component
@@ -616,7 +641,18 @@ def _authorization_assignment_scheme(segment: str) -> str | None:
         return None
 
     value = "=".join(assignment_parts[key_index + 1 :]).strip()
-    return value if _AUTHORIZATION_SCHEME_PATTERN.fullmatch(value) is not None else None
+    return value if _is_authorization_scheme(value) else None
+
+
+def _is_authorization_scheme(value: str) -> bool:
+    return (
+        _AUTHORIZATION_SCHEME_PATTERN.fullmatch(value) is not None
+        and value.casefold() not in _NON_CREDENTIAL_AUTHORIZATION_VALUES
+    )
+
+
+def _is_chainable_authorization_scheme(value: str) -> bool:
+    return value.casefold() in _CHAINABLE_AUTHORIZATION_SCHEMES
 
 
 def _is_bare_ip_path_endpoint(value: str) -> bool:
@@ -641,14 +677,31 @@ def _is_bare_ip_path_endpoint(value: str) -> bool:
     return False
 
 
+def _is_bare_domain_path_endpoint(value: str) -> bool:
+    decoded = _decode_path_token(value).lstrip("/")
+    candidate = decoded.split("/", 1)[0].rstrip(".")
+    if candidate.count(":") == 1:
+        possible_host, possible_port = candidate.rsplit(":", 1)
+        if possible_port.isdigit() and 0 < int(possible_port) <= 65535:
+            candidate = possible_host
+    try:
+        encoded_candidate = candidate.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if _BARE_DOMAIN_PATTERN.fullmatch(encoded_candidate) is None:
+        return False
+    first_label = candidate.split(".", 1)[0]
+    return not _looks_like_hostname_credential_value(first_label)
+
+
 def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
-    if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
+    if following_value is None or not _is_authorization_scheme(scheme):
         return False
     decoded_following_value = _decode_path_token(following_value)
     endpoint_key, separator, _endpoint_value = decoded_following_value.partition("=")
     if separator and _is_endpoint_location_key(endpoint_key):
         return False
-    if _is_bare_ip_path_endpoint(following_value):
+    if _is_bare_ip_path_endpoint(following_value) or _is_bare_domain_path_endpoint(following_value):
         return False
     return not _looks_like_known_artifact_filename(following_value)
 
@@ -775,10 +828,12 @@ def _redact_hostname_tokens(hostname: str) -> str:
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
             following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _hostname_authorization_scheme_has_payload(
-                decoded, following_value, labels, index
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(decoded)
+                and _hostname_authorization_scheme_has_payload(decoded, following_value, labels, index)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             continue
         remaining_labels = len(labels) - index
         short_hostname_value_is_sensitive = remaining_labels == 3 and _looks_like_hostname_credential_value(
@@ -808,10 +863,12 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             following_value = next((candidate for candidate in segments[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                _token_candidate, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(_token_candidate)
+                and _authorization_scheme_has_payload(_token_candidate, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             continue
 
         token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
@@ -1393,8 +1450,12 @@ def _is_match_redacted_from_url_component(
             if value_lower in part.lower():
                 return True
             following_value = next((candidate for candidate in delimited_parts[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(part, following_value)
-            authorization_value_pending = False
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(part)
+                and _authorization_scheme_has_payload(part, following_value)
+            )
+            authorization_value_pending = redact_next_value
             continue
         if _is_sensitive_path_key(part):
             redact_next_value = True

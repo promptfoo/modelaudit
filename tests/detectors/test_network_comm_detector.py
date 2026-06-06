@@ -552,6 +552,57 @@ class TestNetworkCommDetector:
 
         assert any(finding.get("ip") == ip for finding in findings)
 
+    def test_authorization_matrix_assignment_reports_port_qualified_ip_endpoint(self) -> None:
+        ip = "45.33.32.156"
+        port = 6379
+        url = f"https://evil.example/path;authorization=Bearer;{ip}:{port}/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+
+        assert any(finding.get("ip") == ip for finding in findings)
+        assert any(finding.get("port") == port for finding in findings)
+
+    def test_authorization_matrix_assignment_preserves_bare_domain_endpoint(self) -> None:
+        domain = "download.example.com"
+        url = f"https://evil.example/path;authorization=Bearer;{domain}/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+
+        assert any(
+            finding.get("url") == f"https://evil.example/path;authorization=<redacted>;{domain}/model.bin"
+            for finding in findings
+        )
+        assert any(finding.get("domain") == domain for finding in findings)
+
+    @pytest.mark.parametrize(
+        "flag_value",
+        ["anonymous", "auto", "default", "disabled", "enabled", "false", "inherit", "none", "off", "optional"],
+    )
+    def test_authorization_flag_value_does_not_consume_bare_domain_endpoint(self, flag_value: str) -> None:
+        domain = "download.example.com"
+        url = f"https://evil.example/path;auth={flag_value};{domain}/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == f"https://evil.example/path;auth=<redacted>;{domain}/model.bin"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example/path;authorization=Bearer;Bearer;secret.example.com/model.bin",
+            "https://evil.example/path,authorization=Bearer,Bearer,secret.example.com,model.bin",
+            "https://evil.example/Authorization/Bearer/Bearer/secret.example.com/model.bin",
+            "https://auth.Bearer.Bearer.secret.example.com/path",
+        ],
+    )
+    def test_authorization_redacts_duplicate_scheme_payload(self, url: str) -> None:
+        secret = "secret.example.com"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret not in serialized
+
     def test_authorization_matrix_assignment_redacts_invalid_ip_port_payload(self) -> None:
         url = "https://evil.example/path;authorization=Bearer;45.33.32.156:99999/model.bin"
 
