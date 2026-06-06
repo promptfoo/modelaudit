@@ -83,6 +83,15 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
     )
 
 
+def should_bypass_cache_for_sharded_model(file_path: str) -> bool:
+    """Bypass representative-only cache keys for files that can expand to sibling shards."""
+    try:
+        from ..file.handlers import ShardedModelDetector
+    except Exception:
+        return False
+    return ShardedModelDetector.match_shard_filename(os.path.basename(file_path)) is not None
+
+
 def _h5py_availability() -> bool:
     """Return whether Keras HDF5 analysis is available in this process."""
     try:
@@ -265,6 +274,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_sharded_model(file_path):
+                    logger.debug(f"Bypassing cache for sharded model family: {file_path}")
                     return func(*args, **kwargs)
 
                 if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):

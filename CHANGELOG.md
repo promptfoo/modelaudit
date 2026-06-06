@@ -214,6 +214,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- prevent sharded-model scans from accepting changed family membership, stale shard identities, or unsafe aliases
 - invalidate cached pickle call-graph results when analyzed Python sources, search paths, or loaded module origins change
 - harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files; preserve Windows ownership and ACLs, and reject EFS-encrypted destinations that cannot be replaced without changing recipients
 - distinguish valid R call/index argument tags from malformed credential assignments and fail closed on incomplete function bodies

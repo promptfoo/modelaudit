@@ -95,6 +95,7 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
+    ValidatedShardTargets,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -116,6 +117,7 @@ from modelaudit.utils.sources._huggingface_cache import (
     _get_hf_cache_roots,
     _path_has_part,
     _resolve_hf_cache_path,
+    _trusted_hf_blobs_root,
 )
 from modelaudit.utils.sources.cloud_storage import (
     is_sensitive_credential_key,
@@ -469,6 +471,7 @@ def _build_shard_family_cache_fingerprint(
     shard_family_key: _ShardFamilyKey,
     scanned_file_paths: list[str],
     content_hashes: dict[str, str],
+    validated_targets: ValidatedShardTargets,
 ) -> dict[str, Any]:
     """Fingerprint every present shard so representative cache entries stay valid."""
     _parent_dir, pattern, expected_total_shards = shard_family_key
@@ -477,12 +480,29 @@ def _build_shard_family_cache_fingerprint(
         "expected_total_shards": expected_total_shards,
         "members": [
             {
-                "path": str(Path(scanned_file_path).resolve()),
+                "source_path": str(Path(scanned_file_path).absolute()),
+                "path": validated_targets.get(scanned_file_path, {}).get(
+                    "resolved_path",
+                    _resolve_or_absolute_path(scanned_file_path),
+                ),
+                "device": validated_targets.get(scanned_file_path, {}).get("device"),
+                "inode": validated_targets.get(scanned_file_path, {}).get("inode"),
+                "size": validated_targets.get(scanned_file_path, {}).get("size"),
+                "mtime_ns": validated_targets.get(scanned_file_path, {}).get("mtime_ns"),
+                "ctime_ns": validated_targets.get(scanned_file_path, {}).get("ctime_ns"),
                 "content_hash": content_hashes.get(scanned_file_path),
             }
             for scanned_file_path in sorted(scanned_file_paths)
         ],
     }
+
+
+def _resolve_or_absolute_path(path: str) -> str:
+    """Return a resolved path, preserving a stable lexical path after concurrent breakage."""
+    try:
+        return str(Path(path).resolve(strict=True))
+    except (OSError, RuntimeError):
+        return str(Path(path).absolute())
 
 
 def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None:
@@ -499,6 +519,172 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
         str(member["path"]) for member in members if isinstance(member, dict) and isinstance(member.get("path"), str)
     ]
     return allowed_paths or None
+
+
+def _validated_shard_targets_from_config(config: dict[str, Any]) -> ValidatedShardTargets | None:
+    """Return the immutable lexical shard-to-target mapping from grouped scan config."""
+    fingerprint = config.get(_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY)
+    if not isinstance(fingerprint, dict):
+        return None
+    members = fingerprint.get("members")
+    if not isinstance(members, list):
+        return None
+
+    targets: ValidatedShardTargets = {}
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        source_path = member.get("source_path")
+        resolved_path = member.get("path")
+        if not isinstance(source_path, str) or not isinstance(resolved_path, str):
+            continue
+        target: dict[str, int | str] = {"resolved_path": resolved_path}
+        for key in ("device", "inode", "size", "mtime_ns", "ctime_ns"):
+            value = member.get(key)
+            if isinstance(value, int):
+                target[key] = value
+        targets[source_path] = target
+    return targets or None
+
+
+def _grouped_shard_boundary_error(
+    path: str,
+    allowed_paths: list[str],
+    allowed_targets: ValidatedShardTargets | None = None,
+) -> dict[str, Any] | None:
+    """Return details when a grouped shard no longer matches its validated family."""
+    if ShardedModelDetector.match_shard_filename(Path(path).name) is None:
+        return None
+
+    allowed_path_set = {
+        os.path.normcase(os.path.normpath(os.path.abspath(allowed_path))) for allowed_path in allowed_paths
+    }
+    try:
+        resolved_path = Path(path).resolve(strict=True)
+        resolved_stat = os.stat(resolved_path, follow_symlinks=False)
+    except (OSError, RuntimeError) as e:
+        return {"path": path, "error": str(e), "reason": "shard_target_unavailable"}
+
+    normalized_resolved_path = os.path.normcase(os.path.normpath(str(resolved_path)))
+    expected_target: dict[str, int | str] | None = None
+    if allowed_targets is not None:
+        normalized_source_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        expected_target = next(
+            (
+                target
+                for source_path, target in allowed_targets.items()
+                if os.path.normcase(os.path.normpath(os.path.abspath(source_path))) == normalized_source_path
+            ),
+            None,
+        )
+        if expected_target is None:
+            return {"path": path, "reason": "shard_path_outside_validated_family"}
+        expected_path = expected_target.get("resolved_path")
+        if not isinstance(expected_path, str) or normalized_resolved_path != os.path.normcase(
+            os.path.normpath(expected_path)
+        ):
+            return {
+                "path": path,
+                "resolved_path": str(resolved_path),
+                "reason": "shard_target_changed",
+            }
+    elif normalized_resolved_path not in allowed_path_set:
+        return {
+            "path": path,
+            "resolved_path": str(resolved_path),
+            "reason": "shard_target_outside_validated_family",
+        }
+    if not stat.S_ISREG(resolved_stat.st_mode):
+        return {
+            "path": path,
+            "resolved_path": str(resolved_path),
+            "reason": "shard_target_not_regular_file",
+        }
+    if expected_target is not None:
+        expected_device = expected_target.get("device")
+        expected_inode = expected_target.get("inode")
+        if (
+            isinstance(expected_device, int)
+            and isinstance(expected_inode, int)
+            and expected_inode
+            and (resolved_stat.st_dev, resolved_stat.st_ino) != (expected_device, expected_inode)
+        ):
+            return {
+                "path": path,
+                "resolved_path": str(resolved_path),
+                "reason": "shard_target_identity_changed",
+            }
+        for key, current_value in (
+            ("size", resolved_stat.st_size),
+            ("mtime_ns", resolved_stat.st_mtime_ns),
+            ("ctime_ns", resolved_stat.st_ctime_ns),
+        ):
+            expected_value = expected_target.get(key)
+            if isinstance(expected_value, int) and current_value != expected_value:
+                return {
+                    "path": path,
+                    "resolved_path": str(resolved_path),
+                    "reason": "shard_target_content_changed",
+                }
+    return None
+
+
+def _allowed_hf_shard_alias_paths(shard_path: str, base_dir: Path, hf_cache_root: Path) -> list[str]:
+    """Return shard siblings resolving inside the scan root or the same HF cache blobs directory."""
+    allowed_paths: list[str] = []
+    blobs_root = _trusted_hf_blobs_root(hf_cache_root)
+    for candidate_path in Path(shard_path).parent.glob("*"):
+        with suppress(OSError, RuntimeError):
+            resolved_candidate = candidate_path.resolve(strict=True)
+            resolved_candidate_path = str(resolved_candidate)
+            if resolved_candidate.is_file() and (
+                is_within_directory(str(base_dir), resolved_candidate_path)
+                or (blobs_root is not None and is_within_directory(str(blobs_root), resolved_candidate_path))
+            ):
+                allowed_paths.append(resolved_candidate_path)
+    return allowed_paths
+
+
+def _add_path_traversal_issue_once(
+    results: ModelAuditResultModel,
+    *,
+    location: str,
+    resolved_path: str,
+    reported_targets: set[str] | None = None,
+) -> None:
+    """Report one traversal issue per resolved target during directory discovery."""
+    normalized_target = os.path.normcase(os.path.normpath(resolved_path))
+    if reported_targets is not None:
+        if normalized_target in reported_targets:
+            return
+        reported_targets.add(normalized_target)
+    _add_issue_to_model(
+        results,
+        "Path traversal outside scanned directory",
+        severity=IssueSeverity.CRITICAL.value,
+        location=location,
+        details={"resolved_path": resolved_path},
+    )
+
+
+def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultModel) -> str | None:
+    """Resolve a detected shard without aborting if it changes during discovery."""
+    try:
+        return str(Path(shard_path).resolve(strict=True))
+    except (OSError, RuntimeError) as e:
+        _add_issue_to_model(
+            results,
+            "Shard path changed during directory discovery",
+            severity=IssueSeverity.INFO.value,
+            location=shard_path,
+            details={
+                "error": str(e),
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_path_changed",
+            },
+        )
+        return None
 
 
 def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -997,42 +1183,60 @@ def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
     return content_hash.startswith(("unhashable_max_file_size_", "unhashable_max_total_size_"))
 
 
-def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
+def _hash_files_by_path(
+    file_paths: list[str],
+    *,
+    config: dict[str, Any] | None = None,
+    routing_paths: dict[str, str] | None = None,
+    hashed_identities: dict[str, dict[str, int]] | None = None,
+) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
         config: Scan settings used for bounded format-specific hashing decisions.
+        routing_paths: Original model paths used for extension-sensitive read limits.
 
     Returns:
         Dictionary mapping each file path to its content hash. Files that fail to
         hash get unique placeholder values so they still scan independently.
     """
     content_hashes: dict[str, str] = {}
-    hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
+    hashes_by_inode: dict[tuple[int, int, int, int, int], str] = {}
     hashed_bytes = 0
 
     for file_path in file_paths:
         hash_config = config or {}
-        if _should_defer_hash_for_safetensors_header_limit(file_path, hash_config):
+        routing_path = routing_paths.get(file_path, file_path) if routing_paths is not None else file_path
+        if _should_defer_hash_for_safetensors_header_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
             continue
-        if _should_defer_hash_for_max_file_size(file_path, hash_config):
+        if _should_defer_hash_for_max_file_size(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
             continue
         try:
-            inode_key: tuple[int, int, int, int] | None = None
+            inode_key: tuple[int, int, int, int, int] | None = None
+            pre_hash_stat: os.stat_result | None = None
             try:
-                file_stat = os.stat(file_path)
-                if file_stat.st_nlink > 1:
+                pre_hash_stat = os.stat(file_path, follow_symlinks=False)
+                if pre_hash_stat.st_nlink > 1:
                     inode_key = (
-                        file_stat.st_dev,
-                        file_stat.st_ino,
-                        file_stat.st_size,
-                        file_stat.st_mtime_ns,
+                        pre_hash_stat.st_dev,
+                        pre_hash_stat.st_ino,
+                        pre_hash_stat.st_size,
+                        pre_hash_stat.st_mtime_ns,
+                        pre_hash_stat.st_ctime_ns,
                     )
                     if cached_hash := hashes_by_inode.get(inode_key):
                         content_hashes[file_path] = cached_hash
+                        if hashed_identities is not None:
+                            hashed_identities[file_path] = {
+                                "device": pre_hash_stat.st_dev,
+                                "inode": pre_hash_stat.st_ino,
+                                "size": pre_hash_stat.st_size,
+                                "mtime_ns": pre_hash_stat.st_mtime_ns,
+                                "ctime_ns": pre_hash_stat.st_ctime_ns,
+                            }
                         continue
             except OSError:
                 # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
@@ -1044,6 +1248,20 @@ def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None 
             with suppress(OSError):
                 hashed_bytes += os.path.getsize(file_path)
             content_hashes[file_path] = _calculate_file_hash(file_path)
+            post_hash_stat = os.stat(file_path, follow_symlinks=False)
+            if pre_hash_stat is None or any(
+                getattr(pre_hash_stat, field) != getattr(post_hash_stat, field)
+                for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            ):
+                raise OSError(f"File changed while hashing: {file_path}")
+            if hashed_identities is not None:
+                hashed_identities[file_path] = {
+                    "device": post_hash_stat.st_dev,
+                    "inode": post_hash_stat.st_ino,
+                    "size": post_hash_stat.st_size,
+                    "mtime_ns": post_hash_stat.st_mtime_ns,
+                    "ctime_ns": post_hash_stat.st_ctime_ns,
+                }
             if inode_key is not None:
                 hashes_by_inode[inode_key] = content_hashes[file_path]
         except Exception as e:
@@ -1078,46 +1296,105 @@ def _resolve_directory_scan_target(
     is_hf_cache: bool,
     hf_cache_root: Path | None,
     results: ModelAuditResultModel,
-) -> tuple[Path | None, bool]:
+    reported_traversal_targets: set[str] | None = None,
+) -> tuple[Path | None, bool, bool]:
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
-    resolved_file = file_path.resolve()
-
-    # Check if this is a HuggingFace cache symlink scenario
-    is_hf_cache_symlink = False
-    if file_path.is_symlink() and is_hf_cache and _path_has_part(file_path, "snapshots"):
-        try:
-            link_target = os.readlink(file_path)
-        except OSError as e:
+    is_symlink = file_path.is_symlink()
+    try:
+        # Strict resolution of valid relative file symlinks is unreliable on
+        # some Windows versions. Resolve once and verify that target directly.
+        resolved_file = file_path.resolve()
+        if is_symlink and resolved_file == file_path.absolute():
+            try:
+                raw_target = Path(os.readlink(file_path))
+            except OSError as e:
+                if not file_path.exists():
+                    raise FileNotFoundError("Symlink target does not exist") from e
+                raise
+            if not raw_target.is_absolute():
+                raw_target = file_path.parent / raw_target
+            resolved_file = raw_target.resolve()
+        resolved_file.stat()
+    except (OSError, RuntimeError) as e:
+        if is_symlink and isinstance(e, FileNotFoundError):
             _add_issue_to_model(
                 results,
                 "Broken symlink encountered",
                 severity=IssueSeverity.INFO.value,
                 location=str(file_path),
-                details={"error": str(e)},
+                details={
+                    "error": str(e),
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "directory_entry_unavailable",
+                },
             )
-            return None, False
+            return None, False, True
+        _add_issue_to_model(
+            results,
+            "Directory entry unavailable during discovery",
+            severity=IssueSeverity.INFO.value,
+            location=str(file_path),
+            details={
+                "error": str(e),
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "directory_entry_unavailable",
+            },
+        )
+        return None, False, True
 
-        # Resolve the relative link target
-        resolved_target = (file_path.parent / link_target).resolve()
+    # Check if this is a HuggingFace cache symlink scenario
+    is_hf_cache_symlink = False
+    if is_symlink and is_hf_cache and _path_has_part(file_path, "snapshots"):
+        # Reuse the canonical target resolved above. On Windows, os.readlink()
+        # may expose a device-path spelling that cannot safely be rejoined.
+        resolved_target = resolved_file
         # Check if target is in the blobs directory of the same model cache
         if hf_cache_root is not None:
-            blobs_root = hf_cache_root / "blobs"
-            if is_within_directory(str(blobs_root), str(resolved_target)):
+            blobs_root = _trusted_hf_blobs_root(hf_cache_root)
+            if blobs_root is not None and is_within_directory(str(blobs_root), str(resolved_target)):
                 is_hf_cache_symlink = True
                 # Update the resolved_file to the actual target for scanning
                 resolved_file = resolved_target
 
     if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
-        _add_issue_to_model(
+        _add_path_traversal_issue_once(
             results,
-            "Path traversal outside scanned directory",
-            severity=IssueSeverity.CRITICAL.value,
             location=str(file_path),
-            details={"resolved_path": str(resolved_file)},
+            resolved_path=str(resolved_file),
+            reported_targets=reported_traversal_targets,
         )
-        return None, False
+        return None, False, False
 
-    return resolved_file, is_hf_cache_symlink
+    return resolved_file, is_hf_cache_symlink, False
+
+
+def _unclassified_symlink_names(root: str, dirs: list[str], files: list[str]) -> list[str]:
+    """Return file-like symlinks omitted from ``os.walk``'s file classification."""
+    classified_files = set(files)
+    unclassified_symlinks: list[str] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name in classified_files:
+                    continue
+                try:
+                    is_symlink = entry.is_symlink()
+                except OSError:
+                    is_symlink = True
+                if not is_symlink:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        continue
+                except OSError as error:
+                    # Preserve the file-like fallback when following the symlink cannot be classified.
+                    logger.debug("Unable to classify symlink %s in %s as a directory: %s", entry.name, root, error)
+                unclassified_symlinks.append(entry.name)
+    except OSError:
+        return []
+    return sorted(unclassified_symlinks)
 
 
 def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
@@ -1336,14 +1613,17 @@ def scan_model_directory_or_file(
             base_dir = Path(path).resolve()
             hf_cache_root = _find_hf_cache_root(base_dir)
             is_hf_cache = hf_cache_root is not None
+            trusted_hf_blobs_root = _trusted_hf_blobs_root(hf_cache_root) if hf_cache_root is not None else None
             scanned_paths: set[str] = set()
             directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
+            reported_traversal_targets: set[str] = set()
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
+            shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
             dvc_directory_output_owners: list[tuple[Path, str]] = []
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
@@ -1429,7 +1709,12 @@ def scan_model_directory_or_file(
             ):
                 dirs.sort()
                 directory_walk_covered_directories.add(str(Path(root).resolve()))
-                for file in sorted(files):
+                unclassified_symlinks = _unclassified_symlink_names(root, dirs, files)
+                if unclassified_symlinks:
+                    unclassified_symlink_set = set(unclassified_symlinks)
+                    dirs[:] = [directory for directory in dirs if directory not in unclassified_symlink_set]
+                candidate_files = sorted([*files, *unclassified_symlinks])
+                for file in candidate_files:
                     file_path = os.path.join(root, file)
 
                     # HuggingFace cache bookkeeping files should never surface as
@@ -1449,13 +1734,17 @@ def scan_model_directory_or_file(
                     is_dvc_covered_file_symlink = resolved_file is not None
                     is_hf_cache_symlink = False
                     if resolved_file is None:
-                        resolved_file, is_hf_cache_symlink = _resolve_directory_scan_target(
+                        resolved_file, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                             file_path_obj,
                             base_dir,
                             is_hf_cache=is_hf_cache,
                             hf_cache_root=hf_cache_root,
                             results=results,
+                            reported_traversal_targets=reported_traversal_targets,
                         )
+                        if entry_unavailable:
+                            scan_metadata["success"] = False
+                            scan_metadata["has_operational_errors"] = True
                     record_uncovered_dvc_file_symlink(file_path_obj, resolved_file)
                     if resolved_file is None:
                         continue
@@ -1521,15 +1810,18 @@ def scan_model_directory_or_file(
                             continue
 
                         target_str = str(target_path)
-                        if str(target_path.resolve()) in dvc_excluded_paths:
-                            continue
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
+                        exclusion_path = (
+                            str(resolved_file) if is_hf_shard_alias else _resolve_or_absolute_path(target_str)
+                        )
+                        if exclusion_path in dvc_excluded_paths:
+                            continue
                         if is_hf_shard_alias:
-                            hf_shard_blob_paths.add(str(target_path.resolve()))
+                            hf_shard_blob_paths.add(str(resolved_file))
                         dedupe_target_str = (
-                            str(target_path.resolve())
-                            if is_hf_cache_symlink and shard_family_key is None
+                            str(resolved_file)
+                            if is_hf_cache_symlink and target_path == scan_source and shard_family_key is None
                             else target_str
                         )
                         if dedupe_target_str in scanned_paths:
@@ -1541,55 +1833,99 @@ def scan_model_directory_or_file(
                             and not is_dvc_covered_file_symlink
                             and not is_within_directory(str(base_dir), str(target_path))
                         ):
-                            _add_issue_to_model(
+                            _add_path_traversal_issue_once(
                                 results,
-                                "Path traversal outside scanned directory",
-                                severity=IssueSeverity.CRITICAL.value,
                                 location=str(target_path),
-                                details={"resolved_path": str(target_path)},
+                                resolved_path=str(target_path),
+                                reported_targets=reported_traversal_targets,
                             )
                             continue
 
                         # Add to files to scan list instead of scanning immediately
                         if shard_family_key is not None:
-                            family_paths = shard_family_paths.setdefault(shard_family_key, set())
-                            family_paths.add(target_str)
                             if shard_family_key not in shard_family_representatives:
                                 shard_family_representatives[shard_family_key] = target_str
-                                shard_info = ShardedModelDetector.detect_shards(target_str)
-                                if shard_info is not None:
+                                family_paths = shard_family_paths.setdefault(shard_family_key, set())
+                                shard_is_in_hf_snapshot = bool(
+                                    is_hf_cache
+                                    and hf_cache_root is not None
+                                    and _path_has_part(Path(target_str), "snapshots")
+                                )
+                                allowed_hf_shard_paths = (
+                                    _allowed_hf_shard_alias_paths(target_str, base_dir, hf_cache_root)
+                                    if shard_is_in_hf_snapshot and hf_cache_root is not None
+                                    else None
+                                )
+                                shard_info = ShardedModelDetector.detect_shards(
+                                    target_str,
+                                    allowed_paths=allowed_hf_shard_paths,
+                                )
+                                if shard_info is None:
+                                    family_paths.add(target_str)
+                                else:
+                                    validated_targets: ValidatedShardTargets = {}
+                                    detected_targets = shard_info.get("shard_targets")
                                     expected_total_shards = shard_info.get("expected_total_shards")
+                                    for shard_path in shard_info.get("shards", []):
+                                        if not isinstance(shard_path, str) or not isinstance(detected_targets, dict):
+                                            continue
+                                        detected_target = detected_targets.get(shard_path)
+                                        if not isinstance(detected_target, dict):
+                                            continue
+                                        resolved_shard_path = detected_target.get("resolved_path")
+                                        if not isinstance(resolved_shard_path, str):
+                                            continue
+                                        shard_in_base_dir = is_within_directory(str(base_dir), resolved_shard_path)
+                                        shard_in_hf_blobs = bool(
+                                            trusted_hf_blobs_root is not None
+                                            and is_within_directory(
+                                                str(trusted_hf_blobs_root),
+                                                resolved_shard_path,
+                                            )
+                                        )
+                                        if shard_in_base_dir or shard_in_hf_blobs:
+                                            lexical_shard_path = str(Path(shard_path).absolute())
+                                            family_paths.add(lexical_shard_path)
+                                            validated_targets[lexical_shard_path] = {
+                                                key: value
+                                                for key, value in detected_target.items()
+                                                if key
+                                                in {"resolved_path", "device", "inode", "size", "mtime_ns", "ctime_ns"}
+                                                and isinstance(value, (int, str))
+                                            }
+                                        else:
+                                            _add_path_traversal_issue_once(
+                                                results,
+                                                location=shard_path,
+                                                resolved_path=resolved_shard_path,
+                                                reported_targets=reported_traversal_targets,
+                                            )
+                                    shard_family_targets[shard_family_key] = validated_targets
+                                    incomplete_count_keys = (
+                                        "missing_shard_count",
+                                        "unreadable_shard_count",
+                                        "out_of_scope_shard_count",
+                                        "unvalidated_shard_count",
+                                        "duplicate_shard_count",
+                                    )
                                     if (
-                                        is_hf_cache_symlink
+                                        shard_is_in_hf_snapshot
                                         and isinstance(expected_total_shards, int)
                                         and shard_info.get("total_shards") == expected_total_shards
-                                        and "missing_shard_count" not in shard_info
-                                        and "inconsistent_expected_total_shards" not in shard_info
+                                        and not any(shard_info.get(key, 0) for key in incomplete_count_keys)
                                     ):
                                         complete_hf_shard_families.add(shard_family_key)
-                                    for shard_path in shard_info.get("shards", []):
+                                    for shard_path in shard_info.get("out_of_scope_shards", []):
                                         if isinstance(shard_path, str):
-                                            resolved_shard_path = str(Path(shard_path).resolve())
-                                            shard_in_base_dir = is_within_directory(str(base_dir), resolved_shard_path)
-                                            shard_in_hf_blobs = bool(
-                                                is_hf_cache
-                                                and hf_cache_root is not None
-                                                and is_within_directory(
-                                                    str(hf_cache_root / "blobs"),
-                                                    resolved_shard_path,
-                                                )
-                                            )
-                                            if shard_in_hf_blobs:
-                                                family_paths.add(str(Path(shard_path).absolute()))
-                                            elif shard_in_base_dir:
-                                                family_paths.add(resolved_shard_path)
-                                            else:
-                                                _add_issue_to_model(
+                                            resolved_shard_path = _resolve_discovered_shard_path(shard_path, results)
+                                            if resolved_shard_path is None:
+                                                continue
+                                            if not is_within_directory(str(base_dir), resolved_shard_path):
+                                                _add_path_traversal_issue_once(
                                                     results,
-                                                    "Path traversal outside scanned directory",
-                                                    severity=IssueSeverity.CRITICAL.value,
                                                     location=resolved_shard_path,
-                                                    details={"resolved_path": resolved_shard_path},
+                                                    resolved_path=resolved_shard_path,
+                                                    reported_targets=reported_traversal_targets,
                                                 )
                             continue
 
@@ -1638,7 +1974,7 @@ def scan_model_directory_or_file(
                 files_to_scan = [
                     file_path
                     for file_path in files_to_scan
-                    if str(Path(file_path).resolve()) not in hf_shard_blob_paths
+                    if _resolve_or_absolute_path(file_path) not in hf_shard_blob_paths
                 ]
             scan_entries: list[_ScanEntry] = [(file_path, [file_path], None) for file_path in files_to_scan]
             seen_complete_hf_shard_families: set[tuple[str, tuple[str, ...]]] = set()
@@ -1651,7 +1987,13 @@ def scan_model_directory_or_file(
                     and shard_family_key in complete_hf_shard_families
                     and len(ordered_family_paths) == expected_total_shards
                 ):
-                    resolved_family_paths = tuple(sorted(str(Path(path).resolve()) for path in ordered_family_paths))
+                    family_targets = shard_family_targets.get(shard_family_key, {})
+                    resolved_family_paths = tuple(
+                        sorted(
+                            str(family_targets.get(path, {}).get("resolved_path", _resolve_or_absolute_path(path)))
+                            for path in ordered_family_paths
+                        )
+                    )
                     family_dedupe_key = (shard_family_key[1], resolved_family_paths)
                     if family_dedupe_key in seen_complete_hf_shard_families:
                         continue
@@ -1692,16 +2034,47 @@ def scan_model_directory_or_file(
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries:
-                hash_paths: list[str] = []
-                seen_hash_paths: set[str] = set()
-                for _representative_file, scanned_file_paths, _shard_family_key in scan_entries:
+                hash_sources: list[str] = []
+                seen_hash_sources: set[str] = set()
+                hash_source_by_path: dict[str, str] = {}
+                for _representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                    family_targets = (
+                        shard_family_targets.get(entry_shard_family_key, {})
+                        if entry_shard_family_key is not None
+                        else {}
+                    )
                     for scanned_file_path in scanned_file_paths:
-                        if scanned_file_path not in seen_hash_paths:
-                            hash_paths.append(scanned_file_path)
-                            seen_hash_paths.add(scanned_file_path)
+                        hash_source = str(
+                            family_targets.get(scanned_file_path, {}).get("resolved_path", scanned_file_path)
+                        )
+                        hash_source_by_path[scanned_file_path] = hash_source
+                        if hash_source not in seen_hash_sources:
+                            hash_sources.append(hash_source)
+                            seen_hash_sources.add(hash_source)
 
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
-                content_hashes = _hash_files_by_path(hash_paths, config=config)
+                routing_paths_by_source = {
+                    hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
+                }
+                hashed_identities_by_source: dict[str, dict[str, int]] = {}
+                hashes_by_source = _hash_files_by_path(
+                    hash_sources,
+                    config=config,
+                    routing_paths=routing_paths_by_source,
+                    hashed_identities=hashed_identities_by_source,
+                )
+                for family_targets in shard_family_targets.values():
+                    for validated_target in family_targets.values():
+                        resolved_path = validated_target.get("resolved_path")
+                        if isinstance(resolved_path, str) and resolved_path in hashed_identities_by_source:
+                            validated_target.update(hashed_identities_by_source[resolved_path])
+                content_hashes = {
+                    scanned_file_path: hashes_by_source.get(
+                        hash_source,
+                        f"unhashable_{id(scanned_file_path)}",
+                    )
+                    for scanned_file_path, hash_source in hash_source_by_path.items()
+                }
                 if any(
                     _is_incomplete_aggregate_hash_placeholder(content_hash) for content_hash in content_hashes.values()
                 ):
@@ -1754,6 +2127,7 @@ def scan_model_directory_or_file(
                                         shard_family_key,
                                         scanned_file_paths,
                                         content_hashes,
+                                        shard_family_targets.get(shard_family_key, {}),
                                     )
                                 )
                             file_result = scan_file(representative_file, file_config)
@@ -2517,6 +2891,32 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     scanner_selection = policy_from_config(config)
     validate_scan_config(config)
 
+    allowed_shard_paths = _allowed_shard_paths_from_config(config)
+    allowed_shard_targets = _validated_shard_targets_from_config(config)
+    if allowed_shard_paths is not None:
+        boundary_error = _grouped_shard_boundary_error(path, allowed_shard_paths, allowed_shard_targets)
+        if boundary_error is not None:
+            sr = ScanResult(scanner_name="shard_boundary")
+            sr.add_check(
+                name="Sharded Model Boundary Check",
+                passed=False,
+                message="Validated shard path changed before scanning; scan coverage is incomplete.",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    **boundary_error,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_boundary_changed",
+                },
+            )
+            _mark_operational_scan_error(sr, "shard_boundary_changed")
+            _mark_inconclusive_scan_outcome(sr, "shard_boundary_changed")
+            sr.finish(success=False)
+            return sr
+        config = dict(config)
+        config.pop(_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY, None)
+
     # Skip HuggingFace cache files to reduce noise
     if _is_huggingface_cache_file(path):
         sr = ScanResult(scanner_name="skipped")
@@ -2582,7 +2982,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Check if we should use extreme handler BEFORE applying size limits
     # Extreme handler bypasses size limits for large models
-    use_extreme_handler = should_use_advanced_handler(path)
+    use_extreme_handler = should_use_advanced_handler(
+        path,
+        allowed_shard_paths=allowed_shard_paths,
+        allowed_shard_targets=allowed_shard_targets,
+    )
 
     # Check file size limit only if NOT using extreme handler
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
@@ -2865,7 +3269,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     scanner,
                     progress_callback,
                     timeout * 2,
-                    allowed_shard_paths=_allowed_shard_paths_from_config(config),
+                    allowed_shard_paths=allowed_shard_paths,
+                    allowed_shard_targets=allowed_shard_targets,
                 )  # Double timeout for extreme files
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -2932,7 +3337,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         scanner,
                         progress_callback,
                         timeout * 2,
-                        allowed_shard_paths=_allowed_shard_paths_from_config(config),
+                        allowed_shard_paths=allowed_shard_paths,
+                        allowed_shard_targets=allowed_shard_targets,
                     )  # Double timeout for extreme files
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -3245,13 +3651,15 @@ def scan_model_streaming(
                     continue
 
                 if base_dir is not None:
-                    resolved_path, _is_hf_cache_symlink = _resolve_directory_scan_target(
+                    resolved_path, _is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                         source_path,
                         base_dir,
                         is_hf_cache=is_hf_cache,
                         hf_cache_root=hf_cache_root,
                         results=results,
                     )
+                    if entry_unavailable:
+                        results.has_errors = True
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path

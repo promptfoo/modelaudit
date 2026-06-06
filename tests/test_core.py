@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import gzip
 import importlib
 import io
@@ -25,6 +26,7 @@ from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -727,6 +729,7 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
         and issue.details["resolved_path"] == outside_path
         for issue in result.issues
     )
+    assert sum(issue.message == "Path traversal outside scanned directory" for issue in result.issues) == 1
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -773,6 +776,256 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
     assert {asset.path for asset in result.assets} == {str(shard_link) for shard_link in shard_links}
     assert {member["path"] for member in fingerprint["members"]} == {str(blob_path) for blob_path in blob_paths}
     assert not any("path traversal" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_reresolve_trusted_hf_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical HF target must not depend on a second raw readlink call."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-model")
+    alias = snapshot / "model.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    original_resolve = Path.resolve
+    alias_resolve_calls = 0
+
+    def fail_redundant_resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal alias_resolve_calls
+        if path == alias:
+            alias_resolve_calls += 1
+            if alias_resolve_calls > 1:
+                raise OSError("trusted alias cannot be resolved again")
+        return original_resolve(path, strict=strict)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        return _mock_sharded_scan_result(blob_path.stat().st_size)
+
+    monkeypatch.setattr(Path, "resolve", fail_redundant_resolve)
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.files_scanned == 1
+    assert alias_resolve_calls == 1
+    assert result.has_errors is False
+    assert not any(issue.message == "Directory entry unavailable during discovery" for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_continues_when_hf_shard_alias_retargets_after_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changing HF alias must not abort discovery before later malicious files."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-shard")
+    alias = snapshot / "model-00001-of-00001.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+    malicious_payload = snapshot / "z-malicious.pkl"
+    malicious_payload.write_bytes(_build_malicious_pickle())
+    original_resolve_target = core_module._resolve_directory_scan_target
+    retargeted = False
+
+    def retarget_after_resolution(
+        file_path: Path,
+        base_dir: Path,
+        *,
+        is_hf_cache: bool,
+        hf_cache_root: Path | None,
+        results: ModelAuditResultModel,
+        reported_traversal_targets: set[str] | None = None,
+    ) -> tuple[Path | None, bool, bool]:
+        nonlocal retargeted
+        resolved = original_resolve_target(
+            file_path,
+            base_dir,
+            is_hf_cache=is_hf_cache,
+            hf_cache_root=hf_cache_root,
+            results=results,
+            reported_traversal_targets=reported_traversal_targets,
+        )
+        if file_path == alias and resolved[0] is not None:
+            alias.unlink()
+            alias.symlink_to(alias.name)
+            retargeted = True
+        return resolved
+
+    monkeypatch.setattr(core_module, "_resolve_directory_scan_target", retarget_after_resolution)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert retargeted is True
+    assert any(issue.rule_code == "S201" for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_require_strict_hf_alias_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid relative aliases remain scannable when strict alias resolution is unavailable."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob"
+    blob_path.write_bytes(b"hf-model")
+    alias = snapshot / "model.safetensors"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    original_resolve = Path.resolve
+
+    def reject_strict_symlink_resolution(path: Path, strict: bool = False) -> Path:
+        if strict and path.is_symlink():
+            raise OSError("strict relative symlink resolution is unavailable")
+        return original_resolve(path, strict=strict)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        return _mock_sharded_scan_result(blob_path.stat().st_size)
+
+    monkeypatch.setattr(Path, "resolve", reject_strict_symlink_resolution)
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.files_scanned == 1
+    assert result.has_errors is False
+    assert not any("path traversal" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_rejects_symlinked_hf_blobs_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache-shaped blobs symlink must not grant traversal outside the model cache."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    outside_dir = tmp_path / "outside"
+    snapshot.mkdir(parents=True)
+    outside_dir.mkdir()
+    outside_payload = outside_dir / "blob"
+    outside_payload.write_bytes(_build_malicious_pickle())
+    (cache_dir / "blobs").symlink_to(outside_dir, target_is_directory=True)
+    shard_alias = snapshot / "model-00001-of-00001.safetensors"
+    shard_alias.symlink_to(Path("../../blobs") / outside_payload.name)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.files_scanned == 0
+    assert any(
+        issue.message == "Path traversal outside scanned directory"
+        and issue.location == str(shard_alias)
+        and issue.details["resolved_path"] == str(outside_payload)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hashing and dispatch must retain the target identity captured during discovery."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_one = blobs_dir / "blob-1"
+    blob_two = blobs_dir / "blob-2"
+    blob_one.write_bytes(b"one")
+    blob_two.write_bytes(b"two")
+    shard_one = snapshot / "model-00001-of-00002.safetensors"
+    shard_two = snapshot / "model-00002-of-00002.safetensors"
+    shard_one.symlink_to(Path("../../blobs") / blob_one.name)
+    shard_two.symlink_to(Path("../../blobs") / blob_two.name)
+    original_hash_files = core_module._hash_files_by_path
+
+    def retarget_after_hash(
+        file_paths: list[str],
+        *,
+        config: dict[str, Any] | None = None,
+        routing_paths: dict[str, str] | None = None,
+        hashed_identities: dict[str, dict[str, int]] | None = None,
+    ) -> dict[str, str]:
+        assert set(file_paths) == {str(blob_one), str(blob_two)}
+        assert routing_paths == {str(blob_one): str(shard_one), str(blob_two): str(shard_two)}
+        hashes = original_hash_files(
+            file_paths,
+            config=config,
+            routing_paths=routing_paths,
+            hashed_identities=hashed_identities,
+        )
+        shard_one.unlink()
+        shard_one.symlink_to(Path("../../blobs") / blob_two.name)
+        return hashes
+
+    monkeypatch.setattr(core_module, "_hash_files_by_path", retarget_after_hash)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert any(check.name == "Sharded Model Boundary Check" for check in result.checks)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_allows_mixed_regular_and_hf_blob_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Family allowlisting must not depend on the first shard being an HF symlink."""
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir()
+    regular_shard = snapshots_dir / "model-00001-of-00002.safetensors"
+    linked_shard = snapshots_dir / "model-00002-of-00002.safetensors"
+    blob_path = blobs_dir / "blob-2"
+    regular_shard.write_bytes(b"regular-shard")
+    blob_path.write_bytes(b"linked-shard")
+    linked_shard.symlink_to(Path("../../blobs") / blob_path.name)
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(regular_shard.stat().st_size + blob_path.stat().st_size)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshots_dir), cache_scan_results=False)
+
+    assert calls == [str(regular_shard.resolve())]
+    assert result.files_scanned == 2
+    assert not any(issue.message == "Path traversal outside scanned directory" for issue in result.issues)
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -995,16 +1248,6 @@ def test_directory_scan_handles_broken_hf_shard_alias_per_file(
 
     def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
         calls.append(path)
-        if Path(path) == missing_blob:
-            result = ScanResult(scanner_name="error")
-            result.add_check(
-                name="File Size Check",
-                passed=False,
-                message="Error checking file size: missing blob",
-                severity=IssueSeverity.INFO,
-            )
-            result.finish(success=False)
-            return result
         return _mock_sharded_scan_result(blob_path.stat().st_size, missing_shards=1)
 
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
@@ -1012,10 +1255,15 @@ def test_directory_scan_handles_broken_hf_shard_alias_per_file(
     result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
 
     coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
-    assert len(calls) == 2
-    assert str(missing_blob) in calls
+    assert calls == [str(snapshot / "model-00001-of-00002.safetensors")]
     assert len(coverage_checks) == 1
-    assert any(check.name == "File Size Check" for check in result.checks)
+    assert result.has_errors is True
+    assert any(
+        issue.message == "Broken symlink encountered"
+        and issue.location == str(snapshot / "model-00002-of-00002.safetensors")
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in result.issues
+    )
 
 
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
@@ -1025,7 +1273,9 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     shard = tmp_path / "model-00001-of-00002.safetensors"
     shard.write_bytes(b"inside-shard")
     allowed_path = str(shard.resolve())
+    captured_selection_allowed_paths: list[list[str] | None] = []
     captured_allowed_paths: list[list[str] | None] = []
+    captured_allowed_targets: list[core_module.ValidatedShardTargets | None] = []
 
     class DummyScanner:
         name = "dummy"
@@ -1051,17 +1301,30 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         timeout: int,
         *,
         allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
     ) -> ScanResult:
         assert path == str(shard)
         assert progress_callback is None
         assert timeout == 7200
         captured_allowed_paths.append(allowed_shard_paths)
+        captured_allowed_targets.append(allowed_shard_targets)
+        assert core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY not in scanner.config
         result = ScanResult(scanner_name=scanner.name)
         result.bytes_scanned = shard.stat().st_size
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda path: path == str(shard))
+    def fake_should_use_advanced_handler(
+        path: str,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+    ) -> bool:
+        captured_selection_allowed_paths.append(allowed_shard_paths)
+        captured_allowed_targets.append(allowed_shard_targets)
+        return path == str(shard)
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "get_scanner_for_path", fake_get_scanner_for_path)
     monkeypatch.setattr(core_module, "scan_advanced_large_file", fake_scan_advanced_large_file)
@@ -1072,7 +1335,13 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
             "cache_scan_results": False,
             core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
                 "members": [
-                    {"path": allowed_path, "content_hash": "sha256:inside"},
+                    {
+                        "source_path": str(shard),
+                        "path": allowed_path,
+                        "device": shard.stat().st_dev,
+                        "inode": shard.stat().st_ino,
+                        "content_hash": "sha256:inside",
+                    },
                     {"path": 123, "content_hash": "invalid"},
                     "not-a-member",
                 ],
@@ -1081,7 +1350,375 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     )
 
     assert result.scanner_name == "dummy"
+    assert captured_selection_allowed_paths == [[allowed_path]]
     assert captured_allowed_paths == [[allowed_path]]
+    assert all(
+        targets is not None and targets[str(shard)]["resolved_path"] == allowed_path
+        for targets in captured_allowed_targets
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_scan_file_fails_closed_when_grouped_shard_retargets_outside_allowlist(tmp_path: Path) -> None:
+    """A stale grouped representative cannot downgrade into an ordinary scan."""
+    scan_dir = tmp_path / "scan"
+    outside_dir = tmp_path / "outside"
+    scan_dir.mkdir()
+    outside_dir.mkdir()
+    shard = scan_dir / "model-00001-of-00001.safetensors"
+    inside_target = scan_dir / "inside.safetensors"
+    outside_target = outside_dir / "outside.safetensors"
+    inside_target.write_bytes(b"inside")
+    outside_target.write_bytes(b"outside")
+    shard.symlink_to(inside_target)
+    allowed_path = str(inside_target.resolve())
+    shard.unlink()
+    shard.symlink_to(outside_target)
+
+    result = core_module._scan_file_internal(
+        str(shard),
+        config={
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [{"path": allowed_path, "content_hash": "sha256:inside"}],
+            },
+        },
+    )
+
+    assert result.success is False
+    assert result.scanner_name == "shard_boundary"
+    assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+    assert result.metadata["scan_outcome_reasons"] == ["shard_boundary_changed"]
+    assert any(check.name == "Sharded Model Boundary Check" for check in result.checks)
+
+
+def test_scan_file_fails_closed_when_grouped_shard_content_changes(tmp_path: Path) -> None:
+    """Hash-time shard identity must still match when grouped scanning begins."""
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"malicious")
+    hash_time_stat = shard.stat()
+    shard.write_bytes(b"benign!!!")
+    os.utime(
+        shard,
+        ns=(hash_time_stat.st_atime_ns, hash_time_stat.st_mtime_ns + 1_000_000_000),
+    )
+
+    result = core_module._scan_file_internal(
+        str(shard),
+        config={
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [
+                    {
+                        "source_path": str(shard),
+                        "path": str(shard.resolve()),
+                        "device": hash_time_stat.st_dev,
+                        "inode": hash_time_stat.st_ino,
+                        "size": hash_time_stat.st_size,
+                        "mtime_ns": hash_time_stat.st_mtime_ns,
+                        "ctime_ns": hash_time_stat.st_ctime_ns,
+                        "content_hash": "stale-hash",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert result.success is False
+    assert result.scanner_name == "shard_boundary"
+    assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
+    boundary_check = next(check for check in result.checks if check.name == "Sharded Model Boundary Check")
+    assert boundary_check.details["reason"] == "shard_target_content_changed"
+
+
+def test_scan_file_ignores_outer_shard_boundary_for_non_shard_payload(tmp_path: Path) -> None:
+    """A nested non-shard member should retain malicious scanning under an outer fingerprint."""
+    shard = tmp_path / "model-00001-of-00001.pt"
+    shard.write_bytes(b"outer shard")
+    nested_payload = tmp_path / "payload.pkl"
+    nested_payload.write_bytes(_build_malicious_pickle())
+
+    result = scan_file(
+        str(nested_payload),
+        config={
+            "cache_scan_results": False,
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [{"path": str(shard.resolve()), "content_hash": "sha256:outer"}],
+            },
+        },
+    )
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_discovered_shard_path_handles_concurrent_symlink_loop(tmp_path: Path) -> None:
+    """Concurrent shard breakage becomes an incomplete-discovery issue instead of an exception."""
+    shard_path = tmp_path / "model-00002-of-00002.safetensors"
+    shard_path.symlink_to(shard_path.name)
+    results = core_module.create_initial_audit_result()
+
+    resolved = core_module._resolve_discovered_shard_path(str(shard_path), results)
+
+    assert resolved is None
+    assert any(
+        issue.message == "Shard path changed during directory discovery"
+        and issue.location == str(shard_path)
+        and issue.details["scan_outcome_reason"] == "shard_path_changed"
+        for issue in results.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_allows_restored_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target restored during preflight should continue through normal validation."""
+    target_path = tmp_path / "target.bin"
+    target_path.write_bytes(b"safe")
+    link_path = tmp_path / "model.bin"
+    link_path.symlink_to(target_path.name)
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_exists = Path.exists
+    link_exists_calls = 0
+
+    def transient_exists(path: Path) -> bool:
+        nonlocal link_exists_calls
+        if path == link_path:
+            link_exists_calls += 1
+            return link_exists_calls > 1
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", transient_exists)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        link_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved == target_path.resolve()
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is False
+    assert results.issues == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_reports_missing_symlink_when_windows_stat_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows may stat a dangling reparse point without reaching its missing target."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_exists = Path.exists
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+    original_readlink = os.readlink
+
+    def fake_exists(path: Path) -> bool:
+        return False if path == broken_path else original_exists(path)
+
+    def lexical_broken_resolve(path: Path, strict: bool = False) -> Path:
+        if path == broken_path:
+            return Path(os.path.abspath(path))
+        return original_resolve(path, strict=strict)
+
+    def fake_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == broken_path:
+            return os.lstat(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    def raise_readlink(path: str | os.PathLike[str]) -> str:
+        if Path(path) == broken_path:
+            raise OSError("dangling link")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(Path, "resolve", lexical_broken_resolve)
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(core_module.os, "readlink", raise_readlink)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        broken_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved is None
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is True
+    assert any(
+        issue.message == "Broken symlink encountered"
+        and issue.location == str(broken_path)
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in results.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_recovers_valid_relative_windows_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid relative link remains scannable when Windows leaves it lexically unresolved."""
+    target_path = tmp_path / "blobs" / "model.bin"
+    target_path.parent.mkdir()
+    target_path.write_bytes(b"safe")
+    link_path = tmp_path / "snapshots" / "abc123" / "model.bin"
+    link_path.parent.mkdir(parents=True)
+    link_path.symlink_to(Path("../../blobs/model.bin"))
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+
+    def lexical_link_resolve(path: Path, strict: bool = False) -> Path:
+        if path == link_path:
+            return path.absolute()
+        return original_resolve(path, strict=strict)
+
+    def link_metadata_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == link_path:
+            return os.lstat(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "resolve", lexical_link_resolve)
+    monkeypatch.setattr(Path, "stat", link_metadata_stat)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        link_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved == target_path.resolve()
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is False
+    assert results.issues == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_classifies_symlink_loop_as_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Platform-specific ELOOP errors should not be mislabeled as missing targets."""
+    cyclic_path = tmp_path / "cycle.pt"
+    cyclic_path.symlink_to(cyclic_path.name)
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_resolve = Path.resolve
+
+    def raise_loop_error(path: Path, strict: bool = False) -> Path:
+        if path == cyclic_path:
+            raise OSError(errno.ELOOP, "too many symbolic links")
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", raise_loop_error)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        cyclic_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved is None
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is True
+    assert any(issue.message == "Directory entry unavailable during discovery" for issue in results.issues)
+    assert all(issue.message != "Broken symlink encountered" for issue in results.issues)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_unclassified_symlink_names_recovers_omitted_broken_link(tmp_path: Path) -> None:
+    """Directory discovery should recover dangling links omitted by ``os.walk``."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    directory_link = tmp_path / "directory-link"
+    directory_link.symlink_to(target_dir, target_is_directory=True)
+
+    assert core_module._unclassified_symlink_names(str(tmp_path), [], []) == [broken_path.name]
+    assert core_module._unclassified_symlink_names(
+        str(tmp_path),
+        [broken_path.name, directory_link.name, target_dir.name],
+        [],
+    ) == [broken_path.name]
+    assert core_module._unclassified_symlink_names(str(tmp_path), [], [broken_path.name]) == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.parametrize("classified_as_directory", [False, True], ids=["omitted", "directory"])
+def test_directory_scan_reports_broken_symlink_outside_file_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    classified_as_directory: bool,
+) -> None:
+    """A platform may omit a dangling file link or classify it as a directory."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+    original_walk = os.walk
+
+    def walk_without_broken_link(
+        top: str,
+        topdown: bool = True,
+        onerror: Callable[[OSError], object] | None = None,
+        followlinks: bool = False,
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        for root, dirs, files in original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks):
+            if classified_as_directory and root == str(tmp_path) and broken_path.name not in dirs:
+                dirs.append(broken_path.name)
+            yield root, dirs, [name for name in files if name != broken_path.name]
+
+    monkeypatch.setattr(core_module.os, "walk", walk_without_broken_link)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert any(
+        issue.message == "Broken symlink encountered"
+        and issue.location == str(broken_path)
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_continues_after_cyclic_symlink(tmp_path: Path) -> None:
+    """One unavailable entry must not suppress findings from other directory members."""
+    cyclic_shard = tmp_path / "checkpoint_1.pt"
+    cyclic_shard.symlink_to(cyclic_shard.name)
+    malicious_payload = tmp_path / "payload.pkl"
+    malicious_payload.write_bytes(_build_malicious_pickle())
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert any(issue.rule_code == "S201" for issue in result.issues)
+    assert any(
+        issue.message == "Directory entry unavailable during discovery"
+        and issue.location == str(cyclic_shard)
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in result.issues
+    )
 
 
 def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
@@ -1091,7 +1728,9 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
     shard = tmp_path / "model-00001-of-00002.safetensors"
     shard.write_bytes(b"inside-shard")
     allowed_path = str(shard.resolve())
+    captured_selection_allowed_paths: list[list[str] | None] = []
     captured_allowed_paths: list[list[str] | None] = []
+    captured_allowed_targets: list[core_module.ValidatedShardTargets | None] = []
 
     class DummyPreferredScanner:
         name = "dummy_preferred"
@@ -1116,18 +1755,31 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         timeout: int,
         *,
         allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
     ) -> ScanResult:
         assert path == str(shard)
         assert scanner.name == "dummy_preferred"
         assert progress_callback is None
         assert timeout == 7200
         captured_allowed_paths.append(allowed_shard_paths)
+        captured_allowed_targets.append(allowed_shard_targets)
+        assert core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY not in scanner.config
         result = ScanResult(scanner_name=scanner.name)
         result.bytes_scanned = shard.stat().st_size
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda path: path == str(shard))
+    def fake_should_use_advanced_handler(
+        path: str,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+    ) -> bool:
+        captured_selection_allowed_paths.append(allowed_shard_paths)
+        captured_allowed_targets.append(allowed_shard_targets)
+        return path == str(shard)
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda scanner_id: DummyPreferredScanner)
     monkeypatch.setattr(
@@ -1143,7 +1795,13 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
             "cache_scan_results": False,
             core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
                 "members": [
-                    {"path": allowed_path, "content_hash": "sha256:inside"},
+                    {
+                        "source_path": str(shard),
+                        "path": allowed_path,
+                        "device": shard.stat().st_dev,
+                        "inode": shard.stat().st_ino,
+                        "content_hash": "sha256:inside",
+                    },
                     {"path": None, "content_hash": "invalid"},
                     "not-a-member",
                 ],
@@ -1152,7 +1810,12 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
     )
 
     assert result.scanner_name == "dummy_preferred"
+    assert captured_selection_allowed_paths == [[allowed_path]]
     assert captured_allowed_paths == [[allowed_path]]
+    assert all(
+        targets is not None and targets[str(shard)]["resolved_path"] == allowed_path
+        for targets in captured_allowed_targets
+    )
 
 
 def test_directory_scan_reports_incomplete_sharded_model_family_once(
@@ -1212,7 +1875,85 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     second_fingerprint = second_material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
 
     assert {member["path"] for member in first_fingerprint["members"]} == {str(shard) for shard in shards}
+    assert all(
+        isinstance(member.get(key), int)
+        for member in first_fingerprint["members"]
+        for key in ("size", "mtime_ns", "ctime_ns")
+    )
     assert first_fingerprint != second_fingerprint
+
+
+def test_directory_scan_deferred_shard_hash_rejects_same_size_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery timestamps must survive when grouped shard hashing is deferred."""
+    shard_one = tmp_path / "checkpoint_1.pt"
+    shard_two = tmp_path / "checkpoint_2.pt"
+    shard_one.write_bytes(pickle.dumps({"weights": [1]}))
+    shard_two.write_bytes(pickle.dumps({"weights": [2]}))
+    replacement = pickle.dumps({"weights": [3]})
+    assert len(replacement) == shard_two.stat().st_size
+    original_stat = shard_two.stat()
+    rewrite_performed = False
+
+    def defer_hash(file_paths: list[str], **_kwargs: Any) -> dict[str, str]:
+        nonlocal rewrite_performed
+        shard_two.write_bytes(replacement)
+        os.utime(
+            shard_two,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000),
+        )
+        rewrite_performed = True
+        return {path: f"unhashable_max_file_size_{index}" for index, path in enumerate(file_paths)}
+
+    monkeypatch.setattr(core_module, "_hash_files_by_path", defer_hash)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert rewrite_performed is True
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    coverage_check = next(check for check in result.checks if check.name == "Sharded Model Coverage Check")
+    assert coverage_check.details["unvalidated_shards"] == [str(shard_two)]
+    assert coverage_check.details["scan_outcome_reason"] == "unvalidated_model_shards"
+
+
+def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
+    """Caching or its safety bypass must not hide a newly malicious sibling shard."""
+    shard_one = tmp_path / "checkpoint_1.pt"
+    shard_two = tmp_path / "checkpoint_2.pt"
+    shard_one.write_bytes(pickle.dumps({"weights": [1]}))
+    shard_two.write_bytes(pickle.dumps({"weights": [2]}))
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first_result = scan_file(str(shard_one), config=config)
+        cached_result = scan_file(str(shard_one), config=config)
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        shard_two.write_bytes(_build_malicious_pickle())
+        second_result = scan_file(str(shard_one), config=config)
+
+        assert first_result.success is True
+        assert cached_result.success is True
+        if os.name == "nt":
+            assert cached_entries == 0
+        else:
+            assert cached_entries > 0
+        assert any(issue.rule_code == "S201" for issue in second_result.issues)
+        final_cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        if os.name == "nt":
+            assert final_cache_entries == 0
+        else:
+            assert final_cache_entries >= cached_entries
+    finally:
+        reset_cache_manager()
 
 
 def test_directory_scan_groups_shard_family_without_declared_total(
@@ -4011,16 +4752,29 @@ def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
         timeout: int,
         *,
         allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
     ) -> ScanResult:
         assert path == str(disguised_keras)
         assert progress_callback is None
         assert timeout == 7200
         assert allowed_shard_paths is None
+        assert allowed_shard_targets is None
         assert scanner.config["cache_enabled"] is False
         return scanner.scan(path)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda _path: True)
+
+    def always_use_advanced_handler(
+        _path: str,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+    ) -> bool:
+        assert allowed_shard_paths is None
+        assert allowed_shard_targets is None
+        return True
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", always_use_advanced_handler)
     monkeypatch.setattr(core_module, "scan_advanced_large_file", scan_advanced_without_cache)
 
     result = scan_file(
