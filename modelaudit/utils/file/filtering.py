@@ -279,6 +279,10 @@ def _has_scannable_content(path: str) -> bool:
 
     try:
         from .detection import detect_file_format_for_skip_filter, is_keras_zip_archive
+        from .hdf5 import find_hdf5_signature_offset
+
+        if find_hdf5_signature_offset(path) is not None:
+            return True
 
         detected_format = detect_file_format_for_skip_filter(path)
         if detected_format == "unknown":

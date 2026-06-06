@@ -382,7 +382,7 @@ jobs:
     runs-on: ubuntu-latest
     # The full fast suite can approach 30 minutes on hosted runners when the
     # bounded-replay security regressions land on the long-running worker.
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

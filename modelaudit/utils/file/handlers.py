@@ -17,7 +17,11 @@ from contextvars import copy_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+from ..helpers.cache_decorator import (
+    add_optional_dependency_availability_to_version_context,
+    should_bypass_cache_for_safetensors_header_limit,
+    should_bypass_cache_for_unavailable_hdf5_analysis,
+)
 
 if TYPE_CHECKING:
     from ...scanner_results import ScanResult
@@ -765,6 +769,15 @@ def scan_advanced_large_file(
             timeout,
             allowed_shard_paths=allowed_shard_paths,
         )
+    if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+        logger.debug(f"Bypassing advanced-file cache because HDF5 analysis is unavailable: {file_path}")
+        return _scan_advanced_large_file_internal(
+            file_path,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+        )
 
     # Use cache manager for advanced large file scans
     try:
@@ -778,7 +791,9 @@ def scan_advanced_large_file(
             version_config["advanced_allowed_shard_paths"] = sorted(
                 {str(Path(path).resolve()) for path in allowed_shard_paths}
             )
-        version_context = build_cache_version_context(version_config)
+        version_context = add_optional_dependency_availability_to_version_context(
+            build_cache_version_context(version_config)
+        )
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
