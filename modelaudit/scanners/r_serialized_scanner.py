@@ -106,18 +106,20 @@ _R_RESERVED_WORDS = _R_CONTROL_WORDS | frozenset(
         "TRUE",
     }
 )
-_R_SIMPLE_NUMERIC_TOKEN_RE = re.compile(
-    r"(?i)(?:0x[0-9a-f]+(?:p[+-]?[0-9]+)?|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?"
+_R_SIMPLE_NUMERIC_TOKEN = (
+    r"(?:0x(?:[0-9a-f]+(?:\.[0-9a-f]*)?|\.[0-9a-f]+)(?:p[+-]?[0-9]+)?"
+    r"|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?"
 )
+_R_SIMPLE_NUMERIC_TOKEN_RE = re.compile(_R_SIMPLE_NUMERIC_TOKEN, re.IGNORECASE)
 _R_DOT_ARGUMENT_TOKEN_RE = re.compile(r"\.\.[0-9]+")
 _R_OBVIOUS_NONCALLABLE_GROUPED_TOKEN_RE = re.compile(
-    r"""
+    rf"""
     \s*(?:
         (?P<value>
-            (?i:(?:0x[0-9a-f]+(?:p[+-]?[0-9]+)?|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?)
+            (?i:{_R_SIMPLE_NUMERIC_TOKEN})
             |FALSE|Inf|NA_character_|NA_complex_|NA_integer_|NA_real_|NULL|NaN|TRUE|NA
         )
-        |(?P<operator>%%|%/%|%\*%|%in%|&&|\|\||<=|>=|==|!=|[()+\-*/^:!&|<>])
+        |(?P<operator>%%|%/%|%\*%|%in%|&&|\|\||<=|>=|==|!=|\*\*|[()+\-*/^:!&|<>])
     )
     """,
     re.VERBOSE,
@@ -1079,7 +1081,21 @@ def _r_expression_has_obvious_adjacent_values(
             operator = next(
                 (
                     candidate
-                    for candidate in ("<<-", "->>", ":::", "::", "|>", "||", "&&", "<=", ">=", "!=", "<-", "->")
+                    for candidate in (
+                        "<<-",
+                        "->>",
+                        ":::",
+                        "::",
+                        "|>",
+                        "||",
+                        "&&",
+                        "<=",
+                        ">=",
+                        "!=",
+                        "<-",
+                        "->",
+                        "**",
+                    )
                     if text.startswith(candidate, cursor)
                 ),
                 character if character in "*/^:&|<>$@" else "",
@@ -1105,9 +1121,16 @@ def _r_expression_has_obvious_adjacent_values(
             cursor += len(operator)
             continue
         if character.isalnum() or character in "._":
-            token_end = cursor + 1
-            while token_end < stop and (text[token_end].isalnum() or text[token_end] in "._"):
-                token_end += 1
+            token_starts_like_number = character.isdigit() or (
+                character == "." and cursor + 1 < stop and text[cursor + 1].isdigit()
+            )
+            numeric_match = _R_SIMPLE_NUMERIC_TOKEN_RE.match(text, cursor, stop) if token_starts_like_number else None
+            if numeric_match is not None:
+                token_end = numeric_match.end()
+            else:
+                token_end = cursor + 1
+                while token_end < stop and (text[token_end].isalnum() or text[token_end] in "._"):
+                    token_end += 1
             token = text[cursor:token_end]
             if operator_name_required:
                 if (
@@ -1225,16 +1248,42 @@ def _r_open_paren_starts_argument_list(
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
         span_start, span_end = non_code_spans[span_index]
-        return (
-            not crossed_newline
-            and span_end == cursor + 1
-            and text[span_start] != "#"
-            and _r_expression_start_has_valid_boundary(
-                text,
-                span_start,
-                non_code_spans,
-                delimiter_pairs,
-            )
+        if crossed_newline or span_end != cursor + 1 or text[span_start] == "#":
+            return False
+        if unterminated_literal_starts is None:
+            unterminated_literal_starts = _r_unterminated_literal_span_starts(text, non_code_spans)
+        if span_start in unterminated_literal_starts:
+            return False
+
+        operator_cursor = span_start - 1
+        while operator_cursor >= 0 and text[operator_cursor].isspace():
+            operator_cursor -= 1
+        if operator_cursor >= 0 and text[operator_cursor] in "$@:":
+            operator_start = operator_cursor
+            if text[operator_cursor] == ":":
+                while operator_start >= 0 and text[operator_start] == ":":
+                    operator_start -= 1
+                operator_start += 1
+                if operator_cursor - operator_start + 1 in {2, 3}:
+                    return _r_namespace_receiver_is_valid(
+                        text,
+                        operator_start,
+                        non_code_spans,
+                        delimiter_pairs,
+                        unterminated_literal_starts,
+                    )
+            else:
+                return not _r_expression_before_position_is_obviously_non_callable(
+                    text,
+                    operator_start,
+                    non_code_spans,
+                    delimiter_pairs,
+                )
+        return _r_expression_start_has_valid_boundary(
+            text,
+            span_start,
+            non_code_spans,
+            delimiter_pairs,
         )
 
     character = text[cursor]

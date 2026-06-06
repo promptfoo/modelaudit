@@ -28,6 +28,7 @@ from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
+from modelaudit.utils.file.hdf5 import HDF5_MAGIC, hdf5_metadata_checksum
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers.file_creators import (
     create_mock_mxnet_symbol,
@@ -74,6 +75,23 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
         handle.write(struct.pack("<Q", header_len))
         handle.write(b"{")
         handle.truncate(8 + header_len + 1)
+
+
+def _write_hdf5_userblock_candidate(path: Path, *, valid_checksum: bool) -> None:
+    signature_offset = 512
+    file_size = signature_offset + 64
+    superblock = bytearray(HDF5_MAGIC + b"\x03\x08\x08\x00")
+    superblock.extend(signature_offset.to_bytes(8, "little"))
+    superblock.extend(b"\xff" * 8)
+    superblock.extend(file_size.to_bytes(8, "little"))
+    superblock.extend((signature_offset + 48).to_bytes(8, "little"))
+    checksum = hdf5_metadata_checksum(bytes(superblock))
+    if not valid_checksum:
+        checksum ^= 1
+    superblock.extend(checksum.to_bytes(4, "little"))
+    path.write_bytes(
+        bytes(signature_offset) + bytes(superblock) + bytes(file_size - signature_offset - len(superblock))
+    )
 
 
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
@@ -297,6 +315,19 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_zip))
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
+
+    @pytest.mark.parametrize("suffix", [".txt", ".py", ".jpg"])
+    def test_hdf5_userblock_bypasses_extension_skip(self, tmp_path: Path, suffix: str) -> None:
+        disguised_hdf5 = tmp_path / f"weights{suffix}"
+        _write_hdf5_userblock_candidate(disguised_hdf5, valid_checksum=True)
+
+        assert not should_skip_file(str(disguised_hdf5))
+
+    def test_corrupt_hdf5_userblock_checksum_does_not_bypass_extension_skip(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "weights.jpg"
+        _write_hdf5_userblock_candidate(near_match, valid_checksum=False)
+
+        assert should_skip_file(str(near_match))
 
     def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
         checkpoint_path = tmp_path / "checkpoint.jpg"
