@@ -5343,6 +5343,9 @@ def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabl
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
         for finding in report.findings
     )
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str((tmp_path / "numpy.py").absolute()) in source_fingerprints["fingerprints"]
     load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
     subprocess.run([sys.executable, "-c", load_payload], check=True)
     assert marker.read_text(encoding="utf-8") == "owned"
@@ -5358,6 +5361,27 @@ def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    assert report.private_metadata["call_graph_source_fingerprints"]["reusable"] is True
+
+
+def test_oversized_import_hook_state_disables_source_fingerprint_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StatefulPathHook:
+        def __init__(self) -> None:
+            for index in range(17):
+                setattr(self, f"state_{index}", index)
+
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    monkeypatch.setattr(sys, "path_hooks", [StatefulPathHook()])
+
+    with shared_source_sensitive_caches():
+        source_fingerprints = shared_source_fingerprint_metadata()
+
+    assert source_fingerprints is not None
+    assert source_fingerprints["reusable"] is False
 
 
 def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(

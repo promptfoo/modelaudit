@@ -34,7 +34,7 @@ from importlib.machinery import (
 from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
-from types import CodeType, FunctionType, ModuleType
+from types import CodeType, FunctionType, MethodType, ModuleType
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
@@ -55,6 +55,7 @@ _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _SOURCE_RESOLUTION_SUFFIXES = tuple(dict.fromkeys((*SOURCE_SUFFIXES, *BYTECODE_SUFFIXES, *EXTENSION_SUFFIXES)))
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
+_UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _MAX_BYTECODE_CACHE_BYTES = 4 * _MAX_SOURCE_BYTES
 _MAX_BYTECODE_CACHE_DIRECTORY_BYTES = 64 * 1024
 _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
@@ -1125,10 +1126,12 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         _clear_source_sensitive_caches_now()
+        resolution_context = _source_resolution_context()
         snapshot_token = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.set(
             _SharedSourceSnapshot(
                 search_context=_source_search_context(),
-                resolution_context=_source_resolution_context(),
+                resolution_context=resolution_context,
+                reusable=_resolution_context_is_reusable(resolution_context),
             )
         )
         token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
@@ -1521,18 +1524,22 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
     if value is None or isinstance(value, bool | int | float):
         return repr(value)
     if isinstance(value, str):
-        return repr(value[:256])
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
+    if isinstance(value, bytes):
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, type):
         return f"{value.__module__}.{value.__qualname__}"
     if depth >= _MAX_HOOK_IDENTITY_DEPTH:
-        return f"<{type(value).__module__}.{type(value).__qualname__}>"
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, tuple | list):
-        sequence_identity = ",".join(
-            _bounded_hook_value_identity(item, depth + 1) for item in value[:_MAX_HOOK_IDENTITY_ITEMS]
-        )
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        sequence_identity = ",".join(_bounded_hook_value_identity(item, depth + 1) for item in value)
         return f"{type(value).__name__}({sequence_identity})"
     if isinstance(value, dict):
-        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))[:_MAX_HOOK_IDENTITY_ITEMS]
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))
         return (
             "dict("
             + ",".join(
@@ -1541,7 +1548,16 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
             )
             + ")"
         )
-    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+    try:
+        instance_state = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    if not isinstance(instance_state, dict):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    return (
+        f"<{type(value).__module__}.{type(value).__qualname__}:"
+        f"{_bounded_hook_value_identity(instance_state, depth + 1)}>"
+    )
 
 
 def _hook_type_code(hook_type: type[object]) -> bytes:
@@ -1569,6 +1585,12 @@ def _import_hook_identity(hook: object) -> str:
             except ValueError:
                 closure_values.append("<empty>")
         state = _bounded_hook_value_identity(tuple(closure_values))
+    elif isinstance(hook, MethodType):
+        function = hook.__func__
+        module = function.__module__
+        qualname = function.__qualname__
+        code = marshal.dumps(function.__code__)
+        state = _bounded_hook_value_identity(hook.__self__)
     elif isinstance(hook, type):
         module = hook.__module__
         qualname = hook.__qualname__
@@ -1582,10 +1604,17 @@ def _import_hook_identity(hook: object) -> str:
         try:
             instance_state = object.__getattribute__(hook, "__dict__")
         except (AttributeError, TypeError):
-            instance_state = {}
+            instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
         state = _bounded_hook_value_identity(instance_state)
     digest = hashlib.sha256(code + state.encode()).hexdigest()
-    return f"{module}.{qualname}:{digest}"
+    reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
+    return f"{module}.{qualname}:{reuse_marker}{digest}"
+
+
+def _resolution_context_is_reusable(
+    context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> bool:
+    return all(":unreusable:" not in identity for identities in context for identity in identities)
 
 
 def _path_hook_resolution_identity(hook: object) -> str:
@@ -1850,7 +1879,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.loaded_package_paths.clear()
     snapshot.generation += 1
     snapshot.stable = True
-    snapshot.reusable = True
+    snapshot.reusable = _resolution_context_is_reusable(snapshot.resolution_context)
 
 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:

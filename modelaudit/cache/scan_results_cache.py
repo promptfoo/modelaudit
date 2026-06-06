@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from importlib.machinery import BYTECODE_SUFFIXES, EXTENSION_SUFFIXES, SOURCE_SUFFIXES, FileFinder, ModuleSpec
 from pathlib import Path
-from types import FunctionType, ModuleType
+from types import FunctionType, MethodType, ModuleType
 from typing import Any, BinaryIO
 from zipimport import zipimporter
 
@@ -35,11 +35,16 @@ _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _MAX_HOOK_IDENTITY_ITEMS = 16
 _MAX_HOOK_IDENTITY_DEPTH = 4
+_UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
 _TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
 
 AncestorEntry = tuple[str, int, int, int, int, int]
+_DARWIN_STABLE_SYMLINK_ALIASES = {
+    "/tmp": "/private/tmp",
+    "/var": "/private/var",
+}
 
 
 class _AncestorPathMonitor:
@@ -216,6 +221,7 @@ ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
 
 _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS = 2.1
 _MAX_IDENTITY_BARRIER_ATTEMPTS = 3
+_MAX_IDENTITY_CAPTURE_ATTEMPTS = 5
 
 
 def _is_sampled_fingerprint(value: object) -> bool:
@@ -227,18 +233,22 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
     if value is None or isinstance(value, bool | int | float):
         return repr(value)
     if isinstance(value, str):
-        return repr(value[:256])
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
+    if isinstance(value, bytes):
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, type):
         return f"{value.__module__}.{value.__qualname__}"
     if depth >= _MAX_HOOK_IDENTITY_DEPTH:
-        return f"<{type(value).__module__}.{type(value).__qualname__}>"
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, tuple | list):
-        sequence_identity = ",".join(
-            _bounded_hook_value_identity(item, depth + 1) for item in value[:_MAX_HOOK_IDENTITY_ITEMS]
-        )
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        sequence_identity = ",".join(_bounded_hook_value_identity(item, depth + 1) for item in value)
         return f"{type(value).__name__}({sequence_identity})"
     if isinstance(value, dict):
-        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))[:_MAX_HOOK_IDENTITY_ITEMS]
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))
         return (
             "dict("
             + ",".join(
@@ -247,7 +257,16 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
             )
             + ")"
         )
-    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+    try:
+        instance_state = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    if not isinstance(instance_state, dict):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    return (
+        f"<{type(value).__module__}.{type(value).__qualname__}:"
+        f"{_bounded_hook_value_identity(instance_state, depth + 1)}>"
+    )
 
 
 def _hook_type_code(hook_type: type[object]) -> bytes:
@@ -275,6 +294,12 @@ def _import_hook_identity(hook: object) -> str:
             except ValueError:
                 closure_values.append("<empty>")
         state = _bounded_hook_value_identity(tuple(closure_values))
+    elif isinstance(hook, MethodType):
+        function = hook.__func__
+        module = function.__module__
+        qualname = function.__qualname__
+        code = marshal.dumps(function.__code__)
+        state = _bounded_hook_value_identity(hook.__self__)
     elif isinstance(hook, type):
         module = hook.__module__
         qualname = hook.__qualname__
@@ -288,10 +313,11 @@ def _import_hook_identity(hook: object) -> str:
         try:
             instance_state = object.__getattribute__(hook, "__dict__")
         except (AttributeError, TypeError):
-            instance_state = {}
+            instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
         state = _bounded_hook_value_identity(instance_state)
     digest = hashlib.sha256(code + state.encode()).hexdigest()
-    return f"{module}.{qualname}:{digest}"
+    reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
+    return f"{module}.{qualname}:{reuse_marker}{digest}"
 
 
 def _path_hook_resolution_identity(hook: object) -> str:
@@ -878,67 +904,78 @@ class ScanResultsCache:
         if self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
 
-        preliminary_stat = os.stat(file_path)
-        probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
-        preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
-        preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)
+        last_change_error: ValueError | None = None
+        for _capture_attempt in range(_MAX_IDENTITY_CAPTURE_ATTEMPTS):
+            preliminary_stat = os.stat(file_path)
+            probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
+            preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
+            preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)
 
-        for _attempt in range(_MAX_IDENTITY_BARRIER_ATTEMPTS):
-            barrier_token = self._advance_change_clock(
-                file_path,
-                probe,
-                preliminary_change_token,
-                preliminary_ancestor_identity,
-            )
-            if self._path_has_symlink_component(file_path):
-                raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
-            initial_stat = os.stat(file_path)
-            initial_change_token = self._get_file_change_token(file_path, initial_stat)
-            initial_ancestor_identity = self._capture_ancestor_identity(file_path)
-            newest_initial_token = self._newest_identity_change_token(
-                initial_change_token,
-                initial_ancestor_identity,
-            )
-            if newest_initial_token < barrier_token:
-                break
-            preliminary_change_token = initial_change_token
-            preliminary_ancestor_identity = initial_ancestor_identity
-        else:
-            raise ValueError(f"File kept changing while capturing cache identity: {file_path}")
-
-        monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, initial_ancestor_identity)
-        try:
-            monitored_stat = os.stat(file_path)
-            if (
-                not self._stat_matches(initial_stat, monitored_stat)
-                or initial_change_token != self._get_file_change_token(file_path, monitored_stat)
-                or not self._ancestor_identity_matches(
+            for _attempt in range(_MAX_IDENTITY_BARRIER_ATTEMPTS):
+                barrier_token = self._advance_change_clock(
+                    file_path,
+                    probe,
+                    preliminary_change_token,
+                    preliminary_ancestor_identity,
+                )
+                if self._path_has_symlink_component(file_path):
+                    raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
+                initial_stat = os.stat(file_path)
+                initial_change_token = self._get_file_change_token(file_path, initial_stat)
+                initial_ancestor_identity = self._capture_ancestor_identity(file_path)
+                newest_initial_token = self._newest_identity_change_token(
+                    initial_change_token,
                     initial_ancestor_identity,
-                    self._capture_ancestor_identity(file_path),
                 )
-            ):
-                raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
+                if newest_initial_token < barrier_token:
+                    break
+                preliminary_change_token = initial_change_token
+                preliminary_ancestor_identity = initial_ancestor_identity
+            else:
+                raise ValueError(f"File kept changing while capturing cache identity: {file_path}")
 
-            content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
-            verified_stat = os.stat(file_path)
-            verified_change_token = self._get_file_change_token(file_path, verified_stat)
-            verified_ancestor_identity = self._capture_ancestor_identity(file_path)
+            monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, initial_ancestor_identity)
+            try:
+                monitored_stat = os.stat(file_path)
+                if (
+                    not self._stat_matches(initial_stat, monitored_stat)
+                    or initial_change_token != self._get_file_change_token(file_path, monitored_stat)
+                    or not self._ancestor_identity_matches(
+                        initial_ancestor_identity,
+                        self._capture_ancestor_identity(file_path),
+                    )
+                ):
+                    raise ValueError(f"File changed while starting cache identity monitor: {file_path}")
 
-            if (
-                not self._stat_matches(initial_stat, verified_stat)
-                or initial_change_token != verified_change_token
-                or self._ancestor_monitor_changed(monitored_ancestor_identity)
-                or not self._ancestor_identity_matches_for_store(
-                    monitored_ancestor_identity,
-                    verified_ancestor_identity,
-                )
-            ):
-                raise ValueError(f"File changed while capturing cache identity: {file_path}")
+                content_hash = self.hasher.hash_file_with_stat(file_path, initial_stat)
+                verified_stat = os.stat(file_path)
+                verified_change_token = self._get_file_change_token(file_path, verified_stat)
+                verified_ancestor_identity = self._capture_ancestor_identity(file_path)
 
-            return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
-        except Exception:
-            self.release_ancestor_identity(monitored_ancestor_identity)
-            raise
+                if (
+                    not self._stat_matches(initial_stat, verified_stat)
+                    or initial_change_token != verified_change_token
+                    or self._ancestor_monitor_changed(monitored_ancestor_identity)
+                    or not self._ancestor_identity_matches_for_store(
+                        monitored_ancestor_identity,
+                        verified_ancestor_identity,
+                    )
+                ):
+                    raise ValueError(f"File changed while capturing cache identity: {file_path}")
+
+                return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
+            except ValueError as exc:
+                self.release_ancestor_identity(monitored_ancestor_identity)
+                if str(exc).startswith("File changed while"):
+                    last_change_error = exc
+                    time.sleep(0.01)
+                    continue
+                raise
+            except Exception:
+                self.release_ancestor_identity(monitored_ancestor_identity)
+                raise
+
+        raise ValueError(f"File kept changing while capturing cache identity: {file_path}") from last_change_error
 
     def _get_change_clock_probe(self, file_path: str, file_device: int) -> BinaryIO:
         """Return a reusable probe whose inode lives on the scanned file's filesystem."""
@@ -1051,11 +1088,12 @@ class ScanResultsCache:
         """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
+        boundary = self._ancestor_identity_boundary(ancestor, file_device)
         identity: list[AncestorEntry] = []
         direct_parent = True
         while True:
             ancestor_path = str(ancestor)
-            if ancestor.is_symlink():
+            if ancestor.is_symlink() and not self._is_stable_platform_symlink_component(ancestor):
                 raise ValueError(f"Symlink ancestors are not cacheable: {ancestor_path}")
             ancestor_stat = os.stat(ancestor_path)
             if ancestor_stat.st_dev != file_device:
@@ -1077,11 +1115,23 @@ class ScanResultsCache:
                     self._get_file_change_token(ancestor_path, ancestor_stat),
                 )
             )
+            if boundary is not None and ancestor == boundary:
+                break
             if not parent_on_same_device:
                 break
             direct_parent = False
             ancestor = ancestor.parent
         return AncestorIdentity(identity)
+
+    def _ancestor_identity_boundary(self, file_parent: Path, file_device: int) -> Path | None:
+        probe = self._change_clock_probes.get(file_device)
+        if probe is None:
+            return None
+        try:
+            boundary = Path(os.path.commonpath([str(file_parent), str(probe[1])]))
+            return boundary if os.stat(boundary).st_dev == file_device else None
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _ancestor_identity_matches(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
@@ -1144,6 +1194,13 @@ class ScanResultsCache:
             return identity
 
     @staticmethod
+    def _is_stable_platform_symlink_component(path: Path) -> bool:
+        if getattr(sys, "platform", "") != "darwin":
+            return False
+        expected_target = _DARWIN_STABLE_SYMLINK_ALIASES.get(str(path))
+        return expected_target is not None and os.path.realpath(path) == expected_target
+
+    @staticmethod
     def _path_has_symlink_component(file_path: str) -> bool:
         path = Path(file_path)
         if not path.is_absolute():
@@ -1158,6 +1215,8 @@ class ScanResultsCache:
             current /= component
             component_stat = os.lstat(current)
             if stat.S_ISLNK(component_stat.st_mode) or getattr(component_stat, "st_file_attributes", 0) & 0x400:
+                if ScanResultsCache._is_stable_platform_symlink_component(current):
+                    continue
                 return True
         return False
 

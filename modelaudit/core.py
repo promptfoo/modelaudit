@@ -11,6 +11,8 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from pydantic import AnyUrl, BaseModel
+
 try:
     from modelaudit_picklescan import shared_source_sensitive_caches
 except ImportError:
@@ -28,7 +30,7 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Check, Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -59,6 +61,7 @@ from modelaudit.telemetry import record_file_type_detected, record_issue_found, 
 from modelaudit.utils import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
     DvcResolution,
+    dvc_omitted_outputs_covered,
     is_within_directory,
     resolve_dvc_file_status,
     should_skip_file,
@@ -100,7 +103,7 @@ from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.file.streaming import stream_analyze_file
+from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -113,6 +116,19 @@ from modelaudit.utils.sources._huggingface_cache import (
     _get_hf_cache_roots,
     _path_has_part,
     _resolve_hf_cache_path,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    is_sensitive_credential_key,
+    is_stream_url,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_cloud_error_for_display as _redact_cloud_error_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_stream_error_for_display as _redact_stream_error_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_stream_url_for_display as _redact_stream_url_for_display,
 )
 
 logger = logging.getLogger("modelaudit.core")
@@ -147,6 +163,97 @@ determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+
+
+def _record_dvc_output_limit_incomplete(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    dvc_path: str,
+    resolution: DvcResolution,
+) -> None:
+    """Fail closed when DVC output expansion was capped."""
+    if resolution.omitted_output_count == 0:
+        return
+
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    _add_issue_to_model(
+        results,
+        "DVC output limit exceeded - not all declared outputs were scanned",
+        severity=IssueSeverity.INFO.value,
+        location=dvc_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "reason": "dvc_output_limit_exceeded",
+            "declared_output_count": resolution.declared_output_count,
+            "output_limit": resolution.output_limit,
+            "resolved_output_count": len(resolution.targets),
+            "omitted_output_count": resolution.omitted_output_count,
+            "unresolved_omitted_output_count": resolution.unresolved_omitted_output_count,
+            "unverified_omitted_output_count": resolution.unverified_omitted_output_count,
+            "tail_verification_truncated": resolution.tail_verification_truncated,
+        },
+        issue_type="dvc_output_limit_exceeded",
+    )
+
+
+def _dvc_omitted_outputs_covered_by_directory_walk(
+    dvc_path: str,
+    resolution: DvcResolution,
+    directory_walk_covered_paths: set[str],
+    directory_walk_covered_directories: set[str],
+    *,
+    skip_file_types: bool,
+    metadata_scanner_available: bool,
+    scanner_selection_extensions: frozenset[str] | None,
+) -> bool:
+    """Return whether a directory walk independently covers every bounded omitted DVC target."""
+
+    def is_covered(target: Path) -> bool:
+        target_str = str(target)
+        if target.is_file():
+            return target_str in directory_walk_covered_paths
+        if not target.is_dir() or target_str not in directory_walk_covered_directories:
+            return False
+
+        walk_errors: list[OSError] = []
+        for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
+            if str(Path(root).resolve()) not in directory_walk_covered_directories:
+                return False
+            for directory_name in dirs:
+                try:
+                    resolved_directory = str((Path(root) / directory_name).resolve())
+                except OSError:
+                    return False
+                if resolved_directory not in directory_walk_covered_directories:
+                    return False
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if _is_huggingface_cache_file(file_path):
+                    continue
+                if skip_file_types and should_skip_file(
+                    file_path,
+                    metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
+                ):
+                    continue
+                try:
+                    resolved_file = str(Path(file_path).resolve())
+                except OSError:
+                    return False
+                if resolved_file not in directory_walk_covered_paths:
+                    return False
+        return not walk_errors
+
+    return dvc_omitted_outputs_covered(
+        dvc_path,
+        resolution,
+        is_covered,
+        coverage_budget=len(directory_walk_covered_paths) + len(directory_walk_covered_directories),
+    )
+
+
 _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
@@ -167,6 +274,8 @@ _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
 _DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY = "_dvc_total_size_limit"
 _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
+DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
+DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
 
 
 def _record_incomplete_dvc_resolution(
@@ -233,6 +342,90 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
+
+
+def _redacted_stream_url_for_reporting(stream_url: str) -> str:
+    """Return a stream source identifier safe for persisted scan output."""
+    return _redact_stream_url_for_display(stream_url)
+
+
+def _redacted_scan_path_for_reporting(path: str) -> str:
+    if is_stream_url(path):
+        return f"stream://{_redacted_stream_url_for_reporting(path[9:])}"
+    return path
+
+
+def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
+    if is_stream_url(path):
+        return _redact_stream_error_for_display(error, path[9:])
+    return str(error)
+
+
+def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
+    if isinstance(value, BaseModel):
+        return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
+    if isinstance(value, AnyUrl):
+        return _redact_stream_value_for_reporting(str(value), stream_url, report_url)
+    if isinstance(value, os.PathLike):
+        return _redact_stream_value_for_reporting(os.fspath(value), stream_url, report_url)
+    if isinstance(value, str):
+        return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return b"<binary data>"
+        return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
+    if isinstance(value, bytearray):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return bytearray(b"<binary data>")
+        return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
+    if isinstance(value, dict):
+        redacted_mapping: dict[Any, Any] = {}
+        for key, item in value.items():
+            redacted_key = _redact_stream_value_for_reporting(key, stream_url, report_url)
+            redacted_mapping[redacted_key] = (
+                "<redacted>"
+                if is_sensitive_credential_key(key)
+                else _redact_stream_value_for_reporting(item, stream_url, report_url)
+            )
+        return redacted_mapping
+    if isinstance(value, list):
+        return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+    if isinstance(value, set):
+        return {_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+    return value
+
+
+def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, report_url: str) -> None:
+    for attr in ("location", "message", "why", "rule_code", "type", "name"):
+        value = getattr(record, attr, None)
+        if isinstance(value, str):
+            setattr(record, attr, _redact_stream_value_for_reporting(value, stream_url, report_url))
+    if record.details:
+        record.details = _redact_stream_value_for_reporting(record.details, stream_url, report_url)
+    if record.model_extra:
+        redacted_extra = _redact_stream_value_for_reporting(record.model_extra, stream_url, report_url)
+        record.model_extra.clear()
+        record.model_extra.update(redacted_extra)
+
+
+def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
+    """Strip signed query material from scanner-owned records before aggregation."""
+    for issue in scan_result.issues:
+        _redact_stream_record_for_reporting(issue, stream_url, report_url)
+    for check in scan_result.checks:
+        _redact_stream_record_for_reporting(check, stream_url, report_url)
+
+    if scan_result.metadata:
+        scan_result.metadata = _redact_stream_value_for_reporting(scan_result.metadata, stream_url, report_url)
+        scan_result._refresh_metadata_dependent_state()
 
 
 def _start_phase_timing(phase_timings: dict[str, float] | None) -> float | None:
@@ -976,6 +1169,8 @@ def scan_model_directory_or_file(
     dvc_total_size_limit = kwargs.pop(_DVC_TOTAL_SIZE_LIMIT_CONFIG_KEY, None)
     dvc_excluded_paths_value = kwargs.pop(_DVC_EXCLUDED_PATHS_CONFIG_KEY, ())
     dvc_coverage_roots_value = kwargs.pop(_DVC_COVERAGE_ROOTS_CONFIG_KEY, ())
+    dvc_external_covered_paths_value = kwargs.pop(DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY, ())
+    dvc_external_covered_directories_value = kwargs.pop(DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY, ())
     if not isinstance(dvc_excluded_paths_value, (list, tuple, set, frozenset)):
         dvc_excluded_paths_value = ()
     dvc_excluded_paths = {
@@ -987,6 +1182,20 @@ def scan_model_directory_or_file(
         dvc_coverage_roots_value = ()
     dvc_coverage_roots = {
         Path(coverage_root).resolve() for coverage_root in dvc_coverage_roots_value if isinstance(coverage_root, str)
+    }
+    if not isinstance(dvc_external_covered_paths_value, (list, tuple, set, frozenset)):
+        dvc_external_covered_paths_value = ()
+    dvc_external_covered_paths = {
+        str(Path(covered_path).resolve())
+        for covered_path in dvc_external_covered_paths_value
+        if isinstance(covered_path, str)
+    }
+    if not isinstance(dvc_external_covered_directories_value, (list, tuple, set, frozenset)):
+        dvc_external_covered_directories_value = ()
+    dvc_external_covered_directories = {
+        str(Path(covered_directory).resolve())
+        for covered_directory in dvc_external_covered_directories_value
+        if isinstance(covered_directory, str)
     }
 
     # Initialize results using Pydantic model from the start
@@ -1032,41 +1241,43 @@ def scan_model_directory_or_file(
 
     try:
         # Handle streaming paths
-        if path.startswith("stream://"):
+        if is_stream_url(path):
             # Extract the actual URL
             stream_url = path[9:]  # Remove "stream://" prefix
+            report_url = _redacted_stream_url_for_reporting(stream_url)
             if progress_callback:
-                progress_callback(f"Streaming analysis: {stream_url}", 0.0)
+                progress_callback(f"Streaming analysis: {report_url}", 0.0)
 
             # Perform streaming analysis
             from modelaudit.scanners import get_scanner_for_file
 
-            scanner = get_scanner_for_file(stream_url, config=config)
+            scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
                 scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
+                    _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
                     # Use helper function to add scan result to Pydantic model
-                    _add_scan_result_to_model(results, scan_metadata, scan_result, stream_url)
+                    _add_scan_result_to_model(results, scan_metadata, scan_result, report_url)
 
                     # Add asset
-                    _add_asset_to_results(results, stream_url, scan_result)
+                    _add_asset_to_results(results, report_url, scan_result)
 
                     if not analysis_complete:
                         _add_issue_to_model(
                             results,
                             "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
-                            location=stream_url,
+                            location=report_url,
                             details={"analysis_complete": False},
                         )
                 else:
-                    raise ValueError(f"Streaming analysis failed for {stream_url}")
+                    raise ValueError(f"Streaming analysis failed for {report_url}")
             else:
-                raise ValueError(f"No scanner available for {stream_url}")
+                raise ValueError(f"No scanner available for {report_url}")
 
             # Return early for streaming - finalize the model
             try:
@@ -1126,6 +1337,7 @@ def scan_model_directory_or_file(
             hf_cache_root = _find_hf_cache_root(base_dir)
             is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
+            directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -1134,6 +1346,7 @@ def scan_model_directory_or_file(
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
             dvc_directory_output_owners: list[tuple[Path, str]] = []
+            pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
             directory_coverage_gaps: dict[tuple[str, str], set[str]] = {}
 
             def get_dvc_directory_roots_by_file() -> dict[str, set[Path]]:
@@ -1215,6 +1428,7 @@ def scan_model_directory_or_file(
                 onerror=collect_dvc_directory_walk_error,
             ):
                 dirs.sort()
+                directory_walk_covered_directories.add(str(Path(root).resolve()))
                 for file in sorted(files):
                     file_path = os.path.join(root, file)
 
@@ -1288,9 +1502,11 @@ def scan_model_directory_or_file(
                     if file.lower().endswith(".dvc"):
                         dvc_pointer_file = file_path
                         dvc_resolution = resolve_dvc_file_status(file_path)
-                        _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
-                        if dvc_resolution.analysis_incomplete:
+                        if dvc_resolution.has_non_cap_gap:
+                            _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
                             aggregate_hash_complete = False
+                        elif dvc_resolution.omitted_output_count > 0:
+                            pending_dvc_output_limit_checks.append((file_path, dvc_resolution))
                         if dvc_resolution.resolved_paths:
                             target_paths = [Path(t).resolve() for t in dvc_resolution.resolved_paths]
                         else:
@@ -1690,6 +1906,35 @@ def scan_model_directory_or_file(
                         for scanned_file_path in scanned_file_paths:
                             _add_error_asset_to_results(results, scanned_file_path)
 
+            actual_dvc_covered_paths: set[str] = set()
+            if pending_dvc_output_limit_checks:
+                from modelaudit.scanners import get_scanner_for_file
+
+                for asset in results.assets:
+                    if asset.type == "error" or not os.path.isfile(asset.path):
+                        continue
+                    metadata = results.file_metadata.get(asset.path)
+                    if metadata is not None and (
+                        metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                    ):
+                        continue
+                    if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
+                        continue
+                    actual_dvc_covered_paths.add(str(Path(asset.path).resolve()))
+
+                for dvc_path, dvc_resolution in pending_dvc_output_limit_checks:
+                    if not _dvc_omitted_outputs_covered_by_directory_walk(
+                        dvc_path,
+                        dvc_resolution,
+                        actual_dvc_covered_paths,
+                        directory_walk_covered_directories,
+                        skip_file_types=skip_file_types,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    ):
+                        aggregate_hash_complete = False
+                        _record_dvc_output_limit_incomplete(results, scan_metadata, dvc_path, dvc_resolution)
+
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
                 progress_callback(
@@ -1711,15 +1956,20 @@ def scan_model_directory_or_file(
         else:
             # Scan a single file or DVC pointer
             target_files = [path]
+            single_dvc_resolution: DvcResolution | None = None
+            dvc_scanned_directories: set[str] = set(dvc_external_covered_directories)
+            internally_scanned_dvc_directories: set[str] = set()
             is_dvc_pointer = path.lower().endswith(".dvc")
             if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
-                _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
-                if dvc_resolution.analysis_incomplete:
+                single_dvc_resolution = dvc_resolution
+                if dvc_resolution.has_non_cap_gap:
+                    _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
                     aggregate_hash_complete = False
-                target_files = list(dvc_resolution.resolved_paths)
+                target_files = list(single_dvc_resolution.resolved_paths)
             dvc_declared_output_roots = tuple(str(Path(target).resolve()) for target in target_files)
-            scanned_dvc_paths: set[str] = set()
+            scanned_dvc_paths: set[str] = set(dvc_external_covered_paths)
+            internally_scanned_dvc_paths: set[str] = set()
 
             for _idx, target in enumerate(target_files):
                 # Check for interrupts
@@ -1727,6 +1977,8 @@ def scan_model_directory_or_file(
 
                 resolved_target = str(Path(target).resolve())
                 if is_dvc_pointer and resolved_target in scanned_dvc_paths:
+                    if resolved_target in dvc_external_covered_paths:
+                        aggregate_hash_complete = False
                     continue
 
                 target_timeout = timeout
@@ -1798,9 +2050,26 @@ def scan_model_directory_or_file(
                         **nested_kwargs,
                     )
                     results.aggregate_scan_result(nested_result)
-                    scanned_dvc_paths.update(
-                        str(Path(asset.path).resolve()) for asset in nested_result.assets if asset.path
-                    )
+                    nested_scanned_paths = {
+                        str(Path(asset.path).resolve())
+                        for asset in nested_result.assets
+                        if asset.path
+                        and asset.type != "error"
+                        and not (
+                            (metadata := nested_result.file_metadata.get(asset.path)) is not None
+                            and (
+                                metadata.get("operational_error") is True
+                                or metadata.get("scan_outcome") == "inconclusive"
+                            )
+                        )
+                    }
+                    scanned_dvc_paths.update(nested_scanned_paths)
+                    internally_scanned_dvc_paths.update(nested_scanned_paths)
+                    if nested_result.success and not nested_result.has_errors:
+                        for root, _dirs, _files in os.walk(target, followlinks=False):
+                            resolved_directory = str(Path(root).resolve())
+                            dvc_scanned_directories.add(resolved_directory)
+                            internally_scanned_dvc_directories.add(resolved_directory)
                     if nested_result.has_errors or (
                         nested_result.files_scanned > 0 and nested_result.content_hash is None
                     ):
@@ -1855,6 +2124,30 @@ def scan_model_directory_or_file(
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
 
+                if os.path.isdir(target):
+                    nested_result = scan_model_directory_or_file(target, **config)
+                    results.aggregate_scan_result(nested_result)
+                    for asset in nested_result.assets:
+                        asset_path = Path(asset.path)
+                        if asset_path.is_file():
+                            resolved_asset_path = str(asset_path.resolve())
+                            scanned_dvc_paths.add(resolved_asset_path)
+                            internally_scanned_dvc_paths.add(resolved_asset_path)
+                    for root, _dirs, _files in os.walk(target, followlinks=False):
+                        resolved_directory = str(Path(root).resolve())
+                        dvc_scanned_directories.add(resolved_directory)
+                        internally_scanned_dvc_directories.add(resolved_directory)
+                    if nested_result.has_errors or not nested_result.success:
+                        scan_metadata["success"] = False
+                        scan_metadata["has_operational_errors"] = bool(
+                            scan_metadata["has_operational_errors"]
+                            or nested_result.has_errors
+                            or not nested_result.success
+                        )
+                    results.content_hash = None
+                    aggregate_hash_complete = False
+                    continue
+
                 results.files_scanned += 1
 
                 # Hash the top-level target before scanning. Archive scanners merge
@@ -1895,16 +2188,23 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
-                if is_dvc_pointer:
+                if (
+                    is_dvc_pointer
+                    and not _scan_result_has_operational_error(file_result)
+                    and (file_result.metadata or {}).get("scan_outcome") != "inconclusive"
+                ):
                     scanned_dvc_paths.add(resolved_target)
+                    internally_scanned_dvc_paths.add(resolved_target)
                     for check in file_result.checks:
                         shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
                         if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
-                            scanned_dvc_paths.update(
+                            resolved_shard_paths = {
                                 str(Path(shard_path).resolve())
                                 for shard_path in shard_paths
                                 if isinstance(shard_path, str)
-                            )
+                            }
+                            scanned_dvc_paths.update(resolved_shard_paths)
+                            internally_scanned_dvc_paths.update(resolved_shard_paths)
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
@@ -1964,6 +2264,33 @@ def scan_model_directory_or_file(
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)
 
+            if single_dvc_resolution is not None and single_dvc_resolution.omitted_output_count > 0:
+                internally_covered = _dvc_omitted_outputs_covered_by_directory_walk(
+                    path,
+                    single_dvc_resolution,
+                    internally_scanned_dvc_paths,
+                    internally_scanned_dvc_directories,
+                    skip_file_types=skip_file_types,
+                    metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
+                )
+                dvc_outputs_covered = internally_covered
+                if not internally_covered:
+                    dvc_outputs_covered = _dvc_omitted_outputs_covered_by_directory_walk(
+                        path,
+                        single_dvc_resolution,
+                        scanned_dvc_paths,
+                        dvc_scanned_directories,
+                        skip_file_types=skip_file_types,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
+                    if dvc_outputs_covered:
+                        aggregate_hash_complete = False
+                if not dvc_outputs_covered:
+                    aggregate_hash_complete = False
+                    _record_dvc_output_limit_incomplete(results, scan_metadata, path, single_dvc_resolution)
+
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
@@ -1971,15 +2298,20 @@ def scan_model_directory_or_file(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
     except Exception as e:
-        logger.exception(f"Error during scan: {e!s}")
+        report_path = _redacted_scan_path_for_reporting(path)
+        report_error = _redacted_scan_error_for_reporting(e, path)
+        if is_stream_url(path):
+            logger.error(f"Error during scan: {report_error}")
+        else:
+            logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
         _add_issue_to_model(
             results,
-            f"Error during scan: {e!s}",
+            f"Error during scan: {report_error}",
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
-        _add_error_asset_to_results(results, path)
+        _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
 

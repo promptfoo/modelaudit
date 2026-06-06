@@ -1420,6 +1420,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
 
 def _with_import_origin_findings(report: PickleReport) -> PickleReport:
     enrichment_errors: list[tuple[str, Exception]] = []
+    source_fingerprints: Mapping[str, Any] | None = None
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         try:
@@ -1433,7 +1434,13 @@ def _with_import_origin_findings(report: PickleReport) -> PickleReport:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             enrichment_errors.append(("python_import_origin_stability", error))
-    return _with_call_graph_enrichment_errors(report, tuple(enrichment_errors)) if enrichment_errors else report
+        source_fingerprints = shared_source_fingerprint_metadata()
+    updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
+    return (
+        _with_call_graph_enrichment_errors(updated_report, tuple(enrichment_errors))
+        if enrichment_errors
+        else updated_report
+    )
 
 
 def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]:

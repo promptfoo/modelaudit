@@ -105,6 +105,7 @@ def pytest_runtest_setup(item):
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
+            "test_sarif_formatter.py",  # SARIF output and credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_bug1_confidence_exploit.py",  # Security bug test
@@ -145,6 +146,7 @@ def pytest_runtest_setup(item):
             "test_jit_script_detector.py",  # JIT embedded Python execution regressions
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_keras_h5_lambda_helpers.py",  # Keras H5 Lambda callback classification tests
+            "test_code_validation.py",  # In-memory Python syntax validation regressions
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_pytorch_binary_scanner.py",  # PyTorch binary scanner outcome regressions
@@ -184,6 +186,7 @@ def pytest_runtest_setup(item):
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
             "test_mlflow_integration.py",  # MLflow integration tests
+            "test_streaming_analysis.py",  # signed stream routing and fallback regressions
             "test_tar_scanner.py",  # TAR archive scanner tests
             "test_zip_scanner.py",  # ZIP archive scanner tests
             "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
