@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
 import string
+import tokenize
 import unicodedata
 from typing import Final, TypeAlias
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
@@ -200,16 +202,22 @@ COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|proxy-pass|"
     r"proxy-tls-?password|tls-?password|"
-    r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
+    r"ftp-account|ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
     r"(?:=|\s+))(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
 )
 COMMAND_BODY_OPTION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?is)(?P<option>(?<!\w)(?:-d|--data(?:-ascii|-binary|-raw|-urlencode)?)\s+)"
+    r"(?is)(?P<option>(?<!\w)(?:(?:-d|-F)(?:=|\s*)|"
+    r"(?:--data(?:-ascii|-binary|-raw|-urlencode)?|--form(?:-string)?|--url-query|--post-data|--body-data)"
+    r"(?:=|\s+)))"
     r"(?P<argument>\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s;&|)]+)"
+)
+COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b(?:{SENSITIVE_ASSIGNMENT_KEY})\s*=\s*)"
+    r"(?P<value>\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|(?!\\+[\"'])[^\s\"';&|)]+)"
 )
 COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|"
-    r"proxy-pass|proxy-tls-?password|tls-?password|ftp-password|http-password|oauth2-bearer|client[_-]?secret|"
+    r"proxy-pass|proxy-tls-?password|tls-?password|ftp-account|ftp-password|http-password|oauth2-bearer|client[_-]?secret|"
     r"api[_-]?key|token|secret)|(?<!\w)-b)(?:=|\s+))"
     r"(?P<prefix>\$?)(?P<slashes>\\+)(?P<quote>[\"'])(?:(?!(?<!\\)(?P=slashes)(?P=quote))[\s\S])*?"
     r"(?<!\\)(?P=slashes)(?P=quote)"
@@ -253,6 +261,7 @@ SERIALIZED_STRUCTURED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
 FUNCTION_KEYWORD_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
 )
+FUNCTION_CALL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*")
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
 )
@@ -461,6 +470,8 @@ def _query_value_contains_secret(value: str) -> bool:
                 return True
             continue
         if "@" in parsed.netloc:
+            return True
+        if _redact_sensitive_url_path(parsed.path) != parsed.path:
             return True
         for part in re.split(r"[&;]", parsed.query):
             if any(_is_sensitive_query_key(key) for key, _ in parse_qsl(part, keep_blank_values=True)):
@@ -751,7 +762,14 @@ def _sensitive_function_key_from_safe_expression(expression: str) -> str | None:
         value = _safe_eval_string_expr(ast.parse(expression, mode="eval"))
     except SyntaxError:
         return None
-    return _normalize_sensitive_function_key(value) if isinstance(value, str) else None
+    values = (value,) if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, frozenset)):
+        return None
+    for candidate in values:
+        normalized_key = _normalize_sensitive_function_key(candidate)
+        if normalized_key is not None:
+            return normalized_key
+    return None
 
 
 def _subscript_target_start(text: str, bracket_start: int) -> int:
@@ -2040,6 +2058,8 @@ def _redact_unquoted_sensitive_assignment(match: re.Match[str]) -> str:
         if COMMAND_CONTEXT_LITERAL_RE.search(command_tail):
             leading_whitespace = value[: len(value) - len(stripped_value)]
             return f"{match.group(1)}{leading_whitespace}{REDACTED_EVIDENCE_VALUE}{command_tail}"
+        if re.fullmatch(r"[\s'\"`)\]}]*", command_tail):
+            return match.group(0)
     if COMMAND_EVIDENCE_RE.search(value):
         return f"{match.group(1)}{_redact_sensitive_command_value(value)}"
     trailing_whitespace = re.search(r"\s*$", value)
@@ -2213,6 +2233,56 @@ def _redact_sensitive_setter_arguments(text: str) -> str:
     return text
 
 
+def _redact_keyword_sensitive_function_arguments(text: str) -> str:
+    """Redact defaults or values when a call declares a sensitive key by keyword."""
+    replacements: list[tuple[int, int, str]] = []
+    for match in FUNCTION_CALL_PREFIX_RE.finditer(text):
+        declaration_prefix = text[max(0, match.start() - 32) : match.start()]
+        if re.search(r"(?is)\b(?:async\s+def|def|class)\s+$", declaration_prefix):
+            continue
+
+        argument_start = match.end()
+        arguments: list[tuple[int, int, re.Match[str] | None]] = []
+        while argument_start < len(text):
+            argument_end = _find_function_argument_end(text, argument_start)
+            raw_argument = text[argument_start:argument_end]
+            if raw_argument.strip():
+                arguments.append((argument_start, argument_end, FUNCTION_KEYWORD_ARGUMENT_RE.match(raw_argument)))
+            if argument_end >= len(text) or text[argument_end] != ",":
+                break
+            argument_start = argument_end + 1
+
+        sensitive_descriptor = False
+        for start, end, keyword_match in arguments:
+            if keyword_match is None or keyword_match.group("name").lower() not in {"key", "name", "option_strings"}:
+                continue
+            value_start = start + keyword_match.end()
+            if _sensitive_function_key_from_safe_expression(text[value_start:end].strip()) is not None:
+                sensitive_descriptor = True
+                break
+        if not sensitive_descriptor:
+            continue
+
+        for start, end, keyword_match in arguments:
+            if keyword_match is None or keyword_match.group("name").lower() not in {"default", "value"}:
+                continue
+            value_start = start + keyword_match.end()
+            raw_value = text[value_start:end]
+            if raw_value.strip():
+                replacements.append((value_start, end, _redact_sensitive_function_value(raw_value)))
+
+    non_overlapping: list[tuple[int, int, str]] = []
+    covered_until = -1
+    for candidate_replacement in sorted(replacements, key=lambda item: (item[0], -item[1])):
+        if candidate_replacement[0] < covered_until:
+            continue
+        non_overlapping.append(candidate_replacement)
+        covered_until = candidate_replacement[1]
+    for start, end, replacement_text in reversed(non_overlapping):
+        text = f"{text[:start]}{replacement_text}{text[end:]}"
+    return text
+
+
 def _redact_sensitive_function_arguments(text: str) -> str:
     replacements: list[tuple[int, int, str]] = []
     covered_until = 0
@@ -2281,6 +2351,15 @@ def _redact_command_body_option(match: re.Match[str]) -> str:
         return match.group(0)
     suffix = quote if quote and value.endswith(quote) else ""
     return f"{match.group('option')}{prefix}{quote}{redacted_body}{suffix}"
+
+
+def _redact_command_shell_assignment(match: re.Match[str]) -> str:
+    value = match.group("value")
+    prefix = "$" if value.startswith("$") else ""
+    unprefixed = value[len(prefix) :]
+    quote = unprefixed[0] if unprefixed and unprefixed[0] in {"'", '"'} else ""
+    suffix = quote if quote and unprefixed.endswith(quote) else ""
+    return f"{match.group('prefix')}{prefix}{quote}{REDACTED_EVIDENCE_VALUE}{suffix}"
 
 
 def _find_command_context_end(text: str, start: int) -> int:
@@ -2373,6 +2452,91 @@ def _redact_sensitive_command_value(text: str) -> str:
     return _redact_non_command_sensitive_value_tokens(redacted)
 
 
+def _redact_adjacent_command_literal_groups(text: str) -> str:
+    """Fold bounded adjacent string literals only when their joined command reveals a credential."""
+    token_input = text.replace("\x00", " ")
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except (IndentationError, SyntaxError, tokenize.TokenError, UnicodeError):
+        return text
+
+    line_offsets = [0]
+    line_offsets.extend(match.end() for match in re.finditer("\n", text))
+
+    def position_offset(position: tuple[int, int]) -> int:
+        line, column = position
+        return min(len(text), line_offsets[min(line - 1, len(line_offsets) - 1)] + column)
+
+    literal_groups: list[list[tuple[int, int, str]]] = []
+    current_group: list[tuple[int, int, str]] = []
+    fstring_start = getattr(tokenize, "FSTRING_START", -1)
+    fstring_end = getattr(tokenize, "FSTRING_END", -1)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        literal: tuple[int, int, str] | None = None
+        if token.type == tokenize.STRING:
+            literal = (position_offset(token.start), position_offset(token.end), token.string)
+        elif token.type == fstring_start:
+            depth = 1
+            end_index = index + 1
+            while end_index < len(tokens):
+                if tokens[end_index].type == fstring_start:
+                    depth += 1
+                elif tokens[end_index].type == fstring_end:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                end_index += 1
+            if depth == 0:
+                start = position_offset(token.start)
+                end = position_offset(tokens[end_index].end)
+                literal = (start, end, text[start:end])
+                index = end_index
+
+        if literal is not None:
+            current_group.append(literal)
+        elif current_group and token.type not in {tokenize.COMMENT, tokenize.NL}:
+            if len(current_group) > 1:
+                literal_groups.append(current_group)
+            current_group = []
+        index += 1
+    if len(current_group) > 1:
+        literal_groups.append(current_group)
+    if not literal_groups:
+        return text
+
+    replacements: list[tuple[int, int, str]] = []
+    for group in literal_groups:
+        decoded_parts: list[str] = []
+        for _start, _end, literal_text in group:
+            try:
+                decoded = _safe_eval_string_expr(ast.parse(literal_text, mode="eval"))
+            except SyntaxError:
+                decoded_parts = []
+                break
+            if not isinstance(decoded, str):
+                decoded_parts = []
+                break
+            decoded_parts.append(decoded)
+        if not decoded_parts:
+            continue
+        joined = "".join(decoded_parts)
+        if not COMMAND_EVIDENCE_RE.search(joined):
+            continue
+        redacted_joined = URL_RE.sub(_redact_url, joined)
+        redacted_joined = _redact_command_evidence_text(redacted_joined)
+        if redacted_joined == joined or not any(
+            marker in redacted_joined for marker in {REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS}
+        ):
+            continue
+        replacements.append((group[0][0], group[-1][1], repr(redacted_joined)))
+
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
+
+
 def _redact_command_string_literals(text: str) -> str:
     pieces: list[str] = []
     cursor = 0
@@ -2385,7 +2549,8 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
-    redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", text)
+    redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, text)
+    redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", redacted)
     redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
     redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
@@ -2444,6 +2609,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redaction_budget = max(0, max_chars) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS
     url_budget = max(0, max_chars) + EVIDENCE_URL_LOOKAHEAD_CHARS
     redacted = text[:url_budget]
+    redacted = _redact_adjacent_command_literal_groups(redacted)
     redacted = _normalize_serialized_url_slashes(redacted)
     redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
@@ -2455,6 +2621,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _redact_command_context_tokens(redacted)
     redacted = _redact_sensitive_argv_pairs(redacted)
     redacted = _redact_sensitive_setter_arguments(redacted)
+    redacted = _redact_keyword_sensitive_function_arguments(redacted)
     redacted = _redact_sensitive_function_arguments(redacted)
     redacted = _normalize_expression_sensitive_keys(redacted)
     redacted = _normalize_quoted_sensitive_keys(redacted)

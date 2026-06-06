@@ -319,9 +319,9 @@ def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
     text = _redact_split_base64_evidence(text)
     text = _redact_reversible_base64_evidence(text)
     text = _redact_reversible_percent_evidence(text)
-    text = _redact_truncated_sensitive_assignments(text)
-    text = _redact_standalone_secret_tokens(_redact_urls_for_display(text))
+    text = _redact_urls_for_display(text)
     text = redact_evidence_string(text, max_chars=max_chars)
+    text = _redact_truncated_sensitive_assignments(text)
     return _redact_standalone_secret_tokens(text)
 
 

