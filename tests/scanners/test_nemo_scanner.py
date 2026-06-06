@@ -18,9 +18,12 @@ except ImportError:
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners import nemo_scanner as nemo_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
+
+_TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
 
 
 def _create_nemo_file_from_bytes(
@@ -59,6 +62,17 @@ def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(payload)
     tar.addfile(info, io.BytesIO(payload))
+
+
+def _materialize_tmp_paths(value: Any, tmp_path: Path) -> Any:
+    """Replace fixture path markers without relying on host-global temp paths."""
+    if isinstance(value, str) and value.startswith(_TMP_PATH_MARKER):
+        return str(tmp_path / value.removeprefix(_TMP_PATH_MARKER))
+    if isinstance(value, dict):
+        return {key: _materialize_tmp_paths(item, tmp_path) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_materialize_tmp_paths(item, tmp_path) for item in value]
+    return value
 
 
 def _build_malicious_pickle() -> bytes:
@@ -3386,22 +3400,75 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
-    def test_numpy_load_without_pickle_is_safe_target(self, tmp_path: Path) -> None:
-        """Default numpy.load calls should not be treated as pickle deserialization."""
-        config = {"model": {"_target_": "numpy.load", "file": "weights.npy"}}
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "numpy.fromfile",
+            "numpy.fromregex",
+            "numpy.genfromtxt",
+            "numpy.lib._datasource.DataSource._cache",
+            "numpy.lib._datasource.DataSource._findfile",
+            "numpy.lib._datasource.DataSource.exists",
+            "numpy.lib._datasource.DataSource.open",
+            "numpy.lib._datasource.open",
+            "numpy.lib._format_impl.open_memmap",
+            "numpy.lib._npyio_impl.fromregex",
+            "numpy.lib._npyio_impl.genfromtxt",
+            "numpy.lib._npyio_impl.load",
+            "numpy.lib._npyio_impl.loadtxt",
+            "numpy.lib._npyio_impl.NpzFile",
+            "numpy.lib._npyio_impl.save",
+            "numpy.lib._npyio_impl.savez",
+            "numpy.lib._npyio_impl.savez_compressed",
+            "numpy.lib._npyio_impl.savetxt",
+            "numpy.lib.format.open_memmap",
+            "numpy.lib.npyio.DataSource._cache",
+            "numpy.lib.npyio.DataSource._findfile",
+            "numpy.lib.npyio.DataSource.exists",
+            "numpy.lib.npyio.DataSource.open",
+            "numpy.lib.npyio.fromregex",
+            "numpy.lib.npyio.genfromtxt",
+            "numpy.lib.npyio.load",
+            "numpy.lib.npyio.loadtxt",
+            "numpy.lib.npyio.NpzFile",
+            "numpy.lib.npyio.recfromcsv",
+            "numpy.lib.npyio.recfromtxt",
+            "numpy.lib.npyio.save",
+            "numpy.lib.npyio.savez",
+            "numpy.lib.npyio.savez_compressed",
+            "numpy.lib.npyio.savetxt",
+            "numpy.load",
+            "numpy.loadtxt",
+            "numpy.memmap",
+            "numpy._core.memmap.memmap",
+            "numpy._core.multiarray.fromfile",
+            "numpy._core.records.fromfile",
+            "numpy.core.memmap.memmap",
+            "numpy.core.multiarray.fromfile",
+            "numpy.core.records.fromfile",
+            "numpy.ndarray.dump",
+            "numpy.ndarray.tofile",
+            "numpy.rec.fromfile",
+            "numpy.recfromcsv",
+            "numpy.recfromtxt",
+            "numpy.save",
+            "numpy.savez",
+            "numpy.savez_compressed",
+            "numpy.savetxt",
+        ],
+    )
+    def test_numpy_file_io_targets_override_safe_namespace(self, tmp_path: Path, target: str) -> None:
+        """NumPy file I/O callables must not be hidden by the trusted numpy namespace."""
+        config = {"model": {"_target_": target}}
         path = _create_nemo_file(tmp_path, config)
 
         result = NemoScanner().scan(str(path))
 
-        assert not [
-            check
-            for check in result.checks
-            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
-        ]
         assert any(
-            check.name == "Hydra _target_ Safety Check"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("target") == "numpy.load"
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
             for check in result.checks
         )
 
@@ -3418,7 +3485,7 @@ class TestCVE202523304HydraTarget:
         tmp_path: Path,
         model_config: dict[str, Any],
     ) -> None:
-        """numpy.load becomes a pickle sink only when allow_pickle is enabled."""
+        """Pickle-enabled numpy.load calls remain dangerous file-access targets."""
         path = _create_nemo_file(tmp_path, {"model": model_config})
 
         result = NemoScanner().scan(str(path))
@@ -3449,6 +3516,1800 @@ class TestCVE202523304HydraTarget:
             check
             for check in result.checks
             if check.name == "Hydra _target_ Review" and check.details.get("target") == "skops.io.load"
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
+    @pytest.mark.parametrize(
+        ("target", "target_config"),
+        [
+            (
+                "urllib.request.urlretrieve",
+                {
+                    "_target_": "urllib.request.urlretrieve",
+                    "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    "filename": "__MODELAUDIT_TMP__/modelaudit-nemo-download",
+                },
+            ),
+            (
+                "urllib.request.urlopen",
+                {
+                    "_target_": "urllib.request.urlopen",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.get",
+                {
+                    "_target_": "requests.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.api.get",
+                {
+                    "_target_": "requests.api.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.sessions.Session.get",
+                {
+                    "_target_": "requests.sessions.Session.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.Session.send",
+                {
+                    "_target_": "requests.Session.send",
+                    "_args_": [{"_target_": "requests.Request", "url": "http://169.254.169.254/latest/meta-data/"}],
+                },
+            ),
+            (
+                "httpx.post",
+                {
+                    "_target_": "httpx.post",
+                    "url": "http://169.254.169.254/latest/user-data",
+                    "data": "payload",
+                },
+            ),
+            (
+                "httpx._api.post",
+                {
+                    "_target_": "httpx._api.post",
+                    "url": "http://169.254.169.254/latest/user-data",
+                    "data": "payload",
+                },
+            ),
+            (
+                "httpx.Client.get",
+                {
+                    "_target_": "httpx.Client.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "httpx._client.Client.send",
+                {
+                    "_target_": "httpx._client.Client.send",
+                    "_args_": [{"_target_": "httpx.Request", "method": "GET", "url": "http://169.254.169.254/"}],
+                },
+            ),
+            (
+                "urllib3.request",
+                {
+                    "_target_": "urllib3.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.PoolManager.request",
+                {
+                    "_target_": "urllib3.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.PoolManager.request",
+                {
+                    "_target_": "urllib3.poolmanager.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.ProxyManager.urlopen",
+                {
+                    "_target_": "urllib3.poolmanager.ProxyManager.urlopen",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.HTTPConnectionPool.request",
+                {
+                    "_target_": "urllib3.HTTPConnectionPool.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.connectionpool.HTTPSConnectionPool.urlopen",
+                {
+                    "_target_": "urllib3.connectionpool.HTTPSConnectionPool.urlopen",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib.request.OpenerDirector.open",
+                {
+                    "_target_": "urllib.request.OpenerDirector.open",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.URLopener.retrieve",
+                {
+                    "_target_": "urllib.request.URLopener.retrieve",
+                    "_args_": [
+                        "http://169.254.169.254/latest/meta-data/",
+                        "__MODELAUDIT_TMP__/modelaudit-nemo-download",
+                    ],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_http",
+                {
+                    "_target_": "urllib.request.URLopener.open_http",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.FancyURLopener.open_https",
+                {
+                    "_target_": "urllib.request.FancyURLopener.open_https",
+                    "_args_": ["https://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_local_file",
+                {
+                    "_target_": "urllib.request.URLopener.open_local_file",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "http.client.HTTPConnection.request",
+                {
+                    "_target_": "http.client.HTTPConnection.request",
+                    "method": "GET",
+                    "url": "/latest/meta-data/",
+                },
+            ),
+            (
+                "http.client.HTTPConnection.connect",
+                {
+                    "_target_": "http.client.HTTPConnection.connect",
+                    "_args_": [{"_target_": "http.client.HTTPConnection", "host": "169.254.169.254"}],
+                },
+            ),
+            (
+                "http.client.HTTPConnection.getresponse",
+                {
+                    "_target_": "http.client.HTTPConnection.getresponse",
+                    "_args_": [{"_target_": "http.client.HTTPConnection", "host": "169.254.169.254"}],
+                },
+            ),
+            (
+                "socket.create_connection",
+                {
+                    "_target_": "socket.create_connection",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.getaddrinfo",
+                {
+                    "_target_": "socket.getaddrinfo",
+                    "_args_": ["attacker.example", 443],
+                },
+            ),
+            (
+                "socket.gethostbyname",
+                {
+                    "_target_": "socket.gethostbyname",
+                    "_args_": ["attacker.example"],
+                },
+            ),
+            (
+                "_socket.gethostbyname",
+                {
+                    "_target_": "_socket.gethostbyname",
+                    "_args_": ["attacker.example"],
+                },
+            ),
+            (
+                "socket.socket.sendto",
+                {
+                    "_target_": "socket.socket.sendto",
+                    "_args_": [{"_target_": "socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.SocketType.connect",
+                {
+                    "_target_": "socket.SocketType.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.SocketType.sendall",
+                {
+                    "_target_": "_socket.SocketType.sendall",
+                    "_args_": [{"_target_": "_socket.SocketType"}, b"GET /"],
+                },
+            ),
+            (
+                "_socket.socket.sendto",
+                {
+                    "_target_": "_socket.socket.sendto",
+                    "_args_": [{"_target_": "_socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.socket.connect",
+                {
+                    "_target_": "socket.socket.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.socket.recv",
+                {
+                    "_target_": "socket.socket.recv",
+                    "_args_": [{"_target_": "socket.socket"}, 1024],
+                },
+            ),
+            (
+                "pathlib.Path.write_text",
+                {
+                    "_target_": "pathlib.Path.write_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.Path.read_text",
+                {
+                    "_target_": "pathlib.Path.read_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.read_bytes",
+                {
+                    "_target_": "pathlib.Path.read_bytes",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "builtins.open",
+                {
+                    "_target_": "builtins.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "codecs.open",
+                {
+                    "_target_": "codecs.open",
+                    "_args_": ["modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.FileIO",
+                {
+                    "_target_": "_io.FileIO",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.FileIO",
+                {
+                    "_target_": "io.FileIO",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.open",
+                {
+                    "_target_": "_io.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.open_code",
+                {
+                    "_target_": "io.open_code",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "_io.open_code",
+                {
+                    "_target_": "_io.open_code",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "os.open",
+                {
+                    "_target_": "os.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "posix.open",
+                {
+                    "_target_": "posix.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "os.read",
+                {
+                    "_target_": "os.read",
+                    "_args_": [0, 1024],
+                },
+            ),
+            (
+                "os.write",
+                {
+                    "_target_": "os.write",
+                    "_args_": [1, "payload"],
+                },
+            ),
+            (
+                "os.listdir",
+                {
+                    "_target_": "os.listdir",
+                    "_args_": ["__MODELAUDIT_TMP__/"],
+                },
+            ),
+            (
+                "os.scandir",
+                {
+                    "_target_": "os.scandir",
+                    "_args_": ["__MODELAUDIT_TMP__/"],
+                },
+            ),
+            (
+                "glob.glob",
+                {
+                    "_target_": "glob.glob",
+                    "_args_": ["__MODELAUDIT_TMP__/*"],
+                },
+            ),
+            (
+                "pathlib.Path.stat",
+                {
+                    "_target_": "pathlib.Path.stat",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "os.path.exists",
+                {
+                    "_target_": "os.path.exists",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "posixpath.isfile",
+                {
+                    "_target_": "posixpath.isfile",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "ntpath.isdir",
+                {
+                    "_target_": "ntpath.isdir",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.exists",
+                {
+                    "_target_": "pathlib.Path.exists",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.is_file",
+                {
+                    "_target_": "pathlib.PosixPath.is_file",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.WindowsPath.is_dir",
+                {
+                    "_target_": "pathlib.WindowsPath.is_dir",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.write_text",
+                {
+                    "_target_": "pathlib.PosixPath.write_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_text",
+                {
+                    "_target_": "pathlib.PosixPath.read_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_bytes",
+                {
+                    "_target_": "pathlib.PosixPath.read_bytes",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.readlink",
+                {
+                    "_target_": "pathlib.Path.readlink",
+                    "_args_": ["modelaudit-nemo-link"],
+                },
+            ),
+            (
+                "os.rename",
+                {
+                    "_target_": "os.rename",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "os.replace",
+                {
+                    "_target_": "os.replace",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.rename",
+                {
+                    "_target_": "pathlib.Path.rename",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.touch",
+                {
+                    "_target_": "pathlib.Path.touch",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-created"],
+                },
+            ),
+            (
+                "pathlib.Path.symlink_to",
+                {
+                    "_target_": "pathlib.Path.symlink_to",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.hardlink_to",
+                {
+                    "_target_": "pathlib.PosixPath.hardlink_to",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
+                },
+            ),
+            (
+                "pathlib.WindowsPath.read_text",
+                {
+                    "_target_": "pathlib.WindowsPath.read_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "shutil.copyfile",
+                {
+                    "_target_": "shutil.copyfile",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+        ],
+    )
+    def test_network_and_file_access_targets_are_dangerous(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+    ) -> None:
+        """Network and file-access callables must not fall through to INFO-only review."""
+        localized_target_config = _materialize_tmp_paths(target_config, tmp_path)
+        path = _create_nemo_file(tmp_path, {"model": localized_target_config})
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == target
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.endheaders",
+            "http.client.HTTPSConnection.endheaders",
+            "http.client.HTTPConnection._send_output",
+            "http.client.HTTPSConnection._send_output",
+            "http.client.HTTPResponse.read",
+            "http.client.HTTPResponse.read1",
+            "http.client.HTTPResponse.readinto",
+            "http.client.HTTPResponse.readinto1",
+            "http.client.HTTPResponse.readline",
+            "http.client.HTTPResponse.readlines",
+            "http.client.HTTPResponse.peek",
+            "socketserver.TCPServer",
+            "socketserver.UDPServer",
+            "socketserver.ThreadingTCPServer",
+            "socketserver.ThreadingUDPServer",
+            "http.server.HTTPServer",
+            "http.server.ThreadingHTTPServer",
+            "wsgiref.simple_server.WSGIServer",
+            "wsgiref.simple_server.make_server",
+            "socket.socket.accept",
+            "socket.socket.bind",
+            "socket.socket.listen",
+            "socket.socket.sendfile",
+            "socket.socket.recv_into",
+            "socket.socket.recvfrom_into",
+            "socket.socket.recvmsg_into",
+            "socket.SocketType.accept",
+            "socket.SocketType.bind",
+            "socket.SocketType.listen",
+            "socket.SocketType.sendfile",
+            "socket.SocketType.recv_into",
+            "socket.SocketType.recvfrom_into",
+            "socket.SocketType.recvmsg_into",
+            "socket.send_fds",
+            "socket.recv_fds",
+            "_socket.socket.accept",
+            "_socket.socket.bind",
+            "_socket.socket.listen",
+            "_socket.socket.recv_into",
+            "_socket.socket.recvfrom_into",
+            "_socket.socket.recvmsg_into",
+            "_socket.SocketType.accept",
+            "_socket.SocketType.bind",
+            "_socket.SocketType.listen",
+            "_socket.SocketType.recv_into",
+            "_socket.SocketType.recvfrom_into",
+            "_socket.SocketType.recvmsg_into",
+            "os.access",
+            "posix.access",
+            "nt.access",
+            "os.fstat",
+            "posix.fstat",
+            "nt.fstat",
+            "os.statvfs",
+            "posix.statvfs",
+            "os.fstatvfs",
+            "posix.fstatvfs",
+            "os.chdir",
+            "posix.chdir",
+            "nt.chdir",
+            "os.fchdir",
+            "posix.fchdir",
+            "os.readv",
+            "posix.readv",
+            "os.pread",
+            "posix.pread",
+            "os.preadv",
+            "posix.preadv",
+            "os.writev",
+            "posix.writev",
+            "os.pwrite",
+            "posix.pwrite",
+            "os.pwritev",
+            "posix.pwritev",
+            "os.sendfile",
+            "posix.sendfile",
+            "os.copy_file_range",
+            "posix.copy_file_range",
+            "os.splice",
+            "posix.splice",
+            "os.path.lexists",
+            "posixpath.lexists",
+            "ntpath.lexists",
+            "os.path.realpath",
+            "posixpath.realpath",
+            "ntpath.realpath",
+            "os.path.samefile",
+            "posixpath.samefile",
+            "ntpath.samefile",
+            "os.path.sameopenfile",
+            "posixpath.sameopenfile",
+            "ntpath.sameopenfile",
+            "genericpath.exists",
+            "genericpath.isfile",
+            "genericpath.isdir",
+            "genericpath.getatime",
+            "genericpath.getctime",
+            "genericpath.getmtime",
+            "genericpath.getsize",
+            "genericpath.samefile",
+            "genericpath.sameopenfile",
+            "os.path.ismount",
+            "posixpath.ismount",
+            "ntpath.ismount",
+            "pathlib.Path.resolve",
+            "pathlib.PosixPath.resolve",
+            "pathlib.WindowsPath.resolve",
+            "pathlib.Path.samefile",
+            "pathlib.PosixPath.samefile",
+            "pathlib.WindowsPath.samefile",
+            "pathlib.Path.owner",
+            "pathlib.PosixPath.owner",
+            "pathlib.WindowsPath.owner",
+            "pathlib.Path.group",
+            "pathlib.PosixPath.group",
+            "pathlib.WindowsPath.group",
+            "pathlib.Path.is_socket",
+            "pathlib.PosixPath.is_socket",
+            "pathlib.WindowsPath.is_socket",
+            "pathlib.Path.is_fifo",
+            "pathlib.PosixPath.is_fifo",
+            "pathlib.WindowsPath.is_fifo",
+            "pathlib.Path.is_block_device",
+            "pathlib.PosixPath.is_block_device",
+            "pathlib.WindowsPath.is_block_device",
+            "pathlib.Path.is_char_device",
+            "pathlib.PosixPath.is_char_device",
+            "pathlib.WindowsPath.is_char_device",
+            "os.chmod",
+            "posix.chmod",
+            "nt.chmod",
+            "os.fchmod",
+            "posix.fchmod",
+            "nt.fchmod",
+            "os.chown",
+            "posix.chown",
+            "os.fchown",
+            "posix.fchown",
+            "os.lchown",
+            "posix.lchown",
+            "os.utime",
+            "posix.utime",
+            "nt.utime",
+            "os.ftruncate",
+            "posix.ftruncate",
+            "nt.ftruncate",
+            "os.fsync",
+            "posix.fsync",
+            "nt.fsync",
+            "os.fdatasync",
+            "posix.fdatasync",
+            "os.mknod",
+            "posix.mknod",
+            "os.mkfifo",
+            "posix.mkfifo",
+            "os.getxattr",
+            "posix.getxattr",
+            "os.listxattr",
+            "posix.listxattr",
+            "os.setxattr",
+            "posix.setxattr",
+            "os.removexattr",
+            "posix.removexattr",
+            "shutil.copyfileobj",
+            "shutil.copymode",
+            "shutil.copystat",
+            "shutil.chown",
+            "shutil.disk_usage",
+            "shutil.make_archive",
+            "shutil.unpack_archive",
+            "tarfile.TarFile.extract",
+            "tarfile.TarFile.extractall",
+            "zipfile.ZipFile.extract",
+            "zipfile.ZipFile.extractall",
+            "torch.save",
+            "torch.serialization.save",
+            "transformers.pipeline",
+            "transformers.AutoModel.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
+            "socket.socket",
+            "socket.SocketType",
+            "socket.socketpair",
+            "_socket.socket",
+            "_socket.SocketType",
+            "_socket.socketpair",
+            "os.pipe",
+            "posix.pipe",
+            "nt.pipe",
+            "os.pipe2",
+            "posix.pipe2",
+            "nt.pipe2",
+            "os.close",
+            "posix.close",
+            "nt.close",
+            "os.closerange",
+            "posix.closerange",
+            "nt.closerange",
+            "os.dup",
+            "posix.dup",
+            "nt.dup",
+            "os.dup2",
+            "posix.dup2",
+            "nt.dup2",
+            "logging.config.dictConfig",
+            "logging.config.fileConfig",
+            "site.addpackage",
+            "site.addsitedir",
+            "site.execsitecustomize",
+            "site.execusercustomize",
+            "site.main",
+            "linecache.checkcache",
+            "linecache.getline",
+            "linecache.getlines",
+            "linecache.updatecache",
+            "logging.FileHandler",
+            "logging.handlers.BaseRotatingHandler",
+            "logging.handlers.RotatingFileHandler",
+            "logging.handlers.SysLogHandler",
+            "logging.handlers.TimedRotatingFileHandler",
+            "logging.handlers.WatchedFileHandler",
+            "omegaconf.OmegaConf.load",
+            "omegaconf.OmegaConf.save",
+            "omegaconf.omegaconf.OmegaConf.load",
+            "omegaconf.omegaconf.OmegaConf.save",
+            "tokenize.open",
+            "importlib.resources.open_binary",
+            "importlib.resources.open_text",
+            "importlib.resources.read_binary",
+            "importlib.resources.read_text",
+            "pkgutil.get_data",
+            "pathlib.Path.chmod",
+            "pathlib.PosixPath.chmod",
+            "pathlib.WindowsPath.chmod",
+            "pathlib.Path.lchmod",
+            "pathlib.PosixPath.lchmod",
+            "pathlib.WindowsPath.lchmod",
+            "pathlib.Path.link_to",
+            "pathlib.PosixPath.link_to",
+            "pathlib.WindowsPath.link_to",
+        ],
+    )
+    def test_additional_immediate_io_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Immediate I/O aliases in covered sink families must not remain INFO-only."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "omegaconf.OmegaConf.create",
+            "omegaconf.omegaconf.OmegaConf.create",
+        ],
+    )
+    def test_non_io_omegaconf_targets_remain_safe(self, tmp_path: Path, target: str) -> None:
+        """Exact OmegaConf I/O overrides must not invalidate the broader safe namespace."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    def test_transformers_factory_without_loading_remains_safe(self, tmp_path: Path) -> None:
+        """The from_pretrained override must not invalidate safe Transformers factories."""
+        target = "transformers.AutoModel"
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "hydra.compose",
+            "hydra.compose.compose",
+            "hydra.initialize",
+            "hydra.initialize.initialize",
+            "hydra.initialize.initialize_config_dir",
+            "hydra.initialize.initialize_config_module",
+            "hydra.initialize_config_dir",
+            "hydra.initialize_config_module",
+            "hydra.core.config_store.ConfigStore.store",
+            "hydra.core.config_store.ConfigStoreWithProvider.store",
+            "hydra.core.global_hydra.GlobalHydra.clear",
+            "hydra.core.global_hydra.GlobalHydra.initialize",
+            "hydra.core.global_hydra.GlobalHydra.set_instance",
+            "hydra.core.utils._save_config",
+            "hydra.core.utils.configure_log",
+            "hydra.core.utils.run_job",
+            "hydra._internal.utils._locate",
+            "hydra.utils._locate",
+            "hydra.utils.get_class",
+            "hydra.utils.get_method",
+            "hydra.utils.get_object",
+            "hydra.utils.get_static_method",
+            "omegaconf.OmegaConf.clear_resolver",
+            "omegaconf.OmegaConf.clear_resolvers",
+            "omegaconf.OmegaConf.legacy_register_resolver",
+            "omegaconf.OmegaConf.register_new_resolver",
+            "omegaconf.OmegaConf.register_resolver",
+            "omegaconf.omegaconf.OmegaConf.clear_resolver",
+            "omegaconf.omegaconf.OmegaConf.clear_resolvers",
+            "omegaconf.omegaconf.OmegaConf.legacy_register_resolver",
+            "omegaconf.omegaconf.OmegaConf.register_new_resolver",
+            "omegaconf.omegaconf.OmegaConf.register_resolver",
+            "transformers.dynamic_module_utils._compute_local_source_files_hash",
+            "transformers.dynamic_module_utils.check_imports",
+            "transformers.dynamic_module_utils.check_python_requirements",
+            "transformers.dynamic_module_utils.create_dynamic_module",
+            "transformers.dynamic_module_utils.custom_object_save",
+            "transformers.dynamic_module_utils.get_cached_module_file",
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.dynamic_module_utils.get_class_in_module",
+            "transformers.dynamic_module_utils.get_imports",
+            "transformers.dynamic_module_utils.get_relative_import_files",
+            "transformers.dynamic_module_utils.get_relative_imports",
+            "transformers.dynamic_module_utils.init_hf_modules",
+            "transformers.dynamic_module_utils.resolve_trust_remote_code",
+            "transformers.pipelines.audio_classification.ffmpeg_read",
+            "transformers.pipelines.audio_utils.ffmpeg_read",
+            "transformers.testing_utils.run_command",
+            "transformers.utils.cached_file",
+            "transformers.utils.hub.PushToHubMixin._create_repo",
+            "transformers.utils.hub.PushToHubMixin._upload_modified_files",
+            "transformers.utils.hub.cached_file",
+            "transformers.utils.hub.cached_files",
+            "transformers.utils.hub.create_branch",
+            "transformers.utils.hub.create_commit",
+            "transformers.utils.hub.create_repo",
+            "transformers.utils.hub.create_and_tag_model_card",
+            "transformers.utils.hub.define_sagemaker_information",
+            "transformers.utils.hub.download_url",
+            "transformers.utils.hub.get_file_from_repo",
+            "transformers.utils.hub.get_checkpoint_shard_files",
+            "transformers.utils.hub.has_file",
+            "transformers.utils.hub.hf_hub_download",
+            "transformers.utils.hub.http_get",
+            "transformers.utils.hub.httpx.get",
+            "transformers.utils.hub.list_repo_templates",
+            "transformers.utils.hub.list_repo_tree",
+            "transformers.utils.hub.requests.get",
+            "transformers.utils.hub.snapshot_download",
+            "transformers.utils.import_utils._LazyModule._get_module",
+            "transformers.utils.import_utils.clear_import_cache",
+            "transformers.utils.import_utils.create_import_structure_from_path",
+            "transformers.utils.import_utils.define_import_structure",
+            "transformers.utils.import_utils.direct_transformers_import",
+            "numpy.char.chararray.dump",
+            "numpy.char.chararray.tofile",
+            "numpy.ma.MaskedArray.dump",
+            "numpy.ma.MaskedArray.tofile",
+            "numpy.matrix.dump",
+            "numpy.matrix.tofile",
+            "numpy.recarray.dump",
+            "numpy.recarray.tofile",
+            "numpy.distutils.exec_command._exec_command",
+            "numpy.distutils.exec_command.exec_command",
+            "numpy.load.__call__",
+            "numpy.load.__call__.__call__",
+            "transformers.utils.hub.cached_file.__call__",
+        ],
+    )
+    def test_safe_namespace_side_effect_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Broad trusted namespaces must not hide import, global-state, network, or file side effects."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "hydra.utils.get_original_cwd",
+            "hydra.utils.to_absolute_path",
+            "hydra.core.config_store.ConfigStore.list",
+            "hydra.core.global_hydra.GlobalHydra.is_initialized",
+            "hydra.core.utils.filter_overrides",
+            "numpy.recarray.tobytes",
+            "omegaconf.OmegaConf.has_resolver",
+            "torch.utils.data.DataLoader.__call__",
+            "transformers.pipelines.audio_utils.chunk_bytes_iter",
+            "transformers.pipelines.audio_utils.ffmpeg_microphone",
+            "transformers.pipelines.audio_utils.ffmpeg_microphone_live",
+            "transformers.utils.PushToHubMixin.save_pretrained",
+            "transformers.utils.PushToHubMixin.save_pretrained.__call__",
+            "transformers.utils.hub.PushToHubMixin.save_pretrained",
+            "transformers.utils.hub.PushToHubMixin.save_pretrained.__call__.__call__",
+        ],
+    )
+    def test_safe_namespace_side_effect_near_matches_remain_safe(self, tmp_path: Path, target: str) -> None:
+        """Exact helpers and method suffixes must not promote similarly named safe-namespace callables."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "hydra.compose",
+            "hydra.core.config_store.ConfigStore.store",
+            "hydra.core.global_hydra.GlobalHydra.clear",
+            "hydra.core.utils.run_job",
+            "hydra.utils.get_object",
+            "omegaconf.OmegaConf.register_new_resolver",
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.dynamic_module_utils.check_python_requirements",
+            "transformers.dynamic_module_utils.resolve_trust_remote_code",
+            "transformers.pipelines.audio_utils.ffmpeg_read",
+            "transformers.utils.hub.cached_file",
+            "transformers.utils.hub.requests.get",
+            "transformers.utils.import_utils.direct_transformers_import",
+            "transformers.Trainer.push_to_hub",
+            "transformers.PreTrainedModel.save_pretrained",
+            "numpy.recarray.tofile",
+            "numpy.load.__call__",
+        ],
+    )
+    def test_safe_namespace_side_effect_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """Representative trusted-namespace side effects must retain security exit-code precedence."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "ftplib.FTP",
+            "ftplib.FTP_TLS",
+            "ftplib.FTP.connect",
+            "ftplib.FTP_TLS.connect",
+            "imaplib.IMAP4",
+            "imaplib.IMAP4_SSL",
+            "imaplib.IMAP4.open",
+            "imaplib.IMAP4_SSL.open",
+            "nntplib.NNTP",
+            "nntplib.NNTP_SSL",
+            "poplib.POP3",
+            "poplib.POP3_SSL",
+            "smtplib.LMTP",
+            "smtplib.LMTP.connect",
+            "smtplib.SMTP",
+            "smtplib.SMTP_SSL",
+            "smtplib.SMTP.connect",
+            "smtplib.SMTP_SSL.connect",
+            "telnetlib.Telnet",
+            "telnetlib.Telnet.open",
+            "bz2.open",
+            "bz2.BZ2File",
+            "dbm.open",
+            "gzip.open",
+            "gzip.GzipFile",
+            "lzma.open",
+            "lzma.LZMAFile",
+            "shelve.open",
+            "sqlite3.connect",
+            "sqlite3.Connection",
+            "tarfile.open",
+            "tarfile.TarFile",
+            "tarfile.TarFile.open",
+            "tempfile.NamedTemporaryFile",
+            "tempfile.TemporaryDirectory",
+            "tempfile.TemporaryFile",
+            "tempfile.mkdtemp",
+            "tempfile.mkstemp",
+            "zipfile.PyZipFile",
+            "zipfile.ZipFile",
+            "_ctypes.dlopen",
+            "ctypes.OleDLL",
+            "ctypes.PyDLL",
+            "ctypes.WinDLL",
+            "ctypes._dlopen",
+            "ctypes.cdll.LoadLibrary",
+            "ctypes.oledll.LoadLibrary",
+            "ctypes.pydll.LoadLibrary",
+            "ctypes.windll.LoadLibrary",
+            "ctypes.cdll.attacker_library",
+            "ctypes.pythonapi.PyRun_AnyFile",
+            "ctypes.pythonapi.PyRun_AnyFileEx",
+            "ctypes.pythonapi.PyRun_AnyFileExFlags",
+            "ctypes.pythonapi.PyRun_AnyFileFlags",
+            "ctypes.pythonapi.PyRun_File",
+            "ctypes.pythonapi.PyRun_FileEx",
+            "ctypes.pythonapi.PyRun_FileFlags",
+            "ctypes.pythonapi.PyRun_SimpleString",
+            "ctypes.pythonapi.PyRun_SimpleStringFlags",
+            "ctypes.pythonapi.PyRun_String",
+            "ctypes.pythonapi.PyRun_StringFlags",
+            "ctypes.pythonapi.PyRun_FileExFlags",
+            "ctypes.pythonapi.PyRun_InteractiveLoop",
+            "ctypes.pythonapi.PyRun_InteractiveLoopFlags",
+            "ctypes.pythonapi.PyRun_InteractiveOne",
+            "ctypes.pythonapi.PyRun_InteractiveOneFlags",
+            "ctypes.pythonapi.PyRun_SimpleFile",
+            "ctypes.pythonapi.PyRun_SimpleFileEx",
+            "ctypes.pythonapi.PyRun_SimpleFileExFlags",
+            "ctypes.util.find_library",
+            "numpy.ctypeslib.load_library",
+            "tensorflow.load_op_library",
+            "torch.classes.load_library",
+            "torch.ops.load_library",
+            "zipfile.Path",
+            "importlib.machinery.SourceFileLoader.load_module",
+            "importlib.machinery.SourceFileLoader.exec_module",
+            "importlib.machinery.SourcelessFileLoader.load_module",
+            "importlib.machinery.SourcelessFileLoader.exec_module",
+            "importlib.machinery.ExtensionFileLoader.load_module",
+            "importlib.machinery.ExtensionFileLoader.exec_module",
+            "zipimport.zipimporter.load_module",
+            "zipimport.zipimporter.exec_module",
+            "ssl.SSLContext.load_cert_chain",
+            "ssl.SSLContext.load_verify_locations",
+            "ssl.create_default_context",
+            "configparser.ConfigParser.read",
+            "configparser.RawConfigParser.read",
+            "filecmp.cmp",
+            "filecmp.cmpfiles",
+            "pydoc.importfile",
+        ],
+    )
+    def test_reviewed_constructor_and_loader_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Immediate network, file, and native-loader aliases must fail security review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "tempfile.mktemp",
+            "socket.create_server",
+            "nntplib.NNTP._create_socket",
+            "nntplib.NNTP_SSL._create_socket",
+            "poplib.POP3._create_socket",
+            "poplib.POP3_SSL._create_socket",
+            "pathlib.Path.iterdir",
+            "pathlib.PosixPath.iterdir",
+            "pathlib.WindowsPath.iterdir",
+        ],
+    )
+    def test_immediate_creator_connection_and_discovery_aliases_are_dangerous(
+        self,
+        tmp_path: Path,
+        target: str,
+    ) -> None:
+        """Immediate filesystem, network, and process-backed aliases must fail security review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "custom.ftplib.FTPFactory.SafeBuilder",
+            "custom.gzip.GzipFileFactory.SafeBuilder",
+            "custom.numpy.fromfile_factory.SafeBuilder",
+            "custom.tarfile.open_safe.SafeBuilder",
+            "custom.tempfile.NamedTemporaryFileFactory.SafeBuilder",
+            "custom.ctypes.PyDLLFactory.SafeBuilder",
+            "custom.ftplib.FTP.connect_factory.SafeBuilder",
+            "custom.pathlib.Path.iterdir_factory.SafeBuilder",
+            "custom.ctypes.util.find_library_factory.SafeBuilder",
+            "custom.numpy.lib.npyio.NpzFileFactory.SafeBuilder",
+            "custom.zipfile.PathFactory.SafeBuilder",
+            "custom.importlib.SourceFileLoaderFactory.SafeBuilder",
+            "custom.ssl.SSLContextFactory.SafeBuilder",
+            "custom.ssl.create_default_context_factory.SafeBuilder",
+            "custom.configparser.ConfigParserFactory.SafeBuilder",
+            "custom.filecmp.cmp_factory.SafeBuilder",
+            "custom.pydoc.importfile_factory.SafeBuilder",
+            "custom.ctypes.pythonapi.PyRun_StringFactory.SafeBuilder",
+            "ctypes.pythonapi.PyRun_Custom",
+            "custom.shutil.which_factory.SafeBuilder",
+            "custom.logging.config.dictConfigFactory.SafeBuilder",
+            "custom.site.addsitedir_factory.SafeBuilder",
+            "custom.linecache.getline_factory.SafeBuilder",
+            "custom.logging.FileHandlerFactory.SafeBuilder",
+            "custom.omegaconf.OmegaConf.load_factory.SafeBuilder",
+            "custom.tokenize.open_factory.SafeBuilder",
+            "custom.importlib.resources.read_binary_factory.SafeBuilder",
+            "custom.pkgutil.get_data_factory.SafeBuilder",
+            "custom.os.add_dll_directory_factory.SafeBuilder",
+        ],
+    )
+    def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact alias coverage should not promote similarly named custom factories."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("target", "target_config"),
+        [
+            (
+                "urllib.request.urlretrieve",
+                {
+                    "_target_": "urllib.request.urlretrieve",
+                    "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    "filename": "__MODELAUDIT_TMP__/modelaudit-nemo-download",
+                },
+            ),
+            (
+                "socket.create_connection",
+                {
+                    "_target_": "socket.create_connection",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.getaddrinfo",
+                {
+                    "_target_": "socket.getaddrinfo",
+                    "_args_": ["attacker.example", 443],
+                },
+            ),
+            (
+                "requests.api.get",
+                {
+                    "_target_": "requests.api.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.sessions.Session.get",
+                {
+                    "_target_": "requests.sessions.Session.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "httpx.Client.get",
+                {
+                    "_target_": "httpx.Client.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.request",
+                {
+                    "_target_": "urllib3.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.connectionpool.HTTPConnectionPool.request",
+                {
+                    "_target_": "urllib3.connectionpool.HTTPConnectionPool.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.PoolManager.request",
+                {
+                    "_target_": "urllib3.poolmanager.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib.request.URLopener.retrieve",
+                {
+                    "_target_": "urllib.request.URLopener.retrieve",
+                    "_args_": [
+                        "http://169.254.169.254/latest/meta-data/",
+                        "__MODELAUDIT_TMP__/modelaudit-nemo-download",
+                    ],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_http",
+                {
+                    "_target_": "urllib.request.URLopener.open_http",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "http.client.HTTPConnection.connect",
+                {
+                    "_target_": "http.client.HTTPConnection.connect",
+                    "_args_": [{"_target_": "http.client.HTTPConnection", "host": "169.254.169.254"}],
+                },
+            ),
+            (
+                "socket.socket.connect",
+                {
+                    "_target_": "socket.socket.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.socket.sendto",
+                {
+                    "_target_": "_socket.socket.sendto",
+                    "_args_": [{"_target_": "_socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.SocketType.connect",
+                {
+                    "_target_": "_socket.SocketType.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_io.FileIO",
+                {
+                    "_target_": "_io.FileIO",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.FileIO",
+                {
+                    "_target_": "io.FileIO",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.open",
+                {
+                    "_target_": "_io.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "codecs.open",
+                {
+                    "_target_": "codecs.open",
+                    "_args_": ["modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.open_code",
+                {
+                    "_target_": "io.open_code",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "posix.open",
+                {
+                    "_target_": "posix.open",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "os.write",
+                {
+                    "_target_": "os.write",
+                    "_args_": [1, "payload"],
+                },
+            ),
+            (
+                "os.listdir",
+                {
+                    "_target_": "os.listdir",
+                    "_args_": ["__MODELAUDIT_TMP__/"],
+                },
+            ),
+            (
+                "glob.glob",
+                {
+                    "_target_": "glob.glob",
+                    "_args_": ["__MODELAUDIT_TMP__/*"],
+                },
+            ),
+            (
+                "os.path.exists",
+                {
+                    "_target_": "os.path.exists",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.exists",
+                {
+                    "_target_": "pathlib.Path.exists",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.write_text",
+                {
+                    "_target_": "pathlib.PosixPath.write_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_text",
+                {
+                    "_target_": "pathlib.PosixPath.read_text",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_bytes",
+                {
+                    "_target_": "pathlib.PosixPath.read_bytes",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "os.rename",
+                {
+                    "_target_": "os.rename",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "os.replace",
+                {
+                    "_target_": "os.replace",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-source", "__MODELAUDIT_TMP__/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.symlink_to",
+                {
+                    "_target_": "pathlib.Path.symlink_to",
+                    "_args_": ["__MODELAUDIT_TMP__/modelaudit-nemo-link", "__MODELAUDIT_TMP__/modelaudit-nemo-target"],
+                },
+            ),
+        ],
+    )
+    def test_network_and_file_access_targets_fail_aggregate_scan(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+    ) -> None:
+        """SSRF and file-access Hydra targets should produce aggregate exit 1."""
+        config = {"model": _materialize_tmp_paths(target_config, tmp_path)}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.endheaders",
+            "socket.socket.sendfile",
+            "smtplib.SMTP",
+            "ftplib.FTP.connect",
+            "gzip.GzipFile",
+            "ctypes.util.find_library",
+            "numpy.lib._datasource.DataSource.open",
+            "numpy.lib._npyio_impl.load",
+            "tarfile.open",
+            "tempfile.NamedTemporaryFile",
+            "ctypes.PyDLL",
+            "ctypes.pythonapi.PyRun_SimpleString",
+            "ctypes.pythonapi.PyRun_String",
+            "numpy.lib.npyio.NpzFile",
+            "socket.socket.bind",
+            "socketserver.TCPServer",
+            "os.fork",
+            "os.kill",
+            "sys.exit",
+            "signal.signal",
+            "os.chdir",
+            "os.umask",
+            "os.chroot",
+            "asyncio.run",
+            "multiprocessing.Pool",
+            "multiprocessing.connection.Client",
+            "multiprocessing.managers.BaseManager.start",
+            "os.putenv",
+            "os.environ.update",
+            "resource.setrlimit",
+            "importlib.resources.read_binary",
+            "os.add_dll_directory",
+            "configparser.ConfigParser.read",
+            "torch.ops.load_library",
+            "zipfile.Path",
+            "importlib.machinery.SourceFileLoader.load_module",
+            "webbrowser.open_new",
+            "ssl.SSLContext.load_cert_chain",
+            "ssl.create_default_context",
+            "filecmp.cmp",
+            "pydoc.importfile",
+            "os.path.realpath",
+            "os.chmod",
+            "pathlib.Path.iterdir",
+            "pathlib.Path.resolve",
+            "shutil.unpack_archive",
+            "shutil.which",
+            "logging.config.dictConfig",
+            "omegaconf.OmegaConf.load",
+            "site.addsitedir",
+            "logging.FileHandler",
+            "linecache.getline",
+            "torch.save",
+            "tarfile.TarFile.extractall",
+            "os.close",
+            "sys.modules.clear",
+            "transformers.pipeline",
+            "transformers.AutoModel.from_pretrained",
+            "socket.socket",
+            "os.pipe",
+        ],
+    )
+    def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """Representative added I/O aliases should retain security exit-code precedence."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "os.execlpe",
+            "os.spawnlp",
+            "os.spawnlpe",
+            "os.spawnv",
+            "os.spawnve",
+            "os.spawnvp",
+            "os.spawnvpe",
+            "nt.spawnv",
+            "nt.spawnve",
+            "os.posix_spawn",
+            "os.posix_spawnp",
+            "posix.execv",
+            "posix.execve",
+            "os.fork",
+            "posix.fork",
+            "os.forkpty",
+            "posix.forkpty",
+            "pty.fork",
+            "os.kill",
+            "posix.kill",
+            "nt.kill",
+            "os.killpg",
+            "posix.killpg",
+            "signal.raise_signal",
+            "signal.pthread_kill",
+            "signal.alarm",
+            "signal.setitimer",
+            "signal.signal",
+            "sys.exit",
+            "os.abort",
+            "posix.abort",
+            "nt.abort",
+            "os._exit",
+            "posix._exit",
+            "nt._exit",
+            "posix.system",
+            "posix.posix_spawn",
+            "posix.posix_spawnp",
+            "nt.execv",
+            "nt.execve",
+            "nt.system",
+            "os.chdir",
+            "posix.chdir",
+            "nt.chdir",
+            "os.fchdir",
+            "posix.fchdir",
+            "os.umask",
+            "posix.umask",
+            "nt.umask",
+            "os.chroot",
+            "posix.chroot",
+            "os.setuid",
+            "posix.setuid",
+            "os.seteuid",
+            "posix.seteuid",
+            "os.setgid",
+            "posix.setgid",
+            "os.setegid",
+            "posix.setegid",
+            "os.setreuid",
+            "posix.setreuid",
+            "os.setregid",
+            "posix.setregid",
+            "os.setresuid",
+            "posix.setresuid",
+            "os.setresgid",
+            "posix.setresgid",
+            "os.setgroups",
+            "posix.setgroups",
+            "os.initgroups",
+            "posix.initgroups",
+            "os.setsid",
+            "posix.setsid",
+            "os.setpgid",
+            "posix.setpgid",
+            "os.setpgrp",
+            "posix.setpgrp",
+            "os.tcsetpgrp",
+            "posix.tcsetpgrp",
+            "os.putenv",
+            "posix.putenv",
+            "nt.putenv",
+            "os.unsetenv",
+            "posix.unsetenv",
+            "nt.unsetenv",
+            "os.environ.clear",
+            "os.environ.pop",
+            "os.environ.popitem",
+            "os.environ.setdefault",
+            "os.environ.update",
+            "os.environ.__setitem__",
+            "os.environ.__delitem__",
+            "os.environ.__ior__",
+            "os.environb.clear",
+            "os.environb.pop",
+            "os.environb.popitem",
+            "os.environb.setdefault",
+            "os.environb.update",
+            "os.environb.__setitem__",
+            "os.environb.__delitem__",
+            "os.environb.__ior__",
+            "sys.path.append",
+            "sys.path.clear",
+            "sys.path.extend",
+            "sys.path.insert",
+            "sys.path.pop",
+            "sys.path.remove",
+            "sys.path.reverse",
+            "sys.path.sort",
+            "sys.path.__setitem__",
+            "sys.path.__delitem__",
+            "sys.path.__iadd__",
+            "sys.path.__imul__",
+            "sys.modules.clear",
+            "sys.modules.pop",
+            "sys.modules.popitem",
+            "sys.modules.setdefault",
+            "sys.modules.update",
+            "sys.modules.__setitem__",
+            "sys.modules.__delitem__",
+            "sys.modules.__ior__",
+            "resource.setrlimit",
+            "resource.prlimit",
+            "os.add_dll_directory",
+            "nt.add_dll_directory",
+            "os.startfile",
+            "nt.startfile",
+            "runpy.run_module",
+            "runpy.run_path",
+            "operator.call",
+            "asyncio.run",
+            "threading.Thread.start",
+            "multiprocessing.Process.start",
+            "multiprocessing.Pool",
+            "multiprocessing.pool.Pool",
+            "multiprocessing.Manager",
+            "multiprocessing.connection.Client",
+            "multiprocessing.connection.Listener",
+            "multiprocessing.managers.BaseManager.start",
+            "multiprocessing.managers.SyncManager.start",
+            "webbrowser.open_new",
+            "webbrowser.open_new_tab",
+        ],
+    )
+    def test_process_and_global_side_effect_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Exact process and cwd side effects should not fall through to INFO-only review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "custom.spawnv_factory.SafeBuilder",
+            "custom.run_path_factory.SafeBuilder",
+            "custom.posix.execve_factory.SafeBuilder",
+            "custom.os.fork_factory.SafeBuilder",
+            "custom.os.chdir_factory.SafeBuilder",
+            "custom.os.kill_factory.SafeBuilder",
+            "custom.sys.exit_factory.SafeBuilder",
+            "custom.signal.signal_factory.SafeBuilder",
+            "custom.os.umask_factory.SafeBuilder",
+            "custom.os.chroot_factory.SafeBuilder",
+            "custom.os.setuid_factory.SafeBuilder",
+            "custom.posix.setgroups_factory.SafeBuilder",
+            "custom.os.putenv_factory.SafeBuilder",
+            "custom.posix.unsetenv_factory.SafeBuilder",
+            "custom.os.environ.update_factory.SafeBuilder",
+            "custom.os.environb.clear_factory.SafeBuilder",
+            "custom.sys.path.append_factory.SafeBuilder",
+            "custom.sys.modules.clear_factory.SafeBuilder",
+            "custom.os.close_factory.SafeBuilder",
+            "custom.torch.save_factory.SafeBuilder",
+            "custom.tarfile.TarFile.extractall_factory.SafeBuilder",
+            "custom.transformers.pipeline_factory.SafeBuilder",
+            "custom.socket.socket_factory.SafeBuilder",
+            "custom.os.pipe_factory.SafeBuilder",
+            "custom.resource.setrlimit_factory.SafeBuilder",
+            "custom.os.add_dll_directory_factory.SafeBuilder",
+            "custom.multiprocessing.PoolFactory.SafeBuilder",
+            "custom.multiprocessing.connection.ClientFactory.SafeBuilder",
+            "custom.multiprocessing.connection.ListenerFactory.SafeBuilder",
+            "custom.multiprocessing.managers.BaseManagerFactory.SafeBuilder",
+            "custom.webbrowser.open_new_factory.SafeBuilder",
+            "operator.callable",
+        ],
+    )
+    def test_execution_alias_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact alias coverage should not promote similarly named custom factories."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    def test_unknown_request_named_custom_target_remains_review_only(self, tmp_path: Path) -> None:
+        """Exact sink coverage should not promote benign request-like custom factories."""
+        config = {"model": {"_target_": "custom_package.requests_get_factory.SafeBuilder"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review"
+            and check.details.get("target") == "custom_package.requests_get_factory.SafeBuilder"
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.putrequest",
+            "http.client.HTTPSConnection.putrequest",
+            "httpx.Client.stream",
+            "httpx._client.Client.stream",
+            "httpx.AsyncClient.get",
+            "httpx._client.AsyncClient.request",
+            "ctypes.LibraryLoader",
+            "tempfile.SpooledTemporaryFile",
+            "glob.iglob",
+            "os.walk",
+            "pathlib.Path.glob",
+        ],
+    )
+    def test_non_io_target_invocations_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact coverage should not promote callables that only prepare data or return lazy handles."""
+        config = {"model": {"_target_": target}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review" and check.details.get("target") == target
         ]
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
@@ -3610,6 +5471,164 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].details["target"] == "subprocess.Popen"
         assert cve_checks[0].details["config_path"] == "trainer.callbacks[0][0]._target_"
 
+    def test_yaml_parser_recursion_limit_returns_inconclusive_exit2_without_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Parser recursion limits should fail closed instead of escaping the scanner."""
+
+        def raise_recursion_error(_: bytes) -> Any:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(yaml, "safe_load", raise_recursion_error)
+        path = _create_nemo_file_from_bytes(tmp_path, b"model: safe\n")
+
+        direct_result = NemoScanner().scan(str(path))
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_yaml_complexity_limit" in direct_result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate_result = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert aggregate_result.success is False
+            assert determine_exit_code(aggregate_result) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_recursive_yaml_alias_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Recursive YAML aliases should stop at a controlled incomplete outcome."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model: &loop\n  children:\n    - *loop\n",
+        )
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_recursive_alias" in direct_result.metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_wide_yaml_config_returns_inconclusive_before_enqueuing_all_children(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Wide YAML configs should respect the node budget before expanding every sibling."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {f"child_{index}": {"value": index} for index in range(32)}},
+        )
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_traversal_node_limit" in direct_result.metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_wide_yaml_config_preserves_detected_security_exit1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mapping-local targets must be checked before an earlier wide sibling exhausts the budget."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        wide_children = "".join(f"  child_{index}:\n    value: {index}\n" for index in range(32))
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            f"wide:\n{wide_children}_target_: os.system\n".encode(),
+        )
+
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_traversal_node_limit" in metadata["scan_outcome_reasons"]
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_wide_yaml_config_preserves_interpolated_target_exit1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Interpolated targets found before a traversal limit retain security precedence."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        path = _create_nemo_file(
+            tmp_path,
+            {
+                "callable": "os.system",
+                "_target_": "${callable}",
+                **{f"child_{index}": {"value": index} for index in range(32)},
+            },
+        )
+
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_traversal_node_limit" in metadata["scan_outcome_reasons"]
+        assert any("Interpolated _target_" in issue.message for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
+        """Mapping-local targets must be checked before an earlier recursive alias sibling."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model: &loop\n  children:\n    - *loop\n_target_: os.system\n",
+        )
+
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_recursive_alias" in metadata["scan_outcome_reasons"]
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_reused_yaml_alias_emits_one_target_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated aliases should not amplify identical Hydra target diagnostics."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 1_100)
+        aliases = b"  - *shared\n" * 1_000
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"shared: &shared\n  _target_: os.system\naliases:\n" + aliases,
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        target_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "os.system"
+        ]
+        assert len(target_checks) == 1
+        assert "nemo_config_traversal_node_limit" not in result.metadata.get("scan_outcome_reasons", [])
+
     @pytest.mark.parametrize(
         ("payload", "expected_reason", "expected_check"),
         [
@@ -3725,6 +5744,30 @@ class TestCVE202523304HydraTarget:
         review_checks = [c for c in result.checks if c.name == "Hydra _target_ Review"]
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
+
+    def test_unknown_target_diagnostics_redact_and_bound_config_evidence(self, tmp_path: Path) -> None:
+        """Review diagnostics should not retain unbounded secret-bearing config strings."""
+        secret = "TARGETSECRET123"
+        path_secret = "PATHSECRET456"
+        target = f"custom_package.Builder?token={secret}" + ("A" * 400)
+        path = _create_nemo_file(
+            tmp_path,
+            {f"client_secret={path_secret}": {"_target_": target}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        review_checks = [check for check in result.checks if check.name == "Hydra _target_ Review"]
+        assert len(review_checks) == 1
+        check = review_checks[0]
+        assert secret not in check.message
+        assert path_secret not in check.message
+        assert secret not in check.details["target"]
+        assert path_secret not in check.details["config_path"]
+        assert "<redacted>" in check.details["target"]
+        assert "<redacted>" in check.details["config_path"]
+        assert len(check.details["target"]) <= 256
+        assert len(check.details["config_path"]) <= 256
 
     def test_oversized_yaml_config_is_rejected_before_parse(
         self,
