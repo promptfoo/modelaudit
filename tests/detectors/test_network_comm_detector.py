@@ -162,11 +162,20 @@ class TestNetworkCommDetector:
 
     def test_authorization_hostname_conservatively_preserves_unlisted_public_suffix_context(self) -> None:
         """Unknown two-label suffixes must retain their registrable hostname label."""
-        url = "https://auth.token.example.blogspot.com/path"
+        url = "https://auth.token.example.workers.dev/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+        findings = NetworkCommDetector().scan(url.encode(), "model.bin")
+
+        assert redacted == "https://auth.<redacted>.example.workers.dev/path"
+        assert any(finding.get("url") == redacted for finding in findings)
+
+    def test_authorization_hostname_unknown_suffix_still_redacts_credential_shaped_payload(self) -> None:
+        url = "https://auth.token.SECRET123.workers.dev/path"
 
         redacted = network_comm.redact_url_for_finding(url)
 
-        assert redacted == "https://auth.<redacted>.example.blogspot.com/path"
+        assert redacted == "https://auth.<redacted>.<redacted>.workers.dev/path"
 
     def test_authorization_hostname_redacts_ambiguous_payload_with_extra_domain_context(self) -> None:
         """Ambiguous schemes still carry redaction when enough hostname context remains."""

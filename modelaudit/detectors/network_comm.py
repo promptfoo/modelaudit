@@ -125,6 +125,7 @@ _NON_CREDENTIAL_AUTHORIZATION_VALUES = frozenset(
     }
 )
 _RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+_COMMON_SINGLE_LABEL_PUBLIC_SUFFIXES = frozenset({"com", "edu", "gov", "int", "mil", "net", "org"})
 _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
 _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
     {
@@ -707,7 +708,9 @@ def _authorization_scheme_has_payload(scheme: str, following_value: str | None) 
 
 
 def _hostname_public_suffix_label_count(normalized_labels: list[str]) -> int:
-    suffix_labels = 1
+    suffix_labels = (
+        1 if len(normalized_labels) == 1 or normalized_labels[-1] in _COMMON_SINGLE_LABEL_PUBLIC_SUFFIXES else 2
+    )
     if (
         len(normalized_labels) >= 2
         and len(normalized_labels[-1]) == 2
