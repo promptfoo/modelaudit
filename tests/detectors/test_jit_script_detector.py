@@ -7540,6 +7540,37 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_preserves_safe_builtin_setattr_after_alias_reimport(self) -> None:
+        padding = b"".join(f"value_{index} = {index}\n".encode() for index in range(20))
+        data = (
+            b"import runpy as rp\nbuiltins = object()\n"
+            + padding
+            + b"import builtins\nbuiltins.setattr(rp, 'run_path', print)\n"
+            b"builtins = object()\nrp.run_path('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    def test_scan_model_rejects_transient_shadowed_builtin_setattr(self) -> None:
+        data = (
+            b"import runpy as rp\nfrom types import SimpleNamespace\n"
+            b"builtins = SimpleNamespace(setattr=lambda *args: None)\n"
+            b"builtins.setattr(rp, 'run_path', print)\nimport builtins\n"
+            b"rp.run_path('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         "inactive_shadow",
         [

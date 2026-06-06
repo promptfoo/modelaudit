@@ -10656,29 +10656,17 @@ def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
 def _compact_snippet_shadowed_setattr_references_by_statement(
     statements: Sequence[ast.stmt],
 ) -> dict[int, set[str]]:
-    if not statements:
-        return {}
-    tree = ast.Module(body=list(statements), type_ignores=[])
-    shadowed_references = _compact_snippet_shadowed_setattr_references(tree)
-    first_shadow_indexes: dict[str, int] = {}
-    for reference in shadowed_references:
-        first_shadow_index = 0
-        last_unshadowed_index = len(statements) - 1
-        while first_shadow_index < last_unshadowed_index:
-            candidate_index = (first_shadow_index + last_unshadowed_index) // 2
-            prefix_tree = ast.Module(body=list(statements[: candidate_index + 1]), type_ignores=[])
-            prefix_references = _compact_snippet_shadowed_setattr_references(prefix_tree)
-            if reference in prefix_references:
-                last_unshadowed_index = candidate_index
-            else:
-                first_shadow_index = candidate_index + 1
-        first_shadow_indexes[reference] = first_shadow_index
-    return {
-        id(statement): {
-            reference for reference, first_index in first_shadow_indexes.items() if first_index <= statement_index
-        }
-        for statement_index, statement in enumerate(statements)
-    }
+    relevant_references = {"setattr", "builtins.setattr", "__builtins__.setattr"}
+    shadowed_by_statement: dict[int, set[str]] = {}
+    for index, statement in enumerate(statements):
+        if not any(
+            isinstance(node, ast.Call) and _simple_reference_name(node.func) in relevant_references
+            for node in ast.walk(statement)
+        ):
+            continue
+        prefix_tree = ast.Module(body=list(statements[: index + 1]), type_ignores=[])
+        shadowed_by_statement[id(statement)] = _compact_snippet_shadowed_setattr_references(prefix_tree)
+    return shadowed_by_statement
 
 
 def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
