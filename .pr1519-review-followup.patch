@@ -1,0 +1,204 @@
+From dd73ef513eace1b3c3f6354192b3220caf6aab91 Mon Sep 17 00:00:00 2001
+From: Michael D'Angelo <mdangelo@openai.com>
+Date: Sat, 6 Jun 2026 14:45:32 +0000
+Subject: [PATCH] fix: preserve JIT aliases across branch replay
+
+
+diff --git a/modelaudit/detectors/jit_script.py b/modelaudit/detectors/jit_script.py
+index 9798bdfb..51e306ad 100644
+--- a/modelaudit/detectors/jit_script.py
++++ b/modelaudit/detectors/jit_script.py
+@@ -8460,11 +8460,19 @@ def _deterministic_named_expressions(
+     )
+ 
+ 
+-def _prior_deterministic_named_expressions(expression: ast.AST, call: ast.Call) -> list[ast.NamedExpr]:
++def _prior_deterministic_named_expressions(
++    expression: ast.AST,
++    call: ast.Call,
++    *,
++    eager_generator_consumers: dict[str, str] | None = None,
++) -> list[ast.NamedExpr]:
+     call_position = (getattr(call, "lineno", 0), getattr(call, "col_offset", 0))
+     return [
+         node
+-        for node in _deterministic_named_expressions(expression)
++        for node in _deterministic_named_expressions(
++            expression,
++            eager_generator_consumers=eager_generator_consumers,
++        )
+         if (
+             getattr(node, "end_lineno", getattr(node, "lineno", 0)),
+             getattr(node, "end_col_offset", getattr(node, "col_offset", 0)),
+@@ -8496,9 +8504,15 @@ def _name_aliases_before_call(
+     expression: ast.AST,
+     call: ast.Call,
+     aliases_before: Mapping[str, _ContainerValue],
++    *,
++    eager_generator_consumers: dict[str, str] | None = None,
+ ) -> dict[str, _ContainerValue]:
+     aliases = dict(aliases_before)
+-    for named_expression in _prior_deterministic_named_expressions(expression, call):
++    for named_expression in _prior_deterministic_named_expressions(
++        expression,
++        call,
++        eager_generator_consumers=eager_generator_consumers,
++    ):
+         value = aliases.get(named_expression.value.id) if isinstance(named_expression.value, ast.Name) else None
+         aliases.pop(named_expression.target.id, None)
+         if value is not None:
+@@ -12582,6 +12596,7 @@ def _compact_snippet_typed_print_overwrite_replay(
+                     expression,
+                     outer_call,
+                     dict.fromkeys(active_print_builtins_aliases, True),
++                    eager_generator_consumers=active_eager_generator_consumer_aliases(),
+                 ).keys()
+             else:
+                 active_builtins_aliases = ()
+@@ -13291,7 +13306,8 @@ def _compact_snippet_typed_print_overwrite_replay(
+         if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+             owner = module_aliases.get(value.value.id)
+             if owner is not None and _typed_member_high_risk_call(owner[0], value.attr) is not None:
+-                return frozenset({(owner[0], value.attr, (owner, value.attr) in safe_members)})
++                active_safe_members = safe_members if dynamic_safe_members is None else dynamic_safe_members
++                return frozenset({(owner[0], value.attr, (owner, value.attr) in active_safe_members)})
+         return frozenset()
+ 
+     def merge_typed_member_callable_values(
+@@ -13570,6 +13586,8 @@ def _compact_snippet_typed_print_overwrite_replay(
+                 base_safe_print_aliases = set(
+                     safe_print_aliases if parent_safe_print_aliases is None else parent_safe_print_aliases
+                 )
++                base_typed_aliases = dict(typed_aliases)
++                base_typed_member_callable_aliases = dict(typed_member_callable_aliases)
+ 
+                 dynamic_print_shadow_state = base_print_state
+                 dynamic_builtins_print_shadow_state = base_builtins_print_state
+@@ -13581,17 +13599,40 @@ def _compact_snippet_typed_print_overwrite_replay(
+                 body_builtins_print_state = dynamic_builtins_print_shadow_state
+                 body_safe_members = set(dynamic_safe_members)
+                 body_safe_print_aliases = set(dynamic_safe_print_aliases)
++                body_typed_aliases = dict(typed_aliases)
++                body_typed_member_callable_aliases = dict(typed_member_callable_aliases)
+ 
+                 dynamic_print_shadow_state = base_print_state
+                 dynamic_builtins_print_shadow_state = base_builtins_print_state
+                 dynamic_safe_members = set(base_safe_members)
+                 dynamic_safe_print_aliases = set(base_safe_print_aliases)
++                typed_aliases.clear()
++                typed_aliases.update(base_typed_aliases)
++                typed_member_callable_aliases.clear()
++                typed_member_callable_aliases.update(base_typed_member_callable_aliases)
+                 for child in node.orelse:
+                     self.visit(child)
+                 merged_print_state = bool(body_print_state or dynamic_print_shadow_state)
+                 merged_builtins_print_state = bool(body_builtins_print_state or dynamic_builtins_print_shadow_state)
+                 merged_safe_members = body_safe_members.intersection(dynamic_safe_members)
+                 merged_safe_print_aliases = body_safe_print_aliases.intersection(dynamic_safe_print_aliases)
++                else_typed_aliases = dict(typed_aliases)
++                else_typed_member_callable_aliases = dict(typed_member_callable_aliases)
++                typed_aliases.clear()
++                typed_aliases.update(
++                    {
++                        name: identity
++                        for name, identity in body_typed_aliases.items()
++                        if else_typed_aliases.get(name) == identity
++                    }
++                )
++                typed_member_callable_aliases.clear()
++                for name in body_typed_member_callable_aliases.keys() | else_typed_member_callable_aliases.keys():
++                    body_value = body_typed_member_callable_aliases.get(name, frozenset())
++                    else_value = else_typed_member_callable_aliases.get(name, frozenset())
++                    merged_value = merge_typed_member_callable_values(body_value, else_value)
++                    if merged_value:
++                        typed_member_callable_aliases[name] = merged_value
+ 
+                 if parent_print_state is None:
+                     current_print_is_shadowed = merged_print_state
+@@ -14107,13 +14148,24 @@ def _compact_snippet_typed_print_overwrite_replay(
+                 eager_generator_consumers=eager_generator_consumers,
+             ):
+                 reference = _simple_reference_name(node.func)
+-                active_typed_aliases = _name_aliases_before_call(value, node, expression_typed_aliases)
++                active_typed_aliases = _name_aliases_before_call(
++                    value,
++                    node,
++                    expression_typed_aliases,
++                    eager_generator_consumers=eager_generator_consumers,
++                )
+                 active_typed_member_callable_aliases = _name_aliases_before_call(
+                     value,
+                     node,
+                     expression_typed_member_callable_aliases,
++                    eager_generator_consumers=eager_generator_consumers,
++                )
++                active_mapping_aliases = _name_aliases_before_call(
++                    value,
++                    node,
++                    expression_mapping_aliases,
++                    eager_generator_consumers=eager_generator_consumers,
+                 )
+-                active_mapping_aliases = _name_aliases_before_call(value, node, expression_mapping_aliases)
+                 (
+                     active_sys_aliases,
+                     active_sys_modules_aliases,
+diff --git a/tests/detectors/test_jit_script_detector.py b/tests/detectors/test_jit_script_detector.py
+index 68f934ea..fa2df22f 100644
+--- a/tests/detectors/test_jit_script_detector.py
++++ b/tests/detectors/test_jit_script_detector.py
+@@ -8819,6 +8819,20 @@ class TestJITScriptDetector:
+             for finding in findings
+         )
+ 
++    def test_scan_model_keeps_dangerous_walrus_alias_from_eager_builtins_consumer(self) -> None:
++        source = (
++            b"import builtins as bi\nimport webbrowser as wb\n"
++            b"original = wb.open\nwb.open = print\n"
++            b"(bi.list((opener := original) for _ in [0]), opener('https://example.invalid'))\n"
++        )
++
++        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
++
++        assert any(
++            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
++            for finding in findings
++        )
++
+     def test_scan_model_accepts_builtin_print_after_statically_empty_generator_walrus(self) -> None:
+         source = b"import ctypes as c\nunused = ((print := eval) for _ in [])\nc.CDLL = print\nc.CDLL('safe')\n"
+ 
+@@ -9115,6 +9129,34 @@ class TestJITScriptDetector:
+             for finding in findings
+         )
+ 
++    def test_scan_model_restores_alias_state_before_uncertain_else_branch(self) -> None:
++        source = (
++            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
++            b"if condition:\n    wb = Holder\nelse:\n    wb.open = original\n"
++            b"wb.open('https://example.invalid')\n"
++        )
++
++        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
++
++        assert any(
++            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
++            for finding in findings
++        )
++
++    def test_scan_model_uses_branch_local_safety_for_captured_member_alias(self) -> None:
++        source = (
++            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
++            b"if condition:\n    wb.open = original\n    opener = wb.open\n"
++            b"opener('https://example.invalid')\n"
++        )
++
++        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
++
++        assert any(
++            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
++            for finding in findings
++        )
++
+     @pytest.mark.parametrize(
+         "safe_write",
+         [
