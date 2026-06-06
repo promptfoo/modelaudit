@@ -1,6 +1,7 @@
 """Tests for HuggingFace URL handling."""
 
 import importlib
+import os
 import pickle
 import signal
 import struct
@@ -1513,6 +1514,7 @@ class TestModelDownload:
 
         mock_terminate.assert_called_once_with(process)
 
+    @pytest.mark.skipif(not hasattr(os, "killpg"), reason="requires POSIX process groups")
     @patch("modelaudit.utils.sources.huggingface.os.killpg")
     def test_download_worker_terminates_posix_process_group(self, mock_killpg: MagicMock) -> None:
         """Timeout cleanup must stop transfer helpers launched by the worker."""
