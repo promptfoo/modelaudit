@@ -7523,6 +7523,24 @@ class TestJITScriptDetector:
         )
 
     @pytest.mark.parametrize(
+        "setattr_shadow",
+        [
+            b"setattr = lambda *args: None\n",
+            b"globals()['setattr'] = lambda *args: None\n",
+            b"import builtins\nbuiltins.__dict__['setattr'] = lambda *args: None\n",
+        ],
+    )
+    def test_scan_model_preserves_safe_runpy_overwrite_before_setattr_shadow(self, setattr_shadow: bytes) -> None:
+        data = b"import runpy as rp\nsetattr(rp, 'run_path', print)\n" + setattr_shadow + b"rp.run_path('safe')\n"
+
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
         "inactive_shadow",
         [
             "if False:\n    globals()['setattr'] = lambda *args: None\n",
@@ -7669,6 +7687,27 @@ class TestJITScriptDetector:
 
     def test_scan_model_preserves_safe_runpy_overwrite_before_print_shadow(self) -> None:
         source = b"import runpy as rp\nrp.run_path = print\nprint = eval\nrp.run_path('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "print_shadow",
+        [
+            b"globals()['print'] = eval\n",
+            b"namespace = globals()\nnamespace['print'] = eval\n",
+            b"import builtins\nbuiltins.__dict__.update(print=eval)\n",
+        ],
+    )
+    def test_scan_model_preserves_safe_runpy_overwrite_before_mapping_print_shadow(
+        self,
+        print_shadow: bytes,
+    ) -> None:
+        source = b"import runpy as rp\nrp.run_path = print\n" + print_shadow + b"rp.run_path('safe')\n"
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
@@ -8360,6 +8399,57 @@ class TestJITScriptDetector:
             for finding in findings
         )
         assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("mapping_setup", "target"),
+        [
+            (b"", b"wb.__dict__['open']"),
+            (b"mapping = wb.__dict__\n", b"mapping['open']"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("restored_value", "should_detect"),
+        [
+            (b"original", True),
+            (b"print", False),
+        ],
+    )
+    def test_scan_model_tracks_typed_member_mapping_assignment(
+        self,
+        mapping_setup: bytes,
+        target: bytes,
+        restored_value: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            + mapping_setup
+            + target
+            + b" = "
+            + restored_value
+            + b"\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    def test_scan_model_ignores_unrelated_mapping_assignment_after_typed_safe_overwrite(self) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"other = {}\nother['open'] = original\nwb.open('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
 
     @pytest.mark.parametrize(
         ("deletion", "should_detect"),

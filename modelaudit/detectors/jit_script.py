@@ -10509,36 +10509,15 @@ def _compact_snippet_shadowed_print_statement_ids(statements: Sequence[ast.stmt]
     if not _compact_snippet_has_shadowed_print(source, tree):
         return set()
 
-    def directly_shadows_print(statement: ast.stmt) -> bool:
-        statement_tree = ast.Module(body=[statement], type_ignores=[])
-        parents, executed_statement_ids = _compact_module_scope_context(statement_tree)
-        for node in ast.walk(statement):
-            if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
-                continue
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
-                return True
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
-                return True
-            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in node.names
-            ):
-                return True
-        return False
-
-    direct_shadow_indexes = [index for index, statement in enumerate(statements) if directly_shadows_print(statement)]
-    if not direct_shadow_indexes:
-        return {id(statement) for statement in statements}
-
-    direct_shadow_index_set = set(direct_shadow_indexes)
-    non_direct_statements = [
-        statement for index, statement in enumerate(statements) if index not in direct_shadow_index_set
-    ]
-    if non_direct_statements:
-        non_direct_tree = ast.Module(body=non_direct_statements, type_ignores=[])
-        if _compact_snippet_has_shadowed_print(ast.unparse(non_direct_tree), non_direct_tree):
-            return {id(statement) for statement in statements}
-
-    first_shadow_index = direct_shadow_indexes[0]
+    first_shadow_index = 0
+    last_unshadowed_index = len(statements) - 1
+    while first_shadow_index < last_unshadowed_index:
+        candidate_index = (first_shadow_index + last_unshadowed_index) // 2
+        prefix_tree = ast.Module(body=list(statements[: candidate_index + 1]), type_ignores=[])
+        if _compact_snippet_has_shadowed_print(ast.unparse(prefix_tree), prefix_tree):
+            last_unshadowed_index = candidate_index
+        else:
+            first_shadow_index = candidate_index + 1
     return {id(statement) for statement in statements[first_shadow_index:]}
 
 
@@ -10672,6 +10651,34 @@ def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
     if "__builtins__" not in builtins_aliases:
         shadowed_references.add("__builtins__.setattr")
     return shadowed_references
+
+
+def _compact_snippet_shadowed_setattr_references_by_statement(
+    statements: Sequence[ast.stmt],
+) -> dict[int, set[str]]:
+    if not statements:
+        return {}
+    tree = ast.Module(body=list(statements), type_ignores=[])
+    shadowed_references = _compact_snippet_shadowed_setattr_references(tree)
+    first_shadow_indexes: dict[str, int] = {}
+    for reference in shadowed_references:
+        first_shadow_index = 0
+        last_unshadowed_index = len(statements) - 1
+        while first_shadow_index < last_unshadowed_index:
+            candidate_index = (first_shadow_index + last_unshadowed_index) // 2
+            prefix_tree = ast.Module(body=list(statements[: candidate_index + 1]), type_ignores=[])
+            prefix_references = _compact_snippet_shadowed_setattr_references(prefix_tree)
+            if reference in prefix_references:
+                last_unshadowed_index = candidate_index
+            else:
+                first_shadow_index = candidate_index + 1
+        first_shadow_indexes[reference] = first_shadow_index
+    return {
+        id(statement): {
+            reference for reference, first_index in first_shadow_indexes.items() if first_index <= statement_index
+        }
+        for statement_index, statement in enumerate(statements)
+    }
 
 
 def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
@@ -10956,7 +10963,6 @@ def _compact_snippet_runpy_print_overwrite_calls(
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
-    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
     deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
     runpy_aliases = set(inherited_runpy_aliases)
     runpy_alias_ids = dict.fromkeys(inherited_runpy_aliases, 0)
@@ -11198,8 +11204,12 @@ def _compact_snippet_runpy_print_overwrite_calls(
 
     executed_statements = _deterministically_executed_statements(tree.body)
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
     for statement in executed_statements:
         current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
+        current_shadowed_setattr_references = shadowed_setattr_references_by_statement.get(id(statement), set())
         runpy_alias_ids_before = dict(runpy_alias_ids)
         mapping_aliases_before = dict(mapping_aliases)
         reload_aliases_before = frozenset(reload_aliases)
@@ -11362,7 +11372,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 )
                 if (
                     reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
-                    and reference not in shadowed_setattr_references
+                    and reference not in current_shadowed_setattr_references
                     and len(node.args) >= 3
                     and isinstance(node.args[0], ast.Name)
                     and (module_id := active_runpy_alias_ids.get(node.args[0].id)) is not None
@@ -11487,6 +11497,9 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
     parents, executed_statement_ids = _compact_module_scope_context(tree)
     executed_statements = _compact_deterministically_executed_statements(tree.body)
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
     for statement in executed_statements:
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
@@ -11516,7 +11529,13 @@ def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
                     and isinstance(call.args[2], ast.Name)
                     and call.args[2].id == "print"
                 ):
-                    if id(statement) in shadowed_print_statement_ids or reference in shadowed_setattr_references:
+                    current_shadowed_setattr_references = shadowed_setattr_references_by_statement.get(
+                        id(statement), set()
+                    )
+                    if (
+                        id(statement) in shadowed_print_statement_ids
+                        or reference in current_shadowed_setattr_references
+                    ):
                         dangerous_members.add(member_name)
                     else:
                         dangerous_members.discard(member_name)
@@ -11558,7 +11577,11 @@ def _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str: str) -> se
             for target_name in _assignment_target_names(target):
                 typed_aliases.pop(target_name, None)
 
-    for statement in _compact_deterministically_executed_statements(tree.body):
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
+    for statement in executed_statements:
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
         if isinstance(statement, ast.Import):
@@ -11587,7 +11610,7 @@ def _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str: str) -> se
                 reference = _simple_reference_name(call.func)
                 if (
                     reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
-                    and reference in shadowed_setattr_references
+                    and reference in shadowed_setattr_references_by_statement.get(id(statement), set())
                     and len(call.args) >= 3
                     and isinstance(call.args[0], ast.Name)
                     and call.args[0].id in typed_aliases
@@ -11622,7 +11645,10 @@ def _compact_snippet_captured_runpy_high_risk_calls(
     except (RecursionError, SyntaxError, ValueError):
         return set()
     runpy_aliases = set(inherited_runpy_aliases)
-    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
     first_safe_write: dict[str, int] = {}
     captured_members: dict[str, tuple[str, int]] = {}
     dangerous_calls: set[tuple[str, str]] = set()
@@ -11662,7 +11688,7 @@ def _compact_snippet_captured_runpy_high_risk_calls(
 
     parents, executed_statement_ids = _compact_module_scope_context(tree)
 
-    for statement in _compact_deterministically_executed_statements(tree.body):
+    for statement in executed_statements:
         if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
             continue
         if isinstance(statement, ast.Import):
@@ -11706,7 +11732,7 @@ def _compact_snippet_captured_runpy_high_risk_calls(
                 if (
                     (reference := _simple_reference_name(node.func))
                     in {"setattr", "builtins.setattr", "__builtins__.setattr"}
-                    and reference not in shadowed_setattr_references
+                    and reference not in shadowed_setattr_references_by_statement.get(id(statement), set())
                     and len(node.args) >= 3
                     and isinstance(node.args[0], ast.Name)
                     and node.args[0].id in runpy_aliases
@@ -12063,7 +12089,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 if alias.name == "builtins":
                     builtins_aliases.add(alias.asname or "builtins")
     mutated_truthy_builtins = _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set())
-    if "print" in mutated_truthy_builtins or mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
+    if mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
         return set(), set()
     vars_helper_aliases: set[str] = set()
     setattr_helper_aliases: set[str] = set()
@@ -12337,18 +12363,35 @@ def _compact_snippet_typed_print_overwrite_replay(
         target: ast.AST,
         value: ast.AST,
         aliases_before: Mapping[str, tuple[str, int]],
+        mapping_aliases_before: Mapping[str, tuple[str, int]],
     ) -> None:
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
             record_attribute(aliases_before.get(target.value.id), target.attr, value)
+        elif isinstance(target, ast.Subscript):
+            record_member(
+                owner_name(target.value, mapping_aliases_before, aliases_before),
+                _static_getattr_member_name(target.slice),
+                value,
+            )
         elif isinstance(target, ast.Starred):
-            record_assignment_target(target.value, ast.Constant(value=None), aliases_before)
+            record_assignment_target(
+                target.value,
+                ast.Constant(value=None),
+                aliases_before,
+                mapping_aliases_before,
+            )
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 for target_item, value_item in zip(target.elts, value.elts, strict=True):
-                    record_assignment_target(target_item, value_item, aliases_before)
+                    record_assignment_target(target_item, value_item, aliases_before, mapping_aliases_before)
             else:
                 for target_item in target.elts:
-                    record_assignment_target(target_item, ast.Constant(value=None), aliases_before)
+                    record_assignment_target(
+                        target_item,
+                        ast.Constant(value=None),
+                        aliases_before,
+                        mapping_aliases_before,
+                    )
 
     def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
         def invalidate_owner() -> None:
@@ -12755,7 +12798,12 @@ def _compact_snippet_typed_print_overwrite_replay(
                 record_setattr_shadow(target, statement.value)
                 record_vars_shadow(target, statement.value)
                 record_dict_shadow(target, statement.value)
-                record_assignment_target(target, statement.value, typed_aliases_before)
+                record_assignment_target(
+                    target,
+                    statement.value,
+                    typed_aliases_before,
+                    mapping_aliases_before,
+                )
                 value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
                     if active_vars_reference(value_reference):
@@ -12795,7 +12843,12 @@ def _compact_snippet_typed_print_overwrite_replay(
             record_setattr_shadow(statement.target, statement.value)
             record_vars_shadow(statement.target, statement.value)
             record_dict_shadow(statement.target, statement.value)
-            record_assignment_target(statement.target, statement.value, typed_aliases_before)
+            record_assignment_target(
+                statement.target,
+                statement.value,
+                typed_aliases_before,
+                mapping_aliases_before,
+            )
             if isinstance(statement.target, ast.Name):
                 bind_builtins_mapping_alias(statement.target.id, statement.value)
             bind_module_helper_target(
