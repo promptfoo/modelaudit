@@ -9585,6 +9585,13 @@ class TestJITScriptDetector:
         assert aliases == frozenset()
         assert shadowed == frozenset({"builtins"})
 
+    def test_prefix_builtins_aliases_ignore_lazy_walrus_rebind(self) -> None:
+        prefix = b"import builtins as bi\ncallback = lambda: (bi := None)\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" in aliases
+
     def test_compact_replay_calls_inherited_typed_alias_without_print(self) -> None:
         inherited_aliases = {"alias": frozenset({("webbrowser", "open", False)})}
 
@@ -9654,6 +9661,23 @@ class TestJITScriptDetector:
 
         assert suppressed == set()
         assert high_risk == {("webbrowser.open", "S109")}
+
+    @pytest.mark.parametrize(("class_value", "expected"), [("original", True), ("print", False)])
+    def test_compact_replay_visits_class_body_in_uncertain_branch(
+        self,
+        class_value: str,
+        expected: bool,
+    ) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+            "if condition:\n"
+            "    class Holder:\n"
+            f"        builtins.print = {class_value}\n"
+            "wb.open = builtins.print\nwb.open('https://example.invalid')\n"
+        )
+
+        assert (("webbrowser.open", "S109") in high_risk) is expected
+        assert (("webbrowser.open", "S109") in suppressed) is (not expected)
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),

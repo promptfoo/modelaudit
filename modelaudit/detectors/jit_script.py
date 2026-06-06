@@ -971,10 +971,14 @@ def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str,
         for target in statement.targets:
             for name in _assignment_target_names(target):
                 aliases.pop(name, None)
-    for node in ast.walk(statement):
-        if isinstance(node, ast.NamedExpr):
-            for name in _assignment_target_names(node.target):
-                aliases.pop(name, None)
+    for expression in _deterministically_evaluated_statement_expressions(
+        statement,
+        evaluate_annotations=False,
+    ):
+        for node in _deterministically_executed_expression_nodes(expression):
+            if isinstance(node, ast.NamedExpr):
+                for name in _assignment_target_names(node.target):
+                    aliases.pop(name, None)
 
 
 def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
@@ -11254,9 +11258,13 @@ def _update_compact_builtins_aliases(statement: ast.stmt, builtins_aliases: set[
     elif isinstance(statement, ast.Delete):
         for target in statement.targets:
             bind_target(target)
-    for node in ast.walk(statement):
-        if isinstance(node, ast.NamedExpr):
-            bind_target(node.target)
+    for expression in _deterministically_evaluated_statement_expressions(
+        statement,
+        evaluate_annotations=False,
+    ):
+        for node in _deterministically_executed_expression_nodes(expression):
+            if isinstance(node, ast.NamedExpr):
+                bind_target(node.target)
 
 
 def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
@@ -13040,6 +13048,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     dynamic_builtins_print_shadow_state: bool | None = None
     dynamic_safe_members: set[tuple[tuple[str, int], str]] | None = None
     dynamic_safe_print_aliases: set[str] | None = None
+    class_scope_depth = 0
     active_print_builtins_aliases = set(inherited_active_builtins_aliases)
     eager_builtins_aliases = set(inherited_active_builtins_aliases)
     local_setattr_shadowed = False
@@ -14159,6 +14168,8 @@ def _compact_snippet_typed_print_overwrite_replay(
             record_builtins_helper_assignment(_static_getattr_member_name(target.slice), value)
             return
         if isinstance(target, ast.Name):
+            if class_scope_depth:
+                return
             previous = typed_member_callable_aliases.get(target.id)
             candidate = typed_member_callable_value(value, typed_member_callable_aliases, typed_aliases)
             active_safe_print_aliases = (
@@ -14311,6 +14322,8 @@ def _compact_snippet_typed_print_overwrite_replay(
             invalidate_rebound_target(target.value)
             return
         if isinstance(target, ast.Name):
+            if class_scope_depth:
+                return
             typed_aliases.pop(target.id, None)
             typed_member_callable_aliases.pop(target.id, None)
             active_print_builtins_aliases.discard(target.id)
@@ -14631,11 +14644,18 @@ def _compact_snippet_typed_print_overwrite_replay(
                         self.visit(default)
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                nonlocal class_scope_depth
                 invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
                 for expression in [*node.decorator_list, *node.bases]:
                     self.visit(expression)
                 for keyword in node.keywords:
                     self.visit(keyword.value)
+                class_scope_depth += 1
+                try:
+                    for child in node.body:
+                        self.visit(child)
+                finally:
+                    class_scope_depth -= 1
 
             def visit_Lambda(self, node: ast.Lambda) -> None:
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
