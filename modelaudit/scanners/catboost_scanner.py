@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import ipaddress
 import os
 import re
 import struct
 from typing import Any, ClassVar
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 from ._catboost_evidence_redaction import (
     EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
@@ -40,7 +41,8 @@ _PROCESS_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URL_PATTERN = re.compile(r"\b(?:https?|ftp)://[^\s\"'<>]{4,}", re.IGNORECASE)
-_IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?\b")
+_IPV4_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?\b")
+_IPV6_PATTERN = re.compile(r"(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![0-9a-f:])", re.IGNORECASE)
 _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^#!\s*/", re.MULTILINE), "shebang marker"),
     (re.compile(r"<script\b", re.IGNORECASE), "embedded HTML script"),
@@ -55,12 +57,24 @@ _SPLIT_BASE64_EVIDENCE_PATTERN = re.compile(
     r"(?is)(?:(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"'](?:\s+|\s*\+\s*))+"
     r"(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"']"
 )
+_PYTHON_STRING_LITERAL_PATTERN = r"(?:[rubf]{0,3})(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+_STRING_LITERAL_COLLECTION_PATTERN = re.compile(
+    rf"(?is)(?P<open>[\[(])\s*{_PYTHON_STRING_LITERAL_PATTERN}"
+    rf"(?:\s*,\s*{_PYTHON_STRING_LITERAL_PATTERN})+\s*,?\s*(?P<close>[\])])"
+)
+_PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_UNICODE_OR_OCTAL_ESCAPE_PATTERN = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3})")
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
     r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
     r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-]))"
 )
+_TRUNCATED_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?is)(?P<prefix>(?<![\w.-])(?:_?(?:auth|key|password|secret|token))\s*[:=]\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;&|,)]+)"
+)
 _MAX_ENCODED_EVIDENCE_CHARS = 8192
+_MAX_PERCENT_DECODE_PASSES = 16
 
 _SUSPICIOUS_NETWORK_KEYWORDS = (
     "webhook",
@@ -162,6 +176,68 @@ def _redact_split_base64_evidence(text: str) -> str:
     return _SPLIT_BASE64_EVIDENCE_PATTERN.sub(replace_payload, text)
 
 
+def _redact_literal_collection_evidence(text: str) -> str:
+    """Join bounded string-literal collections before reversible decoding."""
+
+    def replace_collection(match: re.Match[str]) -> str:
+        matching_close = "]" if match.group("open") == "[" else ")"
+        if match.group("close") != matching_close:
+            return match.group(0)
+        try:
+            values = ast.literal_eval(match.group(0))
+        except (SyntaxError, ValueError):
+            return match.group(0)
+        if not isinstance(values, (list, tuple)) or not all(isinstance(value, str) for value in values):
+            return match.group(0)
+        joined = "".join(values)
+        if len(joined) > _MAX_ENCODED_EVIDENCE_CHARS:
+            return match.group(0)
+
+        decoded_text = _decode_base64_evidence_payload(joined)
+        if decoded_text:
+            sanitized = _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
+            if sanitized != match.group(0):
+                return sanitized
+
+        hex_sanitized = _redact_reversible_hex_evidence(joined)
+        if hex_sanitized != joined:
+            return hex_sanitized
+        return _sanitize_decoded_reversible_evidence(joined, match.group(0))
+
+    return _STRING_LITERAL_COLLECTION_PATTERN.sub(replace_collection, text)
+
+
+def _redact_reversible_percent_evidence(text: str) -> str:
+    """Decode percent-encoded evidence until a sensitive value can be sanitized."""
+
+    def redact_segment(segment: str) -> str:
+        if _PERCENT_ESCAPE_PATTERN.search(segment) is None:
+            return segment
+
+        decoded = segment
+        for _ in range(_MAX_PERCENT_DECODE_PASSES):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                return segment
+            decoded = next_decoded
+            sanitized = _sanitize_decoded_reversible_evidence(decoded, segment)
+            if sanitized != segment:
+                return sanitized
+            if _PERCENT_ESCAPE_PATTERN.search(decoded) is None:
+                return segment
+
+        return REDACTED_EVIDENCE_VALUE
+
+    pieces: list[str] = []
+    cursor = 0
+    for url_match in _URL_PATTERN.finditer(text):
+        pieces.append(redact_segment(text[cursor : url_match.start()]))
+        pieces.append(url_match.group(0))
+        cursor = url_match.end()
+    pieces.append(redact_segment(text[cursor:]))
+    return "".join(pieces)
+
+
 def _redact_reversible_hex_evidence(text: str) -> str:
     """Decode and sanitize reversible hex-escaped evidence before display."""
 
@@ -174,8 +250,35 @@ def _redact_reversible_hex_evidence(text: str) -> str:
     return _HEX_ESCAPE_PATTERN.sub(replace_payload, text)
 
 
+def _redact_reversible_unicode_evidence(text: str) -> str:
+    """Decode bounded Unicode and octal escapes before provider-token redaction."""
+    if _UNICODE_OR_OCTAL_ESCAPE_PATTERN.search(text) is None:
+        return text
+
+    def replace_escape(match: re.Match[str]) -> str:
+        token = match.group(0)[1:]
+        base = 16 if token[0] in {"u", "U"} else 8
+        digits = token[1:] if base == 16 else token
+        codepoint = int(digits, base)
+        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            return match.group(0)
+        return chr(codepoint)
+
+    decoded_text = _UNICODE_OR_OCTAL_ESCAPE_PATTERN.sub(replace_escape, text)
+    return _sanitize_decoded_reversible_evidence(decoded_text, text)
+
+
 def _redact_standalone_secret_tokens(text: str) -> str:
     return _STANDALONE_SECRET_TOKEN_PATTERN.sub(REDACTED_EVIDENCE_VALUE, text)
+
+
+def _redact_truncated_sensitive_assignments(text: str) -> str:
+    if not any(pattern.search(text) for pattern, _ in _COMMAND_PATTERNS):
+        return text
+    return _TRUNCATED_SENSITIVE_ASSIGNMENT_PATTERN.sub(
+        rf"\g<prefix>{REDACTED_EVIDENCE_VALUE}",
+        text,
+    )
 
 
 class _CatBoostParseError(ValueError):
@@ -211,8 +314,12 @@ def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
     )
     text = text[:evidence_budget]
     text = _redact_reversible_hex_evidence(text)
+    text = _redact_reversible_unicode_evidence(text)
+    text = _redact_literal_collection_evidence(text)
     text = _redact_split_base64_evidence(text)
     text = _redact_reversible_base64_evidence(text)
+    text = _redact_reversible_percent_evidence(text)
+    text = _redact_truncated_sensitive_assignments(text)
     text = _redact_standalone_secret_tokens(_redact_urls_for_display(text))
     text = redact_evidence_string(text, max_chars=max_chars)
     return _redact_standalone_secret_tokens(text)
@@ -496,12 +603,11 @@ class CatBoostScanner(BaseScanner):
         return summarized
 
     @staticmethod
-    def _is_private_or_loopback_ip(candidate: str) -> bool:
+    def _parse_ip_candidate(candidate: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         try:
-            ip_obj = ipaddress.ip_address(candidate)
+            return ipaddress.ip_address(candidate)
         except ValueError:
-            return False
-        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+            return None
 
     @staticmethod
     def _is_trusted_reference_url(url: str) -> bool:
@@ -558,13 +664,14 @@ class CatBoostScanner(BaseScanner):
                         {"text": url, "section": fragment["section"], "pattern": "suspicious network URL"},
                     )
 
-            for ip_match in _IP_PATTERN.finditer(text):
-                host = ip_match.group(0).split(":", 1)[0]
-                if self._is_private_or_loopback_ip(host):
-                    continue
-                network_matches.append(
-                    {"text": ip_match.group(0), "section": fragment["section"], "pattern": "public IP"}
-                )
+            for ip_pattern in (_IPV4_PATTERN, _IPV6_PATTERN):
+                for ip_match in ip_pattern.finditer(text):
+                    candidate = ip_match.group(0)
+                    host = candidate.rsplit(":", 1)[0] if ip_pattern is _IPV4_PATTERN else candidate
+                    ip_obj = self._parse_ip_candidate(host)
+                    if ip_obj is None or ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                        continue
+                    network_matches.append({"text": candidate, "section": fragment["section"], "pattern": "public IP"})
 
             for pattern, reason in _SCRIPT_PATTERNS:
                 if pattern.search(text):

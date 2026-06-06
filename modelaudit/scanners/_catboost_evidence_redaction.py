@@ -84,6 +84,7 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "api_key",
         "api-key",
         "apikey",
+        "auth",
         "aws_access_key_id",
         "aws-secret-access-key",
         "aws_secret_access_key",
@@ -94,6 +95,8 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "awssessiontoken",
         "auth_token",
         "auth-token",
+        "basic_auth",
+        "basic-auth",
         "client_secret",
         "client-secret",
         "cookie",
@@ -133,7 +136,8 @@ COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|client[_.-]?secret|"
-    r"cookie|credential|jwt|passphrase|password|passwd|private[_.-]?key|pwd|refresh[_.-]?token|sas|secret|"
+    r"auth|basic[_.-]?auth|cookie|credential|jwt|passphrase|password|passwd|private[_.-]?key|pwd|"
+    r"refresh[_.-]?token|sas|secret|"
     r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
     r"(?:s|[0-9]+|[_.-]?values?)?"
 )
@@ -198,6 +202,10 @@ COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"proxy-tls-?password|tls-?password|"
     r"ftp-password|http-password|oauth2-bearer|client[_-]?secret|api[_-]?key|token|secret)|(?<!\w)-b)"
     r"(?:=|\s+))(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+)
+COMMAND_BODY_OPTION_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?P<option>(?<!\w)(?:-d|--data(?:-ascii|-binary|-raw|-urlencode)?)\s+)"
+    r"(?P<argument>\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s;&|)]+)"
 )
 COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>((?<!\w)--(?:cookie|password|passwd|passphrase|pass|proxy-password|proxy-passphrase|"
@@ -395,6 +403,10 @@ def _redact_sensitive_url_path(path: str) -> str:
     if not decoding_complete:
         return REDACTED_EVIDENCE_VALUE
 
+    provider_redacted_path = _redact_standalone_secret_tokens(decoded_path)
+    if provider_redacted_path != decoded_path:
+        return provider_redacted_path
+
     match = URL_PATH_SENSITIVE_ASSIGNMENT_RE.search(decoded_path)
     if match is None:
         return path
@@ -558,6 +570,42 @@ def _escape_evidence_controls(text: str) -> str:
         else:
             escaped.append(char)
     return "".join(escaped)
+
+
+def _normalize_embedded_control_sensitive_keys(text: str) -> str:
+    """Remove invisible separators only when they conceal a sensitive assignment key."""
+
+    def normalize_key(raw_key: str) -> str | None:
+        normalized = "".join(char for char in raw_key if unicodedata.category(char) not in {"Cc", "Cf", "Cs"})
+        if normalized == raw_key:
+            return None
+        return _normalize_sensitive_key(normalized)
+
+    quoted_pattern = re.compile(
+        rf"(?is)(?P<quote>[\"'])(?P<key>(?:\\.|(?!(?P=quote))[\s\S]){{1,128}})(?P=quote)"
+        rf"(?P<separator>\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    )
+
+    def replace_quoted(match: re.Match[str]) -> str:
+        normalized = normalize_key(match.group("key"))
+        if normalized is None:
+            return match.group(0)
+        quote = match.group("quote")
+        return f"{quote}{normalized}{quote}{match.group('separator')}"
+
+    text = quoted_pattern.sub(replace_quoted, text)
+    unquoted_pattern = re.compile(
+        rf"(?is)(?<![\w.-])(?P<key>[^\s\"'=:;,\[\](){{}}]{{1,128}})"
+        rf"(?P<separator>\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    )
+
+    def replace_unquoted(match: re.Match[str]) -> str:
+        normalized = normalize_key(match.group("key"))
+        if normalized is None:
+            return match.group(0)
+        return f"{normalized}{match.group('separator')}"
+
+    return unquoted_pattern.sub(replace_unquoted, text)
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
@@ -876,6 +924,43 @@ def _safe_eval_string_expr(node: ast.AST) -> EvaluatedStringValue | None:
         right = _safe_eval_string_expr(node.right)
         if isinstance(left, str) and isinstance(right, (str, tuple)):
             return _safe_percent_literal(left, right)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "chr"
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        codepoint = _safe_eval_int_literal(node.args[0])
+        if codepoint is not None and 0 <= codepoint <= 0x10FFFF and not 0xD800 <= codepoint <= 0xDFFF:
+            return chr(codepoint)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "decode"
+        and len(node.args) <= 1
+        and not node.keywords
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id in {"bytes", "bytearray"}
+        and len(node.func.value.args) == 1
+        and not node.func.value.keywords
+        and isinstance(node.func.value.args[0], (ast.List, ast.Tuple))
+    ):
+        encoding = _safe_eval_string_expr(node.args[0]) if node.args else "utf-8"
+        if isinstance(encoding, str) and encoding.lower().replace("_", "-") in {"ascii", "utf-8", "utf8"}:
+            byte_values: list[int] = []
+            for element in node.func.value.args[0].elts:
+                int_value = _safe_eval_int_literal(element)
+                if int_value is None or not 0 <= int_value <= 255:
+                    return None
+                byte_values.append(int_value)
+            if len(byte_values) <= MAX_EVALUATED_KEY_CHARS:
+                try:
+                    decoded = bytes(byte_values).decode(encoding)
+                except (LookupError, UnicodeDecodeError):
+                    return None
+                return decoded if len(decoded) <= MAX_EVALUATED_KEY_CHARS else None
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1553,7 +1638,8 @@ def _normalize_expression_sensitive_keys(text: str) -> str:
             continue
         window_start = max(0, separator.start() - MAX_KEY_EXPRESSION_CHARS)
         window_start = _last_unquoted_statement_boundary(text, window_start, separator.start())
-        if not _has_sensitive_literal_signal(text[window_start : separator.start()]):
+        expression_window = text[window_start : separator.start()]
+        if not (_has_sensitive_literal_signal(expression_window) or _has_bounded_numeric_key_signal(expression_window)):
             continue
         following = text[separator.end() :].lstrip()
         if not following or following[0] not in {"'", '"', "{", "[", "("}:
@@ -1569,9 +1655,10 @@ def _normalize_expression_sensitive_keys(text: str) -> str:
             expression = raw_expression.strip()
             if not expression or len(expression) > MAX_KEY_EXPRESSION_CHARS:
                 continue
-            if KEY_LITERAL_RE.search(expression) is None:
-                continue
-            if not _has_sensitive_literal_signal(expression):
+            has_literal_signal = KEY_LITERAL_RE.search(expression) is not None and _has_sensitive_literal_signal(
+                expression
+            )
+            if not (has_literal_signal or _has_bounded_numeric_key_signal(expression)):
                 continue
             parse_attempts += 1
             parse_failed = False
@@ -1714,9 +1801,20 @@ def _has_sensitive_literal_signal(expression: str) -> bool:
     return _sensitive_key_from_compact(compact) is not None or _sensitive_key_from_compact(compact[::-1]) is not None
 
 
+def _has_bounded_numeric_key_signal(expression: str) -> bool:
+    if len(expression) > MAX_KEY_EXPRESSION_CHARS:
+        return False
+    return bool(
+        re.search(r"\bchr\s*\(\s*\d{1,3}\s*\)", expression)
+        or re.search(r"\b(?:bytes|bytearray)\s*\(\s*[\[(]\s*\d{1,3}", expression)
+    )
+
+
 def _sensitive_key_from_compact(compact: str) -> str | None:
     if "authorization" in compact:
         return "Authorization"
+    if compact in {"auth", "basicauth"}:
+        return "basic_auth" if compact == "basicauth" else "auth"
     if "accesskeyid" in compact:
         return "access_key_id"
     if "client" in compact and "secret" in compact:
@@ -2068,18 +2166,47 @@ def _redact_sensitive_argv_pairs(text: str) -> str:
 
 
 def _redact_sensitive_setter_arguments(text: str) -> str:
-    """Redact the first value passed to setter methods named for sensitive keys."""
+    """Redact value-bearing arguments passed to setter methods named for sensitive keys."""
     replacements: list[tuple[int, int, str]] = []
     covered_until = 0
     for match in SENSITIVE_SETTER_CALL_RE.finditer(text):
         if match.start() < covered_until or _normalize_sensitive_key(match.group("key")) is None:
             continue
         argument_start = match.end()
-        argument_end = _find_function_argument_end(text, argument_start)
-        raw_argument = text[argument_start:argument_end]
-        if raw_argument.strip():
-            replacements.append((argument_start, argument_end, _redact_sensitive_function_value(raw_argument)))
-        covered_until = argument_end + 1
+        arguments: list[tuple[int, int, re.Match[str] | None]] = []
+        while argument_start < len(text):
+            argument_end = _find_function_argument_end(text, argument_start)
+            raw_argument = text[argument_start:argument_end]
+            if raw_argument.strip():
+                arguments.append((argument_start, argument_end, FUNCTION_KEYWORD_ARGUMENT_RE.match(raw_argument)))
+            if argument_end >= len(text) or text[argument_end] != ",":
+                covered_until = argument_end + 1
+                break
+            argument_start = argument_end + 1
+        else:
+            covered_until = len(text)
+
+        positional_arguments = [argument for argument in arguments if argument[2] is None]
+        keyword_arguments = [argument for argument in arguments if argument[2] is not None]
+        redacted_keyword = False
+        for start, end, keyword_match in keyword_arguments:
+            if keyword_match is None:
+                continue
+            keyword_name = keyword_match.group("name")
+            value_bearing = keyword_name.lower() in {"default", "value"}
+            value_bearing = value_bearing or _normalize_sensitive_function_key(keyword_name) is not None
+            value_bearing = value_bearing or (len(arguments) == 1 and not positional_arguments)
+            if not value_bearing:
+                continue
+            value_start = start + keyword_match.end()
+            raw_value = text[value_start:end]
+            if raw_value.strip():
+                replacements.append((value_start, end, _redact_sensitive_function_value(raw_value)))
+                redacted_keyword = True
+
+        if not redacted_keyword and positional_arguments:
+            start, end, _ = positional_arguments[0]
+            replacements.append((start, end, _redact_sensitive_function_value(text[start:end])))
 
     for start, end, replacement in reversed(replacements):
         text = f"{text[:start]}{replacement}{text[end:]}"
@@ -2141,6 +2268,19 @@ def _redact_sensitive_function_arguments(text: str) -> str:
 def _redact_command_structured_value(match: re.Match[str]) -> str:
     quote = match.group("value_quote")
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+
+
+def _redact_command_body_option(match: re.Match[str]) -> str:
+    argument = match.group("argument")
+    prefix = "$" if argument.startswith("$") else ""
+    value = argument[len(prefix) :]
+    quote = value[0] if value and value[0] in {"'", '"'} else ""
+    body = value[1:-1] if quote and value.endswith(quote) else value
+    redacted_body = redact_evidence_string(body, max_chars=len(body) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS)
+    if redacted_body == body:
+        return match.group(0)
+    suffix = quote if quote and value.endswith(quote) else ""
+    return f"{match.group('option')}{prefix}{quote}{redacted_body}{suffix}"
 
 
 def _find_command_context_end(text: str, start: int) -> int:
@@ -2255,6 +2395,7 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = COMMAND_SENSITIVE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_SERIALIZED_QUOTED_RE.sub(_redact_serialized_command_option, redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = COMMAND_BODY_OPTION_RE.sub(_redact_command_body_option, redacted)
     redacted = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, redacted)
     redacted = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
@@ -2308,6 +2449,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = redacted[:redaction_budget]
     redacted = _normalize_serialized_assignment_separators(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
+    redacted = _normalize_embedded_control_sensitive_keys(redacted)
     redacted = _normalize_serialized_structured_sensitive_keys(redacted)
     redacted = STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_structured_quoted_assignment, redacted)
     redacted = _redact_command_context_tokens(redacted)

