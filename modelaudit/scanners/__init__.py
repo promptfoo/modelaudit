@@ -225,6 +225,17 @@ class ScannerRegistry:
 
         return None
 
+    def get_scanner_id_for_content_routed_filename(self, path: str) -> str | None:
+        """Resolve a scanner from an exact descriptor-owned filename route."""
+        filename = Path(path).name.lower()
+        for scanner_id, scanner_info in sorted(self._scanners.items(), key=lambda item: item[1]["priority"]):
+            if not self._is_content_routed_filename(filename, scanner_info):
+                continue
+            scanner_class = self._load_scanner(scanner_id)
+            if scanner_class and scanner_class.can_handle(path):
+                return scanner_id
+        return None
+
     def get_header_format_to_scanner_ids(self) -> dict[str, str]:
         """Return all descriptor-owned header-format routes without loading scanners."""
         header_format_to_scanner_id = {scanner_id: scanner_id for scanner_id in self._scanners}

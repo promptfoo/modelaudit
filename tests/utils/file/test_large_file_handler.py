@@ -13,8 +13,9 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.scan_results_cache import _source_resolution_context
-from modelaudit.scanners import safetensors_scanner
+from modelaudit.scanners import keras_h5_scanner, safetensors_scanner
 from modelaudit.scanners.base import ScanResult
+from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES, SafeTensorsScanner
 from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
@@ -166,6 +167,101 @@ def test_large_handler_cache_preserves_private_metadata_for_internal_results(
     assert first._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
     assert second._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
     assert "_private_metadata" not in second.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("scan_func", "handler_module"),
+    [
+        (large_file_handler.scan_large_file, large_file_handler),
+        (advanced_handlers.scan_advanced_large_file, advanced_handlers),
+    ],
+)
+def test_disabled_large_handler_cache_skips_hdf5_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scan_func: Callable[..., ScanResult],
+    handler_module: object,
+) -> None:
+    payload = tmp_path / "model.bin"
+    payload.write_bytes(b"benign")
+    scanner = DummyNonChunkScanner()
+    scanner.config = {"cache_enabled": False}  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        handler_module,
+        "should_bypass_cache_for_unavailable_hdf5_analysis",
+        lambda _path: pytest.fail("disabled caches must not probe HDF5"),
+    )
+
+    result = scan_func(str(payload), scanner)
+
+    assert result.success is True
+
+
+def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "model.h5"
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = '{"class_name":"Sequential","config":{"layers":[]}}'
+
+    cache_dir = tmp_path / "large-hdf5-cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    scanner = KerasH5Scanner(config=config)
+
+    reset_cache_manager()
+    try:
+        clean_result = large_file_handler.scan_large_file(str(model_path), scanner)
+        assert clean_result.success is True
+        cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+        cached_entries = cache_manager.get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        monkeypatch.setattr(keras_h5_scanner, "HAS_H5PY", False)
+        for _ in range(2):
+            result = large_file_handler.scan_large_file(str(model_path), scanner)
+            assert result.success is False
+            assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+
+        assert cache_manager.get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_advanced_handler_missing_h5py_preserves_shard_coverage_without_stale_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    shard_paths = [tmp_path / "model_weights_1.h5", tmp_path / "model_weights_2.h5"]
+    for shard_path in shard_paths:
+        with h5py.File(shard_path, "w") as h5_file:
+            h5_file.attrs["model_config"] = '{"class_name":"Sequential","config":{"layers":[]}}'
+
+    cache_dir = tmp_path / "advanced-hdf5-cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    scanner = KerasH5Scanner(config=config)
+
+    reset_cache_manager()
+    try:
+        clean_result = advanced_handlers.scan_advanced_large_file(str(shard_paths[0]), scanner)
+        assert clean_result.success is True
+        cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+        cached_entries = cache_manager.get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        monkeypatch.setattr(keras_h5_scanner, "HAS_H5PY", False)
+        for _ in range(2):
+            result = advanced_handlers.scan_advanced_large_file(str(shard_paths[0]), scanner)
+            assert result.success is False
+            assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+            shard_check = next(check for check in result.checks if check.name == "Sharded Model Detection")
+            assert shard_check.details["total_shards"] == 2
+
+        assert cache_manager.get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
 
 
 def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

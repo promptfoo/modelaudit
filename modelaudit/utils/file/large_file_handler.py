@@ -12,7 +12,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+from ..helpers.cache_decorator import (
+    add_optional_dependency_availability_to_version_context,
+    should_bypass_cache_for_safetensors_header_limit,
+    should_bypass_cache_for_unavailable_hdf5_analysis,
+)
 
 # Lazy import to avoid circular dependency
 if TYPE_CHECKING:
@@ -249,6 +253,9 @@ def scan_large_file(
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
         return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
+    if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+        logger.debug(f"Bypassing large-file cache because HDF5 analysis is unavailable: {file_path}")
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
 
     # Use cache manager for large file scans
     try:
@@ -256,7 +263,7 @@ def scan_large_file(
         from ...cache.optimized_config import build_cache_version_context
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
-        version_context = build_cache_version_context(config)
+        version_context = add_optional_dependency_availability_to_version_context(build_cache_version_context(config))
 
         # Create wrapper function for cache manager
         def cached_large_scan_wrapper(fpath: str) -> dict:
