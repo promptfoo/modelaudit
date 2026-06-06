@@ -21,6 +21,7 @@ _get_rule_name = sarif_formatter._get_rule_name
 _get_rule_short_description = sarif_formatter._get_rule_short_description
 _get_tags_for_issue = sarif_formatter._get_tags_for_issue
 _normalize_path_to_uri = sarif_formatter._normalize_path_to_uri
+_redact_path_for_sarif = sarif_formatter._redact_path_for_sarif
 _severity_to_rank = sarif_formatter._severity_to_rank
 _severity_to_sarif_level = sarif_formatter._severity_to_sarif_level
 format_sarif_output = sarif_formatter.format_sarif_output
@@ -353,6 +354,20 @@ class TestFormatSarifOutput:
         assert "visible=yes" in output
         assert "encoded-password" not in output
         assert "private-token-value" not in output
+
+    def test_sarif_path_redaction_does_not_treat_windows_drive_as_url(self) -> None:
+        """Local Windows paths must not be rewritten as URL schemes."""
+        windows_path = r"C:\models\model.pkl"
+
+        assert _redact_path_for_sarif(windows_path) == windows_path
+
+    def test_sarif_path_redaction_handles_encoded_url_prefix(self) -> None:
+        """Encoded URL-like paths still need credential stripping."""
+        raw_url = (
+            "https%253A%252F%252Fbucket.s3.amazonaws.com%252Fmodel.pkl%253FX-Amz-Signature%253Dprivate-token-value"
+        )
+
+        assert _redact_path_for_sarif(raw_url) == "https://bucket.s3.amazonaws.com/model.pkl"
 
     def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
         """Opaque URL components must not bypass key/value redaction."""

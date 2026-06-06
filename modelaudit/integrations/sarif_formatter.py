@@ -34,6 +34,7 @@ _URL_TOKEN_RE = re.compile(
     rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
     re.IGNORECASE,
 )
+_URL_LIKE_PREFIX_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
 
 def format_sarif_output(
@@ -463,9 +464,12 @@ def _normalize_path_to_uri(path: str) -> str:
 
 def _redact_path_for_sarif(path: str) -> str:
     """Return a SARIF-safe path without signed URL material."""
-    if is_stream_url(path):
-        return f"stream://{_redact_stream_url_for_display(path[9:])}"
-    return _redact_url_for_display(path)
+    normalized_path = _normalize_escaped_url_delimiters_for_display(path)
+    if is_stream_url(normalized_path):
+        return f"stream://{_redact_stream_url_for_display(normalized_path[9:])}"
+    if _URL_LIKE_PREFIX_RE.match(normalized_path):
+        return _redact_url_for_display(normalized_path)
+    return path
 
 
 def _redact_text_for_sarif(text: str) -> str:
