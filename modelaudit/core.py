@@ -1889,7 +1889,8 @@ def scan_model_directory_or_file(
                                             validated_targets[lexical_shard_path] = {
                                                 key: value
                                                 for key, value in detected_target.items()
-                                                if key in {"resolved_path", "device", "inode", "size"}
+                                                if key
+                                                in {"resolved_path", "device", "inode", "size", "mtime_ns", "ctime_ns"}
                                                 and isinstance(value, (int, str))
                                             }
                                         else:

@@ -1883,6 +1883,42 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     assert first_fingerprint != second_fingerprint
 
 
+def test_directory_scan_deferred_shard_hash_rejects_same_size_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery timestamps must survive when grouped shard hashing is deferred."""
+    shard_one = tmp_path / "checkpoint_1.pt"
+    shard_two = tmp_path / "checkpoint_2.pt"
+    shard_one.write_bytes(pickle.dumps({"weights": [1]}))
+    shard_two.write_bytes(pickle.dumps({"weights": [2]}))
+    replacement = pickle.dumps({"weights": [3]})
+    assert len(replacement) == shard_two.stat().st_size
+    original_stat = shard_two.stat()
+    rewrite_performed = False
+
+    def defer_hash(file_paths: list[str], **_kwargs: Any) -> dict[str, str]:
+        nonlocal rewrite_performed
+        shard_two.write_bytes(replacement)
+        os.utime(
+            shard_two,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000),
+        )
+        rewrite_performed = True
+        return {path: f"unhashable_max_file_size_{index}" for index, path in enumerate(file_paths)}
+
+    monkeypatch.setattr(core_module, "_hash_files_by_path", defer_hash)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert rewrite_performed is True
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    coverage_check = next(check for check in result.checks if check.name == "Sharded Model Coverage Check")
+    assert coverage_check.details["unvalidated_shards"] == [str(shard_two)]
+    assert coverage_check.details["scan_outcome_reason"] == "unvalidated_model_shards"
+
+
 def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
     """Caching or its safety bypass must not hide a newly malicious sibling shard."""
     shard_one = tmp_path / "checkpoint_1.pt"
