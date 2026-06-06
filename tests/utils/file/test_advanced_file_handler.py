@@ -374,6 +374,34 @@ class TestMemoryMappedHandler:
         assert "memory_mapped_source_changed" in result.metadata["scan_outcome_reasons"]
         assert any(check.name == "Memory-Mapped Source Stability" for check in result.checks)
 
+    def test_mmap_file_truncation_during_scan_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "truncated-model.bin"
+        model_path.write_bytes(b"a" * 32)
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+        truncated = False
+
+        def truncate_during_scan(_message: str, _percentage: float) -> None:
+            nonlocal truncated
+            if not truncated:
+                with model_path.open("r+b") as model_file:
+                    model_file.truncate(8)
+                truncated = True
+
+        result = handler.scan_with_mmap(progress_callback=truncate_during_scan)
+
+        assert result.success is False
+        assert result.bytes_scanned == 16
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "memory_mapped_source_changed" in result.metadata["scan_outcome_reasons"]
+        stability_check = next(check for check in result.checks if check.name == "Memory-Mapped Source Stability")
+        assert stability_check.details["opened_file_size"] == 32
+        assert stability_check.details["final_file_size"] == 8
+
     def test_mmap_progress_counts_unique_coverage(
         self,
         tmp_path: Path,

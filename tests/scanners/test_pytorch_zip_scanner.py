@@ -1182,11 +1182,14 @@ def test_pytorch_zip_timeout_marks_inconclusive(tmp_path: Path) -> None:
 
 def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> None:
     model_path = tmp_path / "large_jit_member.pt"
+    leaked_member_secret = "OVERSIZE-MEMBER-SECRET-123456"
+    sensitive_member = f"archive/code/api_key={leaked_member_secret}.txt"
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
         zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+        zip_file.writestr(sensitive_member, b"print('oversize secret member')\n")
 
     result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 4}).scan(str(model_path))
 
@@ -1201,6 +1204,8 @@ def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> N
     assert size_checks[0].severity == IssueSeverity.INFO
     assert "archive/code/debug/source.py" in size_checks[0].details["zip_entries"]
     assert "archive/byteorder" in size_checks[0].details["zip_entries"]
+    assert leaked_member_secret not in result.to_json()
+    assert any("<redacted>" in entry for entry in size_checks[0].details["zip_entries"])
     assert size_checks[0].details["skipped_count"] == len(size_checks[0].details["zip_entries"])
     assert size_checks[0].details["analysis_incomplete"] is True
     assert size_checks[0].details["max_scan_bytes"] == 4

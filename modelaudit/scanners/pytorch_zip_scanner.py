@@ -1832,11 +1832,12 @@ class PyTorchZipScanner(BaseScanner):
                 if normalized_name in trusted_storage_blob_members:
                     continue
                 if entry.file_size > self.max_jit_scan_member_bytes:
+                    safe_name = redact_evidence_string(name, max_chars=500)
                     size_limited_entries.append(
                         {
-                            "zip_entry": name,
+                            "zip_entry": safe_name,
                             "file_size": entry.file_size,
-                            "location": f"{path}:{name}",
+                            "location": redact_evidence_string(f"{path}:{name}", max_chars=500),
                         }
                     )
                     continue
