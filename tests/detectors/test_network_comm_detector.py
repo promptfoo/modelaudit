@@ -1604,6 +1604,25 @@ class TestNetworkCommDetector:
         assert "QUERYSECRET" not in snippet
         assert "AFTERSECRET" not in snippet
 
+    def test_network_function_snippets_preserve_nested_endpoint_context_at_finding_limit(self) -> None:
+        nested_url = "https://evil-c2.com/payload"
+        data = f"requests.get('https://benign.example/download?next={nested_url}')".encode()
+
+        findings = NetworkCommDetector({"max_findings": 1}).scan(data, "hook.py")
+
+        assert findings[0]["type"] == "network_function"
+        assert findings[0]["snippet"] == f"requests.get {nested_url} https://benign.example/download"
+
+    def test_network_function_snippets_redact_sensitive_nested_endpoint_context(self) -> None:
+        secret = "https://secret-value.example.com/payload"
+        data = f"requests.get('https://benign.example/download?token={secret}')".encode()
+
+        findings = NetworkCommDetector({"max_findings": 1}).scan(data, "hook.py")
+        serialized = json.dumps(findings[0], sort_keys=True)
+
+        assert secret not in serialized
+        assert network_comm._SENSITIVE_NESTED_URL in serialized
+
     def test_network_function_snippets_support_triple_quoted_endpoints(self) -> None:
         """Triple-quoted call arguments should retain sanitized endpoint context."""
         data = b"requests.get('''https://c2.example/path?token=QUERYSECRET''')"
@@ -2032,6 +2051,42 @@ class TestNetworkCommDetector:
         finding = next(item for item in findings if item["type"] == finding_type)
 
         assert finding["snippet"] == expected_snippet
+
+    @pytest.mark.parametrize(
+        ("data", "finding_type", "expected_snippet"),
+        [
+            (b'c2_server = "45.33.32.156"', "cc_pattern", "c2_server 45.33.32.156"),
+            (
+                b'socket.connect(("45.33.32.156", 4444))',
+                "network_function",
+                "socket.connect 45.33.32.156:4444",
+            ),
+            (b'c2_server = {"url": "https://evil.example/path"}', "cc_pattern", "c2_server https://evil.example/path"),
+            (
+                b'c2_server = get_default({"url": "https://evil.example/path"})',
+                "cc_pattern",
+                "c2_server https://evil.example/path",
+            ),
+        ],
+    )
+    def test_network_snippets_preserve_structured_and_bare_endpoint_context_at_finding_limit(
+        self,
+        data: bytes,
+        finding_type: str,
+        expected_snippet: str,
+    ) -> None:
+        findings = NetworkCommDetector({"max_findings": 1}).scan(data, "hook.py")
+
+        assert findings[0]["type"] == finding_type
+        assert findings[0]["snippet"] == expected_snippet
+
+    def test_network_function_snippets_do_not_preserve_bare_endpoint_credentials(self) -> None:
+        secret = "45.33.32.156"
+        data = f'requests.get(api_key="{secret}")'.encode()
+
+        findings = NetworkCommDetector({"max_findings": 1}).scan(data, "hook.py")
+
+        assert secret not in json.dumps(findings[0], sort_keys=True)
 
     def test_network_function_snippet_expansion_is_bounded_without_nearby_url_scheme(self) -> None:
         """Incidental matches in long binary blobs should not expand snippets across megabytes."""
@@ -2584,9 +2639,9 @@ class TestNetworkCommDetector:
 
         assert len(func_findings) > 0
 
-        # Keep the matched token without preserving arbitrary surrounding bytes.
+        # Keep the matched token and its structured endpoint without arbitrary surrounding bytes.
         snippet = func_findings[0].get("snippet", "")
-        assert snippet == "socket.connect"
+        assert snippet == "socket.connect evil.com:4444"
 
 
 class TestDetectNetworkCommunication:

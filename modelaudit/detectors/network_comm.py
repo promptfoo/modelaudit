@@ -25,6 +25,12 @@ _URI_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URI_IN_BYTES_PATTERN = re.compile(_URI_IN_TEXT_PATTERN.pattern.encode("ascii"), re.IGNORECASE)
+_BARE_IPV4_PATTERN = re.compile(
+    rb"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
+)
+_BARE_DOMAIN_PATTERN = re.compile(rb"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b")
+_BARE_PORT_SUFFIX_PATTERN = re.compile(rb"^\s*[\"']?\s*[,):]\s*[\"']?(\d{1,5})\b")
 _ENCODED_URI_SCHEME_PATTERN = re.compile(
     r"[a-z][a-z0-9+.-]{0,31}%(?:25)*3a%(?:25)*2f%(?:25)*2f",
     re.IGNORECASE,
@@ -850,7 +856,86 @@ def _is_url_associated_with_match(
         return False
     if _url_is_likely_call_endpoint(data, match_end, url_start):
         return True
-    return _URL_ASSIGNMENT_PREFIX_PATTERN.fullmatch(data[match_end:url_start]) is not None
+    assignment_prefix = data[match_end:url_start]
+    return _URL_ASSIGNMENT_PREFIX_PATTERN.fullmatch(
+        assignment_prefix
+    ) is not None or _is_structured_assignment_endpoint_prefix(assignment_prefix)
+
+
+def _is_structured_assignment_endpoint_prefix(prefix: bytes) -> bool:
+    """Recognize an endpoint nested inside one bounded assignment expression."""
+    stripped = prefix.lstrip()
+    if not stripped.startswith((b"=", b":")) or any(delimiter in prefix for delimiter in (b"\n", b"\r", b"#", b";")):
+        return False
+    allowed_punctuation = b" \t_=:{[(),.'\"-"
+    return all(chr(byte).isalnum() or byte in allowed_punctuation for byte in prefix)
+
+
+def _is_first_call_argument_endpoint(data: bytes, call_end: int, endpoint_start: int) -> bool:
+    """Return whether an endpoint occurs inside the first argument of the matched call."""
+    prefix = data[call_end:endpoint_start]
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    quote: int | None = None
+    escaped = False
+
+    for byte in prefix:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == quote:
+                quote = None
+            continue
+        if byte in {ord("'"), ord('"')}:
+            quote = byte
+        elif byte == ord("("):
+            paren_depth += 1
+        elif byte == ord(")"):
+            paren_depth -= 1
+            if paren_depth <= 0:
+                return False
+        elif byte == ord("["):
+            bracket_depth += 1
+        elif byte == ord("]"):
+            bracket_depth -= 1
+        elif byte == ord("{"):
+            brace_depth += 1
+        elif byte == ord("}"):
+            brace_depth -= 1
+        elif (
+            byte == ord("#")
+            or byte in {ord("\n"), ord("\r")}
+            or (byte == ord(",") and paren_depth == 1 and bracket_depth == 0 and brace_depth == 0)
+            or (paren_depth == 0 and not chr(byte).isspace())
+        ):
+            return False
+
+    return paren_depth >= 1 and bracket_depth >= 0 and brace_depth >= 0
+
+
+def _is_bare_endpoint_associated_with_match(
+    data: bytes,
+    *,
+    match_end: int,
+    endpoint_start: int,
+) -> bool:
+    if endpoint_start < match_end:
+        return False
+    if _is_first_call_argument_endpoint(data, match_end, endpoint_start):
+        return True
+    return _is_structured_assignment_endpoint_prefix(data[match_end:endpoint_start])
+
+
+def _bare_endpoint_with_optional_port(data: bytes, endpoint_start: int, endpoint_end: int, scan_end: int) -> str:
+    endpoint = data[endpoint_start:endpoint_end].decode("utf-8", errors="ignore")
+    port_match = _BARE_PORT_SUFFIX_PATTERN.match(data[endpoint_end : min(scan_end, endpoint_end + 32)])
+    if port_match is None:
+        return endpoint
+    port = int(port_match.group(1))
+    return f"{endpoint}:{port}" if port <= 65535 else endpoint
 
 
 def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
@@ -880,7 +965,9 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
 
     match_text = data[match_start:match_end].decode("utf-8", errors="ignore")
     snippet_parts = [match_text]
-    for url_match in _URI_IN_BYTES_PATTERN.finditer(data, start, end):
+    uri_spans: list[tuple[int, int]] = []
+    for url_match in _URI_IN_BYTES_PATTERN.finditer(data, scan_start, scan_end):
+        uri_spans.append((url_match.start(), url_match.end()))
         raw_url = url_match.group().decode("utf-8", errors="ignore")
         source_quote = _source_quote_before_url(data, url_match.start())
         trimmed_url = _trim_source_literal_url(raw_url, source_quote)
@@ -893,9 +980,41 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
             url_end=trimmed_url_end,
         ):
             continue
+        for nested_url in _decoded_nested_urls(trimmed_url):
+            redacted_nested_url = redact_url_for_finding(nested_url)
+            if redacted_nested_url not in snippet_parts:
+                snippet_parts.append(redacted_nested_url)
         redacted_url = redact_url_for_finding(trimmed_url)
         if redacted_url not in snippet_parts:
             snippet_parts.append(redacted_url)
+
+    bare_endpoint_matches = sorted(
+        (
+            endpoint_match.start(),
+            endpoint_match.end(),
+            endpoint_match.group().decode("utf-8", errors="ignore"),
+        )
+        for pattern in (_BARE_IPV4_PATTERN, _BARE_DOMAIN_PATTERN)
+        for endpoint_match in pattern.finditer(data, scan_start, scan_end)
+    )
+    for endpoint_start, endpoint_end, endpoint in bare_endpoint_matches:
+        if any(uri_start <= endpoint_start < uri_end for uri_start, uri_end in uri_spans):
+            continue
+        if not _is_bare_endpoint_associated_with_match(
+            data,
+            match_end=match_end,
+            endpoint_start=endpoint_start,
+        ):
+            continue
+        if (
+            _is_match_redacted_from_url(data, endpoint_start, endpoint)
+            or _is_split_sensitive_url_value(data, endpoint_start)
+            or _is_redacted_evidence_value(data, endpoint_start, endpoint)
+        ):
+            continue
+        endpoint_with_port = _bare_endpoint_with_optional_port(data, endpoint_start, endpoint_end, scan_end)
+        if endpoint_with_port not in snippet_parts:
+            snippet_parts.append(endpoint_with_port)
 
     snippet = " ".join(snippet_parts)
     if len(snippet) <= _MAX_SNIPPET_CHARS:
@@ -1428,15 +1547,12 @@ class NetworkCommDetector:
     ]
 
     # IP address patterns (v4 and v6)
-    IPV4_PATTERN = re.compile(
-        rb"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
-        rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
-    )
+    IPV4_PATTERN = _BARE_IPV4_PATTERN
 
     IPV6_PATTERN = re.compile(rb"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}")
 
     # Domain patterns
-    DOMAIN_PATTERN = re.compile(rb"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b")
+    DOMAIN_PATTERN = _BARE_DOMAIN_PATTERN
 
     # Network library imports
     NETWORK_LIBRARIES: ClassVar[list[bytes]] = [
