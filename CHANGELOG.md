@@ -311,6 +311,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- redact reversible secret evidence from CatBoost findings and validate IPv4/IPv6 network indicators
 - detect and safely bound NeMo Hydra process-execution, native-loader, network, and file-access callable targets, including trusted-namespace import/cache helpers, repeated YAML aliases, and NumPy file writers
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
