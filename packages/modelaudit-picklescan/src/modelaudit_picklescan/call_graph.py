@@ -1890,11 +1890,27 @@ def _read_bounded_source_text(path: Path) -> str:
     return source.decode("utf-8")
 
 
+def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
+    identity = "\0".join(
+        str(value)
+        for value in (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_mode,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        )
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
+
+
 def _resolution_candidate_fingerprint(path: Path) -> tuple[bool, bytes | str | None]:
     try:
         if str(path).endswith(tuple(EXTENSION_SUFFIXES)):
-            _read_bounded_regular_file(path, None)
-            return True, _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+            _, file_stat = _read_bounded_regular_file(path, None)
+            return True, _regular_file_identity_fingerprint(file_stat)
         max_bytes = _MAX_SOURCE_BYTES * 2 if str(path).endswith(tuple(BYTECODE_SUFFIXES)) else _MAX_SOURCE_BYTES
         source, _ = _read_bounded_regular_file(path, max_bytes)
     except (FileNotFoundError, NotADirectoryError):
@@ -2059,6 +2075,8 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     for module_name, expected_search_path in snapshot.loaded_package_paths.items():
         is_loaded, current_search_path = _loaded_package_search_path(module_name)
         if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
+            return False
+        if _search_path_has_untrusted_importer(current_search_path):
             return False
     return True
 

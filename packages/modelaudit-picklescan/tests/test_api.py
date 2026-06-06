@@ -6092,13 +6092,9 @@ def test_zipimport_archive_changes_invalidate_source_snapshot(
             _ensure_shared_source_snapshot_stable(report_generation)
 
 
-def test_recreated_file_finder_hooks_are_not_trusted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+def test_recreated_file_finder_hooks_are_not_trusted() -> None:
     equivalent_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
     different_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (trusted_hook,))
 
     assert not _is_standard_path_hook(equivalent_hook)
     assert not _is_standard_path_hook(different_hook)
@@ -6132,7 +6128,6 @@ def test_spoofed_equivalent_file_finder_hook_is_not_trusted(
     evil_hook = FileFinder.path_hook((EvilLoader, SOURCE_SUFFIXES))
     evil_hook.__module__ = trusted_hook.__module__
     evil_hook.__qualname__ = trusted_hook.__qualname__
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (trusted_hook,))
     monkeypatch.setattr(sys, "path_hooks", [evil_hook])
     monkeypatch.syspath_prepend(str(tmp_path))
     sys.path_importer_cache.pop(str(tmp_path), None)
@@ -6381,14 +6376,24 @@ def test_resolution_candidate_fingerprint_rejects_fifo(tmp_path: Path) -> None:
     assert fingerprint is None
 
 
-def test_resolution_candidate_fingerprint_tracks_large_extension_by_presence(tmp_path: Path) -> None:
+def test_resolution_candidate_fingerprint_tracks_large_extension_identity(tmp_path: Path) -> None:
     extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
     extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
 
-    reusable, fingerprint = _resolution_candidate_fingerprint(extension_path)
+    reusable, initial_fingerprint = _resolution_candidate_fingerprint(extension_path)
 
     assert reusable is True
-    assert fingerprint == _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+    assert isinstance(initial_fingerprint, str)
+    assert initial_fingerprint.startswith(f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:")
+
+    replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
+    replacement_path.write_bytes(b"y" * (1024 * 1024 + 1))
+    os.replace(replacement_path, extension_path)
+
+    reusable, replacement_fingerprint = _resolution_candidate_fingerprint(extension_path)
+
+    assert reusable is True
+    assert replacement_fingerprint != initial_fingerprint
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")

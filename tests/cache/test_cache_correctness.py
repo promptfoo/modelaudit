@@ -13,6 +13,7 @@ from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
+    ExtensionFileLoader,
     FileFinder,
     ModuleSpec,
     PathFinder,
@@ -27,6 +28,9 @@ from zipimport import zipimporter
 import pytest
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
 from modelaudit_picklescan.call_graph import _path_hook_resolution_identity as _picklescan_path_hook_resolution_identity
+from modelaudit_picklescan.call_graph import (
+    _resolution_candidate_fingerprint as _picklescan_resolution_candidate_fingerprint,
+)
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -1387,6 +1391,14 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     loaded_parent.__path__ = [str(first_source.parent)]
     loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
     monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+    package_path = str(first_source.parent.absolute())
+    standard_finder = FileFinder(
+        package_path,
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    monkeypatch.setitem(sys.path_importer_cache, package_path, standard_finder)
 
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -1399,7 +1411,7 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
             "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
                 {first_source_path: hashlib.sha256(first_source.read_bytes()).hexdigest()},
                 module_sources={"cache_pkg.child": first_source_path},
-                loaded_package_paths={"cache_pkg": [str(first_source.parent.absolute())]},
+                loaded_package_paths={"cache_pkg": [package_path]},
             )
         },
     }
@@ -1410,6 +1422,48 @@ def test_scan_cache_reuses_matching_loaded_parent_package_path(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
     loaded_parent.__path__ = [str(second_source.parent)]
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_rejects_custom_importer_on_matching_loaded_parent_package_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "runtime" / "cache_pkg" / "child.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("def entrypoint():\n    return 1\n")
+    package_path = str(source_path.parent.absolute())
+    loaded_parent = ModuleType("cache_pkg")
+    loaded_parent.__path__ = [package_path]
+    loaded_parent.__spec__ = ModuleSpec("cache_pkg", loader=None, is_package=True)
+    monkeypatch.setitem(sys.modules, "cache_pkg", loaded_parent)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source = str(source_path.absolute())
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {
+            "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
+                {source: hashlib.sha256(source_path.read_bytes()).hexdigest()},
+                module_sources={"cache_pkg.child": source},
+                loaded_package_paths={"cache_pkg": [package_path]},
+            )
+        },
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
+
+    class CustomFinder:
+        pass
+
+    monkeypatch.setitem(sys.path_importer_cache, package_path, CustomFinder())
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
@@ -1824,18 +1878,24 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
-def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: Path) -> None:
+def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Path) -> None:
     extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
     extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
+    extension_fingerprint = cache._bounded_source_fingerprint(extension_path)
+    reusable, picklescan_fingerprint = _picklescan_resolution_candidate_fingerprint(extension_path)
+    assert reusable is True
+    assert picklescan_fingerprint == extension_fingerprint
+    assert isinstance(extension_fingerprint, str)
+    assert extension_fingerprint.startswith(f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:")
     scan_result = {
         "checks": [],
         "issues": [],
         "_private_metadata": {
             "call_graph_source_fingerprints": _call_graph_fingerprint_metadata(
-                {str(extension_path.absolute()): _CALL_GRAPH_REGULAR_FILE_FINGERPRINT}
+                {str(extension_path.absolute()): extension_fingerprint}
             )
         },
     }
@@ -1845,7 +1905,9 @@ def test_scan_cache_validates_large_extension_candidates_by_presence(tmp_path: P
     )
     assert cache.get_cached_result(str(file_path), version_context=version_context) is not None
 
-    extension_path.unlink()
+    replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
+    replacement_path.write_bytes(b"y" * (1024 * 1024 + 1))
+    os.replace(replacement_path, extension_path)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 

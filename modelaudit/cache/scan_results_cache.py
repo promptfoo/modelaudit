@@ -534,6 +534,15 @@ def _source_resolution_context() -> dict[str, list[str]]:
     }
 
 
+def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
+    for entry in search_path:
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
+            return True
+    return False
+
+
 def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return True, None
@@ -1688,6 +1697,22 @@ class ScanResultsCache:
         return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
 
     @staticmethod
+    def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
+        identity = "\0".join(
+            str(value)
+            for value in (
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_mode,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            )
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
+
+    @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -1749,7 +1774,7 @@ class ScanResultsCache:
             if before_identity != after_identity or after_identity != path_identity:
                 raise ValueError("source fingerprint candidate changed while being read")
             if is_extension:
-                return _CALL_GRAPH_REGULAR_FILE_FINGERPRINT
+                return ScanResultsCache._regular_file_identity_fingerprint(after)
             if len(source) > max_bytes:
                 raise ValueError("source fingerprint budget exceeded")
             return hashlib.sha256(source).hexdigest()
@@ -1905,7 +1930,10 @@ class ScanResultsCache:
                 return False
             if not all(isinstance(entry, str) for entry in expected_search_path):
                 return False
-            if _loaded_package_search_path(module_name) != expected_search_path:
+            current_search_path = _loaded_package_search_path(module_name)
+            if current_search_path != expected_search_path:
+                return False
+            if current_search_path is None or _search_path_has_untrusted_importer(current_search_path):
                 return False
         for module_name in module_sources:
             if any(
