@@ -21,6 +21,7 @@ TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON = "text_content_security_class
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
 DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
+FSTRING_MIDDLE_TOKEN_TYPE = getattr(token, "FSTRING_MIDDLE", None)
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
     {
         "license.md",
@@ -957,11 +958,14 @@ class TextScanner(BaseScanner):
         try:
             for current in tokenize.generate_tokens(io.StringIO(text).readline):
                 if (
-                    current.type == token.STRING
-                    and current.start[0] == 1
+                    current.start[0] == 1
                     and current.end[0] == 1
                     and current.start[1] <= character_position < current.end[1]
                 ):
+                    if current.type == FSTRING_MIDDLE_TOKEN_TYPE:
+                        return True
+                    if current.type != token.STRING:
+                        continue
                     local_position = character_position - current.start[1]
                     return not TextScanner._documentation_f_string_expression_contains_position(
                         current.string,
@@ -1319,6 +1323,8 @@ class TextScanner(BaseScanner):
             return False
         line, position = line_parts
         if cls._documentation_shell_comment_before_position(line, position):
+            return True
+        if cls._documentation_python_string_contains_position(line, position):
             return True
         pattern_bytes = pattern.encode()
         cursor = position + len(pattern_bytes)

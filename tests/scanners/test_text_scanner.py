@@ -480,6 +480,34 @@ def test_text_scanner_documentation_network_library_prose_is_informational(tmp_p
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        'print("import requests before downloading weights")\n',
+        'logger.info("import requests before downloading weights")\n',
+        'message = f"import requests before downloading weights"\n',
+    ],
+)
+def test_text_scanner_network_library_string_literals_are_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_imperative_network_import_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("import requests before downloading weights.\n", encoding="utf-8")
