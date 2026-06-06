@@ -47,6 +47,13 @@ MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 ValidatedShardTargets = dict[str, dict[str, int | str]]
 
 
+def _supports_reliable_shard_cache_identity() -> bool:
+    """Return whether sibling metadata changes reliably invalidate cached families."""
+    # On supported Windows Python versions, st_ctime_ns is the file creation
+    # time, so same-size in-place rewrites can preserve every cached identity field.
+    return os.name != "nt"
+
+
 def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> bool:
     """Return True when a resolved target remains inside the shard directory."""
     try:
@@ -1318,6 +1325,16 @@ def scan_advanced_large_file(
         allowed_paths=allowed_shard_paths,
         allowed_targets=allowed_shard_targets,
     )
+    if shard_info is not None and not _supports_reliable_shard_cache_identity():
+        logger.debug(f"Bypassing advanced-file cache for unreliable shard identities: {file_path}")
+        return _scan_advanced_large_file_internal(
+            file_path,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
+        )
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:

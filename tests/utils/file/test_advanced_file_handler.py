@@ -1079,6 +1079,65 @@ class TestAdvancedFileHandler:
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
 
+    def test_sharded_scan_bypasses_cache_without_reliable_sibling_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Platforms without a content-change token must rescan every shard."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        cache_dir = tmp_path / "cache"
+        scanned_paths: list[str] = []
+
+        class CachedRecordingShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_paths.append(shard_path)
+                result = ScanResult(scanner_name=self.name)
+                payload = Path(shard_path).read_bytes()
+                result.bytes_scanned = len(payload)
+                if payload == b"bad":
+                    result.add_check(
+                        name="Malicious Shard Payload",
+                        passed=False,
+                        message=Path(shard_path).name,
+                        severity=IssueSeverity.CRITICAL,
+                    )
+                result.finish(success=payload != b"bad")
+                return result
+
+        scanner = CachedRecordingShardScanner(
+            {
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+            }
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: False,
+        )
+
+        reset_cache_manager()
+        try:
+            first = scan_advanced_large_file(str(shard_one), scanner)
+            shard_two.write_bytes(b"bad")
+            second = scan_advanced_large_file(str(shard_one), scanner)
+            cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        finally:
+            reset_cache_manager()
+
+        assert first.success is True
+        assert second.success is False
+        assert any(check.name == "Malicious Shard Payload" for check in second.checks)
+        assert scanned_paths.count(str(shard_one)) == 2
+        assert scanned_paths.count(str(shard_two)) == 2
+        assert cache_entries == 0
+
     def test_cached_sharded_scan_revalidates_retargeted_sibling(
         self,
         tmp_path: Path,
