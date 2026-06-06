@@ -1788,7 +1788,15 @@ def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
     }
 
 
-def test_windows_output_temp_file_uses_normal_attributes(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("preserve_security", "expected_security_access"),
+    [(False, 0), (True, 0x00040000 | 0x00080000)],
+)
+def test_windows_output_temp_file_uses_minimum_access_and_normal_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+    preserve_security: bool,
+    expected_security_access: int,
+) -> None:
     """Published Windows reports must not retain FILE_ATTRIBUTE_TEMPORARY."""
     captured: dict[str, object] = {}
 
@@ -1829,13 +1837,14 @@ def test_windows_output_temp_file_uses_normal_attributes(monkeypatch: pytest.Mon
         str(destination_path),
         destination_path,
         ".modelaudit-output.tmp",
+        preserve_security=preserve_security,
     )
 
     assert temp_fd == 7
     assert temp_path == destination_path.parent / ".modelaudit-output.tmp"
     assert captured == {
         "path": str(temp_path),
-        "desired_access": 0x40000000 | 0x00010000 | 0x0080 | 0x00040000 | 0x00080000,
+        "desired_access": 0x40000000 | 0x00010000 | 0x0080 | expected_security_access,
         "share_mode": 0,
         "creation_disposition": 1,
         "flags": 0x00000080,

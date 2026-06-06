@@ -421,7 +421,13 @@ def _reject_windows_encrypted_output(output_path: str, fd: int) -> None:
         )
 
 
-def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_name: str) -> tuple[int, Path]:
+def _open_windows_output_temp_file(
+    output_path: str,
+    absolute_path: Path,
+    temp_name: str,
+    *,
+    preserve_security: bool,
+) -> tuple[int, Path]:
     """Create a writable Windows temp file whose handle can be renamed securely."""
     import ctypes
     import ctypes.wintypes as wintypes
@@ -449,9 +455,12 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
     create_new = 1
     file_attribute_normal = 0x00000080
     temp_path = absolute_path.parent / temp_name
+    desired_access = generic_write | delete_access | file_read_attributes
+    if preserve_security:
+        desired_access |= write_dac | write_owner
     temp_handle = create_file(
         str(temp_path),
-        generic_write | delete_access | file_read_attributes | write_dac | write_owner,
+        desired_access,
         0,
         None,
         create_new,
@@ -966,7 +975,12 @@ def _preflight_output_text_file(output_path: str) -> None:
 
         if os.name == "nt":
             temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            temp_fd, temp_path = _open_windows_output_temp_file(output_path, absolute_path, temp_name)
+            temp_fd, temp_path = _open_windows_output_temp_file(
+                output_path,
+                absolute_path,
+                temp_name,
+                preserve_security=initial_stat is not None,
+            )
             _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
         elif parent_fd is not None:
             parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
@@ -1073,7 +1087,12 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
 
         if os.name == "nt":
             temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            temp_fd, temp_path = _open_windows_output_temp_file(output_path, absolute_path, temp_name)
+            temp_fd, temp_path = _open_windows_output_temp_file(
+                output_path,
+                absolute_path,
+                temp_name,
+                preserve_security=initial_stat is not None,
+            )
             _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
         elif parent_fd is None:
             temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
