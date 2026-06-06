@@ -1575,7 +1575,9 @@ def scan_model_directory_or_file(
                         target_str = str(target_path)
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
-                        exclusion_path = str(resolved_file) if is_hf_shard_alias else str(target_path.resolve())
+                        exclusion_path = (
+                            str(resolved_file) if is_hf_shard_alias else _resolve_or_absolute_path(target_str)
+                        )
                         if exclusion_path in dvc_excluded_paths:
                             continue
                         if is_hf_shard_alias:
