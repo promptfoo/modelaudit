@@ -1414,6 +1414,7 @@ class TestAdvancedFileHandler:
         self,
         tmp_path: Path,
         requires_symlinks: None,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A successful shard scan cache cannot hide a sibling later retargeted outside."""
         scan_dir = tmp_path / "scan"
@@ -1429,24 +1430,28 @@ class TestAdvancedFileHandler:
         outside_target.write_bytes(b"outside")
         shard_two.symlink_to(inside_target)
         cache_dir = tmp_path / "cache"
+        scanned_paths: list[str] = []
 
         class CachedCompletingShardScanner(CompletingShardScanner):
             def __init__(self, config: dict[str, Any] | None = None) -> None:
                 self.config = config or {}
-                self.scanned_paths: list[str] = []
 
             def scan(self, shard_path: str) -> ScanResult:
-                self.scanned_paths.append(shard_path)
+                scanned_paths.append(shard_path)
                 return super().scan(shard_path)
 
         scanner = CachedCompletingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
 
         reset_cache_manager()
         try:
             first = scan_advanced_large_file(str(shard_one), scanner)
-            first_scan_paths = list(scanner.scanned_paths)
+            first_scan_paths = list(scanned_paths)
             cached = scan_advanced_large_file(str(shard_one), scanner)
-            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            cached_scan_paths = list(scanned_paths)
             shard_two.unlink()
             shard_two.symlink_to(outside_target)
             second = scan_advanced_large_file(str(shard_one), scanner)
@@ -1455,8 +1460,8 @@ class TestAdvancedFileHandler:
 
         assert first.success is True
         assert cached.success is True
-        assert scanner.scanned_paths == first_scan_paths
-        assert cache_manager.get_stats()["total_entries"] > 0
+        assert str(inside_target) in first_scan_paths
+        assert cached_scan_paths == first_scan_paths
         assert second.success is False
         assert "out_of_scope_model_shards" in second.metadata["scan_outcome_reasons"]
 
