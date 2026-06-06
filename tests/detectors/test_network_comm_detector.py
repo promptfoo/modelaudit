@@ -128,6 +128,22 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "url_detected" and finding["url"] == url for finding in findings)
 
+    def test_authorization_hostname_redaction_preserves_registrable_domain(self) -> None:
+        """An auth-scheme candidate must not consume the hostname's registrable suffix."""
+        url = "https://auth.token.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.com/path"
+
+    def test_authorization_hostname_redacts_payload_before_registrable_domain(self) -> None:
+        """Authorization metadata can still introduce a payload when two domain labels remain."""
+        url = "https://auth.Bearer.SECRET123.example.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.<redacted>.example.com/path"
+
     def test_detect_urls_redacts_value_after_over_encoded_hostname_key(self) -> None:
         """Decode-depth exhaustion on a hostname key must also redact its following value."""
         encoded_key = "".join(f"%{ord(character):02X}" for character in "api_key")
@@ -398,6 +414,25 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_authorization_matrix_assignment_redacts_following_payload(self) -> None:
+        """A scheme-only Authorization parameter must carry redaction to the next matrix field."""
+        secret = "secret.example.com"
+        url = f"https://evil.example/path;authorization=Bearer;{secret}/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret not in serialized
+        assert "path;authorization=<redacted>;<redacted>/model.bin" in serialized
+
+    def test_authorization_matrix_assignment_preserves_artifact_filename(self) -> None:
+        """A scheme-only Authorization parameter must not consume a following artifact name."""
+        url = "https://evil.example/path;authorization=Bearer;model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://evil.example/path;authorization=<redacted>;model.bin"
 
     @pytest.mark.parametrize("separator", ["&", "&amp;"])
     def test_ampersand_delimited_path_tokens_are_redacted(self, separator: str) -> None:
@@ -3439,6 +3474,29 @@ def test_network_finding_limit_uses_lazy_url_context_for_long_credentials(secret
     findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
 
     assert secret not in json.dumps(findings, sort_keys=True)
+
+
+def test_network_finding_limit_reuses_long_cloud_uri_context_for_all_credentials() -> None:
+    """Lazy non-generic URI context must remain available for later endpoint matches."""
+    ip = "45.33.32.156"
+    domain = "secret.example.com"
+    data = b"s3://bucket/" + (b"a" * 5_000) + f"/api_key/{ip}/token/{domain}/model.bin".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+    serialized = json.dumps(findings, sort_keys=True)
+
+    assert ip not in serialized
+    assert domain not in serialized
+
+
+def test_network_finding_limit_preserves_long_cloud_uri_endpoint_near_match() -> None:
+    """Caching a cloud URI must not suppress endpoints after nonsensitive path labels."""
+    ip = "45.33.32.156"
+    data = b"s3://bucket/" + (b"a" * 5_000) + f"/algorithm/{ip}/model.bin".encode()
+
+    findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
+
+    assert any(finding.get("ip") == ip for finding in findings)
 
 
 @pytest.mark.parametrize("separator", ["/", "?", "&", "@", "+"])

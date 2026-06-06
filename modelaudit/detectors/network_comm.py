@@ -330,6 +330,10 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
         redacted_part, part_changed = _redact_boundary_component(part)
         if part_changed:
             parts[index] = redacted_part
+            authorization_scheme = _authorization_assignment_scheme(part)
+            following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
+            if authorization_scheme is not None:
+                redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
             changed = True
     return changed
 
@@ -558,6 +562,21 @@ def _is_authorization_path_key(key: str) -> bool:
     )
 
 
+def _authorization_assignment_scheme(segment: str) -> str | None:
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = _decode_path_token(token_candidate)
+    assignment_parts = decoded.split("=")
+    key_index = next(
+        (index for index, key in enumerate(assignment_parts[:-1]) if _is_authorization_path_key(key)),
+        None,
+    )
+    if key_index is None:
+        return None
+
+    value = "=".join(assignment_parts[key_index + 1 :]).strip()
+    return value if _AUTHORIZATION_SCHEME_PATTERN.fullmatch(value) is not None else None
+
+
 def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
     if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
         return False
@@ -644,8 +663,10 @@ def _redact_hostname_tokens(hostname: str) -> str:
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
             following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                decoded, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and len(labels) - index >= 4
+                and _authorization_scheme_has_payload(decoded, following_value)
             )
             authorization_value_pending = False
             continue
@@ -2206,17 +2227,22 @@ class NetworkCommDetector:
             context = self._pending_url_context
             if context[0] > match_start:
                 break
-            self._pending_url_context = None
             _start, _end, url = context
             cache_limit = (self.max_findings or 0) + 1
             recordable_url = self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None or any(
                 _decoded_nested_urls(url)
             )
-            if recordable_url and len(self._url_contexts) < cache_limit:
+            contains_match = match_start < context[1]
+            context_cached = False
+            if (recordable_url or contains_match) and len(self._url_contexts) < cache_limit:
                 self._url_contexts.append(context)
                 self._url_context_starts.append(context[0])
-            if match_start < context[1]:
+                context_cached = True
+            if contains_match:
+                if context_cached:
+                    self._pending_url_context = None
                 return context
+            self._pending_url_context = None
         return None
 
     def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
