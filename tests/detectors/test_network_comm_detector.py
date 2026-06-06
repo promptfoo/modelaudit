@@ -145,12 +145,42 @@ class TestNetworkCommDetector:
         assert redacted == "https://auth.<redacted>.<redacted>.example.com/path"
 
     def test_authorization_hostname_preserves_multi_label_registrable_domain(self) -> None:
-        """An ambiguous auth scheme must not consume a country-code registrable label."""
-        url = "https://auth.token.example.co.uk/path"
+        """An ambiguous auth scheme must not consume a multi-label registrable domain."""
+        urls = [
+            "https://auth.token.example.co.uk/path",
+            "https://auth.token.example.github.io/path",
+            "https://auth.token.bucket.s3.amazonaws.com/path",
+        ]
+
+        redacted = [network_comm.redact_url_for_finding(url) for url in urls]
+
+        assert redacted == [
+            "https://auth.<redacted>.example.co.uk/path",
+            "https://auth.<redacted>.example.github.io/path",
+            "https://auth.<redacted>.bucket.s3.amazonaws.com/path",
+        ]
+
+    def test_authorization_hostname_redacts_ambiguous_payload_with_extra_domain_context(self) -> None:
+        """Ambiguous schemes still carry redaction when enough hostname context remains."""
+        urls = [
+            "https://auth.token.payload.sub.example.com/path",
+            "https://auth.token.payload.bucket.s3.amazonaws.com/path",
+        ]
+
+        redacted = [network_comm.redact_url_for_finding(url) for url in urls]
+
+        assert redacted == [
+            "https://auth.<redacted>.<redacted>.sub.example.com/path",
+            "https://auth.<redacted>.<redacted>.bucket.s3.amazonaws.com/path",
+        ]
+
+    def test_authorization_hostname_redacts_low_entropy_payload_before_standard_domain(self) -> None:
+        """Public-suffix preservation must not expose a short explicit auth payload."""
+        url = "https://auth.Bearer.hunter2.example.com/path"
 
         redacted = network_comm.redact_url_for_finding(url)
 
-        assert redacted == "https://auth.<redacted>.example.co.uk/path"
+        assert redacted == "https://auth.<redacted>.<redacted>.example.com/path"
 
     def test_authorization_hostname_redacts_short_bearer_payload(self) -> None:
         """A strong auth scheme still redacts a short payload immediately before the TLD."""

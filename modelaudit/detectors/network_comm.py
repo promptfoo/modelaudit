@@ -102,6 +102,34 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
+_COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
+    {
+        "akamaized.net",
+        "appspot.com",
+        "azureedge.net",
+        "azurewebsites.net",
+        "blob.core.windows.net",
+        "cloudfront.net",
+        "fastly.net",
+        "firebaseapp.com",
+        "gitbook.io",
+        "github.io",
+        "gitlab.io",
+        "googleusercontent.com",
+        "gradio.app",
+        "herokuapp.com",
+        "netlify.app",
+        "pages.dev",
+        "readthedocs.io",
+        "rtfd.io",
+        "sourceforge.net",
+        "s3.amazonaws.com",
+        "storage.googleapis.com",
+        "streamlit.io",
+        "vercel.app",
+        "web.app",
+    }
+)
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9])"
     rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
@@ -601,8 +629,13 @@ def _hostname_authorization_scheme_has_payload(
         return True
 
     suffix_labels = 2
+    normalized_labels = [label.casefold() for label in labels]
     if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2].casefold() in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS:
         suffix_labels = 3
+    for public_suffix in _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES:
+        public_suffix_labels = public_suffix.split(".")
+        if normalized_labels[-len(public_suffix_labels) :] == public_suffix_labels:
+            suffix_labels = max(suffix_labels, len(public_suffix_labels) + 1)
     labels_after_payload = len(labels) - (scheme_index + 2)
     return labels_after_payload >= suffix_labels
 
