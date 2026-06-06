@@ -21,7 +21,7 @@ from modelaudit.core_results import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
-from modelaudit.utils.sources.cloud_storage import is_stream_url
+from modelaudit.utils.sources.cloud_storage import is_sensitive_credential_key, is_stream_url
 from modelaudit.utils.sources.cloud_storage import (
     normalize_escaped_url_delimiters_for_display as _normalize_escaped_url_delimiters_for_display,
 )
@@ -511,7 +511,12 @@ def _redact_value_for_sarif(value: Any) -> Any:
         except UnicodeDecodeError:
             return "<binary data>"
     if isinstance(value, dict):
-        return {_redact_mapping_key_for_sarif(key): _redact_value_for_sarif(item) for key, item in value.items()}
+        return {
+            _redact_mapping_key_for_sarif(key): (
+                "<redacted>" if is_sensitive_credential_key(key) else _redact_value_for_sarif(item)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_redact_value_for_sarif(item) for item in value]
     if isinstance(value, tuple):

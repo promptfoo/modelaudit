@@ -18,6 +18,14 @@ class HeaderOnlyScanner(BaseScanner):
         raise RuntimeError("full scan is not available for streaming fallback")
 
 
+def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
+    signed_url = "https://bucket.example/model.pkl%3FX-Amz-Signature%3Dsecret"
+    literal_question_mark = "https://bucket.example/model%3Fv1.pkl"
+
+    assert streaming.stream_source_path(signed_url) == "/model.pkl"
+    assert streaming.stream_source_path(literal_question_mark) == "/model?v1.pkl"
+
+
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "sample.pkl"
     file_path.write_bytes(b"\x80\x04K*\x85q\x00.")

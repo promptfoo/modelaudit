@@ -31,6 +31,8 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as 
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
 
+_HF_TEST_REVISION = "a" * 40
+
 
 def default_remote_cache_dir() -> str:
     """Compute the CLI's default remote cache root at assertion time."""
@@ -1053,10 +1055,14 @@ def test_scan_huggingface_url_passes_max_size_to_download(
     mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "--timeout", "7", "hf://test/model"],
+    )
 
     assert result.exit_code == 0
     assert mock_download.call_args.kwargs["max_size"] == 2048
+    assert mock_download.call_args.kwargs["timeout_seconds"] == 7
     mock_rmtree.assert_called()
 
 
@@ -1077,9 +1083,13 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     assert "Download failed" in result.output
 
 
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
 @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
 @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
-@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["notes.unknown"], _HF_TEST_REVISION, None),
+)
 @patch("huggingface_hub.snapshot_download")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_huggingface_no_scannable_listing_fails_closed(
@@ -1088,6 +1098,7 @@ def test_scan_huggingface_no_scannable_listing_fails_closed(
     _mock_list_repo_files: MagicMock,
     _mock_get_extensions: MagicMock,
     _mock_get_model_size: MagicMock,
+    _mock_detect_content: MagicMock,
 ) -> None:
     """Unsupported-only repositories should exit 2 without downloading or scanning."""
     runner = CliRunner()
@@ -1672,6 +1683,7 @@ def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({"", ".exe", ".llamafile"})
+    assert "llamafile" in mock_download_streaming.call_args.kwargs["scannable_scanner_ids"]
     assert "include_all_files" not in mock_download_streaming.call_args.kwargs
 
 
@@ -1738,10 +1750,14 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, has_errors=False)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "--stream", "--quiet", "--max-size", "2KB", "hf://test/model"])
+    result = runner.invoke(
+        cli,
+        ["scan", "--stream", "--quiet", "--max-size", "2KB", "--timeout", "7", "hf://test/model"],
+    )
 
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 2048
+    assert mock_download_streaming.call_args.kwargs["timeout_seconds"] == 7
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -1982,13 +1998,18 @@ def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mo
 
 
 @pytest.mark.parametrize(("malicious", "expected_exit_code"), [(False, 0), (True, 1)])
+@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
 @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
-@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["model.unknown"], None))
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["model.unknown"], _HF_TEST_REVISION, None),
+)
 @patch("huggingface_hub.hf_hub_download")
 def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     mock_hf_hub_download: MagicMock,
     _mock_list_repo_files: MagicMock,
     _mock_get_extensions: MagicMock,
+    mock_run_download: MagicMock,
     tmp_path: Path,
     malicious: bool,
     expected_exit_code: int,
@@ -1996,6 +2017,9 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     """Bounded unknown-suffix files should preserve benign and malicious content routing."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.unknown", malicious=malicious)
     mock_hf_hub_download.return_value = str(model_path)
+    mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
+        direct_download(**download_kwargs)
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -2009,6 +2033,7 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     assert parsed["files_scanned"] == 1
     assert (parsed["failed_checks"] > 0) is malicious
     mock_hf_hub_download.assert_called_once()
+    mock_run_download.assert_called_once()
 
 
 @patch("modelaudit.cli.is_huggingface_url")

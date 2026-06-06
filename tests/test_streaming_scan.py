@@ -97,7 +97,26 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         mock_stream.assert_called_once_with(stream_url, dummy_scanner)
         assert result.files_scanned == 1
         assert result.bytes_scanned == 123
-        assert determine_exit_code(result) == 0
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_directory_or_file_encoded_signed_query_preserves_routing() -> None:
+    """Encoded signed queries must not hide the model suffix from scanner routing."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret-token"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)) as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()) as mock_scanner,
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    assert mock_scanner.call_args.args[0] == "/model.pkl"
+    mock_stream.assert_called_once_with(stream_url, mock_scanner.return_value)
+    serialized = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in serialized
+    assert "secret-token" not in serialized
 
 
 def test_scan_model_directory_or_file_mixed_case_streaming_path() -> None:
@@ -190,6 +209,11 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "https://collector.example/upload?"
         "visible=yes&token=secondary-secret&password=password-secret&opaque=unknown-secret"
     )
+    parsed_credentials = {
+        "Authorization": "Bearer nested-auth-secret",
+        "client_secret": "nested-client-secret",
+        "tokenizer": "sentencepiece",
+    }
     fragment_url = "https://collector.example/callback#access_token=fragment-secret"
     legacy_signed_url = (
         "https://bucket.s3.amazonaws.com/related.pkl?"
@@ -207,6 +231,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
             "legacy_signed_url": legacy_signed_url,
+            "parsed_query": parsed_credentials,
             "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
         }
     )
@@ -225,6 +250,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
             "legacy_signed_url": legacy_signed_url,
+            "parsed_query": parsed_credentials,
             "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
         },
     )
@@ -234,11 +260,17 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         message=f"Checked {stream_url}",
         severity=IssueSeverity.CRITICAL,
         location=f"{stream_url} (header)",
-        details={"source": stream_url, stream_url: {"source": stream_url}},
+        details={
+            "source": stream_url,
+            stream_url: {"source": stream_url},
+            "parsed_query": parsed_credentials,
+        },
         why=f"Matched {stream_url}",
     )
     cast(Any, scan_result.issues[0]).source_index = {stream_url: stream_url}
     cast(Any, scan_result.checks[0]).source_index = {stream_url: stream_url}
+    cast(Any, scan_result.issues[0]).parsed_query = parsed_credentials
+    cast(Any, scan_result.checks[0]).parsed_query = parsed_credentials
     scan_result.finish(success=True)
 
     with (
@@ -266,9 +298,13 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "AKIARELATED",
         "related-signature",
         "X-Amz-Signature",
+        "nested-auth-secret",
+        "nested-client-secret",
     ):
         assert leaked not in json_text
         assert leaked not in sarif_text
+    assert "sentencepiece" in json_text
+    assert "sentencepiece" in sarif_text
     assert stream_url not in json_text
     assert stream_url not in sarif_text
     assert safe_url in json_text

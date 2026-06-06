@@ -56,7 +56,7 @@ _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
 )
 _PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23)", re.IGNORECASE)
 _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
-    r"(?P<scheme>[a-z][a-z0-9+.-]*)%(?:25)*3a%(?:25)*2f%(?:25)*2f",
+    r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
     re.IGNORECASE,
 )
 _PERCENT_ENCODED_AUTHORITY_DELIMITER_RE = re.compile(
@@ -299,6 +299,16 @@ def _is_sensitive_assignment_key(key: str) -> bool:
         return True
     collapsed_key = re.sub(r"[^a-z0-9]+", "", normalized_key)
     return any(marker in collapsed_key for marker in _SENSITIVE_ASSIGNMENT_KEY_MARKERS)
+
+
+def is_sensitive_credential_key(key: object) -> bool:
+    """Return whether a structured metadata key identifies credential material."""
+    if isinstance(key, bytes):
+        try:
+            key = key.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    return isinstance(key, str) and _is_sensitive_assignment_key(key)
 
 
 def _redact_sensitive_query_param(match: re.Match[str]) -> str:

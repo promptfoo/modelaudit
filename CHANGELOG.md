@@ -205,6 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - redact signed stream source URLs across JSON, SARIF, CLI, progress, and SBOM reporting, including malformed, transformed, and escaped source identifiers; preserve mixed-case cloud transport routing
+- fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
+- mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
 - redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - bind cache reads and writes to complete file and pathname identities captured before scanning
@@ -292,6 +294,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect and safely bound NeMo Hydra process-execution, native-loader, network, and file-access callable targets, including trusted-namespace import/cache helpers, repeated YAML aliases, and NumPy file writers
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
@@ -319,6 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
+- include bounded content-routed Hugging Face repository files in selective downloads, preserve local filename-based false-positive guards, pin probes and downloads to one immutable revision, redact signed transport errors, enforce acquisition deadlines across transfer process groups, and fail closed when repository coverage cannot be completed safely
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage

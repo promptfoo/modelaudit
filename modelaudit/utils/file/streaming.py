@@ -28,6 +28,13 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
 def stream_source_path(url: str) -> str:
     """Return the decoded URL path used for scanner routing and file naming."""
     parsed_path = unquote(urlparse(url).path)
+    for index, character in enumerate(parsed_path):
+        if character not in "?#":
+            continue
+        prefix = parsed_path[:index]
+        encoded_suffix = parsed_path[index + 1 :]
+        if Path(prefix).suffix or any(delimiter in encoded_suffix for delimiter in "=&;"):
+            return prefix or url
     return parsed_path or url
 
 

@@ -80,6 +80,11 @@ class TestFormatSarifOutput:
                     raw_path.encode(): {"nested": [raw_path]},
                     "source_set": {raw_path},
                     "source_bytes": raw_path.encode(),
+                    "parsed_query": {
+                        "Authorization": "Bearer standalone-auth-secret",
+                        "client_secret": "standalone-client-secret",
+                        "tokenizer": "sentencepiece",
+                    },
                     "nested_model": Issue(message=raw_path, details={"source_bytes": raw_path.encode()}),
                 },
                 why=f"Why contains {raw_path}",
@@ -95,8 +100,16 @@ class TestFormatSarifOutput:
         parsed = json.loads(output)
         invocation = parsed["runs"][0]["invocations"][0]
 
-        for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
+        for leaked in (
+            "AKIASECRET",
+            "deadbeef",
+            "secret-token",
+            "X-Amz-Signature",
+            "standalone-auth-secret",
+            "standalone-client-secret",
+        ):
             assert leaked not in output
+        assert "sentencepiece" in output
         assert raw_path not in output
         assert safe_path in output
         assert safe_path in invocation["commandLine"]
@@ -133,6 +146,32 @@ class TestFormatSarifOutput:
         assert "ENCODED-SARIF-SECRET" not in output
         assert "https://collector.example/callback" in output
         assert "token=" not in output
+
+    @pytest.mark.parametrize(
+        "mixed_encoded_url",
+        [
+            "https%3A//user:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
+            "https:%2F%2Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
+            "https%253A/%252Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
+        ],
+    )
+    def test_mixed_encoded_url_prefixes_cannot_bypass_sarif_redaction(self, mixed_encoded_url: str) -> None:
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message=f"Related endpoint: {mixed_encoded_url}",
+                severity=IssueSeverity.WARNING,
+                details={"related_url": mixed_encoded_url},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test/path"])
+
+        assert "user:password" not in output
+        assert "MIXED-TOKEN-LEAK" not in output
+        assert "https://collector.example/model.pkl" in output
 
     def test_malformed_stream_paths_fail_closed(self) -> None:
         """SARIF invocation and asset paths must not retain malformed stream queries."""

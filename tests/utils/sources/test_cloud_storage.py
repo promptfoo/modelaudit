@@ -311,6 +311,21 @@ class TestCloudURLRedaction:
         )
         assert "deadbeef" not in redacted
 
+    @pytest.mark.parametrize(
+        "mixed_encoded_url",
+        [
+            "https%3A//user:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+            "https:%2F%2Fuser:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+            "https%253A/%252Fuser:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+        ],
+    )
+    def test_redact_cloud_error_normalizes_mixed_encoded_url_prefixes(self, mixed_encoded_url: str) -> None:
+        redacted = redact_cloud_error_for_display(f"provider failed: {mixed_encoded_url}")
+
+        assert redacted == "provider failed: https://bucket.s3.amazonaws.com/model.pkl?token=<redacted>"
+        assert "user:password" not in redacted
+        assert "secret" not in redacted
+
     def test_redact_cloud_error_for_display_strips_fully_encoded_userinfo(self) -> None:
         message = (
             "provider failed: https%253A%252F%252Fuser%253Aencoded-password%2540"
