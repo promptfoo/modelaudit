@@ -945,6 +945,40 @@ def test_r_named_argument_helper_stops_function_body_at_completed_statement() ->
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        'x$$y(token = "DOUBLE_DOLLAR_CALL_SECRET")',
+        'x@@y(token = "DOUBLE_AT_CALL_SECRET")',
+        'x::$y(token = "NS_DOLLAR_CALL_SECRET")',
+        'x::y::z(token = "CHAINED_NS_CALL_SECRET")',
+        'x$y::z(token = "MEMBER_NS_CALL_SECRET")',
+        'x$$y[token = "DOUBLE_DOLLAR_SUBSCRIPT_SECRET"]',
+        'x@@y[token = "DOUBLE_AT_SUBSCRIPT_SECRET"]',
+        'x::$y[token = "NS_DOLLAR_SUBSCRIPT_SECRET"]',
+        'x::y::z[token = "CHAINED_NS_SUBSCRIPT_SECRET"]',
+        'x$y::z[token = "MEMBER_NS_SUBSCRIPT_SECRET"]',
+    ],
+)
+def test_r_credential_assignment_helper_rejects_malformed_access_chains(text: str) -> None:
+    assert r_scanner_module._contains_r_credential_assignment(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'x$y$z(token = "standard")',
+        'x@y$z(token = "standard")',
+        'base::x(token = "standard")',
+        'x$y$z[token = "standard"]',
+        'x@y$z[token = "standard"]',
+        'base::x[token = "standard"]',
+    ],
+)
+def test_r_credential_assignment_helper_allows_valid_access_chains(text: str) -> None:
+    assert not r_scanner_module._contains_r_credential_assignment(text)
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         'r"(example: "NOT_A_SECRET" -> token)"',
@@ -1110,6 +1144,18 @@ def test_r_named_argument_helper_stops_function_body_at_completed_statement() ->
         '{list()}[token = "standard"]',
         'NULL\n(identity)(token = r"(standard)")',
         '1 # completed expression\n(identity)(token = "standard")',
+        'x[1]\nlist(token = "standard")',
+        '{x}\ny[token = r"(standard)"]',
+        'outer(x,\nlist(token = "standard"))',
+        'outer(x +\nlist(token = "standard"))',
+        'outer({x\nlist(token = r"(standard)")})',
+        'list(token = if (TRUE) for (x in y) {} else "standard")',
+        'list(token = if (TRUE) if (FALSE) "x" else "y" else "standard")',
+        'package::x[token = "standard"]',
+        'package::"x"[token = r"(standard)"]',
+        'object$x[token = r"(standard)"]',
+        'object$"x"[token = "standard"]',
+        'object@x[token = "standard"]',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
@@ -1329,6 +1375,20 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         '{1, x}[token = "INVALID_BRACED_COMMA_SECRET"]',
         'list(token = if (TRUE) "SPLIT_ELSE_SECRET"\nelse "x")',
         'list(token = if (TRUE) {"COMMENT_SPLIT_ELSE_SECRET"} # gap\nelse "x")',
+        'x[1]list(token = "SUBSCRIPT_ADJACENT_SECRET")',
+        '{x} y[token = "BRACE_IDENT_SECRET"]',
+        'outer(x\nlist(token = "INNER_NEWLINE_SECRET"))',
+        'list(token = for (x in y) {} else "FOR_ELSE_SECRET")',
+        'list(token = foo() else "CALL_ELSE_SECRET")',
+        'list(token = if (TRUE) "x" else "y" else "SECOND_ELSE_SECRET")',
+        '1::x[token = "BAD_NS_SUBSCRIPT_SECRET"]',
+        'NULL$x[token = "BAD_MEMBER_SUBSCRIPT_SECRET"]',
+        '1::obj$x[token = "BAD_CHAINED_NS_SUBSCRIPT_SECRET"]',
+        'NULL$x$y[token = "BAD_CHAINED_MEMBER_SUBSCRIPT_SECRET"]',
+        '1::"x"[token = "BAD_QUOTED_NS_SUBSCRIPT_SECRET"]',
+        'NULL$"x"[token = "BAD_QUOTED_MEMBER_SUBSCRIPT_SECRET"]',
+        'x$$y(token = "DOUBLE_DOLLAR_CALL_SECRET")',
+        'x::y::z(token = "CHAINED_NS_CALL_SECRET")',
     ],
 )
 def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment: str) -> None:

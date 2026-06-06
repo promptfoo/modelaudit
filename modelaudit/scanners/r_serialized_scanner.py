@@ -908,6 +908,7 @@ def _r_expression_has_obvious_adjacent_values(
     native_pipe_placeholder_extraction_required = False
     saw_code = False
     assignment_target_start = position
+    unmatched_if_count = 0
     while cursor < stop:
         search_start = cursor
         cursor = _r_next_code_position(text, cursor, non_code_spans) or stop
@@ -921,6 +922,7 @@ def _r_expression_has_obvious_adjacent_values(
         if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
             expects_value = True
             assignment_target_start = cursor
+            unmatched_if_count = 0
         if text[cursor] == ";" and not allow_newline_separator:
             return True
         if text[cursor] in ",;":
@@ -933,6 +935,7 @@ def _r_expression_has_obvious_adjacent_values(
             expects_value = True
             namespace_receiver_is_valid = False
             member_receiver_is_valid = False
+            unmatched_if_count = 0
             cursor += 1
             assignment_target_start = cursor
             continue
@@ -1236,6 +1239,8 @@ def _r_expression_has_obvious_adjacent_values(
                 member_receiver_is_valid = False
                 cursor = closer + 1
                 assignment_target_start = cursor
+                if token == "if":
+                    unmatched_if_count += 1
                 continue
             if token == "repeat":
                 if not expects_value or native_pipe_call_required:
@@ -1247,8 +1252,13 @@ def _r_expression_has_obvious_adjacent_values(
                 assignment_target_start = cursor
                 continue
             if token == "else":
-                if expects_value or any(separator in text[search_start:cursor] for separator in "\r\n"):
+                if (
+                    expects_value
+                    or unmatched_if_count == 0
+                    or any(separator in text[search_start:cursor] for separator in "\r\n")
+                ):
                     return True
+                unmatched_if_count -= 1
                 expects_value = True
                 namespace_receiver_is_valid = False
                 member_receiver_is_valid = False
@@ -1452,7 +1462,7 @@ def _r_expression_start_has_valid_boundary(
             cursor = previous_span_start - 1
             continue
 
-        if crossed_newline:
+        if crossed_newline and _r_newline_can_separate_expressions(text, span_start, delimiter_pairs):
             return text[cursor] not in "$@:"
         if text[cursor] == ")":
             opener_position = _r_matching_open_delimiter_position(
@@ -1475,7 +1485,15 @@ def _r_expression_start_has_valid_boundary(
                 delimiter_pairs,
             )
         if text[cursor] in "]}":
-            return True
+            return (
+                _r_matching_open_delimiter_position(
+                    text,
+                    cursor,
+                    non_code_spans,
+                    delimiter_pairs,
+                )
+                is None
+            )
         if text[cursor].isalnum() or text[cursor] in "._":
             token_end = cursor + 1
             while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
@@ -1483,6 +1501,23 @@ def _r_expression_start_has_valid_boundary(
             return text[cursor + 1 : token_end] in {"else", "repeat"}
         return text[cursor] in "([{,;=<>+-*/^!&|~?:$@%"
     return True
+
+
+def _r_newline_can_separate_expressions(
+    text: str,
+    position: int,
+    delimiter_pairs: dict[int, int] | None,
+) -> bool:
+    if delimiter_pairs is None:
+        return True
+
+    innermost_opener: int | None = None
+    for opener, closer in delimiter_pairs.items():
+        if text[opener] not in "([{" or not opener < position < closer:
+            continue
+        if innermost_opener is None or opener > innermost_opener:
+            innermost_opener = opener
+    return innermost_opener is None or text[innermost_opener] == "{"
 
 
 def _r_namespace_receiver_is_valid(
@@ -1503,10 +1538,14 @@ def _r_namespace_receiver_is_valid(
         span_start, span_end = non_code_spans[span_index]
         if unterminated_literal_starts is None:
             unterminated_literal_starts = _r_unterminated_literal_span_starts(text, non_code_spans)
+        receiver_cursor = span_start - 1
+        while receiver_cursor >= 0 and text[receiver_cursor].isspace():
+            receiver_cursor -= 1
         return (
             span_end == cursor + 1
             and text[span_start] != "#"
             and span_start not in unterminated_literal_starts
+            and (receiver_cursor < 0 or text[receiver_cursor] not in "$@:")
             and _r_expression_start_has_valid_boundary(
                 text,
                 span_start,
@@ -1521,11 +1560,17 @@ def _r_namespace_receiver_is_valid(
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
     token_start = cursor + 1
-    return _r_token_can_start_call(text[token_start:token_end]) and _r_expression_start_has_valid_boundary(
-        text,
-        token_start,
-        non_code_spans,
-        delimiter_pairs,
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    return (
+        _r_token_can_start_call(text[token_start:token_end])
+        and (cursor < 0 or text[cursor] not in "$@:")
+        and _r_expression_start_has_valid_boundary(
+            text,
+            token_start,
+            non_code_spans,
+            delimiter_pairs,
+        )
     )
 
 
@@ -2274,12 +2319,46 @@ def _r_expression_before_position_is_obviously_non_callable(
             delimiter_pairs,
         )
     if not (character.isalnum() or character in "._"):
-        return False
+        return character in "$@:"
 
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    return not _r_token_can_start_call(text[cursor + 1 : token_end])
+    token_start = cursor + 1
+    token = text[token_start:token_end]
+    if not _r_token_can_start_call(token):
+        if token != "_":
+            return True
+        pipe_cursor = token_start - 1
+        while pipe_cursor >= 0 and text[pipe_cursor].isspace():
+            pipe_cursor -= 1
+        if pipe_cursor < 1 or text[pipe_cursor - 1 : pipe_cursor + 1] != "|>":
+            return True
+
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    if cursor < 0 or text[cursor] not in "$@:":
+        return False
+    if text[cursor] in "$@":
+        return _r_expression_before_position_is_obviously_non_callable(
+            text,
+            cursor,
+            non_code_spans,
+            delimiter_pairs,
+        )
+
+    operator_end = cursor + 1
+    while cursor >= 0 and text[cursor] == ":":
+        cursor -= 1
+    operator_start = cursor + 1
+    if operator_end - operator_start not in {2, 3}:
+        return False
+    return not _r_namespace_receiver_is_valid(
+        text,
+        operator_start,
+        non_code_spans,
+        delimiter_pairs,
+    )
 
 
 def _r_subscript_result_can_start_call(
@@ -2409,15 +2488,37 @@ def _r_open_bracket_starts_subscript(
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
         span_start, span_end = non_code_spans[span_index]
-        return (
-            span_end == cursor + 1
-            and text[span_start] != "#"
-            and _r_expression_start_has_valid_boundary(
+        if span_end != cursor + 1 or text[span_start] == "#":
+            return False
+        operator_cursor = span_start - 1
+        while operator_cursor >= 0 and text[operator_cursor].isspace():
+            operator_cursor -= 1
+        if operator_cursor >= 0 and text[operator_cursor] in "$@:":
+            operator_start = operator_cursor
+            if text[operator_cursor] == ":":
+                while operator_start >= 0 and text[operator_start] == ":":
+                    operator_start -= 1
+                operator_start += 1
+                if operator_cursor - operator_start + 1 not in {2, 3}:
+                    return False
+                return _r_namespace_receiver_is_valid(
+                    text,
+                    operator_start,
+                    non_code_spans,
+                    delimiter_pairs,
+                    unterminated_literal_starts,
+                )
+            return not _r_expression_before_position_is_obviously_non_callable(
                 text,
-                span_start,
+                operator_start,
                 non_code_spans,
                 delimiter_pairs,
             )
+        return _r_expression_start_has_valid_boundary(
+            text,
+            span_start,
+            non_code_spans,
+            delimiter_pairs,
         )
     if not (text[cursor].isalnum() or text[cursor] in "._"):
         return False
@@ -2427,7 +2528,36 @@ def _r_open_bracket_starts_subscript(
         cursor -= 1
     token_start = cursor + 1
     token = text[token_start:token_end]
-    return _r_token_can_start_subscript(token) and _r_expression_start_has_valid_boundary(
+    if not _r_token_can_start_subscript(token):
+        return False
+
+    operator_cursor = cursor
+    while operator_cursor >= 0 and text[operator_cursor].isspace():
+        operator_cursor -= 1
+    if operator_cursor >= 0 and text[operator_cursor] in "$@:":
+        if text[operator_cursor] == ":":
+            operator_start = operator_cursor
+            while operator_start >= 0 and text[operator_start] == ":":
+                operator_start -= 1
+            operator_start += 1
+            if operator_cursor - operator_start + 1 in {2, 3}:
+                return _r_namespace_receiver_is_valid(
+                    text,
+                    operator_start,
+                    non_code_spans,
+                    delimiter_pairs,
+                    unterminated_literal_starts,
+                )
+            if operator_cursor - operator_start + 1 > 1:
+                return False
+        else:
+            return not _r_expression_before_position_is_obviously_non_callable(
+                text,
+                operator_cursor,
+                non_code_spans,
+                delimiter_pairs,
+            )
+    return _r_expression_start_has_valid_boundary(
         text,
         token_start,
         non_code_spans,
