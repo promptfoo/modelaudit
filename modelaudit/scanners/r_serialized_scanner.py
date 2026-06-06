@@ -884,13 +884,19 @@ def _r_expression_has_obvious_adjacent_values(
     operator_name_required = False
     native_pipe_call_required = False
     native_pipe_placeholder_extraction_required = False
+    saw_code = False
     while cursor < stop:
         search_start = cursor
         cursor = _r_next_code_position(text, cursor, non_code_spans) or stop
         if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
             expects_value = True
         if cursor >= stop or text[cursor] in ")]}":
-            return operator_name_required or native_pipe_call_required or native_pipe_placeholder_extraction_required
+            return (
+                (saw_code and expects_value)
+                or operator_name_required
+                or native_pipe_call_required
+                or native_pipe_placeholder_extraction_required
+            )
         if text[cursor] in ",;":
             if not allow_newline_separator:
                 return (
@@ -910,6 +916,7 @@ def _r_expression_has_obvious_adjacent_values(
             if text[span_start] == "#":
                 cursor = span_end
                 continue
+            saw_code = True
             if not expects_value:
                 return True
             if span_start in unterminated_literal_starts:
@@ -923,6 +930,7 @@ def _r_expression_has_obvious_adjacent_values(
             continue
 
         character = text[cursor]
+        saw_code = True
         if operator_name_required and not (character.isalnum() or character in "._"):
             return True
         if character in "([{":
@@ -1177,7 +1185,12 @@ def _r_expression_has_obvious_adjacent_values(
             continue
 
         cursor += 1
-    return operator_name_required or native_pipe_call_required or native_pipe_placeholder_extraction_required
+    return (
+        (saw_code and expects_value)
+        or operator_name_required
+        or native_pipe_call_required
+        or native_pipe_placeholder_extraction_required
+    )
 
 
 def _r_open_paren_starts_argument_list(
@@ -1630,6 +1643,18 @@ def _r_function_body_awaits_continuation(
             non_code_spans,
             unterminated_literal_starts,
         ):
+            return True
+        try:
+            body_expression_follows = _r_expression_follows(
+                text,
+                body_start,
+                non_code_spans,
+                delimiter_pairs,
+                unterminated_literal_starts,
+            )
+        except _RExpressionDepthExceeded:
+            body_expression_follows = True
+        if not body_expression_follows:
             return True
     return False
 
@@ -2090,7 +2115,16 @@ def _r_open_bracket_starts_subscript(
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
         span_start, span_end = non_code_spans[span_index]
-        return span_end == cursor + 1 and text[span_start] != "#"
+        return (
+            span_end == cursor + 1
+            and text[span_start] != "#"
+            and _r_expression_start_has_valid_boundary(
+                text,
+                span_start,
+                non_code_spans,
+                delimiter_pairs,
+            )
+        )
     if not (text[cursor].isalnum() or text[cursor] in "._"):
         return False
 

@@ -431,6 +431,24 @@ def test_scan_short_text_with_trailing_padding_does_not_report_payload_stuffing(
     assert core.determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        'function(token = "standard") if\n(TRUE) NULL',
+        'function(token = r"(standard)") if (TRUE)\n# body follows\nNULL',
+    ],
+)
+def test_scan_joins_function_control_bodies_split_across_printable_runs(tmp_path: Path, body: str) -> None:
+    path = tmp_path / "split-function-control-body.rds"
+    _write_raw_r_serialized(path, body)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+
+
 def test_scan_detects_executable_call_split_at_printable_chunk_boundary(tmp_path: Path) -> None:
     path = tmp_path / "split-system-call.rds"
     _write_raw_r_serialized(path, "A" * 503 + "base::system('id')")
@@ -1136,6 +1154,8 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'list(token = "TRUNCATED_ARGUMENT_SECRET" +)',
         'x[token = r"(TRUNCATED_INDEX_SECRET)" +]',
         'list(token = if (TRUE) "TRUNCATED_CONTROL_SECRET" else)',
+        'list(token = \\(x) if (TRUE) "TRUNCATED_LAMBDA_ELSE_SECRET" else)',
+        'list(token = \\(x) if (TRUE) "SPACED_LAMBDA_ELSE_SECRET" else   )',
         'list(token = "ADJACENT_ARGUMENT_SECRET" value)',
         'list(token = paste0("ADJACENT_CALL_SECRET") value)',
         'list(token = if (TRUE) "ADJACENT_CONTROL_SECRET" value)',
@@ -1168,6 +1188,8 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'function(x["token"] = "SUBSCRIPT_FORMAL_SECRET") NULL',
         '1"list"(token = r"(QUOTED_CALLEE_BOUNDARY_SECRET)")',
         'x`list`(token = "BACKTICK_CALLEE_BOUNDARY_SECRET")',
+        '1"x"[token = "QUOTED_SUBSCRIPT_BOUNDARY_SECRET"]',
+        'x`obj`[token = "BACKTICK_SUBSCRIPT_BOUNDARY_SECRET"]',
         'list(token = if (TRUE FALSE) "INVALID_IF_HEADER_SECRET")',
         'list(token = for (x in y z) "INVALID_FOR_HEADER_SECRET")',
         'list(token = function(x=) "INCOMPLETE_FORMAL_SECRET")',
