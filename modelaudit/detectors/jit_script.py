@@ -839,6 +839,8 @@ def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
     assignment_pattern = re.compile(rb"^([A-Za-z_]\w*)(?:\s*:[^=]+)?\s*(?::=|=(?!=))\s*([A-Za-z_]\w*)?")
     rebound_pattern = re.compile(rb"^(?:class|def|del|case)\s+([A-Za-z_]\w*)\b|^for\s+([A-Za-z_]\w*)\s+in\b")
     for raw_line in candidate[prefix_end:].split(b"\n"):
+        if raw_line[:1].isspace():
+            continue
         line = _python_structural_line_bytes(raw_line).strip()
         imported = import_pattern.fullmatch(line)
         if imported is not None:
@@ -917,15 +919,67 @@ def _unsafe_typed_member_aliases(
 ) -> dict[str, _TypedMemberCallableValue]:
     typed_aliases = dict(inherited_typed_aliases)
     safe_members: set[tuple[str, str]] = set()
-    mutated_members: set[tuple[str, str]] = set()
+    unknown_members: set[tuple[str, str]] = set()
     callable_aliases: dict[str, _TypedMemberCallableValue] = {}
     assignment_pattern = re.compile(rb"^([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
     member_target_pattern = re.compile(rb"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
+    mapping_member_target_pattern = re.compile(
+        rb"^([A-Za-z_]\w*)\.__dict__\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]\s*=\s*(.+?)\s*$"
+    )
     member_value_pattern = re.compile(rb"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
 
-    for raw_line in candidate.split(b"\n"):
+    module_scope_lines: set[int] | None = None
+    source = candidate.lstrip(b"\x00\xff").decode("utf-8", errors="ignore")
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        pass
+    else:
+        module_scope_lines = {
+            statement.lineno for statement in _compact_deterministically_executed_statements(tree.body)
+        }
+
+    def record_member_state(module_name: str, member_name: str, value: bytes) -> None:
+        member = (module_name, member_name)
+        value_reference = value.strip().decode("utf-8", errors="ignore")
+        if value.strip() == b"print":
+            safe_members.add(member)
+            unknown_members.discard(member)
+            return
+        if any(
+            owner_name == module_name and captured_member == member_name and not is_safe
+            for owner_name, captured_member, is_safe in callable_aliases.get(value_reference, frozenset())
+        ):
+            safe_members.discard(member)
+            unknown_members.discard(member)
+            return
+        value_member = member_value_pattern.fullmatch(value.strip())
+        if (
+            value_member is not None
+            and typed_aliases.get(value_member.group(1).decode("utf-8")) == module_name
+            and value_member.group(2).decode("utf-8") == member_name
+        ):
+            return
+        safe_members.discard(member)
+        unknown_members.add(member)
+
+    for line_number, raw_line in enumerate(candidate.split(b"\n"), start=1):
+        if module_scope_lines is not None:
+            if line_number not in module_scope_lines:
+                continue
+        elif raw_line[:1].isspace():
+            continue
+        raw_statement = raw_line.strip()
         line = _python_structural_line_bytes(raw_line).strip()
         if not line:
+            continue
+        mapping_member_target = mapping_member_target_pattern.fullmatch(raw_statement)
+        if mapping_member_target is not None:
+            owner_alias = mapping_member_target.group(1).decode("utf-8")
+            member_name = mapping_member_target.group(2).decode("utf-8")
+            module_name = typed_aliases.get(owner_alias)
+            if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
+                record_member_state(module_name, member_name, mapping_member_target.group(3))
             continue
         member_target = member_target_pattern.fullmatch(line)
         if member_target is not None:
@@ -933,12 +987,7 @@ def _unsafe_typed_member_aliases(
             member_name = member_target.group(2).decode("utf-8")
             module_name = typed_aliases.get(owner_alias)
             if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
-                member = (module_name, member_name)
-                mutated_members.add(member)
-                if member_target.group(3).strip() == b"print":
-                    safe_members.add(member)
-                else:
-                    safe_members.discard(member)
+                record_member_state(module_name, member_name, member_target.group(3))
             continue
 
         assignment = assignment_pattern.fullmatch(line)
@@ -946,24 +995,40 @@ def _unsafe_typed_member_aliases(
             for owner_alias, module_name in typed_aliases.items():
                 for member_name in _TYPED_PROOF_MEMBER_NAMES:
                     member_literal = re.escape(member_name.encode("utf-8"))
+                    owner_literal = re.escape(owner_alias.encode("utf-8"))
+                    owner_mapping = (
+                        rb"(?:"
+                        + owner_literal
+                        + rb"\s*\.\s*__dict__|(?:\b[A-Za-z_]\w*\.)?vars\s*\(\s*"
+                        + owner_literal
+                        + rb"\s*\))"
+                    )
                     if re.search(
                         rb"(?:\b[A-Za-z_]\w*\.)?setattr\s*\(\s*"
-                        + re.escape(owner_alias.encode("utf-8"))
+                        + owner_literal
                         + rb"\s*,\s*['\"]"
                         + member_literal
                         + rb"['\"]",
                         line,
                     ) or (
                         member_literal in line
-                        and any(marker in line for marker in (b"|=", b".update(", b".__setitem__("))
+                        and re.search(
+                            owner_mapping + rb"\s*(?:\|=|\.\s*(?:update|__setitem__)\s*\()",
+                            line,
+                        )
                     ):
-                        mutated_members.add((module_name, member_name))
+                        member = (module_name, member_name)
+                        safe_members.discard(member)
+                        unknown_members.add(member)
             continue
         target_name = assignment.group(1).decode("utf-8")
         value = assignment.group(2).strip()
         value_reference = value.decode("utf-8", errors="ignore")
+        copied_callable = callable_aliases.get(value_reference)
         callable_aliases.pop(target_name, None)
         typed_aliases.pop(target_name, None)
+        if copied_callable is not None:
+            callable_aliases[target_name] = copied_callable
         if value_reference in typed_aliases:
             typed_aliases[target_name] = typed_aliases[value_reference]
         member_value = member_value_pattern.fullmatch(value)
@@ -975,7 +1040,7 @@ def _unsafe_typed_member_aliases(
         if (
             module_name is not None
             and (module_name, member_name) not in safe_members
-            and (module_name, member_name) not in mutated_members
+            and (module_name, member_name) not in unknown_members
             and _typed_member_high_risk_call(module_name, member_name) is not None
         ):
             callable_aliases[target_name] = frozenset({(module_name, member_name, False)})
@@ -12688,7 +12753,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     inherited_typed_member_aliases: Mapping[str, _TypedMemberCallableValue] | None = None,
 ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     source = textwrap.dedent(code_str)
-    if "print" not in source:
+    if "print" not in source and not inherited_typed_member_aliases:
         return set(), set()
     try:
         tree = ast.parse(source)
@@ -12763,7 +12828,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     dynamic_builtins_print_shadow_state: bool | None = None
     dynamic_safe_members: set[tuple[tuple[str, int], str]] | None = None
     dynamic_safe_print_aliases: set[str] | None = None
-    active_print_builtins_aliases = {"builtins", "__builtins__"}
+    active_print_builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
     eager_builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
@@ -12771,7 +12836,46 @@ def _compact_snippet_typed_print_overwrite_replay(
     builtins_vars_shadowed = False
     local_dict_shadowed = False
     builtins_dict_shadowed = False
+    uncertain_helper_shadows: set[str] = set()
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def helper_shadowed(helper: str) -> bool:
+        return {
+            "local_setattr": local_setattr_shadowed,
+            "builtins_setattr": builtins_setattr_shadowed,
+            "local_vars": local_vars_shadowed,
+            "builtins_vars": builtins_vars_shadowed,
+            "local_dict": local_dict_shadowed,
+            "builtins_dict": builtins_dict_shadowed,
+        }[helper]
+
+    def set_helper_shadowed(helper: str, shadowed: bool, *, conditional: bool = False) -> None:
+        nonlocal local_setattr_shadowed, builtins_setattr_shadowed
+        nonlocal local_vars_shadowed, builtins_vars_shadowed
+        nonlocal local_dict_shadowed, builtins_dict_shadowed
+        current_definite = helper_shadowed(helper)
+        current_possible = current_definite or helper in uncertain_helper_shadows
+        if conditional:
+            definite = current_definite and shadowed
+            possible = current_possible or shadowed
+        else:
+            definite = shadowed
+            possible = shadowed
+        if helper == "local_setattr":
+            local_setattr_shadowed = definite
+        elif helper == "builtins_setattr":
+            builtins_setattr_shadowed = definite
+        elif helper == "local_vars":
+            local_vars_shadowed = definite
+        elif helper == "builtins_vars":
+            builtins_vars_shadowed = definite
+        elif helper == "local_dict":
+            local_dict_shadowed = definite
+        else:
+            builtins_dict_shadowed = definite
+        uncertain_helper_shadows.discard(helper)
+        if possible and not definite:
+            uncertain_helper_shadows.add(helper)
 
     def active_eager_generator_consumer_aliases(
         aliases: Collection[str] | None = None,
@@ -12978,6 +13082,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             and not builtins_setattr_shadowed
         )
 
+    def uncertain_setattr_reference(reference: str | None) -> bool:
+        if reference in setattr_helper_aliases:
+            return False
+        if reference == "setattr":
+            return bool({"local_setattr", "builtins_setattr"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.setattr":
+            return "builtins_setattr" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".setattr")
+            and reference.removesuffix(".setattr") in builtins_aliases
+            and "builtins_setattr" in uncertain_helper_shadows
+        )
+
     def active_vars_reference(reference: str | None) -> bool:
         if reference in vars_helper_aliases:
             return True
@@ -12990,6 +13108,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             and reference.endswith(".vars")
             and reference.removesuffix(".vars") in builtins_aliases
             and not builtins_vars_shadowed
+        )
+
+    def uncertain_vars_reference(reference: str | None) -> bool:
+        if reference in vars_helper_aliases:
+            return False
+        if reference == "vars":
+            return bool({"local_vars", "builtins_vars"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.vars":
+            return "builtins_vars" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".vars")
+            and reference.removesuffix(".vars") in builtins_aliases
+            and "builtins_vars" in uncertain_helper_shadows
         )
 
     def active_getattr_reference(reference: str | None) -> bool:
@@ -13016,6 +13148,28 @@ def _compact_snippet_typed_print_overwrite_replay(
             and reference.removesuffix(".dict") in builtins_aliases
             and not builtins_dict_shadowed
         )
+
+    def uncertain_dict_reference(reference: str | None) -> bool:
+        if reference in dict_helper_aliases:
+            return False
+        if reference == "dict":
+            return bool({"local_dict", "builtins_dict"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.dict":
+            return "builtins_dict" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".dict")
+            and reference.removesuffix(".dict") in builtins_aliases
+            and "builtins_dict" in uncertain_helper_shadows
+        )
+
+    def uncertain_dict_mutator_reference(reference: str | None) -> bool:
+        if reference is None:
+            return False
+        for suffix in (".update", ".__ior__", ".__setitem__", ".setdefault", ".pop", ".__delitem__"):
+            if reference.endswith(suffix):
+                return uncertain_dict_reference(reference.removesuffix(suffix))
+        return False
 
     def active_dict_update_reference(reference: str | None) -> bool:
         if reference in dict_update_aliases:
@@ -13118,6 +13272,15 @@ def _compact_snippet_typed_print_overwrite_replay(
             node,
             active_print_builtins_aliases,
             builtins_mapping_aliases,
+        )
+
+    def mapping_expression_is_uncertain(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return mapping_expression_is_uncertain(node.value)
+        return bool(
+            isinstance(node, ast.Call)
+            and uncertain_vars_reference(_simple_reference_name(node.func))
+            and len(node.args) == 1
         )
 
     def is_builtins_object(node: ast.AST) -> bool:
@@ -13249,7 +13412,11 @@ def _compact_snippet_typed_print_overwrite_replay(
             target_builtins_aliases,
             target_builtins_mapping_aliases,
         ):
-            record_builtins_helper_assignment(_static_getattr_member_name(target.slice), value)
+            record_builtins_helper_assignment(
+                _static_getattr_member_name(target.slice),
+                value,
+                conditional=mapping_expression_is_uncertain(target.value),
+            )
         elif isinstance(target, ast.Name):
             aliases_builtins_object = isinstance(value, ast.Name) and value.id in value_builtins_aliases
             aliases_builtins_mapping = is_builtins_mapping_with_aliases(
@@ -13272,7 +13439,12 @@ def _compact_snippet_typed_print_overwrite_replay(
                 safe_members.difference_update({member for member in safe_members if member[0] == owner})
                 deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
             else:
-                record_member(owner, member_name, value)
+                record_member(
+                    owner,
+                    member_name,
+                    value,
+                    conditional=mapping_expression_is_uncertain(target.value),
+                )
         elif isinstance(target, ast.Starred):
             record_assignment_target(
                 target.value,
@@ -13432,35 +13604,57 @@ def _compact_snippet_typed_print_overwrite_replay(
             )
             record_typed_call(nested_call, aliases_before_call)
 
-    def record_builtins_helper_assignment(member_name: str | None, value: ast.AST) -> None:
-        nonlocal builtins_dict_shadowed, builtins_print_is_shadowed, builtins_setattr_shadowed, builtins_vars_shadowed
+    def record_builtins_helper_assignment(
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        nonlocal builtins_print_is_shadowed
         nonlocal dynamic_builtins_print_shadow_state
         if member_name is None:
             deleted_builtins_members.clear()
             definitely_deleted_builtins_members.clear()
-            builtins_dict_shadowed = True
+            set_helper_shadowed("builtins_dict", True, conditional=conditional)
             if dynamic_builtins_print_shadow_state is None:
                 builtins_print_is_shadowed = True
             else:
                 dynamic_builtins_print_shadow_state = True
-            builtins_setattr_shadowed = True
-            builtins_vars_shadowed = True
+            set_helper_shadowed("builtins_setattr", True, conditional=conditional)
+            set_helper_shadowed("builtins_vars", True, conditional=conditional)
             return
-        deleted_builtins_members.discard(member_name)
+        if not conditional:
+            deleted_builtins_members.discard(member_name)
         definitely_deleted_builtins_members.discard(member_name)
         value_reference = _simple_reference_name(value)
         if member_name == "print":
             print_is_shadowed = not is_safe_print_value(value)
             if dynamic_builtins_print_shadow_state is None:
-                builtins_print_is_shadowed = print_is_shadowed
+                builtins_print_is_shadowed = (
+                    builtins_print_is_shadowed or print_is_shadowed if conditional else print_is_shadowed
+                )
             else:
-                dynamic_builtins_print_shadow_state = print_is_shadowed
+                dynamic_builtins_print_shadow_state = (
+                    dynamic_builtins_print_shadow_state or print_is_shadowed if conditional else print_is_shadowed
+                )
         elif member_name == "setattr":
-            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_setattr",
+                not active_setattr_reference(value_reference),
+                conditional=conditional,
+            )
         elif member_name == "vars":
-            builtins_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_vars",
+                not active_vars_reference(value_reference),
+                conditional=conditional,
+            )
         elif member_name == "dict":
-            builtins_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_dict",
+                not active_dict_reference(value_reference),
+                conditional=conditional,
+            )
 
     def record_builtins_helper_delete(member_name: str | None) -> None:
         if member_name is None:
@@ -13475,7 +13669,6 @@ def _compact_snippet_typed_print_overwrite_replay(
         definitely_deleted_builtins_members.add(member_name)
 
     def record_builtins_setdefault(member_name: str | None, value: ast.AST) -> None:
-        nonlocal builtins_dict_shadowed, builtins_setattr_shadowed, builtins_vars_shadowed
         nonlocal builtins_print_is_shadowed, dynamic_builtins_print_shadow_state
         if member_name is None or member_name not in deleted_builtins_members:
             return
@@ -13498,37 +13691,53 @@ def _compact_snippet_typed_print_overwrite_replay(
             else:
                 dynamic_builtins_print_shadow_state = joined_shadowed
         elif member_name == "setattr":
-            builtins_setattr_shadowed = builtins_setattr_shadowed or not active_setattr_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_setattr",
+                not active_setattr_reference(value_reference),
+                conditional=True,
+            )
         elif member_name == "vars":
-            builtins_vars_shadowed = builtins_vars_shadowed or not active_vars_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_vars",
+                not active_vars_reference(value_reference),
+                conditional=True,
+            )
         elif member_name == "dict":
-            builtins_dict_shadowed = builtins_dict_shadowed or not active_dict_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_dict",
+                not active_dict_reference(value_reference),
+                conditional=True,
+            )
 
-    def record_builtins_update(call: ast.Call) -> None:
+    def record_builtins_update(call: ast.Call, *, conditional: bool = False) -> None:
         def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
-            record_builtins_helper_assignment(_static_getattr_member_name(key_node), value_node)
+            record_builtins_helper_assignment(
+                _static_getattr_member_name(key_node),
+                value_node,
+                conditional=conditional,
+            )
 
         for argument in call.args:
             _replay_static_update_items(
                 argument,
                 record_item,
-                invalidate_builtins_mapping_helpers,
+                lambda: invalidate_builtins_mapping_helpers(conditional=conditional),
             )
         for keyword in call.keywords:
             if keyword.arg is not None:
-                record_builtins_helper_assignment(keyword.arg, keyword.value)
+                record_builtins_helper_assignment(keyword.arg, keyword.value, conditional=conditional)
             else:
                 _replay_static_update_items(
                     keyword.value,
                     record_item,
-                    invalidate_builtins_mapping_helpers,
+                    lambda: invalidate_builtins_mapping_helpers(conditional=conditional),
                 )
 
-    def invalidate_builtins_mapping_helpers() -> None:
-        record_builtins_helper_assignment("dict", ast.Constant(value=None))
-        record_builtins_helper_assignment("print", ast.Constant(value=None))
-        record_builtins_helper_assignment("setattr", ast.Constant(value=None))
-        record_builtins_helper_assignment("vars", ast.Constant(value=None))
+    def invalidate_builtins_mapping_helpers(*, conditional: bool = False) -> None:
+        record_builtins_helper_assignment("dict", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("print", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("setattr", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("vars", ast.Constant(value=None), conditional=conditional)
 
     def bind_mapping_alias(
         target: ast.AST,
@@ -13833,59 +14042,55 @@ def _compact_snippet_typed_print_overwrite_replay(
                 safe_members.add(member_key)
 
     def record_setattr_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_setattr_shadowed, builtins_setattr_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_setattr_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "setattr":
-            local_setattr_shadowed = not active_setattr_reference(value_reference)
+            set_helper_shadowed("local_setattr", not active_setattr_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "setattr"
             and isinstance(target.value, ast.Name)
             and target.value.id in active_print_builtins_aliases
         ):
-            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+            set_helper_shadowed("builtins_setattr", not active_setattr_reference(value_reference))
 
     def record_vars_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_vars_shadowed, builtins_vars_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_vars_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "vars":
-            local_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed("local_vars", not active_vars_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "vars"
             and isinstance(target.value, ast.Name)
             and target.value.id in active_print_builtins_aliases
         ):
-            builtins_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed("builtins_vars", not active_vars_reference(value_reference))
 
     def record_dict_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_dict_shadowed, builtins_dict_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_dict_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "dict":
-            local_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed("local_dict", not active_dict_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "dict"
             and isinstance(target.value, ast.Name)
             and target.value.id in active_print_builtins_aliases
         ):
-            builtins_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed("builtins_dict", not active_dict_reference(value_reference))
 
     def invalidate_rebound_target(target: ast.AST) -> None:
-        nonlocal local_setattr_shadowed, builtins_setattr_shadowed, local_vars_shadowed, builtins_vars_shadowed
-        nonlocal local_dict_shadowed, builtins_dict_shadowed, builtins_print_is_shadowed
+        nonlocal builtins_print_is_shadowed
         if isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 invalidate_rebound_target(element)
@@ -13903,11 +14108,11 @@ def _compact_snippet_typed_print_overwrite_replay(
             reload_aliases.discard(target.id)
             clear_local_helper_alias(target.id)
             if target.id == "vars":
-                local_vars_shadowed = True
+                set_helper_shadowed("local_vars", True)
             elif target.id == "setattr":
-                local_setattr_shadowed = True
+                set_helper_shadowed("local_setattr", True)
             elif target.id == "dict":
-                local_dict_shadowed = True
+                set_helper_shadowed("local_dict", True)
         elif isinstance(target, ast.Attribute):
             if isinstance(target.value, ast.Name):
                 owner = typed_aliases.get(target.value.id)
@@ -13917,11 +14122,11 @@ def _compact_snippet_typed_print_overwrite_replay(
                     if target.attr == "print":
                         builtins_print_is_shadowed = True
                     elif target.attr == "vars":
-                        builtins_vars_shadowed = True
+                        set_helper_shadowed("builtins_vars", True)
                     elif target.attr == "setattr":
-                        builtins_setattr_shadowed = True
+                        set_helper_shadowed("builtins_setattr", True)
                     elif target.attr == "dict":
-                        builtins_dict_shadowed = True
+                        set_helper_shadowed("builtins_dict", True)
         elif isinstance(target, ast.Subscript):
             owner = owner_name(target.value)
             member_name = _static_getattr_member_name(target.slice)
@@ -14083,13 +14288,20 @@ def _compact_snippet_typed_print_overwrite_replay(
                 elif isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_delete_aliases and node.args:
                     record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
                 elif active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
-                    record_builtins_update(node)
+                    record_builtins_update(
+                        node,
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
                 elif (
                     active_dict_setitem_reference(reference)
                     and len(node.args) >= 3
                     and is_builtins_mapping(node.args[0])
                 ):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
                 elif (
                     active_dict_delete_reference(reference)
                     and len(node.args) >= 2
@@ -14130,7 +14342,11 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ):
                     record_builtins_setdefault(_static_getattr_member_name(node.args[0]), node.args[1])
                 elif active_setattr_reference(reference) and len(node.args) >= 3 and is_builtins_object(node.args[0]):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_setattr_reference(reference),
+                    )
                 elif (
                     reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
                     and reference not in shadowed_delattr_references_by_statement.get(id(statement), set())
@@ -14250,6 +14466,7 @@ def _compact_snippet_typed_print_overwrite_replay(
             set(builtins_mapping_delete_aliases),
             set(definitely_deleted_builtins_members),
             set(eager_builtins_aliases),
+            set(uncertain_helper_shadows),
         )
 
     def restore_lexical_scope(snapshot: tuple[Any, ...]) -> None:
@@ -14297,6 +14514,8 @@ def _compact_snippet_typed_print_overwrite_replay(
         definitely_deleted_builtins_members.update(snapshot[30])
         eager_builtins_aliases.clear()
         eager_builtins_aliases.update(snapshot[31])
+        uncertain_helper_shadows.clear()
+        uncertain_helper_shadows.update(snapshot[32])
 
     def merge_lexical_branch_scopes(body: tuple[Any, ...], otherwise: tuple[Any, ...]) -> tuple[Any, ...]:
         merged_typed_aliases: dict[str, tuple[str, int]] = {}
@@ -14313,7 +14532,7 @@ def _compact_snippet_typed_print_overwrite_replay(
 
         union_set_indexes = {1, *range(3, 12), *range(14, 20), 27, 28, 29}
         intersection_set_indexes = {2, 20, 30, 31}
-        merged: list[Any] = [None] * 32
+        merged: list[Any] = [None] * 33
         merged[0] = merged_typed_aliases
         merged[12] = merged_mapping_aliases
         merged[13] = merged_member_aliases
@@ -14321,8 +14540,23 @@ def _compact_snippet_typed_print_overwrite_replay(
             merged[index] = set(body[index]).union(otherwise[index])
         for index in intersection_set_indexes:
             merged[index] = set(body[index]).intersection(otherwise[index])
-        for index in range(21, 27):
-            merged[index] = bool(body[index] or otherwise[index])
+        helper_names = (
+            "local_setattr",
+            "local_vars",
+            "local_dict",
+            "builtins_setattr",
+            "builtins_vars",
+            "builtins_dict",
+        )
+        merged_uncertain_helpers: set[str] = set()
+        for index, helper_name in zip(range(21, 27), helper_names, strict=True):
+            merged[index] = bool(body[index] and otherwise[index])
+            helper_is_possible = bool(
+                body[index] or otherwise[index] or helper_name in body[32] or helper_name in otherwise[32]
+            )
+            if helper_is_possible and not merged[index]:
+                merged_uncertain_helpers.add(helper_name)
+        merged[32] = merged_uncertain_helpers
         return tuple(merged)
 
     executed_statement_ids = {id(statement) for statement in executed_statements}
@@ -14695,14 +14929,21 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
                     continue
                 if active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
-                    record_builtins_update(node)
+                    record_builtins_update(
+                        node,
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
                     continue
                 if (
                     active_dict_setitem_reference(reference)
                     and len(node.args) >= 3
                     and is_builtins_mapping(node.args[0])
                 ):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
                     continue
                 if (
                     active_dict_delete_reference(reference)
@@ -14750,7 +14991,11 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_builtins_setdefault(_static_getattr_member_name(node.args[0]), node.args[1])
                     continue
                 if active_setattr_reference(reference) and len(node.args) >= 3 and is_builtins_object(node.args[0]):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_setattr_reference(reference),
+                    )
                     continue
                 if (
                     reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
@@ -14770,7 +15015,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=is_conditionally_evaluated_typed_call(node),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_setattr_reference(reference)
+                        ),
                     )
                     continue
                 if (
@@ -14854,7 +15101,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_update(
                         update_owner,
                         node,
-                        conditional=is_conditionally_evaluated_typed_call(node),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_dict_mutator_reference(reference)
+                        ),
                     )
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
@@ -14878,7 +15127,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                                 setitem_owner,
                                 member_name,
                                 node.args[2],
-                                conditional=is_conditionally_evaluated_typed_call(node),
+                                conditional=(
+                                    is_conditionally_evaluated_typed_call(node)
+                                    or uncertain_dict_mutator_reference(reference)
+                                ),
                             )
                     continue
                 if active_dict_setdefault_reference(reference) and len(node.args) >= 3:
@@ -14886,7 +15138,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                         owner_name(node.args[0], active_mapping_aliases, active_typed_aliases),
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=is_conditionally_evaluated_typed_call(node),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_dict_mutator_reference(reference)
+                        ),
                     )
                     continue
                 if (
