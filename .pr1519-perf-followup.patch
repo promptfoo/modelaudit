@@ -1,0 +1,85 @@
+From 5b05720e4ee2b2f6b4fa50886283d331a1376d34 Mon Sep 17 00:00:00 2001
+From: Michael D'Angelo <mdangelo@openai.com>
+Date: Sat, 6 Jun 2026 17:12:29 +0000
+Subject: [PATCH] perf: bound JIT tail replay fallback
+
+---
+ modelaudit/detectors/jit_script.py          | 14 +++++-----
+ tests/detectors/test_jit_script_detector.py | 30 +++++++++++++++++++++
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/modelaudit/detectors/jit_script.py b/modelaudit/detectors/jit_script.py
+index ba47bbf2..e6954042 100644
+--- a/modelaudit/detectors/jit_script.py
++++ b/modelaudit/detectors/jit_script.py
+@@ -850,9 +850,10 @@ def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
+ 
+     tail = candidate[prefix_end:]
+     for line, statements in _compact_tail_module_lines(tail):
+-        for alias in list(aliases):
+-            if _has_late_alias_rebinding(line, alias):
+-                aliases.discard(alias)
++        if not statements:
++            for alias in list(aliases):
++                if _has_late_alias_rebinding(line, alias):
++                    aliases.discard(alias)
+         for statement in statements:
+             _update_compact_builtins_aliases(statement, aliases)
+     return frozenset(aliases - {"builtins", "__builtins__"})
+@@ -905,9 +906,10 @@ def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
+ 
+     tail = candidate[prefix_end:]
+     for line, statements in _compact_tail_module_lines(tail):
+-        for alias_name in list(aliases):
+-            if _has_late_alias_rebinding(line, alias_name):
+-                aliases.pop(alias_name, None)
++        if not statements:
++            for alias_name in list(aliases):
++                if _has_late_alias_rebinding(line, alias_name):
++                    aliases.pop(alias_name, None)
+         for statement in statements:
+             _update_compact_typed_import_aliases(statement, aliases)
+     return aliases
+diff --git a/tests/detectors/test_jit_script_detector.py b/tests/detectors/test_jit_script_detector.py
+index aef813c7..472c0388 100644
+--- a/tests/detectors/test_jit_script_detector.py
++++ b/tests/detectors/test_jit_script_detector.py
+@@ -9246,6 +9246,36 @@ class TestJITScriptDetector:
+ 
+         assert "bi" in aliases
+ 
++    def test_prefix_alias_rebinding_fallback_skips_parseable_tail_lines(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
++        prefix = b"import builtins as bi\nimport webbrowser as wb\n" + padding + b"bi = holder\nwb = holder\n"
++        calls = 0
++        original = jit_script_module._has_late_alias_rebinding
++
++        def track_fallback(candidate: bytes, alias: str) -> bool:
++            nonlocal calls
++            calls += 1
++            return original(candidate, alias)
++
++        monkeypatch.setattr(jit_script_module, "_has_late_alias_rebinding", track_fallback)
++
++        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
++        typed_aliases = jit_script_module._typed_import_aliases(prefix)
++
++        assert "bi" not in builtins_aliases
++        assert "wb" not in typed_aliases
++        assert calls == 0
++
++    def test_prefix_alias_rebinding_fallback_handles_malformed_tail_lines(self) -> None:
++        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
++        prefix = b"import builtins as bi\nimport webbrowser as wb\n" + padding + b"bi = holder +\nwb = holder +\n"
++
++        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
++        typed_aliases = jit_script_module._typed_import_aliases(prefix)
++
++        assert "bi" not in builtins_aliases
++        assert "wb" not in typed_aliases
++
+     def test_prefix_typed_aliases_discover_module_import_in_tail(self) -> None:
+         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+         prefix = padding + b"import webbrowser as wb\nalias = wb.open\n"
+-- 
+2.54.0
