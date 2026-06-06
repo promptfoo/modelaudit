@@ -186,12 +186,13 @@ SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|"
-    r"(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|(?:curl|wget|nc|netcat)(?=\s|$))"
+    r"(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|"
+    r"(?:curl|wget|nc|netcat|sshpass|redis-cli)(?=\s|$))"
     r"|(?:docker\s+login|aws\s+configure\s+set)\b"
 )
 COMMAND_CONTEXT_LITERAL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?:os\.system|subprocess|__import__|bash\s+-c|sh\s+-c|cmd\.exe|powershell|curl|wget|nc\s+|netcat|"
-    r"docker\s+login|aws\s+configure\s+set|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
+    r"sshpass|redis-cli|docker\s+login|aws\s+configure\s+set|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
 )
 COMMAND_BARE_SENSITIVE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
@@ -279,6 +280,11 @@ AWS_CONFIGURE_SET_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     rf"{COMMAND_TOKEN_SEPARATOR}(?:{SENSITIVE_ASSIGNMENT_KEY}){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
     rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
+COMMAND_PROGRAM_SHORT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b(?:(?:sshpass\b[^;&|\n]{{0,1024}}?(?<!\w)-p)|"
+    rf"(?:redis-cli\b[^;&|\n]{{0,1024}}?(?<!\w)-a))(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
     rf"(?P<key_quote>[\"'])(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
@@ -336,6 +342,9 @@ STRUCTURED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
 REDACTED_STRUCTURED_VALUE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"^\s*(?P<slashes>\\*)(?P<quote>[\"']){re.escape(REDACTED_EVIDENCE_VALUE)}"
     rf"(?P=slashes)(?P=quote)\s*(?=[,\]}})]|$)"
+)
+REDACTED_VALUE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^\s*{re.escape(REDACTED_EVIDENCE_VALUE)}(?=\s|[\"',;\])}}]|$)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
@@ -2123,7 +2132,7 @@ def _redact_sensitive_literal_expressions(text: str) -> str:
         segment_end = _find_value_expression_end(text, match.end(), segment_end)
         segment = text[match.end() : segment_end]
         pieces.append(text[cursor : match.start()])
-        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(segment):
+        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(segment) or REDACTED_VALUE_PREFIX_RE.match(segment):
             pieces.append(text[match.start() : segment_end])
         elif COMMAND_EVIDENCE_RE.search(segment):
             pieces.append(f"{text[match.start() : match.end()]}{_redact_sensitive_command_value(segment)}")
@@ -2791,6 +2800,7 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
     redacted = DOCKER_LOGIN_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = AWS_CONFIGURE_SET_SECRET_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = COMMAND_PROGRAM_SHORT_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", redacted)
     redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
     redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
