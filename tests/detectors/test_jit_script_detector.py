@@ -9523,6 +9523,84 @@ class TestJITScriptDetector:
 
         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
 
+    def test_prefix_typed_member_aliases_distinguish_reimported_module_identity(self) -> None:
+        prefix = (
+            b"import sys\nimport webbrowser as old\nold.open = print\n"
+            b"sys.modules.pop('webbrowser')\nimport webbrowser as fresh\nalias = fresh.open\n"
+        )
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_respect_safe_setdefault_after_delete(self) -> None:
+        prefix = b"import webbrowser as wb\ndel wb.open\nwb.__dict__.setdefault('open', print)\nalias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert "alias" not in aliases
+
+    def test_prefix_typed_member_aliases_replay_executing_class_body(self) -> None:
+        prefix = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"class Restore:\n    wb.open = original\nalias = wb.open\n"
+        )
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_scan_model_clears_callable_alias_overwritten_in_all_branches(self) -> None:
+        source = (
+            b"from webbrowser import open as opener\n"
+            b"if condition:\n    opener = print\nelse:\n    opener = print\n"
+            b"opener('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "expected"),
+        [
+            (
+                b"import sys\nimport webbrowser as old\nold.open = print\n"
+                b"sys.modules.pop('webbrowser')\nimport webbrowser as fresh\nalias = fresh.open\n",
+                True,
+            ),
+            (
+                b"import webbrowser as wb\ndel wb.open\nwb.__dict__.setdefault('open', print)\nalias = wb.open\n",
+                False,
+            ),
+            (
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"class Restore:\n    wb.open = original\nalias = wb.open\n",
+                True,
+            ),
+        ],
+    )
+    def test_scan_model_replays_prefix_member_state_across_split(
+        self,
+        prefix: bytes,
+        expected: bool,
+    ) -> None:
+        call_padding = b"# gap\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# gap\n") + 8
+        )
+        source = b"\x00\xff" + prefix + call_padding + b"alias('https://example.invalid')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+        assert detected is expected
+
     def test_prefix_typed_aliases_discover_deterministic_indented_tail_import(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\n"
