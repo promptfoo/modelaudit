@@ -96,8 +96,9 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
-    rb"(?:api[_-]?key|auth(?:orization)?\b|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
-    rb"(?![_-](?:cache|count|hint)\b)",
+    rb"(?<![A-Za-z0-9])"
+    rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
+    rb"\b(?![_-](?:cache|count|hint)\b)",
     re.IGNORECASE,
 )
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
@@ -1013,7 +1014,7 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
 
     key, separator, field_value = component[field_start:field_end].partition("=")
     value_lower = value.lower()
-    if separator and _is_sensitive_path_key(key):
+    if separator and _is_sensitive_path_key(_decode_query_component(key)):
         return True
     nested_url_candidates = (field_value, _decode_path_token(field_value))
     for candidate in nested_url_candidates:
@@ -1141,7 +1142,7 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
         for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
             key, separator, value = field.partition("=")
             candidate = value if separator else field
-            sensitive_field = bool(separator and _is_sensitive_path_key(key))
+            sensitive_field = bool(separator and _is_sensitive_path_key(_decode_query_component(key)))
             decoded = candidate
             decode_limit_exhausted = False
             for _ in range(_MAX_PATH_TOKEN_DECODE_PASSES):
