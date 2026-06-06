@@ -1472,6 +1472,101 @@ def test_resolve_discovered_shard_path_handles_concurrent_symlink_loop(tmp_path:
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_allows_restored_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target restored during preflight should continue through normal validation."""
+    target_path = tmp_path / "target.bin"
+    target_path.write_bytes(b"safe")
+    link_path = tmp_path / "model.bin"
+    link_path.symlink_to(target_path.name)
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_exists = Path.exists
+    link_exists_calls = 0
+
+    def transient_exists(path: Path) -> bool:
+        nonlocal link_exists_calls
+        if path == link_path:
+            link_exists_calls += 1
+            return link_exists_calls > 1
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", transient_exists)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        link_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved == target_path.resolve()
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is False
+    assert results.issues == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_reports_missing_symlink_when_windows_stat_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows may stat a dangling reparse point without reaching its missing target."""
+    broken_path = tmp_path / "missing.bin"
+    broken_path.symlink_to("absent.bin")
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_exists = Path.exists
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+    original_readlink = os.readlink
+
+    def fake_exists(path: Path) -> bool:
+        return False if path == broken_path else original_exists(path)
+
+    def lexical_broken_resolve(path: Path, strict: bool = False) -> Path:
+        if path == broken_path:
+            return Path(os.path.abspath(path))
+        return original_resolve(path, strict=strict)
+
+    def fake_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == broken_path:
+            return os.lstat(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    def raise_readlink(path: str | os.PathLike[str]) -> str:
+        if Path(path) == broken_path:
+            raise OSError("dangling link")
+        return original_readlink(path)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(Path, "resolve", lexical_broken_resolve)
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(core_module.os, "readlink", raise_readlink)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        broken_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved is None
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is True
+    assert any(
+        issue.message == "Broken symlink encountered"
+        and issue.location == str(broken_path)
+        and issue.details["scan_outcome_reason"] == "directory_entry_unavailable"
+        for issue in results.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_resolve_directory_scan_target_classifies_symlink_loop_as_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
