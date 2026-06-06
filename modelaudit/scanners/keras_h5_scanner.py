@@ -25,6 +25,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ..utils.file.hdf5 import find_hdf5_signature_offset
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -40,7 +41,7 @@ try:
     import h5py
 
     HAS_H5PY = True
-except ImportError:
+except Exception:
     HAS_H5PY = False
 
 _KERAS_VERSION_SEPARATOR = r"[._-]?"
@@ -246,11 +247,7 @@ class KerasH5Scanner(BaseScanner):
             return False
 
         if not HAS_H5PY:
-            try:
-                with open(path, "rb") as handle:
-                    return handle.read(8) == b"\x89HDF\r\n\x1a\n"
-            except OSError:
-                return False
+            return find_hdf5_signature_offset(path) is not None
 
         # Try to open as HDF5 file
         try:
@@ -276,16 +273,24 @@ class KerasH5Scanner(BaseScanner):
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
+            reason = "keras_h5_h5py_unavailable"
+            result.metadata["file_size"] = self.get_file_size(path)
+            self._mark_inconclusive_scan_result(result, reason)
             result.add_check(
                 name="H5PY Library Check",
                 passed=False,
                 message="h5py is required for Keras H5 scanning. Install with 'pip install modelaudit[h5]'.",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"path": path, "required_package": "h5py"},
+                details={
+                    "path": path,
+                    "required_package": "h5py",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 rule_code="S902",
             )
-            result.finish(success=True)
+            self._finish_scan_result(result)
             return result
 
         result = self._create_result()

@@ -205,6 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; clean up temporary Python compiler artifacts; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
+- fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
 - redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
@@ -321,6 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
+- include bounded content-routed Hugging Face repository files in selective downloads, preserve local filename-based false-positive guards, pin probes and downloads to one immutable revision, redact signed transport errors, enforce acquisition deadlines across transfer process groups, and fail closed when repository coverage cannot be completed safely
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
