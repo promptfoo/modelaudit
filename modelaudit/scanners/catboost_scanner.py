@@ -133,16 +133,26 @@ def _neutralize_existing_redaction_markers(text: str) -> str:
     )
 
 
-def _sanitize_decoded_reversible_evidence(decoded_text: str, original_text: str) -> str:
+def _sanitize_decoded_reversible_evidence(
+    decoded_text: str,
+    original_text: str,
+    *,
+    fail_closed_on_hidden_redaction: bool = False,
+) -> str:
     decoded_text = _neutralize_existing_redaction_markers(decoded_text)
     standalone_redacted = _redact_standalone_secret_tokens(decoded_text)
     redacted_decoded = redact_evidence_string(standalone_redacted, max_chars=160)
-    baseline = decoded_text if len(decoded_text) <= 160 else f"{decoded_text[:157]}..."
-    redaction_changed = standalone_redacted != decoded_text or redacted_decoded != baseline
-    if redaction_changed and (
-        REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded
-    ):
+    if REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded:
         return redacted_decoded
+    if fail_closed_on_hidden_redaction:
+        full_redacted = redact_evidence_string(
+            standalone_redacted,
+            max_chars=min(len(standalone_redacted), _MAX_ENCODED_EVIDENCE_CHARS),
+        )
+        if standalone_redacted != decoded_text or (
+            REDACTED_EVIDENCE_VALUE in full_redacted or REDACTED_URL_CREDENTIALS in full_redacted
+        ):
+            return REDACTED_EVIDENCE_VALUE
     return original_text
 
 
@@ -171,7 +181,11 @@ def _redact_split_base64_evidence(text: str) -> str:
         decoded_text = _decode_base64_evidence_payload(payload)
         if not decoded_text:
             return match.group(0)
-        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
+        return _sanitize_decoded_reversible_evidence(
+            decoded_text,
+            match.group(0),
+            fail_closed_on_hidden_redaction=True,
+        )
 
     return _SPLIT_BASE64_EVIDENCE_PATTERN.sub(replace_payload, text)
 
@@ -195,14 +209,22 @@ def _redact_literal_collection_evidence(text: str) -> str:
 
         decoded_text = _decode_base64_evidence_payload(joined)
         if decoded_text:
-            sanitized = _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
+            sanitized = _sanitize_decoded_reversible_evidence(
+                decoded_text,
+                match.group(0),
+                fail_closed_on_hidden_redaction=True,
+            )
             if sanitized != match.group(0):
                 return sanitized
 
         hex_sanitized = _redact_reversible_hex_evidence(joined)
         if hex_sanitized != joined:
             return hex_sanitized
-        return _sanitize_decoded_reversible_evidence(joined, match.group(0))
+        return _sanitize_decoded_reversible_evidence(
+            joined,
+            match.group(0),
+            fail_closed_on_hidden_redaction=True,
+        )
 
     return _STRING_LITERAL_COLLECTION_PATTERN.sub(replace_collection, text)
 
