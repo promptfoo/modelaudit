@@ -151,7 +151,10 @@ def _sanitize_decoded_reversible_evidence(
     if fail_closed_on_hidden_redaction:
         full_redacted = redact_evidence_string(
             standalone_redacted,
-            max_chars=min(len(standalone_redacted), _MAX_ENCODED_EVIDENCE_CHARS),
+            max_chars=min(
+                len(standalone_redacted) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
+                _MAX_ENCODED_EVIDENCE_CHARS + EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
+            ),
         )
         if standalone_redacted != decoded_text or (
             REDACTED_EVIDENCE_VALUE in full_redacted or REDACTED_URL_CREDENTIALS in full_redacted
