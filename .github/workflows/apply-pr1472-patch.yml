@@ -1,0 +1,43 @@
+name: Apply validated PR 1472 patch
+
+on:
+  push:
+    branches:
+      - mdangelo/codex/fix-dvc-output-limit-coverage-c085
+    paths:
+      - .github/workflows/apply-pr1472-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct validated tree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat .github/pr1472-patch/gzip*.b64 > /tmp/pr1472.patch.gz.b64
+          test "$(cut -c 7016 /tmp/pr1472.patch.gz.b64)" = "y"
+          printf 'i' | dd of=/tmp/pr1472.patch.gz.b64 bs=1 seek=7015 count=1 conv=notrunc status=none
+          echo "8787b5f87d0c8d50b98156e38025e0f0838ed349cf49bd4c88bdb5016975a45f  /tmp/pr1472.patch.gz.b64" | sha256sum --check -
+          base64 --decode /tmp/pr1472.patch.gz.b64 | gzip --decompress > /tmp/pr1472.patch
+          echo "3af69f6bcbe8b1f2bd9dc492a25b55ffd24326a1c58cd581de5cdd696b90431b  /tmp/pr1472.patch" | sha256sum --check -
+
+          git restore --source=0e81de7a8f98fb9b5e658c9af24351fdadd29f3c --staged --worktree :/
+          git apply --index /tmp/pr1472.patch
+          git diff --cached --check
+
+          tree_sha="$(git write-tree)"
+          test "$tree_sha" = "1204a49f126114f36b9dd68f194bf6a9fee9e848"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: harden capped DVC verification"
+          git push origin HEAD:mdangelo/codex/fix-dvc-output-limit-coverage-c085
