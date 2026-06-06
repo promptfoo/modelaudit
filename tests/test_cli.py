@@ -1037,6 +1037,69 @@ def test_cli_report_writers_reject_missing_path_with_trailing_separator(tmp_path
     assert not output_path.exists()
 
 
+def test_cli_report_writers_reject_missing_path_with_final_dot_component(tmp_path: Path) -> None:
+    """Raw directory syntax must not normalize into a different output filename."""
+    output_path = tmp_path / "missing-output"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", f"{output_path}{os.sep}."],
+    )
+
+    assert result.exit_code == 2
+    assert "final dot component" in result.output
+    assert not output_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent persistence handles are required")
+def test_cli_report_writers_open_parent_sync_handle_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent that cannot be reopened for fsync must fail before publication work."""
+    output_path = tmp_path / "scanners.json"
+    staging_open = MagicMock()
+
+    def reject_parent_sync(_output_path: str, _parent_fd: int) -> int:
+        raise cli_module._OutputWriteError("simulated parent sync open failure")
+
+    monkeypatch.setattr(cli_module, "_open_posix_output_parent_sync_fd", reject_parent_sync)
+    monkeypatch.setattr(cli_module, "_open_posix_output_staging_directory", staging_open)
+
+    with pytest.raises(cli_module._OutputWriteError, match="simulated parent sync open failure"):
+        cli_module._write_output_text_file(str(output_path), "report")
+
+    staging_open.assert_not_called()
+    assert not output_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_report_destination_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    """Unsupported atomic output destinations must be rejected before scan orchestration."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+
+    def reject_staging(_output_path: str, _parent_fd: int, _staging_name: str) -> int:
+        raise PermissionError(errno.EACCES, "simulated read-only output directory")
+
+    monkeypatch.setattr(cli_module, "_open_posix_output_staging_directory", reject_staging)
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "simulated read-only output directory" in result.output
+    resolve_scan_paths.assert_not_called()
+    assert not output_path.exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
 def test_cli_report_writers_stage_new_output_in_private_directory(
     tmp_path: Path,
@@ -1325,6 +1388,7 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
     victim_path.write_text("sentinel")
     output_path = output_dir / victim_path.name
     guard_handle = 123
+    lock_handle = 456
     closed_handles: list[int] = []
 
     def swap_parent_then_open(path: str) -> tuple[Path, int | None, int | None]:
@@ -1334,6 +1398,7 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
         return opened_path, None, guard_handle
 
     monkeypatch.setattr(cli_module, "_open_output_parent_directory", swap_parent_then_open)
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
     monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
 
     result = CliRunner().invoke(
@@ -1345,7 +1410,7 @@ def test_cli_report_writers_recheck_parent_links_on_fallback(
     assert "Refusing to write output through symlink" in result.output
     assert victim_path.read_text() == "sentinel"
     assert not list(redirected_dir.glob(".scanners.json.*.tmp"))
-    assert closed_handles == [guard_handle]
+    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
 
 
 def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
@@ -1359,6 +1424,7 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
     original_validate = cli_module._validated_absolute_output_path
     validation_count = 0
     guard_handle = 123
+    lock_handle = 456
     closed_handles: list[int] = []
 
     def install_hard_link_after_validation(path: str) -> Path:
@@ -1374,6 +1440,7 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
         "_open_output_parent_directory",
         lambda path: (original_validate(path), None, guard_handle),
     )
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
     monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
     monkeypatch.setattr(cli_module, "_validated_absolute_output_path", install_hard_link_after_validation)
 
@@ -1385,7 +1452,7 @@ def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
     assert result.exit_code == 2
     assert victim_path.read_text() == "sentinel"
     assert output_path.samefile(victim_path)
-    assert closed_handles == [guard_handle]
+    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
 
 
 def test_cli_report_writers_keep_windows_parent_guard_through_replace(
@@ -1395,21 +1462,44 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     """The Windows parent guard must remain live until atomic installation finishes."""
     output_path = tmp_path / "scanners.json"
     guard_handle = 123
+    lock_handle = 456
     closed_handles: list[int] = []
-    original_replace = cli_module.os.replace
 
     monkeypatch.setattr(
         cli_module,
         "_open_output_parent_directory",
         lambda _path: (output_path, None, guard_handle),
     )
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: lock_handle)
     monkeypatch.setattr(cli_module, "_close_windows_handle", closed_handles.append)
 
-    def guarded_replace(source: Path, destination: Path) -> None:
-        assert closed_handles == []
-        original_replace(source, destination)
+    if os.name == "nt":
+        original_windows_replace = cli_module._replace_windows_output_file
 
-    monkeypatch.setattr(cli_module.os, "replace", guarded_replace)
+        def guarded_windows_replace(
+            output: str,
+            temp_fd: int,
+            destination_path: Path,
+            *,
+            replace_existing: bool,
+        ) -> None:
+            assert closed_handles == []
+            original_windows_replace(
+                output,
+                temp_fd,
+                destination_path,
+                replace_existing=replace_existing,
+            )
+
+        monkeypatch.setattr(cli_module, "_replace_windows_output_file", guarded_windows_replace)
+    else:
+        original_replace = cli_module.os.replace
+
+        def guarded_replace(source: Path, destination: Path) -> None:
+            assert closed_handles == []
+            original_replace(source, destination)
+
+        monkeypatch.setattr(cli_module.os, "replace", guarded_replace)
 
     result = CliRunner().invoke(
         cli,
@@ -1417,7 +1507,7 @@ def test_cli_report_writers_keep_windows_parent_guard_through_replace(
     )
 
     assert result.exit_code == 0, result.output
-    assert closed_handles == [guard_handle]
+    assert closed_handles == ([lock_handle, guard_handle] if os.name == "nt" else [guard_handle])
     assert json.loads(output_path.read_text())["scanners"]
 
 

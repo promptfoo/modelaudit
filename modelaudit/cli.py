@@ -119,6 +119,8 @@ def _absolute_output_path(output_path: str) -> Path:
     separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
     if output_path.endswith(separators):
         raise _OutputWriteError(f"Refusing output path with trailing separator: {_display_path(output_path)}")
+    if output_path == "." or any(output_path.endswith(f"{separator}.") for separator in separators):
+        raise _OutputWriteError(f"Refusing output path with final dot component: {_display_path(output_path)}")
     path = Path(output_path)
     if path.is_absolute():
         return path
@@ -885,18 +887,77 @@ def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int
         ) from exc
 
 
-def _fsync_posix_output_parent(output_path: str, parent_fd: int) -> None:
-    """Persist a published POSIX report directory entry before reporting success."""
+def _open_posix_output_parent_sync_fd(output_path: str, parent_fd: int) -> int:
+    """Open the pinned parent for fsync before publishing a report entry."""
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(".", directory_flags, dir_fd=parent_fd)
     try:
-        os.fsync(directory_fd)
+        return os.open(".", directory_flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to secure output persistence for {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _fsync_posix_output_parent(output_path: str, parent_sync_fd: int) -> None:
+    """Persist a published POSIX report directory entry before reporting success."""
+    try:
+        os.fsync(parent_sync_fd)
     except OSError as exc:
         raise _OutputWriteError(
             f"Unable to persist output {_display_path(output_path)}: {exc.strerror or exc}"
         ) from exc
+
+
+def _preflight_output_text_file(output_path: str) -> None:
+    """Reject unsupported output destinations before a model scan begins."""
+    absolute_path: Path | None = None
+    parent_fd: int | None = None
+    parent_guard: int | None = None
+    existing_fd: int | None = None
+    parent_sync_fd: int | None = None
+    staging_fd: int | None = None
+    staging_name = ""
+    try:
+        absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
+        initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+        if initial_stat is not None:
+            existing_fd = _open_existing_output_file(
+                output_path,
+                absolute_path,
+                initial_stat,
+                parent_fd=parent_fd,
+            )
+        if parent_fd is None:
+            return
+
+        parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
+        staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+        staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+    except _OutputWriteError:
+        raise
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to prepare output {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
     finally:
-        os.close(directory_fd)
+        if staging_fd is not None:
+            staging_stat: os.stat_result | None = None
+            with contextlib.suppress(OSError):
+                staging_stat = os.fstat(staging_fd)
+            os.close(staging_fd)
+            if parent_fd is not None and staging_name and staging_stat is not None:
+                with contextlib.suppress(OSError):
+                    named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+                    if os.path.samestat(staging_stat, named_stat):
+                        os.rmdir(staging_name, dir_fd=parent_fd)
+        if parent_sync_fd is not None:
+            os.close(parent_sync_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if parent_guard is not None:
+            _close_windows_handle(parent_guard)
 
 
 def _write_output_text_file(output_path: str, output_text: str, *, trailing_newline: bool = False) -> None:
@@ -911,6 +972,7 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
     parent_guard: int | None = None
     parent_lock: int | None = None
     existing_fd: int | None = None
+    parent_sync_fd: int | None = None
     staging_fd: int | None = None
     staging_name = ""
     temp_fd: int | None = None
@@ -937,6 +999,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
                 raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
             if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
                 raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        if parent_fd is not None:
+            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         if nofollow:
@@ -1007,7 +1071,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
             else:
                 os.rename(temp_name, absolute_path.name, src_dir_fd=staging_fd, dst_dir_fd=parent_fd)
             temp_name = ""
-            _fsync_posix_output_parent(output_path, parent_fd)
+            assert parent_sync_fd is not None
+            _fsync_posix_output_parent(output_path, parent_sync_fd)
     except _OutputWriteError:
         raise
     except OSError as exc:
@@ -1034,6 +1099,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
                     named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
                     if os.path.samestat(staging_stat, named_stat):
                         os.rmdir(staging_name, dir_fd=parent_fd)
+            if parent_sync_fd is not None:
+                os.close(parent_sync_fd)
             os.close(parent_fd)
         elif temp_path is not None:
             with contextlib.suppress(OSError):
@@ -3302,6 +3369,14 @@ def scan_command(
         "has_scanner_selection": bool(scanners or exclude_scanners),
         "num_paths": len(paths),
     }
+
+    try:
+        for output_path in dict.fromkeys(path for path in (output, sbom) if path is not None):
+            _preflight_output_text_file(output_path)
+    except _OutputWriteError:
+        record_scan_failed(time.time() - scan_start_time, "Unable to prepare scan output")
+        flush_telemetry()
+        raise
 
     record_command_used("scan", duration=None, **telemetry_options)
     record_scan_started(list(paths), telemetry_options)
