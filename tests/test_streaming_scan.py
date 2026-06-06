@@ -1,5 +1,6 @@
 """Tests for streaming scan-and-delete functionality."""
 
+import logging
 import os
 import pickle
 import struct
@@ -7,13 +8,16 @@ import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
+from modelaudit.integrations.sarif_formatter import format_sarif_output
+from modelaudit.models import LicenseInfoModel
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -88,12 +92,50 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         result = scan_model_directory_or_file(f"stream://{stream_url}")
 
         args, kwargs = mock_scanner.call_args
-        assert args[0] == stream_url
+        assert args[0] == "/model.pkl"
         assert "config" in kwargs
         mock_stream.assert_called_once_with(stream_url, dummy_scanner)
         assert result.files_scanned == 1
         assert result.bytes_scanned == 123
-        assert determine_exit_code(result) == 0
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_directory_or_file_encoded_signed_query_preserves_routing() -> None:
+    """Encoded signed queries must not hide the model suffix from scanner routing."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret-token"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)) as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()) as mock_scanner,
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    assert mock_scanner.call_args.args[0] == "/model.pkl"
+    mock_stream.assert_called_once_with(stream_url, mock_scanner.return_value)
+    serialized = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in serialized
+    assert "secret-token" not in serialized
+
+
+def test_scan_model_directory_or_file_mixed_case_streaming_path() -> None:
+    """URI scheme casing must not bypass streaming routing."""
+    stream_url = "S3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        scan_model_directory_or_file(f"STREAM://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
 
 
 def test_scan_model_directory_or_file_incomplete_streaming_path_returns_exit_code_2() -> None:
@@ -154,6 +196,335 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
     assert metadata["scan_outcome"] == "inconclusive"
     assert result.success is True
     assert determine_exit_code(result) == 1
+
+
+def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
+    """stream:// scans must preserve raw scanner input but redact persisted output."""
+    stream_url = (
+        "https://bucket.s3.amazonaws.com/model.pkl?"
+        "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
+    )
+    safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = (
+        "https://collector.example/upload?"
+        "visible=yes&token=secondary-secret&password=password-secret&opaque=unknown-secret"
+    )
+    parsed_credentials = {
+        "Authorization": "Bearer nested-auth-secret",
+        "client_secret": "nested-client-secret",
+        "access%252525255Ftoken": "deeply-encoded-token-secret",
+        "tokenizer": "sentencepiece",
+    }
+    fragment_url = "https://collector.example/callback#access_token=fragment-secret"
+    legacy_signed_url = (
+        "https://bucket.s3.amazonaws.com/related.pkl?"
+        "AWSAccessKeyId=AKIARELATED&Expires=123456&Signature=related-signature"
+    )
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata.update(
+        {
+            "source_url": stream_url,
+            "related_url": related_url,
+            "fragment_url": fragment_url,
+            "path_url": Path(related_url),
+            "license_info": [LicenseInfoModel(url=related_url)],
+            "source_set": {stream_url, related_url},
+            "source_bytes": stream_url.encode(),
+            "legacy_signed_url": legacy_signed_url,
+            "parsed_query": parsed_credentials,
+            "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
+        }
+    )
+    scan_result.add_issue(
+        f"Dangerous payload from {stream_url}",
+        severity=IssueSeverity.CRITICAL,
+        location=f"{stream_url}:payload",
+        details={
+            "source": stream_url,
+            "nested": [stream_url],
+            stream_url: {"source": stream_url},
+            "related_url": related_url,
+            "fragment_url": fragment_url,
+            "path_url": Path(related_url),
+            "license_info": [LicenseInfoModel(url=related_url)],
+            "source_set": {stream_url, related_url},
+            "source_bytes": stream_url.encode(),
+            "legacy_signed_url": legacy_signed_url,
+            "parsed_query": parsed_credentials,
+            "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
+        },
+    )
+    scan_result.add_check(
+        name=f"Streaming Payload {stream_url}",
+        passed=False,
+        message=f"Checked {stream_url}",
+        severity=IssueSeverity.CRITICAL,
+        location=f"{stream_url} (header)",
+        details={
+            "source": stream_url,
+            stream_url: {"source": stream_url},
+            "parsed_query": parsed_credentials,
+        },
+        why=f"Matched {stream_url}",
+    )
+    cast(Any, scan_result.issues[0]).source_index = {stream_url: stream_url}
+    cast(Any, scan_result.checks[0]).source_index = {stream_url: stream_url}
+    cast(Any, scan_result.issues[0]).parsed_query = parsed_credentials
+    cast(Any, scan_result.checks[0]).parsed_query = parsed_credentials
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+    json_text = result.model_dump_json(exclude_none=True)
+    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
+
+    for leaked in (
+        "AKIASECRET",
+        "deadbeef",
+        "secret-token",
+        "secondary-secret",
+        "password-secret",
+        "unknown-secret",
+        "fragment-secret",
+        "AKIARELATED",
+        "related-signature",
+        "X-Amz-Signature",
+        "nested-auth-secret",
+        "nested-client-secret",
+        "deeply-encoded-token-secret",
+    ):
+        assert leaked not in json_text
+        assert leaked not in sarif_text
+    assert "sentencepiece" in json_text
+    assert "sentencepiece" in sarif_text
+    assert stream_url not in json_text
+    assert stream_url not in sarif_text
+    assert safe_url in json_text
+    assert safe_url in sarif_text
+    assert "visible=yes" in json_text
+    assert "visible=yes" in sarif_text
+    assert "token=<redacted>" in sarif_text
+    assert "opaque=<redacted>" in json_text
+    assert "opaque=<redacted>" in sarif_text
+    assert "https://collector.example/upload<redacted>" not in sarif_text
+    assert safe_url in result.file_metadata
+    assert all(asset.path != stream_url for asset in result.assets)
+
+
+def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
+    """Stream record sanitization should not depend on the source URL needing redaction."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret&password=password-secret"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata.update({"related_url": related_url})
+    scan_result.add_issue(
+        f"Related signed URL {related_url}",
+        severity=IssueSeverity.WARNING,
+        location=stream_url,
+        details={"related_url": related_url},
+    )
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "secondary-secret" not in json_text
+    assert "password-secret" not in json_text
+    assert "token=<redacted>" in json_text
+    assert "visible=yes" in json_text
+
+
+def test_streaming_transformed_and_escaped_credentials_are_redacted() -> None:
+    """Scanner-normalized source diagnostics must not bypass reporting redaction."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    opaque_url = "https://collector.example/callback?OPAQUE-QUERY-SECRET#OPAQUE-FRAGMENT-SECRET"
+    escaped_url = r"https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-STREAM-SECRET"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata.update(
+        {
+            "normalized_query": "token=TRANSFORMED-STREAM-SECRET",
+            "opaque_url": opaque_url,
+            "escaped_url": escaped_url,
+            "authorization_header": "Authorization: Bearer HEADER-STREAM-SECRET",
+        }
+    )
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
+    for secret in (
+        "TRANSFORMED-STREAM-SECRET",
+        "OPAQUE-QUERY-SECRET",
+        "OPAQUE-FRAGMENT-SECRET",
+        "ENCODED-STREAM-SECRET",
+        "HEADER-STREAM-SECRET",
+    ):
+        assert secret not in json_text
+        assert secret not in sarif_text
+    assert "token=<redacted>" in json_text
+    assert "https://collector.example/callback" in json_text
+
+
+def test_streaming_related_url_safe_key_cannot_hide_encoded_nested_credentials() -> None:
+    """Scanner metadata must redact nested credentials hidden under an allowlisted key."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = "https://collector.example/upload?lang=en%26token%3Dsecondary-secret"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata["related_url"] = related_url
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
+    assert "secondary-secret" not in json_text
+    assert "secondary-secret" not in sarif_text
+    assert "lang=<redacted>" in json_text
+
+
+def test_streaming_invalid_utf8_metadata_is_replaced_before_reporting() -> None:
+    """Opaque binary metadata must not retain signed URLs or break JSON output."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?token=secret-token"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.metadata["opaque_blob"] = b"\xff" + stream_url.encode()
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "<binary data>" in json_text
+    assert "secret-token" not in json_text
+
+
+def test_streaming_malformed_port_error_is_redacted() -> None:
+    """Malformed stream URLs should produce a safe operational result, not escape error handling."""
+    stream_url = "https://user:password@example.com:notaport/model.pkl?token=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "stream://<cloud URL redacted>" in json_text
+    assert "password" not in json_text
+    assert "secret-token" not in json_text
+
+
+def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:
+    """stream:// scanner-routing failures must not persist signed URL material."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with patch("modelaudit.scanners.get_scanner_for_file", return_value=None) as mock_scanner:
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_scanner.assert_called_once()
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in json_text
+    assert "secret-token" not in json_text
+    assert "X-Amz-Signature" not in json_text
+    assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
+    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert determine_exit_code(result) == 2
+
+
+def test_streaming_signed_url_analysis_none_error_is_redacted() -> None:
+    """stream:// analysis failures must not persist signed URL material."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(None, False)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in json_text
+    assert "secret-token" not in json_text
+    assert "X-Amz-Signature" not in json_text
+    assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
+    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert determine_exit_code(result) == 2
+
+
+def test_streaming_signed_url_routing_exception_log_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    """stream:// routing exceptions must not leak signed URLs through tracebacks."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit.core"),
+        patch(
+            "modelaudit.scanners.get_scanner_for_file",
+            side_effect=RuntimeError(f"route failed for {stream_url}"),
+        ),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    assert determine_exit_code(result) == 2
+    assert "https://bucket.s3.amazonaws.com/model.pkl" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+def test_streaming_signed_url_with_invalid_port_fails_closed() -> None:
+    """Malformed URL authorities must not make the reporting sanitizer raise or leak."""
+    stream_url = "https://example.com:not-a-port/model.pkl?token=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "secret-token" not in json_text
+    assert "token=" not in json_text
+    assert "<cloud URL redacted>" in json_text
+
+
+def test_streaming_signed_url_without_inner_scheme_fails_closed() -> None:
+    """Malformed stream identifiers must not persist their raw query in error assets."""
+    stream_url = "bucket/model.pkl?session=secret-token"
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert "secret-token" not in json_text
+    assert "session=" not in json_text
+    assert "stream://<cloud URL redacted>" in json_text
 
 
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
