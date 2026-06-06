@@ -24,7 +24,7 @@ from ..scanner_results import (
     mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
-from ._evidence_redaction import redact_untrusted_error_message
+from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
 # Progress tracking imports with circular dependency detection
@@ -570,7 +570,7 @@ class BaseScanner(ABC):
         coverage_gap: str = "analysis_failed",
     ) -> None:
         mark_inconclusive_scan_result(result, RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON)
-        location = context or self.current_file_path
+        location = redact_evidence_string(context or self.current_file_path, max_chars=500)
         failure_details: dict[str, Any] = {
             "detector": detector,
             "context": location,
@@ -1050,7 +1050,7 @@ class BaseScanner(ABC):
                 detector_config = {**(detector_config or {}), "max_findings": max_findings}
             detector = NetworkCommDetector(detector_config)
             findings = detector.scan(data, context)
-            return findings
+            return [dict(finding) for finding in findings]
 
         except ImportError:
             if raise_on_error:

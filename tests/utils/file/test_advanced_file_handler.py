@@ -71,6 +71,12 @@ class RawDetectorMemoryMappedScanner(BaseScanner):
         raise NotImplementedError
 
 
+class PatternMemoryMappedScanner:
+    """Minimal scanner that exercises the mmap fallback pattern checks."""
+
+    name = "pattern_mmap"
+
+
 _SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
 
 
@@ -289,6 +295,81 @@ class TestMemoryMappedHandler:
             check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
             for check in result.checks
         )
+
+    def test_mmap_uses_opened_file_size_after_growth(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "grown-model.bin"
+        model_path.write_bytes(b"benign-prefix")
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        with model_path.open("ab") as model_file:
+            model_file.write(b"; os.system('id')")
+
+        result = handler.scan_with_mmap()
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert any(
+            check.name == "Suspicious Pattern Detection" and check.status.value == "failed" for check in result.checks
+        )
+
+    def test_mmap_file_growth_during_scan_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "mutated-model.bin"
+        model_path.write_bytes(b"a" * 32)
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+        mutated = False
+
+        def append_during_scan(_message: str, _percentage: float) -> None:
+            nonlocal mutated
+            if not mutated:
+                with model_path.open("ab") as model_file:
+                    model_file.write(b"os.system('id')")
+                mutated = True
+
+        result = handler.scan_with_mmap(progress_callback=append_during_scan)
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "memory_mapped_source_changed" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "Memory-Mapped Source Stability" for check in result.checks)
+
+    def test_mmap_progress_counts_unique_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "overlap-progress.bin"
+        model_path.write_bytes(b"a" * (3 * 1024 * 1024))
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 2 * 1024 * 1024)
+        percentages: list[float] = []
+
+        result = handler.scan_with_mmap(
+            progress_callback=lambda _message, percentage: percentages.append(percentage),
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert percentages
+        assert max(percentages) == 100.0
+
+    def test_mmap_error_details_are_redacted(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "progress-error.bin"
+        model_path.write_bytes(b"benign model content")
+        leaked_secret = "MMAP-ERROR-SECRET-123456"
+
+        def fail_progress(_message: str, _percentage: float) -> None:
+            raise RuntimeError(f"progress failed with {leaked_secret}")
+
+        result = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner()).scan_with_mmap(
+            progress_callback=fail_progress,
+        )
+
+        assert result.success is False
+        assert leaked_secret not in result.to_json()
+        error_check = next(check for check in result.checks if check.name == "Memory-Mapped Scan")
+        assert error_check.details["error"] == "<redacted>"
 
     def test_mmap_raw_detector_failure_suppresses_later_clean_check(
         self,

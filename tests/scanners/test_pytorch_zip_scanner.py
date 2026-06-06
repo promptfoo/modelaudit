@@ -4,6 +4,7 @@ import struct
 import time
 import warnings
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
 
@@ -1235,11 +1236,14 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = tmp_path / "unreadable_jit_member.pt"
+    leaked_member_secret = "MEMBER-READ-SECRET-123456"
+    leaked_error_secret = "READ-ERROR-SECRET-123456"
+    sensitive_member = f"archive/code/debug/api_key={leaked_member_secret}.txt"
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
-        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+        zip_file.writestr(sensitive_member, b"print('hello')\n")
 
     original_read_member_bytes = PyTorchZipScanner._read_member_bytes
 
@@ -1252,8 +1256,8 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
         result: ScanResult,
         max_bytes: int | None = None,
     ) -> bytes:
-        if phase == "jit_script_scan" and self._get_zip_member_name(name).endswith("source.py"):
-            raise OSError("member read failed")
+        if phase == "jit_script_scan" and self._get_zip_member_name(name) == sensitive_member:
+            raise OSError(f"member read failed: {leaked_error_secret}")
         return original_read_member_bytes(self, zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
 
     monkeypatch.setattr(PyTorchZipScanner, "_read_member_bytes", fail_jit_member_read)
@@ -1269,9 +1273,11 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     assert len(read_failure_checks) == 1
     details = read_failure_checks[0].details
     assert details["failed_count"] == 1
-    assert details["zip_entries"] == ["archive/code/debug/source.py"]
     assert details["entries"][0]["exception_type"] == "OSError"
-    assert details["entries"][0]["exception"] == "member read failed"
+    assert details["entries"][0]["exception"] == "<redacted>"
+    assert leaked_member_secret not in result.to_json()
+    assert leaked_error_secret not in result.to_json()
+    assert "<redacted>" in details["zip_entries"][0]
 
 
 def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
@@ -1427,6 +1433,48 @@ def test_pytorch_zip_raw_detector_exception_marks_scan_inconclusive(
     assert leaked_secret not in caplog.text
     assert not any(
         check.name == clean_check_name and check.status == CheckStatus.PASSED and check.location == str(model_path)
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_deferred_network_detector_exception_is_redacted_and_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "deferred-network-error.pt", prefix="archive")
+    leaked_secret = "DEFERRED-NETWORK-SECRET-123456"
+    leaked_member_secret = "MEMBER-NAME-SECRET-123456"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(f"archive/code/api_key={leaked_member_secret}.txt", "network detector input")
+
+    def deferred_detector_error(*_args: object, **_kwargs: object) -> Iterator[dict[str, object]]:
+        def findings() -> Iterator[dict[str, object]]:
+            yield from ()
+            raise RuntimeError(f"network detector rejected {leaked_secret}")
+
+        return findings()
+
+    monkeypatch.setattr("modelaudit.detectors.network_comm.NetworkCommDetector.scan", deferred_detector_error)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "pytorch_zip_jit_member_read_failed" not in result.metadata["scan_outcome_reasons"]
+    assert leaked_secret not in result.to_json()
+    assert leaked_member_secret not in result.to_json()
+    assert leaked_secret not in caplog.text
+    assert leaked_member_secret not in caplog.text
+    assert any(
+        check.name == "Raw Detector Analysis Coverage"
+        and check.details.get("detector") == "network_communication"
+        and check.details.get("exception") == "<redacted>"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
 

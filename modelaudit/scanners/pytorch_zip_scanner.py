@@ -21,6 +21,7 @@ from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import (
     executable_archive_member_content_rule_code_from_bytes,
@@ -1856,13 +1857,15 @@ class PyTorchZipScanner(BaseScanner):
                         all_network_findings.extend(network_findings)
 
             except Exception as e:
-                logger.debug(f"Exception reading {name}: {e}")
+                safe_name = redact_evidence_string(name, max_chars=500)
+                safe_error = redact_untrusted_error_message(e)
+                logger.debug("Exception reading %s: %s", safe_name, safe_error)
                 read_failed_entries.append(
                     {
-                        "zip_entry": name,
-                        "exception": str(e),
+                        "zip_entry": safe_name,
+                        "exception": safe_error,
                         "exception_type": type(e).__name__,
-                        "location": f"{path}:{name}",
+                        "location": redact_evidence_string(f"{path}:{name}", max_chars=500),
                     }
                 )
 
