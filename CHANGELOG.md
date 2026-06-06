@@ -213,6 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files; preserve Windows ownership and ACLs, and reject EFS-encrypted destinations that cannot be replaced without changing recipients
+- distinguish valid R call/index argument tags from malformed credential assignments and fail closed on incomplete function bodies
 - validate OCI layer member and link metadata without suppressing regular-file payload scans, while preserving valid container-root symlinks
 - prevent cache identity checks from accepting temporary higher-ancestor path swaps
 - preflight MLflow artifact sizes and copy supported local repositories under hard byte limits, rejecting unsafe paths, size drift, and backends that cannot enforce the configured download budget
