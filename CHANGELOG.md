@@ -204,6 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
 - redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
