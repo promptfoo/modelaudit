@@ -1,5 +1,9 @@
 """Tests for code validation utilities."""
 
+import tempfile
+
+import pytest
+
 from modelaudit.utils.helpers.code_validation import (
     extract_dangerous_constructs,
     is_code_potentially_dangerous,
@@ -62,6 +66,31 @@ class MyClass:
         is_valid, error = validate_python_syntax(complex_code)
         assert is_valid is True
         assert error is None
+
+    def test_validates_without_temporary_files(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def reject_temporary_file(*args: object, **kwargs: object) -> None:
+            raise AssertionError("syntax validation must not persist source or bytecode")
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", reject_temporary_file)
+        monkeypatch.setattr(tempfile, "TemporaryDirectory", reject_temporary_file)
+
+        is_valid, error = validate_python_syntax("value = 1")
+
+        assert is_valid is True
+        assert error is None
+
+    @pytest.mark.parametrize(
+        "invalid_code",
+        ["return 'LAMBDA_VALIDATION_SECRET_C032'", "break", "continue", "nonlocal value"],
+    )
+    def test_rejects_semantically_invalid_module_code(self, invalid_code: str) -> None:
+        marker = "LAMBDA_VALIDATION_SECRET_C032"
+
+        is_valid, error = validate_python_syntax(invalid_code)
+
+        assert is_valid is False
+        assert error is not None and "Syntax error" in error
+        assert marker not in error
 
 
 class TestExtractDangerousConstructs:

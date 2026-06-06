@@ -375,6 +375,29 @@ def test_cache_identity_rejects_symlink_component_before_parent_traversal(tmp_pa
         cache.capture_file_identity(str(traversed_path))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin /private path aliases")
+def test_cache_identity_allows_darwin_private_var_and_tmp_aliases(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    alias_path: Path | None = None
+    for alias, target in ((Path("/var"), Path("/private/var")), (Path("/tmp"), Path("/private/tmp"))):
+        try:
+            candidate = alias / file_path.resolve().relative_to(target)
+        except ValueError:
+            continue
+        if alias.is_symlink() and candidate.exists():
+            alias_path = candidate
+            break
+    if alias_path is None:
+        pytest.skip("test temp path is not reachable through a Darwin /private alias")
+
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+
+    assert cache._path_has_symlink_component(str(alias_path)) is False
+    file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(alias_path))
+    assert file_stat.st_size == file_path.stat().st_size
+    assert ancestor_identity
+
+
 def test_cache_path_component_rejects_windows_reparse_point(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
