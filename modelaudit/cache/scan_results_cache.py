@@ -1797,6 +1797,11 @@ class ScanResultsCache:
             fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
         if not isinstance(fingerprint_metadata, dict):
             return False
+        if fingerprint_metadata.get("source_independent") is True:
+            return isinstance(metadata, dict) and self._source_independent_call_graph_fingerprints_are_valid(
+                fingerprint_metadata,
+                metadata,
+            )
         if fingerprint_metadata.get("reusable") is not True:
             return False
         if fingerprint_metadata.get("search_context") != self._source_search_context():
@@ -1877,6 +1882,36 @@ class ScanResultsCache:
         except (OSError, ValueError):
             return False
         return True
+
+    @staticmethod
+    def _source_independent_call_graph_fingerprints_are_valid(
+        fingerprint_metadata: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> bool:
+        if fingerprint_metadata != {
+            "reusable": True,
+            "source_independent": True,
+            "fingerprints": {},
+            "read_fingerprints": {},
+            "module_sources": {},
+            "loaded_module_sources": {},
+            "loaded_package_paths": {},
+        }:
+            return False
+        if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
+            return False
+        if any(
+            metadata.get(key)
+            for key in (
+                "import_references_truncated",
+                "callable_invocations_truncated",
+                "non_allowlisted_global_imports_truncated",
+            )
+        ):
+            return False
+        if metadata.get("container_type") == "pytorch_zip":
+            return True
+        return not any(metadata.get(key) for key in _PICKLE_CALL_GRAPH_INPUT_KEYS)
 
     @staticmethod
     def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:

@@ -1531,6 +1531,56 @@ def test_merge_call_graph_source_fingerprint_metadata_marks_read_conflict_unreus
     assert merged["read_fingerprints"]["/tmp/src/helper.py"]["fingerprint"] == "1111"
 
 
+def test_merge_call_graph_source_fingerprints_preserves_source_independence_only_when_all_members_are() -> None:
+    source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    source_sensitive = {
+        "reusable": True,
+        "search_context": ["source-root"],
+        "resolution_context": {"meta_path": [], "path_hooks": [], "path_importers": []},
+        "fingerprints": {"source.py": "digest"},
+        "read_fingerprints": {},
+        "module_sources": {"source": "source.py"},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+    assert package_api._merge_call_graph_source_fingerprint_metadata(None, source_independent) == source_independent
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, source_independent)
+        == source_independent
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, source_sensitive)
+        == source_sensitive
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_sensitive, source_independent)
+        == source_sensitive
+    )
+
+
+def test_combine_pytorch_zip_reports_marks_missing_member_fingerprint_provenance_unreusable() -> None:
+    source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    proven_member = PickleReport(
+        source="model.pt:archive/data.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        private_metadata={"call_graph_source_fingerprints": source_independent},
+    )
+    unproven_member = PickleReport(
+        source="model.pt:archive/extra.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+    )
+
+    private_metadata = package_api._combine_call_graph_source_fingerprint_private_metadata(
+        [proven_member, unproven_member]
+    )
+
+    assert private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert "source_independent" not in private_metadata["call_graph_source_fingerprints"]
+
+
 @pytest.mark.parametrize(
     "metadata_key",
     [
@@ -6386,6 +6436,15 @@ def test_scan_bytes_skips_call_graph_enrichment_without_references(
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    assert report.private_metadata["call_graph_source_fingerprints"] == {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
 
 
 def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(

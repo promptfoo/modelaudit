@@ -89,6 +89,18 @@ def _call_graph_fingerprint_metadata(
     }
 
 
+def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
+    return {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+
 def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
     file_stat, file_hash, change_token, ancestor_identity = cache.capture_file_identity(file_path)
     return {
@@ -1905,6 +1917,128 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
     )
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
+
+
+@pytest.mark.parametrize(
+    "metadata_extra",
+    (
+        {},
+        {"container_type": "pytorch_zip", "member_reports": []},
+    ),
+)
+def test_scan_cache_accepts_source_independent_call_graph_metadata_under_unreusable_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_extra: dict[str, object],
+) -> None:
+    class StatefulPathHook:
+        def __init__(self) -> None:
+            for index in range(17):
+                setattr(self, f"state_{index}", index)
+
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    monkeypatch.setattr(sys, "path_hooks", [StatefulPathHook()])
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    metadata = {
+        "pickle_report_status": "complete",
+        "pickle_verdict": "clean",
+        "import_references": [],
+        "callable_invocations": [],
+        **metadata_extra,
+    }
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": metadata,
+        "_private_metadata": {"call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata()},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == {
+        "checks": [],
+        "issues": [],
+        "metadata": metadata,
+    }
+
+
+@pytest.mark.parametrize("mutation", ("fingerprints", "resolution_context", "source_independent"))
+def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprint_metadata: dict[str, object] = _source_independent_call_graph_fingerprint_metadata()
+    if mutation == "fingerprints":
+        fingerprint_metadata["fingerprints"] = {str(tmp_path / "helper.py"): None}
+    elif mutation == "resolution_context":
+        fingerprint_metadata["resolution_context"] = {}
+    else:
+        fingerprint_metadata["source_independent"] = False
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [],
+            "callable_invocations": [],
+        },
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize(
+    "metadata_update",
+    (
+        {"import_references": [{"module": "helper", "name": "entrypoint"}]},
+        {"callable_invocations": [{"module": "helper", "name": "entrypoint"}]},
+        {"import_references_truncated": True},
+        {"callable_invocations_truncated": True},
+        {"non_allowlisted_global_imports_truncated": True},
+        {"container_type": "pytorch_zip", "import_references_truncated": True},
+    ),
+)
+def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
+    tmp_path: Path,
+    metadata_update: dict[str, object],
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    metadata = {
+        "pickle_report_status": "complete",
+        "pickle_verdict": "clean",
+        "import_references": [],
+        "callable_invocations": [],
+        **metadata_update,
+    }
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": metadata,
+        "_private_metadata": {"call_graph_source_fingerprints": _source_independent_call_graph_fingerprint_metadata()},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returning_them(

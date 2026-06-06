@@ -753,11 +753,17 @@ def _combine_call_graph_source_fingerprint_private_metadata(
     member_reports: list[PickleReport],
 ) -> dict[str, Any]:
     combined: dict[str, Any] | None = None
+    missing_member_fingerprints = False
     for report in member_reports:
         fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
         if not isinstance(fingerprint_metadata, Mapping):
+            missing_member_fingerprints = True
             continue
         combined = _merge_call_graph_source_fingerprint_metadata(combined, fingerprint_metadata)
+    if missing_member_fingerprints:
+        combined = dict(combined or {})
+        combined.pop("source_independent", None)
+        combined["reusable"] = False
     return {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: combined} if combined is not None else {}
 
 
@@ -765,6 +771,11 @@ def _merge_call_graph_source_fingerprint_metadata(
     existing: Mapping[str, Any] | None,
     incoming: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+        return dict(existing) if existing is not None else dict(incoming)
+    if existing is not None and _is_source_independent_call_graph_fingerprint_metadata(existing):
+        return dict(incoming)
+
     merged = dict(existing or {})
     existing_fingerprints = existing.get("fingerprints") if existing is not None else None
     incoming_fingerprints = incoming.get("fingerprints")
@@ -1186,6 +1197,11 @@ def _scan_pickle_payload_native(
         report = _report_from_native_dict(raw_report)
         if enrich_call_graph:
             if _call_graph_enrichment_is_redundant(report):
+                if _call_graph_has_no_source_inputs(report):
+                    return _with_call_graph_source_fingerprint_metadata(
+                        report,
+                        _source_independent_call_graph_fingerprint_metadata(),
+                    )
                 with shared_source_sensitive_caches():
                     source_fingerprints = shared_source_fingerprint_metadata()
                 return _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
@@ -1262,6 +1278,35 @@ def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
         if finding.severity == Severity.CRITICAL
     }
     return references <= critical_references
+
+
+def _call_graph_has_no_source_inputs(report: PickleReport) -> bool:
+    return not any(
+        report.metadata.get(key)
+        for key in (
+            "import_references",
+            "callable_invocations",
+            "import_references_truncated",
+            "callable_invocations_truncated",
+            "non_allowlisted_global_imports_truncated",
+        )
+    )
+
+
+def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
+    return {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+
+def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
+    return dict(metadata) == _source_independent_call_graph_fingerprint_metadata()
 
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
