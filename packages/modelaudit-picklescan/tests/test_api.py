@@ -6220,6 +6220,55 @@ def test_loaded_parent_package_path_controls_child_source_resolution(
     assert source_fingerprints["loaded_package_paths"]["loaded_parent_pkg"] == (str(runtime_package.absolute()),)
 
 
+def test_loaded_parent_package_custom_importer_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = f"loaded_custom_pkg_{uuid.uuid4().hex}"
+    runtime_package = tmp_path / package_name
+    runtime_package.mkdir()
+    (runtime_package / "child.py").write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+
+    class CustomFinder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def find_spec(self, fullname: str, _target: object = None) -> ModuleSpec | None:
+            self.calls += 1
+            return ModuleSpec(fullname, loader=None, origin="custom://child")
+
+    finder = CustomFinder()
+    loaded_package = ModuleType(package_name)
+    loaded_spec = ModuleSpec(
+        package_name,
+        loader=None,
+        origin=str(runtime_package / "__init__.py"),
+        is_package=True,
+    )
+    loaded_spec.submodule_search_locations = [str(runtime_package)]
+    loaded_package.__spec__ = loaded_spec
+    loaded_package.__path__ = [str(runtime_package)]
+    monkeypatch.setitem(sys.modules, package_name, loaded_package)
+    monkeypatch.setitem(sys.path_importer_cache, str(runtime_package), finder)
+    report = PickleReport(
+        source="loaded-custom-package.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": f"{package_name}.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": f"{package_name}.child", "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert any(notice.code == "call_graph_source_unavailable" for notice in updated.notices)
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert finder.calls == 0
+
+
 def test_valid_mismatched_source_bytecode_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

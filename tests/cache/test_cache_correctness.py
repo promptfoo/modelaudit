@@ -15,6 +15,7 @@ from importlib.machinery import (
     SOURCE_SUFFIXES,
     FileFinder,
     ModuleSpec,
+    PathFinder,
     SourceFileLoader,
     SourcelessFileLoader,
 )
@@ -1496,6 +1497,45 @@ def test_import_hook_identity_tracks_referenced_global_state() -> None:
     assert all(
         identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
     )
+
+
+def test_import_hook_identity_tracks_class_method_state() -> None:
+    namespace: dict[str, Any] = {"__name__": "modelaudit_class_hook_identity_test", "target": "safe"}
+    exec(
+        "class Finder:\n"
+        "    root = 'safe'\n"
+        "    def find_spec(self, fullname, mode='source'):\n"
+        "        return self.root, target, fullname, mode\n",
+        namespace,
+    )
+    finder_type: Any = namespace["Finder"]
+    finder = finder_type()
+    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
+
+    initial_identities = tuple(identity(finder) for identity in identity_functions)
+    finder_type.root = "malicious"
+    assert all(
+        identity(finder) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
+    )
+
+    finder_type.root = "safe"
+    restored_identities = tuple(identity(finder) for identity in identity_functions)
+    finder_type.find_spec.__defaults__ = ("bytecode",)
+    assert all(
+        identity(finder) != restored for identity, restored in zip(identity_functions, restored_identities, strict=True)
+    )
+
+    finder_type.find_spec.__defaults__ = ("source",)
+    defaults_restored_identities = tuple(identity(finder) for identity in identity_functions)
+    namespace["target"] = "malicious"
+    assert all(
+        identity(finder) != restored
+        for identity, restored in zip(identity_functions, defaults_restored_identities, strict=True)
+    )
+
+    finder_type.__module__ = PathFinder.__module__
+    finder_type.__qualname__ = PathFinder.__qualname__
+    assert all(":unreusable:" in identity(finder_type) for identity in identity_functions)
 
 
 def test_standard_file_finder_hook_identity_invalidates_when_methods_change(

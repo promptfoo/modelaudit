@@ -18,9 +18,12 @@ from importlib.machinery import (
     BYTECODE_SUFFIXES,
     EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
+    BuiltinImporter,
     ExtensionFileLoader,
     FileFinder,
+    FrozenImporter,
     ModuleSpec,
+    PathFinder,
     SourceFileLoader,
     SourcelessFileLoader,
 )
@@ -340,6 +343,22 @@ def _hook_type_code(hook_type: type[object]) -> bytes:
     return b"".join(code_parts)
 
 
+def _hook_type_state(hook_type: type[object]) -> str:
+    method_states: dict[str, str] = {}
+    class_attributes: dict[str, object] = {}
+    for method_name, method in _hook_type_methods(hook_type):
+        method_states[method_name] = _function_hook_state(method)
+        for attribute_name in sorted(set(method.__code__.co_names)):
+            for candidate_type in hook_type.__mro__:
+                if attribute_name not in candidate_type.__dict__:
+                    continue
+                class_attributes[f"{candidate_type.__module__}.{candidate_type.__qualname__}.{attribute_name}"] = (
+                    candidate_type.__dict__[attribute_name]
+                )
+                break
+    return _bounded_hook_value_identity({"methods": method_states, "class_attributes": class_attributes})
+
+
 def _import_hook_identity(hook: object) -> str:
     if isinstance(hook, FunctionType):
         module = hook.__module__
@@ -351,12 +370,20 @@ def _import_hook_identity(hook: object) -> str:
         module = function.__module__
         qualname = function.__qualname__
         code = marshal.dumps(function.__code__)
-        state = f"self={_bounded_hook_value_identity(hook.__self__)}|function={_function_hook_state(function)}"
+        bound_type = hook.__self__ if isinstance(hook.__self__, type) else type(hook.__self__)
+        state = "|".join(
+            (
+                f"type={_hook_type_state(bound_type)}",
+                f"self={_bounded_hook_value_identity(hook.__self__)}",
+                f"function={_function_hook_state(function)}",
+            )
+        )
     elif isinstance(hook, type):
         module = hook.__module__
         qualname = hook.__qualname__
         code = _hook_type_code(hook)
-        state = ""
+        known_class_finder = hook in {BuiltinImporter, FrozenImporter, PathFinder}
+        state = "" if known_class_finder else f"{_UNREUSABLE_HOOK_STATE_IDENTITY}:{_hook_type_state(hook)}"
     else:
         hook_type = type(hook)
         module = hook_type.__module__
@@ -366,7 +393,15 @@ def _import_hook_identity(hook: object) -> str:
             instance_state = object.__getattribute__(hook, "__dict__")
         except (AttributeError, TypeError):
             instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
-        state = _bounded_hook_value_identity(instance_state)
+        instance_identity = _bounded_hook_value_identity(instance_state)
+        virtualenv_module = sys.modules.get("_virtualenv")
+        virtualenv_finder_type = getattr(virtualenv_module, "_Finder", None) if virtualenv_module is not None else None
+        is_virtualenv_finder = isinstance(virtualenv_finder_type, type) and type(hook) is virtualenv_finder_type
+        state = (
+            f"self={instance_identity}"
+            if is_virtualenv_finder
+            else f"type={_hook_type_state(hook_type)}|self={instance_identity}"
+        )
     digest = hashlib.sha256(code + state.encode()).hexdigest()
     reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
     return f"{module}.{qualname}:{reuse_marker}{digest}"
