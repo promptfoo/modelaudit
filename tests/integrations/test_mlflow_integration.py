@@ -20,6 +20,7 @@ from modelaudit.integrations.mlflow import (
     _MlflowLocalSource,
     _normalize_mlflow_artifact_path,
     _opened_local_mlflow_path,
+    _runs_mlflow_repository_is_scoped,
     _snapshot_local_mlflow_sources,
     scan_mlflow_model,
 )
@@ -97,6 +98,37 @@ def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path
 
     assert artifacts == {}
     assert entry_count == 0
+
+
+@pytest.mark.parametrize("legacy_resolver", [False, True], ids=["current", "legacy"])
+def test_runs_mlflow_repository_scope_supports_mlflow_resolver_versions(legacy_resolver: bool) -> None:
+    expected_uri = "file:///artifacts/model"
+
+    class RunRepository:
+        artifact_uri = expected_uri
+
+    class CurrentRunsRepository:
+        tracking_uri = "sqlite:///tracking.db"
+
+        @staticmethod
+        def get_underlying_uri(wrapper_uri: str, tracking_uri: str | None = None) -> str:
+            assert wrapper_uri == "runs:/run-1/model"
+            assert tracking_uri == "sqlite:///tracking.db"
+            return expected_uri
+
+    class LegacyRunsRepository:
+        @staticmethod
+        def get_underlying_uri(wrapper_uri: str) -> str:
+            assert wrapper_uri == "runs:/run-1/model"
+            return expected_uri
+
+    artifact_repository = LegacyRunsRepository() if legacy_resolver else CurrentRunsRepository()
+
+    assert _runs_mlflow_repository_is_scoped(
+        artifact_repository,
+        RunRepository(),
+        "runs:/run-1/model",
+    )
 
 
 def test_local_mlflow_artifact_root_preserves_runs_repository(tmp_path: Path) -> None:
@@ -464,8 +496,11 @@ def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_p
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("repository_scoped", [False, True], ids=["unscoped", "scoped"])
-def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, repository_scoped: bool) -> None:
+@pytest.mark.parametrize(
+    "repository_layout",
+    ["unscoped", "scoped", "unscoped_matching_suffix"],
+)
+def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, repository_layout: str) -> None:
     """Run repositories must apply the wrapper prefix exactly once."""
 
     class LocalArtifactRepository:
@@ -479,13 +514,19 @@ def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, reposit
     class RunsArtifactRepository:
         artifact_uri = "runs:/run-1/model"
 
-        def __init__(self, run_repository: object) -> None:
+        def __init__(self, run_repository: object, underlying_uri: str) -> None:
             self.repo = run_repository
+            self.underlying_uri = underlying_uri
 
         @staticmethod
         def parse_runs_uri(uri: str) -> tuple[str, str | None]:
             assert uri == "runs:/run-1/model"
             return "run-1", "model"
+
+        def get_underlying_uri(self, uri: str, tracking_uri: str | None = None) -> str:
+            assert uri == "runs:/run-1/model"
+            assert tracking_uri is None
+            return self.underlying_uri
 
         @staticmethod
         def _get_logged_model_artifact_repo(run_id: str, name: str) -> None:
@@ -503,22 +544,32 @@ def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, reposit
     models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
     runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
 
-    if repository_scoped:
+    if repository_layout == "scoped":
         run_root = tmp_path / "run-artifacts" / "model"
         artifact_sizes = {
             "subdir/right.bin": 4,
             "model/subdir/wrong.bin": 3,
         }
-        artifact_uri = "file:///run-artifacts/model"
+        underlying_uri = run_root.as_uri()
+    elif repository_layout == "unscoped_matching_suffix":
+        run_root = tmp_path / "run-artifacts" / "model"
+        artifact_sizes = {
+            "subdir/wrong.bin": 3,
+            "model/subdir/right.bin": 4,
+        }
+        underlying_uri = (run_root / "model").as_uri()
     else:
         run_root = tmp_path / "run-artifacts"
         artifact_sizes = {
             "subdir/wrong.bin": 3,
             "model/subdir/right.bin": 4,
         }
-        artifact_uri = None
+        underlying_uri = (run_root / "model").as_uri()
     _write_local_artifacts(run_root, artifact_sizes)
-    repository = RunsArtifactRepository(LocalArtifactRepository(run_root, artifact_uri=artifact_uri))
+    repository = RunsArtifactRepository(
+        LocalArtifactRepository(run_root, artifact_uri=run_root.as_uri()),
+        underlying_uri,
+    )
     mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
         "runs:/run-1/model",
         "subdir",

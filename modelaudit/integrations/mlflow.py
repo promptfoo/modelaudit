@@ -228,6 +228,29 @@ def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
     return artifact_root if artifact_root.is_dir() else None
 
 
+def _runs_mlflow_repository_is_scoped(
+    artifact_repository: Any,
+    run_repository: Any,
+    wrapper_uri: str,
+) -> bool:
+    """Return whether MLflow resolved the run repository at the wrapper path."""
+    repository_uri = getattr(run_repository, "artifact_uri", None)
+    get_underlying_uri = getattr(artifact_repository, "get_underlying_uri", None)
+    if not isinstance(repository_uri, str) or not callable(get_underlying_uri):
+        return False
+
+    try:
+        expected_uri = get_underlying_uri(wrapper_uri, getattr(artifact_repository, "tracking_uri", None))
+    except TypeError:
+        try:
+            expected_uri = get_underlying_uri(wrapper_uri)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    return isinstance(expected_uri, str) and repository_uri == expected_uri
+
+
 def _local_runs_mlflow_sources(
     artifact_repository: Any,
     artifact_path: str | None,
@@ -250,16 +273,13 @@ def _local_runs_mlflow_sources(
     )
 
     run_artifact_path = artifact_path
-    if wrapper_path and effective_path:
-        wrapper_parts = tuple(os.path.normcase(part) for part in PurePosixPath(wrapper_path).parts)
-        run_root_suffix = tuple(os.path.normcase(part) for part in run_root.parts[-len(wrapper_parts) :])
-        run_root_is_scoped = (
-            isinstance(getattr(run_repository, "artifact_uri", None), str)
-            and len(run_root.parts) >= len(wrapper_parts)
-            and run_root_suffix == wrapper_parts
-        )
-        if not run_root_is_scoped:
-            run_artifact_path = effective_path
+    if (
+        wrapper_path
+        and effective_path
+        and isinstance(wrapper_uri, str)
+        and not _runs_mlflow_repository_is_scoped(artifact_repository, run_repository, wrapper_uri)
+    ):
+        run_artifact_path = effective_path
 
     sources = [_MlflowLocalSource(run_root, run_artifact_path, artifact_path)]
     if not effective_path or run_id is None or not callable(get_logged_model_repository):
