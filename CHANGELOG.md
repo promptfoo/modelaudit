@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
+
+### Bug Fixes
+
+- bind cache reads and writes to scanned file identity ([#1458](https://github.com/promptfoo/modelaudit/issues/1458)) ([860adab](https://github.com/promptfoo/modelaudit/commit/860adabe039437fcee6811a9cef561816ba25e74))
+- redact MetaGraph evidence previews ([#1473](https://github.com/promptfoo/modelaudit/issues/1473)) ([58139d9](https://github.com/promptfoo/modelaudit/commit/58139d98cd6c20ddadc379ee476f2e51aa4b798e))
+- redact Torch7 evidence examples ([#1467](https://github.com/promptfoo/modelaudit/issues/1467)) ([646857b](https://github.com/promptfoo/modelaudit/commit/646857bdd54f78334e79eb38896d3e0991810fca))
+
 ## [0.2.46](https://github.com/promptfoo/modelaudit/compare/v0.2.45...v0.2.46) (2026-06-05)
 
 ### Bug Fixes
@@ -197,6 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - fail closed when raw secret, JIT, or network detector analysis errors occur
+- mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
+- redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples
+- redact credential-shaped Torch7 evidence and detect execution primitives across chunk boundaries and alternate Lua syntax
 - bind cache reads and writes to complete file and pathname identities captured before scanning
 - bind SBOM hashing to stable scan-root descriptors and omit hashes for outside, swapped, or missing local symlink targets
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
@@ -282,6 +293,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect and safely bound NeMo Hydra process-execution, native-loader, network, and file-access callable targets, including trusted-namespace import/cache helpers, repeated YAML aliases, and NumPy file writers
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
@@ -309,6 +321,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - enforce Hugging Face repository `--max-size` budgets before selected snapshot or streaming downloads begin
 - fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
+- include bounded content-routed Hugging Face repository files in selective downloads, preserve local filename-based false-positive guards, pin probes and downloads to one immutable revision, redact signed transport errors, enforce acquisition deadlines across transfer process groups, and fail closed when repository coverage cannot be completed safely
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
