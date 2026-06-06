@@ -8,6 +8,7 @@ import ipaddress
 import os
 import re
 import struct
+import unicodedata
 from typing import Any, ClassVar
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
@@ -65,7 +66,9 @@ _STRING_LITERAL_COLLECTION_PATTERN = re.compile(
 _PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _HEX_EVIDENCE_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
-_UNICODE_OR_OCTAL_ESCAPE_PATTERN = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3})")
+_UNICODE_OR_OCTAL_ESCAPE_PATTERN = re.compile(
+    r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|N\{[A-Za-z0-9 -]{1,100}\})"
+)
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
     r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
     r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-]))"
@@ -252,7 +255,11 @@ def _redact_reversible_percent_evidence(text: str) -> str:
                 return segment
             decoded = next_decoded
             if _PERCENT_ESCAPE_PATTERN.search(decoded) is None:
-                return _sanitize_decoded_reversible_evidence(decoded, segment)
+                return _sanitize_decoded_reversible_evidence(
+                    decoded,
+                    segment,
+                    fail_closed_on_hidden_redaction=True,
+                )
 
         return REDACTED_EVIDENCE_VALUE
 
@@ -284,6 +291,11 @@ def _redact_reversible_unicode_evidence(text: str) -> str:
 
     def replace_escape(match: re.Match[str]) -> str:
         token = match.group(0)[1:]
+        if token.startswith("N{"):
+            try:
+                return unicodedata.lookup(token[2:-1])
+            except KeyError:
+                return match.group(0)
         base = 16 if token[0] in {"u", "U"} else 8
         digits = token[1:] if base == 16 else token
         codepoint = int(digits, base)

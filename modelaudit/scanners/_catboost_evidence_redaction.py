@@ -428,6 +428,9 @@ SERIALIZED_STRUCTURED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
 FUNCTION_KEYWORD_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*"
 )
+SUBPROCESS_CALL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)\bsubprocess\.(?:popen|run|call|check_output|check_call)\s*\(\s*"
+)
 FUNCTION_CALL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*")
 STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
@@ -2660,7 +2663,7 @@ def _redact_sensitive_function_value(raw_value: str) -> str:
 
 def _redact_sensitive_argv_pairs(text: str) -> str:
     """Redact adjacent quoted option/value pairs such as ['--api-key', 'secret']."""
-    replacements: list[tuple[int, int]] = []
+    replacements: list[tuple[int, int, str]] = []
     search_start = 0
     while match := SENSITIVE_ARGV_PAIR_RE.search(text, search_start):
         if match.group("collection_prefix") == ",":
@@ -2671,16 +2674,19 @@ def _redact_sensitive_argv_pairs(text: str) -> str:
                 continue
         decoded_key = _decode_key_escapes(match.group("key"))
         sensitive_key = _normalize_sensitive_function_key(decoded_key) is not None
-        curl_cookie_option = CURL_SHORT_COOKIE_OPTION_RE.fullmatch(decoded_key) is not None and _argv_pair_is_for_curl(
-            text,
-            match.start(),
+        is_curl_argv = _argv_pair_is_for_curl(text, match.start())
+        curl_cookie_option = CURL_SHORT_COOKIE_OPTION_RE.fullmatch(decoded_key) is not None and is_curl_argv
+        curl_credential_value = (
+            _redact_curl_argv_credential_value(decoded_key, match.group("value")) if is_curl_argv else None
         )
         if sensitive_key or curl_cookie_option:
-            replacements.append((match.start("value"), match.end("value")))
+            replacements.append((match.start("value"), match.end("value"), REDACTED_EVIDENCE_VALUE))
+        elif curl_credential_value is not None:
+            replacements.append((match.start("value"), match.end("value"), curl_credential_value))
         search_start = match.start() + 1
 
-    for start, end in reversed(replacements):
-        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
     return text
 
 
@@ -2692,6 +2698,103 @@ def _argv_pair_is_for_curl(text: str, pair_start: int) -> bool:
         return False
     collection_prefix = text[collection_start + 1 : pair_start]
     return PYTHON_CURL_ARGV_START_RE.match(collection_prefix) is not None
+
+
+def _redact_curl_argv_credential_value(option: str, value: str) -> str | None:
+    if option in {"-u", "-U", "--user", "--proxy-user"}:
+        prefix = "--user "
+        redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, f"{prefix}{value}", count=1)
+    elif option in {"-E", "--cert", "--proxy-cert"}:
+        prefix = "--cert "
+        redacted = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, f"{prefix}{value}", count=1)
+    else:
+        return None
+    return redacted[len(prefix) :] if redacted != f"{prefix}{value}" else None
+
+
+def _safe_eval_subprocess_command(raw_argument: str) -> str | EvaluatedStringSequence | None:
+    try:
+        return _safe_eval_string_expr(ast.parse(raw_argument.strip(), mode="eval"))
+    except SyntaxError:
+        return None
+
+
+def _is_stdin_auth_subprocess_command(raw_argument: str) -> bool:
+    command = _safe_eval_subprocess_command(raw_argument)
+    if isinstance(command, str):
+        return bool(
+            re.search(
+                r"(?is)^\s*(?:[^\s]+[\\/])?docker(?:\.exe)?\s+login\b.{0,1024}?--password-stdin(?![\w-])",
+                command,
+            )
+            or re.search(
+                r"(?is)^\s*(?:[^\s]+[\\/])?gh(?:\.exe)?\s+auth\s+login\b.{0,1024}?--with-token(?![\w-])",
+                command,
+            )
+        )
+    if not isinstance(command, (list, tuple)) or not command:
+        return False
+    executable = command[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    executable = executable.removesuffix(".exe")
+    normalized_args = [argument.casefold() for argument in command[1:]]
+    if executable == "docker":
+        return "login" in normalized_args and "--password-stdin" in normalized_args
+    if executable == "gh":
+        return normalized_args[:2] == ["auth", "login"] and "--with-token" in normalized_args
+    return False
+
+
+def _is_static_string_input(raw_value: str) -> bool:
+    try:
+        node = ast.parse(raw_value.strip(), mode="eval")
+    except SyntaxError:
+        return False
+    if isinstance(node.body, ast.Constant) and isinstance(node.body.value, (str, bytes)):
+        return True
+    return isinstance(_safe_eval_string_expr(node), str)
+
+
+def _redact_subprocess_stdin_auth_inputs(text: str) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    for call_match in SUBPROCESS_CALL_PREFIX_RE.finditer(text):
+        argument_start = call_match.end()
+        arguments: list[tuple[int, int, re.Match[str] | None]] = []
+        while argument_start < len(text):
+            argument_end = _find_function_argument_end(text, argument_start)
+            raw_argument = text[argument_start:argument_end]
+            if raw_argument.strip():
+                arguments.append((argument_start, argument_end, FUNCTION_KEYWORD_ARGUMENT_RE.match(raw_argument)))
+            if argument_end >= len(text) or text[argument_end] != ",":
+                break
+            argument_start = argument_end + 1
+
+        command_argument = next(
+            (text[start:end] for start, end, keyword in arguments if keyword is None),
+            None,
+        )
+        if command_argument is None:
+            command_argument = next(
+                (
+                    text[start + keyword.end() : end]
+                    for start, end, keyword in arguments
+                    if keyword is not None and keyword.group("name").casefold() == "args"
+                ),
+                None,
+            )
+        if command_argument is None or not _is_stdin_auth_subprocess_command(command_argument):
+            continue
+
+        for start, end, keyword in arguments:
+            if keyword is None or keyword.group("name").casefold() != "input":
+                continue
+            value_start = start + keyword.end()
+            raw_value = text[value_start:end]
+            if _is_static_string_input(raw_value):
+                replacements.append((value_start, end, _redact_sensitive_function_value(raw_value)))
+
+    for start, end, replacement in reversed(replacements):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
 
 
 def _redact_sensitive_setter_arguments(text: str) -> str:
@@ -3063,6 +3166,7 @@ def _redact_command_string_literals(text: str) -> str:
 def _redact_command_evidence_text(text: str) -> str:
     redacted = _redact_inline_curl_config_passwords(text)
     redacted = _redact_inline_password_sources(redacted)
+    redacted = _redact_subprocess_stdin_auth_inputs(redacted)
     redacted = _redact_inline_command_secret_sources(redacted)
     redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE.sub(_redact_command_positional_secret, redacted)

