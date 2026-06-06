@@ -898,6 +898,8 @@ def _compact_tail_module_lines(tail: bytes) -> Iterator[tuple[bytes, tuple[ast.s
 def _compact_prefix_module_lines(candidate: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
     """Yield bounded prefix statements in source order without hoisting scoped bindings."""
     prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
+    if prefix_end < len(candidate):
+        prefix_end = candidate.rfind(b"\n", 0, prefix_end) + 1
     raw_prefix = candidate[:prefix_end]
     prefix = raw_prefix.lstrip(b"\x00\xff")
     prefix_offset = len(raw_prefix) - len(prefix)
@@ -5894,15 +5896,18 @@ def _deterministically_executed_expression_nodes(
             for argument in current.args:
                 if not isinstance(argument, ast.GeneratorExp) or not argument.generators:
                     continue
-                outer = argument.generators[0]
-                pending.extend(reversed(outer.ifs))
-                if any(
-                    _static_late_iter_truth(generator.iter) is False
-                    or any(_static_late_truth_value(condition) is False for condition in generator.ifs)
-                    for generator in argument.generators
-                ):
-                    continue
-                pending.append(argument.elt)
+                eager_nodes: list[ast.AST] = []
+                for index, generator in enumerate(argument.generators):
+                    if index:
+                        eager_nodes.append(generator.iter)
+                    if _static_late_iter_truth(generator.iter) is False:
+                        break
+                    eager_nodes.extend(generator.ifs)
+                    if any(_static_late_truth_value(condition) is False for condition in generator.ifs):
+                        break
+                else:
+                    eager_nodes.append(argument.elt)
+                pending.extend(reversed(eager_nodes))
         if isinstance(current, (ast.ListComp, ast.SetComp, ast.DictComp)) and current.generators:
             generators = current.generators
             outer = generators[0]
@@ -13362,6 +13367,22 @@ def _compact_snippet_typed_print_overwrite_replay(
         return consumers
 
     def is_conditionally_evaluated_typed_call(node: ast.AST) -> bool:
+        def generator_reaches_node_unconditionally(generator_expression: ast.GeneratorExp) -> bool:
+            def contains(candidate: ast.AST, target: ast.AST) -> bool:
+                return any(descendant is target for descendant in ast.walk(candidate))
+
+            for generator in generator_expression.generators:
+                if contains(generator.iter, node):
+                    return True
+                if _static_late_iter_truth(generator.iter) is not True:
+                    return False
+                for condition in generator.ifs:
+                    if contains(condition, node):
+                        return True
+                    if _static_late_truth_value(condition) is not True:
+                        return False
+            return contains(generator_expression.elt, node)
+
         if not _is_conditionally_evaluated_expression(node, parents):
             return False
         current = node
@@ -13393,11 +13414,7 @@ def _compact_snippet_typed_print_overwrite_replay(
             if (
                 eager_consumer is not None
                 and eager_consumer not in mutated_truthy_builtins
-                and all(
-                    _static_late_iter_truth(generator.iter) is True
-                    and all(_static_late_truth_value(condition) is True for condition in generator.ifs)
-                    for generator in current.generators
-                )
+                and generator_reaches_node_unconditionally(current)
             ):
                 return False
         return True
