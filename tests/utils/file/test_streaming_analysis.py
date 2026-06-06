@@ -8,6 +8,7 @@ from fsspec.implementations.local import LocalFileSystem
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import streaming
+from modelaudit.utils.file._streaming_read_cap import STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
 
 
 class HeaderOnlyScanner(BaseScanner):
@@ -16,6 +17,39 @@ class HeaderOnlyScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         del path
         raise RuntimeError("full scan is not available for streaming fallback")
+
+
+class _FakeLargeRemoteFile:
+    def __init__(self, payload: bytes, read_sizes: list[int]) -> None:
+        self._payload = payload
+        self._read_sizes = read_sizes
+
+    def __enter__(self) -> "_FakeLargeRemoteFile":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+
+    def read(self, size: int = -1) -> bytes:
+        self._read_sizes.append(size)
+        if size < 0:
+            return self._payload
+        return self._payload[:size]
+
+
+class _FakeLargeRemoteFileSystem:
+    def __init__(self, *, size: int, payload: bytes, read_sizes: list[int]) -> None:
+        self._size = size
+        self._payload = payload
+        self._read_sizes = read_sizes
+
+    def info(self, path: str) -> dict[str, int]:
+        del path
+        return {"size": self._size}
+
+    def open(self, path: str, mode: str = "rb") -> _FakeLargeRemoteFile:
+        del path, mode
+        return _FakeLargeRemoteFile(self._payload, self._read_sizes)
 
 
 def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
@@ -34,6 +68,87 @@ def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     assert streaming.stream_source_path(double_encoded_literal_question_mark) == "/model?v1.pkl"
     assert streaming.stream_source_path(literal_question_mark_with_signed_query) == "/model?v1.pkl"
     assert streaming.can_stream_analyze(literal_question_mark_with_signed_query, PickleScanner()) is True
+
+
+def test_stream_analyze_file_default_read_is_bounded_for_large_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"model-header-only"
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
+        payload=payload,
+        read_sizes=read_sizes,
+    )
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.joblib", HeaderOnlyScanner())
+
+    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.issues == []
+    assert result.bytes_scanned == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.success is False
+    assert result.metadata["max_bytes"] == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.metadata["bytes_analyzed"] == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_stream_analyze_file_bounded_large_remote_still_reports_header_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
+        payload=b"os\nsystem",
+        read_sizes=read_sizes,
+    )
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.pkl", HeaderOnlyScanner())
+
+    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert analysis_complete is False
+    assert result is not None
+    assert any(issue.type == "streaming_security_check" for issue in result.issues)
+    assert result.has_errors is True
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+
+
+def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=100,
+        payload=b"abcdef",
+        read_sizes=read_sizes,
+    )
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/large.joblib",
+        HeaderOnlyScanner(config={"max_file_size": 4}),
+    )
+
+    assert read_sizes == [4]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.bytes_scanned == 4
+    assert result.metadata["max_bytes"] == 4
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -9,6 +9,9 @@ This package contains utilities for file operations:
 """
 
 from modelaudit.utils.file import detection, filtering, handlers, large_file_handler, streaming
+from modelaudit.utils.file._streaming_read_cap import apply_streaming_read_cap
+
+apply_streaming_read_cap(streaming)
 
 __all__ = [
     "detection",
