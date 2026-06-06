@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import posixpath
 import shutil
 import tarfile
 import tempfile
@@ -13,7 +14,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from ..scanner_results import mark_inconclusive_scan_result
-from ..utils import is_within_directory, sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
     MARKED_PROTOCOL0_GLOBAL_RE,
     PROTOCOL0_GLOBAL_RE,
@@ -30,6 +31,20 @@ try:
     HAS_YAML = True
 except Exception:
     HAS_YAML = False
+
+CRITICAL_SYSTEM_PATHS = [
+    "/etc",
+    "/bin",
+    "/usr",
+    "/var",
+    "/lib",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/sbin",
+    "C:\\Windows",
+]
 
 
 @dataclass
@@ -165,6 +180,15 @@ class _GzipStreamMetrics:
     safe_tar_entries: int = 0
     failure: str | None = None
     tar: _TarStreamMetrics | None = None
+
+
+@dataclass
+class _LayerMetadataState:
+    """Bounded per-layer state for metadata ambiguity checks."""
+
+    seen_paths: set[str] = field(default_factory=set)
+    duplicate_reported: bool = False
+    invalid_whiteout_reported: bool = False
 
 
 class OciLayerScanner(BaseScanner):
@@ -518,6 +542,168 @@ class OciLayerScanner(BaseScanner):
                     best_candidate = (candidate_width, start, candidate)
 
         return best_candidate[2] if best_candidate is not None else None
+
+    def _validate_layer_member_metadata(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        member: tarfile.TarInfo,
+        state: _LayerMetadataState,
+    ) -> tuple[bool, bool]:
+        """Return whether metadata is valid and whether member bytes should be scanned."""
+        name = member.name
+        temp_base = os.path.join(tempfile.gettempdir(), "extract_oci_layer")
+        resolved_name, is_safe = sanitize_archive_path(name, temp_base)
+        if not is_safe:
+            result.add_check(
+                name="Path Traversal Protection",
+                passed=False,
+                message=f"Layer member {name} attempted path traversal outside the layer",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{manifest_path}:{layer_ref}:{name}",
+                details={"layer": layer_ref, "member": name},
+                rule_code="S405",
+            )
+            return False, member.isfile()
+
+        metadata_valid = True
+        normalized_name = posixpath.normpath(name.replace("\\", "/"))
+        if normalized_name in state.seen_paths:
+            metadata_valid = False
+            if not state.duplicate_reported:
+                result.add_check(
+                    name="OCI Layer Metadata Validation",
+                    passed=False,
+                    message=f"Layer member {name} duplicates normalized path {normalized_name}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details={"layer": layer_ref, "member": name, "normalized_path": normalized_name},
+                    rule_code="S902",
+                )
+                state.duplicate_reported = True
+        else:
+            state.seen_paths.add(normalized_name)
+
+        raw_path_components = [component for component in name.replace("\\", "/").split("/") if component]
+        reserved_whiteout_parent = next(
+            (component for component in raw_path_components[:-1] if component.startswith(".wh.")),
+            None,
+        )
+        if reserved_whiteout_parent is not None:
+            metadata_valid = False
+            if not state.invalid_whiteout_reported:
+                result.add_check(
+                    name="OCI Layer Metadata Validation",
+                    passed=False,
+                    message=(
+                        f"Layer member {name} uses reserved OCI whiteout path component {reserved_whiteout_parent}"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details={
+                        "layer": layer_ref,
+                        "member": name,
+                        "reserved_component": reserved_whiteout_parent,
+                    },
+                    rule_code="S902",
+                )
+                state.invalid_whiteout_reported = True
+
+        basename = posixpath.basename(normalized_name)
+        if basename.startswith(".wh."):
+            whiteout_target = basename.removeprefix(".wh.")
+            valid_whiteout_target = basename == ".wh..wh..opq" or (
+                whiteout_target not in {"", ".", ".."} and not whiteout_target.startswith(".wh.")
+            )
+            valid_whiteout = valid_whiteout_target and member.isfile() and member.size == 0
+            if not valid_whiteout:
+                metadata_valid = False
+                if not state.invalid_whiteout_reported:
+                    result.add_check(
+                        name="OCI Layer Metadata Validation",
+                        passed=False,
+                        message=f"Layer member {name} is not a valid empty OCI whiteout file",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{manifest_path}:{layer_ref}:{name}",
+                        details={
+                            "layer": layer_ref,
+                            "member": name,
+                            "member_type": member.type.decode("ascii", errors="replace"),
+                            "size": member.size,
+                        },
+                        rule_code="S902",
+                    )
+                    state.invalid_whiteout_reported = True
+            return metadata_valid, not valid_whiteout and member.isfile() and member.size > 0
+
+        if member.issym() or member.islnk():
+            target = member.linkname
+            details = {"layer": layer_ref, "member": name, "target": target}
+            if not target:
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Layer link {name} has an empty target",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details=details,
+                    rule_code="S406",
+                )
+                return False, False
+            _target_resolved, target_safe = self._resolve_link_target(
+                target,
+                resolved_member_name=resolved_name,
+                extraction_root=temp_base,
+                is_symlink=member.issym(),
+            )
+            if not target_safe:
+                if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                    message = f"Layer link {name} points to critical system path: {target}"
+                else:
+                    message = f"Layer link {name} resolves outside extraction directory"
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details=details,
+                    rule_code="S406",
+                )
+                return False, False
+            return metadata_valid, False
+
+        return metadata_valid, member.isfile()
+
+    @staticmethod
+    def _resolve_link_target(
+        target: str,
+        *,
+        resolved_member_name: str,
+        extraction_root: str,
+        is_symlink: bool,
+    ) -> tuple[str, bool]:
+        if not is_symlink:
+            return sanitize_archive_path(target, extraction_root)
+        normalized_archive_target = target.replace("\\", "/")
+        if target.startswith("/") and not normalized_archive_target.startswith("//"):
+            # OCI layers describe a container root filesystem. A POSIX-absolute
+            # symlink therefore targets that root, not the extraction host.
+            container_relative_target = posixpath.normpath(normalized_archive_target).lstrip("/")
+            return posixpath.join(extraction_root.replace("\\", "/"), container_relative_target), True
+        if is_absolute_archive_path(normalized_archive_target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_member_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -930,6 +1116,7 @@ class OciLayerScanner(BaseScanner):
                         preflight_member_limit = min(preflight_member_limit, hidden_entry_member_limit)
 
                 layer_entry_count = 0
+                metadata_state = _LayerMetadataState()
                 with tarfile.open(layer_path, "r:gz") as tar:
                     while preflight_member_limit is None or layer_entry_count < preflight_member_limit:
                         member = tar.next()
@@ -951,7 +1138,16 @@ class OciLayerScanner(BaseScanner):
                             )
                             break
 
-                        if not member.isfile():
+                        metadata_valid, should_scan_member = self._validate_layer_member_metadata(
+                            result,
+                            manifest_path=path,
+                            layer_ref=layer_ref,
+                            member=member,
+                            state=metadata_state,
+                        )
+                        if not metadata_valid:
+                            scan_complete = False
+                        if not should_scan_member:
                             continue
                         name = member.name
                         matched_ext = self._get_scannable_extension(name)

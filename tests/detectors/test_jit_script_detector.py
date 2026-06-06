@@ -7473,6 +7473,26 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    @pytest.mark.parametrize("method", [b"pop", b"__delitem__"])
+    def test_scan_model_keeps_runpy_call_after_shadowed_dict_descriptor_delete(self, method: bytes) -> None:
+        arguments = b"rp.__dict__, 'run_path'" + (b", None" if method == b"pop" else b"")
+        source = (
+            b"import runpy as rp\ndict = fake\n"
+            + b"dict."
+            + method
+            + b"("
+            + arguments
+            + b")\n"
+            + b"rp.__dict__.setdefault('run_path', print)\n((rp).run_path)('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         "setattr_shadow",
         [
@@ -8274,6 +8294,42 @@ class TestJITScriptDetector:
             for finding in findings
         )
         assert detected is should_detect
+
+    def test_runpy_replay_applies_eager_annotation_side_effects(self) -> None:
+        source = (
+            "import runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            "def payload(value: setattr(rp, 'run_path', original)):\n    pass\n"
+            "((rp).run_path)('payload.py')\n"
+        )
+
+        suppressed = jit_script_module._compact_snippet_runpy_print_overwrite_calls(source)
+
+        assert ("runpy.run_path", "S108") not in suppressed
+
+    def test_runpy_replay_preserves_safe_state_for_deferred_annotation(self) -> None:
+        source = (
+            "from __future__ import annotations\nimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+            "def payload(value: setattr(rp, 'run_path', original)):\n    pass\n"
+            "((rp).run_path)('safe')\n"
+        )
+
+        suppressed = jit_script_module._compact_snippet_runpy_print_overwrite_calls(source)
+
+        assert ("runpy.run_path", "S108") in suppressed
+
+    def test_scan_model_invalidates_safe_member_in_uncertain_branch(self) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"if flag:\n    wb.open = original\n"
+            b"((wb).open)('https://collector.evil')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
 
     @pytest.mark.parametrize(
         ("restored_value", "should_detect"),

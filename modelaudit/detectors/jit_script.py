@@ -10684,8 +10684,9 @@ def _compact_snippet_deleted_print_setdefault_members(
 ) -> set[str]:
     if "setdefault" not in code_str or "print" not in code_str:
         return set()
+    source = textwrap.dedent(code_str.lstrip("\x00"))
     try:
-        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+        tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
     if _compact_snippet_has_shadowed_print(code_str, tree):
@@ -10696,6 +10697,8 @@ def _compact_snippet_deleted_print_setdefault_members(
     bound_method_aliases: dict[str, str] = {}
     deleted_members: set[str] = set()
     safe_members: set[str] = set()
+    local_dict_shadowed = False
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
 
     def mapping_targets_runpy(node: ast.AST) -> bool:
         return (
@@ -10726,6 +10729,7 @@ def _compact_snippet_deleted_print_setdefault_members(
             isinstance(call.func, ast.Attribute)
             and isinstance(call.func.value, ast.Name)
             and call.func.value.id == "dict"
+            and not local_dict_shadowed
             and call.args
             and mapping_targets_runpy(call.args[0])
         ):
@@ -10763,6 +10767,12 @@ def _compact_snippet_deleted_print_setdefault_members(
                     mapping_aliases.discard(target.id)
                     descriptor_aliases.pop(target.id, None)
                     bound_method_aliases.pop(target.id, None)
+                    if target.id == "dict":
+                        local_dict_shadowed = not (
+                            isinstance(statement.value, ast.Name)
+                            and statement.value.id == "dict"
+                            and not local_dict_shadowed
+                        )
                     if mapping_targets_runpy(statement.value):
                         mapping_aliases.add(target.id)
                     elif isinstance(statement.value, ast.Attribute):
@@ -10775,6 +10785,7 @@ def _compact_snippet_deleted_print_setdefault_members(
                         elif (
                             isinstance(statement.value.value, ast.Name)
                             and statement.value.value.id == "dict"
+                            and not local_dict_shadowed
                             and statement.value.attr in {"pop", "__delitem__", "setdefault"}
                         ):
                             descriptor_aliases[target.id] = statement.value.attr
@@ -10798,7 +10809,10 @@ def _compact_snippet_deleted_print_setdefault_members(
                     member_name = _runpy_static_member_key(target.slice)
                     if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
                         deleted_members.add(member_name)
-        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
             for call in _deterministically_executed_expression_calls(value):
                 record_call(call)
         _update_compact_runpy_aliases(statement, runpy_aliases, for_suppression=True)
@@ -10937,11 +10951,13 @@ def _compact_snippet_runpy_print_overwrite_calls(
     code_str: str,
     inherited_runpy_aliases: frozenset[str] = frozenset(),
 ) -> set[tuple[str, str]]:
+    source = textwrap.dedent(code_str.lstrip("\x00"))
     try:
-        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+        tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
         return set()
     shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
     runpy_aliases = set(inherited_runpy_aliases)
     runpy_alias_ids = dict.fromkeys(inherited_runpy_aliases, 0)
     cached_runpy_id: int | None = 0
@@ -11309,7 +11325,10 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 if item.optional_vars is not None:
                     clear_reload_target(item.optional_vars)
                     clear_module_helper_target(item.optional_vars)
-        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
             expression_runpy_alias_ids = (
                 runpy_alias_ids_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else runpy_alias_ids
             )
@@ -12527,17 +12546,23 @@ def _compact_snippet_typed_print_overwrite_replay(
                 local_setattr_shadowed = True
             elif target.id == "dict":
                 local_dict_shadowed = True
-        elif (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id in builtins_aliases
-        ):
-            if target.attr == "vars":
-                builtins_vars_shadowed = True
-            elif target.attr == "setattr":
-                builtins_setattr_shadowed = True
-            elif target.attr == "dict":
-                builtins_dict_shadowed = True
+        elif isinstance(target, ast.Attribute):
+            if isinstance(target.value, ast.Name):
+                owner = typed_aliases.get(target.value.id)
+                if owner is not None:
+                    safe_members.discard((owner, target.attr))
+                if target.value.id in builtins_aliases:
+                    if target.attr == "vars":
+                        builtins_vars_shadowed = True
+                    elif target.attr == "setattr":
+                        builtins_setattr_shadowed = True
+                    elif target.attr == "dict":
+                        builtins_dict_shadowed = True
+        elif isinstance(target, ast.Subscript):
+            owner = owner_name(target.value)
+            member_name = _static_getattr_member_name(target.slice)
+            if owner is not None and member_name is not None:
+                safe_members.discard((owner, member_name))
 
     def invalidate_match_pattern(pattern: ast.pattern) -> None:
         for node in ast.walk(pattern):
