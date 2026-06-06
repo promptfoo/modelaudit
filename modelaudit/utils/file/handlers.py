@@ -2,11 +2,10 @@
 Advanced file handling utilities for ModelAudit.
 
 This module provides advanced utilities for scanning large model files (400B+ parameters)
-with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
+with bounded windowed I/O, sharded model support, and distributed scanning capabilities.
 """
 
 import logging
-import mmap
 import os
 import re
 import stat
@@ -515,8 +514,27 @@ def _shard_boundary_failure_result(scanner_name: str, file_path: str, details: d
     return result
 
 
+def _preserve_findings_with_shard_boundary_failure(
+    result: "ScanResult",
+    scanner_name: str,
+    file_path: str,
+    details: dict[str, str],
+) -> "ScanResult":
+    """Keep observed failures while marking changed shard coverage inconclusive."""
+    from ...scanner_results import CheckStatus
+
+    result.checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+    if not any(check.name == "Sharded Model Boundary Check" for check in result.checks):
+        result.merge(_shard_boundary_failure_result(scanner_name, file_path, details))
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "shard_boundary_changed"
+    _mark_inconclusive_scan_outcome(result, "shard_boundary_changed")
+    result.finish(success=False)
+    return result
+
+
 class MemoryMappedHandler:
-    """Scanner using memory-mapped I/O for large file sizes."""
+    """Scanner using bounded windowed I/O for large file sizes."""
 
     def __init__(self, file_path: str, scanner: Any):
         """
@@ -540,62 +558,147 @@ class MemoryMappedHandler:
         Returns:
             ScanResult with findings
         """
-        from ...scanner_results import IssueSeverity, ScanResult
+        from ...scanner_results import (
+            IssueSeverity,
+            ScanResult,
+            scan_result_has_inconclusive_outcome,
+        )
 
         result = ScanResult(scanner_name=self.scanner.name)
         bytes_scanned = 0
+        short_read = False
 
         try:
-            with open(self.file_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
-                # Scan in windows to avoid loading entire file
-                window_size = min(MMAP_MAX_WINDOW, self.file_size)
-                position = 0
+            with open(self.file_path, "rb", buffering=0) as f:
+                opened_stat = os.fstat(f.fileno())
+                scan_file_size = opened_stat.st_size
+                self.file_size = scan_file_size
+                if scan_file_size > 0:
+                    # Whole-file mappings can terminate the process with SIGBUS if another
+                    # process truncates the file. Bounded reads fail safely with a short read.
+                    window_size = min(MMAP_MAX_WINDOW, scan_file_size)
+                    position = 0
 
-                while position < self.file_size:
-                    # Calculate window boundaries
-                    end_pos = min(position + window_size, self.file_size)
+                    while position < scan_file_size:
+                        end_pos = min(position + window_size, scan_file_size)
+                        expected_bytes = end_pos - position
+                        f.seek(position)
+                        window_data = f.read(expected_bytes)
+                        actual_end_pos = position + len(window_data)
 
-                    # Extract window data
-                    window_data = mmapped_file[position:end_pos]
+                        if window_data:
+                            window_result = self._analyze_window(window_data, position, detector_result=result)
+                            result.merge(window_result)
 
-                    # Analyze window for suspicious patterns
-                    window_result = self._analyze_window(window_data, position)
-                    result.merge(window_result)
+                        # Overlapping windows should not inflate unique coverage or progress.
+                        bytes_scanned = max(bytes_scanned, actual_end_pos)
 
-                    bytes_scanned += len(window_data)
+                        if progress_callback:
+                            percentage = (bytes_scanned / scan_file_size) * 100
+                            progress_callback(
+                                f"Memory-mapped scan: {bytes_scanned:,}/{scan_file_size:,} bytes",
+                                percentage,
+                            )
 
-                    # Progress reporting
-                    if progress_callback:
-                        percentage = (bytes_scanned / self.file_size) * 100
-                        progress_callback(f"Memory-mapped scan: {bytes_scanned:,}/{self.file_size:,} bytes", percentage)
-
-                    # Move to next window with small overlap
-                    if end_pos >= self.file_size:
-                        break  # Reached end of file
-                    position = end_pos - (1024 * 1024)  # 1MB overlap
-                    if position <= 0:
-                        position = end_pos  # Avoid going negative
+                        if len(window_data) != expected_bytes:
+                            short_read = True
+                            break
+                        if end_pos >= scan_file_size:
+                            break
+                        position = end_pos - (1024 * 1024)  # 1MB overlap
+                        if position <= 0:
+                            position = end_pos  # Avoid going negative
 
                 result.bytes_scanned = bytes_scanned
+                final_stat = os.fstat(f.fileno())
+                try:
+                    path_stat = os.stat(self.file_path)
+                except OSError:
+                    path_stat = None
+                opened_identity = (
+                    opened_stat.st_dev,
+                    opened_stat.st_ino,
+                    opened_stat.st_size,
+                    opened_stat.st_mtime_ns,
+                    opened_stat.st_ctime_ns,
+                )
+                source_changed = (
+                    short_read
+                    or path_stat is None
+                    or opened_identity
+                    != (
+                        final_stat.st_dev,
+                        final_stat.st_ino,
+                        final_stat.st_size,
+                        final_stat.st_mtime_ns,
+                        final_stat.st_ctime_ns,
+                    )
+                )
+                if path_stat is not None:
+                    source_changed = source_changed or opened_identity != (
+                        path_stat.st_dev,
+                        path_stat.st_ino,
+                        path_stat.st_size,
+                        path_stat.st_mtime_ns,
+                        path_stat.st_ctime_ns,
+                    )
+                if source_changed:
+                    reason = "memory_mapped_source_changed"
+                    _mark_inconclusive_scan_outcome(result, reason)
+                    result.add_check(
+                        name="Memory-Mapped Source Stability",
+                        passed=False,
+                        message="File identity changed or a bounded read was incomplete; coverage is incomplete",
+                        severity=IssueSeverity.INFO,
+                        location=self.file_path,
+                        details={
+                            "scan_outcome_reason": reason,
+                            "analysis_incomplete": True,
+                            "opened_file_size": opened_stat.st_size,
+                            "final_file_size": final_stat.st_size,
+                            "short_read": short_read,
+                        },
+                    )
 
         except Exception as e:
-            logger.error(f"Error during memory-mapped scanning: {e}")
+            from ...scanners._evidence_redaction import redact_untrusted_error_message
+
+            redacted_error = redact_untrusted_error_message(e)
+            logger.error("Error during memory-mapped scanning: %s", redacted_error)
             result.add_check(
                 name="Memory-Mapped Scan",
                 passed=False,
-                message=f"Memory-mapped scan error: {e!s}",
+                message=f"Memory-mapped scan error: {redacted_error}",
                 severity=IssueSeverity.WARNING,
-                details={"error": str(e), "bytes_scanned": bytes_scanned},
+                details={
+                    "error": redacted_error,
+                    "exception_type": type(e).__name__,
+                    "bytes_scanned": bytes_scanned,
+                },
             )
 
+        remove_failed_raw_detector_clean_checks = getattr(
+            self.scanner,
+            "_remove_failed_raw_detector_clean_checks",
+            None,
+        )
+        if callable(remove_failed_raw_detector_clean_checks):
+            remove_failed_raw_detector_clean_checks(result)
+
         result.finish(
-            success=not any(
+            success=not scan_result_has_inconclusive_outcome(result)
+            and not any(
                 check.name == "Memory-Mapped Scan" and check.status.value == "failed" for check in result.checks
-            )
+            ),
         )
         return result
 
-    def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
+    def _analyze_window(
+        self,
+        data: bytes,
+        offset: int,
+        detector_result: "ScanResult | None" = None,
+    ) -> "ScanResult":
         """Analyze a window of data using the actual scanner's checks."""
         from ...scanner_results import IssueSeverity, ScanResult
 
@@ -640,7 +743,8 @@ class MemoryMappedHandler:
         # Run any additional scanner-specific checks
         if hasattr(self.scanner, "check_for_embedded_secrets"):
             # Check for embedded secrets in this window
-            self.scanner.check_for_embedded_secrets(data, result, f"offset {offset:,}")
+            raw_detector_result = detector_result if detector_result is not None else result
+            self.scanner.check_for_embedded_secrets(data, raw_detector_result, f"offset {offset:,}")
 
         if hasattr(self.scanner, "check_for_dangerous_imports"):
             # Check for dangerous imports
@@ -766,17 +870,26 @@ class ParallelShardHandler:
                         progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
 
                 except Exception as e:
-                    logger.error(f"Error scanning shard {shard}: {e}")
+                    from ...scanners._evidence_redaction import (
+                        redact_evidence_string,
+                        redact_untrusted_error_message,
+                    )
+
+                    safe_shard = redact_evidence_string(shard, max_chars=500)
+                    safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
+                    safe_error = redact_untrusted_error_message(e)
+                    logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
                     success = False
                     _mark_inconclusive_scan_outcome(result, "shard_scan_error")
                     result.add_check(
                         name="Shard Scan",
                         passed=False,
-                        message=f"Error scanning shard: {Path(shard).name}",
+                        message=f"Error scanning shard: {safe_shard_name}",
                         severity=IssueSeverity.INFO,
-                        location=shard,
+                        location=safe_shard,
                         details={
-                            "error": str(e),
+                            "error": safe_error,
+                            "exception_type": type(e).__name__,
                             "analysis_incomplete": True,
                             "scan_outcome": "inconclusive",
                             "scan_outcome_reason": "shard_scan_error",
@@ -1413,7 +1526,8 @@ def scan_advanced_large_file(
                 allowed_targets=allowed_shard_targets,
             )
             if current_shard_info != shard_info:
-                result = _shard_boundary_failure_result(
+                result = _preserve_findings_with_shard_boundary_failure(
+                    result,
                     scanner.name,
                     file_path,
                     {"path": file_path, "reason": "shard_family_changed_during_scan"},
@@ -1427,22 +1541,24 @@ def scan_advanced_large_file(
             version_context=version_context,
         )
 
+        from ...utils.helpers.result_conversion import scan_result_from_dict
+
+        result = scan_result_from_dict(result_dict)
+
         post_scan_shard_info = ShardedModelDetector.detect_shards(
             file_path,
             allowed_paths=allowed_shard_paths,
             allowed_targets=allowed_shard_targets,
         )
         if post_scan_shard_info != shard_info:
-            return _shard_boundary_failure_result(
+            return _preserve_findings_with_shard_boundary_failure(
+                result,
                 scanner.name,
                 file_path,
                 {"path": file_path, "reason": "shard_family_changed_during_scan"},
             )
 
-        # Convert back to ScanResult
-        from ...utils.helpers.result_conversion import scan_result_from_dict
-
-        return scan_result_from_dict(result_dict)  # type: ignore[no-any-return]
+        return result
 
     except Exception as e:
         # If cache system fails, fall back to direct scanning
