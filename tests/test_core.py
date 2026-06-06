@@ -7684,11 +7684,20 @@ def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
 
 
-@pytest.mark.parametrize("filename", ["README.md", "README", "model_card"])
+@pytest.mark.parametrize(
+    ("filename", "scanner_name", "failure_reason"),
+    [
+        ("README.md", "text", "text_content_read_failed"),
+        ("README", "text", "text_content_read_failed"),
+        ("model_card", "text", "text_content_read_failed"),
+    ],
+)
 def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
+    scanner_name: str,
+    failure_reason: str,
 ) -> None:
     readme_path = tmp_path / filename
     readme_path.write_text("# metadata\n", encoding="utf-8")
@@ -7699,13 +7708,14 @@ def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
     monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
     monkeypatch.setattr("modelaudit.scanners.metadata_scanner.open", raise_read_error, raising=False)
+    monkeypatch.setattr("modelaudit.scanners.text_scanner.open", raise_read_error, raising=False)
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
+    assert result.scanner_name == scanner_name
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
-    assert result.metadata["operational_error_reason"] == "metadata_read_failed"
+    assert result.metadata["operational_error_reason"] == failure_reason
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -8428,18 +8438,29 @@ def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None
         reset_cache_manager()
 
 
-def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:
+def test_scan_file_routes_readme_documentation_to_text_scanner(tmp_path: Path) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text("# Model Card\n\nThis README is benign.\n")
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
+    assert result.scanner_name == "text"
+    assert result.success is True
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_scan_file_routes_extensionless_documentation_to_text_scanner(tmp_path: Path, filename: str) -> None:
+    documentation_path = tmp_path / filename
+    documentation_path.write_text("# Model Card\n\nThis documentation is benign.\n")
+
+    result = scan_file(str(documentation_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
     assert result.success is True
 
 
 @pytest.mark.parametrize("leading_line", ["tree model notes", "tree=implementation notes"])
-def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path, leading_line: str) -> None:
+def test_scan_file_keeps_tree_prefixed_readme_on_text_scanner(tmp_path: Path, leading_line: str) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text(
         f"{leading_line}\n"
@@ -8451,8 +8472,8 @@ def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path
 
     result = scan_file(str(readme_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "metadata"
-    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
+    assert result.scanner_name == "text"
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) -> None:
