@@ -442,6 +442,7 @@ def _r_named_argument_equals_positions(
     formal_list_validity: dict[int, bool] = {}
     function_body_validity: dict[int, bool] = {}
     unterminated_literal_starts = _r_unterminated_literal_span_starts(text, non_code_spans)
+    statement_starts = _r_statement_starts(text, non_code_spans)
     for position in positions:
         context = contexts.get(position)
         if context is None:
@@ -492,6 +493,14 @@ def _r_named_argument_equals_positions(
         if target_is_function_formals:
             if target[1] not in function_body_validity:
                 body_start = target_close + 1
+                body_stop = _r_completed_expression_stop(
+                    text,
+                    body_start,
+                    non_code_spans,
+                    delimiter_pairs,
+                    unterminated_literal_starts,
+                    statement_starts,
+                )
                 function_body_validity[target[1]] = (
                     _r_expression_follows(
                         text,
@@ -509,7 +518,7 @@ def _r_named_argument_equals_positions(
                     and not _r_expression_has_obvious_adjacent_values(
                         text,
                         body_start,
-                        len(text),
+                        body_stop,
                         non_code_spans,
                         delimiter_pairs,
                     )
@@ -898,11 +907,13 @@ def _r_expression_has_obvious_adjacent_values(
     native_pipe_call_required = False
     native_pipe_placeholder_extraction_required = False
     saw_code = False
+    assignment_target_start = position
     while cursor < stop:
         search_start = cursor
         cursor = _r_next_code_position(text, cursor, non_code_spans) or stop
         if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
             expects_value = True
+            assignment_target_start = cursor
         if cursor >= stop or text[cursor] in ")]}":
             return (
                 (saw_code and expects_value)
@@ -921,6 +932,7 @@ def _r_expression_has_obvious_adjacent_values(
             namespace_receiver_is_valid = False
             member_receiver_is_valid = False
             cursor += 1
+            assignment_target_start = cursor
             continue
 
         span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
@@ -1053,6 +1065,7 @@ def _r_expression_has_obvious_adjacent_values(
             namespace_receiver_is_valid = False
             member_receiver_is_valid = False
             cursor = closer + 1
+            assignment_target_start = cursor
             continue
         if character == "%":
             operator_end = text.find("%", cursor + 1, stop)
@@ -1088,18 +1101,24 @@ def _r_expression_has_obvious_adjacent_values(
             if cursor + 1 < stop and text[cursor + 1] == "=":
                 operator = "=="
             else:
-                assignment_target = _r_identifier_before_position(text, cursor, non_code_spans)
                 if (
                     expects_value
                     or native_pipe_call_required
-                    or assignment_target is None
-                    or _r_unquoted_named_argument_target_kind(assignment_target) != "symbol"
+                    or not _r_assignment_target_is_valid(
+                        text,
+                        assignment_target_start,
+                        cursor,
+                        non_code_spans,
+                        delimiter_pairs,
+                        unterminated_literal_starts,
+                    )
                 ):
                     return True
                 expects_value = True
                 namespace_receiver_is_valid = False
                 member_receiver_is_valid = False
                 cursor += 1
+                assignment_target_start = cursor
                 continue
         else:
             operator = next(
@@ -1133,6 +1152,24 @@ def _r_expression_has_obvious_adjacent_values(
                 return True
             if operator in {"$", "@"} and not member_receiver_is_valid:
                 return True
+            if operator in {"<-", "<<-"} and not _r_assignment_target_is_valid(
+                text,
+                assignment_target_start,
+                cursor,
+                non_code_spans,
+                delimiter_pairs,
+                unterminated_literal_starts,
+            ):
+                return True
+            if operator in {"->", "->>"} and not _r_assignment_target_is_valid(
+                text,
+                cursor + len(operator),
+                stop,
+                non_code_spans,
+                delimiter_pairs,
+                unterminated_literal_starts,
+            ):
+                return True
             operator_name_required = operator in {"::", ":::", "$", "@"}
             if native_pipe_placeholder_extraction_required and operator in {"$", "@"}:
                 native_pipe_call_required = False
@@ -1143,6 +1180,8 @@ def _r_expression_has_obvious_adjacent_values(
             namespace_receiver_is_valid = False
             member_receiver_is_valid = False
             cursor += len(operator)
+            if operator in {"<-", "<<-", "->", "->>"}:
+                assignment_target_start = cursor
             continue
         if character.isalnum() or character in "._":
             token_starts_like_number = character.isdigit() or (
@@ -1194,6 +1233,7 @@ def _r_expression_has_obvious_adjacent_values(
                 namespace_receiver_is_valid = False
                 member_receiver_is_valid = False
                 cursor = closer + 1
+                assignment_target_start = cursor
                 continue
             if token == "repeat":
                 if not expects_value or native_pipe_call_required:
@@ -1202,14 +1242,16 @@ def _r_expression_has_obvious_adjacent_values(
                 namespace_receiver_is_valid = False
                 member_receiver_is_valid = False
                 cursor = token_end
+                assignment_target_start = cursor
                 continue
             if token == "else":
-                if expects_value:
+                if expects_value or any(separator in text[search_start:cursor] for separator in "\r\n"):
                     return True
                 expects_value = True
                 namespace_receiver_is_valid = False
                 member_receiver_is_valid = False
                 cursor = token_end
+                assignment_target_start = cursor
                 continue
             if not expects_value:
                 return True
@@ -1554,6 +1596,126 @@ def _r_delimited_expression_can_start_call(
     ):
         return False
     return not _r_grouped_expression_is_obviously_non_callable(expression)
+
+
+def _r_completed_expression_stop(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+    delimiter_pairs: dict[int, int],
+    unterminated_literal_starts: set[int],
+    statement_starts: list[int],
+) -> int:
+    """Stop at the first top-level statement boundary after a complete expression."""
+    for statement_start in statement_starts:
+        statement_stop = statement_start - 1
+        if statement_stop <= position:
+            continue
+        first_code = _r_next_code_position(text, position, non_code_spans)
+        if first_code is None or first_code >= statement_stop:
+            continue
+        if not _r_expression_has_obvious_adjacent_values(
+            text,
+            first_code,
+            statement_stop,
+            non_code_spans,
+            delimiter_pairs,
+            unterminated_literal_starts=unterminated_literal_starts,
+        ):
+            return statement_stop
+    return len(text)
+
+
+def _r_assignment_target_is_valid(
+    text: str,
+    position: int,
+    stop: int,
+    non_code_spans: list[tuple[int, int]],
+    delimiter_pairs: dict[int, int],
+    unterminated_literal_starts: set[int],
+    remaining_depth: int = _R_EXPRESSION_MAX_DEPTH,
+) -> bool:
+    """Validate a bounded R assignment target expression."""
+    if remaining_depth <= 0:
+        raise _RExpressionDepthExceeded
+    cursor = _r_next_code_position(text, position, non_code_spans)
+    if cursor is None or cursor >= stop:
+        return False
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        span_start, span_end = non_code_spans[span_index]
+        if text[span_start] != "`" or span_start in unterminated_literal_starts:
+            return False
+        cursor = span_end
+    else:
+        if not (text[cursor].isalpha() or text[cursor] in "._"):
+            return False
+        token_end = cursor + 1
+        while token_end < stop and (text[token_end].isalnum() or text[token_end] in "._"):
+            token_end += 1
+        if _r_unquoted_named_argument_target_kind(text[cursor:token_end]) != "symbol":
+            return False
+        cursor = token_end
+
+    while True:
+        next_code = _r_next_code_position(text, cursor, non_code_spans)
+        if next_code is None or next_code >= stop or text[next_code] in ",;)]}":
+            return True
+        if text.startswith("->>", next_code) or text.startswith("->", next_code):
+            operator_length = 3 if text.startswith("->>", next_code) else 2
+            return _r_assignment_target_is_valid(
+                text,
+                next_code + operator_length,
+                stop,
+                non_code_spans,
+                delimiter_pairs,
+                unterminated_literal_starts,
+                remaining_depth - 1,
+            )
+        if text[next_code] in "$@":
+            name_start = _r_next_code_position(text, next_code + 1, non_code_spans)
+            if name_start is None or name_start >= stop:
+                return False
+            name_span_index = bisect_right(non_code_spans, name_start, key=lambda span: span[0]) - 1
+            if name_span_index >= 0 and name_start < non_code_spans[name_span_index][1]:
+                span_start, span_end = non_code_spans[name_span_index]
+                if text[span_start] not in "`\"'" or span_start in unterminated_literal_starts:
+                    return False
+                cursor = span_end
+                continue
+            if not (text[name_start].isalpha() or text[name_start] in "._"):
+                return False
+            name_end = name_start + 1
+            while name_end < stop and (text[name_end].isalnum() or text[name_end] in "._"):
+                name_end += 1
+            if _r_unquoted_named_argument_target_kind(text[name_start:name_end]) != "symbol":
+                return False
+            cursor = name_end
+            continue
+        if text[next_code] in "([":
+            closer = delimiter_pairs.get(next_code)
+            if closer is None or closer >= stop:
+                return False
+            if text[next_code] == "(" and not _r_comma_separated_values_are_complete(
+                text,
+                next_code + 1,
+                closer,
+                non_code_spans,
+                delimiter_pairs,
+                unterminated_literal_starts,
+            ):
+                return False
+            if text[next_code] == "[" and not _r_open_bracket_starts_subscript(
+                text,
+                next_code,
+                non_code_spans,
+                delimiter_pairs,
+            ):
+                return False
+            cursor = closer + 1
+            continue
+        return False
 
 
 def _r_grouped_expression_is_obviously_non_callable(expression: str) -> bool:
@@ -2183,7 +2345,27 @@ def _r_open_bracket_starts_subscript(
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
         return opener_prefix is None
     if text[cursor] == "}":
-        return _r_matching_open_delimiter_position(text, cursor, non_code_spans, delimiter_pairs) is not None
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans, delimiter_pairs)
+        if opener_position is None or not _r_expression_start_has_valid_boundary(
+            text,
+            opener_position,
+            non_code_spans,
+            delimiter_pairs,
+        ):
+            return False
+        expression_start = _r_next_code_position(text, opener_position + 1, non_code_spans)
+        return (
+            expression_start is not None
+            and expression_start < cursor
+            and not _r_expression_has_obvious_adjacent_values(
+                text,
+                expression_start,
+                cursor,
+                non_code_spans,
+                delimiter_pairs or {},
+                allow_newline_separator=True,
+            )
+        )
 
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:

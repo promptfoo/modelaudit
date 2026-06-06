@@ -2,6 +2,7 @@
 
 import json
 import pickle
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -68,7 +69,7 @@ class TestPyCompileImprovements:
         assert len(encoded_issues) >= 1
         assert "subprocess" in str(encoded_issues[0].details)
 
-    def test_keras_lambda_layer_validation(self, tmp_path):
+    def test_keras_lambda_layer_validation(self, tmp_path: Path) -> None:
         """Test Lambda layer code validation in Keras models."""
         h5_path = tmp_path / "lambda_test.h5"
 
@@ -95,7 +96,11 @@ class TestPyCompileImprovements:
         # Should detect dangerous Lambda code
         lambda_issues = [i for i in result.issues if "Lambda" in i.message and "dangerous" in i.message]
         assert len(lambda_issues) == 1
-        assert "Dynamic code execution" in lambda_issues[0].details.get("code_analysis", "")
+        assert "code_analysis" not in lambda_issues[0].details
+        assert (
+            lambda_issues[0].details.get("code_analysis_omitted")
+            == "lambda_code_analysis_may_contain_sensitive_identifiers"
+        )
 
     def test_keras_lambda_false_positive_reduction(self, tmp_path):
         """Test that Lambda layers with non-code strings aren't flagged as dangerous."""

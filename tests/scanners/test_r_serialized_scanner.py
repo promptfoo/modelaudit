@@ -11,7 +11,8 @@ import pytest
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE
+from modelaudit.scanners import r_serialized_scanner as r_scanner_module
+from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, _r_non_code_spans
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import (
@@ -916,6 +917,17 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
     assert credential_checks[0].status == CheckStatus.PASSED
 
 
+def test_r_named_argument_helper_stops_function_body_at_completed_statement() -> None:
+    text = 'function(token = "standard") "body"\nvalue'
+    equals_position = text.index("=")
+
+    assert r_scanner_module._r_named_argument_equals_positions(
+        text,
+        {equals_position},
+        _r_non_code_spans(text),
+    ) == {equals_position}
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -995,6 +1007,8 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'function(token = "standard") \\(x) x',
         'function(token = "standard") {}',
         'function(token = r"(standard)") "body"',
+        'function(token = "standard") "body"\nvalue',
+        'function(token = "standard") "body" # next statement\nvalue',
         'function(token = "standard") value +\nother',
         'function(token = r"(standard)") list(value + 1)',
         'function(token = "standard") { value + 1 }',
@@ -1028,6 +1042,14 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'x\n\\(token = r"(standard)") NULL',
         'x %foo% function(token = "standard") NULL',
         'x %>% function(token = r"(standard)") NULL',
+        'list(token = { x <- 1; "standard" })',
+        'list(token = { x[1] <- 1; "standard" })',
+        'list(token = { names(x) <<- 1; "standard" })',
+        'list(token = { if (TRUE) x <- 1; "standard" })',
+        'list(token = { x <- y <- 1; "standard" })',
+        'list(token = "standard" -> object$field)',
+        'list(token = "standard" -> x[1])',
+        '{x; y}[token = "standard"]',
         'x[token = "standard"]',
         'x[[token = r"(standard)"]]',
         'x[token = r"(standard)" == x]',
@@ -1266,6 +1288,18 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'x[a b][token = "BAD_SUBSCRIPT_CHAIN_SECRET"]',
         '(x y)(token = "BAD_GROUPED_SECRET")',
         '{x y}(token = "BAD_BRACED_SECRET")',
+        'list(token = 1 <- "INVALID_LEFT_ASSIGNMENT_SECRET")',
+        'list(token = x + y <- "INVALID_COMPLEX_LEFT_SECRET")',
+        'list(token = x && y <<- "INVALID_SUPER_LEFT_SECRET")',
+        'list(token = "INVALID_RIGHT_ASSIGNMENT_SECRET" -> TRUE)',
+        'list(token = "INVALID_SUPER_RIGHT_SECRET" ->> FALSE)',
+        'list(token = "INVALID_RIGHT_EXPRESSION_SECRET" -> x + y)',
+        'list(token = x + y = "INVALID_EQUALS_TARGET_SECRET")',
+        'list(token = { if (TRUE) x + y <- "INVALID_CONTROL_ASSIGN_SECRET" })',
+        '{x y}[token = "INVALID_BRACED_RECEIVER_SECRET"]',
+        '{1, x}[token = "INVALID_BRACED_COMMA_SECRET"]',
+        'list(token = if (TRUE) "SPLIT_ELSE_SECRET"\nelse "x")',
+        'list(token = if (TRUE) {"COMMENT_SPLIT_ELSE_SECRET"} # gap\nelse "x")',
     ],
 )
 def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment: str) -> None:
