@@ -911,9 +911,6 @@ def _r_expression_has_obvious_adjacent_values(
     while cursor < stop:
         search_start = cursor
         cursor = _r_next_code_position(text, cursor, non_code_spans) or stop
-        if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
-            expects_value = True
-            assignment_target_start = cursor
         if cursor >= stop or text[cursor] in ")]}":
             return (
                 (saw_code and expects_value)
@@ -921,6 +918,9 @@ def _r_expression_has_obvious_adjacent_values(
                 or native_pipe_call_required
                 or native_pipe_placeholder_extraction_required
             )
+        if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
+            expects_value = True
+            assignment_target_start = cursor
         if text[cursor] in ",;":
             if not allow_newline_separator:
                 return (
@@ -1390,7 +1390,8 @@ def _r_open_paren_starts_argument_list(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    token = text[cursor + 1 : token_end]
+    token_start = cursor + 1
+    token = text[token_start:token_end]
     if crossed_newline or not _r_token_can_start_call(token):
         return False
 
@@ -1417,7 +1418,12 @@ def _r_open_paren_starts_argument_list(
             non_code_spans,
             delimiter_pairs,
         )
-    return True
+    return _r_expression_start_has_valid_boundary(
+        text,
+        token_start,
+        non_code_spans,
+        delimiter_pairs,
+    )
 
 
 def _r_expression_start_has_valid_boundary(
@@ -1453,17 +1459,27 @@ def _r_expression_start_has_valid_boundary(
                 non_code_spans,
                 delimiter_pairs,
             )
-            return opener_position is not None and _r_identifier_before_position(
+            if opener_position is None:
+                return True
+            return _r_identifier_before_position(text, opener_position, non_code_spans) in {
+                "for",
+                "function",
+                "if",
+                "while",
+            } or _r_lambda_shorthand_before_position(
                 text,
                 opener_position,
                 non_code_spans,
-            ) in {"for", "function", "if", "while"}
+                delimiter_pairs,
+            )
+        if text[cursor] in "]}":
+            return True
         if text[cursor].isalnum() or text[cursor] in "._":
             token_end = cursor + 1
             while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
                 cursor -= 1
             return text[cursor + 1 : token_end] in {"else", "repeat"}
-        return text[cursor] in "([{,;=<>+-*/^!&|~?:$@"
+        return text[cursor] in "([{,;=<>+-*/^!&|~?:$@%"
     return True
 
 
@@ -1614,6 +1630,13 @@ def _r_completed_expression_stop(
         first_code = _r_next_code_position(text, position, non_code_spans)
         if first_code is None or first_code >= statement_stop:
             continue
+        next_statement_code = _r_next_code_position(text, statement_start, non_code_spans)
+        if next_statement_code is not None:
+            token_end = next_statement_code
+            while token_end < len(text) and (text[token_end].isalnum() or text[token_end] in "._"):
+                token_end += 1
+            if text[next_statement_code:token_end] == "else":
+                continue
         if not _r_expression_has_obvious_adjacent_values(
             text,
             first_code,
@@ -2386,8 +2409,14 @@ def _r_open_bracket_starts_subscript(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    token = text[cursor + 1 : token_end]
-    return _r_token_can_start_subscript(token)
+    token_start = cursor + 1
+    token = text[token_start:token_end]
+    return _r_token_can_start_subscript(token) and _r_expression_start_has_valid_boundary(
+        text,
+        token_start,
+        non_code_spans,
+        delimiter_pairs,
+    )
 
 
 def _r_open_call_or_subscript_awaits_continuation(
@@ -3107,6 +3136,8 @@ class RSerializedScanner(BaseScanner):
                             break
                         current_text = "".join(current_parts)
                         non_code_spans = _r_non_code_spans(current_text)
+                        next_text = match.group().decode("utf-8", errors="ignore")
+                        next_starts_else = re.match(r"else(?:\b|(?=[({]))", next_text.lstrip()) is not None
                         continuation_active = (
                             _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
                             or _r_function_keyword_awaits_formals(current_text, non_code_spans)
@@ -3117,6 +3148,7 @@ class RSerializedScanner(BaseScanner):
                                 non_code_spans,
                             )
                             or _r_open_call_or_subscript_awaits_continuation(current_text, non_code_spans)
+                            or next_starts_else
                         )
                     else:
                         continuation_active = False
