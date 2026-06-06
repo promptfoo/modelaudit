@@ -619,6 +619,28 @@ def _authorization_assignment_scheme(segment: str) -> str | None:
     return value if _AUTHORIZATION_SCHEME_PATTERN.fullmatch(value) is not None else None
 
 
+def _is_bare_ip_path_endpoint(value: str) -> bool:
+    decoded = _decode_path_token(value).lstrip("/")
+    candidate = decoded.split("/", 1)[0]
+    host = candidate
+    if candidate.startswith("["):
+        closing_bracket = candidate.find("]")
+        if closing_bracket < 0:
+            return False
+        remainder = candidate[closing_bracket + 1 :]
+        if remainder and (re.fullmatch(r":\d{1,5}", remainder) is None or not 0 < int(remainder[1:]) <= 65535):
+            return False
+        host = candidate[1:closing_bracket]
+    elif candidate.count(":") == 1:
+        possible_host, possible_port = candidate.rsplit(":", 1)
+        if possible_port.isdigit() and 0 < int(possible_port) <= 65535:
+            host = possible_host
+    with suppress(ValueError):
+        ipaddress.ip_address(host)
+        return True
+    return False
+
+
 def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
     if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
         return False
@@ -626,9 +648,7 @@ def _authorization_scheme_has_payload(scheme: str, following_value: str | None) 
     endpoint_key, separator, _endpoint_value = decoded_following_value.partition("=")
     if separator and _is_endpoint_location_key(endpoint_key):
         return False
-    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(decoded_following_value)
-    with suppress(ValueError):
-        ipaddress.ip_address(token_candidate.strip("[]"))
+    if _is_bare_ip_path_endpoint(following_value):
         return False
     return not _looks_like_known_artifact_filename(following_value)
 

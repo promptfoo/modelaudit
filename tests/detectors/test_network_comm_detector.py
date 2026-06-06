@@ -536,17 +536,36 @@ class TestNetworkCommDetector:
         )
         assert any(finding.get("ip") == ip for finding in findings)
 
-    def test_authorization_matrix_assignment_preserves_bare_ip_endpoint(self) -> None:
+    @pytest.mark.parametrize("endpoint", ["45.33.32.156", "45.33.32.156:443", "[2001:4860:4860::8888]:443"])
+    def test_authorization_matrix_assignment_preserves_bare_ip_endpoint(self, endpoint: str) -> None:
+        url = f"https://evil.example/path;authorization=Bearer;{endpoint}/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == f"https://evil.example/path;authorization=<redacted>;{endpoint}/model.bin"
+
+    def test_authorization_matrix_assignment_reports_bare_ip_endpoint(self) -> None:
         ip = "45.33.32.156"
         url = f"https://evil.example/path;authorization=Bearer;{ip}/model.bin"
 
         findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
 
-        assert any(
-            finding.get("url") == f"https://evil.example/path;authorization=<redacted>;{ip}/model.bin"
-            for finding in findings
-        )
         assert any(finding.get("ip") == ip for finding in findings)
+
+    def test_authorization_matrix_assignment_redacts_invalid_ip_port_payload(self) -> None:
+        url = "https://evil.example/path;authorization=Bearer;45.33.32.156:99999/model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://evil.example/path;authorization=<redacted>;<redacted>/model.bin"
+
+    @pytest.mark.parametrize("scheme", ["token", "Bearer"])
+    def test_authorization_hostname_redacts_payload_before_multi_label_domain(self, scheme: str) -> None:
+        url = f"https://auth.{scheme}.payload.example.co.uk/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.<redacted>.example.co.uk/path"
 
     @pytest.mark.parametrize("separator", [",", "&", "&amp;"])
     def test_authorization_boundary_assignment_redacts_following_payload(self, separator: str) -> None:
