@@ -515,6 +515,24 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_prioritized_rescan_fails_closed_when_source_start_budget_is_exceeded(self) -> None:
+        line_count = jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
+        source = b"}\x00\n".join(f"if True: import webbrowser as wb_{index}".encode() for index in range(line_count))
+        prioritized = jit_script_module._candidate_embedded_python_snippets(source)
+
+        findings = JITScriptDetector()._extract_and_check_python_code(
+            source,
+            "TorchScript",
+            "prioritized-rescan.bin",
+            prioritized_snippets=prioritized,
+        )
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+            for finding in findings
+        )
+
     def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00".join(
@@ -9452,6 +9470,21 @@ class TestJITScriptDetector:
 
         assert "alias" not in aliases
 
+    @pytest.mark.parametrize(("value", "expected"), [(b"original", True), (b"print", False)])
+    def test_prefix_typed_member_aliases_replay_helper_call_in_assignment(
+        self,
+        value: bytes,
+        expected: bool,
+    ) -> None:
+        prefix = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"ignored = setattr(wb, 'open', " + value + b")\nalias = wb.open\n"
+        )
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert ("alias" in aliases) is expected
+
     @pytest.mark.parametrize(
         "update",
         [
@@ -9478,6 +9511,13 @@ class TestJITScriptDetector:
     def test_prefix_typed_member_aliases_capture_same_line_tail_assignment(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = padding + b"import webbrowser as wb; alias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_resume_after_trimmed_prefix_parse(self) -> None:
+        prefix = b"import webbrowser as wb\x00alias = wb.open\n"
 
         aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
 

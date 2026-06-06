@@ -898,16 +898,26 @@ def _compact_tail_module_lines(tail: bytes) -> Iterator[tuple[bytes, tuple[ast.s
 def _compact_prefix_module_lines(candidate: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
     """Yield bounded prefix statements in source order without hoisting scoped bindings."""
     prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
-    prefix = candidate[:prefix_end].lstrip(b"\x00\xff")
-    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(prefix.decode("utf-8", errors="ignore")))
+    raw_prefix = candidate[:prefix_end]
+    prefix = raw_prefix.lstrip(b"\x00\xff")
+    prefix_offset = len(raw_prefix) - len(prefix)
+    prefix_source, prefix_byte_offsets = _decode_utf8_with_byte_offsets(prefix)
+    parsed_prefix_source = textwrap.dedent(prefix_source)
+    parsed_snippet = _parse_embedded_python_snippet(parsed_prefix_source)
+    tail_start = 0
     if parsed_snippet is not None:
-        tree, _parsed_chars = parsed_snippet
+        tree, parsed_chars = parsed_snippet
         if isinstance(tree, ast.Module):
             parents, executed_statement_ids = _compact_module_scope_context(tree)
             for statement in _compact_deterministically_executed_statements(tree.body):
                 if _is_compact_module_scope_node(statement, parents, executed_statement_ids):
                     yield b"", (statement,)
-    yield from _compact_tail_module_lines(candidate[prefix_end:])
+        tail_start = (
+            prefix_end
+            if parsed_chars == len(parsed_prefix_source)
+            else (prefix_offset + prefix_byte_offsets[parsed_chars] if parsed_prefix_source == prefix_source else 0)
+        )
+    yield from _compact_tail_module_lines(candidate[tail_start:])
 
 
 def _builtins_import_alias_state(candidate: bytes) -> tuple[frozenset[str], frozenset[str]]:
@@ -1191,6 +1201,12 @@ def _unsafe_typed_member_aliases(
                     callable_aliases.pop(alias_name, None)
             continue
         for statement in statements:
+            for expression in _deterministically_evaluated_statement_expressions(
+                statement,
+                evaluate_annotations=False,
+            ):
+                for call in _deterministically_executed_expression_calls(expression):
+                    record_helper_call(call)
             if isinstance(statement, ast.Import):
                 for alias in statement.names:
                     local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
@@ -1226,8 +1242,6 @@ def _unsafe_typed_member_aliases(
             elif isinstance(statement, ast.Delete):
                 for target in statement.targets:
                     bind_target(target, None)
-            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
-                record_helper_call(statement.value)
             _update_compact_builtins_aliases(statement, builtins_aliases)
     return callable_aliases
 
@@ -22167,6 +22181,7 @@ class JITScriptDetector:
                 matches, bounded=bounded
             )
         else:
+            matches = prioritized_snippets
             prioritized_matches = prioritized_snippets
             omitted_budgeted_spans = []
         has_bounded_source = _has_source_like_embedded_python_start(bounded)
