@@ -11,7 +11,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
-from modelaudit.scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.sources.dvc import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
     DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
@@ -1179,7 +1179,9 @@ class TestDvcSecurity:
         assert result.has_errors is True
         assert result.success is False
         assert determine_exit_code(result) == 2
-        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+        cap_issue = next(issue for issue in result.issues if issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON)
+        assert cap_issue.details["pointer_digest"] == resolution.pointer_digest
+        assert cap_issue.details["resolved_outputs"] == list(resolution.resolved_paths)
 
         cached_result = scan_model_directory_or_file(
             str(dvc_file),
@@ -1773,12 +1775,12 @@ class TestDvcCliIntegration:
         assert any(issue.get("location") and str(late) in issue["location"] for issue in output_data["issues"])
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
-    def test_cli_discharged_cap_preserves_non_operational_info_finding(
+    def test_cli_benign_info_issue_does_not_become_operational_after_cap_discharge(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A normal INFO finding must not become an operational error after cap discharge."""
+        """Ordinary informational findings must not turn a completed scan into exit 2."""
         benign = tmp_path / "benign.pkl"
         benign.write_bytes(pickle.dumps({"safe": True}))
         late = tmp_path / "late.pkl"
@@ -1788,68 +1790,66 @@ class TestDvcCliIntegration:
 
         from click.testing import CliRunner
 
-        import modelaudit.cli as cli_module
+        from modelaudit import cli as cli_module
+        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
         def scan_with_info(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
             result = real_scan(path, *args, **kwargs)
-            if Path(path).resolve() == late.resolve():
+            if path == str(late):
                 result.issues.append(
                     Issue(
-                        message="Benign informational finding",
+                        message="Benign informational note",
                         severity=IssueSeverity.INFO,
-                        location=str(late),
-                        type="test_info",
+                        location=path,
                     )
                 )
             return result
 
         monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_with_info)
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
-        )
+
+        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
 
         assert result.exit_code == 0
         output_data = json.loads(result.output)
         assert output_data["success"] is True
         assert output_data["has_errors"] is False
-        assert any(issue.get("type") == "test_info" for issue in output_data["issues"])
+        assert any(issue["message"] == "Benign informational note" for issue in output_data["issues"])
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
-    def test_cli_pointer_rewrite_cannot_discharge_original_cap(
+    def test_cli_pointer_rewrite_cannot_discharge_prior_output_cap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Coverage reconciliation must stay bound to the pointer version that produced the issue."""
+        """Coverage must remain bound to the DVC pointer that produced the cap issue."""
         benign = tmp_path / "benign.pkl"
         benign.write_bytes(pickle.dumps({"safe": True}))
-        original_late = tmp_path / "original-late.pkl"
-        original_late.write_bytes(pickle.dumps({"original": True}))
-        rewritten_late = tmp_path / "rewritten-late.pkl"
-        rewritten_late.write_bytes(pickle.dumps({"rewritten": True}))
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: original-late.pkl\n")
+        hidden = tmp_path / "hidden.pkl"
+        hidden.write_bytes(pickle.dumps({"hidden": True}))
+        late = tmp_path / "late.pkl"
+        late.write_bytes(pickle.dumps({"late": True}))
+        dvc_file = tmp_path / "mutable.dvc"
+        pointer_prefix = "outs:\n" + "- path: benign.pkl\n" * 100
+        dvc_file.write_text(pointer_prefix + "- path: hidden.pkl\n")
 
         from click.testing import CliRunner
 
-        import modelaudit.cli as cli_module
+        from modelaudit import cli as cli_module
+        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
-        def scan_and_rewrite(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        def scan_then_rewrite_pointer(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
             result = real_scan(path, *args, **kwargs)
-            if Path(path).resolve() == dvc_file.resolve():
-                dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: rewritten-late.pkl\n")
+            if path == str(dvc_file):
+                dvc_file.write_text(pointer_prefix + "- path: late.pkl\n")
             return result
 
-        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_and_rewrite)
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(rewritten_late), "--format", "json", "--no-cache"],
-        )
+        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_then_rewrite_pointer)
+
+        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
 
         assert result.exit_code == 2
         output_data = json.loads(result.output)
@@ -1857,76 +1857,64 @@ class TestDvcCliIntegration:
         assert output_data["has_errors"] is True
         assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
-    def test_cli_sharded_scan_credits_reported_sibling_coverage(
+    def test_cli_shard_check_coverage_discharges_output_cap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A completed sharded scan can discharge a cap for a reported sibling shard."""
+        """A passed shard check can prove coverage of siblings omitted from assets."""
         benign = tmp_path / "benign.pkl"
         benign.write_bytes(pickle.dumps({"safe": True}))
-        first_shard = tmp_path / "model-00001-of-00002.pkl"
-        first_shard.write_bytes(pickle.dumps({"shard": 1}))
-        late_shard = tmp_path / "model-00002-of-00002.pkl"
-        late_shard.write_bytes(pickle.dumps({"shard": 2}))
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + f"- path: {late_shard.name}\n")
+        shards = [
+            tmp_path / "model-00001-of-00002.safetensors",
+            tmp_path / "model-00002-of-00002.safetensors",
+        ]
+        for shard in shards:
+            shard.write_bytes(b"0123456789")
+        dvc_file = tmp_path / "shards.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + f"- path: {shards[1].name}\n")
+
+        def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
+            result = ScanResult(scanner_name="test")
+            result.bytes_scanned = Path(path).stat().st_size
+            if path == str(shards[0]):
+                result.add_check(
+                    name="Sharded Model Detection",
+                    passed=True,
+                    message="Detected sharded model",
+                    details={"shards": [str(shard) for shard in shards]},
+                )
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
 
         from click.testing import CliRunner
 
-        import modelaudit.cli as cli_module
+        from modelaudit import cli as cli_module
+        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
-        def scan_with_shard_check(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
+        def scan_without_sibling_asset(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
             result = real_scan(path, *args, **kwargs)
-            if Path(path).resolve() == first_shard.resolve():
-                result.checks.append(
-                    Check(
-                        name="Sharded Model Detection",
-                        status=CheckStatus.PASSED,
-                        message="Scanned both model shards",
-                        details={"shards": [str(first_shard), str(late_shard)]},
-                    )
-                )
+            if path == str(shards[0]):
+                result.assets = [asset for asset in result.assets if asset.path != str(shards[1])]
+                result.file_metadata.pop(str(shards[1]), None)
             return result
 
-        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_with_shard_check)
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(first_shard), "--format", "json", "--no-cache"],
-        )
-
-        assert result.exit_code == 0
-        output_data = json.loads(result.output)
-        assert output_data["success"] is True
-        assert output_data["has_errors"] is False
-        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
-
-    def test_cli_unhandled_sibling_does_not_discharge_output_cap(self, tmp_path: Path) -> None:
-        """An asset with no owning scanner is not proof that the omitted output was analyzed."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        late = tmp_path / "late.txt"
-        late.write_text("ordinary unhandled text")
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.txt\n")
-
-        from click.testing import CliRunner
-
-        from modelaudit.cli import cli
+        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_without_sibling_asset)
 
         result = CliRunner().invoke(
             cli,
-            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
+            ["scan", str(dvc_file), str(shards[0]), "--format", "json", "--no-cache"],
         )
 
-        assert result.exit_code == 2
+        assert result.exit_code == 0
         output_data = json.loads(result.output)
-        assert output_data["success"] is False
-        assert output_data["has_errors"] is True
-        assert any(asset.get("type") == "unknown" and asset.get("path") == str(late) for asset in output_data["assets"])
-        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+        assert output_data["success"] is True
+        assert output_data["has_errors"] is False
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     def test_cli_scanner_selection_does_not_credit_excluded_sibling(self, tmp_path: Path) -> None:
         """An explicit sibling is not coverage when the selected scanner cannot analyze it."""

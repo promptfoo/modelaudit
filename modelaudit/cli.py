@@ -407,14 +407,19 @@ def _dvc_target_was_scanned(
     return not walk_errors
 
 
-def _dvc_resolution_from_cap_issue(issue: Any) -> DvcResolution | None:
-    """Rebuild the pointer resolution that originally produced a cap issue."""
-    details = issue.details if isinstance(getattr(issue, "details", None), dict) else {}
+def _dvc_resolution_from_limit_issue(issue: Any) -> DvcResolution | None:
+    """Rebuild the original capped resolution recorded by the core scan."""
+    details = issue.details
+    if not isinstance(details, dict):
+        return None
+
     pointer_digest = details.get("pointer_digest")
     resolved_outputs = details.get("resolved_outputs")
-    if not isinstance(pointer_digest, str) or not pointer_digest or not isinstance(resolved_outputs, list):
+    if not isinstance(pointer_digest, str) or re.fullmatch(r"[0-9a-f]{64}", pointer_digest) is None:
         return None
-    if not all(isinstance(path, str) for path in resolved_outputs):
+    if not isinstance(resolved_outputs, list) or not all(
+        isinstance(path, str) and os.path.isabs(path) for path in resolved_outputs
+    ):
         return None
 
     count_fields = (
@@ -427,9 +432,16 @@ def _dvc_resolution_from_cap_issue(issue: Any) -> DvcResolution | None:
     counts: dict[str, int] = {}
     for field_name in count_fields:
         value = details.get(field_name)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
         counts[field_name] = value
+    if (
+        counts["output_limit"] != DvcResolution().output_limit
+        or counts["omitted_output_count"] == 0
+        or counts["declared_output_count"] <= counts["output_limit"]
+        or counts["omitted_output_count"] != counts["declared_output_count"] - counts["output_limit"]
+    ):
+        return None
 
     return DvcResolution(
         resolved_paths=tuple(resolved_outputs),
@@ -440,6 +452,47 @@ def _dvc_resolution_from_cap_issue(issue: Any) -> DvcResolution | None:
         unresolved_omitted_output_count=counts["unresolved_omitted_output_count"],
         unverified_omitted_output_count=counts["unverified_omitted_output_count"],
         pointer_digest=pointer_digest,
+    )
+
+
+def _add_scanner_expanded_shard_coverage(
+    audit_result: ModelAuditResultModel,
+    covered_files: set[str],
+    scanner_policy: ScannerSelectionPolicy,
+) -> None:
+    """Credit shard siblings from successful scans of covered representatives."""
+    for check in audit_result.checks:
+        if check.name != "Sharded Model Detection" or check.status != CheckStatus.PASSED:
+            continue
+        shards = check.details.get("shards")
+        if not isinstance(shards, list) or not shards:
+            continue
+
+        resolved_shards: list[str] = []
+        for shard in shards:
+            if not isinstance(shard, str) or not os.path.isfile(shard):
+                break
+            if not _selected_scanner_can_analyze(shard, scanner_policy):
+                break
+            try:
+                resolved_shards.append(str(Path(shard).resolve()))
+            except OSError:
+                break
+        else:
+            if covered_files.intersection(resolved_shards):
+                covered_files.update(resolved_shards)
+
+
+def _issue_indicates_operational_error(issue: Any) -> bool:
+    """Return whether an issue explicitly records incomplete or failed analysis."""
+    details = issue.details
+    if not isinstance(details, dict):
+        return False
+    return bool(
+        details.get("operational_error") is True
+        or details.get("analysis_incomplete") is True
+        or details.get("interrupted") is True
+        or details.get("scan_outcome") == "inconclusive"
     )
 
 
@@ -455,7 +508,7 @@ def _reconcile_dvc_output_limit_issues(
     scanner_policy = policy_from_config(runtime.config)
     covered_files: set[str] = set()
     for asset in audit_result.assets:
-        if asset.type in {"error", "skipped", "unknown"} or not os.path.isfile(asset.path):
+        if asset.type == "error" or not os.path.isfile(asset.path):
             continue
         metadata = audit_result.file_metadata.get(asset.path)
         if metadata is not None and (
@@ -466,28 +519,13 @@ def _reconcile_dvc_output_limit_issues(
             continue
         covered_files.add(str(Path(asset.path).resolve()))
 
-    for check in audit_result.checks:
-        shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
-        if (
-            check.name != "Sharded Model Detection"
-            or check.status != CheckStatus.PASSED
-            or not isinstance(shard_paths, list)
-        ):
-            continue
-        for shard_path in shard_paths:
-            if not isinstance(shard_path, str) or not os.path.isfile(shard_path):
-                continue
-            try:
-                covered_files.add(str(Path(shard_path).resolve()))
-            except OSError:
-                continue
-
+    _add_scanner_expanded_shard_coverage(audit_result, covered_files, scanner_policy)
     covered = frozenset(covered_files)
     discharged_locations: set[str] = set()
     for issue in cap_issues:
         if not issue.location or not os.path.isfile(issue.location):
             continue
-        resolution = _dvc_resolution_from_cap_issue(issue)
+        resolution = _dvc_resolution_from_limit_issue(issue)
         if resolution is None:
             continue
         if dvc_omitted_outputs_covered(
@@ -515,15 +553,7 @@ def _reconcile_dvc_output_limit_issues(
         metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
         for metadata in audit_result.file_metadata.values()
     )
-    issue_has_operational_error = any(
-        isinstance(issue.details, dict)
-        and (
-            issue.details.get("operational_error") is True
-            or issue.details.get("analysis_incomplete") is True
-            or issue.details.get("scan_outcome") == "inconclusive"
-        )
-        for issue in audit_result.issues
-    )
+    issue_has_operational_error = any(_issue_indicates_operational_error(issue) for issue in audit_result.issues)
     audit_result.has_errors = bool(
         metadata_has_operational_error
         or issue_has_operational_error

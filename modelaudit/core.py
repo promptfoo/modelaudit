@@ -28,7 +28,7 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -224,9 +224,9 @@ def _record_dvc_output_limit_incomplete(
         details={
             "analysis_incomplete": True,
             "scan_outcome_reason": DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
-            "pointer_digest": resolution.pointer_digest,
             "declared_output_count": resolution.declared_output_count,
             "output_limit": resolution.output_limit,
+            "pointer_digest": resolution.pointer_digest,
             "resolved_outputs": list(resolution.resolved_paths),
             "resolved_output_count": len(resolution.resolved_paths),
             "omitted_output_count": resolution.omitted_output_count,
@@ -2049,7 +2049,11 @@ def scan_model_directory_or_file(
                     scanned_dvc_paths.add(resolved_target)
                     for check in file_result.checks:
                         shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
-                        if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
+                        if (
+                            check.name == "Sharded Model Detection"
+                            and check.status == CheckStatus.PASSED
+                            and isinstance(shard_paths, list)
+                        ):
                             scanned_dvc_paths.update(
                                 str(Path(shard_path).resolve())
                                 for shard_path in shard_paths
