@@ -1665,6 +1665,23 @@ class TestDvcSecurity:
         assert path_state.dvc_covered_paths == set()
         assert path_state.dvc_covered_directories == set()
 
+    def test_cli_security_finding_asset_counts_as_dvc_coverage(self, tmp_path: Path) -> None:
+        """A completed sibling scan remains coverage when it reports a critical finding."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        malicious_path = tmp_path / "malicious.pkl"
+        malicious_path.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        finding_result = create_initial_audit_result()
+        finding_result.success = True
+        finding_result.has_errors = True
+        finding_result.assets.append(AssetModel(path=str(malicious_path), type="pickle"))
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(malicious_path), finding_result)
+
+        assert path_state.dvc_covered_paths == {str(malicious_path)}
+
     def test_cli_shard_check_paths_count_as_dvc_coverage(self, tmp_path: Path) -> None:
         """Shard siblings scanned by the advanced handler must discharge capped outputs."""
         from modelaudit.cli import _ScanPathState
@@ -2442,8 +2459,6 @@ class TestDvcCliIntegration:
 
     def test_cli_sibling_coverage_avoids_false_inconclusive_exit(self, tmp_path: Path) -> None:
         """A fully covered expanded argument list should complete without a DVC cap error."""
-        import json
-
         from click.testing import CliRunner
 
         from modelaudit.cli import cli
@@ -2473,8 +2488,6 @@ class TestDvcCliIntegration:
 
     def test_cli_directory_sibling_scans_malicious_omitted_output(self, tmp_path: Path) -> None:
         """Directory coverage must still surface a malicious omitted descendant."""
-        import json
-
         from click.testing import CliRunner
 
         from modelaudit.cli import cli

@@ -195,7 +195,7 @@ class _ScanPathState:
         scanner_config: dict[str, Any] | None = None,
     ) -> None:
         """Record concrete artifacts and successful directory walks for later DVC pointers."""
-        if not self.collect_dvc_coverage or not scan_result.success or scan_result.has_errors:
+        if not self.collect_dvc_coverage or not scan_result.success:
             return
 
         scanner_policy = policy_from_config(scanner_config)

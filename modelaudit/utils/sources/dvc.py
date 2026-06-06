@@ -145,8 +145,8 @@ def _resolve_output_base(path: Path, data: dict[Any, Any]) -> Path | None:
         output_base = (dvc_dir / wdir).resolve()
         if output_base.is_relative_to(dvc_dir):
             return output_base
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as exc:
+        logger.debug("Unable to resolve DVC working directory %s -> %s: %s", path, wdir, exc)
     logger.warning(f"DVC working directory outside safe boundaries: {path} -> {wdir}")
     return None
 
