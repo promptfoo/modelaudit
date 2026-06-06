@@ -160,6 +160,14 @@ class TestNetworkCommDetector:
             "https://auth.<redacted>.bucket.s3.amazonaws.com/path",
         ]
 
+    def test_authorization_hostname_conservatively_preserves_unlisted_public_suffix_context(self) -> None:
+        """Unknown two-label suffixes must retain their registrable hostname label."""
+        url = "https://auth.token.example.blogspot.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.example.blogspot.com/path"
+
     def test_authorization_hostname_redacts_ambiguous_payload_with_extra_domain_context(self) -> None:
         """Ambiguous schemes still carry redaction when enough hostname context remains."""
         urls = [
@@ -185,6 +193,14 @@ class TestNetworkCommDetector:
     def test_authorization_hostname_redacts_short_bearer_payload(self) -> None:
         """A strong auth scheme still redacts a short payload immediately before the TLD."""
         url = "https://auth.Bearer.SECRET.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.<redacted>.com/path"
+
+    def test_authorization_hostname_redacts_low_entropy_bearer_payload(self) -> None:
+        """A strong auth scheme makes an otherwise domain-like label sensitive."""
+        url = "https://auth.Bearer.hunter2.com/path"
 
         redacted = network_comm.redact_url_for_finding(url)
 
@@ -505,6 +521,27 @@ class TestNetworkCommDetector:
             for finding in findings
         )
         assert any(finding.get("ip") == ip for finding in findings)
+
+    @pytest.mark.parametrize("separator", [",", "&", "&amp;"])
+    def test_authorization_boundary_assignment_redacts_following_payload(self, separator: str) -> None:
+        """A scheme-only assignment must carry across sensitive boundary delimiters."""
+        secret = "secret.example.com"
+        url = f"https://evil.example/path{separator}authorization=Bearer{separator}{secret}{separator}model.bin"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == (
+            f"https://evil.example/path{separator}authorization=<redacted>{separator}<redacted>{separator}model.bin"
+        )
+
+    @pytest.mark.parametrize("following_value", ["model.bin", "next=45.33.32.156"])
+    def test_authorization_boundary_assignment_preserves_noncredential_value(self, following_value: str) -> None:
+        """Boundary carry-over must not consume artifacts or explicit endpoints."""
+        url = f"https://evil.example/path,authorization=Bearer,{following_value}"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == f"https://evil.example/path,authorization=<redacted>,{following_value}"
 
     @pytest.mark.parametrize("separator", ["&", "&amp;"])
     def test_ampersand_delimited_path_tokens_are_redacted(self, separator: str) -> None:

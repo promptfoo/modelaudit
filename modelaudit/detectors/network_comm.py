@@ -101,6 +101,10 @@ _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
+_STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
+    {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
+)
+_RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
 _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
 _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
     {
@@ -437,6 +441,14 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
                 authorization_value_pending = _is_authorization_path_key(empty_assignment_key)
             else:
                 redacted_component, component_changed = _redact_boundary_component(component)
+                authorization_scheme = _authorization_assignment_scheme(component)
+                following_value = next((candidate for candidate in components[index + 1 :] if candidate), None)
+                if (
+                    component_changed
+                    and authorization_scheme is not None
+                    and carries_sensitive_value(following_boundary)
+                ):
+                    redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
             if (
                 empty_assignment_key is None
                 and component
@@ -628,8 +640,17 @@ def _hostname_authorization_scheme_has_payload(
     if _looks_like_hostname_credential_value(following_value):
         return True
 
-    suffix_labels = 2
     normalized_labels = [label.casefold() for label in labels]
+    remaining_hostname = ".".join(normalized_labels[scheme_index + 1 :])
+    if (
+        scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES
+        and remaining_hostname not in _RESERVED_EXAMPLE_DOMAINS
+    ):
+        return True
+
+    # Without a bundled PSL, reserve one registrable label plus a possible
+    # two-label public suffix. Known longer private suffixes raise this bound.
+    suffix_labels = 3
     if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2].casefold() in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS:
         suffix_labels = 3
     for public_suffix in _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES:
