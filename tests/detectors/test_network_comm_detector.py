@@ -109,6 +109,17 @@ class TestNetworkCommDetector:
         assert secret.lower() not in serialized.lower()
         assert f"https://{key}.<redacted>.example.com/path" in serialized
 
+    @pytest.mark.parametrize(
+        ("key", "secret"),
+        [("api_key", "HOSTSECRET"), ("token", "SECRET123")],
+    )
+    def test_detect_urls_redacts_three_label_hostname_credentials(self, key: str, secret: str) -> None:
+        findings = NetworkCommDetector().scan(f"https://{key}.{secret}.com/path".encode(), "model.bin")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret.lower() not in serialized.lower()
+        assert f"https://{key}.<redacted>.com/path" in serialized
+
     def test_detect_urls_preserves_sensitive_word_as_registrable_subdomain(self) -> None:
         """A sensitive word without a separate value label should remain useful hostname context."""
         url = "https://token.example.com/path"
@@ -1519,6 +1530,24 @@ class TestNetworkCommDetector:
 
         assert any(finding.get("type") == endpoint_type and finding.get(field) == value for finding in findings)
 
+    @pytest.mark.parametrize("config", [{}, {"max_findings": 2}])
+    def test_completed_sensitive_path_preserves_explicit_query_endpoint(self, config: dict[str, int]) -> None:
+        ip = "45.33.32.156"
+        url = f"https://evil.example/api_key?endpoint={ip}"
+
+        findings = NetworkCommDetector(config).scan(url.encode(), "tokens.txt")
+
+        assert any(finding.get("ip") == ip for finding in findings)
+
+    @pytest.mark.parametrize("config", [{}, {"max_findings": 1}])
+    def test_completed_sensitive_path_preserves_explicit_nested_destination(self, config: dict[str, int]) -> None:
+        nested_url = "https://evil-c2.com/payload"
+        url = f"https://benign.example/token?next={nested_url}"
+
+        findings = NetworkCommDetector(config).scan(url.encode(), "tokens.txt")
+
+        assert any(finding.get("url") == nested_url for finding in findings)
+
     def test_detect_domain_names(self) -> None:
         """Test detection of domain names."""
         detector = NetworkCommDetector()
@@ -2293,6 +2322,19 @@ class TestNetworkCommDetector:
         assert findings[0]["type"] == finding_type
         assert findings[0]["snippet"] == expected_snippet
 
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b'c2_server = None, docs_url = "https://docs.example/reference"',
+            b'c2_server = None, docs_host = "docs.example.com"',
+        ],
+    )
+    def test_cc_pattern_snippets_do_not_cross_into_sibling_assignments(self, data: bytes) -> None:
+        findings = NetworkCommDetector({"max_findings": 1}).scan(data, "hook.py")
+
+        assert findings[0]["type"] == "cc_pattern"
+        assert findings[0]["snippet"] == "c2_server"
+
     def test_network_function_snippets_do_not_preserve_bare_endpoint_credentials(self) -> None:
         secret = "45.33.32.156"
         data = f'requests.get(api_key="{secret}")'.encode()
@@ -2981,6 +3023,26 @@ def test_network_finding_limit_prioritizes_raw_nested_url() -> None:
     assert findings[-1]["truncated_finding"]["url"] == "https://benign.example/download"
 
 
+def test_network_finding_limit_prioritizes_encoded_nested_url_in_path() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    data = b"https://benign.example/redirect/https%3A%2F%2Fevil-c2.com%2Fpayload"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
+
+
+def test_network_finding_limit_redacts_encoded_nested_url_in_sensitive_path() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    data = b"https://benign.example/api_key/https%3A%2F%2Fevil-c2.com%2Fpayload"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert nested_url not in json.dumps(findings, sort_keys=True)
+    assert findings[0]["url"] == network_comm._SENSITIVE_NESTED_URL
+
+
 @pytest.mark.parametrize(
     ("key", "secret"),
     [
@@ -3007,6 +3069,29 @@ def test_network_finding_limit_redacts_nested_url_credentials(
     serialized = json.dumps(findings, sort_keys=True)
     assert secret not in serialized
     assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
+
+
+@pytest.mark.parametrize("separator", ["&", "&amp;", ";", "%26", "%3B"])
+@pytest.mark.parametrize("max_findings", [None, 1])
+def test_delimited_nested_url_credentials_do_not_reappear(separator: str, max_findings: int | None) -> None:
+    nested_url = "https://evil-c2.com/payload"
+    url = f"https://benign.example/download?api_key{separator}{nested_url}"
+    config = {} if max_findings is None else {"max_findings": max_findings}
+
+    findings = NetworkCommDetector(config).scan(url.encode(), "tokens.txt")
+    serialized = json.dumps(findings, sort_keys=True)
+
+    assert nested_url not in serialized
+    assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
+
+
+def test_delimited_nested_url_sensitive_key_near_match_preserves_endpoint() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    url = f"https://benign.example/download?algorithm&{nested_url}"
+
+    findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+    assert any(finding.get("url") == nested_url for finding in findings)
 
 
 @pytest.mark.parametrize(
@@ -3073,6 +3158,18 @@ def test_network_finding_limit_deduplicates_cloud_nested_url_before_distinct_end
     assert any(finding.get("url") == distinct_url for finding in findings)
 
 
+def test_network_finding_limit_deduplicates_repeated_cloud_wrapper_before_distinct_endpoint() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    wrapper = b"https://storage.googleapis.com/bucket/model?next=https%3A%2F%2Fevil-c2.com%2Fpayload"
+    distinct_url = "https://distinct.example/path"
+    data = b" ".join((wrapper, wrapper, distinct_url.encode()))
+
+    findings = NetworkCommDetector({"max_findings": 4}).scan(data, "tokens.txt")
+
+    assert sum(finding.get("url") == nested_url for finding in findings) == 1
+    assert any(finding.get("url") == distinct_url for finding in findings)
+
+
 @pytest.mark.parametrize("secret", ["45.33.32.156", "secret-value.example.com"])
 def test_network_finding_limit_suppresses_colon_query_credentials(secret: str) -> None:
     """Colon-style query credentials must not reappear through endpoint scanners."""
@@ -3081,6 +3178,27 @@ def test_network_finding_limit_suppresses_colon_query_credentials(secret: str) -
     findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
 
     assert secret not in json.dumps(findings, sort_keys=True)
+
+
+@pytest.mark.parametrize("secret", ["45.33.32.156", "secret.example.com"])
+def test_network_finding_limit_suppresses_endpoint_inside_uri_credential(secret: str) -> None:
+    data = f"api_key=redis://{secret}/db".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "finding_key"),
+    [("45.33.32.156", "ip"), ("public.example.com", "domain")],
+)
+def test_network_finding_limit_preserves_endpoint_inside_uri_near_match(value: str, finding_key: str) -> None:
+    data = f"endpoint=redis://{value}/db".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert any(finding.get(finding_key) == value for finding in findings)
 
 
 def test_network_finding_limit_preserves_colon_query_near_match() -> None:
@@ -3130,6 +3248,21 @@ def test_delimiter_only_query_credentials_do_not_reappear(
     secret: str,
 ) -> None:
     """Endpoint-shaped query credentials must remain absent from secondary findings."""
+    findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+    assert not any(finding.get(finding_key) == secret for finding in findings)
+
+
+@pytest.mark.parametrize("separator", ["&", "&amp;", ";", "%26", "%3B"])
+@pytest.mark.parametrize(("finding_key", "secret"), [("ip", "45.33.32.156"), ("domain", "secret.example.com")])
+def test_query_field_separator_credentials_do_not_reappear(
+    separator: str,
+    finding_key: str,
+    secret: str,
+) -> None:
+    url = f"https://evil.example/path?api_key{separator}{secret}"
+
     findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
 
     assert secret not in json.dumps(findings, sort_keys=True)
@@ -3354,3 +3487,6 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
 
     assert calls == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
     assert sum(finding.get("ip") == ip for finding in findings) == calls
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["analysis_incomplete"] is True
+    assert findings[-1]["max_classifications"] == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
