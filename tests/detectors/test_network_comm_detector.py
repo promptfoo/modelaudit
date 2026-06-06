@@ -182,6 +182,13 @@ class TestNetworkCommDetector:
             "https://auth.<redacted>.<redacted>.bucket.s3.amazonaws.com/path",
         ]
 
+    def test_authorization_hostname_redacts_ambiguous_payload_before_standard_domain(self) -> None:
+        url = "https://auth.token.payload.example.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.<redacted>.example.com/path"
+
     def test_authorization_hostname_redacts_low_entropy_payload_before_standard_domain(self) -> None:
         """Public-suffix preservation must not expose a short explicit auth payload."""
         url = "https://auth.Bearer.hunter2.example.com/path"
@@ -218,6 +225,13 @@ class TestNetworkCommDetector:
         redacted = network_comm.redact_url_for_finding(url)
 
         assert redacted == expected
+
+    def test_authorization_hostname_preserves_strong_scheme_multi_label_registrable_domain(self) -> None:
+        url = "https://auth.Bearer.example.co.uk/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.example.co.uk/path"
 
     def test_detect_urls_redacts_value_after_over_encoded_hostname_key(self) -> None:
         """Decode-depth exhaustion on a hostname key must also redact its following value."""
@@ -518,6 +532,18 @@ class TestNetworkCommDetector:
 
         assert any(
             finding.get("url") == f"https://evil.example/path;authorization=<redacted>;next={ip}/model.bin"
+            for finding in findings
+        )
+        assert any(finding.get("ip") == ip for finding in findings)
+
+    def test_authorization_matrix_assignment_preserves_bare_ip_endpoint(self) -> None:
+        ip = "45.33.32.156"
+        url = f"https://evil.example/path;authorization=Bearer;{ip}/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+
+        assert any(
+            finding.get("url") == f"https://evil.example/path;authorization=<redacted>;{ip}/model.bin"
             for finding in findings
         )
         assert any(finding.get("ip") == ip for finding in findings)

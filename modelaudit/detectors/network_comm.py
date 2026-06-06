@@ -113,6 +113,7 @@ _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES = frozenset(
         "azureedge.net",
         "azurewebsites.net",
         "blob.core.windows.net",
+        "blogspot.com",
         "cloudfront.net",
         "fastly.net",
         "firebaseapp.com",
@@ -625,7 +626,26 @@ def _authorization_scheme_has_payload(scheme: str, following_value: str | None) 
     endpoint_key, separator, _endpoint_value = decoded_following_value.partition("=")
     if separator and _is_endpoint_location_key(endpoint_key):
         return False
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(decoded_following_value)
+    with suppress(ValueError):
+        ipaddress.ip_address(token_candidate.strip("[]"))
+        return False
     return not _looks_like_known_artifact_filename(following_value)
+
+
+def _hostname_public_suffix_label_count(normalized_labels: list[str]) -> int:
+    suffix_labels = 1
+    if (
+        len(normalized_labels) >= 2
+        and len(normalized_labels[-1]) == 2
+        and normalized_labels[-2] in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS
+    ):
+        suffix_labels = 2
+    for public_suffix in _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES:
+        public_suffix_labels = public_suffix.split(".")
+        if normalized_labels[-len(public_suffix_labels) :] == public_suffix_labels:
+            suffix_labels = max(suffix_labels, len(public_suffix_labels))
+    return suffix_labels
 
 
 def _hostname_authorization_scheme_has_payload(
@@ -642,23 +662,17 @@ def _hostname_authorization_scheme_has_payload(
 
     normalized_labels = [label.casefold() for label in labels]
     remaining_hostname = ".".join(normalized_labels[scheme_index + 1 :])
-    if (
-        scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES
-        and remaining_hostname not in _RESERVED_EXAMPLE_DOMAINS
-    ):
-        return True
+    public_suffix_labels = _hostname_public_suffix_label_count(normalized_labels)
+    labels_after_scheme = len(labels) - (scheme_index + 1)
+    if scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES:
+        if remaining_hostname in _RESERVED_EXAMPLE_DOMAINS:
+            return False
+        return not (public_suffix_labels > 1 and labels_after_scheme == public_suffix_labels + 1)
 
-    # Without a bundled PSL, reserve one registrable label plus a possible
-    # two-label public suffix. Known longer private suffixes raise this bound.
-    suffix_labels = 3
-    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2].casefold() in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS:
-        suffix_labels = 3
-    for public_suffix in _COMMON_MULTI_TENANT_PUBLIC_SUFFIXES:
-        public_suffix_labels = public_suffix.split(".")
-        if normalized_labels[-len(public_suffix_labels) :] == public_suffix_labels:
-            suffix_labels = max(suffix_labels, len(public_suffix_labels) + 1)
+    # Without a bundled PSL, retain one registrable label plus the bounded
+    # public/private suffix estimate before treating an earlier label as payload.
     labels_after_payload = len(labels) - (scheme_index + 2)
-    return labels_after_payload >= suffix_labels
+    return labels_after_payload >= public_suffix_labels + 1
 
 
 def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
