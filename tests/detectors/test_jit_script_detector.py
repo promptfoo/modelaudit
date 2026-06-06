@@ -7203,6 +7203,111 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
         )
 
+    def test_scan_model_keeps_original_alias_after_uncertain_try_rebind(self) -> None:
+        source = (
+            b"import webbrowser as wb\nactual = wb\ntry:\n    wb = object()\n"
+            b"except Exception:\n    pass\nwb.open = print\nactual.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_allows_safe_overwrite_after_non_raising_try(self) -> None:
+        source = b"import webbrowser as wb\ntry:\n    wb.open = print\nexcept Exception:\n    pass\nwb.open('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_original_alias_after_uncertain_try_star_rebind(self) -> None:
+        if not hasattr(ast, "TryStar"):
+            pytest.skip("except* requires Python 3.11+")
+        source = (
+            b"import webbrowser as wb\nactual = wb\ntry:\n    wb = object()\n"
+            b"except* Exception:\n    pass\nwb.open = print\nactual.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "dict_shadow",
+        [
+            b"builtins.__dict__.update(dict=Safe)\n",
+            b"setattr(builtins, 'dict', Safe)\n",
+        ],
+    )
+    def test_scan_model_rejects_dict_update_after_builtin_dict_shadow(self, dict_shadow: bytes) -> None:
+        source = (
+            b"import builtins, webbrowser as wb\n"
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            + dict_shadow
+            + b"dict.update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("future_import", "should_detect"),
+        [(b"", True), (b"from __future__ import annotations\n", False)],
+    )
+    def test_scan_model_respects_deferred_print_mutation_annotation(
+        self,
+        future_import: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            future_import
+            + b"import runpy as rp\nx: globals().update(print=eval)\n"
+            + b"rp.run_path = print\nrp.run_path('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+        assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("class_body", "should_detect"),
+        [
+            (b"    wb = object()\n    wb.open = print\n", True),
+            (b"    marker = object()\n    wb.open = print\n", False),
+        ],
+    )
+    def test_scan_model_keeps_class_local_module_alias_state(
+        self,
+        class_body: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = b"import webbrowser as wb\nclass C:\n" + class_body + b"wb.open('https://example.invalid')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+        assert detected is should_detect
+
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
         [

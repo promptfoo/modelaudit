@@ -10036,7 +10036,12 @@ def _parsed_real_spans(
     return parsed_spans
 
 
-def _compact_snippet_mutates_module_name(tree: ast.Module, target_name: str) -> bool:
+def _compact_snippet_mutates_module_name(
+    tree: ast.Module,
+    target_name: str,
+    *,
+    evaluate_annotations: bool = True,
+) -> bool:
     namespace_helper_aliases = {"globals", "locals"}
     dict_descriptor_aliases = {"dict"}
     module_mapping_aliases: set[str] = set()
@@ -10160,7 +10165,10 @@ def _compact_snippet_mutates_module_name(tree: ast.Module, target_name: str) -> 
                 value = statement.value
             if any(target_writes_print(target) for target in targets):
                 return True
-            for expression in _deterministically_evaluated_statement_expressions(statement):
+            for expression in _deterministically_evaluated_statement_expressions(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            ):
                 if any(call_writes_print(call) for call in _deterministically_executed_expression_calls(expression)):
                     return True
             if isinstance(statement, ast.If) and _static_late_truth_value(statement.test) is None:
@@ -10452,7 +10460,11 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
             tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
         except (RecursionError, SyntaxError, ValueError):
             return True
-    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(tree, "print"):
+    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(
+        tree,
+        "print",
+        evaluate_annotations=not _source_defers_annotations(code_str.encode("utf-8")),
+    ):
         return True
     (
         builtins_aliases,
@@ -10533,7 +10545,16 @@ def _compact_snippet_shadowed_print_statement_ids(statements: Sequence[ast.stmt]
 def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
     if not isinstance(tree, ast.Module):
         return {"setattr", "builtins.setattr", "__builtins__.setattr"}
-    local_setattr_shadowed = _compact_snippet_mutates_module_name(tree, "setattr")
+    local_setattr_shadowed = _compact_snippet_mutates_module_name(
+        tree,
+        "setattr",
+        evaluate_annotations=not any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(alias.name == "annotations" for alias in statement.names)
+            for statement in tree.body
+        ),
+    )
     builtins_setattr_shadowed = False
     parents, executed_statement_ids = _compact_module_scope_context(tree)
     (
@@ -11846,6 +11867,55 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
                 for key in keys:
                     exception_aliases[key] = canonical
 
+    def class_scope_binding_names(statements: Sequence[ast.stmt]) -> set[str]:
+        bindings: set[str] = set()
+        global_names: set[str] = set()
+
+        class BindingVisitor(ast.NodeVisitor):
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, ast.Store):
+                    bindings.add(node.id)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                bindings.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                bindings.update(alias.asname or alias.name for alias in node.names)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                bindings.add(node.name)
+                for expression in _deterministically_evaluated_statement_expressions(node):
+                    self.visit(expression)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                bindings.add(node.name)
+                for expression in _deterministically_evaluated_statement_expressions(node):
+                    self.visit(expression)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                bindings.add(node.name)
+                for expression in _deterministically_evaluated_statement_expressions(node):
+                    self.visit(expression)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                self.visit(node.annotation)
+                if node.value is not None:
+                    self.visit(node.target)
+                    self.visit(node.value)
+
+            def visit_Global(self, node: ast.Global) -> None:
+                global_names.update(node.names)
+
+        visitor = BindingVisitor()
+        for statement in statements:
+            visitor.visit(statement)
+        return bindings - global_names
+
     def visit(block: list[ast.stmt]) -> str | None:
         for statement in block:
             executed.append(statement)
@@ -11859,7 +11929,8 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
                 return "return"
             if isinstance(statement, ast.ClassDef):
                 module_aliases_before = set(non_raising_module_aliases)
-                visit(statement.body)
+                if not class_scope_binding_names(statement.body).intersection(module_aliases_before):
+                    visit(statement.body)
                 non_raising_module_aliases.clear()
                 non_raising_module_aliases.update(module_aliases_before)
             elif isinstance(statement, ast.If) and isinstance(statement.test, ast.Constant):
@@ -12281,12 +12352,14 @@ def _compact_snippet_typed_print_overwrite_replay(
                 _replay_static_update_items(keyword.value, record_item, invalidate_owner)
 
     def record_builtins_helper_assignment(member_name: str | None, value: ast.AST) -> None:
-        nonlocal builtins_setattr_shadowed, builtins_vars_shadowed
+        nonlocal builtins_dict_shadowed, builtins_setattr_shadowed, builtins_vars_shadowed
         value_reference = _simple_reference_name(value)
         if member_name == "setattr":
             builtins_setattr_shadowed = not active_setattr_reference(value_reference)
         elif member_name == "vars":
             builtins_vars_shadowed = not active_vars_reference(value_reference)
+        elif member_name == "dict":
+            builtins_dict_shadowed = not active_dict_reference(value_reference)
 
     def record_builtins_update(call: ast.Call) -> None:
         for argument in call.args:
@@ -12301,6 +12374,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         record_builtins_helper_assignment(_static_getattr_member_name(dict_key_node), dict_value_node)
 
     def invalidate_builtins_mapping_helpers() -> None:
+        record_builtins_helper_assignment("dict", ast.Constant(value=None))
         record_builtins_helper_assignment("setattr", ast.Constant(value=None))
         record_builtins_helper_assignment("vars", ast.Constant(value=None))
 
@@ -12581,6 +12655,7 @@ def _compact_snippet_typed_print_overwrite_replay(
 
         BindingVisitor().visit(statement)
 
+    executed_statement_ids = {id(statement) for statement in executed_statements}
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
     for statement in executed_statements:
         current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
@@ -12592,7 +12667,19 @@ def _compact_snippet_typed_print_overwrite_replay(
         sys_modules_aliases_before = frozenset(sys_modules_aliases)
         sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
         sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
-        if isinstance(statement, ast.If) and not isinstance(statement.test, ast.Constant):
+        uncertain_if = isinstance(statement, ast.If) and not isinstance(statement.test, ast.Constant)
+        uncertain_try = statement.__class__.__name__ == "TryStar" or (
+            isinstance(statement, ast.Try)
+            and not any(
+                id(child) in executed_statement_ids
+                for child in [
+                    *statement.body,
+                    *statement.orelse,
+                    *(handler_statement for handler in statement.handlers for handler_statement in handler.body),
+                ]
+            )
+        )
+        if uncertain_if or uncertain_try:
             invalidate_dynamic_bindings(statement)
         if isinstance(statement, ast.Import):
             for alias in statement.names:
