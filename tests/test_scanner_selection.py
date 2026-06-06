@@ -764,7 +764,7 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
 
     assert extensions is not None
     assert "" not in extensions
-    assert filenames == frozenset({"readme", "model_card"})
+    assert filenames == frozenset({"readme", "model_card", "requirements.txt"})
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:

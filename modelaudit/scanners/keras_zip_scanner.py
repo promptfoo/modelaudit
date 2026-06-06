@@ -27,6 +27,13 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded, _read_zip_member_prefix
+from ..utils.file.hdf5 import (
+    HDF5_SIGNATURE_SCAN_MAX_BYTES,
+    HDF5_SUPERBLOCK_PROBE_BYTES,
+    has_plausible_hdf5_superblock,
+    hdf5_signature_offsets,
+    is_hdf5_signature_probe_complete,
+)
 from ._archive_config import get_archive_depth
 from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .archive_dispatch import (
@@ -218,10 +225,6 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
-_HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
-_HDF5_USERBLOCK_FIRST_OFFSET = 512
-_HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
-_HDF5_SUPERBLOCK_PROBE_BYTES = 96
 _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
@@ -249,78 +252,16 @@ _KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
 )
 
 
-def _hdf5_signature_offsets(file_size: int) -> list[int]:
-    max_signature_end = min(file_size, _HDF5_SIGNATURE_SCAN_MAX_BYTES)
-    offsets = [0]
-    offset = _HDF5_USERBLOCK_FIRST_OFFSET
-    while offset + len(_HDF5_MAGIC) <= max_signature_end:
-        offsets.append(offset)
-        offset *= 2
-    return offsets
-
-
-def _has_plausible_hdf5_superblock(prefix: bytes, signature_offset: int, file_size: int) -> bool:
-    """Validate bounded superblock invariants after an HDF5 signature."""
-    superblock_start = signature_offset
-    if prefix[superblock_start : superblock_start + len(_HDF5_MAGIC)] != _HDF5_MAGIC:
-        return False
-    if len(prefix) <= superblock_start + len(_HDF5_MAGIC):
-        return False
-
-    superblock_version = prefix[superblock_start + 8]
-    if superblock_version in (0, 1):
-        fixed_header_bytes = 24 if superblock_version == 0 else 28
-        if len(prefix) < superblock_start + fixed_header_bytes:
-            return False
-        if any(prefix[superblock_start + field_offset] != 0 for field_offset in (9, 10, 11, 12, 15)):
-            return False
-        if int.from_bytes(prefix[superblock_start + 16 : superblock_start + 18], "little") == 0:
-            return False
-        if int.from_bytes(prefix[superblock_start + 18 : superblock_start + 20], "little") == 0:
-            return False
-        if superblock_version == 1:
-            if int.from_bytes(prefix[superblock_start + 24 : superblock_start + 26], "little") == 0:
-                return False
-            if prefix[superblock_start + 26 : superblock_start + 28] != b"\x00\x00":
-                return False
-        offset_size = prefix[superblock_start + 13]
-        length_size = prefix[superblock_start + 14]
-        base_address_offset = superblock_start + fixed_header_bytes
-    elif superblock_version in (2, 3):
-        if len(prefix) < superblock_start + 12:
-            return False
-        offset_size = prefix[superblock_start + 9]
-        length_size = prefix[superblock_start + 10]
-        base_address_offset = superblock_start + 12
-    else:
-        return False
-
-    if not 1 <= offset_size <= 16 or not 1 <= length_size <= 16:
-        return False
-
-    end_of_file_offset = base_address_offset + (2 * offset_size)
-    if len(prefix) < end_of_file_offset + offset_size:
-        return False
-
-    undefined_address = (1 << (offset_size * 8)) - 1
-    base_address = int.from_bytes(prefix[base_address_offset : base_address_offset + offset_size], "little")
-    end_of_file_address = int.from_bytes(prefix[end_of_file_offset : end_of_file_offset + offset_size], "little")
-    if base_address == undefined_address or end_of_file_address == undefined_address:
-        return False
-
-    adjusted_end_of_file = end_of_file_address + (signature_offset - base_address)
-    return signature_offset < adjusted_end_of_file <= file_size
-
-
 def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> int | None:
-    offsets = _hdf5_signature_offsets(member_info.file_size)
+    offsets = hdf5_signature_offsets(member_info.file_size)
     if not offsets:
         return None
 
-    read_size = min(member_info.file_size, offsets[-1] + _HDF5_SUPERBLOCK_PROBE_BYTES)
+    read_size = min(member_info.file_size, offsets[-1] + HDF5_SUPERBLOCK_PROBE_BYTES)
     prefix = _read_zip_member_prefix(archive, member_info, read_size)
     for offset in offsets:
-        if _has_plausible_hdf5_superblock(prefix, offset, member_info.file_size):
+        superblock = prefix[offset : offset + HDF5_SUPERBLOCK_PROBE_BYTES]
+        if has_plausible_hdf5_superblock(superblock, offset, member_info.file_size):
             return offset
     return None
 
@@ -396,7 +337,7 @@ try:
     import h5py
 
     HAS_H5PY = True
-except ImportError:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - optional dependency
     HAS_H5PY = False
 
 
@@ -469,6 +410,7 @@ class KerasZipScanner(BaseScanner):
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
         self._nested_layer_items_scanned = 0
+        self._content_route_embedded_weights = False
         self._checked_config_module_references: set[tuple[int, str, str]] = set()
         self._torchmodule_version_status: bool | None = None
 
@@ -715,6 +657,7 @@ class KerasZipScanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._nested_layer_items_scanned = 0
+        self._content_route_embedded_weights = False
         self._checked_config_module_references.clear()
         self._torchmodule_version_status = None
 
@@ -955,10 +898,11 @@ class KerasZipScanner(BaseScanner):
             return False
         return "keras_zip_embedded_weights_h5py_unavailable" in reasons
 
-    @staticmethod
-    def _should_content_route_owned_weights_entry(result: ScanResult) -> bool:
+    def _should_content_route_owned_weights_entry(self, result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
-        return isinstance(reasons, list) and "keras_zip_embedded_weights_hdf5_signature_probe_incomplete" in reasons
+        return self._content_route_embedded_weights or (
+            isinstance(reasons, list) and "keras_zip_embedded_weights_hdf5_signature_probe_incomplete" in reasons
+        )
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
@@ -2321,7 +2265,8 @@ class KerasZipScanner(BaseScanner):
         if not HAS_H5PY:
             hdf5_signature_offset = _zip_member_hdf5_signature_offset(archive, weights_info)
             if hdf5_signature_offset is None:
-                if weights_info.file_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES:
+                self._content_route_embedded_weights = True
+                if not is_hdf5_signature_probe_complete(weights_info.file_size):
                     self._mark_embedded_weights_hdf5_signature_probe_incomplete(weights_info, result)
                 return
 
@@ -2550,7 +2495,7 @@ class KerasZipScanner(BaseScanner):
                 "entry": weights_entry,
                 "required_package": "h5py",
                 "file_size": weights_info.file_size,
-                "hdf5_signature_probe_max_bytes": _HDF5_SIGNATURE_SCAN_MAX_BYTES,
+                "hdf5_signature_probe_max_bytes": HDF5_SIGNATURE_SCAN_MAX_BYTES,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
@@ -2708,14 +2653,14 @@ class KerasZipScanner(BaseScanner):
             check.details.setdefault("zip_entry", weights_entry)
             check.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
-                check.details["hdf5_signature_probe_max_bytes"] = _HDF5_SIGNATURE_SCAN_MAX_BYTES
+                check.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES
             else:
                 check.details["hdf5_signature_offset"] = hdf5_signature_offset
         for issue in prefix_result.issues:
             issue.details.setdefault("zip_entry", weights_entry)
             issue.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
-                issue.details["hdf5_signature_probe_max_bytes"] = _HDF5_SIGNATURE_SCAN_MAX_BYTES
+                issue.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES
             else:
                 issue.details["hdf5_signature_offset"] = hdf5_signature_offset
 
