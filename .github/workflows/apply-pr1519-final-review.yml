@@ -1,0 +1,37 @@
+name: Apply PR 1519 final review patch
+
+on:
+  push:
+    branches:
+      - mdangelo/codex/fix-jit-review-followup
+    paths:
+      - .github/workflows/apply-pr1519-final-review.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    if: github.repository == 'promptfoo/modelaudit' && github.ref == 'refs/heads/mdangelo/codex/fix-jit-review-followup'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mdangelo/codex/fix-jit-review-followup
+          fetch-depth: 0
+
+      - name: Apply validated patch and clean up
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .pr1519-final-review.patch
+          git apply --check .pr1519-final-review.patch
+          git apply .pr1519-final-review.patch
+          rm .pr1519-final-review.patch
+          rm .github/workflows/apply-pr1519-final-review.yml
+          printf '%s\n' 'Final review patch applied; delete this marker to trigger PR CI.' > .pr1519-finalized
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add modelaudit/detectors/jit_script.py tests/detectors/test_jit_script_detector.py .pr1519-final-review.patch .github/workflows/apply-pr1519-final-review.yml .pr1519-finalized
+          git commit -m 'fix: close remaining JIT replay gaps'
+          git push origin HEAD:mdangelo/codex/fix-jit-review-followup
