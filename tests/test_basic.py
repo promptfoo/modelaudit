@@ -297,6 +297,47 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
     }
 
 
+@pytest.mark.parametrize("source_independent_first", [False, True])
+def test_merge_scan_results_ignores_source_independent_call_graph_metadata(
+    source_independent_first: bool,
+) -> None:
+    source_independent = {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+    source_sensitive = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []},
+        "module_sources": {"helper": "/tmp/src/helper.py"},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+        "fingerprints": {"/tmp/src/helper.py": "1111"},
+        "read_fingerprints": {
+            "/tmp/src/helper.py": {"read_limit": 1024, "require_complete": True, "fingerprint": "aaaa"}
+        },
+    }
+    first = ScanResult(scanner_name="first")
+    second = ScanResult(scanner_name="second")
+    first._private_metadata["call_graph_source_fingerprints"] = (
+        source_independent if source_independent_first else source_sensitive
+    )
+    second._private_metadata["call_graph_source_fingerprints"] = (
+        source_sensitive if source_independent_first else source_independent
+    )
+
+    first.merge(second)
+
+    merged = first.to_dict(include_private_metadata=True)["_private_metadata"]["call_graph_source_fingerprints"]
+    assert merged == source_sensitive
+    assert "source_independent" not in merged
+
+
 def test_merge_scan_results_marks_conflicting_call_graph_source_fingerprints_unreusable() -> None:
     """Test merging changed source fingerprints fails closed instead of overwriting."""
     result1 = ScanResult(scanner_name="pytorch_zip")

@@ -35,9 +35,26 @@ def _deep_mutable_copy(value: Any) -> Any:
     return deepcopy(value)
 
 
+def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
+    return dict(metadata) == {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+
 def _merge_call_graph_source_fingerprints_metadata(
     existing: Mapping[str, Any], incoming: Mapping[str, Any]
 ) -> dict[str, Any]:
+    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+        return {key: _deep_mutable_copy(value) for key, value in existing.items()}
+    if _is_source_independent_call_graph_fingerprint_metadata(existing):
+        return {key: _deep_mutable_copy(value) for key, value in incoming.items()}
+
     merged: dict[str, Any] = _deep_mutable_copy(existing)
     existing_fingerprints = existing.get("fingerprints")
     incoming_fingerprints = incoming.get("fingerprints")
