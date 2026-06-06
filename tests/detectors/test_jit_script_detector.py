@@ -1335,6 +1335,11 @@ class TestJITScriptDetector:
             b'text = """\nimport subprocess\n"""\n'
             b"if True:\n    import ctypes as c\n"
             b"value = 1; import webbrowser as browser\n"
+            b"if True: from webbrowser import open as inline_open; inline_open('safe')\n"
+            b"label: from webbrowser import open as invalid_open\n"
+            b"value if flag else label: from webbrowser import open as ternary_open\n"
+            b"value = 'if True: from webbrowser import open as quoted_open'\n"
+            b"# if True: from webbrowser import open as commented_open\n"
             b"\x00\xffimport os as alias\n"
         )
 
@@ -1343,6 +1348,7 @@ class TestJITScriptDetector:
         assert offsets == [
             source.index(b"import ctypes"),
             source.index(b"import webbrowser"),
+            source.index(b"from webbrowser import open as inline_open"),
             source.index(b"import os as alias"),
         ]
 
@@ -1385,6 +1391,46 @@ class TestJITScriptDetector:
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
             for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"opener('https://example.invalid')",
+            b"alias = opener; alias('https://example.invalid')",
+            b"(alias := opener)('https://example.invalid')",
+        ],
+    )
+    @pytest.mark.parametrize(("condition", "should_detect"), [(b"True", True), (b"False", False)])
+    def test_scan_model_keeps_late_one_line_compound_priority_import(
+        self,
+        condition: bytes,
+        should_detect: bool,
+        body: bytes,
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_starts = b"".join(
+            f"value_{index} = {index}\n".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2)
+        )
+        source = (
+            b"\x00\xff"
+            + leading_starts
+            + b"if "
+            + condition
+            + b": from webbrowser import open as opener; "
+            + body
+            + b"\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert (
+            any(
+                finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+                for finding in findings
+            )
+            is should_detect
         )
 
     def test_scan_model_detects_indented_priority_import_after_default_cap(self) -> None:
@@ -7254,6 +7300,114 @@ class TestJITScriptDetector:
             b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
             + dict_shadow
             + b"dict.update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_rejects_dict_update_after_walrus_builtin_dict_shadow(self) -> None:
+        source = (
+            b"import builtins, webbrowser as wb\n"
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"(mapping := builtins.__dict__).update(dict=Safe)\n"
+            b"dict.update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_allows_safe_update_through_walrus_mapping_receiver(self) -> None:
+        source = b"import webbrowser as wb\n(mapping := wb.__dict__).update(open=print)\nwb.open('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_statement",
+        [
+            b"(vars := lambda _value: {})\nvars(wb).update(open=print)\n",
+            b"((setattr := lambda *args: None), setattr(wb, 'open', print))\n",
+        ],
+    )
+    def test_scan_model_rejects_safe_overwrite_through_walrus_shadowed_helper(
+        self,
+        shadow_statement: bytes,
+    ) -> None:
+        source = b"import webbrowser as wb\n" + shadow_statement + b"wb.open('https://example.invalid')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "alias_statement",
+        [
+            b"update: object = dict.update\nupdate(wb.__dict__, open=print)\n",
+            b"mapping_type: object = dict\nmapping_type.update(wb.__dict__, open=print)\n",
+        ],
+    )
+    def test_scan_model_allows_safe_overwrite_through_annotated_dict_helper_alias(
+        self,
+        alias_statement: bytes,
+    ) -> None:
+        source = b"import webbrowser as wb\n" + alias_statement + b"wb.open('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_rejects_annotated_dict_update_alias_after_shadow(self) -> None:
+        source = (
+            b"import webbrowser as wb\nclass Safe:\n"
+            b"    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"dict = Safe\nupdate: object = dict.update\n"
+            b"update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_preserves_safe_overwrite_across_sys_modules_setdefault(self) -> None:
+        source = (
+            b"import sys, webbrowser as wb\nwb.open = print\n"
+            b"sys.modules.setdefault('webbrowser', object())\n"
+            b"import webbrowser as wb2\nwb2.open('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_invalidates_safe_overwrite_across_sys_modules_setitem(self) -> None:
+        source = (
+            b"import sys, webbrowser as wb\nwb.open = print\n"
+            b"sys.modules.__setitem__('webbrowser', object())\n"
+            b"import webbrowser as wb2\nwb2.open('https://example.invalid')\n"
         )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")

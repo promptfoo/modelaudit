@@ -442,7 +442,29 @@ def _candidate_embedded_python_snippets(
         for match in block_matches
         if any(marker in match.group(0) for marker in _BUILTIN_ALIAS_CONTEXT_MARKERS)
     }
-    all_start_offsets = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)]
+    priority_import_sites = _priority_import_sites(bounded)
+    compound_import_ranges = [
+        (header_start, import_offset)
+        for import_offset, header_start in priority_import_sites
+        if header_start is not None
+    ]
+    ordinary_start_offsets: list[int] = []
+    compound_range_index = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded):
+        start = match.start()
+        while (
+            compound_range_index < len(compound_import_ranges)
+            and compound_import_ranges[compound_range_index][1] < start
+        ):
+            compound_range_index += 1
+        if compound_range_index < len(compound_import_ranges):
+            header_start, import_offset = compound_import_ranges[compound_range_index]
+            if header_start < start <= import_offset:
+                continue
+        ordinary_start_offsets.append(start)
+    all_start_offsets = sorted(
+        {*ordinary_start_offsets, *(header_start for header_start, _import_offset in compound_import_ranges)}
+    )
     if (
         all_start_offsets
         and b"__future__" in bounded
@@ -530,10 +552,28 @@ def _priority_import_offsets(
     *,
     start_offsets: list[int] | None = None,
 ) -> list[int]:
-    lowered = bounded.lower()
     allowed_offsets = set(start_offsets) if start_offsets is not None else None
-    offsets: list[int] = []
-    matches = iter(_PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(lowered))
+    return [
+        offset
+        for offset, header_start in _priority_import_sites(bounded)
+        if allowed_offsets is None or offset in allowed_offsets or header_start in allowed_offsets
+    ]
+
+
+def _same_line_compound_header_start(prefix: bytes, line_start: int) -> int | None:
+    prefix = prefix.rstrip(b" \t\r")
+    if not _python_structural_line_bytes(prefix).rstrip().endswith(b":"):
+        return None
+    for match in _COMPOUND_HEADER_MATCH_PATTERN.finditer(prefix):
+        framing = prefix[: match.start()]
+        if all(byte in b" \t\r" or not 0x20 <= byte < 0x7F for byte in framing):
+            return line_start + match.start()
+    return None
+
+
+def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
+    sites: list[tuple[int, int | None]] = []
+    matches = iter(_PRIORITY_EMBEDDED_PYTHON_IMPORT_START_PATTERN.finditer(bounded.lower()))
     match = next(matches, None)
     line_start = 0
     multiline_quote: bytes | None = None
@@ -545,15 +585,18 @@ def _priority_import_offsets(
                 prefix = bounded[line_start:offset].rstrip(b" \t\r")
                 structural_prefix = _python_structural_line_bytes(prefix).rstrip()
                 binary_prefix = bool(prefix) and structural_prefix == prefix and not 0x20 <= prefix[-1] < 0x7F
-                source_like_prefix = not prefix or binary_prefix or structural_prefix.endswith(b";")
-                if not source_like_prefix or (allowed_offsets is not None and offset not in allowed_offsets):
+                header_start = _same_line_compound_header_start(prefix, line_start)
+                source_like_prefix = (
+                    not prefix or binary_prefix or structural_prefix.endswith(b";") or header_start is not None
+                )
+                if not source_like_prefix:
                     match = next(matches, None)
                     continue
-                offsets.append(offset)
+                sites.append((offset, header_start))
             match = next(matches, None)
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
-    return offsets
+    return sites
 
 
 def _span_contains_priority_offset(span: tuple[int, int], priority_offsets: list[int]) -> bool:
@@ -12242,6 +12285,8 @@ def _compact_snippet_typed_print_overwrite_replay(
     ) -> tuple[str, int] | None:
         current_aliases = mapping_aliases if aliases is None else aliases
         current_typed_ids = typed_aliases if typed_ids is None else typed_ids
+        if isinstance(node, ast.NamedExpr):
+            return owner_name(node.value, current_aliases, current_typed_ids)
         if isinstance(node, ast.Name):
             return current_aliases.get(node.id)
         if (
@@ -12262,6 +12307,8 @@ def _compact_snippet_typed_print_overwrite_replay(
         return None
 
     def is_builtins_mapping(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return is_builtins_mapping(node.value)
         if isinstance(node, ast.Name):
             return node.id == "__builtins__" or node.id in builtins_mapping_aliases
         if (
@@ -12431,7 +12478,9 @@ def _compact_snippet_typed_print_overwrite_replay(
         ):
             return False
         if call.func.attr in {"__setitem__", "setdefault"} and len(call.args) >= 2:
-            invalidate_cached_module_name(_static_getattr_member_name(call.args[0]))
+            module_name = _static_getattr_member_name(call.args[0])
+            if call.func.attr == "__setitem__" or module_name not in cached_typed_identities:
+                invalidate_cached_module_name(module_name)
             return True
         if call.func.attr not in {"update", "__ior__"}:
             return False
@@ -12546,6 +12595,21 @@ def _compact_snippet_typed_print_overwrite_replay(
             builtins_mapping_update_aliases.add(name)
         elif kind == "setitem":
             builtins_mapping_setitem_aliases.add(name)
+
+    def bind_local_helper_alias(name: str, value: ast.AST) -> None:
+        value_reference = _simple_reference_name(value)
+        helper_bindings = (
+            (vars_helper_aliases, active_vars_reference),
+            (setattr_helper_aliases, active_setattr_reference),
+            (dict_helper_aliases, active_dict_reference),
+            (dict_update_aliases, active_dict_update_reference),
+            (dict_setitem_aliases, active_dict_setitem_reference),
+        )
+        for aliases, is_active in helper_bindings:
+            if is_active(value_reference):
+                aliases.add(name)
+            else:
+                aliases.discard(name)
 
     def bind_typed_alias(
         target: ast.AST,
@@ -12927,28 +12991,8 @@ def _compact_snippet_typed_print_overwrite_replay(
                     mapping_aliases_before,
                 )
                 invalidate_sys_modules_assignment(target, sys_aliases_before, sys_modules_aliases_before)
-                value_reference = _simple_reference_name(statement.value)
                 if isinstance(target, ast.Name):
-                    if active_vars_reference(value_reference):
-                        vars_helper_aliases.add(target.id)
-                    else:
-                        vars_helper_aliases.discard(target.id)
-                    if active_setattr_reference(value_reference):
-                        setattr_helper_aliases.add(target.id)
-                    else:
-                        setattr_helper_aliases.discard(target.id)
-                    if active_dict_reference(value_reference):
-                        dict_helper_aliases.add(target.id)
-                    else:
-                        dict_helper_aliases.discard(target.id)
-                    if active_dict_update_reference(value_reference):
-                        dict_update_aliases.add(target.id)
-                    else:
-                        dict_update_aliases.discard(target.id)
-                    if active_dict_setitem_reference(value_reference):
-                        dict_setitem_aliases.add(target.id)
-                    else:
-                        dict_setitem_aliases.discard(target.id)
+                    bind_local_helper_alias(target.id, statement.value)
                     bind_builtins_mapping_alias(target.id, statement.value)
                 bind_module_helper_target(
                     target,
@@ -12978,6 +13022,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 sys_modules_aliases_before,
             )
             if isinstance(statement.target, ast.Name):
+                bind_local_helper_alias(statement.target.id, statement.value)
                 bind_builtins_mapping_alias(statement.target.id, statement.value)
             bind_module_helper_target(
                 statement.target,
@@ -13067,6 +13112,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                     typed_aliases.pop(target_name, None)
                 else:
                     typed_aliases[target_name] = canonical_module
+                record_setattr_shadow(named_expression.target, named_expression.value)
+                record_vars_shadow(named_expression.target, named_expression.value)
+                record_dict_shadow(named_expression.target, named_expression.value)
+                bind_local_helper_alias(target_name, named_expression.value)
                 bind_builtins_mapping_alias(target_name, named_expression.value)
                 bind_mapping_alias(named_expression.target, named_expression.value, expression_mapping_aliases)
                 bind_module_helper_target(
