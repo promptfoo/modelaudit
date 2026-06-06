@@ -12736,7 +12736,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     dict_setdefault_aliases: set[str] = set()
     dict_delete_aliases: set[str] = set()
     safe_print_aliases: set[str] = set()
-    builtins_mapping_aliases: set[str] = set()
+    builtins_mapping_aliases: set[str] = {"__builtins__"}
     builtins_mapping_update_aliases: set[str] = set()
     builtins_mapping_setitem_aliases: set[str] = set()
     builtins_mapping_delete_aliases: set[str] = set()
@@ -13088,16 +13088,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             return current_typed_ids[node.args[0].id]
         return None
 
-    def is_builtins_mapping(node: ast.AST) -> bool:
+    def is_builtins_mapping_with_aliases(
+        node: ast.AST,
+        module_aliases: Collection[str],
+        mapping_names: Collection[str],
+    ) -> bool:
         if isinstance(node, ast.NamedExpr):
-            return is_builtins_mapping(node.value)
+            return is_builtins_mapping_with_aliases(node.value, module_aliases, mapping_names)
         if isinstance(node, ast.Name):
-            return node.id in active_print_builtins_aliases or node.id in builtins_mapping_aliases
+            return node.id in mapping_names
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "__dict__"
             and isinstance(node.value, ast.Name)
-            and node.value.id in active_print_builtins_aliases
+            and node.value.id in module_aliases
         ):
             return True
         if not isinstance(node, ast.Call):
@@ -13106,7 +13110,14 @@ def _compact_snippet_typed_print_overwrite_replay(
             active_vars_reference(_simple_reference_name(node.func))
             and len(node.args) == 1
             and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in active_print_builtins_aliases
+            and node.args[0].id in module_aliases
+        )
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return is_builtins_mapping_with_aliases(
+            node,
+            active_print_builtins_aliases,
+            builtins_mapping_aliases,
         )
 
     def is_builtins_object(node: ast.AST) -> bool:
@@ -13213,15 +13224,45 @@ def _compact_snippet_typed_print_overwrite_replay(
         value: ast.AST,
         aliases_before: Mapping[str, tuple[str, int]],
         mapping_aliases_before: Mapping[str, tuple[str, int]],
+        target_builtins_aliases: set[str] | None = None,
+        target_builtins_mapping_aliases: set[str] | None = None,
+        value_builtins_aliases: frozenset[str] | None = None,
+        value_builtins_mapping_aliases: frozenset[str] | None = None,
     ) -> None:
+        if target_builtins_aliases is None:
+            target_builtins_aliases = set(active_print_builtins_aliases)
+        if target_builtins_mapping_aliases is None:
+            target_builtins_mapping_aliases = set(builtins_mapping_aliases)
+        if value_builtins_aliases is None:
+            value_builtins_aliases = frozenset(active_print_builtins_aliases)
+        if value_builtins_mapping_aliases is None:
+            value_builtins_mapping_aliases = frozenset(builtins_mapping_aliases)
+
         if (
             isinstance(target, ast.Attribute)
             and isinstance(target.value, ast.Name)
-            and target.value.id in active_print_builtins_aliases
+            and target.value.id in target_builtins_aliases
         ):
             record_builtins_helper_assignment(target.attr, value)
-        elif isinstance(target, ast.Subscript) and is_builtins_mapping(target.value):
+        elif isinstance(target, ast.Subscript) and is_builtins_mapping_with_aliases(
+            target.value,
+            target_builtins_aliases,
+            target_builtins_mapping_aliases,
+        ):
             record_builtins_helper_assignment(_static_getattr_member_name(target.slice), value)
+        elif isinstance(target, ast.Name):
+            aliases_builtins_object = isinstance(value, ast.Name) and value.id in value_builtins_aliases
+            aliases_builtins_mapping = is_builtins_mapping_with_aliases(
+                value,
+                value_builtins_aliases,
+                value_builtins_mapping_aliases,
+            )
+            target_builtins_aliases.discard(target.id)
+            target_builtins_mapping_aliases.discard(target.id)
+            if aliases_builtins_object:
+                target_builtins_aliases.add(target.id)
+            if aliases_builtins_mapping:
+                target_builtins_mapping_aliases.add(target.id)
         elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
             record_attribute(aliases_before.get(target.value.id), target.attr, value)
         elif isinstance(target, ast.Subscript):
@@ -13238,11 +13279,24 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ast.Constant(value=None),
                 aliases_before,
                 mapping_aliases_before,
+                target_builtins_aliases,
+                target_builtins_mapping_aliases,
+                value_builtins_aliases,
+                value_builtins_mapping_aliases,
             )
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 for target_item, value_item in zip(target.elts, value.elts, strict=True):
-                    record_assignment_target(target_item, value_item, aliases_before, mapping_aliases_before)
+                    record_assignment_target(
+                        target_item,
+                        value_item,
+                        aliases_before,
+                        mapping_aliases_before,
+                        target_builtins_aliases,
+                        target_builtins_mapping_aliases,
+                        value_builtins_aliases,
+                        value_builtins_mapping_aliases,
+                    )
             else:
                 for target_item in target.elts:
                     record_assignment_target(
@@ -13250,6 +13304,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                         ast.Constant(value=None),
                         aliases_before,
                         mapping_aliases_before,
+                        target_builtins_aliases,
+                        target_builtins_mapping_aliases,
+                        value_builtins_aliases,
+                        value_builtins_mapping_aliases,
                     )
 
     def invalidate_owner_state(owner: tuple[str, int]) -> None:
@@ -14362,6 +14420,10 @@ def _compact_snippet_typed_print_overwrite_replay(
             reload_aliases.discard(statement.name)
             clear_local_helper_alias(statement.name)
         elif isinstance(statement, ast.Assign):
+            target_builtins_aliases = set(active_print_builtins_aliases)
+            target_builtins_mapping_aliases = set(builtins_mapping_aliases)
+            value_builtins_aliases = frozenset(active_print_builtins_aliases)
+            value_builtins_mapping_aliases = frozenset(builtins_mapping_aliases)
             for target in statement.targets:
                 bind_typed_alias(target, statement.value, typed_aliases_before)
                 bind_typed_member_callable_alias(
@@ -14378,6 +14440,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                     statement.value,
                     typed_aliases_before,
                     mapping_aliases_before,
+                    target_builtins_aliases,
+                    target_builtins_mapping_aliases,
+                    value_builtins_aliases,
+                    value_builtins_mapping_aliases,
                 )
                 bind_safe_print_alias(target, statement.value)
                 invalidate_sys_modules_assignment(target, sys_aliases_before, sys_modules_aliases_before)
