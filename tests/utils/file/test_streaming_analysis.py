@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
 import pytest
@@ -15,6 +16,24 @@ class HeaderOnlyScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         del path
         raise RuntimeError("full scan is not available for streaming fallback")
+
+
+def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
+    signed_url = "https://bucket.example/model.pkl%3FX-Amz-Signature%3Dsecret"
+    double_encoded_signed_url = "https://bucket.example/model.pkl%253FX-Amz-Signature%253Dsecret"
+    four_times_encoded_signed_url = "https://bucket.example/model.pkl%2525253FX-Amz-Signature%2525253Dsecret"
+    literal_question_mark = "https://bucket.example/model%3Fv1.pkl"
+    double_encoded_literal_question_mark = "https://bucket.example/model%253Fv1.pkl"
+    literal_question_mark_with_signed_query = "https://bucket.example/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret"
+
+    assert streaming.stream_source_path(signed_url) == "/model.pkl"
+    assert streaming.stream_source_path(double_encoded_signed_url) == "/model.pkl"
+    assert streaming.stream_source_path(four_times_encoded_signed_url) == "/model.pkl"
+    assert streaming.can_stream_analyze(double_encoded_signed_url, PickleScanner()) is True
+    assert streaming.stream_source_path(literal_question_mark) == "/model?v1.pkl"
+    assert streaming.stream_source_path(double_encoded_literal_question_mark) == "/model?v1.pkl"
+    assert streaming.stream_source_path(literal_question_mark_with_signed_query) == "/model?v1.pkl"
+    assert streaming.can_stream_analyze(literal_question_mark_with_signed_query, PickleScanner()) is True
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,6 +176,37 @@ def test_stream_analyze_file_returns_clean_partial_header_result(
     assert result.metadata["analysis_complete"] is False
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
+def test_stream_analyze_file_signed_pickle_url_uses_path_for_header_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signed URL queries must not hide pickle extensions from fallback checks."""
+    file_path = tmp_path / "sample.pkl"
+    file_path.write_bytes(b"os\nsystem")
+    signed_url = f"{file_path.as_uri()}?X-Amz-Signature=secret"
+
+    class QueryIgnoringLocalFileSystem(LocalFileSystem):
+        @staticmethod
+        def _without_query(path: str) -> str:
+            parts = urlsplit(path)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+        def info(self, path: str, **kwargs: object) -> dict[str, object]:
+            return dict(super().info(self._without_query(path), **kwargs))
+
+        def open(self, path: str, mode: str = "rb", **kwargs: object) -> object:
+            return super().open(self._without_query(path), mode=mode, **kwargs)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: QueryIgnoringLocalFileSystem())
+
+    result, analysis_complete = streaming.stream_analyze_file(signed_url, HeaderOnlyScanner())
+
+    assert analysis_complete is False
+    assert result is not None
+    assert any(issue.type == "streaming_security_check" for issue in result.issues)
 
 
 def test_stream_analyze_file_returns_incomplete_full_header_result(
