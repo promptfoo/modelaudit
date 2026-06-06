@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) enum ArgValue {
     None,
@@ -575,15 +577,30 @@ fn read_line_bytes_kind(
                 .at(report_index),
         );
     }
-    let search_end = limit.min(payload.len());
+    let payload_end = limit.min(payload.len());
+    let search_end =
+        payload_end.min((*cursor).saturating_add(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1));
     let line_end = payload[*cursor..search_end]
         .iter()
         .position(|byte| *byte == b'\n')
         .map(|offset| *cursor + offset)
         .ok_or_else(|| {
-            ParseError::new(format!("no newline found when trying to read {read_kind}"))
-                .at(report_index)
+            if payload_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
+                ParseError::new(format!(
+                    "{read_kind} protocol 0 line operand exceeds {MAX_PROTOCOL0_LINE_OPERAND_BYTES} bytes"
+                ))
+                .at(search_end)
+            } else {
+                ParseError::new(format!("no newline found when trying to read {read_kind}"))
+                    .at(report_index)
+            }
         })?;
+    if line_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
+        return Err(ParseError::new(format!(
+            "{read_kind} protocol 0 line operand exceeds {MAX_PROTOCOL0_LINE_OPERAND_BYTES} bytes"
+        ))
+        .at(line_end));
+    }
     let value = payload[*cursor..line_end].to_vec();
     *cursor = line_end + 1;
     Ok(value)
@@ -833,6 +850,39 @@ mod tests {
 
         assert_eq!(opcode.name, "STRING");
         assert_eq!(opcode.arg.text(payload).as_ref(), "os\n");
+    }
+
+    #[test]
+    fn parse_protocol0_line_operand_accepts_exact_limit() {
+        let mut payload = Vec::with_capacity(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 3);
+        payload.extend_from_slice(b"S'");
+        payload.resize(payload.len() + MAX_PROTOCOL0_LINE_OPERAND_BYTES - 2, b'a');
+        payload.extend_from_slice(b"'\n.");
+
+        let opcode = parse_opcode(&payload, 0, payload.len()).expect("STRING at line limit");
+
+        assert_eq!(opcode.name, "STRING");
+        assert_eq!(opcode.next, MAX_PROTOCOL0_LINE_OPERAND_BYTES + 2);
+    }
+
+    #[test]
+    fn parse_protocol0_line_operand_rejects_over_limit_before_copy() {
+        let mut payload = Vec::with_capacity(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 4);
+        payload.extend_from_slice(b"S'");
+        payload.resize(payload.len() + MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1, b'a');
+        payload.extend_from_slice(b"'\n.");
+
+        let error = match parse_opcode(&payload, 0, payload.len()) {
+            Ok(_) => panic!("overlong protocol 0 line operand should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.exception_type, "ValueError");
+        assert!(error.message.contains("protocol 0 line operand exceeds"));
+        assert_eq!(
+            error.report_index,
+            Some(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 2)
+        );
     }
 
     #[test]
