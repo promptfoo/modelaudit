@@ -213,7 +213,8 @@ DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_XARGS_DOWNLOADER_PATTERN = re.compile(
-    rb"\|\s*xargs(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
+    rb"(?:" + DOCUMENTATION_SHELL_LINE_PREFIX + rb"|[;&|]\s*)xargs"
+    rb"(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
     re.IGNORECASE,
 )
 DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
@@ -319,7 +320,8 @@ DOCUMENTATION_DOCKER_PULL_OPTION = (
 DOCUMENTATION_DOCKER_PULL_COMMAND_PATTERN = re.compile(
     DOCUMENTATION_SHELL_LINE_PREFIX + DOCUMENTATION_SHELL_WRAPPED_COMMAND + rb"docker(?:\.exe)?\s+(?:image\s+)?pull"
     rb"(?:\s+" + DOCUMENTATION_DOCKER_PULL_OPTION + rb"){0,8}\s+"
-    rb"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s\"'<>]{1,4096}(?=\s*(?:$|[;&|#]))",
+    rb"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::" + DOCUMENTATION_NETWORK_PORT + rb")?/[^\s\"'<>]{1,4096}"
+    rb"(?=\s*(?:$|[;&|#]))",
     re.IGNORECASE,
 )
 DOCUMENTATION_INLINE_NETCAT_COMMAND_PATTERN = re.compile(
@@ -895,6 +897,60 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_f_string_expression_contains_position(token_text: str, local_position: int) -> bool:
+        prefix_match = re.match(r"(?i)(?:[rubf]*)('''|\"\"\"|'|\")", token_text)
+        if prefix_match is None or "f" not in token_text[: prefix_match.start(1)].casefold():
+            return False
+
+        quote = prefix_match.group(1)
+        content_start = prefix_match.end(1)
+        content_end = len(token_text) - len(quote) if token_text.endswith(quote) else len(token_text)
+        if local_position < content_start or local_position >= content_end:
+            return False
+
+        cursor = content_start
+        while cursor < content_end:
+            current = token_text[cursor]
+            if current == "{" and token_text[cursor + 1 : cursor + 2] != "{":
+                expression_start = cursor + 1
+                cursor += 1
+                depth = 1
+                quote_char: str | None = None
+                triple_quote = False
+                escaped = False
+                while cursor < content_end:
+                    expression_char = token_text[cursor]
+                    if escaped:
+                        escaped = False
+                    elif quote_char is not None:
+                        if expression_char == "\\":
+                            escaped = True
+                        elif triple_quote and token_text.startswith(quote_char * 3, cursor):
+                            cursor += 2
+                            quote_char = None
+                            triple_quote = False
+                        elif not triple_quote and expression_char == quote_char:
+                            quote_char = None
+                    elif expression_char in {"'", '"'}:
+                        quote_char = expression_char
+                        triple_quote = token_text.startswith(expression_char * 3, cursor)
+                        if triple_quote:
+                            cursor += 2
+                    elif expression_char == "{":
+                        depth += 1
+                    elif expression_char == "}":
+                        depth -= 1
+                        if depth == 0:
+                            if expression_start <= local_position < cursor:
+                                return True
+                            break
+                    cursor += 1
+            elif current == "{" and token_text[cursor + 1 : cursor + 2] == "{":
+                cursor += 1
+            cursor += 1
+        return False
+
+    @staticmethod
     def _documentation_python_string_contains_position(line: bytes, position: int) -> bool:
         text = line.decode("utf-8", errors="replace")
         character_position = len(line[:position].decode("utf-8", errors="replace"))
@@ -906,9 +962,41 @@ class TextScanner(BaseScanner):
                     and current.end[0] == 1
                     and current.start[1] <= character_position < current.end[1]
                 ):
-                    return True
+                    local_position = character_position - current.start[1]
+                    return not TextScanner._documentation_f_string_expression_contains_position(
+                        current.string,
+                        local_position,
+                    )
         except (IndentationError, tokenize.TokenError):
             return False
+        return False
+
+    @staticmethod
+    def _line_network_token_contains_position(line: bytes, start: int, end: int, position: int) -> bool:
+        bounded_line = line[start:end]
+        for pattern in BARE_NETWORK_TOKEN_PATTERNS:
+            for match in pattern.finditer(bounded_line):
+                token_start = start + match.start()
+                token_end = start + match.end()
+                if token_start <= position < token_end:
+                    return True
+        return False
+
+    @classmethod
+    def _documentation_xargs_downloader_is_actionable(cls, line: bytes, position: int) -> bool:
+        for match in DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.finditer(line):
+            if position < match.start():
+                if cls._line_network_token_contains_position(line, 0, match.start(), position):
+                    return True
+                continue
+
+            cursor = match.end()
+            while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
+                cursor += 1
+            if cursor >= len(line) or line[cursor : cursor + 1] in {b"`", b"'", b'"', b".", b",", b";", b"#"}:
+                continue
+            if cls._line_network_token_contains_position(line, cursor, len(line), position):
+                return True
         return False
 
     @staticmethod
@@ -948,7 +1036,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
-            or DOCUMENTATION_XARGS_DOWNLOADER_PATTERN.search(line) is not None
+            or cls._documentation_xargs_downloader_is_actionable(line, position)
         )
         if cls._documentation_shell_comment_before_position(
             line, position

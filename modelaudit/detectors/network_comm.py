@@ -882,6 +882,7 @@ class NetworkCommDetector:
         rb"(?:[ \t]+" + DOCKER_PULL_OPTION + rb"){0,8}[ \t]+"
         rb"(?P<destination>"
         + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"(?::[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?"
         + rb"/[^\s\"'<>]{1,4096})"
         + NETWORK_COMMAND_TERMINATOR,
         re.IGNORECASE | re.MULTILINE,
