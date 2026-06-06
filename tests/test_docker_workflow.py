@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
+_PINNED_ACTION_RE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 
 
 def _load_docker_workflow() -> dict[str, Any]:
@@ -55,6 +58,32 @@ def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
         if step.get("name") == name:
             return step
     raise AssertionError(f"Step {name!r} not found")
+
+
+def _iter_uses_values(node: Any) -> Iterator[str]:
+    if isinstance(node, dict):
+        uses_value = node.get("uses")
+        if isinstance(uses_value, str):
+            yield uses_value
+        for value in node.values():
+            yield from _iter_uses_values(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _iter_uses_values(value)
+
+
+def test_external_github_actions_are_pinned_to_commit_sha() -> None:
+    mutable_refs: list[str] = []
+
+    for workflow_path in sorted(_WORKFLOW_DIR.glob("*.yml")):
+        workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+        for uses_value in _iter_uses_values(workflow):
+            if uses_value.startswith(("./", "docker://")):
+                continue
+            if not _PINNED_ACTION_RE.fullmatch(uses_value):
+                mutable_refs.append(f"{workflow_path.relative_to(_REPO_ROOT)}: {uses_value}")
+
+    assert mutable_refs == []
 
 
 def test_dockerfiles_pin_python_base_images_by_digest() -> None:
