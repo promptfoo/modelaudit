@@ -515,7 +515,7 @@ def _is_sensitive_path_key(key: str) -> bool:
         return True
     normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", decoded)
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized).replace("-", "_")
-    parts = [part for part in re.split(r"[._\[\]]+", normalized) if part]
+    parts = [part for part in re.split(r"[.\s_\[\]]+", normalized) if part]
     return any(
         _SENSITIVE_PATH_KEY_PATTERN.fullmatch("_".join(parts[index:])) is not None for index in range(len(parts))
     )
@@ -527,7 +527,7 @@ def _is_authorization_path_key(key: str) -> bool:
         return False
     normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", decoded)
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized).replace("-", "_")
-    parts = [part.lower() for part in re.split(r"[._\[\]]+", normalized) if part]
+    parts = [part.lower() for part in re.split(r"[.\s_\[\]]+", normalized) if part]
     return any(
         "_".join(parts[index:]) in {"auth", "authorization", "proxy_authorization"} for index in range(len(parts))
     )
@@ -982,6 +982,7 @@ def _is_match_redacted_from_url_context(url: str, url_start: int, match_start: i
     path_end = authority_end + len(parsed.path)
     relative_start = match_start - url_start
     value_lower = value.lower()
+    path_awaits_sensitive_value = _url_path_awaits_sensitive_value(url)
 
     if relative_start < authority_end:
         return value_lower in parsed.netloc.lower() and value_lower not in safe_parsed.netloc.lower()
@@ -992,11 +993,15 @@ def _is_match_redacted_from_url_context(url: str, url_start: int, match_start: i
         query_start = path_end + 1
         query_end = query_start + len(parsed.query)
         if query_start <= relative_start < query_end:
+            if path_awaits_sensitive_value:
+                return True
             return _is_match_redacted_from_url_component(parsed.query, relative_start - query_start, value)
 
     if parsed.fragment:
         fragment_start = path_end + (len(parsed.query) + 1 if parsed.query else 0) + 1
         if fragment_start <= relative_start:
+            if path_awaits_sensitive_value:
+                return True
             return _is_match_redacted_from_url_component(parsed.fragment, relative_start - fragment_start, value)
     return False
 
@@ -1130,6 +1135,13 @@ def _is_redacted_evidence_value(data: bytes, match_start: int, value: str) -> bo
     return _EVIDENCE_MATCH_START_MARKER not in redacted or _EVIDENCE_MATCH_END_MARKER not in redacted
 
 
+def _query_prefix_awaits_sensitive_value(prefix: str) -> bool:
+    """Return whether the current decoded query field leaves a credential key pending."""
+    field_prefix = _URL_COMPONENT_SEPARATOR_PATTERN.split(prefix)[-1]
+    parts = [part for part in re.split(r"[=/,:\s]+", field_prefix) if part]
+    return any(_is_sensitive_path_key("_".join(parts[index:])) for index in range(len(parts)))
+
+
 def _decoded_nested_urls(url: str) -> Iterator[str]:
     """Yield nested URLs that only become visible after bounded component decoding."""
     try:
@@ -1138,6 +1150,7 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
         return
 
     seen: set[str] = set()
+    path_awaits_sensitive_value = _url_path_awaits_sensitive_value(url)
     for component in (parsed.query, parsed.fragment):
         for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
             key, separator, value = field.partition("=")
@@ -1158,7 +1171,12 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
 
             found_nested_url = False
             for match in _URI_IN_TEXT_PATTERN.finditer(decoded):
-                nested_url = _SENSITIVE_NESTED_URL if sensitive_field else match.group()
+                redact_nested_url = (
+                    path_awaits_sensitive_value
+                    or sensitive_field
+                    or _query_prefix_awaits_sensitive_value(decoded[: match.start()])
+                )
+                nested_url = _SENSITIVE_NESTED_URL if redact_nested_url else match.group()
                 if nested_url not in seen:
                     seen.add(nested_url)
                     found_nested_url = True

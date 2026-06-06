@@ -1147,6 +1147,55 @@ class TestNetworkCommDetector:
         assert secret not in serialized
         assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
 
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            (
+                "https://benign.example/download?api_key:https%3A%2F%2Fevil-c2.com%2Fpayload",
+                "evil-c2.com",
+            ),
+            (
+                "https://benign.example/download?x=1%26token=https%3A%2F%2Fevil-c2.com%2Fpayload",
+                "evil-c2.com",
+            ),
+            (
+                "https://benign.example/download?api+key=https%3A%2F%2F45.33.32.156%2Fpayload",
+                "45.33.32.156",
+            ),
+            (
+                "https://evil.example/api_key?x=https%3A%2F%2Fevil-c2.com%2Fpayload",
+                "evil-c2.com",
+            ),
+        ],
+    )
+    def test_nested_url_credentials_with_indirect_keys_emit_only_redacted_marker(
+        self,
+        url: str,
+        secret: str,
+    ) -> None:
+        """Decoded separators and path/query splits must not expose URL-valued credentials."""
+        findings = NetworkCommDetector({"max_findings": 1}).scan(url.encode(), "tokens.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret not in serialized
+        assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://benign.example/download?algorithm:https%3A%2F%2Fevil-c2.com%2Fpayload",
+            "https://benign.example/download?x=1%26api_key_hint=https%3A%2F%2Fevil-c2.com%2Fpayload",
+            "https://benign.example/download?api+keyboard=https%3A%2F%2Fevil-c2.com%2Fpayload",
+            "https://evil.example/algorithm?x=https%3A%2F%2Fevil-c2.com%2Fpayload",
+        ],
+    )
+    def test_indirect_sensitive_key_near_matches_preserve_nested_endpoint(self, url: str) -> None:
+        nested_url = "https://evil-c2.com/payload"
+
+        findings = NetworkCommDetector({"max_findings": 1}).scan(url.encode(), "tokens.txt")
+
+        assert findings[0].get("url") == nested_url
+
     def test_encoded_nested_endpoint_in_cloud_url_remains_finding(self) -> None:
         """Nested endpoints must be decoded before generic URL-scheme filtering."""
         url = "s3://model-bucket/model?next=https%3A%2F%2F45.33.32.156%2Fpayload"
@@ -1362,6 +1411,42 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(url.encode(), "hook.py")
 
         assert secret not in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            ("https://benign.example/download?api+key=45.33.32.156", "45.33.32.156"),
+            ("https://benign.example/download?api%20key=secret-value.example.com", "secret-value.example.com"),
+            ("https://evil.example/api_key?x=45.33.32.156", "45.33.32.156"),
+            ("https://evil.example/client%5Fsecret#x=secret-value.example.com", "secret-value.example.com"),
+        ],
+    )
+    def test_indirect_sensitive_query_values_do_not_reappear_as_endpoint_findings(
+        self,
+        url: str,
+        secret: str,
+    ) -> None:
+        findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+        assert secret not in json.dumps(findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        ("url", "endpoint_type", "field", "value"),
+        [
+            ("https://benign.example/download?api+keyboard=45.33.32.156", "ipv4_address", "ip", "45.33.32.156"),
+            ("https://evil.example/algorithm?x=45.33.32.156", "ipv4_address", "ip", "45.33.32.156"),
+        ],
+    )
+    def test_indirect_sensitive_key_near_matches_preserve_endpoint_findings(
+        self,
+        url: str,
+        endpoint_type: str,
+        field: str,
+        value: str,
+    ) -> None:
+        findings = NetworkCommDetector().scan(url.encode(), "tokens.txt")
+
+        assert any(finding.get("type") == endpoint_type and finding.get(field) == value for finding in findings)
 
     def test_detect_domain_names(self) -> None:
         """Test detection of domain names."""
