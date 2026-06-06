@@ -1549,6 +1549,8 @@ def _hook_type_code(hook_type: type[object]) -> bytes:
     for method_name in ("find_spec", "__call__"):
         for candidate_type in hook_type.__mro__:
             method = candidate_type.__dict__.get(method_name)
+            if isinstance(method, (classmethod, staticmethod)):
+                method = method.__func__
             if isinstance(method, FunctionType):
                 code_parts.append(marshal.dumps(method.__code__))
                 break

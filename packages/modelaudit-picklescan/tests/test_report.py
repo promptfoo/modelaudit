@@ -182,3 +182,23 @@ def test_rust_report_conversion_rejects_non_bool_coverage_flags() -> None:
 
     with pytest.raises(TypeError, match="expected bool or None"):
         _report_from_native_dict(raw_report)
+
+
+def test_rust_report_conversion_keeps_private_metadata_out_of_public_serialization() -> None:
+    raw_report = {
+        "source": "native.pkl",
+        "status": "complete",
+        "verdict": "clean",
+        "findings": [],
+        "notices": [],
+        "errors": [],
+        "coverage": {"bytes_scanned": 0},
+        "metadata": {},
+        "private_metadata": {"cache_only": {"paths": ["helper.py"]}},
+        "duration_s": 0.0,
+    }
+
+    report = _report_from_native_dict(raw_report)
+
+    assert report.private_metadata == {"cache_only": {"paths": ("helper.py",)}}
+    assert "private_metadata" not in report.to_dict()

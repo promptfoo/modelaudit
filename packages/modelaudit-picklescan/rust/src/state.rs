@@ -30,8 +30,9 @@ use crate::policy::{
 };
 use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
-    detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
-    Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
+    detail_string, detail_usize, empty_private_metadata, notice_to_detail_value,
+    scan_error_to_detail_value, DetailValue, Finding, FindingDedupeKey, Notice, NoticeDedupeKey,
+    ScanError,
 };
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_descriptor_ref, pytorch_storage_key,
@@ -7622,6 +7623,7 @@ impl<'a> ScanState<'a> {
             metadata.set_item("first_pickle_end_pos", first_pickle_end_pos)?;
         }
         report.set_item("metadata", metadata)?;
+        report.set_item("private_metadata", empty_private_metadata(py))?;
         report.set_item("duration_s", duration_s)?;
         Ok(report.unbind())
     }

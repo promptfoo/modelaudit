@@ -30,6 +30,7 @@ _OPERATIONAL_ERROR_INDICATORS = (
     "out of memory",
     "disk space",
     "too many open files",
+    "associated .bin weights file not found",
 )
 
 

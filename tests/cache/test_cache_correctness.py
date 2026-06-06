@@ -22,6 +22,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -1339,6 +1340,25 @@ def test_import_hook_identity_distinguishes_same_qualname_closures() -> None:
     assert _import_hook_identity(source_hook) != _import_hook_identity(bytecode_hook)
 
 
+@pytest.mark.parametrize("descriptor_kind", ["classmethod", "staticmethod"])
+def test_import_hook_identity_includes_descriptor_method_code(descriptor_kind: str) -> None:
+    def original_find_spec(*_args: object) -> None:
+        return None
+
+    def changed_find_spec(*_args: object) -> str:
+        return "changed"
+
+    descriptor = classmethod if descriptor_kind == "classmethod" else staticmethod
+    original_hook = type("DescriptorFinder", (), {"find_spec": descriptor(original_find_spec)})
+    equivalent_hook = type("DescriptorFinder", (), {"find_spec": descriptor(original_find_spec)})
+    changed_hook = type("DescriptorFinder", (), {"find_spec": descriptor(changed_find_spec)})
+
+    assert _import_hook_identity(original_hook) == _import_hook_identity(equivalent_hook)
+    assert _import_hook_identity(original_hook) != _import_hook_identity(changed_hook)
+    assert _picklescan_import_hook_identity(original_hook) == _picklescan_import_hook_identity(equivalent_hook)
+    assert _picklescan_import_hook_identity(original_hook) != _picklescan_import_hook_identity(changed_hook)
+
+
 def test_cache_resolution_context_matches_picklescan_metadata() -> None:
     meta_path, path_hooks, path_importers = _picklescan_source_resolution_context()
 
@@ -2184,14 +2204,7 @@ def test_cached_scan_skips_persisting_memory_mapped_scan_errors(tmp_path: Path) 
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Associated .bin weights file not found",
-        "Not a valid zip file: /tmp/example.zip",
-    ],
-)
-def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path, message: str) -> None:
+def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
@@ -2202,7 +2215,7 @@ def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path, 
         calls["count"] += 1
         return {
             "checks": [],
-            "issues": [{"message": message, "severity": "warning"}],
+            "issues": [{"message": "Not a valid zip file: /tmp/example.zip", "severity": "warning"}],
             "scan_count": calls["count"],
         }
 
@@ -2212,6 +2225,30 @@ def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path, 
     assert first == second
     assert calls["count"] == 1
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
+def test_cached_scan_does_not_persist_missing_associated_weights(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": "Associated .bin weights file not found", "severity": "warning"}],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
 def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None:

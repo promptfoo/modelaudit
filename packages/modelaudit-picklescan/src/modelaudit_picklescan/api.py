@@ -1227,6 +1227,7 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
             opcode_scan_complete=_optional_bool(coverage.get("opcode_scan_complete")),
         ),
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
+        private_metadata=dict(_mapping(raw_report.get("private_metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
     )
 
