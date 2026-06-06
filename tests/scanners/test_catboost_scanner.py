@@ -1961,7 +1961,7 @@ def test_catboost_sarif_redacts_composite_evidence_bypasses(tmp_path: Path) -> N
         'auth=("alice", "authsecret"); os.system("id")',
         'api\u200b_key=controlsecret; os.system("id")',
         'config={chr(97)+chr(112)+chr(105)+chr(95)+chr(107)+chr(101)+chr(121): "numericsecret", '
-        '"cmd": "os.system(\\"id\\")"}',
+        + '"cmd": "os.system(\\"id\\")"}',
     ]
     model_path = tmp_path / "catboost_composite_evidence.cbm"
     model_path.write_bytes(_build_cbm(evidence))
