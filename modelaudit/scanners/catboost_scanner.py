@@ -251,11 +251,8 @@ def _redact_reversible_percent_evidence(text: str) -> str:
             if next_decoded == decoded:
                 return segment
             decoded = next_decoded
-            sanitized = _sanitize_decoded_reversible_evidence(decoded, segment)
-            if sanitized != segment:
-                return sanitized
             if _PERCENT_ESCAPE_PATTERN.search(decoded) is None:
-                return segment
+                return _sanitize_decoded_reversible_evidence(decoded, segment)
 
         return REDACTED_EVIDENCE_VALUE
 
@@ -699,7 +696,13 @@ class CatBoostScanner(BaseScanner):
                     candidate = ip_match.group(0)
                     host = candidate.rsplit(":", 1)[0] if ip_pattern is _IPV4_PATTERN else candidate
                     ip_obj = self._parse_ip_candidate(host)
-                    if ip_obj is None or ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                    if (
+                        ip_obj is None
+                        or not ip_obj.is_global
+                        or ip_obj.is_multicast
+                        or ip_obj.is_reserved
+                        or ip_obj.is_unspecified
+                    ):
                         continue
                     network_matches.append({"text": candidate, "section": fragment["section"], "pattern": "public IP"})
 

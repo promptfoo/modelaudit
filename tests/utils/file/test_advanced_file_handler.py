@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
@@ -38,7 +41,7 @@ class OperationalFailureScanner:
     name = "operational_failure_scanner"
 
     def scan(self, shard_path: str) -> ScanResult:
-        raise RuntimeError(f"cannot scan {Path(shard_path).name}")
+        raise RuntimeError(f"cannot scan {Path(shard_path).name}: {Path(shard_path).read_text()}")
 
 
 class IncompleteShardScanner:
@@ -57,6 +60,60 @@ class IncompleteShardScanner:
         )
         result.finish(success=False)
         return result
+
+
+class RawDetectorMemoryMappedScanner(BaseScanner):
+    """Minimal scanner that exercises BaseScanner's raw detector helpers."""
+
+    name = "raw_detector_mmap"
+
+    def scan(self, path: str) -> ScanResult:
+        raise NotImplementedError
+
+
+class MixedRawDetectorShardScanner(BaseScanner):
+    """Emit different raw-detector outcomes across parallel shard workers."""
+
+    name = "mixed_raw_detector_shards"
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        shard_name = Path(path).name
+        if "secret-failure" in shard_name:
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="embedded_secrets",
+                context=path,
+                error=RuntimeError("secret detector failed"),
+            )
+        elif "network-failure" in shard_name:
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="network_communication",
+                context=path,
+                error=RuntimeError("network detector failed"),
+            )
+        else:
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=path,
+            )
+            result.add_check(
+                name="Network Communication Detection",
+                passed=True,
+                message="No network communication patterns detected",
+                location=path,
+            )
+        result.finish(success="scan_outcome" not in result.metadata)
+        return result
+
+
+class PatternMemoryMappedScanner:
+    """Minimal scanner that exercises the mmap fallback pattern checks."""
+
+    name = "pattern_mmap"
 
 
 _SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
@@ -258,6 +315,180 @@ class TestMemoryMappedHandler:
 
         finally:
             os.unlink(temp_path)
+
+    def test_mmap_raw_detector_failure_is_unsuccessful(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "detector-error.bin"
+        model_path.write_bytes(b"benign model content")
+        scanner = RawDetectorMemoryMappedScanner()
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=RuntimeError("detector failed"),
+        ):
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+            for check in result.checks
+        )
+
+    def test_mmap_uses_opened_file_size_after_growth(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "grown-model.bin"
+        model_path.write_bytes(b"benign-prefix")
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        with model_path.open("ab") as model_file:
+            model_file.write(b"; os.system('id')")
+
+        result = handler.scan_with_mmap()
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert any(
+            check.name == "Suspicious Pattern Detection" and check.status.value == "failed" for check in result.checks
+        )
+
+    def test_mmap_file_growth_during_scan_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "mutated-model.bin"
+        model_path.write_bytes(b"a" * 32)
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+        mutated = False
+
+        def append_during_scan(_message: str, _percentage: float) -> None:
+            nonlocal mutated
+            if not mutated:
+                with model_path.open("ab") as model_file:
+                    model_file.write(b"os.system('id')")
+                mutated = True
+
+        result = handler.scan_with_mmap(progress_callback=append_during_scan)
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "memory_mapped_source_changed" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "Memory-Mapped Source Stability" for check in result.checks)
+
+    def test_mmap_file_truncation_during_scan_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "truncated-model.bin"
+        model_path.write_bytes(b"a" * 32)
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+        truncated = False
+
+        def truncate_during_scan(_message: str, _percentage: float) -> None:
+            nonlocal truncated
+            if not truncated:
+                with model_path.open("r+b") as model_file:
+                    model_file.truncate(8)
+                truncated = True
+
+        result = handler.scan_with_mmap(progress_callback=truncate_during_scan)
+
+        assert result.success is False
+        assert result.bytes_scanned == 16
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "memory_mapped_source_changed" in result.metadata["scan_outcome_reasons"]
+        stability_check = next(check for check in result.checks if check.name == "Memory-Mapped Source Stability")
+        assert stability_check.details["opened_file_size"] == 32
+        assert stability_check.details["final_file_size"] == 8
+
+    def test_mmap_progress_counts_unique_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "overlap-progress.bin"
+        model_path.write_bytes(b"a" * (3 * 1024 * 1024))
+        handler = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner())
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 2 * 1024 * 1024)
+        percentages: list[float] = []
+
+        result = handler.scan_with_mmap(
+            progress_callback=lambda _message, percentage: percentages.append(percentage),
+        )
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert percentages
+        assert max(percentages) == 100.0
+
+    def test_mmap_error_details_are_redacted(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "progress-error.bin"
+        model_path.write_bytes(b"benign model content")
+        leaked_secret = "MMAP-ERROR-SECRET-123456"
+
+        def fail_progress(_message: str, _percentage: float) -> None:
+            raise RuntimeError(f"progress failed with {leaked_secret}")
+
+        result = MemoryMappedHandler(str(model_path), PatternMemoryMappedScanner()).scan_with_mmap(
+            progress_callback=fail_progress,
+        )
+
+        assert result.success is False
+        assert leaked_secret not in result.to_json()
+        error_check = next(check for check in result.checks if check.name == "Memory-Mapped Scan")
+        assert error_check.details["error"] == "<redacted>"
+
+    def test_mmap_raw_detector_failure_suppresses_later_clean_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "detector-error-then-clean.bin"
+        model_path.write_bytes(b"a" * 32)
+        scanner = RawDetectorMemoryMappedScanner()
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=[RuntimeError("detector failed"), []],
+        ) as scan_model_weights:
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        assert scan_model_weights.call_count == 2
+        assert result.success is False
+        assert not any(
+            check.name == "Embedded Secrets Detection" and check.status.value == "passed" for check in result.checks
+        )
+
+    def test_mmap_repeated_raw_detector_failure_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = tmp_path / "repeated-detector-error.bin"
+        model_path.write_bytes(b"a" * (16 * 25))
+        scanner = RawDetectorMemoryMappedScanner()
+        monkeypatch.setattr("modelaudit.utils.file.handlers.MMAP_MAX_WINDOW", 16)
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=RuntimeError("detector failed"),
+        ) as scan_model_weights:
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        coverage_checks = [
+            check
+            for check in result.checks
+            if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+        ]
+        assert scan_model_weights.call_count == 25
+        assert result.success is False
+        assert len(coverage_checks) == 1
+        assert len(result.metadata["raw_detector_analysis_failures"]) == 20
+        assert result.metadata["raw_detector_failed_detectors"] == ["embedded_secrets"]
+        assert not any(
+            check.name == "Embedded Secrets Detection" and check.status.value == "passed" for check in result.checks
+        )
 
 
 class TestAdvancedFileHandler:
@@ -481,8 +712,9 @@ class TestAdvancedFileHandler:
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
+        leaked_secret = "SHARD-ERROR-SECRET-123456"
         shard_path = tmp_path / "model-00001-of-00001.safetensors"
-        shard_path.write_bytes(b"safe")
+        shard_path.write_text(leaked_secret)
         handler = ParallelShardHandler(
             {
                 "shards": [str(shard_path)],
@@ -502,6 +734,77 @@ class TestAdvancedFileHandler:
         shard_checks = [check for check in result.checks if check.name == "Shard Scan"]
         assert len(shard_checks) == 1
         assert shard_checks[0].severity == IssueSeverity.INFO
+        assert shard_checks[0].details["error"] == "<redacted>"
+        assert leaked_secret not in result.to_json()
+
+    def test_parallel_shards_preserve_raw_detector_failures_and_remove_clean_checks(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Shard merge order must not erase failures or preserve contradictory clean checks."""
+        shard_paths = [
+            tmp_path / "secret-failure.pt",
+            tmp_path / "network-failure.pt",
+            tmp_path / "clean.pt",
+        ]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            MixedRawDetectorShardScanner,
+        )
+
+        result = handler.scan_shards()
+
+        assert result.success is False
+        assert result.metadata["raw_detector_failed_detectors"] == [
+            "embedded_secrets",
+            "network_communication",
+        ]
+        assert {failure["detector"] for failure in result.metadata["raw_detector_analysis_failures"]} == {
+            "embedded_secrets",
+            "network_communication",
+        }
+        assert not any(
+            check.status.value == "passed"
+            and check.name in {"Embedded Secrets Detection", "Network Communication Detection"}
+            for check in result.checks
+        )
+
+    def test_parallel_shard_raw_detector_failure_reporting_is_bounded(self, tmp_path: Path) -> None:
+        """Repeated per-shard detector failures should emit one check and bounded contexts."""
+        shard_paths = [tmp_path / f"secret-failure-{index}.pt" for index in range(25)]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            MixedRawDetectorShardScanner,
+        )
+
+        result = handler.scan_shards()
+
+        coverage_checks = [
+            check
+            for check in result.checks
+            if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+        ]
+        coverage_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == "raw_detector_analysis_incomplete"
+            and issue.details.get("detector") == "embedded_secrets"
+        ]
+        assert len(coverage_checks) == 1
+        assert len(coverage_issues) == 1
+        assert len(result.metadata["raw_detector_analysis_failures"]) == 20
 
     def test_parallel_shards_inherit_scan_context(self, tmp_path: Path) -> None:
         """Shard workers preserve an enclosing source-sensitive scan snapshot."""
