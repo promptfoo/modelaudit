@@ -170,7 +170,11 @@ class TestHuggingFaceSymlinks:
         broken_link = snapshots / "model.bin"
         os.symlink("../../blobs/missing", broken_link)
 
-        monkeypatch.setattr(Path, "resolve", lambda self: Path(os.path.abspath(self)))
+        def lexical_resolve(path: Path, strict: bool = False) -> Path:
+            del strict
+            return Path(os.path.abspath(path))
+
+        monkeypatch.setattr(Path, "resolve", lexical_resolve)
 
         def _raise(path: str) -> str:  # pragma: no cover - simulate error
             raise OSError("dangling link")
