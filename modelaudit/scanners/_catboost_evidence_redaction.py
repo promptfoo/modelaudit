@@ -225,7 +225,7 @@ COMMAND_SECRET_OPTION_PREFIX_PATTERN: Final[str] = (
 )
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)({COMMAND_SECRET_OPTION_PREFIX_PATTERN})"
-    r"(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
+    r"(?!<\()(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
 )
 CURL_COMMAND_TRANSITION_PATTERN: Final[str] = (
     r"(?<![-/\w.])(?:bash|sh|cmd\.exe|powershell(?:\.exe)?|wget|nc|netcat|sshpass|redis-cli|docker|aws|curl)"
@@ -310,6 +310,12 @@ NPMRC_SCOPED_AUTH_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?:^|[\s\"'])//[^\s\"';&|)=]+/:"
     rf"(?:(?:_auth(?:token)?|_password)|username)\s*=\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
+NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\bnpm{COMMAND_TOKEN_SEPARATOR}config{COMMAND_TOKEN_SEPARATOR}set"
+    rf"{COMMAND_TOKEN_SEPARATOR}//[^\s\"';&|)=]+/:"
+    rf"(?:(?:_auth(?:token)?|_password)|username)(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
 MYSQL_ATTACHED_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?s)(?P<prefix>(?i:\bmysql\b)(?:(?![;&|\n]).){0,1024}?(?<![\w-])-p)"
     r"(?P<value>[^\s\"';&|),\]]+)"
@@ -338,6 +344,14 @@ SSHPASS_NAMED_ENV_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 SSHPASS_INLINE_FILE_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)\bsshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-f(?![\w-])(?:=|\s+)\s*<\("
+)
+SSHPASS_FILE_DESCRIPTOR_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)\bsshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-d(?:=|\s*)(?P<fd>[0-9]+)(?![0-9])"
+)
+COMMAND_INLINE_SECRET_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?:(?<!\w){COMMAND_SECRET_LONG_OPTION_PATTERN}(?:=|\s+)|"
+    rf"\bcurl\b(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,2048}}?"
+    r"(?<!\w)-[A-Za-z]*b(?![A-Za-z])(?:=|\s+))\s*<\("
 )
 SHELL_HERE_STRING_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)<<<\s*(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
@@ -2266,7 +2280,7 @@ def _redact_adjacent_string_literals(text: str) -> str:
 def _redact_residual_expression_literals(text: str) -> str:
     def replace_residual(match: re.Match[str]) -> str:
         value = match.group(0)[len(match.group(1)) :]
-        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(value):
+        if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(value) or REDACTED_VALUE_PREFIX_RE.match(value):
             return match.group(0)
         if COMMAND_EVIDENCE_RE.search(match.group(0)):
             return match.group(0)
@@ -2413,6 +2427,27 @@ def _redact_inline_stdin_emitter(fragment: str) -> str:
     return f"{fragment[: emitter.start()]}{emitter.group('prefix')}{REDACTED_EVIDENCE_VALUE}{emitter.group('suffix')}"
 
 
+def _redact_inline_secret_source(fragment: str) -> str:
+    redacted = _redact_inline_stdin_emitter(fragment)
+    if redacted != fragment:
+        return redacted
+
+    here_string = SHELL_HERE_STRING_VALUE_RE.search(fragment)
+    if here_string is not None:
+        return (
+            f"{fragment[: here_string.start('value')]}"
+            f"{_redact_positional_secret_value(here_string.group('value'))}"
+            f"{fragment[here_string.end('value') :]}"
+        )
+
+    heredoc_range = _find_shell_heredoc_body_range(fragment, 0)
+    if heredoc_range is None:
+        return fragment
+    body_start, body_end = heredoc_range
+    trailing_newline = "\n" if fragment[body_start:body_end].endswith("\n") else ""
+    return f"{fragment[:body_start]}{REDACTED_EVIDENCE_VALUE}{trailing_newline}{fragment[body_end:]}"
+
+
 def _redact_inline_password_sources(text: str) -> str:
     """Redact inline values consumed by password-specific command inputs."""
     text = SSHPASS_DEFAULT_ENV_PASSWORD_RE.sub(_redact_command_positional_secret, text)
@@ -2421,9 +2456,28 @@ def _redact_inline_password_sources(text: str) -> str:
     for match in reversed(list(SSHPASS_INLINE_FILE_SOURCE_RE.finditer(text))):
         source_end = _find_shell_group_end(text, match.end())
         source = text[match.end() : source_end]
-        redacted_source = _redact_inline_stdin_emitter(source)
+        redacted_source = _redact_inline_secret_source(source)
         if redacted_source != source:
             text = f"{text[: match.end()]}{redacted_source}{text[source_end:]}"
+
+    for match in reversed(list(SSHPASS_FILE_DESCRIPTOR_SOURCE_RE.finditer(text))):
+        line_end = text.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(text)
+        descriptor_here_string = re.search(
+            rf"(?is)(?<![0-9]){re.escape(match.group('fd'))}\s*<<<\s*"
+            rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})",
+            text[match.end() : line_end],
+        )
+        if descriptor_here_string is None:
+            continue
+        value_start = match.end() + descriptor_here_string.start("value")
+        value_end = match.end() + descriptor_here_string.end("value")
+        text = (
+            f"{text[:value_start]}"
+            f"{_redact_positional_secret_value(descriptor_here_string.group('value'))}"
+            f"{text[value_end:]}"
+        )
 
     for match in reversed(list(DOCKER_LOGIN_PASSWORD_STDIN_RE.finditer(text))):
         replacements: list[tuple[int, int, str]] = []
@@ -2457,6 +2511,16 @@ def _redact_inline_password_sources(text: str) -> str:
 
         for start, end, replacement in reversed(replacements):
             text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
+
+
+def _redact_inline_command_secret_sources(text: str) -> str:
+    for match in reversed(list(COMMAND_INLINE_SECRET_SOURCE_RE.finditer(text))):
+        source_end = _find_shell_group_end(text, match.end())
+        source = text[match.end() : source_end]
+        redacted_source = _redact_inline_secret_source(source)
+        if redacted_source != source:
+            text = f"{text[: match.end()]}{redacted_source}{text[source_end:]}"
     return text
 
 
@@ -2976,7 +3040,9 @@ def _redact_command_string_literals(text: str) -> str:
 def _redact_command_evidence_text(text: str) -> str:
     redacted = _redact_inline_curl_config_passwords(text)
     redacted = _redact_inline_password_sources(redacted)
+    redacted = _redact_inline_command_secret_sources(redacted)
     redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
     redacted = DOCKER_LOGIN_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = AWS_CONFIGURE_SET_SECRET_RE.sub(_redact_command_positional_secret, redacted)
@@ -3083,5 +3149,6 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
     redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = _redact_shared_provider_tokens(redacted)
     return _truncate(_escape_evidence_controls(redacted), max_chars)

