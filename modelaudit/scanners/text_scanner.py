@@ -141,14 +141,31 @@ DOCUMENTATION_ENV_SPLIT_STRING_WRAPPER = (
 )
 DOCUMENTATION_ENV_WRAPPER = (
     rb"(?:(?:" + DOCUMENTATION_ENV_SPLIT_STRING_WRAPPER + rb")|(?:env(?:\s+" + DOCUMENTATION_ENV_OPTION + rb"){0,8}\s+"
-    rb"(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){0,16})"
+    rb"(?:--\s+)?(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){0,16})"
     rb"|(?:(?:" + DOCUMENTATION_ENV_ASSIGNMENT + rb"\s+){1,16}))?"
 )
 DOCUMENTATION_PRIVILEGE_WRAPPER = (
-    rb"(?:(?:sudo|doas)(?:\s+" + DOCUMENTATION_PRIVILEGE_OPTION + rb"){0,8}\s+" + DOCUMENTATION_ENV_WRAPPER + rb")?"
+    rb"(?:(?:sudo|doas)(?:\s+"
+    + DOCUMENTATION_PRIVILEGE_OPTION
+    + rb"){0,8}\s+(?:--\s+)?"
+    + DOCUMENTATION_ENV_WRAPPER
+    + rb")?"
 )
 DOCUMENTATION_SHELL_WRAPPERS = DOCUMENTATION_ENV_WRAPPER + DOCUMENTATION_PRIVILEGE_WRAPPER
-DOCUMENTATION_POSIX_LAUNCHER_WRAPPER = rb"(?:(?:(?:command|exec|nohup)\s+){0,2})"
+DOCUMENTATION_TIMEOUT_OPTION = (
+    rb"(?:-(?:k|s)|--(?:kill-after|signal))(?:=[^\s]+|\s+[^\s]+)"
+    rb"|--(?:foreground|preserve-status|verbose)"
+)
+DOCUMENTATION_POSIX_LAUNCHER_WRAPPER = (
+    rb"(?:(?:"
+    rb"(?:command|exec|nohup)(?:\s+--)?\s+"
+    rb"|time(?:\s+-[pv]+){0,2}\s+"
+    rb"|timeout(?:\s+(?:" + DOCUMENTATION_TIMEOUT_OPTION + rb")){0,4}\s+"
+    rb"[0-9]+(?:\.[0-9]+)?[smhd]?\s+"
+    rb"|nice(?:\s+(?:-n\s+[-+]?[0-9]+|--adjustment(?:=|\s+)[-+]?[0-9]+|[-+][0-9]+))?\s+"
+    rb"|setsid(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,4}\s+"
+    rb")){0,2}"
+)
 DOCUMENTATION_SHELL_OPTION = rb"--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?"
 DOCUMENTATION_SHELL_COMMAND_OPTION = rb"-[A-Za-z]*c[A-Za-z]*"
 DOCUMENTATION_COMMAND_ARRAY_SEPARATOR = rb"[\"']?\s*,\s*[\"']?"
@@ -184,7 +201,7 @@ DOCUMENTATION_SHELL_LINE_PREFIX = (
     + DOCUMENTATION_SHELL_PROMPT
     + DOCUMENTATION_COMMAND_CONTEXT
 )
-DOCUMENTATION_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?"
+DOCUMENTATION_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?(?:(?:busybox|toybox)(?:\.exe)?\s+)?"
 DOCUMENTATION_DOWNLOADER_COMMAND = (
     DOCUMENTATION_COMMAND_PATH_PREFIX + rb"(?:curl|fetch|invoke-restmethod|invoke-webrequest|irm|iwr|wget)(?:\.exe)?"
 )
@@ -216,6 +233,15 @@ DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN = re.compile(
 DOCUMENTATION_XARGS_DOWNLOADER_PATTERN = re.compile(
     rb"(?:" + DOCUMENTATION_SHELL_LINE_PREFIX + rb"|[;&|]\s*)xargs"
     rb"(?:\s+--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]+)?){0,8}\s+" + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FIND_EXEC_DOWNLOADER_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + rb"find\b[^\r\n]{0,4096}?\s+-(?:exec|execdir)\s+"
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_DOWNLOADER_COMMAND
+    + rb"\b\s+(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\])",
     re.IGNORECASE,
 )
 DOCUMENTATION_DOCKER_ADD_PATTERN = re.compile(
@@ -493,7 +519,7 @@ BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
     rb"\b(?:not|no|without)\s+(?:a\s+)?(?:known\s+)?" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"\b"
     rb"|\b" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"[ -]free\b"
     rb"|\b" + GENERIC_CC_BENIGN_TERM_PATTERN + rb"\s+"
-    rb"(?:analysis|benchmark|classification|classifier|dataset|defen[cs]e|detection|mitigation|research|resistance|robustness|testing)\b"
+    rb"(?:analysis|benchmark|classification|classifier|dataset|defen[cs]e|detection|indicators?|mitigation|research|resistance|robustness|testing)\b"
     rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
     + GENERIC_CC_BENIGN_TERM_PATTERN
     + rb"\b"
@@ -1011,6 +1037,7 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_SHELL_COMMAND_PATTERN,
                 DOCUMENTATION_COMMAND_ARRAY_PATTERN,
                 DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN,
+                DOCUMENTATION_FIND_EXEC_DOWNLOADER_PATTERN,
                 DOCUMENTATION_DOCKER_ADD_PATTERN,
                 DOCUMENTATION_CERTUTIL_COMMAND_PATTERN,
                 DOCUMENTATION_NETCAT_COMMAND_PATTERN,

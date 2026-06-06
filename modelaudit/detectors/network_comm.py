@@ -798,7 +798,7 @@ class NetworkCommDetector:
         rb"(?:`{1,3}[ \t]*)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])[ \t]*)?"
     )
     NETWORK_COMMAND_LINE_LIMIT = rb"(?=[^\r\n]{1,8192}(?:\r?$))"
-    NETWORK_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?"
+    NETWORK_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?(?:(?:busybox|toybox)(?:\.exe)?[ \t]+)?"
     NETWORK_COMMAND_TERMINATOR = rb"(?=[ \t]*(?:\r?$|[;&|<>#]))"
     NETWORK_COMMAND_HOST = (
         rb"(?:"
