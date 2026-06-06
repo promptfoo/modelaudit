@@ -437,9 +437,11 @@ def test_scan_short_text_with_trailing_padding_does_not_report_payload_stuffing(
     [
         'function(token = "standard") if\n(TRUE) NULL',
         'function(token = r"(standard)") if (TRUE)\n# body follows\nNULL',
+        'function(token = "standard")\n# café\nNULL',
+        '\\\n(token = "standard") NULL',
     ],
 )
-def test_scan_joins_function_control_bodies_split_across_printable_runs(tmp_path: Path, body: str) -> None:
+def test_scan_joins_function_expressions_split_across_printable_runs(tmp_path: Path, body: str) -> None:
     path = tmp_path / "split-function-control-body.rds"
     _write_raw_r_serialized(path, body)
 
@@ -448,6 +450,20 @@ def test_scan_joins_function_control_bodies_split_across_printable_runs(tmp_path
     credential_checks = _check_by_name(result, "Credential-like String Detection")
     assert len(credential_checks) == 1
     assert credential_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_invalid_utf8_comment_gap_does_not_suppress_credential_detection(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-utf8-comment-gap.rds"
+    _write_raw_r_serialized_bytes(
+        path,
+        b'function(token = "INVALID_UTF8_SECRET")\n# caf\xff\nNULL',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
 
 
 def test_scan_detects_executable_call_split_at_printable_chunk_boundary(tmp_path: Path) -> None:
@@ -952,6 +968,7 @@ def test_r_named_argument_helper_stops_function_body_at_completed_statement() ->
         'list(token = r"(standard)" ->> x)',
         'list(token = if (TRUE) "standard" else "fallback")',
         'list(token = for (x in values) "standard")',
+        'list(token = for (`i` in values) "standard")',
         'list(token = function(x = 1, y) "standard")',
         'list(token = function(..., x = 1) "standard")',
         'list(token = \\(x = 1, y) "standard")',
@@ -1175,6 +1192,7 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'function(token = r"(UNTERMINATED_RAW_BODY_SECRET)") r"(',
         r'x\(token = r"(PREFIXED_LAMBDA_SECRET)") NULL',
         r'1 \(token = "NUMERIC_PREFIXED_LAMBDA_SECRET") NULL',
+        'x\\\n(token = "PREFIXED_SPLIT_LAMBDA_SECRET") NULL',
         '(1[1])(token = r"(GROUPED_NUMERIC_SUBSCRIPT_RESULT_SECRET)")',
         '((1[1]))(token = "NESTED_GROUPED_NUMERIC_SUBSCRIPT_RESULT_SECRET")',
         'function(token = r"(TRUNCATED_ELSE_BODY_SECRET)") if (TRUE) 1 else',
@@ -1205,6 +1223,7 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'list(token = \\(x) if (TRUE) "SPACED_LAMBDA_ELSE_SECRET" else   )',
         'list(token = "ADJACENT_ARGUMENT_SECRET" value)',
         'list(token = paste0("ADJACENT_CALL_SECRET") value)',
+        'list(token = paste0("SEMICOLON_SECRET"); value)',
         'list(token = if (TRUE) "ADJACENT_CONTROL_SECRET" value)',
         'function(token = paste0("ADJACENT_DEFAULT_SECRET")) value value',
         'function(token = "DANGLING_ELSE_SECRET") if (TRUE) "x"\nelse "y"',
@@ -1249,6 +1268,7 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         '1 y[token = r"(NUMERIC_SUBSCRIPT_BOUNDARY_SECRET)"]',
         'list(token = if (TRUE FALSE) "INVALID_IF_HEADER_SECRET")',
         'list(token = for (x in y z) "INVALID_FOR_HEADER_SECRET")',
+        'list(token = for (`i in values) "UNTERMINATED_BACKTICK_FOR_SECRET")',
         'list(token = function(x=) "INCOMPLETE_FORMAL_SECRET")',
         'list(token = function(x y) "ADJACENT_FORMAL_SECRET")',
         'list(token = \\(x=) "INCOMPLETE_LAMBDA_FORMAL_SECRET")',

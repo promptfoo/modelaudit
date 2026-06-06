@@ -921,6 +921,8 @@ def _r_expression_has_obvious_adjacent_values(
         if allow_newline_separator and not expects_value and "\n" in text[search_start:cursor]:
             expects_value = True
             assignment_target_start = cursor
+        if text[cursor] == ";" and not allow_newline_separator:
+            return True
         if text[cursor] in ",;":
             if not allow_newline_separator:
                 return (
@@ -2073,13 +2075,27 @@ def _r_control_header_is_complete(
     if expression_start is None or expression_start >= closer_position:
         return False
     if token == "for":
-        if not (text[expression_start].isalpha() or text[expression_start] in "._"):
-            return False
-        symbol_end = expression_start + 1
-        while symbol_end < closer_position and (text[symbol_end].isalnum() or text[symbol_end] in "._"):
-            symbol_end += 1
-        if _r_unquoted_named_argument_target_kind(text[expression_start:symbol_end]) != "symbol":
-            return False
+        if text[expression_start] == "`":
+            span_index = bisect_right(non_code_spans, expression_start, key=lambda span: span[0]) - 1
+            if span_index < 0:
+                return False
+            span_start, symbol_end = non_code_spans[span_index]
+            if (
+                span_start != expression_start
+                or symbol_end > closer_position
+                or symbol_end <= expression_start + 2
+                or text[symbol_end - 1] != "`"
+                or span_start in unterminated_literal_starts
+            ):
+                return False
+        else:
+            if not (text[expression_start].isalpha() or text[expression_start] in "._"):
+                return False
+            symbol_end = expression_start + 1
+            while symbol_end < closer_position and (text[symbol_end].isalnum() or text[symbol_end] in "._"):
+                symbol_end += 1
+            if _r_unquoted_named_argument_target_kind(text[expression_start:symbol_end]) != "symbol":
+                return False
         in_position = _r_next_code_position(text, symbol_end, non_code_spans)
         if in_position is None or not (
             text[in_position : in_position + 2] == "in"
@@ -3093,27 +3109,43 @@ class RSerializedScanner(BaseScanner):
                 return
             prefix = payload[prefix_start:prefix_end].decode("utf-8", errors="ignore")
             non_code_spans = _r_non_code_spans(prefix)
-            if not _r_open_call_or_subscript_awaits_continuation(prefix, non_code_spans):
+            if not (
+                _r_open_call_or_subscript_awaits_continuation(prefix, non_code_spans)
+                or _r_lambda_shorthand_before_position(prefix, len(prefix), non_code_spans)
+            ):
                 return
             current_offset = prefix_start
             append_part(payload[prefix_start:end].decode("utf-8", errors="ignore"))
             continuation_active = True
 
-        def gap_supports_continuation(gap: bytes) -> bool:
+        def classify_continuation_gap(gap: bytes) -> tuple[bool, bool]:
             if not gap or not any(byte in (0x0A, 0x0D) for byte in gap):
-                return False
+                return False, False
             try:
-                lines = gap.decode("ascii").splitlines()
+                lines = gap.decode("utf-8").splitlines()
             except UnicodeDecodeError:
-                return False
-            return all(not line.strip() or line.lstrip().startswith("#") for line in lines)
+                return False, False
+            valid_lines = [not line.strip() or line.lstrip().startswith("#") for line in lines]
+            if all(valid_lines):
+                return True, False
+            return False, bool(valid_lines) and all(valid_lines[1:])
 
         for match in self._PRINTABLE_RE.finditer(payload):
             if previous_match_end != match.start():
                 if previous_match_end is not None:
                     append_printable_tail(previous_match_end, match.start())
                     gap = payload[previous_match_end : match.start()]
-                    is_newline_whitespace_gap = gap_supports_continuation(gap)
+                    is_newline_whitespace_gap, requires_comment_context = classify_continuation_gap(gap)
+                    current_text = ""
+                    non_code_spans: list[tuple[int, int]] = []
+                    if requires_comment_context:
+                        current_text = "".join(current_parts)
+                        non_code_spans = _r_non_code_spans(current_text)
+                        is_newline_whitespace_gap = bool(
+                            non_code_spans
+                            and non_code_spans[-1][1] == len(current_text)
+                            and current_text[non_code_spans[-1][0]] == "#"
+                        )
                     if (
                         is_newline_whitespace_gap
                         and continuation_active
@@ -3134,8 +3166,9 @@ class RSerializedScanner(BaseScanner):
                                 else _STRING_EXTRACTION_INCONCLUSIVE_REASON
                             )
                             break
-                        current_text = "".join(current_parts)
-                        non_code_spans = _r_non_code_spans(current_text)
+                        if not current_text:
+                            current_text = "".join(current_parts)
+                            non_code_spans = _r_non_code_spans(current_text)
                         next_text = match.group().decode("utf-8", errors="ignore")
                         next_starts_else = re.match(r"else(?:\b|(?=[({]))", next_text.lstrip()) is not None
                         continuation_active = (
@@ -3153,7 +3186,7 @@ class RSerializedScanner(BaseScanner):
                     else:
                         continuation_active = False
                     if continuation_active:
-                        append_part(gap.decode("ascii"))
+                        append_part(gap.decode("utf-8"))
                         append_part(match.group().decode("utf-8", errors="ignore"))
                         previous_match_end = match.end()
                         continue
