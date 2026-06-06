@@ -852,7 +852,7 @@ class ParallelShardHandler:
         return members
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":
-        from ...scanner_results import ScanResult
+        from ...scanner_results import CheckStatus, IssueSeverity, ScanResult
 
         """Scan a single shard file."""
         scanner = (
@@ -901,10 +901,30 @@ class ParallelShardHandler:
 
         result: ScanResult = scanner.scan(scan_path)
         if target_validator is not None and validated_stat is not None:
-            post_scan_stat = target_validator("during scanning")
-            identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-            if any(getattr(validated_stat, field) != getattr(post_scan_stat, field) for field in identity_fields):
-                raise OSError(f"Validated shard target changed during scanning: {Path(shard_path).name}")
+            try:
+                post_scan_stat = target_validator("during scanning")
+                identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+                if any(getattr(validated_stat, field) != getattr(post_scan_stat, field) for field in identity_fields):
+                    raise OSError(f"Validated shard target changed during scanning: {Path(shard_path).name}")
+            except OSError as error:
+                # Keep security findings already observed, but discard passing
+                # evidence that became untrustworthy when the target changed.
+                result.checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+                _mark_inconclusive_scan_outcome(result, "shard_scan_error")
+                result.add_check(
+                    name="Shard Scan",
+                    passed=False,
+                    message=f"Error scanning shard: {Path(shard_path).name}",
+                    severity=IssueSeverity.INFO,
+                    location=shard_path,
+                    details={
+                        "error": str(error),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "shard_scan_error",
+                    },
+                )
+                result.finish(success=False)
         return result
 
 

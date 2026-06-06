@@ -542,6 +542,49 @@ class TestShardedModelDetector:
         assert any(check.name == "Shard Scan" and check.status == CheckStatus.FAILED for check in result.checks)
         assert not any(check.name == "Clean Replacement Accepted" for check in result.checks)
 
+    def test_shard_target_swap_during_scan_preserves_security_findings(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A target race must not erase a security finding already produced by the scanner."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        malicious_target = tmp_path / "malicious.pt"
+        replacement_target = tmp_path / "replacement.pt"
+        shard_one.write_bytes(b"first")
+        malicious_target.write_bytes(b"malicious")
+        replacement_target.write_bytes(b"replacement")
+        shard_two.symlink_to(malicious_target)
+
+        class FindingThenSwappingScanner:
+            name = "finding_then_swapping_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                path = Path(shard_path)
+                result = ScanResult(scanner_name=self.name)
+                if path == malicious_target:
+                    result.add_check(
+                        name="Malicious Shard Payload",
+                        passed=False,
+                        message="Malicious shard payload detected",
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(path),
+                    )
+                    path.unlink()
+                    path.symlink_to(replacement_target)
+                result.finish(success=not result.has_errors)
+                return result
+
+        result = AdvancedFileHandler(str(shard_one), FindingThenSwappingScanner()).scan()
+
+        assert result.success is False
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Malicious Shard Payload" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+        assert any(issue.message == "Malicious shard payload detected" for issue in result.issues)
+
     def test_shard_added_during_scan_marks_family_inconclusive(self, tmp_path: Path) -> None:
         """A shard created after detection cannot remain outside the completed scan set."""
         shard_one = tmp_path / "checkpoint_1.pt"
