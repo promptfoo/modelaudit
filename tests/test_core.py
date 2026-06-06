@@ -1510,17 +1510,28 @@ def test_unclassified_symlink_names_recovers_omitted_broken_link(tmp_path: Path)
     """Directory discovery should recover dangling links omitted by ``os.walk``."""
     broken_path = tmp_path / "missing.bin"
     broken_path.symlink_to("absent.bin")
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    directory_link = tmp_path / "directory-link"
+    directory_link.symlink_to(target_dir, target_is_directory=True)
 
     assert core_module._unclassified_symlink_names(str(tmp_path), [], []) == [broken_path.name]
+    assert core_module._unclassified_symlink_names(
+        str(tmp_path),
+        [broken_path.name, directory_link.name, target_dir.name],
+        [],
+    ) == [broken_path.name]
     assert core_module._unclassified_symlink_names(str(tmp_path), [], [broken_path.name]) == []
 
 
 @pytest.mark.usefixtures("requires_symlinks")
-def test_directory_scan_reports_broken_symlink_omitted_by_walk(
+@pytest.mark.parametrize("classified_as_directory", [False, True], ids=["omitted", "directory"])
+def test_directory_scan_reports_broken_symlink_outside_file_classification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    classified_as_directory: bool,
 ) -> None:
-    """A platform may omit a dangling file link from both ``dirs`` and ``files``."""
+    """A platform may omit a dangling file link or classify it as a directory."""
     broken_path = tmp_path / "missing.bin"
     broken_path.symlink_to("absent.bin")
     original_walk = os.walk
@@ -1532,6 +1543,8 @@ def test_directory_scan_reports_broken_symlink_omitted_by_walk(
         followlinks: bool = False,
     ) -> Iterator[tuple[str, list[str], list[str]]]:
         for root, dirs, files in original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks):
+            if classified_as_directory and root == str(tmp_path) and broken_path.name not in dirs:
+                dirs.append(broken_path.name)
             yield root, dirs, [name for name in files if name != broken_path.name]
 
     monkeypatch.setattr(core_module.os, "walk", walk_without_broken_link)
@@ -1731,8 +1744,8 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     assert first_fingerprint != second_fingerprint
 
 
-def test_scan_file_bypasses_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
-    """A representative cache entry must not hide a newly malicious sibling shard."""
+def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
+    """A family cache entry must not hide a newly malicious sibling shard."""
     shard_one = tmp_path / "checkpoint_1.pt"
     shard_two = tmp_path / "checkpoint_2.pt"
     shard_one.write_bytes(pickle.dumps({"weights": [1]}))
@@ -1747,12 +1760,16 @@ def test_scan_file_bypasses_cache_when_shard_sibling_changes(tmp_path: Path) -> 
     reset_cache_manager()
     try:
         first_result = scan_file(str(shard_one), config=config)
+        cached_result = scan_file(str(shard_one), config=config)
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         shard_two.write_bytes(_build_malicious_pickle())
         second_result = scan_file(str(shard_one), config=config)
 
         assert first_result.success is True
+        assert cached_result.success is True
+        assert cached_entries > 0
         assert any(issue.rule_code == "S201" for issue in second_result.issues)
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] >= cached_entries
     finally:
         reset_cache_manager()
 

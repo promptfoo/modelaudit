@@ -1168,20 +1168,26 @@ def _resolve_directory_scan_target(
 
 
 def _unclassified_symlink_names(root: str, dirs: list[str], files: list[str]) -> list[str]:
-    """Return symlink entries omitted by platform-specific ``os.walk`` classification."""
-    classified_names = set(dirs).union(files)
+    """Return file-like symlinks omitted from ``os.walk``'s file classification."""
+    classified_files = set(files)
     unclassified_symlinks: list[str] = []
     try:
         with os.scandir(root) as entries:
             for entry in entries:
-                if entry.name in classified_names:
+                if entry.name in classified_files:
                     continue
                 try:
                     is_symlink = entry.is_symlink()
                 except OSError:
                     is_symlink = True
-                if is_symlink:
-                    unclassified_symlinks.append(entry.name)
+                if not is_symlink:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        continue
+                except OSError:
+                    pass
+                unclassified_symlinks.append(entry.name)
     except OSError:
         return []
     return sorted(unclassified_symlinks)
@@ -1478,7 +1484,11 @@ def scan_model_directory_or_file(
                 onerror=collect_dvc_directory_walk_error,
             ):
                 dirs.sort()
-                candidate_files = sorted([*files, *_unclassified_symlink_names(root, dirs, files)])
+                unclassified_symlinks = _unclassified_symlink_names(root, dirs, files)
+                if unclassified_symlinks:
+                    unclassified_symlink_set = set(unclassified_symlinks)
+                    dirs[:] = [directory for directory in dirs if directory not in unclassified_symlink_set]
+                candidate_files = sorted([*files, *unclassified_symlinks])
                 for file in candidate_files:
                     file_path = os.path.join(root, file)
 
@@ -1884,9 +1894,6 @@ def scan_model_directory_or_file(
                             file_config = config
                             if shard_family_key is not None:
                                 file_config = dict(config)
-                                # Group membership and symlink targets must be revalidated
-                                # before any representative-file cache lookup can read them.
-                                file_config["cache_enabled"] = False
                                 file_config[_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] = (
                                     _build_shard_family_cache_fingerprint(
                                         shard_family_key,

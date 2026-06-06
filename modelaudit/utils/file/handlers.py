@@ -1313,25 +1313,11 @@ def scan_advanced_large_file(
         logger.debug(f"Bypassing advanced-file cache for bounded SafeTensors header failure: {file_path}")
         return scanner.scan(file_path)  # type: ignore[no-any-return]
 
-    # A representative-file cache key cannot safely describe sibling shard
-    # targets, identities, or coverage changes. Re-evaluate sharded families on
-    # every scan so retargeted aliases and missing members fail closed.
-    if (
-        ShardedModelDetector.detect_shards(
-            file_path,
-            allowed_paths=allowed_shard_paths,
-            allowed_targets=allowed_shard_targets,
-        )
-        is not None
-    ):
-        return _scan_advanced_large_file_internal(
-            file_path,
-            scanner,
-            progress_callback,
-            timeout,
-            allowed_shard_paths=allowed_shard_paths,
-            allowed_shard_targets=allowed_shard_targets,
-        )
+    shard_info = ShardedModelDetector.detect_shards(
+        file_path,
+        allowed_paths=allowed_shard_paths,
+        allowed_targets=allowed_shard_targets,
+    )
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
@@ -1361,6 +1347,10 @@ def scan_advanced_large_file(
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
         version_config = dict(config)
+        if shard_info is not None:
+            # A representative file key alone cannot describe sibling shard
+            # membership, target identity, or incomplete-family state.
+            version_config["advanced_shard_family"] = shard_info
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
             version_config["advanced_allowed_shard_paths"] = sorted(
@@ -1380,6 +1370,17 @@ def scan_advanced_large_file(
                 allowed_shard_paths=allowed_shard_paths,
                 allowed_shard_targets=allowed_shard_targets,
             )
+            current_shard_info = ShardedModelDetector.detect_shards(
+                file_path,
+                allowed_paths=allowed_shard_paths,
+                allowed_targets=allowed_shard_targets,
+            )
+            if current_shard_info != shard_info:
+                result = _shard_boundary_failure_result(
+                    scanner.name,
+                    file_path,
+                    {"path": file_path, "reason": "shard_family_changed_during_scan"},
+                )
             return result.to_dict()
 
         # Get cached result or perform scan
@@ -1388,6 +1389,18 @@ def scan_advanced_large_file(
             cached_advanced_scan_wrapper,
             version_context=version_context,
         )
+
+        post_scan_shard_info = ShardedModelDetector.detect_shards(
+            file_path,
+            allowed_paths=allowed_shard_paths,
+            allowed_targets=allowed_shard_targets,
+        )
+        if post_scan_shard_info != shard_info:
+            return _shard_boundary_failure_result(
+                scanner.name,
+                file_path,
+                {"path": file_path, "reason": "shard_family_changed_during_scan"},
+            )
 
         # Convert back to ScanResult
         from ...utils.helpers.result_conversion import scan_result_from_dict

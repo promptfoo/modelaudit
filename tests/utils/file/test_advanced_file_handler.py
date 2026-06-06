@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.cache.cache_manager import reset_cache_manager
+from modelaudit.cache.cache_manager import get_cache_manager, reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
@@ -1102,12 +1102,20 @@ class TestAdvancedFileHandler:
         class CachedCompletingShardScanner(CompletingShardScanner):
             def __init__(self, config: dict[str, Any] | None = None) -> None:
                 self.config = config or {}
+                self.scanned_paths: list[str] = []
+
+            def scan(self, shard_path: str) -> ScanResult:
+                self.scanned_paths.append(shard_path)
+                return super().scan(shard_path)
 
         scanner = CachedCompletingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
 
         reset_cache_manager()
         try:
             first = scan_advanced_large_file(str(shard_one), scanner)
+            first_scan_paths = list(scanner.scanned_paths)
+            cached = scan_advanced_large_file(str(shard_one), scanner)
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
             shard_two.unlink()
             shard_two.symlink_to(outside_target)
             second = scan_advanced_large_file(str(shard_one), scanner)
@@ -1115,8 +1123,51 @@ class TestAdvancedFileHandler:
             reset_cache_manager()
 
         assert first.success is True
+        assert cached.success is True
+        assert scanner.scanned_paths == first_scan_paths
+        assert cache_manager.get_stats()["total_entries"] > 0
         assert second.success is False
         assert "out_of_scope_model_shards" in second.metadata["scan_outcome_reasons"]
+
+    def test_cached_sharded_scan_rejects_family_change_during_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A family change during a fresh scan must fail before cache storage."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"first")
+        shard_two.write_bytes(b"second")
+        cache_dir = tmp_path / "cache"
+
+        class CachedCompletingShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+        scanner = CachedCompletingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
+
+        def mutate_family_during_scan(*args: Any, **kwargs: Any) -> ScanResult:
+            shard_two.write_bytes(b"changed")
+            result = ScanResult(scanner_name=scanner.name)
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._scan_advanced_large_file_internal",
+            mutate_family_during_scan,
+        )
+
+        reset_cache_manager()
+        try:
+            result = scan_advanced_large_file(str(shard_one), scanner)
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            assert cache_manager.get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "shard_boundary_changed"
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
