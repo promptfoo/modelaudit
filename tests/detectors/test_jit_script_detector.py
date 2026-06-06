@@ -497,6 +497,24 @@ class TestJITScriptDetector:
 
         assert len(candidates) <= jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES
 
+    def test_scan_model_fails_closed_when_middle_priority_start_is_omitted(self) -> None:
+        line_count = jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 26
+        lines = [f"if True: import webbrowser as wb_{index}".encode() for index in range(line_count)]
+        lines[line_count // 2] = b"if True: import webbrowser as wb; wb.open('https://example.invalid')"
+        source = b"}\x00\n".join(lines)
+
+        findings = JITScriptDetector()._extract_and_check_python_code(
+            source,
+            "TorchScript",
+            "middle-compound-priority.bin",
+        )
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+            for finding in findings
+        )
+
     def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00".join(
@@ -9374,6 +9392,135 @@ class TestJITScriptDetector:
         aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
 
         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_track_shadowed_print_assignment(self) -> None:
+        prefix = b"import webbrowser as wb\noriginal = wb.open\nprint = original\nwb.open = print\nalias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_keep_capture_before_owner_rebind(self) -> None:
+        prefix = b"import webbrowser as wb\nalias = wb.open\nwb = Holder\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_ignore_capture_after_owner_rebind(self) -> None:
+        prefix = b"import webbrowser as wb\nwb = Holder\nalias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert "alias" not in aliases
+
+    def test_prefix_typed_member_aliases_preserve_from_import_callable(self) -> None:
+        prefix = b"from webbrowser import open as opener\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["opener"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_respect_safe_from_import(self) -> None:
+        prefix = b"import webbrowser as wb\nwb.open = print\nfrom webbrowser import open as opener\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert "opener" not in aliases
+
+    def test_prefix_typed_member_aliases_track_static_helper_restore(self) -> None:
+        prefix = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"setattr(wb, 'open', original)\nalias = wb.open\n"
+        )
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_member_aliases_respect_static_helper_safe_overwrite(self) -> None:
+        prefix = b"import webbrowser as wb\nsetattr(wb, 'open', print)\nalias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert "alias" not in aliases
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            b"wb.__dict__.update({'open': %s})",
+            b"vars(wb).update({'open': %s})",
+            b"dict.__setitem__(wb.__dict__, 'open', %s)",
+        ],
+    )
+    @pytest.mark.parametrize(("value", "expected"), [(b"original", True), (b"print", False)])
+    def test_prefix_typed_member_aliases_track_positional_mapping_update(
+        self,
+        update: bytes,
+        value: bytes,
+        expected: bool,
+    ) -> None:
+        prefix = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n" + update % value + b"\nalias = wb.open\n"
+        )
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert ("alias" in aliases) is expected
+
+    def test_prefix_typed_member_aliases_capture_same_line_tail_assignment(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"import webbrowser as wb; alias = wb.open\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_aliases_discover_deterministic_indented_tail_import(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+        assert typed_aliases["wb"] == "webbrowser"
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_aliases_ignore_unexecuted_indented_tail_import(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"if False:\n    import webbrowser as wb\nalias = wb.open\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+        assert "wb" not in typed_aliases
+        assert "alias" not in aliases
+
+    def test_prefix_typed_aliases_keep_deterministic_tail_import_before_malformed_line(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\nif True print(\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+        assert typed_aliases["wb"] == "webbrowser"
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_builtins_aliases_drop_destructured_loop_target(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\n" + padding + b"for (bi,) in items:\n    pass\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" not in aliases
+
+    def test_prefix_builtins_aliases_drop_loop_target_before_malformed_line(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\n" + padding + b"for (bi,) in items:\n    pass\nif True print(\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" not in aliases
 
     def test_compact_replay_calls_inherited_typed_alias_without_print(self) -> None:
         inherited_aliases = {"alias": frozenset({("webbrowser", "open", False)})}

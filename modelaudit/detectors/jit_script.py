@@ -11,6 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import builtins
+import codeop
 import json
 import re
 import textwrap
@@ -366,6 +367,23 @@ def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0
             return True
         unambiguous_start = _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate)
         if unambiguous_start is not None and not unambiguous_start.group(0).rstrip().endswith(b"="):
+            return True
+    return False
+
+
+def _embedded_python_source_start_budget_exceeded(data: bytes, *, start_offset: int = 0) -> bool:
+    """Return whether bounded candidate selection must omit source-like starts."""
+    if len(_priority_import_sites(data[start_offset:])) > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+        return True
+    source_start_probes = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data, start_offset):
+        cursor = match.start()
+        while cursor > 0 and data[cursor - 1] in b" \t\r":
+            cursor -= 1
+        if cursor > 0 and data[cursor - 1] != 0x0A and 0x20 <= data[cursor - 1] < 0x7F:
+            continue
+        source_start_probes += 1
+        if source_start_probes > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
             return True
     return False
 
@@ -819,37 +837,82 @@ def _has_late_alias_rebinding(candidate: bytes, alias: str) -> bool:
 
 def _compact_tail_module_lines(tail: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
     """Yield ordered module-scope lines and any parseable statements they contain."""
-    for raw_line in tail.split(b"\n"):
-        if raw_line[:1].isspace():
-            continue
-        line = _python_structural_line_bytes(raw_line).strip()
-        if not line:
-            continue
+
+    def parse_module_scope_statements(chunk: bytes) -> tuple[ast.stmt, ...] | None:
+        decoded_chunk = chunk.decode("utf-8", errors="ignore").lstrip("\x00\ufeff")
         try:
-            tree = ast.parse(line.decode("utf-8", errors="ignore"))
+            tree = ast.parse(decoded_chunk)
         except (RecursionError, SyntaxError, ValueError):
-            statements: tuple[ast.stmt, ...] = ()
-        else:
-            statements = tuple(_compact_deterministically_executed_statements(tree.body))
-        yield line, statements
+            return None
+        parents, executed_statement_ids = _compact_module_scope_context(tree)
+        return tuple(
+            statement
+            for statement in _compact_deterministically_executed_statements(tree.body)
+            if _is_compact_module_scope_node(statement, parents, executed_statement_ids)
+        )
+
+    def chunk_is_incomplete(chunk: bytes) -> bool:
+        try:
+            compiled = codeop.compile_command(chunk.decode("utf-8", errors="ignore"), symbol="exec")
+        except (RecursionError, SyntaxError, ValueError):
+            return False
+        return compiled is None
+
+    def emit_chunk(chunk: bytes) -> tuple[bytes, tuple[ast.stmt, ...]] | None:
+        statements = parse_module_scope_statements(chunk)
+        if statements is not None:
+            return b"", statements
+        structural_chunk = b"\n".join(
+            line for raw_line in chunk.splitlines() if (line := _python_structural_line_bytes(raw_line).strip())
+        )
+        return (structural_chunk, ()) if structural_chunk else None
+
+    complete_tail = emit_chunk(tail)
+    if complete_tail is not None and complete_tail[1]:
+        yield complete_tail
+        return
+
+    chunk_lines: list[bytes] = []
+    for raw_line in tail.splitlines(keepends=True):
+        structural_line = _python_structural_line_bytes(raw_line).strip()
+        starts_top_level_statement = bool(structural_line) and not raw_line[:1].isspace()
+        if not chunk_lines:
+            if starts_top_level_statement:
+                chunk_lines.append(raw_line)
+            continue
+        if starts_top_level_statement:
+            current_chunk = b"".join(chunk_lines)
+            if not chunk_is_incomplete(current_chunk):
+                emitted = emit_chunk(current_chunk)
+                if emitted is not None:
+                    yield emitted
+                chunk_lines = [raw_line]
+                continue
+        chunk_lines.append(raw_line)
+    if chunk_lines:
+        emitted = emit_chunk(b"".join(chunk_lines))
+        if emitted is not None:
+            yield emitted
+
+
+def _compact_prefix_module_lines(candidate: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
+    """Yield bounded prefix statements in source order without hoisting scoped bindings."""
+    prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
+    prefix = candidate[:prefix_end].lstrip(b"\x00\xff")
+    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(prefix.decode("utf-8", errors="ignore")))
+    if parsed_snippet is not None:
+        tree, _parsed_chars = parsed_snippet
+        if isinstance(tree, ast.Module):
+            parents, executed_statement_ids = _compact_module_scope_context(tree)
+            for statement in _compact_deterministically_executed_statements(tree.body):
+                if _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+                    yield b"", (statement,)
+    yield from _compact_tail_module_lines(candidate[prefix_end:])
 
 
 def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
-    prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
-    prefix = candidate[:prefix_end].lstrip(b"\x00\xff")
-    source = prefix.decode("utf-8", errors="ignore")
-    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
-    if parsed_snippet is None:
-        return frozenset()
-    tree, _parsed_chars = parsed_snippet
-    if not isinstance(tree, ast.Module):
-        return frozenset()
     aliases = {"builtins", "__builtins__"}
-    for statement in _compact_deterministically_executed_statements(tree.body):
-        _update_compact_builtins_aliases(statement, aliases)
-
-    tail = candidate[prefix_end:]
-    for line, statements in _compact_tail_module_lines(tail):
+    for line, statements in _compact_prefix_module_lines(candidate):
         if not statements:
             for alias in list(aliases):
                 if _has_late_alias_rebinding(line, alias):
@@ -878,34 +941,29 @@ def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str,
                 aliases.pop(name, None)
                 if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
                     aliases[name] = aliases_before[value.id]
-    elif isinstance(statement, ast.AugAssign):
+    elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
         for name in _assignment_target_names(statement.target):
             aliases.pop(name, None)
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        for item in statement.items:
+            if item.optional_vars is not None:
+                for name in _assignment_target_names(item.optional_vars):
+                    aliases.pop(name, None)
     elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         aliases.pop(statement.name, None)
     elif isinstance(statement, ast.Delete):
         for target in statement.targets:
             for name in _assignment_target_names(target):
                 aliases.pop(name, None)
+    for node in ast.walk(statement):
+        if isinstance(node, ast.NamedExpr):
+            for name in _assignment_target_names(node.target):
+                aliases.pop(name, None)
 
 
 def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
-    prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
-    prefix = candidate[:prefix_end].lstrip(b"\x00\xff")
-    source = prefix.decode("utf-8", errors="ignore")
-    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
-    if parsed_snippet is None:
-        return {}
-    tree, _parsed_chars = parsed_snippet
-    if not isinstance(tree, ast.Module):
-        return {}
-
     aliases: dict[str, str] = {}
-    for statement in _compact_deterministically_executed_statements(tree.body):
-        _update_compact_typed_import_aliases(statement, aliases)
-
-    tail = candidate[prefix_end:]
-    for line, statements in _compact_tail_module_lines(tail):
+    for line, statements in _compact_prefix_module_lines(candidate):
         if not statements:
             for alias_name in list(aliases):
                 if _has_late_alias_rebinding(line, alias_name):
@@ -917,135 +975,254 @@ def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
 
 def _unsafe_typed_member_aliases(
     candidate: bytes,
-    inherited_typed_aliases: Mapping[str, str],
+    _inherited_typed_aliases: Mapping[str, str],
 ) -> dict[str, _TypedMemberCallableValue]:
-    typed_aliases = dict(inherited_typed_aliases)
+    typed_aliases: dict[str, str] = {}
+    builtins_aliases = {"builtins", "__builtins__"}
     safe_members: set[tuple[str, str]] = set()
     unknown_members: set[tuple[str, str]] = set()
+    member_callable_values: dict[tuple[str, str], _TypedMemberCallableValue] = {}
     callable_aliases: dict[str, _TypedMemberCallableValue] = {}
-    assignment_pattern = re.compile(rb"^([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
-    member_target_pattern = re.compile(rb"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
-    mapping_member_target_pattern = re.compile(
-        rb"^([A-Za-z_]\w*)\.__dict__\s*\[\s*['\"]([A-Za-z_]\w*)['\"]\s*\]\s*=\s*(.+?)\s*$"
-    )
-    member_value_pattern = re.compile(rb"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
+    print_is_builtin = True
+    builtins_print_is_builtin = True
+    setattr_is_builtin = True
 
-    module_scope_lines: set[int] | None = None
-    source = candidate.lstrip(b"\x00\xff").decode("utf-8", errors="ignore")
-    try:
-        tree = ast.parse(textwrap.dedent(source))
-    except (RecursionError, SyntaxError, ValueError):
-        pass
-    else:
-        module_scope_lines = {
-            statement.lineno for statement in _compact_deterministically_executed_statements(tree.body)
-        }
+    def typed_member(node: ast.AST) -> tuple[str, str] | None:
+        if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+            return None
+        module_name = typed_aliases.get(node.value.id)
+        if module_name is None or _typed_member_high_risk_call(module_name, node.attr) is None:
+            return None
+        return module_name, node.attr
 
-    def record_member_state(module_name: str, member_name: str, value: bytes) -> None:
+    def typed_mapping_owner(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and isinstance(node.value, ast.Name):
+            return typed_aliases.get(node.value.id)
+        if (
+            isinstance(node, ast.Call)
+            and _simple_reference_name(node.func) in {"vars", "builtins.vars", "__builtins__.vars"}
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+        ):
+            return typed_aliases.get(node.args[0].id)
+        return None
+
+    def static_member_target(target: ast.AST) -> tuple[str, str] | None:
+        direct_member = typed_member(target)
+        if direct_member is not None:
+            return direct_member
+        if not isinstance(target, ast.Subscript):
+            return None
+        module_name = typed_mapping_owner(target.value)
+        member_name = _static_getattr_member_name(target.slice)
+        if module_name is None or member_name is None or _typed_member_high_risk_call(module_name, member_name) is None:
+            return None
+        return module_name, member_name
+
+    def expression_callable_value(value: ast.AST) -> _TypedMemberCallableValue | None:
+        reference = _simple_reference_name(value)
+        if reference is not None and reference in callable_aliases:
+            return callable_aliases[reference]
+        member = typed_member(value)
+        if member is None or member in safe_members or member in unknown_members:
+            return None
+        return member_callable_values.get(member, frozenset({(*member, False)}))
+
+    def is_safe_print_reference(value: ast.AST) -> bool:
+        nonlocal print_is_builtin, builtins_print_is_builtin
+        if isinstance(value, ast.Name) and value.id == "print":
+            return print_is_builtin
+        return bool(
+            isinstance(value, ast.Attribute)
+            and value.attr == "print"
+            and isinstance(value.value, ast.Name)
+            and value.value.id in builtins_aliases
+            and builtins_print_is_builtin
+        )
+
+    def record_member_state(module_name: str, member_name: str, value: ast.AST) -> None:
         member = (module_name, member_name)
-        value_reference = value.strip().decode("utf-8", errors="ignore")
-        if value.strip() == b"print":
+        if is_safe_print_reference(value):
             safe_members.add(member)
             unknown_members.discard(member)
+            member_callable_values.pop(member, None)
             return
-        if any(
-            owner_name == module_name and captured_member == member_name and not is_safe
-            for owner_name, captured_member, is_safe in callable_aliases.get(value_reference, frozenset())
-        ):
+        callable_value = expression_callable_value(value)
+        if callable_value is not None:
             safe_members.discard(member)
             unknown_members.discard(member)
-            return
-        value_member = member_value_pattern.fullmatch(value.strip())
-        if (
-            value_member is not None
-            and typed_aliases.get(value_member.group(1).decode("utf-8")) == module_name
-            and value_member.group(2).decode("utf-8") == member_name
-        ):
+            member_callable_values[member] = callable_value
             return
         safe_members.discard(member)
         unknown_members.add(member)
+        member_callable_values.pop(member, None)
 
-    for line_number, raw_line in enumerate(candidate.split(b"\n"), start=1):
-        if module_scope_lines is not None:
-            if line_number not in module_scope_lines:
-                continue
-        elif raw_line[:1].isspace():
-            continue
-        raw_statement = raw_line.strip()
-        line = _python_structural_line_bytes(raw_line).strip()
-        if not line:
-            continue
-        mapping_member_target = mapping_member_target_pattern.fullmatch(raw_statement)
-        if mapping_member_target is not None:
-            owner_alias = mapping_member_target.group(1).decode("utf-8")
-            member_name = mapping_member_target.group(2).decode("utf-8")
-            module_name = typed_aliases.get(owner_alias)
-            if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
-                record_member_state(module_name, member_name, mapping_member_target.group(3))
-            continue
-        member_target = member_target_pattern.fullmatch(line)
-        if member_target is not None:
-            owner_alias = member_target.group(1).decode("utf-8")
-            member_name = member_target.group(2).decode("utf-8")
-            module_name = typed_aliases.get(owner_alias)
-            if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
-                record_member_state(module_name, member_name, member_target.group(3))
-            continue
-
-        assignment = assignment_pattern.fullmatch(line)
-        if assignment is None:
-            for owner_alias, module_name in typed_aliases.items():
-                for member_name in _TYPED_PROOF_MEMBER_NAMES:
-                    member_literal = re.escape(member_name.encode("utf-8"))
-                    owner_literal = re.escape(owner_alias.encode("utf-8"))
-                    owner_mapping = (
-                        rb"(?:"
-                        + owner_literal
-                        + rb"\s*\.\s*__dict__|(?:\b[A-Za-z_]\w*\.)?vars\s*\(\s*"
-                        + owner_literal
-                        + rb"\s*\))"
+    def bind_name(target_name: str, value: ast.AST | None) -> None:
+        nonlocal print_is_builtin, setattr_is_builtin
+        callable_value = expression_callable_value(value) if value is not None else None
+        typed_value = typed_aliases.get(value.id) if isinstance(value, ast.Name) else None
+        callable_aliases.pop(target_name, None)
+        typed_aliases.pop(target_name, None)
+        if callable_value is not None:
+            callable_aliases[target_name] = callable_value
+        if typed_value is not None:
+            typed_aliases[target_name] = typed_value
+        if target_name == "print":
+            print_is_builtin = value is not None and is_safe_print_reference(value)
+        elif target_name == "setattr":
+            setattr_is_builtin = bool(
+                value is not None
+                and (
+                    _simple_reference_name(value) == "setattr"
+                    or (
+                        isinstance(value, ast.Attribute)
+                        and value.attr == "setattr"
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id in builtins_aliases
                     )
-                    if re.search(
-                        rb"(?:\b[A-Za-z_]\w*\.)?setattr\s*\(\s*"
-                        + owner_literal
-                        + rb"\s*,\s*['\"]"
-                        + member_literal
-                        + rb"['\"]",
-                        line,
-                    ) or (
-                        member_literal in line
-                        and re.search(
-                            owner_mapping + rb"\s*(?:\|=|\.\s*(?:update|__setitem__)\s*\()",
-                            line,
-                        )
-                    ):
+                )
+            )
+
+    def bind_target(target: ast.AST, value: ast.AST | None) -> None:
+        nonlocal builtins_print_is_builtin
+        member = static_member_target(target)
+        if member is not None and value is not None:
+            record_member_state(*member, value)
+            return
+        if (
+            isinstance(target, ast.Attribute)
+            and target.attr == "print"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_print_is_builtin = value is not None and is_safe_print_reference(value)
+            return
+        if isinstance(target, ast.Name):
+            bind_name(target.id, value)
+        elif isinstance(target, ast.Starred):
+            bind_target(target.value, None)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            values = value.elts if isinstance(value, (ast.Tuple, ast.List)) else []
+            for index, element in enumerate(target.elts):
+                bind_target(element, values[index] if index < len(values) else None)
+
+    def record_helper_call(call: ast.Call) -> None:
+        nonlocal builtins_print_is_builtin
+
+        def record_static_update(module_name: str, update: ast.AST) -> None:
+            def record_item(key: ast.AST, value: ast.AST) -> None:
+                member_name = _static_getattr_member_name(key)
+                if member_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
+                    record_member_state(module_name, member_name, value)
+
+            def invalidate_unknown() -> None:
+                for member_name in _TYPED_PROOF_MEMBER_NAMES:
+                    if _typed_member_high_risk_call(module_name, member_name) is not None:
                         member = (module_name, member_name)
                         safe_members.discard(member)
                         unknown_members.add(member)
+                        member_callable_values.pop(member, None)
+
+            _replay_static_update_items(update, record_item, invalidate_unknown)
+
+        reference = _simple_reference_name(call.func)
+        if reference in {"setattr", "builtins.setattr", "__builtins__.setattr"} and len(call.args) >= 3:
+            helper_is_builtin = reference != "setattr" or setattr_is_builtin
+            owner = call.args[0]
+            member_name = _static_getattr_member_name(call.args[1])
+            if helper_is_builtin and isinstance(owner, ast.Name) and member_name is not None:
+                module_name = typed_aliases.get(owner.id)
+                if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
+                    record_member_state(module_name, member_name, call.args[2])
+                elif owner.id in builtins_aliases and member_name == "print":
+                    builtins_print_is_builtin = is_safe_print_reference(call.args[2])
+            return
+        if not isinstance(call.func, ast.Attribute):
+            return
+        if call.func.attr == "__setitem__" and len(call.args) >= 2:
+            module_name = typed_mapping_owner(call.func.value)
+            key_index = 0
+            value_index = 1
+            if (
+                module_name is None
+                and reference in {"dict.__setitem__", "builtins.dict.__setitem__", "__builtins__.dict.__setitem__"}
+                and len(call.args) >= 3
+            ):
+                module_name = typed_mapping_owner(call.args[0])
+                key_index = 1
+                value_index = 2
+            member_name = _static_getattr_member_name(call.args[key_index])
+            if module_name is not None and member_name is not None:
+                record_member_state(module_name, member_name, call.args[value_index])
+            return
+        if call.func.attr != "update":
+            return
+        mapping_node = call.func.value
+        keyword_values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+        if (module_name := typed_mapping_owner(mapping_node)) is not None:
+            for argument in call.args:
+                record_static_update(module_name, argument)
+            for member_name, value in keyword_values.items():
+                if _typed_member_high_risk_call(module_name, member_name) is not None:
+                    record_member_state(module_name, member_name, value)
+            return
+        if reference not in {"dict.update", "builtins.dict.update", "__builtins__.dict.update"} or not call.args:
+            return
+        if (module_name := typed_mapping_owner(call.args[0])) is not None:
+            for argument in call.args[1:]:
+                record_static_update(module_name, argument)
+            for member_name, value in keyword_values.items():
+                if _typed_member_high_risk_call(module_name, member_name) is not None:
+                    record_member_state(module_name, member_name, value)
+
+    for line, statements in _compact_prefix_module_lines(candidate):
+        if not statements:
+            for alias_name in list(typed_aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    typed_aliases.pop(alias_name, None)
+            for alias_name in list(callable_aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    callable_aliases.pop(alias_name, None)
             continue
-        target_name = assignment.group(1).decode("utf-8")
-        value = assignment.group(2).strip()
-        value_reference = value.decode("utf-8", errors="ignore")
-        copied_callable = callable_aliases.get(value_reference)
-        callable_aliases.pop(target_name, None)
-        typed_aliases.pop(target_name, None)
-        if copied_callable is not None:
-            callable_aliases[target_name] = copied_callable
-        if value_reference in typed_aliases:
-            typed_aliases[target_name] = typed_aliases[value_reference]
-        member_value = member_value_pattern.fullmatch(value)
-        if member_value is None:
-            continue
-        owner_alias = member_value.group(1).decode("utf-8")
-        member_name = member_value.group(2).decode("utf-8")
-        module_name = typed_aliases.get(owner_alias)
-        if (
-            module_name is not None
-            and (module_name, member_name) not in safe_members
-            and (module_name, member_name) not in unknown_members
-            and _typed_member_high_risk_call(module_name, member_name) is not None
-        ):
-            callable_aliases[target_name] = frozenset({(module_name, member_name, False)})
+        for statement in statements:
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    bind_name(local_name, None)
+                    if alias.name in {"ctypes", "webbrowser"}:
+                        typed_aliases[local_name] = alias.name
+            elif isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    target_name = alias.asname or alias.name
+                    bind_name(target_name, None)
+                    if (
+                        statement.module in {"ctypes", "webbrowser"}
+                        and _typed_member_high_risk_call(statement.module, alias.name) is not None
+                    ):
+                        member = (statement.module, alias.name)
+                        if member not in safe_members and member not in unknown_members:
+                            callable_aliases[target_name] = member_callable_values.get(
+                                member, frozenset({(*member, False)})
+                            )
+            elif isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    bind_target(target, statement.value)
+            elif isinstance(statement, ast.AnnAssign):
+                bind_target(statement.target, statement.value)
+            elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+                bind_target(statement.target, None)
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    if item.optional_vars is not None:
+                        bind_target(item.optional_vars, None)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bind_name(statement.name, None)
+            elif isinstance(statement, ast.Delete):
+                for target in statement.targets:
+                    bind_target(target, None)
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                record_helper_call(statement.value)
+            _update_compact_builtins_aliases(statement, builtins_aliases)
     return callable_aliases
 
 
@@ -11046,13 +11223,20 @@ def _update_compact_builtins_aliases(statement: ast.stmt, builtins_aliases: set[
             bind_target(target, statement.value)
     elif isinstance(statement, ast.AnnAssign):
         bind_target(statement.target, statement.value)
-    elif isinstance(statement, ast.AugAssign):
+    elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
         bind_target(statement.target)
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        for item in statement.items:
+            if item.optional_vars is not None:
+                bind_target(item.optional_vars)
     elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         builtins_aliases.discard(statement.name)
     elif isinstance(statement, ast.Delete):
         for target in statement.targets:
             bind_target(target)
+    for node in ast.walk(statement):
+        if isinstance(node, ast.NamedExpr):
+            bind_target(node.target)
 
 
 def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
@@ -21974,6 +22158,7 @@ class JITScriptDetector:
             prioritized_matches = prioritized_snippets
             omitted_budgeted_spans = []
         has_bounded_source = _has_source_like_embedded_python_start(bounded)
+        source_start_budget_exceeded = _embedded_python_source_start_budget_exceeded(bounded)
         has_source_beyond_bound = (
             not include_full_source
             and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
@@ -22300,7 +22485,18 @@ class JITScriptDetector:
         uncovered_omitted_spans = [
             span for span in omitted_budgeted_spans if not _is_span_inside_parsed_spans(span, parsed_snippet_spans)
         ]
-        if uncovered_omitted_spans:
+        if source_start_budget_exceeded and bounded_high_risk_calls is None:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: source-start probe budget was exceeded"),
+                    omitted_snippets=1,
+                    candidates_count=len(matches) + 1,
+                )
+            )
+        elif uncovered_omitted_spans:
             findings.append(
                 _embedded_python_analysis_incomplete_finding(
                     framework=framework,
