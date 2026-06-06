@@ -39,8 +39,10 @@ from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import IssueSeverity
 from .scanner_selection import (
     SCANNER_SELECTION_CONFIG_KEY,
+    ScannerSelectionPolicy,
     collect_suppressed_preferred_scanners,
     policy_from_config,
+    resolve_scanner_selection_policy,
     scanner_catalog,
     scanner_selection_config_from_inputs,
     selected_scanner_extensions,
@@ -358,26 +360,48 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
-def _local_path_will_be_scanned(path: str, *, skip_non_model_files: bool) -> bool:
+def _local_path_will_be_scanned(
+    path: str,
+    *,
+    skip_non_model_files: bool,
+    scanner_policy: ScannerSelectionPolicy | None = None,
+) -> bool:
     """Return whether the local CLI prefilter will scan an explicit file path."""
-    if not skip_non_model_files or not os.path.isfile(path):
+    if not os.path.isfile(path):
         return True
+    if not skip_non_model_files:
+        return _selected_scanner_can_analyze(path, scanner_policy)
 
     extension = Path(path).suffix.lower()
     if extension in {".py", ".js", ".html", ".css"}:
-        return not should_skip_file(path)
-    if extension != ".txt":
+        relevant = not should_skip_file(path)
+    elif extension != ".txt":
+        relevant = True
+    else:
+        from modelaudit.scanners import SCANNER_REGISTRY
+
+        relevant = any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
+    if not relevant:
+        return False
+    return _selected_scanner_can_analyze(path, scanner_policy)
+
+
+def _selected_scanner_can_analyze(path: str, scanner_policy: ScannerSelectionPolicy | None) -> bool:
+    """Return whether the active scanner policy retains an owner for a path."""
+    if scanner_policy is None or not scanner_policy.active:
         return True
 
-    from modelaudit.scanners import SCANNER_REGISTRY
+    from modelaudit.scanners import get_scanner_for_file
 
-    return any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
+    selection_config = {SCANNER_SELECTION_CONFIG_KEY: scanner_policy.to_config()}
+    return get_scanner_for_file(path, selection_config) is not None
 
 
 def _collect_dvc_directory_coverage(
     directories: set[str],
     *,
     skip_non_model_files: bool,
+    scanner_policy: ScannerSelectionPolicy,
 ) -> tuple[set[str], set[str]]:
     """Collect paths a prospective directory scan will actually visit."""
     covered_files: set[str] = set()
@@ -403,6 +427,8 @@ def _collect_dvc_directory_coverage(
                     continue
                 if skip_non_model_files and should_skip_file(str(file_path)):
                     continue
+                if not _selected_scanner_can_analyze(str(file_path), scanner_policy):
+                    continue
                 covered_files.add(str(resolved_file))
         if walk_errors:
             covered_directories.discard(str(base_directory))
@@ -415,6 +441,7 @@ def _dvc_directory_target_is_covered(
     covered_files: frozenset[str],
     covered_directories: frozenset[str],
     skip_non_model_files: bool,
+    scanner_policy: ScannerSelectionPolicy,
 ) -> bool:
     """Return whether every traversable member of a DVC directory will be scanned."""
     if str(target) not in covered_directories:
@@ -439,6 +466,8 @@ def _dvc_directory_target_is_covered(
             file_path = Path(root) / filename
             if skip_non_model_files and should_skip_file(str(file_path)):
                 continue
+            if not _selected_scanner_can_analyze(str(file_path), scanner_policy):
+                return False
             try:
                 resolved_file = file_path.resolve()
             except OSError:
@@ -454,6 +483,7 @@ def _dvc_target_is_covered(
     covered_files: frozenset[str],
     covered_directories: frozenset[str],
     skip_non_model_files: bool,
+    scanner_policy: ScannerSelectionPolicy,
 ) -> bool:
     """Return whether a resolved DVC target is in the prospective CLI scan set."""
     target_str = str(target)
@@ -465,14 +495,23 @@ def _dvc_target_is_covered(
             covered_files=covered_files,
             covered_directories=covered_directories,
             skip_non_model_files=skip_non_model_files,
+            scanner_policy=scanner_policy,
         )
     return False
 
 
-def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, strict: bool = False) -> list[str]:
+def _resolve_scan_paths(
+    paths: tuple[str, ...],
+    scan_start_time: float,
+    *,
+    strict: bool = False,
+    scanner_policy: ScannerSelectionPolicy | None = None,
+) -> list[str]:
     """Expand user paths, resolve DVC pointers, warn on unmatched globs, and fail fast if empty."""
     expanded_paths, missing_globs = expand_paths(paths)
     skip_non_model_files = not strict
+    if scanner_policy is None:
+        scanner_policy = resolve_scanner_selection_policy()
     dvc_resolutions = {
         path: resolve_dvc_file_with_metadata(path)
         for path in expanded_paths
@@ -484,7 +523,11 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, stric
         for path in expanded_paths
         if not path.endswith(".dvc")
         and os.path.isfile(path)
-        and _local_path_will_be_scanned(path, skip_non_model_files=skip_non_model_files)
+        and _local_path_will_be_scanned(
+            path,
+            skip_non_model_files=skip_non_model_files,
+            scanner_policy=scanner_policy,
+        )
     }
     independently_covered_directories = {
         str(Path(path).resolve()) for path in expanded_paths if not path.endswith(".dvc") and os.path.isdir(path)
@@ -493,7 +536,12 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, stric
     prospective_covered_files = independently_covered_files | {
         str(Path(target).resolve())
         for target in all_dvc_targets
-        if os.path.isfile(target) and _local_path_will_be_scanned(target, skip_non_model_files=skip_non_model_files)
+        if os.path.isfile(target)
+        and _local_path_will_be_scanned(
+            target,
+            skip_non_model_files=skip_non_model_files,
+            scanner_policy=scanner_policy,
+        )
     }
     prospective_covered_directories = independently_covered_directories | {
         str(Path(target).resolve()) for target in all_dvc_targets if os.path.isdir(target)
@@ -502,6 +550,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, stric
         directory_covered_files, directory_covered_directories = _collect_dvc_directory_coverage(
             prospective_covered_directories,
             skip_non_model_files=skip_non_model_files,
+            scanner_policy=scanner_policy,
         )
         prospective_covered_files.update(directory_covered_files)
         prospective_covered_directories = directory_covered_directories
@@ -518,6 +567,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float, *, stric
                     covered_files=frozenset(prospective_covered_files),
                     covered_directories=frozenset(prospective_covered_directories),
                     skip_non_model_files=skip_non_model_files,
+                    scanner_policy=scanner_policy,
                 ),
                 coverage_budget=len(prospective_covered_files) + len(prospective_covered_directories),
             )
@@ -2517,7 +2567,23 @@ def scan_command(
     record_command_used("scan", duration=None, **telemetry_options)
     record_scan_started(list(paths), telemetry_options)
 
-    expanded_paths = _resolve_scan_paths(paths, scan_start_time, strict=strict)
+    try:
+        scanner_policy = resolve_scanner_selection_policy(
+            scanners=scanners,
+            exclude_scanners=exclude_scanners,
+        )
+    except ValueError as exc:
+        click.echo(f"Error parsing scanner selection: {exc}", err=True)
+        record_scan_failed(time.time() - scan_start_time, f"Invalid scanner selection: {exc}")
+        flush_telemetry()
+        sys.exit(2)
+
+    expanded_paths = _resolve_scan_paths(
+        paths,
+        scan_start_time,
+        strict=strict,
+        scanner_policy=scanner_policy,
+    )
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,

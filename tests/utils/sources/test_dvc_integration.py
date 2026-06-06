@@ -631,6 +631,141 @@ class TestDvcSecurity:
 
         assert resolved_paths == [str(dvc_file), str(skipped_target)]
 
+    def test_cli_keeps_over_limit_pointer_when_scanner_selection_filters_sibling_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Prospective DVC coverage must use the real scanner-selection prefilter."""
+        from modelaudit.cli import _resolve_scan_paths
+        from modelaudit.scanner_selection import resolve_scanner_selection_policy
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        sibling_directory = tmp_path / "documentation"
+        sibling_directory.mkdir()
+        omitted_target = sibling_directory / "notes.md"
+        omitted_target.write_text("not selected\n")
+        dvc_file = tmp_path / "cli_selection_filtered_directory.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: documentation/notes.md\n")
+
+        scanner_policy = resolve_scanner_selection_policy(scanners=("pickle",))
+        resolved_paths = _resolve_scan_paths(
+            (str(dvc_file), str(sibling_directory)),
+            0.0,
+            scanner_policy=scanner_policy,
+        )
+
+        assert resolved_paths == [str(dvc_file), str(sibling_directory)]
+
+    @pytest.mark.parametrize(
+        ("member_name", "is_selected"),
+        [("payload.pkl", True), ("metadata.yaml", False)],
+    )
+    def test_cli_scanner_selection_verifies_omitted_directory_contents(
+        self,
+        tmp_path: Path,
+        member_name: str,
+        is_selected: bool,
+    ) -> None:
+        from modelaudit.cli import _resolve_scan_paths
+        from modelaudit.scanner_selection import resolve_scanner_selection_policy
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        member = models_dir / member_name
+        if member.suffix == ".pkl":
+            with member.open("wb") as f:
+                pickle.dump({"covered": True}, f)
+        else:
+            member.write_text("framework: pytorch\n")
+        dvc_file = tmp_path / "cli_selection_directory_output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models\n")
+
+        scanner_policy = resolve_scanner_selection_policy(scanners=("pickle",))
+        resolved_paths = _resolve_scan_paths(
+            (str(dvc_file), str(models_dir)),
+            0.0,
+            scanner_policy=scanner_policy,
+        )
+
+        assert (str(dvc_file) not in resolved_paths) is is_selected
+        assert str(models_dir) in resolved_paths
+
+    @pytest.mark.parametrize(
+        ("omitted_name", "is_selected"),
+        [("selected.pkl", True), ("filtered.yaml", False)],
+    )
+    def test_cli_scanner_selection_only_discharges_selected_sibling_files(
+        self,
+        tmp_path: Path,
+        omitted_name: str,
+        is_selected: bool,
+    ) -> None:
+        from modelaudit.cli import _resolve_scan_paths
+        from modelaudit.scanner_selection import resolve_scanner_selection_policy
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        omitted_target = tmp_path / omitted_name
+        if omitted_target.suffix == ".pkl":
+            with omitted_target.open("wb") as f:
+                pickle.dump({"covered": True}, f)
+        else:
+            omitted_target.write_text("framework: pytorch\n")
+        dvc_file = tmp_path / "cli_selection_filtered_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + f"- path: {omitted_name}\n")
+
+        scanner_policy = resolve_scanner_selection_policy(scanners=("pickle",))
+        resolved_paths = _resolve_scan_paths(
+            (str(dvc_file), str(omitted_target)),
+            0.0,
+            scanner_policy=scanner_policy,
+        )
+
+        assert (str(dvc_file) not in resolved_paths) is is_selected
+        assert str(omitted_target) in resolved_paths
+
+    @pytest.mark.parametrize(
+        ("omitted_name", "is_selected"),
+        [("selected.pkl", True), ("filtered.py", False)],
+    )
+    def test_cli_strict_scanner_selection_only_discharges_selected_siblings(
+        self,
+        tmp_path: Path,
+        omitted_name: str,
+        is_selected: bool,
+    ) -> None:
+        from modelaudit.cli import _resolve_scan_paths
+        from modelaudit.scanner_selection import resolve_scanner_selection_policy
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        omitted_target = tmp_path / omitted_name
+        if omitted_target.suffix == ".pkl":
+            with omitted_target.open("wb") as f:
+                pickle.dump({"covered": True}, f)
+        else:
+            omitted_target.write_text("value = 1\n")
+        dvc_file = tmp_path / "cli_strict_selection_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + f"- path: {omitted_name}\n")
+
+        scanner_policy = resolve_scanner_selection_policy(scanners=("pickle",))
+        resolved_paths = _resolve_scan_paths(
+            (str(dvc_file), str(omitted_target)),
+            0.0,
+            strict=True,
+            scanner_policy=scanner_policy,
+        )
+
+        assert (str(dvc_file) not in resolved_paths) is is_selected
+        assert str(omitted_target) in resolved_paths
+
     def test_cli_strict_discharges_over_limit_pointer_for_non_model_sibling(self, tmp_path: Path) -> None:
         """Strict mode scans an explicitly supplied source file in the omitted tail."""
         from modelaudit.cli import _resolve_scan_paths
@@ -1033,6 +1168,80 @@ class TestDvcCliIntegration:
 
         assert result.exit_code == 1, result.output
         output_data = json.loads(result.output)
+        assert any(issue.get("rule_code") == "S201" for issue in output_data["issues"])
+        assert not any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
+
+    def test_cli_keeps_capped_pointer_when_selected_scanners_filter_directory_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Prospective DVC coverage must honor the active scanner selection."""
+        import json
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        omitted_metadata = models_dir / "metadata.yaml"
+        omitted_metadata.write_text("framework: pytorch\n")
+        dvc_file = tmp_path / "cli_filtered_directory_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/metadata.yaml\n")
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--scanners",
+                "pickle",
+                "--format",
+                "json",
+                str(dvc_file),
+                str(models_dir),
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
+
+    def test_cli_discharges_capped_pointer_for_selected_directory_output(self, tmp_path: Path) -> None:
+        """An allowed malicious descendant remains covered without a false cap error."""
+        import json
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        omitted_pickle = models_dir / "payload.pkl"
+        omitted_pickle.write_bytes(b"cos\nsystem\n(S'echo selected'\ntR.")
+        dvc_file = tmp_path / "cli_selected_directory_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/payload.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--scanners",
+                "pickle",
+                "--format",
+                "json",
+                str(dvc_file),
+                str(models_dir),
+            ],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
         assert any(issue.get("rule_code") == "S201" for issue in output_data["issues"])
         assert not any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
 
