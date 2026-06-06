@@ -1,15 +1,19 @@
 """Command-line interface for ModelAudit security scanner."""
 
 import contextlib
+import errno
 import json
 import logging
 import os
+import platform
 import re
+import secrets
 import shutil
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
 
 import click
@@ -119,6 +123,1147 @@ def _display_error(error: object, path: str) -> str:
     if is_stream_url(path):
         return redact_stream_error_for_display(error, path[9:])
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
+
+
+class _OutputWriteError(click.ClickException):
+    """Report output failures using the scan command's documented error code."""
+
+    exit_code = 2
+
+
+def _absolute_output_path(output_path: str) -> Path:
+    """Build an absolute path without collapsing symlink-sensitive ``..`` parts."""
+    if os.name == "nt":
+        windows_path = PureWindowsPath(output_path)
+        path_parts = windows_path.parts[1:] if windows_path.anchor else windows_path.parts
+        if any(":" in part for part in path_parts):
+            raise _OutputWriteError(f"Refusing alternate data stream output path: {_display_path(output_path)}")
+    separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
+    if output_path.endswith(separators):
+        raise _OutputWriteError(f"Refusing output path with trailing separator: {_display_path(output_path)}")
+    if output_path == "." or any(output_path.endswith(f"{separator}.") for separator in separators):
+        raise _OutputWriteError(f"Refusing output path with final dot component: {_display_path(output_path)}")
+    path = Path(output_path)
+    if path.is_absolute():
+        return path
+    if path.drive:
+        raise _OutputWriteError(f"Refusing drive-relative output path: {_display_path(output_path)}")
+    return Path.cwd() / path
+
+
+def _is_link_like_path(path: Path) -> bool:
+    """Return whether an existing path is a symlink or Windows reparse point."""
+    try:
+        path_stat = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    if not reparse_attribute or not file_attributes & reparse_attribute:
+        return False
+
+    reparse_tag = getattr(path_stat, "st_reparse_tag", 0)
+    name_surrogate_flag = 0x20000000
+    return not reparse_tag or bool(reparse_tag & name_surrogate_flag)
+
+
+def _darwin_fd_has_extended_acl(fd: int) -> bool:
+    """Return whether a macOS descriptor has an extended ACL."""
+    if platform.system() != "Darwin":
+        return False
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    acl_extended_fd = libc.acl_extended_fd_np
+    acl_extended_fd.argtypes = (ctypes.c_int,)
+    acl_extended_fd.restype = ctypes.c_int
+    result = acl_extended_fd(fd)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return bool(result)
+
+
+def _directory_can_replace_entries(path: Path) -> bool:
+    """Return whether an untrusted user could replace names in a directory."""
+    try:
+        path_stat = path.stat()
+    except OSError:
+        return True
+
+    if os.name != "posix":
+        return True
+    if platform.system() == "Darwin":
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            directory_fd = os.open(path, directory_flags)
+            try:
+                if _darwin_fd_has_extended_acl(directory_fd):
+                    return True
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            return True
+    elif hasattr(os, "listxattr"):
+        try:
+            if "system.posix_acl_access" in os.listxattr(path):
+                return True
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return True
+
+    writable_by_others = bool(path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    if path_stat.st_uid != 0 or writable_by_others:
+        return True
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None or get_effective_uid() == 0:
+        return False
+
+    access_kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    return os.access(path, os.W_OK, **access_kwargs)
+
+
+def _posix_fd_has_extended_acl(output_path: str, fd: int) -> bool:
+    """Return whether a macOS file has an ACL that this writer cannot preserve."""
+    try:
+        return _darwin_fd_has_extended_acl(fd)
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to inspect output ACL for {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _open_windows_output_parent_guard(output_path: str, absolute_path: Path) -> int:
+    """Pin a Windows output parent so path-based replacement cannot be redirected."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    file_traverse = 0x0020
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(absolute_path.parent),
+        file_traverse | file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to secure output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        get_file_information = kernel32.GetFileInformationByHandleEx
+        get_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        get_file_information.restype = wintypes.BOOL
+        file_attribute_tag_info_class = 9
+        tag_info = FileAttributeTagInfo()
+        if not get_file_information(
+            handle,
+            file_attribute_tag_info_class,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            error = ctypes_windows.get_last_error()
+            raise _OutputWriteError(
+                f"Unable to validate output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+            )
+
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        name_surrogate_flag = 0x20000000
+        if tag_info.file_attributes & reparse_attribute and (
+            not tag_info.reparse_tag or tag_info.reparse_tag & name_surrogate_flag
+        ):
+            raise _OutputWriteError(
+                f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+            )
+
+        if _validated_absolute_output_path(output_path) != absolute_path:
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {_display_path(output_path)}")
+        return handle_value
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _close_windows_handle(handle: int) -> None:
+    """Close a native Windows handle acquired for output-path protection."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _windows_handle_identity(output_path: str, handle: int) -> tuple[int, int, int]:
+    """Return a stable volume and file identifier for a Windows handle."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    get_file_information = kernel32.GetFileInformationByHandle
+    get_file_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_file_information.restype = wintypes.BOOL
+    information = ByHandleFileInformation()
+    if not get_file_information(handle, ctypes.byref(information)):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to identify output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+    return information.volume_serial_number, information.file_index_high, information.file_index_low
+
+
+def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, parent_handle: int) -> int:
+    """Open a delete-on-close child that locks the validated Windows parent hierarchy."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    delete_access = 0x00010000
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    create_new = 1
+    file_attribute_temporary = 0x00000100
+    file_flag_delete_on_close = 0x04000000
+    lock_path = absolute_path.parent / f".modelaudit-output-{secrets.token_hex(12)}.lock"
+    lock_handle = create_file(
+        str(lock_path),
+        delete_access | file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        create_new,
+        file_attribute_temporary | file_flag_delete_on_close,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if lock_handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to lock output parent for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    lock_handle_value = lock_handle if isinstance(lock_handle, int) else int(lock_handle.value)
+    verification_handle: int | None = None
+    try:
+        verification_handle = _open_windows_output_parent_guard(output_path, absolute_path)
+        if _windows_handle_identity(output_path, parent_handle) != _windows_handle_identity(
+            output_path,
+            verification_handle,
+        ):
+            raise _OutputWriteError(
+                f"Refusing to write output because its parent changed: {_display_path(output_path)}"
+            )
+        return lock_handle_value
+    except Exception:
+        _close_windows_handle(lock_handle_value)
+        raise
+    finally:
+        if verification_handle is not None:
+            _close_windows_handle(verification_handle)
+
+
+def _windows_output_is_encrypted(fd: int) -> bool:
+    """Return whether a pinned Windows output handle uses EFS encryption."""
+    file_attribute_encrypted = getattr(stat, "FILE_ATTRIBUTE_ENCRYPTED", 0x00004000)
+    return bool(getattr(os.fstat(fd), "st_file_attributes", 0) & file_attribute_encrypted)
+
+
+def _reject_windows_encrypted_output(output_path: str, fd: int) -> None:
+    """Fail closed when atomic replacement cannot preserve EFS recipients."""
+    if _windows_output_is_encrypted(fd):
+        raise _OutputWriteError(
+            f"Refusing to replace encrypted output because its EFS protection cannot be preserved: "
+            f"{_display_path(output_path)}"
+        )
+
+
+def _open_windows_output_temp_file(
+    output_path: str,
+    absolute_path: Path,
+    temp_name: str,
+    *,
+    preserve_security: bool,
+) -> tuple[int, Path]:
+    """Create a writable Windows temp file whose handle can be renamed securely."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    generic_write = 0x40000000
+    delete_access = 0x00010000
+    file_read_attributes = 0x0080
+    write_dac = 0x00040000
+    write_owner = 0x00080000
+    create_new = 1
+    file_attribute_normal = 0x00000080
+    temp_path = absolute_path.parent / temp_name
+    desired_access = generic_write | delete_access | file_read_attributes
+    if preserve_security:
+        desired_access |= write_dac | write_owner
+    temp_handle = create_file(
+        str(temp_path),
+        desired_access,
+        0,
+        None,
+        create_new,
+        file_attribute_normal,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if temp_handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to create output temporary file for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    temp_handle_value = temp_handle if isinstance(temp_handle, int) else int(temp_handle.value)
+    try:
+        msvcrt_windows: Any = msvcrt
+        temp_fd = msvcrt_windows.open_osfhandle(temp_handle_value, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except Exception:
+        _close_windows_handle(temp_handle_value)
+        raise
+    return temp_fd, temp_path
+
+
+def _open_windows_existing_output_file(output_path: str, absolute_path: Path) -> int:
+    """Open a Windows output with DACL-enforced write and replacement access."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    file_write_data = 0x0002
+    file_read_attributes = 0x0080
+    read_control = 0x00020000
+    delete_access = 0x00010000
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(absolute_path),
+        file_write_data | file_read_attributes | read_control | delete_access,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle_value):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to write output {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+    handle_value = handle if isinstance(handle, int) else int(handle.value)
+    try:
+        msvcrt_windows: Any = msvcrt
+        return int(msvcrt_windows.open_osfhandle(handle_value, os.O_WRONLY | getattr(os, "O_BINARY", 0)))
+    except Exception:
+        _close_windows_handle(handle_value)
+        raise
+
+
+def _copy_windows_output_security(output_path: str, source_fd: int, target_fd: int) -> None:
+    """Copy ownership and the DACL from a validated Windows output handle."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    ctypes_windows: Any = ctypes
+    advapi32 = ctypes_windows.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    get_security_info = advapi32.GetSecurityInfo
+    get_security_info.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    )
+    get_security_info.restype = wintypes.DWORD
+    set_security_info = advapi32.SetSecurityInfo
+    set_security_info.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    )
+    set_security_info.restype = wintypes.DWORD
+    get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+    get_security_descriptor_control.argtypes = (
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    get_security_descriptor_control.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = (wintypes.HLOCAL,)
+    local_free.restype = wintypes.HLOCAL
+
+    msvcrt_windows: Any = msvcrt
+    source_handle = msvcrt_windows.get_osfhandle(source_fd)
+    target_handle = msvcrt_windows.get_osfhandle(target_fd)
+    owner = wintypes.LPVOID()
+    group = wintypes.LPVOID()
+    dacl = wintypes.LPVOID()
+    security_descriptor = wintypes.LPVOID()
+    se_file_object = 1
+    owner_security_information = 0x00000001
+    group_security_information = 0x00000002
+    dacl_security_information = 0x00000004
+    security_information = owner_security_information | group_security_information | dacl_security_information
+    result = get_security_info(
+        source_handle,
+        se_file_object,
+        security_information,
+        ctypes.byref(owner),
+        ctypes.byref(group),
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(security_descriptor),
+    )
+    if result:
+        raise _OutputWriteError(
+            f"Unable to preserve output security for {_display_path(output_path)}: {ctypes_windows.WinError(result)}"
+        )
+
+    try:
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not get_security_descriptor_control(
+            security_descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            error = ctypes_windows.get_last_error()
+            raise _OutputWriteError(
+                f"Unable to preserve output security for {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+            )
+        se_dacl_protected = 0x1000
+        security_information |= 0x80000000 if control.value & se_dacl_protected else 0x20000000
+        result = set_security_info(
+            target_handle,
+            se_file_object,
+            security_information,
+            owner,
+            group,
+            dacl,
+            None,
+        )
+        if result:
+            raise _OutputWriteError(
+                f"Unable to preserve output security for {_display_path(output_path)}: "
+                f"{ctypes_windows.WinError(result)}"
+            )
+    finally:
+        if security_descriptor:
+            local_free(security_descriptor)
+
+
+def _replace_windows_output_file(
+    output_path: str,
+    temp_fd: int,
+    destination_path: Path,
+    *,
+    replace_existing: bool,
+) -> None:
+    """Atomically rename an open Windows temp file within its pinned parent."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    encoded_name = str(destination_path).encode("utf-16-le")
+    file_name_offset = FileRenameInfo.file_name.offset
+    buffer_size = ctypes.sizeof(FileRenameInfo) + len(encoded_name)
+    rename_buffer = ctypes.create_string_buffer(buffer_size)
+    rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(FileRenameInfo)).contents
+    file_rename_replace_if_exists = 0x00000001
+    file_rename_posix_semantics = 0x00000002
+    rename_info.flags = file_rename_replace_if_exists | file_rename_posix_semantics if replace_existing else 0
+    rename_info.root_directory = None
+    rename_info.file_name_length = len(encoded_name)
+    ctypes.memmove(ctypes.addressof(rename_buffer) + file_name_offset, encoded_name, len(encoded_name))
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    set_file_information = kernel32.SetFileInformationByHandle
+    set_file_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_file_information.restype = wintypes.BOOL
+    file_rename_info_ex_class = 22
+    msvcrt_windows: Any = msvcrt
+    temp_handle = msvcrt_windows.get_osfhandle(temp_fd)
+    if not set_file_information(temp_handle, file_rename_info_ex_class, rename_buffer, buffer_size):
+        error = ctypes_windows.get_last_error()
+        raise _OutputWriteError(
+            f"Unable to write output {_display_path(output_path)}: {ctypes_windows.WinError(error)}"
+        )
+
+
+def _validated_absolute_output_path(output_path: str) -> Path:
+    """Resolve protected parent links and reject attacker-replaceable ones."""
+    absolute_path = _absolute_output_path(output_path)
+    current_path = Path(absolute_path.anchor)
+    path_parts = absolute_path.parts[1:]
+    for index, part in enumerate(path_parts):
+        if part == ".." and os.name == "nt":
+            if _is_link_like_path(current_path):
+                raise _OutputWriteError(
+                    f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+                )
+            try:
+                component_stat = current_path.lstat()
+            except OSError as exc:
+                raise _OutputWriteError(
+                    f"Refusing output path through invalid parent component: {_display_path(output_path)}"
+                ) from exc
+            if not stat.S_ISDIR(component_stat.st_mode):
+                raise _OutputWriteError(
+                    f"Refusing output path through non-directory component: {_display_path(output_path)}"
+                )
+
+        candidate_path = current_path / part
+        if not _is_link_like_path(candidate_path):
+            current_path = candidate_path
+            continue
+
+        if index == len(path_parts) - 1 or _directory_can_replace_entries(current_path):
+            raise _OutputWriteError(
+                f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+            )
+        current_path = candidate_path.resolve(strict=True)
+
+    return current_path
+
+
+def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None, int | None]:
+    """Open the validated output parent without following replaceable links."""
+    absolute_path = _validated_absolute_output_path(output_path)
+    if os.name == "nt":
+        return absolute_path, None, _open_windows_output_parent_guard(output_path, absolute_path)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    directory_access = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)
+    dir_fd_functions = (os.open, os.stat, os.link, os.rename, os.unlink, os.mkdir, os.rmdir)
+    if (
+        os.name != "posix"
+        or not nofollow
+        or not directory
+        or any(function not in os.supports_dir_fd for function in dir_fd_functions)
+    ):
+        raise _OutputWriteError(f"Secure output writes are unsupported on this platform: {_display_path(output_path)}")
+
+    directory_flags = directory_access | directory | nofollow
+    directory_fds: list[int] = []
+    try:
+        root_fd = os.open(absolute_path.anchor, directory_flags)
+        try:
+            directory_fds.append(root_fd)
+        except BaseException:
+            os.close(root_fd)
+            raise
+        for part in absolute_path.parts[1:-1]:
+            if part == "..":
+                if len(directory_fds) > 1:
+                    os.close(directory_fds.pop())
+                continue
+            if part in {"", "."}:
+                continue
+            child_fd = os.open(part, directory_flags, dir_fd=directory_fds[-1])
+            try:
+                directory_fds.append(child_fd)
+            except BaseException:
+                os.close(child_fd)
+                raise
+        output_parent_fd = directory_fds.pop()
+        for directory_fd in directory_fds:
+            os.close(directory_fd)
+        return absolute_path, output_parent_fd, None
+    except Exception:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+        raise
+
+
+def _validate_existing_output_path(
+    output_path: str,
+    absolute_path: Path,
+    *,
+    parent_fd: int | None,
+) -> os.stat_result | None:
+    """Reject unsafe existing outputs before opening devices or special files."""
+    try:
+        if parent_fd is None:
+            path_stat = absolute_path.lstat()
+        else:
+            path_stat = os.stat(absolute_path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+    output_display = _display_path(output_path)
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise _OutputWriteError(f"Refusing to write output to non-regular file: {output_display}")
+    access_kwargs: dict[str, Any] = {}
+    if os.access in os.supports_effective_ids:
+        access_kwargs["effective_ids"] = True
+    access_path: str | Path = absolute_path
+    if parent_fd is not None and os.access in os.supports_dir_fd:
+        access_path = absolute_path.name
+        access_kwargs["dir_fd"] = parent_fd
+        if os.access in os.supports_follow_symlinks:
+            access_kwargs["follow_symlinks"] = False
+    if not os.access(access_path, os.W_OK, **access_kwargs):
+        raise _OutputWriteError(f"Unable to write output {output_display}: Permission denied")
+    return path_stat
+
+
+def _validate_fallback_temporary_file(
+    output_path: str,
+    absolute_path: Path,
+    temp_path: Path,
+    temp_fd: int,
+) -> None:
+    """Ensure fallback path resolution did not redirect temporary-file creation."""
+    output_display = _display_path(output_path)
+    if _validated_absolute_output_path(output_path) != absolute_path:
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+
+    opened_stat = os.fstat(temp_fd)
+    if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+    if os.name == "nt":
+        return
+
+    try:
+        path_stat = temp_path.lstat()
+    except OSError as exc:
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}") from exc
+
+    if not os.path.samestat(opened_stat, path_stat):
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+
+
+def _open_existing_output_file(
+    output_path: str,
+    absolute_path: Path,
+    initial_stat: os.stat_result,
+    *,
+    parent_fd: int | None,
+) -> int:
+    """Open an existing validated output without truncating or following a replacement link."""
+    if os.name == "nt":
+        output_fd = _open_windows_existing_output_file(output_path, absolute_path)
+    else:
+        flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        if parent_fd is None:
+            output_fd = os.open(absolute_path, flags)
+        else:
+            output_fd = os.open(absolute_path.name, flags, dir_fd=parent_fd)
+
+    try:
+        opened_stat = os.fstat(output_fd)
+        if not stat.S_ISREG(opened_stat.st_mode) or not os.path.samestat(initial_stat, opened_stat):
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {_display_path(output_path)}")
+        return output_fd
+    except Exception:
+        os.close(output_fd)
+        raise
+
+
+def _open_posix_output_staging_directory(output_path: str, parent_fd: int, staging_name: str) -> int:
+    """Create and pin a private staging directory inside the validated output parent."""
+    directory_flags = (
+        (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0))
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+    staging_fd: int | None = None
+    try:
+        staging_fd = os.open(staging_name, directory_flags, dir_fd=parent_fd)
+        opened_stat = os.fstat(staging_fd)
+        named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        effective_uid = getattr(os, "geteuid", lambda: opened_stat.st_uid)()
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or opened_stat.st_uid != effective_uid
+            or stat.S_IMODE(opened_stat.st_mode) & 0o077
+            or not os.path.samestat(opened_stat, named_stat)
+        ):
+            raise _OutputWriteError(
+                f"Refusing to write output because its staging path changed: {_display_path(output_path)}"
+            )
+        return staging_fd
+    except Exception:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        with contextlib.suppress(OSError):
+            os.rmdir(staging_name, dir_fd=parent_fd)
+        raise
+
+
+def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int) -> None:
+    """Copy ownership, mode, ACL, and user xattrs to a staged replacement."""
+    source_stat = os.fstat(source_fd)
+    target_stat = os.fstat(target_fd)
+    try:
+        if _posix_fd_has_extended_acl(output_path, source_fd):
+            raise _OutputWriteError(f"Unable to preserve extended output ACL for {_display_path(output_path)}")
+        if (source_stat.st_uid, source_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
+            os.fchown(target_fd, source_stat.st_uid, source_stat.st_gid)
+        os.fchmod(target_fd, stat.S_IMODE(source_stat.st_mode))
+        if all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
+            try:
+                attribute_names = os.listxattr(source_fd)
+            except OSError as exc:
+                if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                    raise
+                attribute_names = []
+            for name in attribute_names:
+                os.setxattr(target_fd, name, os.getxattr(source_fd, name))
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to preserve output metadata for {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _open_posix_output_parent_sync_fd(output_path: str, parent_fd: int) -> int:
+    """Open the pinned parent for fsync before publishing a report entry."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(".", directory_flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to secure output persistence for {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _validate_posix_output_replacement_permission(
+    output_path: str,
+    parent_fd: int,
+    output_stat: os.stat_result,
+) -> None:
+    """Reject replacements forbidden by sticky-directory ownership rules."""
+    parent_stat = os.fstat(parent_fd)
+    if not parent_stat.st_mode & stat.S_ISVTX:
+        return
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None:
+        raise _OutputWriteError(
+            f"Unable to verify sticky-directory replacement permission for {_display_path(output_path)}"
+        )
+    effective_uid = get_effective_uid()
+    if effective_uid == 0 or effective_uid in {parent_stat.st_uid, output_stat.st_uid}:
+        return
+    raise _OutputWriteError(
+        f"Unable to replace output in sticky directory {_display_path(output_path)}: Permission denied"
+    )
+
+
+def _probe_posix_hard_link_support(output_path: str, staging_fd: int, parent_fd: int, temp_name: str) -> None:
+    """Verify the no-overwrite install primitive before a model scan begins."""
+    probe_name = f".modelaudit-output-{secrets.token_hex(12)}.probe"
+    linked = False
+    try:
+        os.link(temp_name, probe_name, src_dir_fd=staging_fd, dst_dir_fd=parent_fd)
+        linked = True
+        os.unlink(probe_name, dir_fd=parent_fd)
+        linked = False
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to prepare atomic output installation for {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+    finally:
+        if linked:
+            with contextlib.suppress(OSError):
+                os.unlink(probe_name, dir_fd=parent_fd)
+
+
+def _fsync_posix_output_parent(output_path: str, parent_sync_fd: int) -> None:
+    """Persist a published POSIX report directory entry before reporting success."""
+    try:
+        os.fsync(parent_sync_fd)
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to persist output {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _preflight_output_text_file(output_path: str) -> None:
+    """Reject unsupported output destinations before a model scan begins."""
+    absolute_path: Path | None = None
+    parent_fd: int | None = None
+    parent_guard: int | None = None
+    parent_lock: int | None = None
+    existing_fd: int | None = None
+    parent_sync_fd: int | None = None
+    staging_fd: int | None = None
+    staging_name = ""
+    temp_fd: int | None = None
+    temp_path: Path | None = None
+    temp_name = ""
+    try:
+        absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
+        if os.name == "nt":
+            assert parent_guard is not None
+            parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
+        initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+        if initial_stat is not None:
+            if os.name == "posix" and parent_fd is not None:
+                _validate_posix_output_replacement_permission(output_path, parent_fd, initial_stat)
+            existing_fd = _open_existing_output_file(
+                output_path,
+                absolute_path,
+                initial_stat,
+                parent_fd=parent_fd,
+            )
+            if os.name == "nt":
+                _reject_windows_encrypted_output(output_path, existing_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+
+        if os.name == "nt":
+            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            temp_fd, temp_path = _open_windows_output_temp_file(
+                output_path,
+                absolute_path,
+                temp_name,
+                preserve_security=initial_stat is not None,
+            )
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        elif parent_fd is not None:
+            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
+            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+            temp_name = "output.tmp"
+            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=staging_fd)
+            if initial_stat is None:
+                _probe_posix_hard_link_support(output_path, staging_fd, parent_fd, temp_name)
+        else:
+            return
+
+        if initial_stat is not None:
+            assert existing_fd is not None
+            assert temp_fd is not None
+            if os.name == "nt":
+                _copy_windows_output_security(output_path, existing_fd, temp_fd)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
+            else:
+                _copy_posix_output_metadata(output_path, existing_fd, temp_fd)
+    except _OutputWriteError:
+        raise
+    except OSError as exc:
+        raise _OutputWriteError(
+            f"Unable to prepare output {_display_path(output_path)}: {exc.strerror or exc}"
+        ) from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if staging_fd is not None:
+            if temp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=staging_fd)
+            staging_stat: os.stat_result | None = None
+            with contextlib.suppress(OSError):
+                staging_stat = os.fstat(staging_fd)
+            os.close(staging_fd)
+            if parent_fd is not None and staging_name and staging_stat is not None:
+                with contextlib.suppress(OSError):
+                    named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+                    if os.path.samestat(staging_stat, named_stat):
+                        os.rmdir(staging_name, dir_fd=parent_fd)
+        if parent_sync_fd is not None:
+            os.close(parent_sync_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        elif temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+        if parent_lock is not None:
+            _close_windows_handle(parent_lock)
+        if parent_guard is not None:
+            _close_windows_handle(parent_guard)
+
+
+def _write_output_text_file(output_path: str, output_text: str, *, trailing_newline: bool = False) -> None:
+    """Write CLI output without following attacker-controlled path entries."""
+    output_display = _display_path(output_path)
+    try:
+        output_bytes = output_text.encode("utf-8") + (b"\n" if trailing_newline else b"")
+    except UnicodeError as exc:
+        raise _OutputWriteError(f"Unable to encode output {output_display}: {exc}") from exc
+    absolute_path: Path | None = None
+    parent_fd: int | None = None
+    parent_guard: int | None = None
+    parent_lock: int | None = None
+    existing_fd: int | None = None
+    parent_sync_fd: int | None = None
+    staging_fd: int | None = None
+    staging_name = ""
+    temp_fd: int | None = None
+    temp_path: Path | None = None
+    temp_name = ""
+    try:
+        absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
+        if os.name == "nt":
+            assert parent_guard is not None
+            parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
+        if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+
+        if initial_stat is not None:
+            if os.name == "posix" and parent_fd is not None:
+                _validate_posix_output_replacement_permission(output_path, parent_fd, initial_stat)
+            existing_fd = _open_existing_output_file(
+                output_path,
+                absolute_path,
+                initial_stat,
+                parent_fd=parent_fd,
+            )
+            if os.name == "nt":
+                _reject_windows_encrypted_output(output_path, existing_fd)
+            current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+            if current_stat is None or not os.path.samestat(initial_stat, current_stat):
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+            if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        if parent_fd is not None:
+            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+
+        if os.name == "nt":
+            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            temp_fd, temp_path = _open_windows_output_temp_file(
+                output_path,
+                absolute_path,
+                temp_name,
+                preserve_security=initial_stat is not None,
+            )
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        elif parent_fd is None:
+            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            temp_path = absolute_path.parent / temp_name
+            temp_fd = os.open(temp_path, flags, 0o666)
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        else:
+            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+            temp_name = "output.tmp"
+            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=staging_fd)
+
+        if os.name == "nt":
+            if initial_stat is not None:
+                assert existing_fd is not None
+                _copy_windows_output_security(output_path, existing_fd, temp_fd)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
+            with os.fdopen(temp_fd, "wb", closefd=False) as output_file:
+                output_file.write(output_bytes)
+        else:
+            if initial_stat is not None:
+                assert existing_fd is not None
+                _copy_posix_output_metadata(output_path, existing_fd, temp_fd)
+            with os.fdopen(temp_fd, "wb", closefd=False) as output_file:
+                output_file.write(output_bytes)
+        os.fsync(temp_fd)
+
+        if parent_fd is None:
+            current_path = _validated_absolute_output_path(output_path)
+            if current_path != absolute_path:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+        if initial_stat is None:
+            if current_stat is not None:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        elif current_stat is None or not os.path.samestat(initial_stat, current_stat):
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+
+        if os.name == "nt":
+            assert parent_guard is not None
+            assert temp_fd is not None
+            _replace_windows_output_file(
+                output_path,
+                temp_fd,
+                absolute_path,
+                replace_existing=initial_stat is not None,
+            )
+            temp_path = None
+            temp_name = ""
+        elif parent_fd is None:
+            assert temp_path is not None
+            os.replace(temp_path, absolute_path)
+            temp_path = None
+        else:
+            assert staging_fd is not None
+            if initial_stat is None:
+                os.link(temp_name, absolute_path.name, src_dir_fd=staging_fd, dst_dir_fd=parent_fd)
+                os.unlink(temp_name, dir_fd=staging_fd)
+            else:
+                _validate_posix_output_replacement_permission(output_path, parent_fd, initial_stat)
+                os.rename(temp_name, absolute_path.name, src_dir_fd=staging_fd, dst_dir_fd=parent_fd)
+            temp_name = ""
+            assert parent_sync_fd is not None
+            _fsync_posix_output_parent(output_path, parent_sync_fd)
+    except _OutputWriteError:
+        raise
+    except OSError as exc:
+        raise _OutputWriteError(f"Unable to write output {output_display}: {exc.strerror or exc}") from exc
+    finally:
+        if existing_fd is not None:
+            os.close(existing_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        staging_stat: os.stat_result | None = None
+        if staging_fd is not None:
+            if temp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=staging_fd)
+            with contextlib.suppress(OSError):
+                staging_stat = os.fstat(staging_fd)
+            os.close(staging_fd)
+        if parent_fd is not None:
+            if temp_name and staging_fd is None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=parent_fd)
+            if staging_name and staging_stat is not None:
+                with contextlib.suppress(OSError):
+                    named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+                    if os.path.samestat(staging_stat, named_stat):
+                        os.rmdir(staging_name, dir_fd=parent_fd)
+            if parent_sync_fd is not None:
+                os.close(parent_sync_fd)
+            os.close(parent_fd)
+        elif temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+        if parent_lock is not None:
+            _close_windows_handle(parent_lock)
+        if parent_guard is not None:
+            _close_windows_handle(parent_guard)
 
 
 @dataclass
@@ -885,8 +2030,7 @@ def _write_scan_sbom(
         )
 
     sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
-    with open(sbom, "w", encoding="utf-8") as sbom_file:
-        sbom_file.write(sbom_text)
+    _write_output_text_file(sbom, sbom_text)
 
 
 def _format_scan_output(
@@ -919,8 +2063,7 @@ def _emit_scan_output(
 ) -> None:
     """Write rendered scan output to a file or stdout and preserve text-mode UX."""
     if output:
-        with open(output, "w", encoding="utf-8") as output_file:
-            output_file.write(output_text)
+        _write_output_text_file(output, output_text)
 
         click.echo(f"Results written to {output}")
 
@@ -973,9 +2116,7 @@ def _emit_scanner_catalog(*, output_format: str, output: str | None) -> None:
 
     output_text = _format_scanner_catalog(output_format)
     if output:
-        with open(output, "w", encoding="utf-8") as output_file:
-            output_file.write(output_text)
-            output_file.write("\n")
+        _write_output_text_file(output, output_text, trailing_newline=True)
         return
     click.echo(output_text)
 
@@ -2502,6 +3643,14 @@ def scan_command(
         "num_paths": len(paths),
     }
 
+    try:
+        for output_path in dict.fromkeys(path for path in (output, sbom) if path is not None):
+            _preflight_output_text_file(output_path)
+    except _OutputWriteError:
+        record_scan_failed(time.time() - scan_start_time, "Unable to prepare scan output")
+        flush_telemetry()
+        raise
+
     record_command_used("scan", duration=None, **telemetry_options)
     record_scan_started(list(paths), telemetry_options)
 
@@ -2629,31 +3778,39 @@ def scan_command(
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
-    _write_scan_sbom(
-        sbom,
-        audit_result,
-        expanded_paths,
-        path_state,
-        scan_and_delete=runtime.scan_and_delete,
-    )
-    _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+    try:
+        try:
+            _write_scan_sbom(
+                sbom,
+                audit_result,
+                expanded_paths,
+                path_state,
+                scan_and_delete=runtime.scan_and_delete,
+            )
+        finally:
+            _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
 
-    suppressions = _record_suppressed_preferred_scanners(audit_result)
-    if suppressions:
-        _announce_suppressed_preferred_scanners(suppressions)
-    output_text = _format_scan_output(
-        audit_result,
-        expanded_paths,
-        output_format=runtime.output_format,
-        verbose=verbose,
-    )
-    _emit_scan_output(
-        output_text,
-        audit_result,
-        output=output,
-        output_format=runtime.output_format,
-        verbose=verbose,
-    )
+        suppressions = _record_suppressed_preferred_scanners(audit_result)
+        if suppressions:
+            _announce_suppressed_preferred_scanners(suppressions)
+        output_text = _format_scan_output(
+            audit_result,
+            expanded_paths,
+            output_format=runtime.output_format,
+            verbose=verbose,
+        )
+        _emit_scan_output(
+            output_text,
+            audit_result,
+            output=output,
+            output_format=runtime.output_format,
+            verbose=verbose,
+        )
+    except _OutputWriteError:
+        record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+        flush_telemetry()
+        raise
+
     _record_scan_end_and_exit(audit_result, scan_start_time)
 
 
@@ -3140,8 +4297,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             output_text = _format_metadata_table(metadata)
 
         if output:
-            with open(output, "w", encoding="utf-8") as f:
-                f.write(output_text)
+            _write_output_text_file(output, output_text)
             click.secho(f"Metadata written to {output}", fg="green")
         else:
             click.echo(output_text)
@@ -3156,6 +4312,15 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             output_file=bool(output),
         )
 
+    except _OutputWriteError as e:
+        record_command_used(
+            "metadata",
+            duration=time.time() - start_time,
+            success=False,
+            format=output_format,
+            error_type=type(e).__name__,
+        )
+        raise
     except Exception as e:
         record_command_used(
             "metadata",
