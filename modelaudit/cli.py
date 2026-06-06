@@ -35,7 +35,7 @@ from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanner_results import IssueSeverity
+from .scanner_results import CheckStatus, IssueSeverity
 from .scanner_selection import (
     SCANNER_SELECTION_CONFIG_KEY,
     ScannerSelectionPolicy,
@@ -59,8 +59,8 @@ from .telemetry import (
 )
 from .utils import (
     DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
+    DvcResolution,
     dvc_omitted_outputs_covered,
-    resolve_dvc_file_status,
     should_skip_file,
 )
 from .utils.helpers.auto_defaults import (
@@ -407,6 +407,42 @@ def _dvc_target_was_scanned(
     return not walk_errors
 
 
+def _dvc_resolution_from_cap_issue(issue: Any) -> DvcResolution | None:
+    """Rebuild the pointer resolution that originally produced a cap issue."""
+    details = issue.details if isinstance(getattr(issue, "details", None), dict) else {}
+    pointer_digest = details.get("pointer_digest")
+    resolved_outputs = details.get("resolved_outputs")
+    if not isinstance(pointer_digest, str) or not pointer_digest or not isinstance(resolved_outputs, list):
+        return None
+    if not all(isinstance(path, str) for path in resolved_outputs):
+        return None
+
+    count_fields = (
+        "declared_output_count",
+        "output_limit",
+        "omitted_output_count",
+        "unresolved_omitted_output_count",
+        "unverified_omitted_output_count",
+    )
+    counts: dict[str, int] = {}
+    for field_name in count_fields:
+        value = details.get(field_name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        counts[field_name] = value
+
+    return DvcResolution(
+        resolved_paths=tuple(resolved_outputs),
+        incomplete_reason=DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
+        declared_output_count=counts["declared_output_count"],
+        output_limit=counts["output_limit"],
+        omitted_output_count=counts["omitted_output_count"],
+        unresolved_omitted_output_count=counts["unresolved_omitted_output_count"],
+        unverified_omitted_output_count=counts["unverified_omitted_output_count"],
+        pointer_digest=pointer_digest,
+    )
+
+
 def _reconcile_dvc_output_limit_issues(
     audit_result: ModelAuditResultModel,
     runtime: _ScanRuntimeConfig,
@@ -419,7 +455,7 @@ def _reconcile_dvc_output_limit_issues(
     scanner_policy = policy_from_config(runtime.config)
     covered_files: set[str] = set()
     for asset in audit_result.assets:
-        if asset.type == "error" or not os.path.isfile(asset.path):
+        if asset.type in {"error", "skipped", "unknown"} or not os.path.isfile(asset.path):
             continue
         metadata = audit_result.file_metadata.get(asset.path)
         if metadata is not None and (
@@ -430,12 +466,30 @@ def _reconcile_dvc_output_limit_issues(
             continue
         covered_files.add(str(Path(asset.path).resolve()))
 
+    for check in audit_result.checks:
+        shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
+        if (
+            check.name != "Sharded Model Detection"
+            or check.status != CheckStatus.PASSED
+            or not isinstance(shard_paths, list)
+        ):
+            continue
+        for shard_path in shard_paths:
+            if not isinstance(shard_path, str) or not os.path.isfile(shard_path):
+                continue
+            try:
+                covered_files.add(str(Path(shard_path).resolve()))
+            except OSError:
+                continue
+
     covered = frozenset(covered_files)
     discharged_locations: set[str] = set()
     for issue in cap_issues:
         if not issue.location or not os.path.isfile(issue.location):
             continue
-        resolution = resolve_dvc_file_status(issue.location)
+        resolution = _dvc_resolution_from_cap_issue(issue)
+        if resolution is None:
+            continue
         if dvc_omitted_outputs_covered(
             issue.location,
             resolution,
@@ -462,7 +516,13 @@ def _reconcile_dvc_output_limit_issues(
         for metadata in audit_result.file_metadata.values()
     )
     issue_has_operational_error = any(
-        issue.severity in {IssueSeverity.INFO, IssueSeverity.DEBUG} for issue in audit_result.issues
+        isinstance(issue.details, dict)
+        and (
+            issue.details.get("operational_error") is True
+            or issue.details.get("analysis_incomplete") is True
+            or issue.details.get("scan_outcome") == "inconclusive"
+        )
+        for issue in audit_result.issues
     )
     audit_result.has_errors = bool(
         metadata_has_operational_error
