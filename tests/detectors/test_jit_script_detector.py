@@ -9222,6 +9222,113 @@ class TestJITScriptDetector:
 
         assert "bi" not in aliases
 
+    def test_prefix_builtins_aliases_drop_destructured_tail_rebind(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\n" + padding + b"(bi,) = (holder,)\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" not in aliases
+
+    def test_prefix_builtins_aliases_keep_destructured_tail_copy(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"(bi,) = (builtins,)\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" in aliases
+
+    def test_prefix_builtins_aliases_ignore_scoped_destructured_tail_rebind(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import builtins as bi\n" + padding + b"def unused():\n    (bi,) = (holder,)\n"
+
+        aliases = jit_script_module._builtins_import_aliases(prefix)
+
+        assert "bi" in aliases
+
+    def test_prefix_typed_aliases_discover_module_import_in_tail(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"import webbrowser as wb\nalias = wb.open\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+        assert typed_aliases["wb"] == "webbrowser"
+        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+
+    def test_prefix_typed_aliases_ignore_scoped_import_in_tail(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = padding + b"def unused():\n    import webbrowser as wb\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+
+        assert "wb" not in typed_aliases
+
+    def test_prefix_typed_aliases_ignore_scoped_destructured_tail_rebind(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import webbrowser as wb\n" + padding + b"def unused():\n    (wb,) = (holder,)\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+
+        assert typed_aliases["wb"] == "webbrowser"
+
+    def test_scan_model_detects_typed_import_and_capture_after_import_context(self) -> None:
+        import_padding = b"# pad\n" * (
+            jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 8
+        )
+        call_padding = b"# gap\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# gap\n") + 8
+        )
+        source = (
+            b"\x00\xff"
+            + import_padding
+            + b"import webbrowser as wb\nalias = wb.open\n"
+            + call_padding
+            + b"alias('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("tail_binding", "expected"),
+        [
+            (b"(bi,) = (Holder,)\n", True),
+            (b"(bi,) = (builtins,)\n", False),
+        ],
+    )
+    def test_scan_model_tracks_destructured_builtins_alias_rebind_in_prefix_tail(
+        self,
+        tail_binding: bytes,
+        expected: bool,
+    ) -> None:
+        import_padding = b"# pad\n" * (
+            jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 8
+        )
+        call_padding = b"# gap\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# gap\n") + 8
+        )
+        source = (
+            b"\x00\xffimport builtins as bi\nimport webbrowser as wb\n"
+            b"class Holder:\n    print = wb.open\n"
+            + import_padding
+            + tail_binding
+            + b"wb.open = bi.print\nwb.open('https://example.invalid')\n"
+            + call_padding
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+        assert detected is expected
+
     def test_prefix_typed_member_aliases_ignore_unrelated_mapping_update(self) -> None:
         prefix = b"import webbrowser as wb\nother.update(open=1)\nalias = wb.open\n"
         typed_aliases = jit_script_module._typed_import_aliases(prefix)
@@ -9257,6 +9364,47 @@ class TestJITScriptDetector:
 
         assert suppressed == {("webbrowser.open", "S109")}
         assert high_risk == set()
+
+    def test_compact_replay_uses_inherited_builtins_alias_for_setattr_restore(self) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "import builtins\nimport webbrowser as wb\n"
+            "original = wb.open\nwb.open = print\n"
+            "builtins.setattr = bi.setattr\n"
+            "setattr(builtins, 'print', original)\n"
+            "wb.open = bi.print\nwb.open('https://example.invalid')\n",
+            inherited_builtins_aliases=frozenset({"bi"}),
+        )
+
+        assert suppressed == set()
+        assert high_risk == {("webbrowser.open", "S109")}
+
+    def test_compact_replay_accepts_safe_inherited_builtins_setattr_restore(self) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "import builtins\nimport webbrowser as wb\n"
+            "builtins.setattr = bi.setattr\n"
+            "setattr(builtins, 'print', print)\n"
+            "wb.open = bi.print\nwb.open('safe')\n",
+            inherited_builtins_aliases=frozenset({"bi"}),
+        )
+
+        assert suppressed == {("webbrowser.open", "S109")}
+        assert high_risk == set()
+
+    def test_compact_replay_ignores_typed_alias_defined_only_in_safe_uncertain_branch(self) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "if condition:\n    import webbrowser as wb\n    wb.open = print\nwb.open('safe')\n"
+        )
+
+        assert suppressed == set()
+        assert high_risk == set()
+
+    def test_compact_replay_keeps_preexisting_typed_alias_across_uncertain_safe_overwrite(self) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "import webbrowser as wb\nif condition:\n    wb.open = print\nwb.open('https://example.invalid')\n"
+        )
+
+        assert suppressed == set()
+        assert high_risk == {("webbrowser.open", "S109")}
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),

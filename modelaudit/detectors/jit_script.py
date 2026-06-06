@@ -817,6 +817,23 @@ def _has_late_alias_rebinding(candidate: bytes, alias: str) -> bool:
     )
 
 
+def _compact_tail_module_lines(tail: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
+    """Yield ordered module-scope lines and any parseable statements they contain."""
+    for raw_line in tail.split(b"\n"):
+        if raw_line[:1].isspace():
+            continue
+        line = _python_structural_line_bytes(raw_line).strip()
+        if not line:
+            continue
+        try:
+            tree = ast.parse(line.decode("utf-8", errors="ignore"))
+        except (RecursionError, SyntaxError, ValueError):
+            statements: tuple[ast.stmt, ...] = ()
+        else:
+            statements = tuple(_compact_deterministically_executed_statements(tree.body))
+        yield line, statements
+
+
 def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
     prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
     prefix = candidate[:prefix_end].lstrip(b"\x00\xff")
@@ -831,41 +848,44 @@ def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
     for statement in _compact_deterministically_executed_statements(tree.body):
         _update_compact_builtins_aliases(statement, aliases)
 
-    import_pattern = re.compile(rb"^import\s+builtins(?:\s+as\s+([A-Za-z_]\w*))?\s*$")
-    other_import_pattern = re.compile(rb"^import\s+([A-Za-z_]\w*)(?:\.[A-Za-z_]\w*)*(?:\s+as\s+([A-Za-z_]\w*))?\s*$")
-    from_import_pattern = re.compile(
-        rb"^from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$"
-    )
-    assignment_pattern = re.compile(rb"^([A-Za-z_]\w*)(?:\s*:[^=]+)?\s*(?::=|=(?!=))\s*([A-Za-z_]\w*)?")
-    rebound_pattern = re.compile(rb"^(?:class|def|del|case)\s+([A-Za-z_]\w*)\b|^for\s+([A-Za-z_]\w*)\s+in\b")
-    for raw_line in candidate[prefix_end:].split(b"\n"):
-        if raw_line[:1].isspace():
-            continue
-        line = _python_structural_line_bytes(raw_line).strip()
-        imported = import_pattern.fullmatch(line)
-        if imported is not None:
-            aliases.add((imported.group(1) or b"builtins").decode("utf-8"))
-            continue
-        other_import = other_import_pattern.fullmatch(line)
-        if other_import is not None:
-            aliases.discard((other_import.group(2) or other_import.group(1)).decode("utf-8"))
-            continue
-        from_import = from_import_pattern.fullmatch(line)
-        if from_import is not None:
-            aliases.discard((from_import.group(2) or from_import.group(1)).decode("utf-8"))
-            continue
-        assignment = assignment_pattern.match(line)
-        if assignment is not None:
-            target_name = assignment.group(1).decode("utf-8")
-            value_name = assignment.group(2).decode("utf-8") if assignment.group(2) is not None else None
-            aliases.discard(target_name)
-            if value_name in aliases:
-                aliases.add(target_name)
-            continue
-        rebound = rebound_pattern.match(line)
-        if rebound is not None:
-            aliases.discard((rebound.group(1) or rebound.group(2)).decode("utf-8"))
+    tail = candidate[prefix_end:]
+    for line, statements in _compact_tail_module_lines(tail):
+        for alias in list(aliases):
+            if _has_late_alias_rebinding(line, alias):
+                aliases.discard(alias)
+        for statement in statements:
+            _update_compact_builtins_aliases(statement, aliases)
     return frozenset(aliases - {"builtins", "__builtins__"})
+
+
+def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str, str]) -> None:
+    aliases_before = dict(aliases)
+    if isinstance(statement, ast.Import):
+        for alias in statement.names:
+            local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            aliases.pop(local_name, None)
+            if alias.name in {"ctypes", "webbrowser"}:
+                aliases[local_name] = alias.name
+    elif isinstance(statement, ast.ImportFrom):
+        for alias in statement.names:
+            aliases.pop(alias.asname or alias.name, None)
+    elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        value = statement.value
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            for name in _assignment_target_names(target):
+                aliases.pop(name, None)
+                if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
+                    aliases[name] = aliases_before[value.id]
+    elif isinstance(statement, ast.AugAssign):
+        for name in _assignment_target_names(statement.target):
+            aliases.pop(name, None)
+    elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        aliases.pop(statement.name, None)
+    elif isinstance(statement, ast.Delete):
+        for target in statement.targets:
+            for name in _assignment_target_names(target):
+                aliases.pop(name, None)
 
 
 def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
@@ -881,35 +901,15 @@ def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
 
     aliases: dict[str, str] = {}
     for statement in _compact_deterministically_executed_statements(tree.body):
-        aliases_before = dict(aliases)
-        if isinstance(statement, ast.Import):
-            for alias in statement.names:
-                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                aliases.pop(local_name, None)
-                if alias.name in {"ctypes", "webbrowser"}:
-                    aliases[local_name] = alias.name
-        elif isinstance(statement, ast.ImportFrom):
-            for alias in statement.names:
-                aliases.pop(alias.asname or alias.name, None)
-        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            value = statement.value
-            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-            for target in targets:
-                for name in _assignment_target_names(target):
-                    aliases.pop(name, None)
-                    if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
-                        aliases[name] = aliases_before[value.id]
-        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            aliases.pop(statement.name, None)
-        elif isinstance(statement, ast.Delete):
-            for target in statement.targets:
-                for name in _assignment_target_names(target):
-                    aliases.pop(name, None)
+        _update_compact_typed_import_aliases(statement, aliases)
 
     tail = candidate[prefix_end:]
-    for alias_name in list(aliases):
-        if _has_late_alias_rebinding(tail, alias_name):
-            aliases.pop(alias_name, None)
+    for line, statements in _compact_tail_module_lines(tail):
+        for alias_name in list(aliases):
+            if _has_late_alias_rebinding(line, alias_name):
+                aliases.pop(alias_name, None)
+        for statement in statements:
+            _update_compact_typed_import_aliases(statement, aliases)
     return aliases
 
 
@@ -12766,7 +12766,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         "ctypes": ("ctypes", 0),
     }
     next_typed_generation = {"webbrowser": 1, "ctypes": 1}
-    builtins_aliases = {"builtins", "__builtins__"}
+    builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
     executed_statements = _compact_deterministically_executed_statements(tree.body)
     for statement in executed_statements:
         if isinstance(statement, ast.Import):
@@ -14518,11 +14518,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         uncertain_helper_shadows.update(snapshot[32])
 
     def merge_lexical_branch_scopes(body: tuple[Any, ...], otherwise: tuple[Any, ...]) -> tuple[Any, ...]:
-        merged_typed_aliases: dict[str, tuple[str, int]] = {}
-        for name in body[0].keys() | otherwise[0].keys():
-            candidates = {scope[name] for scope in (body[0], otherwise[0]) if name in scope}
-            if len(candidates) == 1:
-                merged_typed_aliases[name] = candidates.pop()
+        merged_typed_aliases = {name: value for name, value in body[0].items() if otherwise[0].get(name) == value}
 
         merged_mapping_aliases = {name: value for name, value in body[12].items() if otherwise[12].get(name) == value}
         merged_member_aliases: dict[str, _TypedMemberCallableValue] = {}
