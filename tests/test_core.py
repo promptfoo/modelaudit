@@ -1745,7 +1745,7 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
 
 
 def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) -> None:
-    """A family cache entry must not hide a newly malicious sibling shard."""
+    """Caching or its safety bypass must not hide a newly malicious sibling shard."""
     shard_one = tmp_path / "checkpoint_1.pt"
     shard_two = tmp_path / "checkpoint_2.pt"
     shard_one.write_bytes(pickle.dumps({"weights": [1]}))
@@ -1767,9 +1767,16 @@ def test_scan_file_invalidates_cache_when_shard_sibling_changes(tmp_path: Path) 
 
         assert first_result.success is True
         assert cached_result.success is True
-        assert cached_entries > 0
+        if os.name == "nt":
+            assert cached_entries == 0
+        else:
+            assert cached_entries > 0
         assert any(issue.rule_code == "S201" for issue in second_result.issues)
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] >= cached_entries
+        final_cache_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        if os.name == "nt":
+            assert final_cache_entries == 0
+        else:
+            assert final_cache_entries >= cached_entries
     finally:
         reset_cache_manager()
 
