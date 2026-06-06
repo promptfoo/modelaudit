@@ -9407,6 +9407,13 @@ class TestJITScriptDetector:
 
         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
 
+    def test_prefix_typed_member_aliases_track_destructured_capture(self) -> None:
+        prefix = b"import webbrowser as wb\n(opener, ignored) = (wb.open, 0)\n"
+
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
+
+        assert aliases["opener"] == frozenset({("webbrowser", "open", False)})
+
     def test_prefix_typed_member_aliases_ignore_capture_after_owner_rebind(self) -> None:
         prefix = b"import webbrowser as wb\nwb = Holder\nalias = wb.open\n"
 
@@ -9506,6 +9513,16 @@ class TestJITScriptDetector:
         assert typed_aliases["wb"] == "webbrowser"
         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
 
+    def test_prefix_typed_aliases_drop_with_item_rebind_before_capture(self) -> None:
+        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+        prefix = b"import webbrowser as wb\n" + padding + b"with manager() as wb:\n    pass\nalias = wb.open\n"
+
+        typed_aliases = jit_script_module._typed_import_aliases(prefix)
+        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+        assert "wb" not in typed_aliases
+        assert "alias" not in aliases
+
     def test_prefix_builtins_aliases_drop_destructured_loop_target(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\n" + padding + b"for (bi,) in items:\n    pass\n"
@@ -9521,6 +9538,12 @@ class TestJITScriptDetector:
         aliases = jit_script_module._builtins_import_aliases(prefix)
 
         assert "bi" not in aliases
+
+    def test_prefix_builtins_alias_state_tracks_shadowed_canonical_name(self) -> None:
+        aliases, shadowed = jit_script_module._builtins_import_alias_state(b"builtins = Holder\n")
+
+        assert aliases == frozenset()
+        assert shadowed == frozenset({"builtins"})
 
     def test_compact_replay_calls_inherited_typed_alias_without_print(self) -> None:
         inherited_aliases = {"alias": frozenset({("webbrowser", "open", False)})}
@@ -9541,6 +9564,15 @@ class TestJITScriptDetector:
 
         assert suppressed == {("webbrowser.open", "S109")}
         assert high_risk == set()
+
+    def test_compact_replay_does_not_trust_shadowed_inherited_builtins_name(self) -> None:
+        suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(
+            "import webbrowser as wb\nwb.open = builtins.print\nwb.open('https://example.invalid')\n",
+            inherited_shadowed_builtins_aliases=frozenset({"builtins"}),
+        )
+
+        assert suppressed == set()
+        assert high_risk == {("webbrowser.open", "S109")}
 
     def test_compact_replay_uses_inherited_builtins_alias_for_setattr_restore(self) -> None:
         suppressed, high_risk = jit_script_module._compact_snippet_typed_print_overwrite_replay(

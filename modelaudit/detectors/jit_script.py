@@ -910,7 +910,7 @@ def _compact_prefix_module_lines(candidate: bytes) -> Iterator[tuple[bytes, tupl
     yield from _compact_tail_module_lines(candidate[prefix_end:])
 
 
-def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
+def _builtins_import_alias_state(candidate: bytes) -> tuple[frozenset[str], frozenset[str]]:
     aliases = {"builtins", "__builtins__"}
     for line, statements in _compact_prefix_module_lines(candidate):
         if not statements:
@@ -919,7 +919,13 @@ def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
                     aliases.discard(alias)
         for statement in statements:
             _update_compact_builtins_aliases(statement, aliases)
-    return frozenset(aliases - {"builtins", "__builtins__"})
+    canonical_aliases = {"builtins", "__builtins__"}
+    return frozenset(aliases - canonical_aliases), frozenset(canonical_aliases - aliases)
+
+
+def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
+    aliases, _shadowed_canonical_aliases = _builtins_import_alias_state(candidate)
+    return aliases
 
 
 def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str, str]) -> None:
@@ -12937,6 +12943,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     code_str: str,
     inherited_builtins_aliases: frozenset[str] = frozenset(),
     inherited_typed_member_aliases: Mapping[str, _TypedMemberCallableValue] | None = None,
+    inherited_shadowed_builtins_aliases: frozenset[str] = frozenset(),
 ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     source = textwrap.dedent(code_str)
     if "print" not in source and not inherited_typed_member_aliases:
@@ -12952,7 +12959,12 @@ def _compact_snippet_typed_print_overwrite_replay(
         "ctypes": ("ctypes", 0),
     }
     next_typed_generation = {"webbrowser": 1, "ctypes": 1}
-    builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
+    inherited_active_builtins_aliases = {
+        "builtins",
+        "__builtins__",
+        *inherited_builtins_aliases,
+    } - set(inherited_shadowed_builtins_aliases)
+    builtins_aliases = set(inherited_active_builtins_aliases)
     executed_statements = _compact_deterministically_executed_statements(tree.body)
     for statement in executed_statements:
         if isinstance(statement, ast.Import):
@@ -13014,8 +13026,8 @@ def _compact_snippet_typed_print_overwrite_replay(
     dynamic_builtins_print_shadow_state: bool | None = None
     dynamic_safe_members: set[tuple[tuple[str, int], str]] | None = None
     dynamic_safe_print_aliases: set[str] | None = None
-    active_print_builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
-    eager_builtins_aliases = {"builtins", "__builtins__", *inherited_builtins_aliases}
+    active_print_builtins_aliases = set(inherited_active_builtins_aliases)
+    eager_builtins_aliases = set(inherited_active_builtins_aliases)
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
     local_vars_shadowed = False
@@ -22370,7 +22382,10 @@ class JITScriptDetector:
                     parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     ast_high_risk_calls = set(parsed_high_risk_calls or set())
-                    builtins_aliases_before_snippet = _builtins_import_aliases(bounded[: span[0]])
+                    (
+                        builtins_aliases_before_snippet,
+                        shadowed_builtins_aliases_before_snippet,
+                    ) = _builtins_import_alias_state(bounded[: span[0]])
                     typed_aliases_before_snippet = _typed_import_aliases(bounded[: span[0]])
                     typed_member_aliases_before_snippet = _unsafe_typed_member_aliases(
                         bounded[: span[0]],
@@ -22380,6 +22395,7 @@ class JITScriptDetector:
                         code_str,
                         builtins_aliases_before_snippet,
                         typed_member_aliases_before_snippet,
+                        shadowed_builtins_aliases_before_snippet,
                     )
                     inactive_restore_high_risk_calls: set[tuple[str, str]] = set()
                     inactive_restore_high_risk_calls.update(typed_high_risk_calls)
