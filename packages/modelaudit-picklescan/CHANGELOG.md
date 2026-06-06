@@ -78,6 +78,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed when known-size pickle streams contain trailing bytes beyond the declared size
 - Invalidate cached call-graph analysis when Python sources, import hooks, loaded module origins, or parent package markers change.
 - detect dangerous call-like strings split across newline-separated statements
 - scan raw nested pickle payloads carried inside Unicode string literals
