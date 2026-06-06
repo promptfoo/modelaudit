@@ -107,6 +107,10 @@ _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"\b(?![_-](?:cache|count|hint)\b)",
     re.IGNORECASE,
 )
+_DIRECT_AUTH_SCHEME_VALUE_PATTERN = re.compile(
+    rb"(?:^|[^A-Za-z0-9])(?:basic|bearer|token)[ \t]+[\"']?\s*$",
+    re.IGNORECASE,
+)
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
 _EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
 _SENSITIVE_NESTED_URL = "redacted://redacted.invalid/sensitive-endpoint"
@@ -1156,8 +1160,11 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
             nested_url = nested_url_match.group()
             if value_lower not in nested_url.lower():
                 continue
+            if _query_prefix_awaits_sensitive_value(candidate[: nested_url_match.start()]):
+                return True
             safe_nested_url = redact_url_for_finding(nested_url)
-            return value_lower not in safe_nested_url.lower()
+            if value_lower not in safe_nested_url.lower():
+                return True
 
         for decoded_field in _URL_COMPONENT_SEPARATOR_PATTERN.split(candidate):
             decoded_key, decoded_separator, decoded_value = decoded_field.partition("=")
@@ -1249,6 +1256,9 @@ def _is_split_sensitive_url_value(data: bytes, match_start: int) -> bool:
 
 def _is_redacted_evidence_value(data: bytes, match_start: int, value: str) -> bool:
     """Use the shared redactor to reject endpoint-shaped credential values."""
+    direct_decision = _direct_evidence_redaction_decision(data, match_start)
+    if direct_decision is not None:
+        return direct_decision
     before = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
     match_end = match_start + len(value.encode("utf-8"))
     after = min(len(data), match_end + _MAX_URL_TEXT_LOOKUP_BYTES)
@@ -1267,6 +1277,33 @@ def _is_redacted_evidence_value(data: bytes, match_start: int, value: str) -> bo
     )
     redacted = _redact_network_evidence(marked_text)
     return _EVIDENCE_MATCH_START_MARKER not in redacted or _EVIDENCE_MATCH_END_MARKER not in redacted
+
+
+def _direct_evidence_redaction_decision(data: bytes, match_start: int) -> bool | None:
+    """Classify immediate auth values and direct network-location assignments."""
+    prefix = data[max(0, match_start - 512) : match_start]
+    if _DIRECT_AUTH_SCHEME_VALUE_PATTERN.search(prefix) is not None:
+        return True
+
+    trimmed = prefix.rstrip(b" \t\"'")
+    if not trimmed or trimmed[-1:] not in {b"=", b":"}:
+        return None
+
+    key_prefix = trimmed[:-1].rstrip()
+    if key_prefix[-1:] in {b'"', b"'"}:
+        key_prefix = key_prefix[:-1].rstrip()
+    record_start = max(
+        (key_prefix.rfind(delimiter) for delimiter in (b"\r", b"\n", b",", b";", b"{", b"}", b"[", b"]", b"(", b")")),
+        default=-1,
+    )
+    key = key_prefix[record_start + 1 :].strip().strip(b"\"'")
+    if not key or b"=" in key or b":" in key:
+        return None
+
+    normalized_key = re.sub(rb"[^a-z0-9]+", b"", key.lower())
+    if normalized_key.endswith((b"endpoint", b"url", b"uri")):
+        return False
+    return None
 
 
 def _query_prefix_awaits_sensitive_value(prefix: str) -> bool:
@@ -1569,6 +1606,101 @@ class NetworkCommDetector:
     # Domain patterns
     DOMAIN_PATTERN = _BARE_DOMAIN_PATTERN
 
+    NETWORK_COMMAND_LINE_PREFIX = (
+        rb"^[ \t]*(?:(?:[-*+>]|[0-9]{1,9}[.)])[ \t]+){0,8}"
+        rb"(?:`{1,3}[ \t]*)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#>])[ \t]*)?"
+    )
+    NETWORK_COMMAND_LINE_LIMIT = rb"(?=[^\r\n]{1,8192}(?:\r?$))"
+    NETWORK_COMMAND_PATH_PREFIX = rb"(?:/(?:usr/)?bin/)?(?:(?:busybox|toybox)(?:\.exe)?[ \t]+)?"
+    NETWORK_COMMAND_TERMINATOR = rb"(?=[ \t]*(?:\r?$|[;&|<>#]))"
+    NETWORK_COMMAND_HOST = (
+        rb"(?:"
+        + IPV4_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|"
+        + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"|\[(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\])"
+    )
+    NETCAT_OPTION_ARGUMENT = rb"[^\s\"']+"
+    NETCAT_OPTION_WITH_ARGUMENT = (
+        rb"(?:-(?:I|M|O|P|R|T|V|W|X|Z|c|e|i|m|p|q|s|w|x)|"
+        rb"--(?:append-output|delay|exec|hex-dump|idle-timeout|lua-exec|max-conns|max-rate|output|proxy|"
+        rb"proxy-auth|proxy-type|sh-exec|source|source-port|ssl-alpn|ssl-ciphers|ssl-servername|"
+        rb"ssl-trustfile|wait))"
+    )
+    NETCAT_OPTION_WITHOUT_ARGUMENT = (
+        rb"(?:-[46bCDdFhklNnStUuvz]+|--(?:allow|broker|chat|keep-open|listen|no-shutdown|recv-only|send-only|ssl))"
+    )
+    NETCAT_OPTION = (
+        rb"(?:"
+        + NETCAT_OPTION_WITH_ARGUMENT
+        + rb"(?:="
+        + NETCAT_OPTION_ARGUMENT
+        + rb"|[ \t]+"
+        + NETCAT_OPTION_ARGUMENT
+        + rb")|"
+        + NETCAT_OPTION_WITHOUT_ARGUMENT
+        + rb")"
+    )
+    NETCAT_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX + rb"(?P<command>" + NETWORK_COMMAND_PATH_PREFIX + rb"(?:nc|ncat|netcat)(?:\.exe)?)"
+        rb"(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}[ \t]+"
+        rb"(?P<destination>" + NETWORK_COMMAND_HOST + rb")"
+        rb"[ \t]+(?P<port>[0-9]{1,5})(?:[ \t]+" + NETCAT_OPTION + rb"){0,8}" + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|[ \t]+)?[^\s]{1,4096}"
+    SSH_OPTION_WITHOUT_ARGUMENT = rb"-[46AaCfGgKkMNnqsTtVvXxYy]+"
+    SSH_OPTION = rb"(?:" + SSH_OPTION_WITH_ARGUMENT + rb"|" + SSH_OPTION_WITHOUT_ARGUMENT + rb")"
+    SSH_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX
+        + rb"(?P<command>"
+        + NETWORK_COMMAND_PATH_PREFIX
+        + rb"ssh(?:\.exe)?)(?:[ \t]+"
+        + SSH_OPTION
+        + rb"){0,8}[ \t]+(?P<destination>(?:[A-Za-z0-9._-]+@)?"
+        + NETWORK_COMMAND_HOST
+        + rb")"
+        + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    GIT_CLONE_OPTION_WITH_ARGUMENT = (
+        rb"(?:-(?:b|c|j|o|u)|--(?:branch|config|depth|filter|jobs|origin|reference|reference-if-able|"
+        rb"separate-git-dir|shallow-exclude|shallow-since|template|upload-pack))(?:=|[ \t]+)[^\s]{1,4096}"
+    )
+    GIT_CLONE_OPTION = (
+        rb"(?:" + GIT_CLONE_OPTION_WITH_ARGUMENT + rb"|-[lnqsv]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+    )
+    GIT_CLONE_DESTINATION = (
+        rb"(?:[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]{1,4096}|(?:[A-Za-z0-9._-]+@)?"
+        + NETWORK_COMMAND_HOST
+        + rb":[^\s\"'<>]{1,4096})"
+    )
+    GIT_CLONE_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX
+        + NETWORK_COMMAND_LINE_LIMIT
+        + rb"(?P<command>"
+        + NETWORK_COMMAND_PATH_PREFIX
+        + rb"git(?:\.exe)?)[ \t]+clone"
+        rb"(?:[ \t]+" + GIT_CLONE_OPTION + rb"){0,8}[ \t]+(?:--[ \t]+)?"
+        rb"(?P<destination>" + GIT_CLONE_DESTINATION + rb")"
+        rb"(?:[ \t]+[^\s;&|#]{1,4096})?" + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    DOCKER_PULL_OPTION_WITH_ARGUMENT = rb"--(?:disable-content-trust|platform)(?:=|[ \t]+)[^\s]{1,4096}"
+    DOCKER_PULL_OPTION = (
+        rb"(?:" + DOCKER_PULL_OPTION_WITH_ARGUMENT + rb"|-[aq]+|--[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]{1,4096})?)"
+    )
+    DOCKER_PULL_COMMAND_PATTERN = re.compile(
+        NETWORK_COMMAND_LINE_PREFIX + rb"(?P<command>docker(?:\.exe)?)[ \t]+(?:image[ \t]+)?pull"
+        rb"(?:[ \t]+" + DOCKER_PULL_OPTION + rb"){0,8}[ \t]+"
+        rb"(?P<destination>"
+        + DOMAIN_PATTERN.pattern.removeprefix(rb"\b").removesuffix(rb"\b")
+        + rb"(?::[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?"
+        + rb"/[^\s\"'<>]{1,4096})"
+        + NETWORK_COMMAND_TERMINATOR,
+        re.IGNORECASE | re.MULTILINE,
+    )
+
     # Network library imports
     NETWORK_LIBRARIES: ClassVar[list[bytes]] = [
         b"socket",
@@ -1795,6 +1927,7 @@ class NetworkCommDetector:
             (
                 self._check_blacklist,
                 self._scan_cc_patterns,
+                self._scan_network_commands,
                 self._scan_network_functions,
                 self._scan_network_libraries,
                 self._scan_suspicious_ports,
@@ -1805,6 +1938,7 @@ class NetworkCommDetector:
             )
             if self.max_findings is not None
             else (
+                self._scan_network_commands,
                 self._scan_urls,
                 self._scan_cloud_storage_urls,
                 self._scan_ip_addresses,
@@ -1898,6 +2032,9 @@ class NetworkCommDetector:
 
     def _is_redacted_evidence_value(self, data: bytes, match_start: int, value: str) -> bool:
         """Bound expensive shared-redactor classifications and fail closed on exhaustion."""
+        direct_decision = _direct_evidence_redaction_decision(data, match_start)
+        if direct_decision is not None:
+            return direct_decision
         before = max(0, match_start - _MAX_URL_TEXT_LOOKUP_BYTES)
         match_end = match_start + len(value.encode("utf-8"))
         after = min(len(data), match_end + _MAX_URL_TEXT_LOOKUP_BYTES)
@@ -1964,6 +2101,57 @@ class NetworkCommDetector:
             self._url_contexts.append(context)
             self._url_context_starts.append(context[0])
             yield context
+
+    def _scan_network_commands(self, data: bytes, context: str) -> None:
+        """Scan for explicit network client commands with concrete destinations."""
+        for match in self.NETCAT_COMMAND_PATTERN.finditer(data):
+            port = int(match.group("port"))
+            if not 1 <= port <= 65535:
+                continue
+            command = match.group("command").decode("utf-8", errors="ignore")
+            destination = match.group("destination").decode("utf-8", errors="ignore")
+            if ":" in destination:
+                try:
+                    ipaddress.ip_address(destination.removeprefix("[").removesuffix("]"))
+                except ValueError:
+                    continue
+            if not self._record_finding(
+                {
+                    "type": "network_command",
+                    "severity": "HIGH",
+                    "confidence": 0.9,
+                    "message": f"Netcat network command detected: {destination}:{port}",
+                    "command": command,
+                    "destination": destination,
+                    "port": port,
+                    "position": match.start("destination"),
+                    "context": context,
+                }
+            ):
+                return
+        for command_type, pattern in (
+            ("SSH", self.SSH_COMMAND_PATTERN),
+            ("Git clone", self.GIT_CLONE_COMMAND_PATTERN),
+            ("Docker pull", self.DOCKER_PULL_COMMAND_PATTERN),
+        ):
+            for match in pattern.finditer(data):
+                command = match.group("command").decode("utf-8", errors="ignore")
+                destination = match.group("destination").decode("utf-8", errors="ignore")
+                safe_destination = redact_url_for_finding(destination) if "://" in destination else destination
+                if not self._record_finding(
+                    {
+                        "type": "network_command",
+                        "severity": "HIGH",
+                        "confidence": 0.9,
+                        "message": f"{command_type} network command detected: {safe_destination}",
+                        "command": command,
+                        "command_type": command_type.casefold().replace(" ", "_"),
+                        "destination": safe_destination,
+                        "position": match.start("destination"),
+                        "context": context,
+                    }
+                ):
+                    return
 
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
@@ -2267,6 +2455,7 @@ class NetworkCommDetector:
                 "ai",
                 "app",
                 "dev",
+                "example",
                 "xyz",
             ]
             if tld not in valid_tlds:
@@ -2342,6 +2531,7 @@ class NetworkCommDetector:
                             "message": f"Network library detected: {lib.decode()}",
                             "library": lib.decode(),
                             "pattern": pattern.decode("utf-8", errors="ignore"),
+                            "position": match_index,
                             "context": context,
                         }
                     ):
@@ -2383,6 +2573,7 @@ class NetworkCommDetector:
                         "message": f"Network function call detected: {func.decode()}",
                         "function": func.decode(),
                         "snippet": snippet,
+                        "position": idx,
                         "context": context,
                     }
                 ):
@@ -2414,6 +2605,7 @@ class NetworkCommDetector:
                     "message": f"C&C pattern detected: {pattern.decode()}",
                     "pattern": pattern.decode(),
                     "snippet": snippet,
+                    "position": idx,
                     "context": context,
                 }
             ):
