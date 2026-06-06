@@ -204,7 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- validate OCI layer member and link metadata while preserving valid container-root symlinks
+- validate OCI layer member and link metadata without suppressing regular-file payload scans, while preserving valid container-root symlinks
+- prevent cache identity checks from accepting temporary higher-ancestor path swaps
 - fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples

@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import pickle
 import shutil
 import tarfile
 import tempfile
@@ -1665,9 +1666,14 @@ class TestOciLayerScanner:
         assert result.success is True
 
     def test_scan_layer_reports_member_path_traversal_metadata(self, tmp_path: Path) -> None:
-        """Unsafe member names should be reported even though OCI uses temp extraction."""
+        """Unsafe member names must not suppress scanning of their safely extracted bytes."""
+
+        class TraversalPayload:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                return (os.system, ("echo traversal-payload",))
+
         payload = tmp_path / "payload.pkl"
-        payload.write_bytes(b"safe")
+        payload.write_bytes(pickle.dumps(TraversalPayload()))
 
         layer_path = tmp_path / "traversal.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
@@ -1676,16 +1682,20 @@ class TestOciLayerScanner:
         manifest_path = tmp_path / "traversal.manifest"
         manifest_path.write_text(json.dumps({"layers": ["traversal.tar.gz"]}))
 
-        with patch("modelaudit.core.scan_file") as mock_scan:
-            result = OciLayerScanner().scan(str(manifest_path))
+        result = OciLayerScanner().scan(str(manifest_path))
 
-        mock_scan.assert_not_called()
         assert result.success is False
         checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.CRITICAL
         assert checks[0].message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
         assert checks[0].details["member"] == "../../payload.pkl"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "traversal.manifest:traversal.tar.gz:../../payload.pkl" in (issue.location or "")
+            and "path traversal" not in issue.message.lower()
+            for issue in result.issues
+        )
 
         cache_dir = tmp_path / "traversal-cache"
         reset_cache_manager()
@@ -1700,6 +1710,12 @@ class TestOciLayerScanner:
             assert determine_exit_code(aggregate) == 1
             assert any(
                 issue.message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
+                for issue in aggregate.issues
+            )
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL
+                and "traversal.manifest:traversal.tar.gz:../../payload.pkl" in (issue.location or "")
+                and "path traversal" not in issue.message.lower()
                 for issue in aggregate.issues
             )
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0

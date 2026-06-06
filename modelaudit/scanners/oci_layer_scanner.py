@@ -566,7 +566,7 @@ class OciLayerScanner(BaseScanner):
                 details={"layer": layer_ref, "member": name},
                 rule_code="S405",
             )
-            return False, False
+            return False, member.isfile()
 
         metadata_valid = True
         normalized_name = posixpath.normpath(name.replace("\\", "/"))
