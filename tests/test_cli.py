@@ -1,19 +1,30 @@
 import importlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
-from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
+from modelaudit.cli import (
+    _create_path_progress_callback,
+    _display_error,
+    _display_path,
+    _resolve_scan_runtime_config,
+    _ScanPathState,
+    _summarize_progress_tree,
+    cli,
+    expand_paths,
+    format_text_output,
+)
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -58,7 +69,7 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
                 timestamp=time.time(),
                 details=issue_dict.get("details", {}),
                 why=None,
-                type=None,
+                type=issue_dict.get("type"),
             )
             issues.append(issue)
         result.issues = issues
@@ -2205,6 +2216,176 @@ def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: Magic
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure_verbose_log_redacts_signed_url(
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verbose cloud errors should not append raw signed URLs through tracebacks."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    mock_is_cloud.return_value = True
+    mock_download.side_effect = Exception(f"Forbidden while opening {url}")
+    runner = CliRunner()
+
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+def test_scan_cloud_url_dry_run_failure_redacts_signed_url() -> None:
+    """Cloud preview failures should redact signed URLs embedded in provider errors."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    runner = CliRunner()
+
+    with (
+        patch("modelaudit.cli.is_cloud_url", return_value=True),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock) as mock_analyze,
+    ):
+        mock_analyze.side_effect = Exception(f"Forbidden while opening {url}")
+        result = runner.invoke(cli, ["scan", "--dry-run", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in result.output
+    assert "deadbeef" not in result.output
+    assert "secret-token" not in result.output
+    assert "X-Amz-Signature" not in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure_sbom_redacts_signed_url(
+    mock_download: MagicMock, mock_is_cloud: MagicMock, tmp_path: Path
+) -> None:
+    """SBOM fallback paths should not persist raw signed cloud URLs."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    sbom_file = tmp_path / "scan.sbom.json"
+    mock_is_cloud.side_effect = lambda candidate: candidate.startswith("s3://")
+    mock_download.side_effect = Exception(f"Forbidden while opening {url}")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--sbom", str(sbom_file), url])
+
+    assert result.exit_code == 2
+    sbom_text = sbom_file.read_text()
+    assert "s3://bucket/model.bin" in sbom_text
+    assert "deadbeef" not in sbom_text
+    assert "secret-token" not in sbom_text
+    assert "X-Amz-Signature" not in sbom_text
+
+
+def test_display_path_redacts_signed_stream_url() -> None:
+    """stream:// display values should keep routing context without signed query material."""
+    url = "stream://https://models.example/model.bin?X-Amz-Signature=secret&token=hidden"
+
+    display_path = _display_path(url)
+    display_error = _display_error(f"Forbidden while opening {url}", url)
+
+    assert display_path == "stream://https://models.example/model.bin"
+    assert "stream://https://models.example/model.bin" in display_error
+    assert "X-Amz-Signature" not in display_error
+    assert "hidden" not in display_error
+
+
+def test_display_path_redacts_mixed_case_signed_urls() -> None:
+    """URI scheme and host casing must not bypass display redaction."""
+    stream_url = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=stream-secret"
+    cloud_url = "HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=cloud-secret"
+
+    assert _display_path(stream_url) == "stream://https://bucket.s3.amazonaws.com/model.bin"
+    assert _display_path(cloud_url) == "https://bucket.s3.amazonaws.com/model.bin"
+
+
+def test_progress_initial_status_redacts_signed_stream_url() -> None:
+    """Initial progress status should not expose signed stream URLs."""
+    url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+
+    class _Stats:
+        total_bytes = 0
+        total_items = 0
+
+    class _Tracker:
+        stats = _Stats()
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def set_phase(self, _phase: object, message: str) -> None:
+            self.messages.append(message)
+
+        def update_bytes(self, _bytes_processed: int, _message: str) -> None:
+            pass
+
+    tracker = _Tracker()
+    callback = _create_path_progress_callback(spinner=None, progress_tracker=tracker, actual_path=url)
+
+    assert callback is not None
+    assert tracker.messages == ["Starting scan: stream://https://bucket.s3.amazonaws.com/model.bin"]
+
+
+def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
+    """Fallback SBOM paths for stream:// scans must not persist signed query strings."""
+    url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=secret"
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), url)
+
+    assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
+
+
+def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    """Verbose stream failures must not reintroduce signed URLs through exception tracebacks."""
+    url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    runner = CliRunner()
+
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit"),
+        patch(
+            "modelaudit.cli._resolve_scan_source_for_path",
+            side_effect=RuntimeError(f"unexpected failure for {url}"),
+        ),
+    ):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "stream://https://bucket.s3.amazonaws.com/model.bin" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_stream_verbose_scan_failure_omits_raw_traceback(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Post-download stream failures must not leak the signed URL through tracebacks."""
+    url = "s3://bucket/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+    stream_path = f"stream://{url}"
+    mock_is_cloud.side_effect = lambda candidate: candidate.startswith("s3://")
+    mock_download.return_value = stream_path
+    mock_scan.side_effect = RuntimeError(f"scan failed for {url}")
+    runner = CliRunner()
+
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.pkl" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
 def test_scan_cloud_url_with_issues(
@@ -2708,6 +2889,36 @@ def test_scan_mlflow_uri_with_options(
         cache_dir=default_remote_cache_dir(),
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.record_download_completed")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
+    mock_scan_mlflow: MagicMock,
+    mock_record_download_completed: MagicMock,
+) -> None:
+    """Budget refusals should not emit successful-download telemetry."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=0,
+        issues=[
+            {
+                "message": "Unable to determine MLflow artifact size before download",
+                "severity": "info",
+                "type": "mlflow_download_budget",
+            }
+        ],
+        files_scanned=0,
+        has_errors=True,
+        success=False,
+        scanners=["mlflow"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"])
+
+    assert result.exit_code == 2
+    assert "Download refused by configured size budget" in result.output
+    mock_record_download_completed.assert_not_called()
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
