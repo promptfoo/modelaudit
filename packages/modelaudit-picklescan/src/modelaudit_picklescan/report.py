@@ -37,7 +37,7 @@ class Severity(str, Enum):
 
 
 def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    frozen = _deep_freeze(deepcopy(dict(value)))
+    frozen = _deep_freeze(_deep_mutable_copy(dict(value)))
     assert isinstance(frozen, Mapping)
     return frozen
 
@@ -174,9 +174,11 @@ class PickleReport:
     coverage: CoverageSummary = field(default_factory=CoverageSummary)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+    private_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
+        object.__setattr__(self, "private_metadata", _immutable_mapping(self.private_metadata))
 
     @property
     def has_security_findings(self) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,76 @@ def test_pickle_report_to_scan_result_maps_clean_report_to_successful_result() -
     assert result.metadata["pickle_coverage"]["opcode_count"] == 3
     assert result.issues == []
     assert any(check.name == "Standalone Pickle Scan" and check.status.value == "passed" for check in result.checks)
+
+
+def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_serialization() -> None:
+    report = PickleReport(
+        source="safe.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        private_metadata={
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": ["/tmp/src"],
+                "resolution_context": {
+                    "meta_path": ["importlib.PathFinder"],
+                    "path_hooks": [],
+                    "path_importers": [],
+                },
+                "module_sources": {"helper": "/tmp/src/helper.py"},
+                "loaded_module_sources": {},
+                "fingerprints": {"/tmp/src/helper.py": "1111"},
+            }
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+    serialized = result.to_dict(include_private_metadata=True)
+
+    json.dumps(serialized)
+    assert serialized["_private_metadata"]["call_graph_source_fingerprints"] == {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": {
+            "meta_path": ["importlib.PathFinder"],
+            "path_hooks": [],
+            "path_importers": [],
+        },
+        "module_sources": {"helper": "/tmp/src/helper.py"},
+        "loaded_module_sources": {},
+        "fingerprints": {"/tmp/src/helper.py": "1111"},
+    }
+    assert "call_graph_source_fingerprints" not in result.to_dict()["metadata"]
+
+    result.merge(
+        pickle_report_to_scan_result(
+            PickleReport(
+                source="other.pkl",
+                status=ScanStatus.COMPLETE,
+                verdict=SafetyVerdict.CLEAN,
+                private_metadata={
+                    "call_graph_source_fingerprints": {
+                        "reusable": True,
+                        "search_context": ["/tmp/src"],
+                        "resolution_context": {
+                            "meta_path": ["importlib.PathFinder"],
+                            "path_hooks": [],
+                            "path_importers": [],
+                        },
+                        "module_sources": {"other": "/tmp/src/other.py"},
+                        "loaded_module_sources": {},
+                        "fingerprints": {"/tmp/src/other.py": "2222"},
+                    }
+                },
+            )
+        )
+    )
+    assert result.to_dict(include_private_metadata=True)["_private_metadata"]["call_graph_source_fingerprints"][
+        "fingerprints"
+    ] == {
+        "/tmp/src/helper.py": "1111",
+        "/tmp/src/other.py": "2222",
+    }
 
 
 def test_pickle_report_to_scan_result_preserves_security_findings() -> None:

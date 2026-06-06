@@ -13,6 +13,7 @@ import functools
 import importlib
 import io
 import logging
+import marshal
 import os
 import pickle
 import py_compile
@@ -24,9 +25,18 @@ import uuid
 import warnings
 import zipfile
 from importlib.abc import Loader
-from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    FileFinder,
+    ModuleSpec,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
+from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
-from types import ModuleType
+from types import CodeType, ModuleType
 from typing import cast
 
 import pytest
@@ -45,13 +55,27 @@ from modelaudit_picklescan import (
     scan_file,
 )
 from modelaudit_picklescan.call_graph import (
+    _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
+    _begin_shared_source_report,
     _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     _clear_source_sensitive_caches,
+    _effective_bytecode_matches_source,
+    _ensure_shared_source_snapshot_stable,
+    _is_standard_path_hook,
+    _meta_path_finder_resolution_identity,
+    _path_hook_resolution_identity,
+    _read_candidate_fingerprint,
+    _resolution_candidate_fingerprint,
+    _track_shared_source_candidates,
+    _track_shared_source_path,
+    _trusted_module_origin_kind,
     find_startup_hook_write_call_graphs,
+    shared_source_fingerprint_metadata,
+    shared_source_sensitive_caches,
 )
 
 
@@ -1437,8 +1461,124 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.metadata["container_type"] == "pytorch_zip"
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert source_fingerprints["fingerprints"] == {}
+    assert source_fingerprints["read_fingerprints"] == {}
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
+
+
+def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    helper_path = source_root / "helper.py"
+    helper_path.write_text("def entrypoint():\n    return 1\n")
+    other_path = source_root / "other.py"
+    other_path.write_text("def entrypoint():\n    return 2\n")
+    monkeypatch.syspath_prepend(str(source_root))
+
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"\x80\x04" + _global(b"helper", b"entrypoint") + b")R.")
+        archive.writestr("archive/extra.pkl", b"\x80\x04" + _global(b"other", b"entrypoint") + b")R.")
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert "call_graph_source_fingerprints" not in report.metadata
+    assert "call_graph_source_fingerprints" not in report.to_dict()["metadata"]
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(helper_path.absolute()) in source_fingerprints["fingerprints"]
+    assert str(other_path.absolute()) in source_fingerprints["fingerprints"]
+    assert str(helper_path.absolute()) in source_fingerprints["read_fingerprints"]
+    assert str(other_path.absolute()) in source_fingerprints["read_fingerprints"]
+    assert source_fingerprints["module_sources"] == {
+        "helper": str(helper_path.absolute()),
+        "other": str(other_path.absolute()),
+    }
+    assert source_fingerprints["loaded_module_sources"] == {}
+
+
+def test_merge_call_graph_source_fingerprint_metadata_marks_read_conflict_unreusable() -> None:
+    context = {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []}
+    existing = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": context,
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "fingerprints": {},
+        "read_fingerprints": {
+            "/tmp/src/helper.py": {"read_limit": 1024, "require_complete": True, "fingerprint": "1111"}
+        },
+    }
+    incoming = {
+        **existing,
+        "read_fingerprints": {
+            "/tmp/src/helper.py": {"read_limit": 1024, "require_complete": True, "fingerprint": "2222"}
+        },
+    }
+
+    merged = package_api._merge_call_graph_source_fingerprint_metadata(existing, incoming)
+
+    assert merged["reusable"] is False
+    assert merged["read_fingerprints"]["/tmp/src/helper.py"]["fingerprint"] == "1111"
+
+
+def test_merge_call_graph_source_fingerprints_preserves_source_independence_only_when_all_members_are() -> None:
+    source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    source_sensitive = {
+        "reusable": True,
+        "search_context": ["source-root"],
+        "resolution_context": {"meta_path": [], "path_hooks": [], "path_importers": []},
+        "fingerprints": {"source.py": "digest"},
+        "read_fingerprints": {},
+        "module_sources": {"source": "source.py"},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+    assert package_api._merge_call_graph_source_fingerprint_metadata(None, source_independent) == source_independent
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, source_independent)
+        == source_independent
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_independent, source_sensitive)
+        == source_sensitive
+    )
+    assert (
+        package_api._merge_call_graph_source_fingerprint_metadata(source_sensitive, source_independent)
+        == source_sensitive
+    )
+
+
+def test_combine_pytorch_zip_reports_marks_missing_member_fingerprint_provenance_unreusable() -> None:
+    source_independent = package_api._source_independent_call_graph_fingerprint_metadata()
+    proven_member = PickleReport(
+        source="model.pt:archive/data.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        private_metadata={"call_graph_source_fingerprints": source_independent},
+    )
+    unproven_member = PickleReport(
+        source="model.pt:archive/extra.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+    )
+
+    private_metadata = package_api._combine_call_graph_source_fingerprint_private_metadata(
+        [proven_member, unproven_member]
+    )
+
+    assert private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert "source_independent" not in private_metadata["call_graph_source_fingerprints"]
 
 
 @pytest.mark.parametrize(
@@ -1472,6 +1612,33 @@ def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metada
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.metadata["analysis_incomplete"] is True
     assert report.metadata[metadata_key] is True
+
+
+def test_merge_call_graph_source_fingerprints_rejects_conflicting_read_records() -> None:
+    context = {"meta_path": ["importlib.PathFinder"], "path_hooks": [], "path_importers": []}
+    first = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "resolution_context": context,
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+        "fingerprints": {},
+        "read_fingerprints": {
+            "/tmp/src/__pycache__": {"read_limit": 1048576, "require_complete": True, "fingerprint": "1111"}
+        },
+    }
+    second = {
+        **first,
+        "read_fingerprints": {
+            "/tmp/src/__pycache__": {"read_limit": 1048576, "require_complete": True, "fingerprint": "2222"}
+        },
+    }
+
+    merged = package_api._merge_call_graph_source_fingerprint_metadata(first, second)
+
+    assert merged["reusable"] is False
+    assert merged["read_fingerprints"]["/tmp/src/__pycache__"]["fingerprint"] == "1111"
 
 
 def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:
@@ -1941,6 +2108,53 @@ def test_scan_stream_short_read_preserves_proven_oversized_frame_tamper() -> Non
     assert finding.details["frame_length"] == 3
     assert any(notice.code == "oversized_frame" for notice in report.notices)
     assert any(error.category == "short_read" for error in report.errors)
+
+
+def test_stream_report_copy_helpers_preserve_private_metadata() -> None:
+    private_metadata = {"call_graph_source_fingerprints": {"reusable": True}}
+    report = PickleReport(
+        source="metadata-preservation.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        notices=(
+            package_api.Notice(
+                message="Unproven oversized frame",
+                code="oversized_frame",
+                details={},
+            ),
+        ),
+        private_metadata=private_metadata,
+    )
+
+    copied_reports = (
+        package_api._without_unproven_oversized_frame_tamper(
+            report,
+            bytes_total=None,
+            stream_start_offset=0,
+        ),
+        package_api._with_unbounded_stream_notice(
+            report,
+            source=report.source,
+            bytes_scanned=8,
+            max_unbounded_read_bytes=8,
+        ),
+        package_api._with_known_stream_notice(
+            report,
+            source=report.source,
+            bytes_scanned=8,
+            bytes_total=16,
+            max_known_read_bytes=8,
+            stream_start_offset=0,
+        ),
+        package_api._with_short_read_error(
+            report,
+            source=report.source,
+            error=package_api._StreamShortReadError(expected_size=16, bytes_read=8, partial_payload=b"partial"),
+            stream_start_offset=0,
+        ),
+    )
+
+    assert all(copied.private_metadata == private_metadata for copied in copied_reports)
 
 
 def test_scan_stream_scans_partial_bytes_on_short_read() -> None:
@@ -4167,18 +4381,22 @@ def test_scan_bytes_warns_when_meta_path_finder_shadows_framework_reference(
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
 
-    report = scan_bytes(payload, source="meta-path-shadowed-framework.pkl")
+    try:
+        report = scan_bytes(payload, source="meta-path-shadowed-framework.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert marker.exists() is False
-    assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-        for finding in report.findings
-    )
-    pickle.loads(payload)
-    assert marker.read_text(encoding="utf-8") == "owned"
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop("torch._utils", None)
+        sys.modules.pop("torch", None)
 
 
 @pytest.mark.skipif(not EXTENSION_SUFFIXES, reason="Python runtime has no native extension suffix")
@@ -5222,6 +5440,9 @@ def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabl
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
         for finding in report.findings
     )
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str((tmp_path / "numpy.py").absolute()) in source_fingerprints["fingerprints"]
     load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
     subprocess.run([sys.executable, "-c", load_payload], check=True)
     assert marker.read_text(encoding="utf-8") == "owned"
@@ -5237,6 +5458,27 @@ def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    assert report.private_metadata["call_graph_source_fingerprints"]["reusable"] is True
+
+
+def test_oversized_import_hook_state_disables_source_fingerprint_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StatefulPathHook:
+        def __init__(self) -> None:
+            for index in range(17):
+                setattr(self, f"state_{index}", index)
+
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    monkeypatch.setattr(sys, "path_hooks", [StatefulPathHook()])
+
+    with shared_source_sensitive_caches():
+        source_fingerprints = shared_source_fingerprint_metadata()
+
+    assert source_fingerprints is not None
+    assert source_fingerprints["reusable"] is False
 
 
 def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
@@ -5574,6 +5816,708 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def test_with_call_graph_findings_records_source_fingerprint_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "safe_module.py"
+    module_path.write_text("def safe():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [finder for finder in sys.meta_path if ":unreusable:" not in _meta_path_finder_resolution_identity(finder)],
+    )
+
+    report = PickleReport(
+        source="safe-module.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "safe_module", "name": "safe"},),
+            "callable_invocations": ({"module": "safe_module", "name": "safe"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert "call_graph_source_fingerprints" not in updated.metadata
+    assert "call_graph_source_fingerprints" not in updated.to_dict()["metadata"]
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
+    assert source_fingerprints["module_sources"] == {"safe_module": str(module_path.absolute())}
+    assert source_fingerprints["loaded_module_sources"] == {}
+    assert source_fingerprints["resolution_context"]["meta_path"]
+
+
+def test_with_call_graph_findings_fails_closed_for_loaded_source_outside_search_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "outside"
+    source_root.mkdir()
+    module_path = source_root / "loaded_safe_module.py"
+    module_path.write_text("def safe():\n    return 1\n")
+    module = ModuleType("loaded_safe_module")
+    module.__spec__ = ModuleSpec("loaded_safe_module", loader=None, origin=str(module_path))
+    monkeypatch.setitem(sys.modules, "loaded_safe_module", module)
+
+    report = PickleReport(
+        source="loaded-safe-module.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "loaded_safe_module", "name": "safe"},),
+            "callable_invocations": ({"module": "loaded_safe_module", "name": "safe"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert any(notice.code == "call_graph_source_unavailable" for notice in updated.notices)
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(module_path.absolute()) not in source_fingerprints["fingerprints"]
+    assert source_fingerprints["module_sources"] == {}
+    assert source_fingerprints["loaded_module_sources"] == {}
+
+
+def test_with_call_graph_findings_fingerprints_parent_package_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_package = first_root / "fingerprint_pkg"
+    second_package = second_root / "fingerprint_pkg"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    (first_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    (second_package / "__init__.py").write_text("")
+    (second_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(second_root))
+    monkeypatch.syspath_prepend(str(first_root))
+
+    report = PickleReport(
+        source="parent-package-marker.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "fingerprint_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "fingerprint_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    initial = package_api._with_call_graph_findings(report)
+
+    assert initial.verdict == SafetyVerdict.CLEAN
+    source_fingerprints = initial.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["fingerprints"][str((first_package / "__init__.py").absolute())] is None
+
+    (first_package / "__init__.py").write_text("")
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+
+
+def test_with_call_graph_findings_fingerprints_higher_priority_namespace_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_package = first_root / "namespace_pkg"
+    second_package = second_root / "namespace_pkg"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    safe_module = second_package / "child.py"
+    safe_module.write_text("def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(second_root))
+    monkeypatch.syspath_prepend(str(first_root))
+
+    report = PickleReport(
+        source="namespace-candidate.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "namespace_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "namespace_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    initial = package_api._with_call_graph_findings(report)
+
+    assert initial.verdict == SafetyVerdict.CLEAN
+    source_fingerprints = initial.private_metadata["call_graph_source_fingerprints"]
+    higher_priority_module = first_package / "child.py"
+    assert source_fingerprints["fingerprints"][str(higher_priority_module.absolute())] is None
+    assert source_fingerprints["fingerprints"][str(safe_module.absolute())] is not None
+
+    higher_priority_module.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+
+
+def test_with_call_graph_findings_fingerprints_sourceless_parent_package_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_package = first_root / "fingerprint_pyc_pkg"
+    second_package = second_root / "fingerprint_pyc_pkg"
+    first_package.mkdir(parents=True)
+    second_package.mkdir(parents=True)
+    (first_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    (second_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    package_source = tmp_path / "package_init.py"
+    package_source.write_text("")
+    package_marker = second_package / "__init__.pyc"
+    py_compile.compile(str(package_source), cfile=str(package_marker), doraise=True)
+    monkeypatch.syspath_prepend(str(second_root))
+    monkeypatch.syspath_prepend(str(first_root))
+
+    report = PickleReport(
+        source="sourceless-parent-package-marker.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "fingerprint_pyc_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "fingerprint_pyc_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    initial = package_api._with_call_graph_findings(report)
+
+    assert initial.verdict == SafetyVerdict.CLEAN
+    source_fingerprints = initial.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["fingerprints"][str(package_marker.absolute())] is not None
+
+    package_marker.unlink()
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+
+
+def test_with_call_graph_findings_disables_reuse_for_oversized_module_names() -> None:
+    module_name = "m" * 4097
+    report = PickleReport(
+        source="oversized-module-name.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert isinstance(updated.private_metadata["call_graph_source_fingerprints"]["reusable"], bool)
+
+
+def test_distribution_root_trust_disables_cache_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_editable_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._installed_distribution_roots",
+        lambda _top_level_name: (tmp_path.resolve(),),
+    )
+    _trusted_module_origin_kind.cache_clear()
+
+    try:
+        with shared_source_sensitive_caches():
+            assert _trusted_module_origin_kind(module_name) == "site_packages"
+            metadata = shared_source_fingerprint_metadata()
+    finally:
+        _trusted_module_origin_kind.cache_clear()
+
+    assert metadata is not None
+    assert metadata["reusable"] is False
+
+
+def test_source_fingerprint_limit_disables_reuse_without_invalidating_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "bounded_module.py"
+    source_path.write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+    absolute_source_path = str(source_path.absolute())
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._MAX_SOURCE_FINGERPRINT_CANDIDATES", 0)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._current_module_source_path",
+        lambda _module_name: absolute_source_path,
+    )
+
+    with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        _track_shared_source_path("bounded_module", source_path, loaded=False)
+        _ensure_shared_source_snapshot_stable(report_generation)
+        metadata = shared_source_fingerprint_metadata()
+
+    assert metadata is not None
+    assert metadata["reusable"] is False
+
+
+def test_zipimport_archive_changes_invalidate_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "modules.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("zip_pkg/__init__.py", "")
+        archive.writestr("zip_pkg/helper.py", "def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(archive_path))
+
+    with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        _track_shared_source_candidates(("zip_pkg", "helper"))
+        metadata = shared_source_fingerprint_metadata()
+        assert metadata is not None
+        assert metadata["fingerprints"][str(archive_path.absolute())] is not None
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("zip_pkg/__init__.py", "")
+            archive.writestr("zip_pkg/helper.py", "import os\nos.system('id')\n")
+
+        with pytest.raises(_CallGraphAnalysisLimitError, match="source changed"):
+            _ensure_shared_source_snapshot_stable(report_generation)
+
+
+def test_recreated_file_finder_hooks_are_not_trusted() -> None:
+    equivalent_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+    different_hook = FileFinder.path_hook((SourcelessFileLoader, BYTECODE_SUFFIXES))
+
+    assert not _is_standard_path_hook(equivalent_hook)
+    assert not _is_standard_path_hook(different_hook)
+
+
+def test_spoofed_equivalent_file_finder_hook_is_not_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_spoofed_file_finder_hook"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+    marker = tmp_path / "evil_loader_called"
+
+    class EvilLoader(SourceFileLoader):
+        def get_code(self, fullname: str) -> CodeType:
+            del fullname
+            return compile(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+                "def entrypoint():\n"
+                "    import os\n"
+                "    return os.system('echo hidden')\n",
+                str(module_path),
+                "exec",
+            )
+
+    EvilLoader.__module__ = SourceFileLoader.__module__
+    EvilLoader.__qualname__ = SourceFileLoader.__qualname__
+    trusted_hook = FileFinder.path_hook((SourceFileLoader, SOURCE_SUFFIXES))
+    evil_hook = FileFinder.path_hook((EvilLoader, SOURCE_SUFFIXES))
+    evil_hook.__module__ = trusted_hook.__module__
+    evil_hook.__qualname__ = trusted_hook.__qualname__
+    monkeypatch.setattr(sys, "path_hooks", [evil_hook])
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.path_importer_cache.pop(str(tmp_path), None)
+
+    try:
+        assert not _is_standard_path_hook(evil_hook)
+        report = scan_bytes(
+            b"\x80\x04" + _global(module_name.encode(), b"entrypoint") + b")R.",
+            source="spoofed-file-finder-hook.pkl",
+        )
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+        assert not marker.exists()
+
+        __import__(module_name)
+        assert marker.read_text(encoding="utf-8") == "loaded"
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path_importer_cache.pop(str(tmp_path), None)
+
+
+def test_pytest_finder_identity_hashes_state_beyond_legacy_item_limit() -> None:
+    rewrite_module = pytest.importorskip("_pytest.assertion.rewrite")
+    finder_type = rewrite_module.AssertionRewritingHook
+    finder = object.__new__(finder_type)
+    finder._basenames_to_check_rewrite = set()
+    finder.session = None
+    finder.fnpats = ()
+    finder._writing_pyc = False
+    finder._must_rewrite = {*(f"module_{index:02d}" for index in range(16)), "zz_first"}
+
+    initial_identity = _meta_path_finder_resolution_identity(finder)
+    finder._must_rewrite.remove("zz_first")
+    finder._must_rewrite.add("zz_second")
+
+    assert _meta_path_finder_resolution_identity(finder) != initial_identity
+
+
+def test_loaded_parent_package_path_controls_child_source_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_root = tmp_path / "safe"
+    runtime_root = tmp_path / "runtime"
+    safe_package = safe_root / "loaded_parent_pkg"
+    runtime_package = runtime_root / "loaded_parent_pkg"
+    safe_package.mkdir(parents=True)
+    runtime_package.mkdir(parents=True)
+    (safe_package / "__init__.py").write_text("")
+    (safe_package / "child.py").write_text("def entrypoint():\n    return 1\n")
+    (runtime_package / "__init__.py").write_text("")
+    (runtime_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+    monkeypatch.syspath_prepend(str(safe_root))
+
+    loaded_package = ModuleType("loaded_parent_pkg")
+    loaded_spec = ModuleSpec(
+        "loaded_parent_pkg",
+        loader=None,
+        origin=str(runtime_package / "__init__.py"),
+        is_package=True,
+    )
+    loaded_spec.submodule_search_locations = [str(runtime_package)]
+    loaded_package.__spec__ = loaded_spec
+    loaded_package.__path__ = [str(runtime_package)]
+    monkeypatch.setitem(sys.modules, "loaded_parent_pkg", loaded_package)
+
+    report = PickleReport(
+        source="loaded-parent-package.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "loaded_parent_pkg.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": "loaded_parent_pkg.child", "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.COMPLETE
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in updated.findings)
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert source_fingerprints["loaded_package_paths"]["loaded_parent_pkg"] == (str(runtime_package.absolute()),)
+
+
+def test_loaded_parent_package_custom_importer_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = f"loaded_custom_pkg_{uuid.uuid4().hex}"
+    runtime_package = tmp_path / package_name
+    runtime_package.mkdir()
+    (runtime_package / "child.py").write_text("def entrypoint():\n    return 1\n", encoding="utf-8")
+
+    class CustomFinder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def find_spec(self, fullname: str, _target: object = None) -> ModuleSpec | None:
+            self.calls += 1
+            return ModuleSpec(fullname, loader=None, origin="custom://child")
+
+    finder = CustomFinder()
+    loaded_package = ModuleType(package_name)
+    loaded_spec = ModuleSpec(
+        package_name,
+        loader=None,
+        origin=str(runtime_package / "__init__.py"),
+        is_package=True,
+    )
+    loaded_spec.submodule_search_locations = [str(runtime_package)]
+    loaded_package.__spec__ = loaded_spec
+    loaded_package.__path__ = [str(runtime_package)]
+    monkeypatch.setitem(sys.modules, package_name, loaded_package)
+    monkeypatch.setitem(sys.path_importer_cache, str(runtime_package), finder)
+    report = PickleReport(
+        source="loaded-custom-package.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": f"{package_name}.child", "name": "entrypoint"},),
+            "callable_invocations": ({"module": f"{package_name}.child", "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert any(notice.code == "call_graph_source_unavailable" for notice in updated.notices)
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert finder.calls == 0
+
+
+def test_valid_mismatched_source_bytecode_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "mismatched_cached_bytecode"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n")
+    py_compile.compile(str(module_path), doraise=True)
+    bytecode_path = Path(cache_from_source(str(module_path)))
+    bytecode_header = bytecode_path.read_bytes()[:16]
+    marker = tmp_path / "mismatched_bytecode_loaded"
+    malicious_code = compile(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        "import os\n\ndef entrypoint():\n    return os.system('id')\n",
+        str(module_path),
+        "exec",
+    )
+    bytecode_path.write_bytes(bytecode_header + marshal.dumps(malicious_code))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = PickleReport(
+        source="mismatched-cached-bytecode.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
+    assert not marker.exists()
+
+    try:
+        __import__(module_name)
+        assert marker.read_text(encoding="utf-8") == "loaded"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_matching_source_bytecode_remains_analyzable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "matching_cached_bytecode"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def entrypoint():\n    return 1\n")
+    py_compile.compile(str(module_path), doraise=True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = PickleReport(
+        source="matching-cached-bytecode.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": module_name, "name": "entrypoint"},),
+            "callable_invocations": ({"module": module_name, "name": "entrypoint"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.COMPLETE
+    assert updated.verdict == SafetyVerdict.CLEAN
+    assert updated.findings == ()
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(Path(cache_from_source(str(module_path))).absolute()) in source_fingerprints["fingerprints"]
+
+
+@pytest.mark.parametrize("oversized_file", ["source", "bytecode"])
+def test_effective_bytecode_validation_rejects_oversized_files_without_unbounded_reads(
+    oversized_file: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "bounded_source.py"
+    source_path.write_bytes(b"value = 1\n")
+    bytecode_path = tmp_path / "bounded_source.pyc"
+    bytecode_path.write_bytes(b"invalid-bytecode")
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._MAX_SOURCE_BYTES", 32)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._source_cache_path", lambda _path: bytecode_path)
+
+    if oversized_file == "source":
+        source_path.write_bytes(b"x" * 33)
+    else:
+        bytecode_path.write_bytes(b"x" * 65)
+
+    def fail_unbounded_read(_path: Path) -> bytes:
+        raise AssertionError("bytecode validation attempted Path.read_bytes()")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_unbounded_read)
+
+    assert not _effective_bytecode_matches_source(source_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO files are not supported on this platform")
+def test_resolution_candidate_fingerprint_rejects_fifo(tmp_path: Path) -> None:
+    source_path = tmp_path / "blocked_source.py"
+    os.mkfifo(source_path)
+
+    reusable, fingerprint = _resolution_candidate_fingerprint(source_path)
+
+    assert reusable is False
+    assert fingerprint is None
+
+
+def test_resolution_candidate_fingerprint_tracks_large_extension_identity(tmp_path: Path) -> None:
+    extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
+    extension_path.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    reusable, initial_fingerprint = _resolution_candidate_fingerprint(extension_path)
+
+    assert reusable is True
+    assert isinstance(initial_fingerprint, str)
+    assert initial_fingerprint.startswith(f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:")
+
+    replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
+    replacement_path.write_bytes(b"y" * (1024 * 1024 + 1))
+    os.replace(replacement_path, extension_path)
+
+    reusable, replacement_fingerprint = _resolution_candidate_fingerprint(extension_path)
+
+    assert reusable is True
+    assert replacement_fingerprint != initial_fingerprint
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+def test_resolution_candidate_fingerprint_rejects_path_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    replacement_path = tmp_path / "replacement.py"
+    malicious_source = b"import os\nos.system('id')\n"
+    replacement_path.write_bytes(malicious_source)
+    displaced_path = tmp_path / "displaced.py"
+    original_read = os.read
+    replaced = False
+
+    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(file_descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            source_path.rename(displaced_path)
+            replacement_path.rename(source_path)
+        return chunk
+
+    monkeypatch.setattr(os, "read", replace_after_first_read)
+
+    assert _resolution_candidate_fingerprint(source_path) == (False, None)
+    assert source_path.read_bytes() == malicious_source
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+def test_read_candidate_fingerprint_rejects_path_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "helper.pyc"
+    source_path.write_bytes(b"safe bytecode")
+    replacement_path = tmp_path / "replacement.pyc"
+    malicious_source = b"malicious bytecode"
+    replacement_path.write_bytes(malicious_source)
+    displaced_path = tmp_path / "displaced.pyc"
+    original_read = os.read
+    replaced = False
+
+    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(file_descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            source_path.rename(displaced_path)
+            replacement_path.rename(source_path)
+        return chunk
+
+    monkeypatch.setattr(os, "read", replace_after_first_read)
+
+    assert _read_candidate_fingerprint(source_path) == (False, None)
+    assert source_path.read_bytes() == malicious_source
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
+def test_resolution_extension_fingerprint_rejects_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension_path = tmp_path / f"native_module{EXTENSION_SUFFIXES[0]}"
+    extension_path.write_bytes(b"safe extension")
+    replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
+    replacement_path.write_bytes(b"malicious extension")
+    displaced_path = tmp_path / f"displaced{EXTENSION_SUFFIXES[0]}"
+    original_fstat = os.fstat
+    fstat_calls = 0
+
+    def replace_after_second_fstat(file_descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        file_stat = original_fstat(file_descriptor)
+        fstat_calls += 1
+        if fstat_calls == 2:
+            extension_path.rename(displaced_path)
+            replacement_path.rename(extension_path)
+        return file_stat
+
+    monkeypatch.setattr(os, "fstat", replace_after_second_fstat)
+
+    assert _resolution_candidate_fingerprint(extension_path) == (False, None)
+
+
+def test_standard_file_finder_path_hook_stops_being_trusted_after_method_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_hook = next(
+        hook
+        for hook in sys.path_hooks
+        if _path_hook_resolution_identity(hook) == "trusted:importlib.machinery.FileFinder.path_hook"
+    )
+    initial_identity = _path_hook_resolution_identity(standard_hook)
+
+    def changed_find_spec(self: FileFinder, _name: str, _target: object = None) -> None:
+        return None
+
+    monkeypatch.setattr(FileFinder, "find_spec", changed_find_spec)
+
+    changed_identity = _path_hook_resolution_identity(standard_hook)
+    assert changed_identity != initial_identity
+    assert ":unreusable:" in changed_identity
+    assert not _is_standard_path_hook(standard_hook)
+
+
+def test_arbitrary_path_hook_is_not_trusted_even_if_present_at_startup() -> None:
+    class StartupPathHook:
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    hook = StartupPathHook()
+
+    assert not _is_standard_path_hook(hook)
+    assert ":unreusable:" in _path_hook_resolution_identity(hook)
+
+
 def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:
     pytest.importorskip("click")
 
@@ -5591,9 +6535,10 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
+    assert "call_graph_source_fingerprints" not in updated.metadata
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is False
 
 
 def test_scan_bytes_skips_call_graph_enrichment_without_references(
@@ -5609,6 +6554,15 @@ def test_scan_bytes_skips_call_graph_enrichment_without_references(
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    assert report.private_metadata["call_graph_source_fingerprints"] == {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
 
 
 def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
@@ -5916,7 +6870,7 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocati
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
     assert updated.verdict == SafetyVerdict.UNKNOWN
     assert updated.findings == ()
 
@@ -5958,7 +6912,8 @@ def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (finding,)
 
 
@@ -6062,7 +7017,7 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_scan_is_
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
     assert updated.verdict == SafetyVerdict.UNKNOWN
     assert updated.findings == ()
 
@@ -6161,7 +7116,8 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_i
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (existing_finding,)
 
 
@@ -6194,7 +7150,8 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_opener_i
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (existing_finding,)
 
 

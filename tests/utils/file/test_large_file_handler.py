@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import struct
+import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.scan_results_cache import _source_resolution_context
 from modelaudit.scanners import keras_h5_scanner, safetensors_scanner
 from modelaudit.scanners.base import ScanResult
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
@@ -108,6 +112,61 @@ def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("module", "scan_func", "internal_name"),
+    [
+        (large_file_handler, large_file_handler.scan_large_file, "_scan_large_file_internal"),
+        (advanced_handlers, advanced_handlers.scan_advanced_large_file, "_scan_advanced_large_file_internal"),
+    ],
+)
+def test_large_handler_cache_preserves_private_metadata_for_internal_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    scan_func: Callable[..., ScanResult],
+    internal_name: str,
+) -> None:
+    payload = tmp_path / "model.pkl"
+    payload.write_bytes(b"safe")
+    cache_dir = tmp_path / "cache"
+    scan_calls = 0
+    fingerprint_metadata = {
+        "reusable": True,
+        "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+        "resolution_context": _source_resolution_context(),
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+        "fingerprints": {},
+        "read_fingerprints": {},
+    }
+
+    class CachedScanner:
+        def __init__(self) -> None:
+            self.config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+
+    def scan_internal(*_args: object, **_kwargs: object) -> ScanResult:
+        nonlocal scan_calls
+        scan_calls += 1
+        result = ScanResult(scanner_name="pickle")
+        result._private_metadata["call_graph_source_fingerprints"] = fingerprint_metadata
+        result.finish()
+        return result
+
+    monkeypatch.setattr(module, internal_name, scan_internal)
+    reset_cache_manager()
+    try:
+        first = scan_func(str(payload), CachedScanner())
+        second = scan_func(str(payload), CachedScanner())
+    finally:
+        reset_cache_manager()
+
+    assert scan_calls == 1
+    assert first._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
+    assert second._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
+    assert "_private_metadata" not in second.to_dict()
 
 
 @pytest.mark.parametrize(

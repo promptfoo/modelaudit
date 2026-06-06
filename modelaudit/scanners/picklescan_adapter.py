@@ -12,7 +12,7 @@ from modelaudit_picklescan import Finding, Notice, PickleReport, ScanError, Scan
 
 from modelaudit.config.explanations import get_import_explanation
 
-from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_results import _deep_mutable_copy, mark_inconclusive_scan_result
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
 
@@ -35,6 +35,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
 )
 _NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
+_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY = "call_graph_source_fingerprints"
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
@@ -189,6 +190,11 @@ def pickle_report_to_scan_result(
     report_dict = report.to_dict()
     report_metadata = report_dict["metadata"]
     result = ScanResult(scanner_name=scanner_name, scanner=scanner)
+    fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY)
+    if isinstance(fingerprint_metadata, Mapping):
+        result._private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY] = _deep_mutable_copy(
+            fingerprint_metadata
+        )
     result.bytes_scanned = report.coverage.bytes_scanned
     result.metadata.update(report_metadata)
     result.metadata["pickle_report_status"] = report.status.value

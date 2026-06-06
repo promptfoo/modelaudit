@@ -27,7 +27,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     Returns:
         Reconstructed ScanResult object
     """
-    from ...scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+    from ...scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult, _deep_mutable_copy
 
     # Create new ScanResult with the same scanner name
     scanner_name = result_dict.get("scanner", "cached")
@@ -42,6 +42,9 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     else:
         result.end_time = time.time()
     result.metadata.update(result_dict.get("metadata", {}))
+    private_metadata = result_dict.get("_private_metadata")
+    if isinstance(private_metadata, dict):
+        result._private_metadata.update(_deep_mutable_copy(private_metadata))
 
     # Restore bytes_scanned from cache
     result.bytes_scanned = result_dict.get("bytes_scanned", 0)

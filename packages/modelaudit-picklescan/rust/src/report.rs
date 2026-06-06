@@ -214,6 +214,10 @@ fn detail_dict_to_py(py: Python<'_>, details: &[(String, DetailValue)]) -> PyRes
     Ok(dict.unbind())
 }
 
+pub(crate) fn empty_private_metadata(py: Python<'_>) -> Py<PyDict> {
+    PyDict::new(py).unbind()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

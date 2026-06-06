@@ -3,6 +3,8 @@
 import json
 import logging
 import time
+from collections.abc import Mapping
+from copy import deepcopy
 from enum import Enum
 from typing import Any, Final
 
@@ -20,6 +22,134 @@ RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_inc
 RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
 RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY: Final[str] = "raw_detector_failed_detectors"
 UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
+CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
+
+
+def _deep_mutable_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_mutable_copy(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_deep_mutable_copy(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return [_deep_mutable_copy(item) for item in value]
+    return deepcopy(value)
+
+
+def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
+    return dict(metadata) == {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+
+def _merge_call_graph_source_fingerprints_metadata(
+    existing: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> dict[str, Any]:
+    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+        return {key: _deep_mutable_copy(value) for key, value in existing.items()}
+    if _is_source_independent_call_graph_fingerprint_metadata(existing):
+        return {key: _deep_mutable_copy(value) for key, value in incoming.items()}
+
+    merged: dict[str, Any] = _deep_mutable_copy(existing)
+    existing_fingerprints = existing.get("fingerprints")
+    incoming_fingerprints = incoming.get("fingerprints")
+    fingerprints = _deep_mutable_copy(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
+    fingerprint_conflict = False
+    if isinstance(incoming_fingerprints, Mapping):
+        for path, fingerprint in incoming_fingerprints.items():
+            if path in fingerprints and fingerprints[path] != fingerprint:
+                fingerprint_conflict = True
+                continue
+            fingerprints[path] = _deep_mutable_copy(fingerprint)
+    merged["fingerprints"] = fingerprints
+
+    existing_read_fingerprints = existing.get("read_fingerprints")
+    incoming_read_fingerprints = incoming.get("read_fingerprints")
+    read_fingerprints = (
+        _deep_mutable_copy(existing_read_fingerprints) if isinstance(existing_read_fingerprints, Mapping) else {}
+    )
+    read_fingerprint_conflict = False
+    if isinstance(incoming_read_fingerprints, Mapping):
+        for path, fingerprint_record in incoming_read_fingerprints.items():
+            if path in read_fingerprints and read_fingerprints[path] != fingerprint_record:
+                read_fingerprint_conflict = True
+                continue
+            read_fingerprints[path] = _deep_mutable_copy(fingerprint_record)
+    merged["read_fingerprints"] = read_fingerprints
+
+    existing_module_sources = existing.get("module_sources")
+    incoming_module_sources = incoming.get("module_sources")
+    module_sources = _deep_mutable_copy(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
+    module_source_conflict = False
+    if isinstance(incoming_module_sources, Mapping):
+        for module_name, source_path in incoming_module_sources.items():
+            if module_name in module_sources and module_sources[module_name] != source_path:
+                module_source_conflict = True
+                continue
+            module_sources[module_name] = _deep_mutable_copy(source_path)
+    merged["module_sources"] = module_sources
+
+    existing_loaded_sources = existing.get("loaded_module_sources")
+    incoming_loaded_sources = incoming.get("loaded_module_sources")
+    loaded_sources = _deep_mutable_copy(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
+    loaded_source_conflict = False
+    if isinstance(incoming_loaded_sources, Mapping):
+        for module_name, source_path in incoming_loaded_sources.items():
+            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
+                loaded_source_conflict = True
+                continue
+            loaded_sources[module_name] = _deep_mutable_copy(source_path)
+    merged["loaded_module_sources"] = loaded_sources
+
+    existing_loaded_package_paths = existing.get("loaded_package_paths")
+    incoming_loaded_package_paths = incoming.get("loaded_package_paths")
+    loaded_package_paths = (
+        _deep_mutable_copy(existing_loaded_package_paths) if isinstance(existing_loaded_package_paths, Mapping) else {}
+    )
+    loaded_package_path_conflict = False
+    if isinstance(incoming_loaded_package_paths, Mapping):
+        for module_name, search_path in incoming_loaded_package_paths.items():
+            if module_name in loaded_package_paths and loaded_package_paths[module_name] != search_path:
+                loaded_package_path_conflict = True
+                continue
+            loaded_package_paths[module_name] = _deep_mutable_copy(search_path)
+    merged["loaded_package_paths"] = loaded_package_paths
+
+    existing_search_context = existing.get("search_context")
+    incoming_search_context = incoming.get("search_context")
+    existing_resolution_context = existing.get("resolution_context")
+    incoming_resolution_context = incoming.get("resolution_context")
+    if existing_search_context != incoming_search_context or existing_resolution_context != incoming_resolution_context:
+        merged["reusable"] = False
+    else:
+        merged["reusable"] = (
+            existing.get("reusable") is True
+            and incoming.get("reusable") is True
+            and not fingerprint_conflict
+            and not read_fingerprint_conflict
+            and not module_source_conflict
+            and not loaded_source_conflict
+            and not loaded_package_path_conflict
+        )
+        merged["search_context"] = existing_search_context
+        merged["resolution_context"] = _deep_mutable_copy(existing_resolution_context)
+    if (
+        fingerprint_conflict
+        or read_fingerprint_conflict
+        or module_source_conflict
+        or loaded_source_conflict
+        or loaded_package_path_conflict
+    ):
+        merged["reusable"] = False
+
+    return merged
+
+
 _MAX_RAW_DETECTOR_FAILURES: Final[int] = 20
 
 
@@ -168,6 +298,7 @@ class ScanResult:
         self.metadata: dict[str, Any] = {
             SCANNER_DEPENDENCY_IDS_METADATA_KEY: [scanner_name],
         }
+        self._private_metadata: dict[str, Any] = {}
         self._metadata_restored_critical: bool = False
         self._merged_children_success: bool = True
 
@@ -385,6 +516,18 @@ class ScanResult:
             "skipped_scanner_ids",
         }
         for key, value in other.metadata.items():
+            if (
+                key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
+                and isinstance(self._private_metadata.get(key), Mapping)
+                and isinstance(value, Mapping)
+            ):
+                self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
+                    self._private_metadata[key], value
+                )
+                continue
+            if key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY and isinstance(value, Mapping):
+                self._private_metadata[key] = _deep_mutable_copy(value)
+                continue
             if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
                 existing_values = self.metadata[key]
                 for item in value:
@@ -411,6 +554,17 @@ class ScanResult:
                 self.metadata[key].update(value)
             else:
                 self.metadata[key] = value
+        for key, value in other._private_metadata.items():
+            if (
+                key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
+                and isinstance(self._private_metadata.get(key), Mapping)
+                and isinstance(value, Mapping)
+            ):
+                self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
+                    self._private_metadata[key], value
+                )
+            else:
+                self._private_metadata[key] = _deep_mutable_copy(value)
         self.reconcile_raw_detector_checks()
 
     def trust_merged_child_failures(self) -> None:
@@ -491,7 +645,7 @@ class ScanResult:
         """Return True if there are any warning-level issues"""
         return any(issue.severity == IssueSeverity.WARNING for issue in self.issues)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_private_metadata: bool = False) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
         # Only count WARNING and CRITICAL severity checks as failures
         # INFO and DEBUG are informational - they should not count as failures
@@ -501,7 +655,7 @@ class ScanResult:
             if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
         )
 
-        return {
+        result = {
             "scanner": self.scanner_name,
             "success": self.success,
             "duration": self.duration,
@@ -515,6 +669,9 @@ class ScanResult:
             "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
             "failed_checks": failed_checks_count,
         }
+        if include_private_metadata and self._private_metadata:
+            result["_private_metadata"] = _deep_mutable_copy(self._private_metadata)
+        return result
 
     def to_json(self, indent: int = 2) -> str:
         """Convert the scan result to a JSON string"""

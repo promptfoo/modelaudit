@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import marshal
 import os
 import stat
 import struct
@@ -10,16 +11,64 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    BuiltinImporter,
+    ExtensionFileLoader,
+    FileFinder,
+    FrozenImporter,
+    ModuleSpec,
+    PathFinder,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 from pathlib import Path
-from typing import Any, BinaryIO
+from types import CodeType, FunctionType, MethodType, ModuleType
+from typing import Any, BinaryIO, cast
+from zipimport import zipimporter
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
+
+_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
+_CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
+_CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
+_CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
+_MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
+_MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
+_MAX_SOURCE_MODULE_NAME_CHARS = 4096
+_MAX_HOOK_IDENTITY_ITEMS = 16
+_MAX_HOOK_IDENTITY_DEPTH = 4
+_UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
+_PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
+_PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
+_STANDARD_FILE_FINDER_LOADER_DETAILS = (
+    (ExtensionFileLoader, list(EXTENSION_SUFFIXES)),
+    (SourceFileLoader, list(SOURCE_SUFFIXES)),
+    (SourcelessFileLoader, list(BYTECODE_SUFFIXES)),
+)
+_STANDARD_FILE_FINDER_LOADER_IDENTITY = tuple(
+    (loader, tuple(suffixes)) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_DETAILS
+)
+_STANDARD_FILE_FINDER_LOADERS = tuple(
+    (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
+)
+_STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
+_TRUSTED_FILE_FINDER_METHODS = tuple(
+    (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
+)
+_TRUSTED_ZIPIMPORTER_METHODS = tuple(
+    (name, getattr(zipimporter, name))
+    for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
+)
 
 AncestorEntry = tuple[str, int, int, int, int, int]
 _DARWIN_STABLE_SYMLINK_ALIASES = {
@@ -210,6 +259,326 @@ def _is_sampled_fingerprint(value: object) -> bool:
     return isinstance(value, str) and value.startswith("fingerprint:")
 
 
+def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
+    if value is None or isinstance(value, bool | int | float):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
+    if isinstance(value, bytes):
+        return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}:{_UNREUSABLE_HOOK_STATE_IDENTITY}"
+    if isinstance(value, (CodeType, FunctionType, MethodType, ModuleType)):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    if depth >= _MAX_HOOK_IDENTITY_DEPTH:
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    if isinstance(value, tuple | list):
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        sequence_identity = ",".join(_bounded_hook_value_identity(item, depth + 1) for item in value)
+        return f"{type(value).__name__}({sequence_identity})"
+    if isinstance(value, dict):
+        if len(value) > _MAX_HOOK_IDENTITY_ITEMS:
+            return _UNREUSABLE_HOOK_STATE_IDENTITY
+        mapping_items = sorted(value.items(), key=lambda item: str(item[0]))
+        return (
+            "dict("
+            + ",".join(
+                f"{_bounded_hook_value_identity(key, depth + 1)}:{_bounded_hook_value_identity(item, depth + 1)}"
+                for key, item in mapping_items
+            )
+            + ")"
+        )
+    try:
+        instance_state = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    if not isinstance(instance_state, dict):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
+    return (
+        f"<{type(value).__module__}.{type(value).__qualname__}:"
+        f"{_bounded_hook_value_identity(instance_state, depth + 1)}>"
+    )
+
+
+def _function_hook_state(function: FunctionType) -> str:
+    closure_values: list[object] = []
+    for cell in function.__closure__ or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            closure_values.append("<empty>")
+    referenced_globals = {
+        name: function.__globals__[name]
+        for name in sorted(set(function.__code__.co_names))
+        if name != "__builtins__" and name in function.__globals__
+    }
+    return "|".join(
+        (
+            f"closure={_bounded_hook_value_identity(tuple(closure_values))}",
+            f"defaults={_bounded_hook_value_identity(function.__defaults__ or ())}",
+            f"kwdefaults={_bounded_hook_value_identity(function.__kwdefaults__ or {})}",
+            f"globals={_bounded_hook_value_identity(referenced_globals)}",
+        )
+    )
+
+
+def _hook_type_methods(hook_type: type[object]) -> tuple[tuple[str, FunctionType], ...]:
+    methods: list[tuple[str, FunctionType]] = []
+    for method_name in ("find_spec", "__call__"):
+        for candidate_type in hook_type.__mro__:
+            method = candidate_type.__dict__.get(method_name)
+            if isinstance(method, (classmethod, staticmethod)):
+                method = method.__func__
+            if isinstance(method, FunctionType):
+                methods.append((method_name, method))
+                break
+    return tuple(methods)
+
+
+def _hook_type_code(hook_type: type[object]) -> bytes:
+    code_parts: list[bytes] = []
+    for _method_name, method in _hook_type_methods(hook_type):
+        code_parts.append(marshal.dumps(method.__code__))
+    return b"".join(code_parts)
+
+
+def _hook_type_state(hook_type: type[object]) -> str:
+    method_states: dict[str, str] = {}
+    class_attributes: dict[str, object] = {}
+    for method_name, method in _hook_type_methods(hook_type):
+        method_states[method_name] = _function_hook_state(method)
+        for attribute_name in sorted(set(method.__code__.co_names)):
+            for candidate_type in hook_type.__mro__:
+                if attribute_name not in candidate_type.__dict__:
+                    continue
+                class_attributes[f"{candidate_type.__module__}.{candidate_type.__qualname__}.{attribute_name}"] = (
+                    candidate_type.__dict__[attribute_name]
+                )
+                break
+    return _bounded_hook_value_identity({"methods": method_states, "class_attributes": class_attributes})
+
+
+def _import_hook_identity(hook: object) -> str:
+    if isinstance(hook, FunctionType):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = marshal.dumps(hook.__code__)
+        state = _function_hook_state(hook)
+    elif isinstance(hook, MethodType):
+        function = cast(FunctionType, hook.__func__)
+        module = function.__module__
+        qualname = function.__qualname__
+        code = marshal.dumps(function.__code__)
+        bound_type = hook.__self__ if isinstance(hook.__self__, type) else type(hook.__self__)
+        state = "|".join(
+            (
+                f"type={_hook_type_state(bound_type)}",
+                f"self={_bounded_hook_value_identity(hook.__self__)}",
+                f"function={_function_hook_state(function)}",
+            )
+        )
+    elif isinstance(hook, type):
+        module = hook.__module__
+        qualname = hook.__qualname__
+        code = _hook_type_code(hook)
+        known_class_finder = hook in {BuiltinImporter, FrozenImporter, PathFinder}
+        state = "" if known_class_finder else f"{_UNREUSABLE_HOOK_STATE_IDENTITY}:{_hook_type_state(hook)}"
+    else:
+        hook_type = type(hook)
+        module = hook_type.__module__
+        qualname = hook_type.__qualname__
+        code = _hook_type_code(hook_type)
+        try:
+            instance_state = object.__getattribute__(hook, "__dict__")
+        except (AttributeError, TypeError):
+            instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
+        instance_identity = _bounded_hook_value_identity(instance_state)
+        virtualenv_module = sys.modules.get("_virtualenv")
+        virtualenv_finder_type = getattr(virtualenv_module, "_Finder", None) if virtualenv_module is not None else None
+        is_virtualenv_finder = isinstance(virtualenv_finder_type, type) and type(hook) is virtualenv_finder_type
+        state = (
+            f"self={instance_identity}"
+            if is_virtualenv_finder
+            else f"type={_hook_type_state(hook_type)}|self={instance_identity}"
+        )
+    digest = hashlib.sha256(code + state.encode()).hexdigest()
+    reuse_marker = "unreusable:" if _UNREUSABLE_HOOK_STATE_IDENTITY in state else ""
+    return f"{module}.{qualname}:{reuse_marker}{digest}"
+
+
+def _path_importer_methods_are_trusted(
+    importer_type: type[object],
+    trusted_methods: tuple[tuple[str, object], ...],
+) -> bool:
+    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
+
+
+def _is_standard_file_finder_path_hook(hook: object) -> bool:
+    if not isinstance(hook, FunctionType) or hook.__code__ is not _STANDARD_FILE_FINDER_PATH_HOOK_CODE:
+        return False
+    closure = hook.__closure__ or ()
+    if len(closure) != len(hook.__code__.co_freevars):
+        return False
+    closure_values = dict(zip(hook.__code__.co_freevars, (cell.cell_contents for cell in closure), strict=True))
+    if closure_values.get("cls") is not FileFinder:
+        return False
+    loader_details = closure_values.get("loader_details")
+    if not isinstance(loader_details, tuple):
+        return False
+    try:
+        normalized_details = tuple((loader, tuple(suffixes)) for loader, suffixes in loader_details)
+    except (TypeError, ValueError):
+        return False
+    return normalized_details == _STANDARD_FILE_FINDER_LOADER_IDENTITY
+
+
+def _path_hook_resolution_identity(hook: object) -> str:
+    """Return a reusable identity only for unmodified standard path hooks."""
+    if hook is zipimporter:
+        if _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+            return "trusted:zipimport.zipimporter"
+        return "zipimport.zipimporter:unreusable:methods-changed"
+    if _is_standard_file_finder_path_hook(hook):
+        if _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+            return "trusted:importlib.machinery.FileFinder.path_hook"
+        return "importlib.machinery.FileFinder.path_hook:unreusable:methods-changed"
+    return f"untrusted:unreusable:{_import_hook_identity(hook)}"
+
+
+def _string_sequence_identity(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    count = 0
+    for value in values:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    return f"{count}:{digest.hexdigest()}"
+
+
+def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
+    rewrite_module = sys.modules.get("_pytest.assertion.rewrite")
+    finder_type = getattr(rewrite_module, "AssertionRewritingHook", None) if rewrite_module is not None else None
+    if not isinstance(finder_type, type) or type(finder) is not finder_type:
+        return None
+
+    basenames = {str(value) for value in getattr(finder, "_basenames_to_check_rewrite", ())}
+    session = getattr(finder, "session", None)
+    for initial_path in getattr(session, "_initialpaths", ()) if session is not None else ():
+        basenames.add(Path(str(initial_path)).stem)
+    state = "|".join(
+        (
+            _string_sequence_identity(sorted(str(value) for value in getattr(finder, "_must_rewrite", ()))),
+            _string_sequence_identity(str(value) for value in getattr(finder, "fnpats", ())),
+            _string_sequence_identity(sorted(basenames)),
+            repr(bool(getattr(finder, "_writing_pyc", False))),
+        )
+    )
+    digest = hashlib.sha256(_hook_type_code(finder_type) + state.encode()).hexdigest()
+    return f"{finder_type.__module__}.{finder_type.__qualname__}:{digest}"
+
+
+def _meta_path_finder_resolution_identity(finder: object) -> str:
+    return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
+
+
+def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    if not isinstance(instance_state, dict):
+        return False
+    if type(finder) is zipimporter:
+        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+            return False
+        try:
+            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+        except (AttributeError, ImportError, OSError, TypeError):
+            return False
+        return (
+            isinstance(expected_state, dict)
+            and set(instance_state) == set(expected_state)
+            and instance_state.get("archive") == expected_state.get("archive")
+            and instance_state.get("prefix") == expected_state.get("prefix")
+            and instance_state.get("_files") is expected_state.get("_files")
+        )
+    if type(finder) is not FileFinder:
+        return False
+    if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+        return False
+    finder_path = instance_state.get("path")
+    loaders = instance_state.get("_loaders")
+    return (
+        set(instance_state) <= {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
+        and isinstance(finder_path, str)
+        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
+        and isinstance(loaders, list)
+        and tuple(loaders) == _STANDARD_FILE_FINDER_LOADERS
+    )
+
+
+def _source_resolution_context() -> dict[str, list[str]]:
+    nonstandard_importers = []
+    for entry in sys.path:
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
+            continue
+        nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
+    return {
+        "meta_path": [_meta_path_finder_resolution_identity(finder) for finder in sys.meta_path],
+        "path_hooks": [_path_hook_resolution_identity(hook) for hook in sys.path_hooks],
+        "path_importers": nonstandard_importers,
+    }
+
+
+def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
+    for entry in search_path:
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
+            return True
+    return False
+
+
+def _loaded_module_source_override(module_name: str) -> tuple[bool, str | None]:
+    if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+        return True, None
+
+    if module_name not in sys.modules:
+        return False, None
+    loaded_module = sys.modules[module_name]
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if (
+        isinstance(loaded_spec, ModuleSpec)
+        and isinstance(loaded_spec.origin, str)
+        and loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES))
+    ):
+        return True, str(Path(loaded_spec.origin).absolute())
+    return True, None
+
+
+def _loaded_parent_package_names(module_name: str) -> tuple[str, ...]:
+    parts = module_name.split(".")
+    return tuple(
+        parent_name
+        for parent_name in (".".join(parts[:index]) for index in range(1, len(parts)))
+        if parent_name in sys.modules
+    )
+
+
+def _loaded_package_search_path(module_name: str) -> list[str] | None:
+    loaded_module = sys.modules.get(module_name)
+    if not isinstance(loaded_module, ModuleType):
+        return None
+    raw_search_path = vars(loaded_module).get("__path__")
+    if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
+        return None
+    return [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
+
+
 @dataclass
 class CacheEntry:
     """Data class for cache entries."""
@@ -254,6 +623,8 @@ class ScanResultsCache:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result if available and valid with optimized file system calls.
@@ -267,6 +638,7 @@ class ScanResultsCache:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            include_private_metadata=include_private_metadata,
         )
         if file_identity is not None:
             self.release_ancestor_identity(file_identity[-1])
@@ -277,6 +649,8 @@ class ScanResultsCache:
         file_path: str,
         file_stat: os.stat_result,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get a cached scan result while reusing an existing stat result.
@@ -292,6 +666,7 @@ class ScanResultsCache:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            include_private_metadata=include_private_metadata,
         )
         if file_identity is not None:
             self.release_ancestor_identity(file_identity[-1])
@@ -301,6 +676,8 @@ class ScanResultsCache:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup plus the monitored identity reusable by a miss scan."""
         file_identity: ScannedFileIdentity | None = None
@@ -350,7 +727,10 @@ class ScanResultsCache:
 
             self._record_cache_hit()
             logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-            return cache_entry["scan_result"], file_identity
+            return (
+                self._result_from_cache_entry(cache_entry, include_private_metadata=include_private_metadata),
+                file_identity,
+            )
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
@@ -363,6 +743,7 @@ class ScanResultsCache:
         *,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result by pre-generated cache key (for performance optimization).
@@ -390,6 +771,7 @@ class ScanResultsCache:
                 file_stat=file_stat,
                 verified_content_hash=file_identity[1] if file_identity is not None else None,
                 expected_file_identity=file_identity,
+                include_private_metadata=include_private_metadata,
             )
         except Exception as e:
             logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
@@ -404,6 +786,8 @@ class ScanResultsCache:
         cache_key: str,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        *,
+        include_private_metadata: bool = False,
         verified_content_hash: str | None = None,
         expected_file_identity: ScannedFileIdentity | None = None,
     ) -> dict[str, Any] | None:
@@ -428,16 +812,17 @@ class ScanResultsCache:
                 self._record_cache_miss("invalid")
                 return None
 
-            if (
-                file_path is not None
-                and file_stat is not None
-                and not self._is_cache_entry_valid_with_stat(
+            if file_path is not None and file_stat is not None:
+                is_valid = self._is_cache_entry_valid_with_stat(
                     cache_entry,
                     file_path,
                     file_stat,
                     verified_content_hash=verified_content_hash,
                 )
-            ):
+            else:
+                is_valid = self._call_graph_source_fingerprints_are_valid(cache_entry)
+
+            if not is_valid:
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
                 return None
@@ -460,12 +845,47 @@ class ScanResultsCache:
 
             self._record_cache_hit()
             logger.debug(f"Cache hit for key {cache_key[:8]}...")
-            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+            return self._result_from_cache_entry(cache_entry, include_private_metadata=include_private_metadata)
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
             self._record_cache_miss("error")
             return None
+
+    @staticmethod
+    def _result_from_cache_entry(
+        cache_entry: dict[str, Any],
+        *,
+        include_private_metadata: bool,
+    ) -> dict[str, Any]:
+        scan_result = cache_entry["scan_result"]
+        if not isinstance(scan_result, dict):
+            return scan_result  # type: ignore[no-any-return]
+        result = dict(scan_result)
+        metadata = result.get("metadata")
+        public_fingerprint_metadata = None
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            public_fingerprint_metadata = metadata.pop(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY, None)
+            result["metadata"] = metadata
+        if not include_private_metadata:
+            result.pop("_private_metadata", None)
+            return result
+
+        cache_metadata = cache_entry.get("cache_metadata")
+        fingerprint_metadata = (
+            cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
+        )
+        if fingerprint_metadata is None:
+            fingerprint_metadata = public_fingerprint_metadata
+        if fingerprint_metadata is None:
+            return result
+        private_metadata = result.get("_private_metadata")
+        result["_private_metadata"] = {
+            **(private_metadata if isinstance(private_metadata, dict) else {}),
+            _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata,
+        }
+        return result
 
     def store_result(
         self,
@@ -564,6 +984,17 @@ class ScanResultsCache:
             # Large-file cache keys already require this exact secure content hash.
             file_hash = content_hash or verified_current_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
             mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
+            private_metadata = scan_result.get("_private_metadata") if isinstance(scan_result, dict) else None
+            fingerprint_metadata = (
+                private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+                if isinstance(private_metadata, dict)
+                else None
+            )
+            cache_private_metadata = (
+                {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata} if fingerprint_metadata is not None else {}
+            )
+            persisted_scan_result = dict(scan_result)
+            persisted_scan_result.pop("_private_metadata", None)
 
             cache_entry = CacheEntry(
                 cache_key=cache_key,
@@ -575,13 +1006,14 @@ class ScanResultsCache:
                     "mtime_ns": mtime_ns,
                 },
                 version_info=version_info,
-                scan_result=scan_result,
+                scan_result=persisted_scan_result,
                 cache_metadata={
                     "scanned_at": time.time(),
                     "last_access": time.time(),
                     "access_count": 1,
                     "scan_duration_ms": scan_duration_ms,
                     "file_format": self._detect_file_format(file_path),
+                    **cache_private_metadata,
                 },
             )
 
@@ -1248,6 +1680,9 @@ class ScanResultsCache:
                 if current_hash != cached_hash:
                     return False
 
+            if not self._call_graph_source_fingerprints_are_valid(cache_entry):
+                return False
+
             # Check entry isn't too old (30 days default)
             scanned_at = cache_entry["cache_metadata"]["scanned_at"]
             age_days = (time.time() - scanned_at) / (24 * 60 * 60)
@@ -1256,6 +1691,334 @@ class ScanResultsCache:
 
         except Exception:
             return False
+
+    @staticmethod
+    def _source_search_context() -> list[str]:
+        return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
+
+    @staticmethod
+    def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
+        identity = "\0".join(
+            str(value)
+            for value in (
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_mode,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            )
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
+
+    @staticmethod
+    def _bounded_source_fingerprint(path: Path) -> str | None:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_descriptor = os.open(path, flags)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        try:
+            before = os.fstat(file_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("source fingerprint candidate is not a regular file")
+            is_extension = str(path).endswith(tuple(EXTENSION_SUFFIXES))
+            max_bytes = 0
+            if not is_extension:
+                max_bytes = (
+                    _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES * 2
+                    if str(path).endswith(tuple(BYTECODE_SUFFIXES))
+                    else _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
+                )
+            if not is_extension and before.st_size > max_bytes:
+                raise ValueError("source fingerprint budget exceeded")
+            chunks: list[bytes] = []
+            remaining = 0 if is_extension else max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            source = b"".join(chunks)
+            after = os.fstat(file_descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            try:
+                path_stat = path.stat()
+            except OSError as error:
+                raise ValueError("source fingerprint candidate path changed while being read") from error
+            path_identity = (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_mode,
+                path_stat.st_size,
+                path_stat.st_mtime_ns,
+                path_stat.st_ctime_ns,
+            )
+            if before_identity != after_identity or after_identity != path_identity:
+                raise ValueError("source fingerprint candidate changed while being read")
+            if is_extension:
+                return ScanResultsCache._regular_file_identity_fingerprint(after)
+            if len(source) > max_bytes:
+                raise ValueError("source fingerprint budget exceeded")
+            return hashlib.sha256(source).hexdigest()
+        finally:
+            os.close(file_descriptor)
+
+    @staticmethod
+    def _bounded_read_fingerprint(path: Path, read_limit: int, require_complete: bool) -> str | None:
+        if read_limit < 0 or read_limit > _CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES:
+            raise ValueError("read fingerprint budget is invalid")
+        try:
+            path_before = path.stat()
+            if stat.S_ISDIR(path_before.st_mode):
+                entries: list[bytes] = []
+                total_bytes = 0
+                for index, entry in enumerate(path.iterdir()):
+                    if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                        raise ValueError("read fingerprint directory entry budget exceeded")
+                    entry_name = os.fsencode(entry.name)
+                    total_bytes += len(entry_name) + 1
+                    if require_complete and total_bytes > read_limit:
+                        raise ValueError("read fingerprint directory budget exceeded")
+                    entries.append(entry_name)
+                path_after = path.stat()
+                before_identity = (
+                    path_before.st_dev,
+                    path_before.st_ino,
+                    path_before.st_mode,
+                    path_before.st_size,
+                    path_before.st_mtime_ns,
+                    path_before.st_ctime_ns,
+                )
+                after_identity = (
+                    path_after.st_dev,
+                    path_after.st_ino,
+                    path_after.st_mode,
+                    path_after.st_size,
+                    path_after.st_mtime_ns,
+                    path_after.st_ctime_ns,
+                )
+                if before_identity != after_identity:
+                    raise ValueError("read fingerprint directory changed while being read")
+                return hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).hexdigest()
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise ValueError("read fingerprint directory is unavailable") from error
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_descriptor = os.open(path, flags)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        try:
+            before = os.fstat(file_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            chunks: list[bytes] = []
+            remaining = read_limit + int(require_complete)
+            while remaining > 0:
+                chunk = os.read(file_descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            source = b"".join(chunks)
+            after = os.fstat(file_descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            try:
+                path_stat = path.stat()
+            except OSError as error:
+                raise ValueError("read fingerprint candidate path changed while being read") from error
+            path_identity = (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_mode,
+                path_stat.st_size,
+                path_stat.st_mtime_ns,
+                path_stat.st_ctime_ns,
+            )
+            if before_identity != after_identity or after_identity != path_identity:
+                raise ValueError("read fingerprint candidate changed while being read")
+            if require_complete and len(source) > read_limit:
+                raise ValueError("read fingerprint budget exceeded")
+            return hashlib.sha256(b"file\0" + source).hexdigest()
+        finally:
+            os.close(file_descriptor)
+
+    def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
+        scan_result = cache_entry.get("scan_result")
+        metadata = scan_result.get("metadata") if isinstance(scan_result, dict) else None
+        cache_metadata = cache_entry.get("cache_metadata")
+        fingerprint_metadata = (
+            cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
+        )
+        if fingerprint_metadata is None:
+            if not isinstance(metadata, dict):
+                return True
+            if _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY not in metadata:
+                return not self._legacy_pickle_call_graph_metadata_requires_fingerprints(metadata)
+            fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
+        if not isinstance(fingerprint_metadata, dict):
+            return False
+        if fingerprint_metadata.get("source_independent") is True:
+            return isinstance(metadata, dict) and self._source_independent_call_graph_fingerprints_are_valid(
+                fingerprint_metadata,
+                metadata,
+            )
+        if fingerprint_metadata.get("reusable") is not True:
+            return False
+        if fingerprint_metadata.get("search_context") != self._source_search_context():
+            return False
+        if fingerprint_metadata.get("resolution_context") != _source_resolution_context():
+            return False
+        module_sources = fingerprint_metadata.get("module_sources")
+        if not isinstance(module_sources, dict):
+            return False
+        for module_name, expected_source in module_sources.items():
+            if not isinstance(module_name, str) or not isinstance(expected_source, str):
+                return False
+            is_overridden, current_source = _loaded_module_source_override(module_name)
+            if is_overridden and current_source != expected_source:
+                return False
+        loaded_module_sources = fingerprint_metadata.get("loaded_module_sources")
+        if not isinstance(loaded_module_sources, dict):
+            return False
+        for module_name, expected_source in loaded_module_sources.items():
+            if not isinstance(module_name, str) or not isinstance(expected_source, str):
+                return False
+            is_overridden, current_source = _loaded_module_source_override(module_name)
+            if not is_overridden or current_source != expected_source:
+                return False
+        loaded_package_paths = fingerprint_metadata.get("loaded_package_paths")
+        if not isinstance(loaded_package_paths, dict):
+            return False
+        for module_name, expected_search_path in loaded_package_paths.items():
+            if not isinstance(module_name, str) or not isinstance(expected_search_path, list):
+                return False
+            if not all(isinstance(entry, str) for entry in expected_search_path):
+                return False
+            current_search_path = _loaded_package_search_path(module_name)
+            if current_search_path != expected_search_path:
+                return False
+            if current_search_path is None or _search_path_has_untrusted_importer(current_search_path):
+                return False
+        for module_name in module_sources:
+            if any(
+                parent_name not in loaded_package_paths for parent_name in _loaded_parent_package_names(module_name)
+            ):
+                return False
+        fingerprints = fingerprint_metadata.get("fingerprints")
+        if not isinstance(fingerprints, dict) or len(fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+            return False
+        try:
+            for raw_path, expected_fingerprint in fingerprints.items():
+                if not isinstance(raw_path, str):
+                    return False
+                current_fingerprint = self._bounded_source_fingerprint(Path(raw_path))
+                if expected_fingerprint is None:
+                    if current_fingerprint is not None:
+                        return False
+                elif not isinstance(expected_fingerprint, str) or current_fingerprint != expected_fingerprint:
+                    return False
+        except (OSError, ValueError):
+            return False
+        read_fingerprints = fingerprint_metadata.get("read_fingerprints")
+        if not isinstance(read_fingerprints, dict) or len(read_fingerprints) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
+            return False
+        try:
+            for raw_path, raw_record in read_fingerprints.items():
+                if not isinstance(raw_path, str) or not isinstance(raw_record, dict):
+                    return False
+                read_limit = raw_record.get("read_limit")
+                require_complete = raw_record.get("require_complete")
+                expected_fingerprint = raw_record.get("fingerprint")
+                if isinstance(read_limit, bool) or not isinstance(read_limit, int):
+                    return False
+                if not isinstance(require_complete, bool):
+                    return False
+                if expected_fingerprint is not None and not isinstance(expected_fingerprint, str):
+                    return False
+                current_fingerprint = self._bounded_read_fingerprint(
+                    Path(raw_path),
+                    read_limit,
+                    require_complete,
+                )
+                if current_fingerprint != expected_fingerprint:
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _source_independent_call_graph_fingerprints_are_valid(
+        fingerprint_metadata: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> bool:
+        if fingerprint_metadata != {
+            "reusable": True,
+            "source_independent": True,
+            "fingerprints": {},
+            "read_fingerprints": {},
+            "module_sources": {},
+            "loaded_module_sources": {},
+            "loaded_package_paths": {},
+        }:
+            return False
+        if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
+            return False
+        if any(
+            metadata.get(key)
+            for key in (
+                "import_references_truncated",
+                "callable_invocations_truncated",
+                "non_allowlisted_global_imports_truncated",
+            )
+        ):
+            return False
+        if metadata.get("container_type") == "pytorch_zip":
+            return True
+        return not any(metadata.get(key) for key in _PICKLE_CALL_GRAPH_INPUT_KEYS)
+
+    @staticmethod
+    def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:
+        if not _PICKLE_RESULT_METADATA_KEYS.intersection(metadata):
+            return False
+        return metadata.get("container_type") == "pytorch_zip" or any(
+            key in metadata for key in _PICKLE_CALL_GRAPH_INPUT_KEYS
+        )
 
     def _detect_file_format(self, file_path: str) -> str:
         """Detect file format for analytics."""
