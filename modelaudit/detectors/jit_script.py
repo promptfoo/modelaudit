@@ -435,7 +435,13 @@ def _candidate_embedded_python_snippets(
 ) -> list[_EmbeddedPythonCandidate]:
     candidates: list[_EmbeddedPythonCandidate] = []
     bounded_view = memoryview(bounded)
-    block_spans: list[tuple[int, int]] = []
+    block_matches = list(_EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded))
+    block_spans = [match.span() for match in block_matches]
+    priority_block_starts = {
+        match.start()
+        for match in block_matches
+        if any(marker in match.group(0) for marker in _BUILTIN_ALIAS_CONTEXT_MARKERS)
+    }
     all_start_offsets = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)]
     if (
         all_start_offsets
@@ -469,26 +475,35 @@ def _candidate_embedded_python_snippets(
             continue
         start_offsets.append(start)
     if len(start_offsets) > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+        selected_required_starts = sorted(priority_starts)
+        block_budget = _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES - len(selected_required_starts)
+        required_block_starts = sorted(priority_block_starts - priority_starts)
+        if len(required_block_starts) > block_budget:
+            leading_blocks = block_budget // 2
+            required_block_starts = [
+                *required_block_starts[:leading_blocks],
+                *required_block_starts[-(block_budget - leading_blocks) :],
+            ]
+        selected_required_starts.extend(required_block_starts)
+        selected_required = set(selected_required_starts)
+        ordinary_budget = _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES - len(selected_required)
         start_offsets = sorted(
-            {
-                *start_offsets[:_MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES],
-                *priority_starts,
-            }
+            [
+                *selected_required,
+                *[start for start in start_offsets if start not in selected_required][:ordinary_budget],
+            ]
         )
 
-    skip_block_candidates = False
     if include_full_source:
         span = (0, len(bounded))
         candidates.append((bounded, span, (span,)))
-        skip_block_candidates = len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and bool(priority_starts)
 
-    if not skip_block_candidates:
-        for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
-            span = match.span()
-            if include_full_source and span[0] == 0:
-                continue
-            block_spans.append(span)
-            candidates.append((match.group(0), span, (span,)))
+    selected_start_offsets = set(start_offsets)
+    for match in block_matches:
+        span = match.span()
+        if span[0] not in selected_start_offsets or (include_full_source and span[0] == 0):
+            continue
+        candidates.append((bounded_view[span[0] : span[1]], span, (span,)))
 
     for start in start_offsets:
         if include_full_source and start == 0:
@@ -11896,7 +11911,16 @@ def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -
                         None,
                     )
                     if handler is not None:
-                        body_outcome = visit(handler.body)
+                        handler_body = handler.body
+                        if handler.name is not None:
+                            handler_binding = ast.Assign(
+                                targets=[ast.Name(id=handler.name, ctx=ast.Store())],
+                                value=ast.Constant(value=None),
+                            )
+                            ast.copy_location(handler_binding, handler)
+                            ast.fix_missing_locations(handler_binding)
+                            handler_body = [handler_binding, *handler_body]
+                        body_outcome = visit(handler_body)
                 final_outcome = visit(statement.finalbody)
                 if final_outcome is not None:
                     return final_outcome
@@ -11922,16 +11946,18 @@ def _compact_snippet_replay_proven_rule_codes(code_str: str) -> frozenset[str]:
     return proved_rule_codes
 
 
-def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
+def _compact_snippet_typed_print_overwrite_replay(
+    code_str: str,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     source = textwrap.dedent(code_str)
     if "print" not in source:
-        return set()
+        return set(), set()
     if " if " in source and " else " in source:
-        return set()
+        return set(), set()
     try:
         tree = ast.parse(source)
     except (RecursionError, SyntaxError, ValueError):
-        return set()
+        return set(), set()
     deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
     typed_aliases: dict[str, tuple[str, int]] = {}
     cached_typed_identities: dict[str, tuple[str, int]] = {
@@ -11948,7 +11974,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     builtins_aliases.add(alias.asname or "builtins")
     mutated_truthy_builtins = _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set())
     if "print" in mutated_truthy_builtins or mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
-        return set()
+        return set(), set()
     vars_helper_aliases: set[str] = set()
     setattr_helper_aliases: set[str] = set()
     dict_helper_aliases: set[str] = set()
@@ -12401,56 +12427,159 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         ):
             builtins_dict_shadowed = not active_dict_reference(value_reference)
 
-    def invalidate_dynamic_helper_assignments(statement: ast.stmt) -> None:
+    def invalidate_rebound_target(target: ast.AST) -> None:
         nonlocal local_setattr_shadowed, builtins_setattr_shadowed, local_vars_shadowed, builtins_vars_shadowed
         nonlocal local_dict_shadowed, builtins_dict_shadowed
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                invalidate_rebound_target(element)
+            return
+        if isinstance(target, ast.Starred):
+            invalidate_rebound_target(target.value)
+            return
+        if isinstance(target, ast.Name):
+            typed_aliases.pop(target.id, None)
+            clear_local_mapping_alias(target.id)
+            clear_module_helper_target(target)
+            reload_aliases.discard(target.id)
+            vars_helper_aliases.discard(target.id)
+            setattr_helper_aliases.discard(target.id)
+            dict_helper_aliases.discard(target.id)
+            dict_update_aliases.discard(target.id)
+            dict_setitem_aliases.discard(target.id)
+            if target.id == "vars":
+                local_vars_shadowed = True
+            elif target.id == "setattr":
+                local_setattr_shadowed = True
+            elif target.id == "dict":
+                local_dict_shadowed = True
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            if target.attr == "vars":
+                builtins_vars_shadowed = True
+            elif target.attr == "setattr":
+                builtins_setattr_shadowed = True
+            elif target.attr == "dict":
+                builtins_dict_shadowed = True
 
-        def invalidate_target(target: ast.AST) -> None:
-            nonlocal local_setattr_shadowed, builtins_setattr_shadowed, local_vars_shadowed, builtins_vars_shadowed
-            nonlocal local_dict_shadowed, builtins_dict_shadowed
-            if isinstance(target, (ast.Tuple, ast.List)):
-                for element in target.elts:
-                    invalidate_target(element)
-                return
-            if isinstance(target, ast.Starred):
-                invalidate_target(target.value)
-                return
-            if isinstance(target, ast.Name):
-                vars_helper_aliases.discard(target.id)
-                setattr_helper_aliases.discard(target.id)
-                dict_helper_aliases.discard(target.id)
-                dict_update_aliases.discard(target.id)
-                dict_setitem_aliases.discard(target.id)
-                if target.id == "vars":
-                    local_vars_shadowed = True
-                elif target.id == "setattr":
-                    local_setattr_shadowed = True
-                elif target.id == "dict":
-                    local_dict_shadowed = True
-            elif (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id in builtins_aliases
-            ):
-                if target.attr == "vars":
-                    builtins_vars_shadowed = True
-                elif target.attr == "setattr":
-                    builtins_setattr_shadowed = True
-                elif target.attr == "dict":
-                    builtins_dict_shadowed = True
+    def invalidate_match_pattern(pattern: ast.pattern) -> None:
+        for node in ast.walk(pattern):
+            if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                invalidate_rebound_target(ast.Name(id=node.rest, ctx=ast.Store()))
 
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Assign):
+    def invalidate_dynamic_bindings(statement: ast.stmt) -> None:
+        class BindingVisitor(ast.NodeVisitor):
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.visit(node.value)
                 for target in node.targets:
-                    invalidate_target(target)
-            elif isinstance(node, (ast.AnnAssign, ast.For, ast.AsyncFor)):
-                invalidate_target(node.target)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    invalidate_rebound_target(target)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                self.visit(node.annotation)
+                if node.value is not None:
+                    self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_Delete(self, node: ast.Delete) -> None:
+                for target in node.targets:
+                    invalidate_rebound_target(target)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    invalidate_rebound_target(ast.Name(id=local_name, ctx=ast.Store()))
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                for alias in node.names:
+                    invalidate_rebound_target(ast.Name(id=alias.asname or alias.name, ctx=ast.Store()))
+
+            def visit_For(self, node: ast.For) -> None:
+                self.visit(node.iter)
+                invalidate_rebound_target(node.target)
+                for child in [*node.body, *node.orelse]:
+                    self.visit(child)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                self.visit(node.iter)
+                invalidate_rebound_target(node.target)
+                for child in [*node.body, *node.orelse]:
+                    self.visit(child)
+
+            def visit_With(self, node: ast.With) -> None:
                 for item in node.items:
+                    self.visit(item.context_expr)
                     if item.optional_vars is not None:
-                        invalidate_target(item.optional_vars)
-            elif isinstance(node, ast.NamedExpr):
-                invalidate_target(node.target)
+                        invalidate_rebound_target(item.optional_vars)
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+                for item in node.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        invalidate_rebound_target(item.optional_vars)
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                if node.type is not None:
+                    self.visit(node.type)
+                if node.name is not None:
+                    invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_Match(self, node: ast.Match) -> None:
+                self.visit(node.subject)
+                for case in node.cases:
+                    invalidate_match_pattern(case.pattern)
+                    if case.guard is not None:
+                        self.visit(case.guard)
+                    for child in case.body:
+                        self.visit(child)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for expression in [*node.decorator_list, *node.bases]:
+                    self.visit(expression)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+        BindingVisitor().visit(statement)
 
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
     for statement in executed_statements:
@@ -12464,7 +12593,7 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
         sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
         sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
         if isinstance(statement, ast.If) and not isinstance(statement.test, ast.Constant):
-            invalidate_dynamic_helper_assignments(statement)
+            invalidate_dynamic_bindings(statement)
         if isinstance(statement, ast.Import):
             for alias in statement.names:
                 local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
@@ -12610,13 +12739,14 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                     ),
                 )
         elif isinstance(statement, (ast.For, ast.AsyncFor)):
-            clear_reload_target(statement.target)
-            clear_module_helper_target(statement.target)
+            invalidate_rebound_target(statement.target)
         elif isinstance(statement, (ast.With, ast.AsyncWith)):
             for item in statement.items:
                 if item.optional_vars is not None:
-                    clear_reload_target(item.optional_vars)
-                    clear_module_helper_target(item.optional_vars)
+                    invalidate_rebound_target(item.optional_vars)
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                invalidate_match_pattern(case.pattern)
         for value in _deterministically_evaluated_statement_expressions(
             statement,
             evaluate_annotations=not deferred_annotations,
@@ -12851,12 +12981,23 @@ def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str
                         node.args[1],
                         conditional=_is_conditionally_evaluated_expression(node, parents),
                     )
-    return {
+    suppressed_calls = {
         high_risk_call
         for owner, member_name in safe_members
         if (owner[0], member_name) not in unsafe_called_members
         if (high_risk_call := _typed_member_high_risk_call(owner[0], member_name)) is not None
     }
+    high_risk_calls = {
+        high_risk_call
+        for owner_name, member_name in unsafe_called_members
+        if (high_risk_call := _typed_member_high_risk_call(owner_name, member_name)) is not None
+    }
+    return suppressed_calls, high_risk_calls
+
+
+def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
+    suppressed_calls, _high_risk_calls = _compact_snippet_typed_print_overwrite_replay(code_str)
+    return suppressed_calls
 
 
 def _compact_snippet_inactive_restore_high_risk_calls(
@@ -19478,7 +19619,10 @@ class JITScriptDetector:
                 bounded_source = bounded.decode("utf-8")
                 bounded_tree = ast.parse(textwrap.dedent(bounded_source))
                 bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
-                bounded_suppressed_calls = _compact_snippet_typed_print_overwrite_calls(bounded_source)
+                (
+                    bounded_suppressed_calls,
+                    bounded_typed_high_risk_calls,
+                ) = _compact_snippet_typed_print_overwrite_replay(bounded_source)
                 bounded_suppressed_calls.update(
                     _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
                         bounded_source,
@@ -19500,6 +19644,7 @@ class JITScriptDetector:
                     if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                 )
                 bounded_explicit_high_risk_calls: set[tuple[str, str]] = set()
+                bounded_explicit_high_risk_calls.update(bounded_typed_high_risk_calls)
                 bounded_explicit_high_risk_calls.update(
                     _compact_snippet_shadowed_setattr_typed_high_risk_calls(bounded_source)
                 )
@@ -19636,7 +19781,11 @@ class JITScriptDetector:
                     parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     ast_high_risk_calls = set(parsed_high_risk_calls or set())
+                    typed_suppressed_calls, typed_high_risk_calls = _compact_snippet_typed_print_overwrite_replay(
+                        code_str
+                    )
                     inactive_restore_high_risk_calls: set[tuple[str, str]] = set()
+                    inactive_restore_high_risk_calls.update(typed_high_risk_calls)
                     inactive_restore_high_risk_calls.update(
                         _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str)
                     )
@@ -19672,7 +19821,6 @@ class JITScriptDetector:
                         )
                         if member_name in _RUNPY_PRIORITY_MEMBER_NAMES
                     }
-                    typed_suppressed_calls = _compact_snippet_typed_print_overwrite_calls(code_str)
                     runpy_suppressed_calls = setdefault_suppressed_calls
                     runpy_suppressed_calls.update(
                         _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(

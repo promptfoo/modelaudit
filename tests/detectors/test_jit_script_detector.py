@@ -7028,6 +7028,43 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    @pytest.mark.parametrize(
+        ("callable_name", "expected_dangerous"),
+        [("eval", True), ("len", False)],
+    )
+    def test_scan_model_keeps_late_block_candidates_after_priority_import(
+        self,
+        callable_name: str,
+        expected_dangerous: bool,
+    ) -> None:
+        """An early priority import must not starve a later non-priority function block."""
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def harmless_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 6)
+        )
+        data = (
+            b"import asyncio\n\x00"
+            + leading_blocks
+            + b"def payload():\n    runner = "
+            + callable_name.encode()
+            + b"\n    return runner('1+1')\n}\x00"
+        )
+
+        candidates = jit_script_module._candidate_embedded_python_snippets(data, include_full_source=True)
+        findings = detector._extract_and_check_python_code(
+            data,
+            "Generic Python",
+            "payload.py",
+            include_full_source=True,
+        )
+
+        assert len(candidates) <= jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
+        assert (
+            any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+            is expected_dangerous
+        )
+
     def test_scan_model_keeps_unrelated_native_load_after_safe_runpy_overwrite(self) -> None:
         """A safe runpy member overwrite must not suppress an unrelated ctypes call."""
         detector = JITScriptDetector()
@@ -7550,6 +7587,32 @@ class TestJITScriptDetector:
                 "Web browser launch detected",
             ),
             (
+                b"import webbrowser as wb\nactual = wb\nwith manager() as wb:\n    pass\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nactual = wb\ntry:\n    1 / 0\n"
+                b"except ZeroDivisionError as wb:\n    wb.open = print\n"
+                b"actual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nactual = wb\nif enabled:\n    wb = object()\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nactual = wb\nfor wb in values:\n    pass\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"import webbrowser as wb\nactual = wb\nmatch value:\n    case wb:\n        pass\n"
+                b"wb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
                 b"import ctypes as c\nm = __builtins__\n"
                 b"m.update(setattr=lambda *args: None)\nsetattr(c, 'CDLL', print)\nc.CDLL('payload.so')\n",
                 "Native library loading detected",
@@ -7567,6 +7630,31 @@ class TestJITScriptDetector:
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            b"with manager() as other:\n    pass\n",
+            b"try:\n    1 / 0\nexcept ZeroDivisionError as other:\n    pass\n",
+            b"if enabled:\n    other = object()\n",
+            b"for other in values:\n    pass\n",
+            b"match value:\n    case other:\n        pass\n",
+            b"if enabled:\n    def helper():\n        wb = object()\n",
+            b"if enabled:\n    [wb for wb in values]\n",
+        ],
+    )
+    def test_scan_model_keeps_typed_safe_overwrite_after_unrelated_binding(
+        self,
+        binding: bytes,
+    ) -> None:
+        source = b"import webbrowser as wb\nactual = wb\n" + binding + b"wb.open = print\nactual.open('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
         )
 
     def test_extract_python_code_scopes_suppressions_to_each_candidate(self) -> None:
