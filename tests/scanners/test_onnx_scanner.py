@@ -1891,28 +1891,44 @@ class TestRawDetectorCoverage:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         model_path = create_onnx_model(tmp_path)
+        leaked_secret = "UNSTRUCTURED-ONNX-JIT-SECRET-123456"
 
         def _raise_analysis_failure(self: JITScriptDetector, *_args: Any, **_kwargs: Any) -> list[Any]:
-            raise RuntimeError("jit detector unavailable")
+            raise RuntimeError(f"jit detector rejected {leaked_secret}")
 
         monkeypatch.setattr(JITScriptDetector, "scan_model", _raise_analysis_failure)
 
         direct = OnnxScanner().scan(str(model_path))
         self._assert_inconclusive_exit2(model_path, direct, detector="jit_script")
+        coverage_check = self._coverage_checks(direct)[0]
+        assert leaked_secret not in str(direct.metadata)
+        assert leaked_secret not in coverage_check.message
+        assert leaked_secret not in str(coverage_check.details)
+        assert leaked_secret not in caplog.text
+        assert "<redacted>" in coverage_check.message
 
     def test_network_detector_failure_is_inconclusive(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         model_path = create_onnx_model(tmp_path)
+        leaked_secret = "UNSTRUCTURED-ONNX-NETWORK-SECRET-123456"
 
         def _raise_analysis_failure(self: NetworkCommDetector, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
-            raise RuntimeError("network detector unavailable")
+            raise RuntimeError(f"network detector rejected {leaked_secret}")
 
         monkeypatch.setattr(NetworkCommDetector, "scan", _raise_analysis_failure)
 
         direct = OnnxScanner().scan(str(model_path))
         self._assert_inconclusive_exit2(model_path, direct, detector="network_communication")
+        coverage_check = self._coverage_checks(direct)[0]
+        assert leaked_secret not in str(direct.metadata)
+        assert leaked_secret not in coverage_check.message
+        assert leaked_secret not in str(coverage_check.details)
+        assert leaked_secret not in caplog.text
+        assert "<redacted>" in coverage_check.message

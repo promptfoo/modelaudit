@@ -1,7 +1,9 @@
 import gzip
 import hashlib
+import io
 import json
 import os
+import pickle
 import shutil
 import tarfile
 import tempfile
@@ -1662,6 +1664,483 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         assert result.success is True
+
+    def test_scan_layer_reports_member_path_traversal_metadata(self, tmp_path: Path) -> None:
+        """Unsafe member names must not suppress scanning of their safely extracted bytes."""
+
+        class TraversalPayload:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                return (os.system, ("echo traversal-payload",))
+
+        payload = tmp_path / "payload.pkl"
+        payload.write_bytes(pickle.dumps(TraversalPayload()))
+
+        layer_path = tmp_path / "traversal.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="../../payload.pkl")
+
+        manifest_path = tmp_path / "traversal.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["traversal.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
+        assert checks[0].details["member"] == "../../payload.pkl"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "traversal.manifest:traversal.tar.gz:../../payload.pkl" in (issue.location or "")
+            and "path traversal" not in issue.message.lower()
+            for issue in result.issues
+        )
+
+        cache_dir = tmp_path / "traversal-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert determine_exit_code(aggregate) == 1
+            assert any(
+                issue.message == "Layer member ../../payload.pkl attempted path traversal outside the layer"
+                for issue in aggregate.issues
+            )
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL
+                and "traversal.manifest:traversal.tar.gz:../../payload.pkl" in (issue.location or "")
+                and "path traversal" not in issue.message.lower()
+                for issue in aggregate.issues
+            )
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "C:\\Windows\\System32\\config\\SAM",
+            "\\Windows\\System32\\config\\SAM",
+            "/\\\\server\\share\\model.bin",
+        ],
+    )
+    def test_scan_layer_reports_unsafe_link_metadata(self, tmp_path: Path, target: str) -> None:
+        """Host-absolute symlink targets should be reported from layer metadata."""
+        layer_path = tmp_path / "unsafe-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/system")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = target
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == target
+
+    @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_scan_layer_reports_empty_link_target(self, tmp_path: Path, link_type: bytes) -> None:
+        """Links without a target are malformed and must not be treated as safe."""
+        layer_path = tmp_path / "empty-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/empty")
+            link_info.type = link_type
+            link_info.linkname = ""
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "empty-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["empty-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].message == "Layer link links/empty has an empty target"
+        assert checks[0].details["target"] == ""
+
+    @pytest.mark.parametrize("target", ["/bin/dash", "/C:/models/model.bin"])
+    def test_scan_layer_allows_posix_absolute_symlink_within_container_root(
+        self,
+        tmp_path: Path,
+        target: str,
+    ) -> None:
+        """OCI rootfs symlinks may use ordinary POSIX-absolute container paths."""
+        layer_path = tmp_path / "absolute-container-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("bin/sh")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = target
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "absolute-container-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["absolute-container-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert checks == []
+
+    def test_scan_layer_reports_absolute_hardlink_target(self, tmp_path: Path) -> None:
+        """Hardlink targets remain archive-root relative and must not be absolute."""
+        layer_path = tmp_path / "absolute-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("bin/tool")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "/bin/target"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "absolute-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["absolute-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "/bin/target"
+
+    def test_scan_layer_allows_safe_link_metadata(self, tmp_path: Path) -> None:
+        """Benign relative link metadata should remain clean."""
+        layer_path = tmp_path / "safe-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/model")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert checks == []
+
+    def test_scan_layer_allows_symlink_target_under_layer_root(self, tmp_path: Path) -> None:
+        """Symlink targets are resolved from the link directory but contained by the layer root."""
+        layer_path = tmp_path / "safe-sibling-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("usr/bin/tool")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../lib/tool"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-sibling-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-sibling-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert checks == []
+
+    def test_resolve_symlink_target_does_not_follow_host_symlinks(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Layer metadata validation should not depend on host filesystem symlinks."""
+        extraction_root = tmp_path / "extract"
+        extraction_root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (extraction_root / "usr").symlink_to(outside, target_is_directory=True)
+
+        resolved, is_safe = OciLayerScanner._resolve_link_target(
+            "../lib/tool",
+            resolved_member_name=str(extraction_root / "usr/bin/tool"),
+            extraction_root=str(extraction_root),
+            is_symlink=True,
+        )
+
+        assert resolved == str(extraction_root / "usr/lib/tool")
+        assert is_safe is True
+
+    def test_resolve_symlink_target_rejects_host_alias_back_into_layer_root(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Host aliases must not make lexically escaping layer links appear safe."""
+        extraction_root = tmp_path / "extract"
+        extraction_root.mkdir()
+        (tmp_path / "alias").symlink_to(extraction_root, target_is_directory=True)
+
+        resolved, is_safe = OciLayerScanner._resolve_link_target(
+            "../../../alias/etc/passwd",
+            resolved_member_name=str(extraction_root / "usr/bin/tool"),
+            extraction_root=str(extraction_root),
+            is_symlink=True,
+        )
+
+        assert resolved == str(tmp_path / "alias/etc/passwd")
+        assert is_safe is False
+
+    def test_scan_layer_reports_symlink_target_traversal_outside_layer_root(self, tmp_path: Path) -> None:
+        """Symlink targets that escape the layer root should still be rejected."""
+        layer_path = tmp_path / "unsafe-relative-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("usr/bin/tool")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../../../etc/passwd"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-relative-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-relative-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "../../../etc/passwd"
+
+    def test_scan_layer_reports_hardlink_target_traversal_from_layer_root(self, tmp_path: Path) -> None:
+        """Hardlink targets are archive-root relative, not relative to the link directory."""
+        layer_path = tmp_path / "unsafe-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("dir/link")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "../dir/model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "../dir/model.bin"
+
+    def test_scan_layer_allows_safe_hardlink_target_from_layer_root(self, tmp_path: Path) -> None:
+        """Benign hardlink targets under the archive root should remain clean."""
+        layer_path = tmp_path / "safe-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("dir/link")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "dir/model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert checks == []
+
+    def test_scan_layer_does_not_retain_checks_for_many_safe_links(self, tmp_path: Path) -> None:
+        """Benign link floods must not amplify a small layer into a large result."""
+        layer_path = tmp_path / "many-links.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            for index in range(250):
+                link_info = tarfile.TarInfo(f"links/link-{index}")
+                link_info.type = tarfile.SYMTYPE
+                link_info.linkname = "../targets/model.bin"
+                tar.addfile(link_info)
+
+        manifest_path = tmp_path / "many-links.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner(
+            {
+                "max_oci_layer_entries": 300,
+                "compressed_max_decompression_ratio": 10000.0,
+            }
+        ).scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "Symlink Safety Validation"]
+
+    def test_scan_layer_reports_normalized_duplicate_paths_and_scans_both_members(self, tmp_path: Path) -> None:
+        """OCI-invalid path aliases must fail closed without hiding either payload."""
+        payload = tmp_path / "payload.txt"
+        payload.write_text("safe")
+        layer_path = tmp_path / "duplicate.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="same.txt")
+            tar.add(payload, arcname="./same.txt")
+
+        manifest_path = tmp_path / "duplicate.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        def clean_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="unknown")
+            nested_result.finish()
+            return nested_result
+
+        with patch("modelaudit.core.scan_file", side_effect=clean_scan) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert mock_scan.call_count == 2
+        assert len(checks) == 1
+        assert checks[0].details["normalized_path"] == "same.txt"
+        assert "duplicates normalized path" in checks[0].message
+
+    @pytest.mark.parametrize(
+        ("member_name", "payload", "expected_scan_calls"),
+        [
+            (".wh.", b"", 0),
+            (".wh..", b"", 0),
+            (".wh...", b"", 0),
+            (".wh..wh.deleted", b"", 0),
+            (".wh.deleted", b"payload", 1),
+        ],
+    )
+    def test_scan_layer_reports_invalid_whiteout_metadata(
+        self,
+        tmp_path: Path,
+        member_name: str,
+        payload: bytes,
+        expected_scan_calls: int,
+    ) -> None:
+        """Bare, reserved-target, or non-empty whiteouts are invalid OCI metadata."""
+        layer_path = tmp_path / "invalid-whiteout.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            whiteout = tarfile.TarInfo(member_name)
+            whiteout.size = len(payload)
+            tar.addfile(whiteout, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "invalid-whiteout.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        nested_result = ScanResult(scanner_name="unknown")
+        nested_result.finish()
+        with patch("modelaudit.core.scan_file", return_value=nested_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert mock_scan.call_count == expected_scan_calls
+        assert len(checks) == 1
+        assert "valid empty OCI whiteout" in checks[0].message
+
+    def test_scan_layer_allows_valid_empty_whiteouts(self, tmp_path: Path) -> None:
+        """Deletion and opaque-directory whiteouts are valid empty regular files."""
+        layer_path = tmp_path / "valid-whiteout.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.addfile(tarfile.TarInfo("root/.wh.deleted"))
+            tar.addfile(tarfile.TarInfo("root/.wh..wh..opq"))
+
+        manifest_path = tmp_path / "valid-whiteout.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_not_called()
+        assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+
+    def test_scan_layer_reports_reserved_whiteout_parent_component(self, tmp_path: Path) -> None:
+        """Implicit directories with reserved whiteout names are invalid OCI metadata."""
+        layer_path = tmp_path / "reserved-whiteout-parent.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.wh.deleted/payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "reserved-whiteout-parent.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].message == (
+            "Layer member root/.wh.deleted/payload.dat uses reserved OCI whiteout path component .wh.deleted"
+        )
+        assert checks[0].details["reserved_component"] == ".wh.deleted"
+
+    @pytest.mark.parametrize(
+        "member_name",
+        [
+            "root/.wh.deleted/../payload.dat",
+            "root\\.wh.deleted\\..\\payload.dat",
+        ],
+    )
+    def test_scan_layer_reports_reserved_whiteout_parent_hidden_by_normalization(
+        self,
+        tmp_path: Path,
+        member_name: str,
+    ) -> None:
+        """Dot segments must not erase a reserved raw whiteout component."""
+        layer_path = tmp_path / "normalized-whiteout-parent.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo(member_name)
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "normalized-whiteout-parent.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].details["reserved_component"] == ".wh.deleted"
+
+    def test_scan_layer_allows_whiteout_prefix_near_match_in_parent_component(self, tmp_path: Path) -> None:
+        """Ordinary parent directory names that merely start similarly remain valid."""
+        layer_path = tmp_path / "whiteout-parent-near-match.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.whitehouse/payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "whiteout-parent-near-match.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
+
+    def test_scan_layer_allows_normalized_whiteout_prefix_near_match(self, tmp_path: Path) -> None:
+        """Normalization through an ordinary similarly named directory remains benign."""
+        layer_path = tmp_path / "normalized-whiteout-parent-near-match.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            member = tarfile.TarInfo("root/.whitehouse/../payload.dat")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+
+        manifest_path = tmp_path / "normalized-whiteout-parent-near-match.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
 
     def test_scan_corrupted_tar_layer(self, tmp_path: Path) -> None:
         """Test scanning corrupted tar layer."""
