@@ -765,15 +765,31 @@ def test_ancestor_monitor_ignores_unrelated_grandparent_churn(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires inotify path monitoring")
-def test_cache_manager_does_not_cache_higher_ancestor_swap(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("model_subdirectory", "cache_subdirectory"),
+    [
+        (None, "cache"),
+        ("sub", "cache"),
+        ("sub", None),
+    ],
+    ids=["direct-parent-probe", "nested-sibling-probe", "intermediate-ancestor-probe"],
+)
+def test_cache_manager_does_not_cache_higher_ancestor_swap(
+    tmp_path: Path,
+    model_subdirectory: str | None,
+    cache_subdirectory: str | None,
+) -> None:
     scan_root = tmp_path / "scan-root"
     model_dir = scan_root / "models"
     model_dir.mkdir(parents=True)
-    model_path = _make_cacheable_file(model_dir, name="model.dat")
+    model_parent = model_dir / model_subdirectory if model_subdirectory is not None else model_dir
+    model_parent.mkdir(exist_ok=True)
+    model_path = _make_cacheable_file(model_parent, name="model.dat")
     model_path.write_bytes(b"evil!:" + (b"x" * 2042))
     displaced_root = tmp_path / "scan-root-displaced"
 
-    cache_manager = get_cache_manager(str(model_dir / "cache"), enabled=True)
+    cache_dir = model_dir / cache_subdirectory if cache_subdirectory is not None else model_dir
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     version_context = build_cache_version_context({"timeout": 30})
     calls = {"count": 0}
 
@@ -781,13 +797,15 @@ def test_cache_manager_does_not_cache_higher_ancestor_swap(tmp_path: Path) -> No
         calls["count"] += 1
         if calls["count"] == 1:
             scan_root.rename(displaced_root)
-            replacement_dir = scan_root / "models"
+            replacement_dir = scan_root / model_path.parent.relative_to(scan_root)
             replacement_dir.mkdir(parents=True)
             replacement_path = replacement_dir / model_path.name
             replacement_path.write_bytes(b"clean:" + (b"y" * 2042))
             prefix = Path(path).read_bytes()[:6].decode("utf-8")
             replacement_path.unlink()
-            replacement_dir.rmdir()
+            while replacement_dir != scan_root:
+                replacement_dir.rmdir()
+                replacement_dir = replacement_dir.parent
             scan_root.rmdir()
             displaced_root.rename(scan_root)
             return {"payload_prefix": prefix}

@@ -817,7 +817,6 @@ class ScanResultsCache:
         """Capture lexical ancestors, including a change token for the direct parent."""
         file_device = os.stat(file_path).st_dev
         ancestor = Path(os.path.abspath(file_path)).parent
-        boundary = self._ancestor_identity_boundary(ancestor, file_device)
         identity: list[AncestorEntry] = []
         direct_parent = True
         while True:
@@ -844,27 +843,11 @@ class ScanResultsCache:
                     self._get_file_change_token(ancestor_path, ancestor_stat),
                 )
             )
-            if boundary is not None and ancestor == boundary:
-                break
             if not parent_on_same_device:
                 break
             direct_parent = False
             ancestor = ancestor.parent
         return AncestorIdentity(identity)
-
-    def _ancestor_identity_boundary(self, file_parent: Path, file_device: int) -> Path | None:
-        probe = self._change_clock_probes.get(file_device)
-        if probe is None:
-            return None
-        try:
-            boundary = Path(os.path.commonpath([str(file_parent), str(probe[1])]))
-            # A probe below the scanned directory moves with that directory. It
-            # therefore cannot provide a stable boundary for ancestor watches.
-            if boundary == file_parent:
-                return None
-            return boundary if os.stat(boundary).st_dev == file_device else None
-        except (OSError, ValueError):
-            return None
 
     @staticmethod
     def _ancestor_identity_matches(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
