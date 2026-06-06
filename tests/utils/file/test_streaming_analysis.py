@@ -20,10 +20,17 @@ class HeaderOnlyScanner(BaseScanner):
 
 def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     signed_url = "https://bucket.example/model.pkl%3FX-Amz-Signature%3Dsecret"
+    double_encoded_signed_url = "https://bucket.example/model.pkl%253FX-Amz-Signature%253Dsecret"
+    four_times_encoded_signed_url = "https://bucket.example/model.pkl%2525253FX-Amz-Signature%2525253Dsecret"
     literal_question_mark = "https://bucket.example/model%3Fv1.pkl"
+    double_encoded_literal_question_mark = "https://bucket.example/model%253Fv1.pkl"
 
     assert streaming.stream_source_path(signed_url) == "/model.pkl"
+    assert streaming.stream_source_path(double_encoded_signed_url) == "/model.pkl"
+    assert streaming.stream_source_path(four_times_encoded_signed_url) == "/model.pkl"
+    assert streaming.can_stream_analyze(double_encoded_signed_url, PickleScanner()) is True
     assert streaming.stream_source_path(literal_question_mark) == "/model?v1.pkl"
+    assert streaming.stream_source_path(double_encoded_literal_question_mark) == "/model?v1.pkl"
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

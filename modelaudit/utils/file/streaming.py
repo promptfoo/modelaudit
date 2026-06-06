@@ -15,6 +15,8 @@ from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud
 
 from .detection import _has_zip_magic
 
+_MAX_STREAM_SOURCE_PATH_DECODE_PASSES = 4
+
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
@@ -27,14 +29,19 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
 
 def stream_source_path(url: str) -> str:
     """Return the decoded URL path used for scanner routing and file naming."""
-    parsed_path = unquote(urlparse(url).path)
-    for index, character in enumerate(parsed_path):
-        if character not in "?#":
-            continue
-        prefix = parsed_path[:index]
-        encoded_suffix = parsed_path[index + 1 :]
-        if Path(prefix).suffix or any(delimiter in encoded_suffix for delimiter in "=&;"):
-            return prefix or url
+    parsed_path = urlparse(url).path
+    for _ in range(_MAX_STREAM_SOURCE_PATH_DECODE_PASSES):
+        decoded_path = unquote(parsed_path)
+        if decoded_path == parsed_path:
+            break
+        parsed_path = decoded_path
+        for index, character in enumerate(parsed_path):
+            if character not in "?#":
+                continue
+            prefix = parsed_path[:index]
+            encoded_suffix = parsed_path[index + 1 :]
+            if Path(prefix).suffix or any(delimiter in encoded_suffix for delimiter in "=&;"):
+                return prefix or url
     return parsed_path or url
 
 
