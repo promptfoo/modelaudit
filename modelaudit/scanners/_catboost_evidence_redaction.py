@@ -138,13 +138,19 @@ COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|client[_.-]?secret|"
-    r"auth|basic[_.-]?auth|cookie|credential|jwt|passphrase|password|passwd|private[_.-]?key|pwd|"
+    r"auth|basic[_.-]?auth|cookie|credential|google[_.-]?access[_.-]?id|jwt|passphrase|password|passwd|"
+    r"private[_.-]?key|pwd|"
     r"refresh[_.-]?token|sas|secret|"
     r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
     r"(?:s|[0-9]+|[_.-]?values?)?"
 )
+CAMEL_CASE_SENSITIVE_NEAR_MATCH_SUFFIX: Final[str] = r"(?:Algorithm|Cache|Count|Format|Hint|Ingredient|Policy)"
+CATBOOST_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?![A-Za-z0-9]*{CAMEL_CASE_SENSITIVE_NEAR_MATCH_SUFFIX}\b)"
+    rf"{SHARED_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}"
+)
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{SHARED_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CATBOOST_CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
 )
 AUTHORIZATION_KEY_PATTERN: Final[str] = SHARED_AUTHORIZATION_ALIAS_ASSIGNMENT_KEY
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
@@ -235,6 +241,28 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)(\$?[\"']?)([^:\s\"';&|]*:)"
     r"([^\"'\s;&|)]+)([\"']?)"
 )
+COMMAND_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?P<option>(?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)"
+    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>(?:\\.|(?!(?P=quote)).)*?:)"
+    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+)
+COMMAND_SUBSTITUTION_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?P<option>(?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)"
+    r"(?P<username>[^:\s\"';&|]*:)(?P<password>\$\((?:\\.|[^)])*\))"
+)
+COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?<![?&/\w-])(?P<option>(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
+    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>(?:\\.|(?!(?P=quote)).)*?:)"
+    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+)
+COMMAND_CONFIG_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?<![?&/\w-])((?:proxy-)?user\s*(?:=|:|\s+)\s*)(\$?[\"']?)([^:\s\"';&|]*:)"
+    r"([^\"'\r\n]+)([\"']?)"
+)
+CURL_INLINE_CONFIG_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)\bcurl\b(?:(?![;\n]).){0,2048}?"
+    r"(?P<option>(?<!\w)(?:--config|-K)(?:=|\s+))(?P<source><\(|-)"
+)
 SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*(?:{PYTHON_STRING_PREFIX_RE})"
     rf"(?P<key_quote>[\"'])(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
@@ -244,8 +272,16 @@ COMPOSED_SENSITIVE_FUNCTION_ARGUMENT_PREFIX_RE: Final[re.Pattern[str]] = re.comp
     rf"(?P<key>(?:{PYTHON_STRING_LITERAL_FRAGMENT_RE}(?:\s*[+%]\s*|\s+))+"
     rf"{PYTHON_STRING_LITERAL_FRAGMENT_RE})\s*,\s*)"
 )
+CAMEL_CASE_SENSITIVE_SETTER_KEY: Final[str] = (
+    r"(?:[A-Z][A-Za-z0-9]*?)?"
+    r"(?:AccessKey(?:Id)?|AccessToken|APIKey|ApiKey|Auth|AuthToken|Authorization|BasicAuth|ClientSecret|Cookie|"
+    r"Credentials?|GoogleAccessId|JWT|Jwt|Passphrase|Password|Passwd|PrivateKey|ProxyAuthorization|Pwd|"
+    r"RefreshToken|SAS|Secret|SecretKey|SessionId|SessionToken|Signature|Sig|Token)"
+)
 SENSITIVE_SETTER_CALL_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b(?P<callee>(?:[A-Za-z_][A-Za-z0-9_]*\.)*set_(?P<key>{SENSITIVE_ASSIGNMENT_KEY}))\s*\(\s*"
+    rf"(?is)\b(?P<callee>(?:[A-Za-z_][A-Za-z0-9_]*\.)*(?:"
+    rf"set_(?P<key>{SENSITIVE_ASSIGNMENT_KEY})|"
+    rf"set(?P<camel_key>(?-i:{CAMEL_CASE_SENSITIVE_SETTER_KEY}))))\s*\(\s*"
 )
 SENSITIVE_ARGV_PAIR_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?P<collection_prefix>[\[(,])\s*(?:{PYTHON_STRING_PREFIX_RE})?(?P<key_quote>[\"'])"
@@ -283,7 +319,7 @@ STRUCTURED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
 )
 REDACTED_STRUCTURED_VALUE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"^\s*(?P<slashes>\\*)(?P<quote>[\"']){re.escape(REDACTED_EVIDENCE_VALUE)}"
-    rf"(?P=slashes)(?P=quote)\s*(?=[,}}]|$)"
+    rf"(?P=slashes)(?P=quote)\s*(?=[,\]}})]|$)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
@@ -2089,6 +2125,64 @@ def _redact_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED_EVIDENCE_VALUE}{match.group(5)}"
 
 
+def _redact_quoted_command_user_password(match: re.Match[str]) -> str:
+    return (
+        f"{match.group('option')}{match.group('prefix')}{match.group('quote')}"
+        f"{match.group('username')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+    )
+
+
+def _redact_substitution_command_user_password(match: re.Match[str]) -> str:
+    return f"{match.group('option')}{match.group('username')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _find_shell_group_end(text: str, start: int) -> int:
+    depth = 1
+    quote: str | None = None
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == quote and _count_preceding_backslashes(text, index) % 2 == 0:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(text)
+
+
+def _redact_inline_curl_config_passwords(text: str) -> str:
+    """Redact user credentials only inside inline curl config sources."""
+    ranges: list[tuple[int, int]] = []
+    for match in CURL_INLINE_CONFIG_SOURCE_RE.finditer(text):
+        if match.group("source") == "<(":
+            ranges.append((match.end(), _find_shell_group_end(text, match.end())))
+            continue
+
+        pipe = text.rfind("|", 0, match.start())
+        if pipe >= 0:
+            input_start = max(text.rfind(";", 0, pipe), text.rfind("\n", 0, pipe)) + 1
+            ranges.append((input_start, pipe))
+        here_string = re.match(r"\s*<<<\s*", text[match.end() :])
+        if here_string is not None:
+            ranges.append((match.end() + here_string.end(), len(text)))
+
+    for start, end in reversed(ranges):
+        fragment = text[start:end]
+        fragment = COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
+        fragment = COMMAND_CONFIG_USER_PASSWORD_RE.sub(_redact_command_user_password, fragment)
+        text = f"{text[:start]}{fragment}{text[end:]}"
+    return text
+
+
 def _redact_quoted_certificate_password(match: re.Match[str]) -> str:
     if re.fullmatch(r"[A-Za-z]:", match.group("certificate")) and match.group("password").startswith(("\\", "/")):
         return match.group(0)
@@ -2190,7 +2284,10 @@ def _redact_sensitive_setter_arguments(text: str) -> str:
     replacements: list[tuple[int, int, str]] = []
     covered_until = 0
     for match in SENSITIVE_SETTER_CALL_RE.finditer(text):
-        if match.start() < covered_until or _normalize_sensitive_key(match.group("key")) is None:
+        if match.start() < covered_until:
+            continue
+        snake_key = match.group("key")
+        if snake_key is not None and _normalize_sensitive_key(snake_key) is None:
             continue
         argument_start = match.end()
         arguments: list[tuple[int, int, re.Match[str] | None]] = []
@@ -2224,8 +2321,8 @@ def _redact_sensitive_setter_arguments(text: str) -> str:
                 replacements.append((value_start, end, _redact_sensitive_function_value(raw_value)))
                 redacted_keyword = True
 
-        if not redacted_keyword and positional_arguments:
-            start, end, _ = positional_arguments[0]
+        positional_values = [] if redacted_keyword else positional_arguments
+        for start, end, _ in positional_values:
             replacements.append((start, end, _redact_sensitive_function_value(text[start:end])))
 
     for start, end, replacement in reversed(replacements):
@@ -2549,7 +2646,8 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
-    redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, text)
+    redacted = _redact_inline_curl_config_passwords(text)
+    redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
     redacted = COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}\2", redacted)
     redacted = COMMAND_STRUCTURED_SENSITIVE_VALUE_RE.sub(_redact_command_structured_value, redacted)
     redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
@@ -2563,6 +2661,8 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = COMMAND_BODY_OPTION_RE.sub(_redact_command_body_option, redacted)
     redacted = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, redacted)
     redacted = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, redacted)
+    redacted = COMMAND_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, redacted)
+    redacted = COMMAND_SUBSTITUTION_USER_PASSWORD_RE.sub(_redact_substitution_command_user_password, redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
     pieces: list[str] = []
     cursor = 0
@@ -2618,6 +2718,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_embedded_control_sensitive_keys(redacted)
     redacted = _normalize_serialized_structured_sensitive_keys(redacted)
     redacted = STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_structured_quoted_assignment, redacted)
+    redacted = _redact_inline_curl_config_passwords(redacted)
     redacted = _redact_command_context_tokens(redacted)
     redacted = _redact_sensitive_argv_pairs(redacted)
     redacted = _redact_sensitive_setter_arguments(redacted)

