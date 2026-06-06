@@ -160,6 +160,19 @@ class TestNetworkCommDetector:
 
         assert redacted == "https://auth.<redacted>.<redacted>.com/path"
 
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://auth.Bearer.com/path", "https://auth.bearer.com/path"),
+            ("https://auth.Bearer.example.com/path", "https://auth.<redacted>.example.com/path"),
+        ],
+    )
+    def test_authorization_hostname_preserves_domain_after_bare_scheme(self, url: str, expected: str) -> None:
+        """A scheme without a credential payload must not consume the registrable domain."""
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == expected
+
     def test_detect_urls_redacts_value_after_over_encoded_hostname_key(self) -> None:
         """Decode-depth exhaustion on a hostname key must also redact its following value."""
         encoded_key = "".join(f"%{ord(character):02X}" for character in "api_key")

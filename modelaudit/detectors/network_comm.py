@@ -101,9 +101,6 @@ _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
-_STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
-    {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
-)
 _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9])"
@@ -600,9 +597,7 @@ def _hostname_authorization_scheme_has_payload(
     if not _authorization_scheme_has_payload(scheme, following_value):
         return False
     assert following_value is not None
-    if scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES or _looks_like_hostname_credential_value(
-        following_value
-    ):
+    if _looks_like_hostname_credential_value(following_value):
         return True
 
     suffix_labels = 2
