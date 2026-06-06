@@ -280,6 +280,10 @@ def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
     if ":" not in decoded:
         return None
 
+    key, separator, value = decoded.partition(":")
+    if separator and _is_sensitive_path_key(key) and _URI_IN_TEXT_PATTERN.match(value) is not None:
+        return f"{key}:{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+
     parts = decoded.split(":")
     changed = _redact_delimited_path_components(parts)
 
@@ -816,6 +820,11 @@ def _redact_network_evidence(text: str) -> str:
 
     safe_urls = _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
     return redact_evidence_string(safe_urls, max_chars=None)
+
+
+def _redact_urls_in_text(text: str) -> str:
+    """Preserve the integration-facing URL redaction and formatting contract."""
+    return _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
 
 
 def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
@@ -1419,7 +1428,11 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
                 pending_sensitive_value = False
             key, separator, value = field.partition("=")
             candidate = value if separator else field
-            sensitive_key = bool(separator and _is_sensitive_path_key(_decode_query_component(key)))
+            decoded_key = _decode_query_component(key)
+            path_key = decoded_key.rsplit("/", maxsplit=1)[-1]
+            sensitive_key = bool(
+                separator and (_is_sensitive_path_key(decoded_key) or _is_sensitive_path_key(path_key))
+            )
             sensitive_field = inherited_sensitive_value or sensitive_key
             if separator:
                 pending_sensitive_value = sensitive_key and not value
@@ -2281,12 +2294,14 @@ class NetworkCommDetector:
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
         url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_generic_url_contexts(data)
-        seen_urls: set[str] = set()
+        seen_cloud_urls: set[str] = set()
         for url_start, _url_end, url in url_contexts:
             if self.max_findings is not None:
-                if url in seen_urls:
+                is_cloud_url = self._is_cloud_storage_url(url)
+                if is_cloud_url and url in seen_cloud_urls:
                     continue
-                seen_urls.add(url)
+                if is_cloud_url:
+                    seen_cloud_urls.add(url)
                 for nested_url in _decoded_nested_urls(url):
                     if nested_url in self._cloud_nested_url_findings:
                         continue

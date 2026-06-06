@@ -1668,7 +1668,7 @@ class KerasH5Scanner(BaseScanner):
                     if self._contains_suspicious_config_term(
                         value,
                         suspicious_term,
-                        case_sensitive=case_sensitive,
+                        case_sensitive=case_sensitive and key == "function",
                     ):
                         result.add_check(
                             name="Suspicious Configuration String Check",
@@ -1690,7 +1690,7 @@ class KerasH5Scanner(BaseScanner):
                     result,
                     nested_context,
                     redact_nested_context=redact_nested_context,
-                    case_sensitive=case_sensitive,
+                    case_sensitive=False,
                 )
             elif isinstance(value, list):
                 # Check each item in the list
@@ -1702,7 +1702,7 @@ class KerasH5Scanner(BaseScanner):
                             result,
                             nested_context,
                             redact_nested_context=redact_nested_context,
-                            case_sensitive=case_sensitive,
+                            case_sensitive=False,
                         )
 
     @staticmethod

@@ -31,8 +31,12 @@ from modelaudit.utils.sources.cloud_storage import (
     download_from_cloud_streaming,
     filter_scannable_files,
     get_cloud_object_size,
+    get_fs_protocol,
     is_cloud_url,
+    is_sensitive_credential_key,
     redact_cloud_error_for_display,
+    redact_stream_error_for_display,
+    redact_stream_url_for_display,
     redact_url_for_display,
 )
 from tests.helpers import create_mock_coreml
@@ -152,6 +156,7 @@ class TestCloudURLDetection:
             "gs://my-bucket/model.pt",
             "r2://data/model.bin",
             "https://bucket.s3.amazonaws.com/file",
+            "HTTPS://BUCKET.S3.AMAZONAWS.COM/file",
             "https://storage.googleapis.com/bucket/file",
             "https://account.r2.cloudflarestorage.com/bucket/file",
         ]
@@ -167,8 +172,24 @@ class TestCloudURLDetection:
         for url in invalid:
             assert not is_cloud_url(url), f"Incorrectly detected {url}"
 
+    @pytest.mark.parametrize(
+        ("url", "expected_protocol"),
+        [
+            ("HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://STORAGE.GOOGLEAPIS.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://ACCOUNT.R2.CLOUDFLARESTORAGE.COM/bucket/model.pkl", "s3"),
+        ],
+    )
+    def test_resolves_mixed_case_https_provider_hosts(self, url: str, expected_protocol: str) -> None:
+        assert get_fs_protocol(url) == expected_protocol
+
 
 class TestCloudURLRedaction:
+    def test_deeply_encoded_structured_key_fails_closed(self) -> None:
+        encoded_access_token = "access%252525255Ftoken"
+
+        assert is_sensitive_credential_key(encoded_access_token) is True
+
     def test_redact_url_for_display_strips_credentials_and_query(self) -> None:
         url = "https://user:pass@example.com:8443/path/to/model.bin?X-Amz-Signature=secret#fragment"
         assert redact_url_for_display(url) == "https://example.com:8443/path/to/model.bin"
@@ -176,6 +197,94 @@ class TestCloudURLRedaction:
     def test_redact_url_for_display_strips_cloud_query_params(self) -> None:
         url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
+
+    def test_redact_url_for_display_strips_percent_encoded_query_params(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://bucket.s3.amazonaws.com/model%3Fv1.pkl",
+            "https://bucket.s3.amazonaws.com/model%253Fv1.pkl",
+            "https://bucket.s3.amazonaws.com/model%23v1.pkl",
+            "https://bucket.s3.amazonaws.com/model%3Bv1.pkl",
+        ],
+    )
+    def test_redact_url_for_display_preserves_encoded_literal_delimiter(self, url: str) -> None:
+        assert redact_url_for_display(url) == url
+
+    def test_redact_url_for_display_preserves_encoded_literal_question_mark_before_signed_query(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret"
+
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model%3Fv1.pkl"
+
+    def test_redact_cloud_error_preserves_encoded_literal_question_mark_before_signed_query(self) -> None:
+        message = "provider failed: https://bucket.s3.amazonaws.com/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret code=403"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com/model%3Fv1.pkl?X-Amz-Signature=<redacted> code=403"
+        )
+        assert "secret" not in redacted
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://bucket.s3.amazonaws.com/model.pkl;token=SECRET",
+            "https://bucket.s3.amazonaws.com/model.pkl%3Btoken%3DSECRET",
+        ],
+    )
+    def test_redact_url_for_display_strips_path_credentials(self, url: str) -> None:
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_preserves_bare_semicolon_filename(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model;v1.pkl"
+
+        assert redact_url_for_display(url) == url
+
+    def test_redact_url_for_display_preserves_non_structural_path_escapes(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/models/bert%20base%2Fmodel.pkl"
+        assert redact_url_for_display(url) == url
+
+    def test_redact_url_for_display_strips_percent_encoded_userinfo(self) -> None:
+        url = "https://user%3Aencoded-password%40bucket.s3.amazonaws.com%2Fmodel.pkl%3Ftoken%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_preserves_path_when_encoded_password_contains_slash(self) -> None:
+        url = "https://user%3Ap%252Fass%40bucket.s3.amazonaws.com%2Fmodel.pkl%3Ftoken%3Dsecret"
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_fails_closed_for_invalid_port(self) -> None:
+        url = "https://user:password@example.com:not-a-port/model.bin?token=secret"
+        assert redact_url_for_display(url) == "<cloud URL redacted>"
+
+    def test_redact_url_for_display_preserves_ipv6_authority(self) -> None:
+        url = "https://[2001:db8::1]:8443/model.bin?token=secret"
+        assert redact_url_for_display(url) == "https://[2001:db8::1]:8443/model.bin"
+
+    def test_redact_stream_url_for_display_fails_closed_without_inner_scheme(self) -> None:
+        url = "bucket/model.bin?redirect=https://safe.example&token=secret"
+        assert redact_stream_url_for_display(url) == "<cloud URL redacted>"
+
+    def test_redact_stream_url_for_display_strips_percent_encoded_query_params(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model.pkl%253Fvisible%253Dyes%2526token%253Dsecret"
+        assert redact_stream_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_stream_error_for_display_removes_unknown_malformed_query(self) -> None:
+        url = "bucket/model.bin?session=secret-value"
+        message = f"failed to open stream://{url}"
+
+        redacted = redact_stream_error_for_display(message, url)
+
+        assert redacted == "failed to open stream://<cloud URL redacted>"
+        assert "secret-value" not in redacted
+
+    def test_redact_stream_error_for_display_handles_empty_source(self) -> None:
+        assert redact_stream_error_for_display("failed to open stream://", "") == (
+            "failed to open stream://<cloud URL redacted>"
+        )
 
     def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
         url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
@@ -199,6 +308,237 @@ class TestCloudURLRedaction:
         assert "token=<redacted>" in redacted
         assert "secret" not in redacted
         assert "abc123" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_transformed_credentials_and_opaque_url_parts(self) -> None:
+        message = (
+            "provider normalized token=secret-token from "
+            "https://collector.example/callback?OPAQUE-QUERY-SECRET#OPAQUE-FRAGMENT-SECRET"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "token=<redacted>" in redacted
+        assert "https://collector.example/callback" in redacted
+        assert "secret-token" not in redacted
+        assert "OPAQUE-QUERY-SECRET" not in redacted
+        assert "OPAQUE-FRAGMENT-SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_escaped_url_delimiters(self) -> None:
+        message = r"provider failed: https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-SECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "provider failed: https://collector.example/callback?token=<redacted>"
+        assert "ENCODED-SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_percent_encoded_url_delimiters(self) -> None:
+        message = (
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl"
+            "%253Fvisible%253Dyes%2526X-Amz-Signature%253Ddeadbeef%2526token%253Dsecret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl"
+            "?visible=yes&X-Amz-Signature=<redacted>&token=<redacted>"
+        )
+        assert "deadbeef" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_schemeless_encoded_query(self) -> None:
+        message = "bucket/path/model.pkl%3FX-Amz-Signature%3Dsecret"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "bucket/path/model.pkl?X-Amz-Signature=<redacted>"
+        assert "secret" not in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Authorization: Bearer HEADER-SECRET",
+            "X-Amz-Security-Token: HEADER-SECRET",
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_header_credentials(self, message: str) -> None:
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted.endswith(": <redacted>")
+        assert "HEADER-SECRET" not in redacted
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("Authorization=Bearer ASSIGNMENT-SECRET", "Authorization=<redacted>"),
+            ("Authorization = Basic ASSIGNMENT-SECRET", "Authorization = <redacted>"),
+            ("aws_secret_access_key = ASSIGNMENT-SECRET", "aws_secret_access_key = <redacted>"),
+            ("client_secret = 'ASSIGNMENT SECRET'", "client_secret = <redacted>"),
+            ('password="UNTERMINATED ASSIGNMENT SECRET', "password=<redacted>"),
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_spaced_assignments(self, message: str, expected: str) -> None:
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == expected
+        assert "ASSIGNMENT" not in redacted
+
+    def test_redact_cloud_error_for_display_preserves_benign_spaced_assignment(self) -> None:
+        message = "tokenizer = sentencepiece"
+
+        assert redact_cloud_error_for_display(message) == message
+
+    @pytest.mark.parametrize("message", ["token==SECRET", "token == SECRET"])
+    def test_redact_cloud_error_for_display_preserves_comparison_operators(self, message: str) -> None:
+        assert redact_cloud_error_for_display(message) == message
+
+    def test_redact_cloud_error_for_display_preserves_context_after_assignment(self) -> None:
+        message = "token=SECRET from https://collector.example/status"
+
+        assert redact_cloud_error_for_display(message) == "token=<redacted> from https://collector.example/status"
+
+    def test_redact_cloud_error_for_display_preserves_benign_header(self) -> None:
+        message = "Tokenizer: sentencepiece"
+
+        assert redact_cloud_error_for_display(message) == message
+
+    def test_redact_cloud_error_for_display_normalizes_percent_encoded_url_prefix(self) -> None:
+        message = (
+            "provider failed: https%253A%252F%252Fbucket.s3.amazonaws.com%252Fmodel.pkl"
+            "%253Fvisible%253Dyes%2526X-Amz-Signature%253Ddeadbeef"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com/model.pkl?visible=yes&X-Amz-Signature=<redacted>"
+        )
+        assert "deadbeef" not in redacted
+
+    @pytest.mark.parametrize(
+        "mixed_encoded_url",
+        [
+            "https%3A//user:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+            "https:%2F%2Fuser:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+            "https%253A/%252Fuser:password@bucket.s3.amazonaws.com/model.pkl?token=secret",
+        ],
+    )
+    def test_redact_cloud_error_normalizes_mixed_encoded_url_prefixes(self, mixed_encoded_url: str) -> None:
+        redacted = redact_cloud_error_for_display(f"provider failed: {mixed_encoded_url}")
+
+        assert redacted == "provider failed: https://bucket.s3.amazonaws.com/model.pkl?token=<redacted>"
+        assert "user:password" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_strips_fully_encoded_userinfo(self) -> None:
+        message = (
+            "provider failed: https%253A%252F%252Fuser%253Aencoded-password%2540"
+            "bucket.s3.amazonaws.com%252Fmodel.pkl%253Ftoken%253Dsecret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "provider failed: https://bucket.s3.amazonaws.com/model.pkl?token=<redacted>"
+        assert "encoded-password" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_common_credential_aliases(self) -> None:
+        message = (
+            "request failed: https://example.test/c2?campaign=test&session=secret-session&password=secret-password"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "campaign=test" in redacted
+        assert "session=<redacted>" in redacted
+        assert "password=<redacted>" in redacted
+        assert "secret-session" not in redacted
+        assert "secret-password" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_unknown_query_values(self) -> None:
+        message = "request failed: https://example.test/c2?campaign=test&opaque=SUPERSECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "campaign=test" in redacted
+        assert "opaque=<redacted>" in redacted
+        assert "SUPERSECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_does_not_normalize_unknown_keys_into_allowlist(self) -> None:
+        message = "request failed: https://example.test/c2?cam-paign=SUPERSECRET&camp%61ign=test"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "cam-paign=<redacted>" in redacted
+        assert "camp%61ign=test" in redacted
+        assert "SUPERSECRET" not in redacted
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "en%26token%3DSECRET",
+            "yes%2526access_token%253DSECRET",
+            "yes%25252526access_token%2525253DSECRET",
+            "token=SECRET",
+            "en,token=SECRET",
+            "en%0D%0AAuthorization%3A%20Bearer%20SECRET",
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_nested_query_structure_in_safe_values(self, value: str) -> None:
+        message = f"request failed: https://example.test/c2?lang={value}"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "request failed: https://example.test/c2?lang=<redacted>"
+        assert "SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_handles_separate_safe_and_sensitive_params(self) -> None:
+        message = "request failed: https://example.test/c2?lang=en&token=SECRET"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "request failed: https://example.test/c2?lang=en&token=<redacted>"
+        assert "SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_preserves_encoded_safe_value_characters(self) -> None:
+        message = "request failed: https://example.test/c2?tokenizer=org%2Fbert-base&lang=en-US"
+
+        assert redact_cloud_error_for_display(message) == message
+
+    def test_redact_cloud_error_for_display_redacts_semicolon_query_credentials(self) -> None:
+        message = "provider failed: https://example.com/model.bin?visible=yes;token=secret-value"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "visible=yes" in redacted
+        assert "token=<redacted>" in redacted
+        assert "secret-value" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_legacy_aws_access_key_id(self) -> None:
+        message = (
+            "provider failed: https://bucket.s3.amazonaws.com/model.bin?"
+            "AWSAccessKeyId=AKIASECRET&Expires=123456&Signature=deadbeef"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "AWSAccessKeyId=<redacted>" in redacted
+        assert "Signature=<redacted>" in redacted
+        assert "AKIASECRET" not in redacted
+        assert "deadbeef" not in redacted
+
+    def test_redact_cloud_error_for_display_handles_encoded_and_fragment_credentials(self) -> None:
+        message = (
+            "provider failed: https://example.com/model?tokenizer=bert&X-Amz-Sign%61ture=secret"
+            "#access_token=fragment-secret"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "tokenizer=bert" in redacted
+        assert "X-Amz-Sign%61ture=<redacted>" in redacted
+        assert "access_token=<redacted>" in redacted
+        assert "fragment-secret" not in redacted
 
 
 @patch("modelaudit.utils.helpers.retry.time.sleep")
@@ -326,6 +666,32 @@ def test_analyze_cloud_target_redacts_protocol_stripped_metadata_error_path(
 ) -> None:
     url = "s3://bucket/path/"
     hidden_path = "bucket/path/hidden.pkl?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory"}
+        raise PermissionError(f"metadata denied for {path}")
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [hidden_path]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+    serialized = json.dumps(result)
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_errors"][0]["path"].endswith("X-Amz-Signature=<redacted>")
+    assert "secret" not in serialized
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_redacts_encoded_protocol_stripped_metadata_error_path(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    hidden_path = "bucket/path/hidden.pkl%3FX-Amz-Signature%3Dsecret"
     fs = make_fs_mock()
 
     def info_side_effect(path: str) -> dict[str, object]:

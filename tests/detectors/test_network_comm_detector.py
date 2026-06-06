@@ -3094,6 +3094,33 @@ def test_delimited_nested_url_sensitive_key_near_match_preserves_endpoint() -> N
     assert any(finding.get("url") == nested_url for finding in findings)
 
 
+@pytest.mark.parametrize("separator", ["=", ":"])
+@pytest.mark.parametrize("max_findings", [None, 1])
+def test_path_nested_url_credentials_do_not_reappear(separator: str, max_findings: int | None) -> None:
+    nested_url = "https://evil-c2.com/payload"
+    encoded_url = quote(nested_url, safe="")
+    url = f"https://benign.example/api_key{separator}{encoded_url}"
+    config = {} if max_findings is None else {"max_findings": max_findings}
+
+    findings = NetworkCommDetector(config).scan(url.encode(), "tokens.txt")
+    serialized = json.dumps(findings, sort_keys=True)
+
+    assert nested_url not in serialized
+    assert "evil-c2.com" not in serialized
+    assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
+
+
+@pytest.mark.parametrize("separator", ["=", ":"])
+def test_path_nested_url_sensitive_key_near_match_preserves_endpoint(separator: str) -> None:
+    nested_url = "https://evil-c2.com/payload"
+    encoded_url = quote(nested_url, safe="")
+    url = f"https://benign.example/algorithm{separator}{encoded_url}"
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(url.encode(), "tokens.txt")
+
+    assert findings[0].get("url") == nested_url
+
+
 @pytest.mark.parametrize(
     "url",
     [
