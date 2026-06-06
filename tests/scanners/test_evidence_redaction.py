@@ -15,6 +15,7 @@ from modelaudit.scanners._evidence_redaction import (
     is_sensitive_evidence_key,
     redact_evidence_string,
     redact_evidence_value,
+    redact_untrusted_error_message,
 )
 
 
@@ -2951,3 +2952,12 @@ def test_preserves_parenthesized_parseable_python_evidence() -> None:
     assert 'eval("1")' in direct
     assert "lambda x: eval(x)" in lambda_hook
     assert 'eval("<redacted>")' in sensitive_tuple
+
+
+def test_untrusted_error_message_discards_mixed_secret_shapes() -> None:
+    leaked_secret = "UNSTRUCTURED-CREDENTIAL-MATERIAL-123456"
+
+    redacted = redact_untrusted_error_message(RuntimeError(f"token=KNOWN_TOKEN_123 rejected {leaked_secret}"))
+
+    assert redacted == REDACTED_EVIDENCE_VALUE
+    assert leaked_secret not in redacted
