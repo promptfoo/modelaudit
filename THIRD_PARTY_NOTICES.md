@@ -14,6 +14,14 @@ package's distribution or at the URLs below.
 - **Source:** <https://github.com/tensorflow/tensorflow>
 - **Notice:** See `modelaudit/protos/LICENSE` and `modelaudit/protos/NOTICE`
 
+### Public Suffix List
+
+- **Path:** `modelaudit/config/data/public_suffix_list.dat`
+- **License:** MPL-2.0
+- **Source:** <https://publicsuffix.org/list/public_suffix_list.dat>
+- **Notice:** The source file retains the Mozilla Public License 2.0 notice and
+  upstream revision metadata.
+
 ## Runtime Dependencies
 
 | Package              | License      | URL                                                 |

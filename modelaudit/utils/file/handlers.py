@@ -1538,13 +1538,14 @@ def scan_advanced_large_file(
                     file_path,
                     {"path": file_path, "reason": "shard_family_changed_during_scan"},
                 )
-            return result.to_dict()
+            return result.to_dict(include_private_metadata=True)
 
         # Get cached result or perform scan
         result_dict = cache_manager.cached_scan(
             file_path,
             cached_advanced_scan_wrapper,
             version_context=version_context,
+            include_private_metadata=True,
         )
 
         from ...utils.helpers.result_conversion import scan_result_from_dict

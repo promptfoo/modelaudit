@@ -25,12 +25,14 @@ from .call_graph import (
     import_only_module_requires_origin_review,
     import_only_reference_is_proven_trusted,
     module_initialization_is_proven_inert,
+    shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
+_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
@@ -699,6 +701,7 @@ def _combine_pytorch_zip_reports(
     opcode_counts = [
         report.coverage.opcode_count for report in member_reports if report.coverage.opcode_count is not None
     ]
+    private_metadata = _combine_call_graph_source_fingerprint_private_metadata(member_reports)
     metadata: dict[str, Any] = {
         "container_type": "pytorch_zip",
         "archive_size_bytes": size,
@@ -741,8 +744,134 @@ def _combine_pytorch_zip_reports(
             opcode_scan_complete=status == ScanStatus.COMPLETE,
         ),
         metadata=metadata,
+        private_metadata=private_metadata,
         duration_s=sum(report.duration_s for report in member_reports),
     )
+
+
+def _combine_call_graph_source_fingerprint_private_metadata(
+    member_reports: list[PickleReport],
+) -> dict[str, Any]:
+    combined: dict[str, Any] | None = None
+    missing_member_fingerprints = False
+    for report in member_reports:
+        fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+        if not isinstance(fingerprint_metadata, Mapping):
+            missing_member_fingerprints = True
+            continue
+        combined = _merge_call_graph_source_fingerprint_metadata(combined, fingerprint_metadata)
+    if missing_member_fingerprints:
+        combined = dict(combined or {})
+        combined.pop("source_independent", None)
+        combined["reusable"] = False
+    return {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: combined} if combined is not None else {}
+
+
+def _merge_call_graph_source_fingerprint_metadata(
+    existing: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    if _is_source_independent_call_graph_fingerprint_metadata(incoming):
+        return dict(existing) if existing is not None else dict(incoming)
+    if existing is not None and _is_source_independent_call_graph_fingerprint_metadata(existing):
+        return dict(incoming)
+
+    merged = dict(existing or {})
+    existing_fingerprints = existing.get("fingerprints") if existing is not None else None
+    incoming_fingerprints = incoming.get("fingerprints")
+    fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
+    fingerprint_conflict = False
+    if isinstance(incoming_fingerprints, Mapping):
+        for path, fingerprint in incoming_fingerprints.items():
+            if path in fingerprints and fingerprints[path] != fingerprint:
+                fingerprint_conflict = True
+                continue
+            fingerprints[path] = fingerprint
+    merged["fingerprints"] = fingerprints
+
+    existing_read_fingerprints = existing.get("read_fingerprints") if existing is not None else None
+    incoming_read_fingerprints = incoming.get("read_fingerprints")
+    read_fingerprints = dict(existing_read_fingerprints) if isinstance(existing_read_fingerprints, Mapping) else {}
+    read_fingerprint_conflict = False
+    if isinstance(incoming_read_fingerprints, Mapping):
+        for path, fingerprint_record in incoming_read_fingerprints.items():
+            if path in read_fingerprints and read_fingerprints[path] != fingerprint_record:
+                read_fingerprint_conflict = True
+                continue
+            read_fingerprints[path] = fingerprint_record
+    merged["read_fingerprints"] = read_fingerprints
+
+    existing_module_sources = existing.get("module_sources") if existing is not None else None
+    incoming_module_sources = incoming.get("module_sources")
+    module_sources = dict(existing_module_sources) if isinstance(existing_module_sources, Mapping) else {}
+    module_source_conflict = False
+    if isinstance(incoming_module_sources, Mapping):
+        for module_name, source_path in incoming_module_sources.items():
+            if module_name in module_sources and module_sources[module_name] != source_path:
+                module_source_conflict = True
+                continue
+            module_sources[module_name] = source_path
+    merged["module_sources"] = module_sources
+
+    existing_loaded_sources = existing.get("loaded_module_sources") if existing is not None else None
+    incoming_loaded_sources = incoming.get("loaded_module_sources")
+    loaded_sources = dict(existing_loaded_sources) if isinstance(existing_loaded_sources, Mapping) else {}
+    loaded_source_conflict = False
+    if isinstance(incoming_loaded_sources, Mapping):
+        for module_name, source_path in incoming_loaded_sources.items():
+            if module_name in loaded_sources and loaded_sources[module_name] != source_path:
+                loaded_source_conflict = True
+                continue
+            loaded_sources[module_name] = source_path
+    merged["loaded_module_sources"] = loaded_sources
+
+    existing_loaded_package_paths = existing.get("loaded_package_paths") if existing is not None else None
+    incoming_loaded_package_paths = incoming.get("loaded_package_paths")
+    loaded_package_paths = (
+        dict(existing_loaded_package_paths) if isinstance(existing_loaded_package_paths, Mapping) else {}
+    )
+    loaded_package_path_conflict = False
+    if isinstance(incoming_loaded_package_paths, Mapping):
+        for module_name, search_path in incoming_loaded_package_paths.items():
+            if module_name in loaded_package_paths and loaded_package_paths[module_name] != search_path:
+                loaded_package_path_conflict = True
+                continue
+            loaded_package_paths[module_name] = search_path
+    merged["loaded_package_paths"] = loaded_package_paths
+
+    existing_search_context = existing.get("search_context") if existing is not None else incoming.get("search_context")
+    incoming_search_context = incoming.get("search_context")
+    existing_resolution_context = (
+        existing.get("resolution_context") if existing is not None else incoming.get("resolution_context")
+    )
+    incoming_resolution_context = incoming.get("resolution_context")
+    context_conflict = existing is not None and (
+        existing_search_context != incoming_search_context or existing_resolution_context != incoming_resolution_context
+    )
+    if context_conflict:
+        merged["reusable"] = False
+    else:
+        merged["search_context"] = incoming_search_context
+        merged["resolution_context"] = incoming_resolution_context
+        merged["reusable"] = (
+            incoming.get("reusable") is True
+            and not fingerprint_conflict
+            and not read_fingerprint_conflict
+            and not module_source_conflict
+            and not loaded_source_conflict
+            and not loaded_package_path_conflict
+        )
+        if existing is not None:
+            merged["reusable"] = merged["reusable"] and existing.get("reusable") is True
+    if (
+        fingerprint_conflict
+        or read_fingerprint_conflict
+        or module_source_conflict
+        or loaded_source_conflict
+        or loaded_package_path_conflict
+    ):
+        merged["reusable"] = False
+    return merged
 
 
 def _combine_status(member_reports: list[PickleReport], notices: tuple[Notice, ...]) -> ScanStatus:
@@ -829,6 +958,7 @@ def _without_unproven_oversized_frame_tamper(
         errors=report.errors,
         coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -873,6 +1003,7 @@ def _with_unbounded_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -924,6 +1055,7 @@ def _with_known_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -977,6 +1109,7 @@ def _with_short_read_error(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1067,7 +1200,16 @@ def _scan_pickle_payload_native(
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
         report = _report_from_native_dict(raw_report)
         if enrich_call_graph:
-            return report if _call_graph_enrichment_is_redundant(report) else _with_call_graph_findings(report)
+            if _call_graph_enrichment_is_redundant(report):
+                if _call_graph_has_no_source_inputs(report):
+                    return _with_call_graph_source_fingerprint_metadata(
+                        report,
+                        _source_independent_call_graph_fingerprint_metadata(),
+                    )
+                with shared_source_sensitive_caches():
+                    source_fingerprints = shared_source_fingerprint_metadata()
+                return _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
+            return _with_call_graph_findings(report)
         return _with_import_origin_findings(report)
     except Exception as error:
         return _engine_error_report(
@@ -1105,6 +1247,7 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
             opcode_scan_complete=_optional_bool(coverage.get("opcode_scan_complete")),
         ),
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
+        private_metadata=dict(_mapping(raw_report.get("private_metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
     )
 
@@ -1141,10 +1284,40 @@ def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
     return references <= critical_references
 
 
+def _call_graph_has_no_source_inputs(report: PickleReport) -> bool:
+    return not any(
+        report.metadata.get(key)
+        for key in (
+            "import_references",
+            "callable_invocations",
+            "import_references_truncated",
+            "callable_invocations_truncated",
+            "non_allowlisted_global_imports_truncated",
+        )
+    )
+
+
+def _source_independent_call_graph_fingerprint_metadata() -> dict[str, Any]:
+    return {
+        "reusable": True,
+        "source_independent": True,
+        "fingerprints": {},
+        "read_fingerprints": {},
+        "module_sources": {},
+        "loaded_module_sources": {},
+        "loaded_package_paths": {},
+    }
+
+
+def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
+    return dict(metadata) == _source_independent_call_graph_fingerprint_metadata()
+
+
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
     enrichment_errors: list[tuple[str, Exception]] = []
+    source_fingerprints: Mapping[str, Any] | None = None
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
@@ -1217,6 +1390,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except _CallGraphAnalysisLimitError as error:
             source_snapshot_stable = False
             enrichment_errors.append(("python_call_graph_source_stability", error))
+        source_fingerprints = shared_source_fingerprint_metadata()
 
     if (
         source_snapshot_stable
@@ -1234,8 +1408,11 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
         )
+    updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
-        _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
+        _with_unanalyzed_call_graph_notices(updated_report, unanalyzed_references)
+        if unanalyzed_references
+        else updated_report
     )
     if (
         not call_graph_findings
@@ -1277,6 +1454,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             errors=updated_report.errors,
             coverage=updated_report.coverage,
             metadata=updated_report.to_dict()["metadata"],
+            private_metadata=updated_report.private_metadata,
             duration_s=updated_report.duration_s,
         )
         if additional_findings
@@ -1291,6 +1469,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
 
 def _with_import_origin_findings(report: PickleReport) -> PickleReport:
     enrichment_errors: list[tuple[str, Exception]] = []
+    source_fingerprints: Mapping[str, Any] | None = None
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         try:
@@ -1304,7 +1483,13 @@ def _with_import_origin_findings(report: PickleReport) -> PickleReport:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             enrichment_errors.append(("python_import_origin_stability", error))
-    return _with_call_graph_enrichment_errors(report, tuple(enrichment_errors)) if enrichment_errors else report
+        source_fingerprints = shared_source_fingerprint_metadata()
+    updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
+    return (
+        _with_call_graph_enrichment_errors(updated_report, tuple(enrichment_errors))
+        if enrichment_errors
+        else updated_report
+    )
 
 
 def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]:
@@ -1602,6 +1787,29 @@ def _with_call_graph_enrichment_errors(
         errors=errors,
         coverage=report.coverage,
         metadata=metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _with_call_graph_source_fingerprint_metadata(
+    report: PickleReport,
+    source_fingerprints: Mapping[str, Any] | None,
+) -> PickleReport:
+    if source_fingerprints is None:
+        return report
+    private_metadata = dict(report.private_metadata)
+    private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY] = dict(source_fingerprints)
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=report.verdict,
+        findings=report.findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        private_metadata=private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1643,6 +1851,7 @@ def _with_unanalyzed_call_graph_notices(
         errors=report.errors,
         coverage=report.coverage,
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 

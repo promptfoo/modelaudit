@@ -268,13 +268,14 @@ def scan_large_file(
         # Create wrapper function for cache manager
         def cached_large_scan_wrapper(fpath: str) -> dict:
             result = _scan_large_file_internal(fpath, scanner, progress_callback, timeout)
-            return result.to_dict()
+            return result.to_dict(include_private_metadata=True)
 
         # Get cached result or perform scan
         result_dict = cache_manager.cached_scan(
             file_path,
             cached_large_scan_wrapper,
             version_context=version_context,
+            include_private_metadata=True,
         )
 
         # Convert back to ScanResult

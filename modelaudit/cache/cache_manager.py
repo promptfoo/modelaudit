@@ -37,6 +37,8 @@ class CacheManager:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result if available.
@@ -53,6 +55,7 @@ class CacheManager:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            include_private_metadata=include_private_metadata,
         )
         try:
             return cached_result
@@ -65,6 +68,8 @@ class CacheManager:
         file_path: str,
         stat_result: os.stat_result,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result using existing stat result for optimized performance.
@@ -82,6 +87,7 @@ class CacheManager:
         cached_result, file_identity = self.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            include_private_metadata=include_private_metadata,
         )
         try:
             return cached_result
@@ -93,6 +99,8 @@ class CacheManager:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> tuple[dict[str, Any] | None, ScannedFileIdentity | None]:
         """Return a cache lookup and retain the monitored identity for a miss scan."""
         if not self.enabled or not self.cache:
@@ -101,6 +109,7 @@ class CacheManager:
         cached_result, file_identity = self.cache.get_cached_result_with_identity(
             file_path,
             version_context=version_context,
+            include_private_metadata=include_private_metadata,
         )
         if cached_result is not None and not cached_scan_result_dependencies_available(cached_result):
             logger.debug(f"Bypassing cached result with unavailable scanner dependencies: {Path(file_path).name}")
@@ -151,6 +160,7 @@ class CacheManager:
         scanner_func: Any,
         *args: Any,
         version_context: dict[str, Any] | None = None,
+        include_private_metadata: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
@@ -172,6 +182,7 @@ class CacheManager:
             cached_result, pre_scan_identity = self.get_cached_result_with_identity(
                 file_path,
                 version_context=version_context,
+                include_private_metadata=include_private_metadata,
             )
 
             if cached_result is not None:
@@ -212,6 +223,8 @@ class CacheManager:
                 )
             elif not cacheable_result:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")
+            if isinstance(scan_result, dict) and not include_private_metadata:
+                scan_result.pop("_private_metadata", None)
 
             return scan_result  # type: ignore[no-any-return]
 

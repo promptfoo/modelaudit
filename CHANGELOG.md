@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets
+- preserve registrable network domains and redact delimiter-split credentials in bounded finding evidence
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
 
@@ -213,6 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - prevent sharded-model scans from accepting changed family membership, stale shard identities, or unsafe aliases
+- invalidate cached pickle call-graph results when analyzed Python sources, search paths, or loaded module origins change
 - harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files; preserve Windows ownership and ACLs, and reject EFS-encrypted destinations that cannot be replaced without changing recipients
 - distinguish valid R call/index argument tags from malformed credential assignments and fail closed on incomplete function bodies
 - validate OCI layer member and link metadata without suppressing regular-file payload scans, while preserving valid container-root symlinks
@@ -310,6 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat normalized PEP 440 prereleases of the fixed Keras 3.11.3 CVE-2025-49655 boundary as vulnerable without allowing long local-version metadata to downgrade attribution
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- redact reversible secret evidence from CatBoost findings and validate IPv4/IPv6 network indicators
 - detect and safely bound NeMo Hydra process-execution, native-loader, network, and file-access callable targets, including trusted-namespace import/cache helpers, repeated YAML aliases, and NumPy file writers
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings

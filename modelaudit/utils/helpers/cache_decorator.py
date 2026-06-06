@@ -325,7 +325,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                         if isinstance(result, ScanResult):
                             normalize_unclassified_scan_failure(result)
-                        return result.to_dict()  # type: ignore[no-any-return]
+                        return result.to_dict(include_private_metadata=True)  # type: ignore[no-any-return]
                     elif isinstance(result, dict):
                         return result
                     else:
@@ -341,6 +341,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     cached_result, pre_scan_identity = cache_manager.get_cached_result_with_identity(
                         file_path,
                         version_context=version_context,
+                        include_private_metadata=True,
                     )
 
                     if cached_result is not None:
@@ -390,6 +391,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Converting cached result back to ScanResult for {file_path}")
                     return scan_result_from_dict(result_dict)
 
+                result_dict.pop("_private_metadata", None)
                 return result_dict
 
             except Exception as e:

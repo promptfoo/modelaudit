@@ -95,6 +95,7 @@ def pytest_runtest_setup(item):
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_picklescan_adapter.py",
+            "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
             "test_scanner_selection.py",  # Scanner selection policy and routing tests
@@ -170,6 +171,7 @@ def pytest_runtest_setup(item):
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
             "test_evidence_redaction.py",  # Shared scanner evidence redaction tests
+            "test_catboost_evidence_redaction.py",  # CatBoost command evidence redaction tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests

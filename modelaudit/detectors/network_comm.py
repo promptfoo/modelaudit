@@ -11,6 +11,8 @@ from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
+from functools import lru_cache
+from importlib.resources import files
 from typing import Any, ClassVar
 from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
@@ -101,6 +103,31 @@ _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
+_STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
+    {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
+)
+_CHAINABLE_AUTHORIZATION_SCHEMES = _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES | {"api-key", "apikey", "jwt", "token"}
+_NON_CREDENTIAL_AUTHORIZATION_VALUES = frozenset(
+    {
+        "anonymous",
+        "auto",
+        "default",
+        "disabled",
+        "enabled",
+        "false",
+        "inherit",
+        "no",
+        "none",
+        "null",
+        "off",
+        "optional",
+        "required",
+        "true",
+        "yes",
+    }
+)
+_RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+_PUBLIC_SUFFIX_LIST_PATH = ("config", "data", "public_suffix_list.dat")
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9])"
     rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
@@ -305,10 +332,12 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
         if redact_next_value:
             parts[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                token_candidate, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(token_candidate)
+                and _authorization_scheme_has_payload(token_candidate, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             changed = True
             continue
 
@@ -330,6 +359,11 @@ def _redact_delimited_path_components(parts: list[str]) -> bool:
         redacted_part, part_changed = _redact_boundary_component(part)
         if part_changed:
             parts[index] = redacted_part
+            authorization_scheme = _authorization_assignment_scheme(part)
+            following_value = next((candidate for candidate in parts[index + 1 :] if candidate), None)
+            if authorization_scheme is not None:
+                redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
+                authorization_value_pending = redact_next_value
             changed = True
     return changed
 
@@ -390,9 +424,10 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
             redact_next_value = (
                 authorization_value_pending
                 and carries_sensitive_value(following_boundary)
+                and _is_chainable_authorization_scheme(token_component)
                 and _authorization_scheme_has_payload(token_component, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
         else:
             empty_assignment_key = _empty_sensitive_path_assignment_key(component)
             if empty_assignment_key is not None and carries_sensitive_value(following_boundary):
@@ -404,6 +439,15 @@ def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
                 authorization_value_pending = _is_authorization_path_key(empty_assignment_key)
             else:
                 redacted_component, component_changed = _redact_boundary_component(component)
+                authorization_scheme = _authorization_assignment_scheme(component)
+                following_value = next((candidate for candidate in components[index + 1 :] if candidate), None)
+                if (
+                    component_changed
+                    and authorization_scheme is not None
+                    and carries_sensitive_value(following_boundary)
+                ):
+                    redact_next_value = _authorization_scheme_has_payload(authorization_scheme, following_value)
+                    authorization_value_pending = redact_next_value
             if (
                 empty_assignment_key is None
                 and component
@@ -558,10 +602,150 @@ def _is_authorization_path_key(key: str) -> bool:
     )
 
 
+def _authorization_assignment_scheme(segment: str) -> str | None:
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = _decode_path_token(token_candidate)
+    assignment_parts = decoded.split("=")
+    key_index = next(
+        (index for index, key in enumerate(assignment_parts[:-1]) if _is_authorization_path_key(key)),
+        None,
+    )
+    if key_index is None:
+        return None
+
+    value = "=".join(assignment_parts[key_index + 1 :]).strip()
+    return value if _is_authorization_scheme(value) else None
+
+
+def _is_authorization_scheme(value: str) -> bool:
+    return (
+        _AUTHORIZATION_SCHEME_PATTERN.fullmatch(value) is not None
+        and value.casefold() not in _NON_CREDENTIAL_AUTHORIZATION_VALUES
+    )
+
+
+def _is_chainable_authorization_scheme(value: str) -> bool:
+    return value.casefold() in _CHAINABLE_AUTHORIZATION_SCHEMES
+
+
+def _is_bare_ip_path_endpoint(value: str) -> bool:
+    decoded = _decode_path_token(value).lstrip("/")
+    candidate = decoded.split("/", 1)[0]
+    host = candidate
+    if candidate.startswith("["):
+        closing_bracket = candidate.find("]")
+        if closing_bracket < 0:
+            return False
+        remainder = candidate[closing_bracket + 1 :]
+        if remainder and (re.fullmatch(r":\d{1,5}", remainder) is None or not 0 < int(remainder[1:]) <= 65535):
+            return False
+        host = candidate[1:closing_bracket]
+    elif candidate.count(":") == 1:
+        possible_host, possible_port = candidate.rsplit(":", 1)
+        if possible_port.isdigit() and 0 < int(possible_port) <= 65535:
+            host = possible_host
+    with suppress(ValueError):
+        ipaddress.ip_address(host)
+        return True
+    return False
+
+
+def _is_bare_domain_path_endpoint(value: str) -> bool:
+    decoded = _decode_path_token(value).lstrip("/")
+    candidate = decoded.split("/", 1)[0].rstrip(".")
+    if candidate.count(":") == 1:
+        possible_host, possible_port = candidate.rsplit(":", 1)
+        if possible_port.isdigit() and 0 < int(possible_port) <= 65535:
+            candidate = possible_host
+    try:
+        encoded_candidate = candidate.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if _BARE_DOMAIN_PATTERN.fullmatch(encoded_candidate) is None:
+        return False
+    first_label = candidate.split(".", 1)[0]
+    return not _looks_like_hostname_credential_value(first_label)
+
+
 def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
-    if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
+    if following_value is None or not _is_authorization_scheme(scheme):
+        return False
+    decoded_following_value = _decode_path_token(following_value)
+    endpoint_key, separator, _endpoint_value = decoded_following_value.partition("=")
+    if separator and _is_endpoint_location_key(endpoint_key):
+        return False
+    if _is_bare_ip_path_endpoint(following_value) or _is_bare_domain_path_endpoint(following_value):
         return False
     return not _looks_like_known_artifact_filename(following_value)
+
+
+@lru_cache(maxsize=1)
+def _public_suffix_rules() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    exact_rules: set[str] = set()
+    wildcard_rules: set[str] = set()
+    exception_rules: set[str] = set()
+    resource = files("modelaudit")
+    for path_component in _PUBLIC_SUFFIX_LIST_PATH:
+        resource = resource.joinpath(path_component)
+    for raw_line in resource.read_text(encoding="utf-8").splitlines():
+        rule = raw_line.partition("//")[0].strip().casefold()
+        if not rule:
+            continue
+        if rule.startswith("!"):
+            exception_rules.add(rule[1:])
+        elif rule.startswith("*."):
+            wildcard_rules.add(rule[2:])
+        else:
+            exact_rules.add(rule)
+    return frozenset(exact_rules), frozenset(wildcard_rules), frozenset(exception_rules)
+
+
+def _hostname_public_suffix_label_count(normalized_labels: list[str]) -> int:
+    labels = normalized_labels[:-1] if normalized_labels and not normalized_labels[-1] else normalized_labels
+    if not labels:
+        return 1
+
+    exact_rules, wildcard_rules, exception_rules = _public_suffix_rules()
+    suffix_labels = 1
+    for start_index in range(len(labels)):
+        suffix = ".".join(labels[start_index:])
+        rule_label_count = len(labels) - start_index
+        if suffix in exception_rules:
+            return max(1, rule_label_count - 1)
+        if suffix in exact_rules:
+            suffix_labels = max(suffix_labels, rule_label_count)
+        if start_index + 1 < len(labels) and ".".join(labels[start_index + 1 :]) in wildcard_rules:
+            suffix_labels = max(suffix_labels, rule_label_count)
+    return suffix_labels
+
+
+def _hostname_authorization_scheme_has_payload(
+    scheme: str,
+    following_value: str | None,
+    labels: list[str],
+    scheme_index: int,
+) -> bool:
+    if not _authorization_scheme_has_payload(scheme, following_value):
+        return False
+    assert following_value is not None
+    if _looks_like_hostname_credential_value(following_value):
+        return True
+
+    normalized_labels = [label.casefold() for label in labels]
+    if normalized_labels and not normalized_labels[-1]:
+        normalized_labels.pop()
+    remaining_hostname = ".".join(normalized_labels[scheme_index + 1 :])
+    public_suffix_labels = _hostname_public_suffix_label_count(normalized_labels)
+    labels_after_scheme = len(normalized_labels) - (scheme_index + 1)
+    if scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES:
+        if remaining_hostname in _RESERVED_EXAMPLE_DOMAINS:
+            return False
+        return not (public_suffix_labels > 1 and labels_after_scheme == public_suffix_labels + 1)
+
+    # Retain one registrable label plus the PSL suffix before treating an earlier
+    # label as an authorization payload.
+    labels_after_payload = len(normalized_labels) - (scheme_index + 2)
+    return labels_after_payload >= public_suffix_labels + 1
 
 
 def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
@@ -625,6 +809,7 @@ def _looks_like_hostname_credential_value(label: str) -> bool:
     return (
         _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded) is not None
         or _looks_like_capability_path_token(decoded)
+        or any(character.isdigit() for character in decoded)
         or any(normalized.startswith(marker) or normalized.endswith(marker) for marker in sensitive_markers)
     )
 
@@ -644,10 +829,12 @@ def _redact_hostname_tokens(hostname: str) -> str:
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
             following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                decoded, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(decoded)
+                and _hostname_authorization_scheme_has_payload(decoded, following_value, labels, index)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             continue
         remaining_labels = len(labels) - index
         short_hostname_value_is_sensitive = remaining_labels == 3 and _looks_like_hostname_credential_value(
@@ -677,10 +864,12 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             following_value = next((candidate for candidate in segments[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(
-                _token_candidate, following_value
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(_token_candidate)
+                and _authorization_scheme_has_payload(_token_candidate, following_value)
             )
-            authorization_value_pending = False
+            authorization_value_pending = redact_next_value
             continue
 
         token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
@@ -1262,8 +1451,12 @@ def _is_match_redacted_from_url_component(
             if value_lower in part.lower():
                 return True
             following_value = next((candidate for candidate in delimited_parts[index + 1 :] if candidate), None)
-            redact_next_value = authorization_value_pending and _authorization_scheme_has_payload(part, following_value)
-            authorization_value_pending = False
+            redact_next_value = (
+                authorization_value_pending
+                and _is_chainable_authorization_scheme(part)
+                and _authorization_scheme_has_payload(part, following_value)
+            )
+            authorization_value_pending = redact_next_value
             continue
         if _is_sensitive_path_key(part):
             redact_next_value = True
@@ -2206,17 +2399,22 @@ class NetworkCommDetector:
             context = self._pending_url_context
             if context[0] > match_start:
                 break
-            self._pending_url_context = None
             _start, _end, url = context
             cache_limit = (self.max_findings or 0) + 1
             recordable_url = self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None or any(
                 _decoded_nested_urls(url)
             )
-            if recordable_url and len(self._url_contexts) < cache_limit:
+            contains_match = match_start < context[1]
+            context_cached = False
+            if (recordable_url or contains_match) and len(self._url_contexts) < cache_limit:
                 self._url_contexts.append(context)
                 self._url_context_starts.append(context[0])
-            if match_start < context[1]:
+                context_cached = True
+            if contains_match:
+                if context_cached:
+                    self._pending_url_context = None
                 return context
+            self._pending_url_context = None
         return None
 
     def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
