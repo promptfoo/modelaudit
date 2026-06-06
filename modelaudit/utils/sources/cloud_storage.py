@@ -37,7 +37,9 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _BARE_ASSIGNMENT_RE = re.compile(
-    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)=(?P<value>[^\s&#;,)}\]]+)",
+    r"""(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)(?P<separator>\s*=\s*)(?![=])"""
+    r"""(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|"[^"\r\n]*|'[^'\r\n]*|"""
+    r"""(?:(?:bearer|basic|digest|negotiate|token|aws4-hmac-sha256)\s+)?[^\s&#;,)}\]]+)""",
     re.IGNORECASE,
 )
 _HEADER_KEY_RE = re.compile(
@@ -209,10 +211,6 @@ def normalize_escaped_url_delimiters_for_display(value: str) -> str:
 
 def _normalize_percent_encoded_url_delimiters_for_display(url: str) -> str:
     """Expose encoded query structure without decoding ordinary path escapes."""
-    boundary = _PERCENT_ENCODED_URL_BOUNDARY_RE.search(url)
-    if boundary is None:
-        return url
-
     percent_replacements = {
         "3f": "?",
         "3d": "=",
@@ -220,11 +218,24 @@ def _normalize_percent_encoded_url_delimiters_for_display(url: str) -> str:
         "23": "#",
         "3b": ";",
     }
-    encoded_suffix = _PERCENT_ENCODED_URL_DELIMITER_RE.sub(
-        lambda match: percent_replacements[match.group("delimiter").lower()],
-        url[boundary.start() :],
-    )
-    return f"{url[: boundary.start()]}{encoded_suffix}"
+
+    def normalize_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        for boundary in _PERCENT_ENCODED_URL_BOUNDARY_RE.finditer(token):
+            decoded_suffix = _PERCENT_ENCODED_URL_DELIMITER_RE.sub(
+                lambda delimiter_match: percent_replacements[delimiter_match.group("delimiter").lower()],
+                token[boundary.start() :],
+            )
+            next_major_boundary = len(decoded_suffix)
+            for delimiter in "?#":
+                delimiter_index = decoded_suffix.find(delimiter, 1)
+                if delimiter_index >= 0:
+                    next_major_boundary = min(next_major_boundary, delimiter_index)
+            if _QUERY_PARAM_RE.search(decoded_suffix[:next_major_boundary]):
+                return f"{token[: boundary.start()]}{decoded_suffix}"
+        return token
+
+    return re.sub(r"""[^\s"'<>]+""", normalize_token, url)
 
 
 def _normalize_percent_encoded_url_authority_for_display(url: str) -> str:
@@ -290,7 +301,7 @@ def _redact_bare_sensitive_assignment(match: re.Match[str]) -> str:
     key = match.group("key")
     if not _is_sensitive_assignment_key(key):
         return match.group(0)
-    return f"{key}=<redacted>"
+    return f"{key}{match.group('separator')}<redacted>"
 
 
 def _redact_sensitive_header_assignments(value: str) -> str:

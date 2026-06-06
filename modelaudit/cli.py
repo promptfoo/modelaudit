@@ -30,7 +30,12 @@ from .auth.config import (
 from .cache.trusted_config_store import TrustedConfigStore
 from .config import ModelAuditConfig, set_config
 from .config.local_config import find_local_config_for_paths
-from .core import determine_exit_code, scan_model_directory_or_file
+from .core import (
+    DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
+    DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    determine_exit_code,
+    scan_model_directory_or_file,
+)
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
@@ -56,7 +61,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import should_skip_file
+from .utils import resolve_dvc_file_with_metadata, should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -164,9 +169,12 @@ class _SourceDispatchResult:
 class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
 
+    collect_dvc_coverage: bool = False
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
     sbom_paths_resolved: bool = False
+    dvc_covered_paths: set[str] = field(default_factory=set)
+    dvc_covered_directories: set[str] = field(default_factory=set)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -190,6 +198,77 @@ class _ScanPathState:
             self.temp_cleanup_entries.append((temp_path, os.path.isdir(temp_path)))
             if verbose:
                 logger.debug(f"Deferring cleanup of temporary artifact: {temp_path}")
+
+    def record_dvc_coverage(
+        self,
+        scan_path: str,
+        scan_result: ModelAuditResultModel,
+        *,
+        scanner_config: dict[str, Any] | None = None,
+    ) -> None:
+        """Record concrete artifacts and successful directory walks for later DVC pointers."""
+        if not self.collect_dvc_coverage or not scan_result.success:
+            return
+
+        scanner_policy = policy_from_config(scanner_config)
+        if scanner_policy.active:
+            from modelaudit.scanners import get_scanner_for_file
+
+        def record_covered_file(file_path: str) -> None:
+            if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
+                return
+            try:
+                resolved_path = Path(file_path).resolve()
+            except OSError:
+                return
+            if not resolved_path.is_file():
+                return
+            self.dvc_covered_paths.add(str(resolved_path))
+            self.dvc_covered_directories.update(str(parent) for parent in resolved_path.parents)
+
+        for asset in scan_result.assets:
+            if not asset.path or asset.type == "error":
+                continue
+            metadata = scan_result.file_metadata.get(asset.path)
+            if metadata is not None and (
+                metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+            ):
+                continue
+            record_covered_file(asset.path)
+
+        for check in scan_result.checks:
+            shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
+            if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
+                continue
+            for shard_path in shard_paths:
+                if isinstance(shard_path, str):
+                    record_covered_file(shard_path)
+
+        directory_roots: list[Path] = []
+        scan_path_obj = Path(scan_path)
+        if scan_path_obj.is_dir():
+            directory_roots.append(scan_path_obj)
+        elif scan_path.lower().endswith(".dvc"):
+            directory_roots.extend(
+                Path(target) for target in resolve_dvc_file_with_metadata(scan_path).targets if Path(target).is_dir()
+            )
+
+        for directory_root in directory_roots:
+            try:
+                resolved_root = directory_root.resolve()
+            except OSError:
+                continue
+            walk_errors: list[OSError] = []
+            walked_directories: set[str] = set()
+            for root, _dirs, _files in os.walk(resolved_root, followlinks=False, onerror=walk_errors.append):
+                try:
+                    resolved_directory = Path(root).resolve()
+                except OSError:
+                    continue
+                if resolved_directory.is_relative_to(resolved_root):
+                    walked_directories.add(str(resolved_directory))
+            if not walk_errors:
+                self.dvc_covered_directories.update(walked_directories)
 
 
 def should_use_color() -> bool:
@@ -372,9 +451,38 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
+def _local_path_will_be_scanned(path: str, *, skip_non_model_files: bool) -> bool:
+    """Return whether the local CLI prefilter will scan an explicit file path."""
+    if not skip_non_model_files or not os.path.isfile(path):
+        return True
+
+    extension = Path(path).suffix.lower()
+    if extension in {".py", ".js", ".html", ".css"}:
+        return not should_skip_file(path)
+    if extension != ".txt":
+        return True
+
+    from modelaudit.scanners import SCANNER_REGISTRY
+
+    return any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
+
+
 def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
-    """Expand user paths, warn on unmatched globs, and fail fast if empty."""
+    """Expand user paths and order capped DVC pointers after concrete sibling inputs."""
     expanded_paths, missing_globs = expand_paths(paths)
+    dvc_resolutions = {
+        path: resolve_dvc_file_with_metadata(path)
+        for path in expanded_paths
+        if os.path.isfile(path) and path.lower().endswith(".dvc")
+    }
+    ordered_paths: list[str] = []
+    capped_dvc_paths: list[str] = []
+    for path in expanded_paths:
+        resolution = dvc_resolutions.get(path)
+        if resolution is not None and resolution.omitted_output_count > 0:
+            capped_dvc_paths.append(path)
+        else:
+            ordered_paths.append(path)
 
     if missing_globs:
         click.echo(
@@ -399,7 +507,7 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
         flush_telemetry()
         sys.exit(2)
 
-    return expanded_paths
+    return list(dict.fromkeys([*ordered_paths, *capped_dvc_paths]))
 
 
 def _build_user_scan_overrides(
@@ -918,25 +1026,17 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
 
 def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, verbose: bool) -> bool:
     """Return True when the local scan prefilter should skip a non-model file."""
-    if not runtime.skip_non_model_files or not os.path.isfile(scan_path):
+    if _local_path_will_be_scanned(scan_path, skip_non_model_files=runtime.skip_non_model_files):
         return False
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
-    if ext in (".py", ".js", ".html", ".css") and should_skip_file(scan_path):
+    if ext in (".py", ".js", ".html", ".css"):
         if verbose:
             logger.debug(f"Skipped: {scan_path} (non-model file)")
         if runtime.show_styled_output:
             click.echo(f"Skipping non-model file: {scan_path}")
         return True
-
-    if ext != ".txt":
-        return False
-
-    from modelaudit.scanners import SCANNER_REGISTRY
-
-    if any(cls().can_handle(scan_path) for cls in SCANNER_REGISTRY):
-        return False
 
     if verbose:
         logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
@@ -1070,6 +1170,7 @@ def _scan_local_or_downloaded_path(
                 **_scanner_selection_overrides(runtime),
             )
             audit_result.aggregate_scan_result(streaming_result.model_dump())
+            path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
 
             if spinner:
@@ -1085,6 +1186,11 @@ def _scan_local_or_downloaded_path(
             "cache_dir": runtime.cache_dir,
             **_scanner_selection_overrides(runtime),
         }
+        is_dvc_pointer = actual_path.lower().endswith(".dvc")
+        has_prior_dvc_coverage = bool(path_state.dvc_covered_paths or path_state.dvc_covered_directories)
+        if is_dvc_pointer:
+            config_overrides[DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY] = tuple(path_state.dvc_covered_paths)
+            config_overrides[DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY] = tuple(path_state.dvc_covered_directories)
         if source_result.source_model_id and source_result.source_model_source == "huggingface":
             config_overrides["_trusted_source_provenance"] = make_trusted_source_provenance(
                 source_result.source_model_id,
@@ -1111,7 +1217,10 @@ def _scan_local_or_downloaded_path(
             **config_overrides,
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
-        if actual_path.lower().endswith(".dvc"):
+        if is_dvc_pointer and has_prior_dvc_coverage:
+            audit_result.content_hash = None
+        path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
+        if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
@@ -2432,7 +2541,9 @@ def scan_command(
     audit_result = create_initial_audit_result()
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
-    path_state = _ScanPathState()
+    path_state = _ScanPathState(
+        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths)
+    )
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:

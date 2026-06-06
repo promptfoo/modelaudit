@@ -205,6 +205,33 @@ class TestCloudURLRedaction:
     @pytest.mark.parametrize(
         "url",
         [
+            "https://bucket.s3.amazonaws.com/model%3Fv1.pkl",
+            "https://bucket.s3.amazonaws.com/model%253Fv1.pkl",
+            "https://bucket.s3.amazonaws.com/model%23v1.pkl",
+            "https://bucket.s3.amazonaws.com/model%3Bv1.pkl",
+        ],
+    )
+    def test_redact_url_for_display_preserves_encoded_literal_delimiter(self, url: str) -> None:
+        assert redact_url_for_display(url) == url
+
+    def test_redact_url_for_display_preserves_encoded_literal_question_mark_before_signed_query(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret"
+
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model%3Fv1.pkl"
+
+    def test_redact_cloud_error_preserves_encoded_literal_question_mark_before_signed_query(self) -> None:
+        message = "provider failed: https://bucket.s3.amazonaws.com/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret code=403"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == (
+            "provider failed: https://bucket.s3.amazonaws.com/model%3Fv1.pkl?X-Amz-Signature=<redacted> code=403"
+        )
+        assert "secret" not in redacted
+
+    @pytest.mark.parametrize(
+        "url",
+        [
             "https://bucket.s3.amazonaws.com/model.pkl;token=SECRET",
             "https://bucket.s3.amazonaws.com/model.pkl%3Btoken%3DSECRET",
         ],
@@ -339,6 +366,36 @@ class TestCloudURLRedaction:
 
         assert redacted.endswith(": <redacted>")
         assert "HEADER-SECRET" not in redacted
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("Authorization=Bearer ASSIGNMENT-SECRET", "Authorization=<redacted>"),
+            ("Authorization = Basic ASSIGNMENT-SECRET", "Authorization = <redacted>"),
+            ("aws_secret_access_key = ASSIGNMENT-SECRET", "aws_secret_access_key = <redacted>"),
+            ("client_secret = 'ASSIGNMENT SECRET'", "client_secret = <redacted>"),
+            ('password="UNTERMINATED ASSIGNMENT SECRET', "password=<redacted>"),
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_spaced_assignments(self, message: str, expected: str) -> None:
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == expected
+        assert "ASSIGNMENT" not in redacted
+
+    def test_redact_cloud_error_for_display_preserves_benign_spaced_assignment(self) -> None:
+        message = "tokenizer = sentencepiece"
+
+        assert redact_cloud_error_for_display(message) == message
+
+    @pytest.mark.parametrize("message", ["token==SECRET", "token == SECRET"])
+    def test_redact_cloud_error_for_display_preserves_comparison_operators(self, message: str) -> None:
+        assert redact_cloud_error_for_display(message) == message
+
+    def test_redact_cloud_error_for_display_preserves_context_after_assignment(self) -> None:
+        message = "token=SECRET from https://collector.example/status"
+
+        assert redact_cloud_error_for_display(message) == "token=<redacted> from https://collector.example/status"
 
     def test_redact_cloud_error_for_display_preserves_benign_header(self) -> None:
         message = "Tokenizer: sentencepiece"
