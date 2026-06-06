@@ -142,6 +142,7 @@ COMPACT_SENSITIVE_KEY_PREFIX: Final[str] = (
 )
 COMPACT_PREFIXED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     rf"(?:{COMPACT_SENSITIVE_KEY_PREFIX}(?:password|token|secret)|"
+    r"azurestoragekey|"
     r"(?-i:[A-Z0-9]+(?:PASSWORD|TOKEN|SECRET)))"
 )
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
@@ -152,7 +153,7 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"auth|basic[_.-]?auth|cookie|credential|google[_.-]?access[_.-]?id|jwt|passphrase|password|passwd|"
     r"private[_.-]?key|pwd|"
     r"refresh[_.-]?token|sas|secret|"
-    r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|token)"
+    r"secret[_.-]?key|session[_.-]?(?:id|token)|sessionid|signature|sig|storage[_.-]?key|token)"
     r"(?:s|[0-9]+|[_.-]?values?)?"
 )
 CAMEL_CASE_SENSITIVE_NEAR_MATCH_SUFFIX: Final[str] = r"(?:Algorithm|Cache|Count|Format|Hint|Ingredient|Policy)"
@@ -198,11 +199,12 @@ COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|"
     r"(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|"
     r"(?:curl|wget|nc|netcat|sshpass|redis-cli)(?=\s|$))"
-    r"|(?:docker\s+login|aws\s+configure\s+set)\b"
+    r"|(?:docker\s+login|aws\s+configure\s+set|az\s+login|openssl\s+enc|poetry\s+config)\b"
 )
 COMMAND_CONTEXT_LITERAL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?:os\.system|subprocess|__import__|bash\s+-c|sh\s+-c|cmd\.exe|powershell|curl|wget|nc\s+|netcat|"
-    r"sshpass|redis-cli|docker\s+login|aws\s+configure\s+set|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
+    r"sshpass|redis-cli|docker\s+login|aws\s+configure\s+set|az\s+login|openssl\s+enc|"
+    r"poetry\s+config|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
 )
 COMMAND_BARE_SENSITIVE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?<![-/\w.])(?!pwd(?![/\w.-])){SENSITIVE_ASSIGNMENT_KEY}(?![/\w.-])"
@@ -316,6 +318,17 @@ NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:(?:_auth(?:token)?|_password)|username)(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
     rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
+POETRY_CONFIG_PYPI_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\bpoetry{COMMAND_TOKEN_SEPARATOR}config{COMMAND_TOKEN_SEPARATOR}"
+    rf"pypi-token\.[A-Za-z0-9_.-]+{COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
+POETRY_CONFIG_HTTP_BASIC_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\bpoetry{COMMAND_TOKEN_SEPARATOR}config{COMMAND_TOKEN_SEPARATOR}"
+    rf"http-basic\.[A-Za-z0-9_.-]+{COMMAND_POSITIONAL_VALUE_SEPARATOR}"
+    rf"{COMMAND_POSITIONAL_SECRET_VALUE}{COMMAND_POSITIONAL_VALUE_SEPARATOR})"
+    rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+)
 MYSQL_ATTACHED_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?s)(?P<prefix>(?i:\bmysql\b)(?:(?![;&|\n]).){0,1024}?(?<![\w-])-p)"
     r"(?P<value>[^\s\"';&|),\]]+)"
@@ -332,6 +345,10 @@ DOCKER_LOGIN_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 DOCKER_LOGIN_PASSWORD_STDIN_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\bdocker{COMMAND_TOKEN_SEPARATOR}login\b"
     r"(?:(?![;&|\n]).){0,1024}?(?<!\w)--password-stdin(?![\w-])"
+)
+GH_AUTH_LOGIN_TOKEN_STDIN_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\bgh{COMMAND_TOKEN_SEPARATOR}auth{COMMAND_TOKEN_SEPARATOR}login\b"
+    r"(?:(?![;&|\n]).){0,1024}?(?<!\w)--with-token(?![\w-])"
 )
 SSHPASS_DEFAULT_ENV_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?s)(?P<prefix>(?<!\w)SSHPASS\s*=\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
@@ -367,6 +384,8 @@ AWS_CONFIGURE_SET_SECRET_RE: Final[re.Pattern[str]] = re.compile(
 COMMAND_PROGRAM_SHORT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\b(?:(?:sshpass\b[^;&|\n]{{0,1024}}?(?<!\w)-p)|"
     rf"(?:redis-cli\b[^;&|\n]{{0,1024}}?(?<!\w)-a)|"
+    rf"(?:az{COMMAND_TOKEN_SEPARATOR}login\b[^;&|\n]{{0,1024}}?(?<!\w)-p)|"
+    rf"(?:openssl{COMMAND_TOKEN_SEPARATOR}enc\b[^;&|\n]{{0,1024}}?(?<!\w)-(?:k|K|pass))|"
     rf"(?:twine{COMMAND_TOKEN_SEPARATOR}upload\b[^;&|\n]{{0,1024}}?(?<!\w)-(?-i:p)))"
     rf"(?![\w-]){COMMAND_POSITIONAL_VALUE_SEPARATOR})"
     rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
@@ -2479,7 +2498,11 @@ def _redact_inline_password_sources(text: str) -> str:
             f"{text[value_end:]}"
         )
 
-    for match in reversed(list(DOCKER_LOGIN_PASSWORD_STDIN_RE.finditer(text))):
+    stdin_secret_matches = [
+        *DOCKER_LOGIN_PASSWORD_STDIN_RE.finditer(text),
+        *GH_AUTH_LOGIN_TOKEN_STDIN_RE.finditer(text),
+    ]
+    for match in sorted(stdin_secret_matches, key=lambda candidate: candidate.start(), reverse=True):
         replacements: list[tuple[int, int, str]] = []
         line_start = text.rfind("\n", 0, match.start()) + 1
         pipe = text.rfind("|", line_start, match.start())
@@ -3043,6 +3066,8 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = _redact_inline_command_secret_sources(redacted)
     redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = POETRY_CONFIG_PYPI_TOKEN_RE.sub(_redact_command_positional_secret, redacted)
+    redacted = POETRY_CONFIG_HTTP_BASIC_RE.sub(_redact_command_positional_secret, redacted)
     redacted = COMMAND_SHELL_SENSITIVE_ASSIGNMENT_RE.sub(_redact_command_shell_assignment, redacted)
     redacted = DOCKER_LOGIN_PASSWORD_RE.sub(_redact_command_positional_secret, redacted)
     redacted = AWS_CONFIGURE_SET_SECRET_RE.sub(_redact_command_positional_secret, redacted)

