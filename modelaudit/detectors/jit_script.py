@@ -1,5 +1,3 @@
-Total output lines: 21460
-
 """
 JIT/Script Code Execution Detection for ML Models
 ==================================================
@@ -7937,7 +7935,5763 @@ def _runpy_priority_member_update_key(
             ),
             (
                 re.escape(alias)
-          …65390 tokens truncated…_expression(node, parents),
+                + rb"\s*\.\s*__dict__\s*\.\s*update\s*\(\s*\{[^}\n]*?['\"]"
+                + member_names
+                + rb"['\"]\s*:",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\(",
+            ),
+            (
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\(\s*\{[^}\n]*?['\"]"
+                + member_names
+                + rb"['\"]\s*:",
+                rb"\bvars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\.\s*update\s*\(",
+            ),
+            (
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\([^)\n]*?\b" + member_names + rb"\s*=",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\([^)\n]*?\b" + member_names + rb"\s*=",
+            ),
+            (
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\([^)\n]*?\b"
+                + member_names
+                + rb"\s*=",
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\([^)\n]*?\b"
+                + member_names
+                + rb"\s*=",
+            ),
+        ):
+            match = re.search(raw_pattern, line)
+            if match is not None and b"vars" in raw_pattern and "vars" in (shadowed_builtin_helper_names or set()):
+                continue
+            if match is not None and re.search(structural_pattern, code_line) is not None:
+                return f"runpy.{match.group(1).decode('utf-8')}", alias.decode("utf-8")
+    return None
+
+
+def _runpy_priority_member_update_dependency_names(
+    statement: bytes,
+    member_key: str,
+    update_aliases: dict[str, str] | None = None,
+    setitem_aliases: dict[str, str] | None = None,
+    setdefault_aliases: dict[str, str] | None = None,
+    descriptor_update_aliases: set[str] | None = None,
+    descriptor_setitem_aliases: set[str] | None = None,
+    descriptor_setdefault_aliases: set[str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+) -> set[str]:
+    normalized_statement = statement.lstrip(b"\x00\xff")
+    dependencies = _assignment_value_dependency_names(normalized_statement)
+    member_name = member_key.removeprefix("runpy.")
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(normalized_statement)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return dependencies
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in (update_aliases or {})
+                    and _static_getattr_member_name(target.slice) == member_name
+                ):
+                    dependencies.add(target.value.id)
+        if isinstance(node, ast.AugAssign) and isinstance(node.op, ast.BitOr):
+            if isinstance(node.target, ast.Name) and node.target.id in (update_aliases or {}):
+                dependencies.add(node.target.id)
+            for key, value in _runpy_static_update_items(node.value) or []:
+                if _static_getattr_member_name(key) == member_name:
+                    dependencies.update(_alias_reference_root_names(value))
+        if not isinstance(node, ast.Call):
+            continue
+        helper_reference = _simple_reference_name(node.func)
+        canonical_helpers = canonical_builtin_helper_aliases or {
+            "setattr": "setattr",
+            "builtins.setattr": "setattr",
+        }
+        if (
+            canonical_helpers.get(helper_reference or "") == "setattr"
+            and helper_reference not in (shadowed_builtin_helper_names or set())
+            and (
+                "." not in (helper_reference or "")
+                or "builtins.setattr" not in (shadowed_builtin_helper_names or set())
+            )
+            and len(node.args) >= 3
+            and _static_getattr_member_name(node.args[1]) == member_name
+        ):
+            if helper_reference is not None and helper_reference not in {"setattr", "builtins.setattr"}:
+                dependencies.add(helper_reference)
+            dependencies.update(_alias_reference_root_names(node.args[2]))
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (setitem_aliases or {})
+            and len(node.args) >= 2
+            and _static_getattr_member_name(node.args[0]) == member_name
+        ):
+            dependencies.add(node.func.id)
+            dependencies.update(_alias_reference_root_names(node.args[1]))
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (setdefault_aliases or {})
+            and len(node.args) >= 2
+            and _static_getattr_member_name(node.args[0]) == member_name
+        ):
+            dependencies.add(node.func.id)
+            dependencies.update(_alias_reference_root_names(node.args[1]))
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (descriptor_setitem_aliases or set())
+            and len(node.args) >= 3
+            and _static_getattr_member_name(node.args[1]) == member_name
+        ):
+            dependencies.add(node.func.id)
+            dependencies.update(_alias_reference_root_names(node.args[2]))
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (descriptor_setdefault_aliases or set())
+            and len(node.args) >= 3
+            and _static_getattr_member_name(node.args[1]) == member_name
+        ):
+            dependencies.add(node.func.id)
+            dependencies.update(_alias_reference_root_names(node.args[2]))
+        descriptor_setitem_name = (
+            _static_builtin_dict_descriptor_name(
+                node.func.value,
+                {"builtins"},
+                shadowed_builtin_helper_names=shadowed_builtin_helper_names,
+                canonical_builtin_helper_aliases=canonical_builtin_helper_aliases,
+            )
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"__setitem__", "setdefault"}
+            else None
+        )
+        if (
+            descriptor_setitem_name is not None
+            and len(node.args) >= 3
+            and _static_getattr_member_name(node.args[1]) == member_name
+        ):
+            dependencies.update(_alias_reference_root_names(node.args[2]))
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"__setitem__", "setdefault"}
+            and len(node.args) >= 2
+        ):
+            key = node.args[0]
+            if _static_getattr_member_name(key) == member_name:
+                dependencies.update(_alias_reference_root_names(node.args[1]))
+        elif (isinstance(node.func, ast.Attribute) and node.func.attr in {"update", "__ior__"}) or (
+            isinstance(node.func, ast.Name)
+            and node.func.id in {*((update_aliases or {}).keys()), *(descriptor_update_aliases or set())}
+        ):
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Call):
+                helper_reference = _simple_reference_name(node.func.value.func)
+                canonical_helper_name = canonical_helpers.get(helper_reference or "")
+                helper_is_canonical = (
+                    canonical_helper_name in {"getattr", "vars"}
+                    and helper_reference not in (shadowed_builtin_helper_names or set())
+                    and (
+                        "." not in (helper_reference or "")
+                        or f"builtins.{canonical_helper_name}" not in (shadowed_builtin_helper_names or set())
+                    )
+                )
+                if not helper_is_canonical:
+                    dependencies.update(_alias_reference_root_names(node.func.value.func))
+            if isinstance(node.func, ast.Name) and node.func.id in (update_aliases or {}):
+                dependencies.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in (descriptor_update_aliases or set()):
+                dependencies.add(node.func.id)
+            descriptor_name = _simple_reference_name(node.func)
+            if descriptor_name is not None and descriptor_name.endswith(".dict.update"):
+                descriptor_owner = descriptor_name.removesuffix(".dict.update")
+                if descriptor_owner != "builtins":
+                    dependencies.add(descriptor_owner)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in (update_aliases or {})
+            ):
+                dependencies.add(node.func.value.id)
+            update_arguments = (
+                node.args[1:]
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"update", "__ior__"}
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"dict", "builtins"}
+                    and node.args
+                )
+                or (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in (descriptor_update_aliases or set())
+                    and node.args
+                )
+                else node.args
+            )
+            for argument in update_arguments:
+                for static_member_key_node, member_value in _runpy_static_update_items(argument) or []:
+                    if _static_getattr_member_name(static_member_key_node) == member_name:
+                        dependencies.update(_alias_reference_root_names(member_value))
+            for keyword in node.keywords:
+                if keyword.arg == member_name:
+                    dependencies.update(_alias_reference_root_names(keyword.value))
+                elif keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                    for member_key_node, member_value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if member_key_node is not None and _static_getattr_member_name(member_key_node) == member_name:
+                            dependencies.update(_alias_reference_root_names(member_value))
+    return dependencies
+
+
+def _line_calls_fail_closed_runpy_member(
+    code_line: bytes, aliases: frozenset[bytes], fail_closed_members: set[str]
+) -> bool:
+    for alias in aliases:
+        match = re.search(
+            rb"(?<![A-Za-z0-9_])(?:\(\s*)*"
+            + re.escape(alias)
+            + rb"(?:\s*\)\s*)*\.\s*(_run_module_as_main|run_module|run_path)(?:\s*\)\s*)*\(",
+            code_line,
+        )
+        if match is not None and f"runpy.{match.group(1).decode('utf-8')}" in fail_closed_members:
+            return True
+    return False
+
+
+def _line_starts_continued_priority_getattr(
+    code_line: bytes,
+    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> bool:
+    if re.fullmatch(rb"\s*(?:builtins\s*\.\s*)?getattr\s*(?:\\\s*|\(\s*)", code_line) is not None:
+        return True
+    blocked_helpers = shadowed_builtin_helper_names or set()
+    return any(
+        "." not in reference
+        and helper_name == "getattr"
+        and reference not in blocked_helpers
+        and re.fullmatch(rb"\s*" + re.escape(reference.encode("utf-8")) + rb"\s*(?:\\\s*|\(\s*)", code_line) is not None
+        for reference, helper_name in (canonical_builtin_helper_aliases or {}).items()
+    )
+
+
+def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    aliases = _referenced_priority_aliases(code_line, aliases)
+    return _fragment_has_continued_priority_alias_call(code_line, aliases) or any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\(|\[)", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?vars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\[",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?vars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\.\s*get\s*\(",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?dict\s*\.\s*get\s*\(\s*(?:builtins\.)?vars\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*\)\s*,",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?object\s*\.\s*__getattribute__\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?type\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*\)\s*\.\s*__getattribute__\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*,",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _priority_getattr_alias_member(
+    line: bytes,
+    aliases: frozenset[bytes],
+    shadowed_builtin_helper_names: set[str] | None = None,
+    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+) -> tuple[str, ast.AST, str] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    alias_names = {alias.decode("utf-8") for alias in aliases}
+    canonical_helpers = canonical_builtin_helper_aliases or {
+        "getattr": "getattr",
+        "builtins.getattr": "getattr",
+        "vars": "vars",
+        "builtins.vars": "vars",
+    }
+    shadowed_helpers = shadowed_builtin_helper_names or set()
+
+    def is_active_helper(reference: str | None, helper_name: str) -> bool:
+        return (
+            reference is not None
+            and canonical_helpers.get(reference) == helper_name
+            and reference not in shadowed_helpers
+            and ("." not in reference or f"builtins.{helper_name}" not in shadowed_helpers)
+        )
+
+    def vars_target(node: ast.AST) -> ast.AST | None:
+        if not isinstance(node, ast.Call):
+            return None
+        helper_name = _simple_reference_name(node.func)
+        if not is_active_helper(helper_name, "vars") or node.keywords or len(node.args) != 1:
+            return None
+        return node.args[0]
+
+    def unbound_getattribute_target(getter: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+        if (
+            not isinstance(getter.func, ast.Attribute)
+            or getter.func.attr != "__getattribute__"
+            or getter.keywords
+            or len(getter.args) != 2
+        ):
+            return None
+        owner_name = _simple_reference_name(getter.func.value)
+        if owner_name in {"object", "builtins.object"}:
+            return getter.args[0], getter.args[1]
+        owner = getter.func.value
+        if (
+            isinstance(owner, ast.Call)
+            and _simple_reference_name(owner.func) in {"type", "builtins.type"}
+            and not owner.keywords
+            and len(owner.args) == 1
+            and isinstance(owner.args[0], ast.Name)
+            and isinstance(getter.args[0], ast.Name)
+            and owner.args[0].id == getter.args[0].id
+        ):
+            return getter.args[0], getter.args[1]
+        return None
+
+    def mapping_get_target(getter: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+        if getter.keywords:
+            return None
+        if isinstance(getter.func, ast.Attribute) and getter.func.attr == "get" and getter.args:
+            target = vars_target(getter.func.value)
+            if target is not None:
+                return target, getter.args[0]
+        if _simple_reference_name(getter.func) in {"dict.get", "builtins.dict.get"} and len(getter.args) >= 2:
+            target = vars_target(getter.args[0])
+            if target is not None:
+                return target, getter.args[1]
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        member_node: ast.AST | None = None
+        target_node: ast.AST | None = None
+        call_target = _explicit_call_target(node.func)
+        if isinstance(call_target, ast.Call):
+            getter = call_target
+            getter_name = _simple_reference_name(getter.func)
+            if is_active_helper(getter_name, "getattr"):
+                if getter.keywords or len(getter.args) < 2:
+                    continue
+                target_node = getter.args[0]
+                member_node = getter.args[1]
+            elif unbound_getattribute := unbound_getattribute_target(getter):
+                target_node, member_node = unbound_getattribute
+            elif mapping_get := mapping_get_target(getter):
+                target_node, member_node = mapping_get
+            else:
+                continue
+        elif isinstance(call_target, ast.Subscript) and isinstance(call_target.value, ast.Call):
+            getter = call_target.value
+            target_node = vars_target(getter)
+            if target_node is None:
+                continue
+            member_node = call_target.slice
+        else:
+            continue
+        if target_node is None or member_node is None or not isinstance(target_node, ast.Name):
+            continue
+        if target_node.id not in alias_names:
+            continue
+        member_name = _static_getattr_member_name(member_node)
+        if isinstance(member_name, str) and re.fullmatch(r"[A-Za-z_]\w*", member_name) is not None:
+            return member_name, member_node, target_node.id
+    return None
+
+
+def _line_calls_priority_getattr_alias(line: bytes, aliases: frozenset[bytes]) -> bool:
+    return _priority_getattr_alias_member(line, aliases) is not None
+
+
+def _line_calls_overbounded_runpy_getattr_alias(
+    line: bytes,
+    aliases: frozenset[bytes],
+    shadowed_builtin_helper_names: set[str] | None = None,
+    canonical_builtin_helper_aliases: dict[str, str] | None = None,
+) -> bool:
+    resolved_member = _priority_getattr_alias_member(
+        line, aliases, shadowed_builtin_helper_names, canonical_builtin_helper_aliases
+    )
+    if resolved_member is None or resolved_member[0] not in _RUNPY_PRIORITY_MEMBER_NAMES:
+        return False
+    pending = [resolved_member[1]]
+    parts = 0
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend((current.right, current.left))
+        elif isinstance(current, ast.Constant) and isinstance(current.value, str):
+            parts += 1
+            if parts > 256:
+                return True
+        else:
+            return False
+    return False
+
+
+def _static_getattr_member_name(node: ast.AST) -> str | None:
+    pieces: list[str] = []
+    pending = [node]
+    visited = 0
+    while pending:
+        current = pending.pop()
+        visited += 1
+        if visited > 8192:
+            return None
+        if isinstance(current, ast.Constant) and isinstance(current.value, str):
+            pieces.append(current.value)
+            continue
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend((current.right, current.left))
+            continue
+        return None
+    member_name = "".join(pieces)
+    return member_name if len(member_name) <= 256 else None
+
+
+def _static_sys_modules_eviction_name(
+    call: ast.Call,
+    sys_aliases: set[str],
+    modules_aliases: set[str],
+    pop_aliases: set[str],
+    clear_aliases: set[str],
+) -> str | None:
+    if isinstance(call.func, ast.Name):
+        if call.func.id in clear_aliases:
+            return "*"
+        if call.func.id in pop_aliases and (module_node := _static_call_argument(call, 0)) is not None:
+            return _static_getattr_member_name(module_node)
+        return None
+    if not isinstance(call.func, ast.Attribute):
+        return None
+    is_modules_mapping = (isinstance(call.func.value, ast.Name) and call.func.value.id in modules_aliases) or (
+        isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "modules"
+        and isinstance(call.func.value.value, ast.Name)
+        and call.func.value.value.id in sys_aliases
+    )
+    if not is_modules_mapping:
+        return None
+    if call.func.attr == "clear":
+        return "*"
+    module_node = _static_call_argument(call, 0)
+    if call.func.attr not in {"pop", "__delitem__"} or module_node is None:
+        return None
+    return _static_getattr_member_name(module_node)
+
+
+def _static_call_argument(call: ast.Call, position: int, keyword: str | None = None) -> ast.AST | None:
+    if position < len(call.args):
+        argument = call.args[position]
+        if isinstance(argument, ast.Starred) and isinstance(argument.value, (ast.Tuple, ast.List)):
+            return argument.value.elts[0] if len(argument.value.elts) == 1 and position == 0 else None
+        return argument
+    if keyword is not None:
+        for item in call.keywords:
+            if item.arg == keyword:
+                return item.value
+            if item.arg is None and isinstance(item.value, ast.Dict):
+                for key_node, value_node in zip(item.value.keys, item.value.values, strict=True):
+                    if key_node is not None and _static_getattr_member_name(key_node) == keyword:
+                        return value_node
+    return None
+
+
+def _deterministic_named_expressions(expression: ast.AST) -> list[ast.NamedExpr]:
+    return sorted(
+        (
+            node
+            for node in _deterministically_executed_expression_nodes(
+                expression,
+                eager_generator_consumers=_canonical_eager_generator_consumer_aliases(),
+            )
+            if isinstance(node, ast.NamedExpr)
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+
+
+def _prior_deterministic_named_expressions(expression: ast.AST, call: ast.Call) -> list[ast.NamedExpr]:
+    call_position = (getattr(call, "lineno", 0), getattr(call, "col_offset", 0))
+    return [
+        node
+        for node in _deterministic_named_expressions(expression)
+        if (
+            getattr(node, "end_lineno", getattr(node, "lineno", 0)),
+            getattr(node, "end_col_offset", getattr(node, "col_offset", 0)),
+        )
+        <= call_position
+    ]
+
+
+def _reload_aliases_before_call(
+    expression: ast.AST,
+    call: ast.Call,
+    aliases_before: frozenset[str],
+    importlib_aliases: set[str],
+) -> frozenset[str]:
+    aliases = set(aliases_before)
+    for named_expression in _prior_deterministic_named_expressions(expression, call):
+        reference = _simple_reference_name(named_expression.value)
+        aliases.discard(named_expression.target.id)
+        if reference in aliases or (
+            reference is not None
+            and reference.endswith(".reload")
+            and reference.removesuffix(".reload") in importlib_aliases
+        ):
+            aliases.add(named_expression.target.id)
+    return frozenset(aliases)
+
+
+def _name_aliases_before_call(
+    expression: ast.AST,
+    call: ast.Call,
+    aliases_before: Mapping[str, _ContainerValue],
+) -> dict[str, _ContainerValue]:
+    aliases = dict(aliases_before)
+    for named_expression in _prior_deterministic_named_expressions(expression, call):
+        value = aliases.get(named_expression.value.id) if isinstance(named_expression.value, ast.Name) else None
+        aliases.pop(named_expression.target.id, None)
+        if value is not None:
+            aliases[named_expression.target.id] = value
+    return aliases
+
+
+def _module_helper_aliases_before_call(
+    expression: ast.AST,
+    call: ast.Call,
+    sys_before: frozenset[str],
+    modules_before: frozenset[str],
+    pop_before: frozenset[str],
+    clear_before: frozenset[str],
+    importlib_before: frozenset[str],
+) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+    sys_aliases = set(sys_before)
+    modules_aliases = set(modules_before)
+    pop_aliases = set(pop_before)
+    clear_aliases = set(clear_before)
+    importlib_aliases = set(importlib_before)
+    for named_expression in _prior_deterministic_named_expressions(expression, call):
+        target_name = named_expression.target.id
+        sys_aliases.discard(target_name)
+        modules_aliases.discard(target_name)
+        pop_aliases.discard(target_name)
+        clear_aliases.discard(target_name)
+        importlib_aliases.discard(target_name)
+        value = named_expression.value
+        if isinstance(value, ast.Name):
+            if value.id in sys_aliases:
+                sys_aliases.add(target_name)
+            elif value.id in modules_aliases:
+                modules_aliases.add(target_name)
+            elif value.id in pop_aliases:
+                pop_aliases.add(target_name)
+            elif value.id in clear_aliases:
+                clear_aliases.add(target_name)
+            elif value.id in importlib_aliases:
+                importlib_aliases.add(target_name)
+        elif (
+            isinstance(value, ast.Attribute)
+            and value.attr == "modules"
+            and isinstance(value.value, ast.Name)
+            and value.value.id in sys_aliases
+        ):
+            modules_aliases.add(target_name)
+        elif isinstance(value, ast.Attribute) and value.attr in {"pop", "__delitem__", "clear"}:
+            is_modules_mapping = (isinstance(value.value, ast.Name) and value.value.id in modules_aliases) or (
+                isinstance(value.value, ast.Attribute)
+                and value.value.attr == "modules"
+                and isinstance(value.value.value, ast.Name)
+                and value.value.value.id in sys_aliases
+            )
+            if is_modules_mapping:
+                if value.attr == "clear":
+                    clear_aliases.add(target_name)
+                else:
+                    pop_aliases.add(target_name)
+    return (
+        frozenset(sys_aliases),
+        frozenset(modules_aliases),
+        frozenset(pop_aliases),
+        frozenset(clear_aliases),
+        frozenset(importlib_aliases),
+    )
+
+
+def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    aliases = _referenced_priority_aliases(code_line, aliases)
+    return _fragment_has_continued_priority_alias_call(code_line, aliases) or any(
+        re.search(
+            rb"(?<![A-Za-z0-9_])(?:\(\s*)*"
+            + re.escape(alias)
+            + rb"(?:\s*\)\s*)*(?:\(|\s*\.\s*[A-Za-z_]\w*(?:\s*\)\s*)*"
+            rb"(?:\s*\.\s*__call__(?:\s*\)\s*)*)*\s*\()",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _line_live_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+    except SyntaxError:
+        return frozenset()
+
+    live_aliases: set[bytes] = set()
+    shadowed_aliases: set[bytes] = set()
+    for statement in tree.body:
+        for event, event_aliases in _statement_priority_alias_runtime_events(statement, aliases):
+            if event == "use":
+                live_aliases.update(event_aliases - shadowed_aliases)
+            else:
+                shadowed_aliases.update(event_aliases)
+    return frozenset(live_aliases)
+
+
+def _statement_priority_alias_runtime_events(
+    statement: ast.stmt,
+    aliases: frozenset[bytes],
+) -> Iterator[tuple[str, frozenset[bytes]]]:
+    if isinstance(statement, ast.Assign):
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield (
+            "bind",
+            frozenset(
+                alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+            ),
+        )
+        return
+    if isinstance(statement, ast.AnnAssign):
+        if statement.value is not None:
+            yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, ast.AugAssign):
+        yield from _node_priority_alias_use_events(statement.target, aliases)
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        yield "bind", _statement_bound_priority_aliases(statement, aliases)
+        return
+    if isinstance(statement, ast.If):
+        yield from _node_priority_alias_use_events(statement.test, aliases)
+        for child_statement in [*statement.body, *statement.orelse]:
+            yield from _statement_priority_alias_runtime_events(child_statement, aliases)
+        return
+    yield from _node_priority_alias_use_events(statement, aliases)
+    if bound_aliases := _statement_bound_priority_aliases(statement, aliases):
+        yield "bind", bound_aliases
+
+
+def _node_priority_alias_use_events(node: ast.AST, aliases: frozenset[bytes]) -> Iterator[tuple[str, frozenset[bytes]]]:
+    alias_names = {alias.decode("utf-8", errors="ignore"): alias for alias in aliases}
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.NamedExpr):
+            yield from _node_priority_alias_use_events(child.value, aliases)
+            yield "bind", _target_bound_priority_aliases(child.target, aliases)
+            continue
+        if isinstance(child, ast.Call):
+            called_aliases = _call_priority_aliases(child, alias_names)
+            if called_aliases:
+                yield "use", called_aliases
+                continue
+        expression_aliases = _expression_priority_aliases(child, alias_names)
+        if expression_aliases:
+            yield "use", expression_aliases
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+
+
+def _call_priority_aliases(call: ast.Call, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(call.func, ast.Name):
+        alias = alias_names.get(call.func.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(call.func, ast.Attribute):
+        return _expression_priority_aliases(call.func.value, alias_names)
+    if (
+        isinstance(call.func, ast.Call)
+        and _simple_reference_name(call.func.func) in {"getattr", "builtins.getattr"}
+        and call.func.args
+    ):
+        return _expression_priority_aliases(call.func.args[0], alias_names)
+    return frozenset()
+
+
+def _expression_priority_aliases(node: ast.AST, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(node, ast.Name):
+        alias = alias_names.get(node.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(node, (ast.Attribute, ast.Subscript)):
+        return _expression_priority_aliases(node.value, alias_names)
+    if (
+        isinstance(node, ast.Call)
+        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+        and node.args
+    ):
+        return _expression_priority_aliases(node.args[0], alias_names)
+    return frozenset()
+
+
+def _target_bound_priority_aliases(target: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    if isinstance(target, ast.Name):
+        name = target.id.encode()
+        return frozenset({name}) if name in aliases else frozenset()
+    if isinstance(target, ast.Starred):
+        return _target_bound_priority_aliases(target.value, aliases)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return frozenset(alias for element in target.elts for alias in _target_bound_priority_aliases(element, aliases))
+    return frozenset()
+
+
+def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    if isinstance(statement, ast.Assign):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return frozenset(
+            alias
+            for item in statement.items
+            if item.optional_vars is not None and _is_contextlib_nullcontext_call(item.context_expr)
+            for alias in _target_bound_priority_aliases(item.optional_vars, aliases)
+        )
+    if isinstance(statement, ast.Import):
+        return frozenset(
+            name
+            for alias in statement.names
+            for name in ((alias.asname or alias.name.split(".", maxsplit=1)[0]).encode(),)
+            if name in aliases
+        )
+    if isinstance(statement, ast.ImportFrom):
+        return frozenset(
+            name for alias in statement.names for name in ((alias.asname or alias.name).encode(),) if name in aliases
+        )
+    if isinstance(statement, ast.Delete):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
+    return frozenset()
+
+
+def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    shadowed_aliases = set(_line_assigned_priority_aliases(code_line, aliases))
+    shadowed_aliases.update(
+        alias
+        for alias in aliases
+        if re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
+        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
+    )
+    return frozenset(shadowed_aliases)
+
+
+def _definitely_executed_late_shadow_aliases(
+    code_line: bytes, aliases: frozenset[bytes], *, nested: bool
+) -> frozenset[bytes]:
+    source = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        if not source.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{source.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
+        return frozenset()
+    if len(tree.body) != 1:
+        return frozenset()
+
+    statement = tree.body[0]
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom, ast.Delete)):
+        return _statement_bound_priority_aliases(statement, aliases)
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        statement_name = statement.name.encode("utf-8")
+        return frozenset({statement_name}) if statement_name in aliases else frozenset()
+    if not nested and isinstance(statement, (ast.With, ast.AsyncWith)):
+        return _statement_bound_priority_aliases(statement, aliases)
+    if not nested and isinstance(statement, ast.Expr) and isinstance(statement.value, ast.NamedExpr):
+        return _target_bound_priority_aliases(statement.value.target, aliases)
+    if (
+        isinstance(statement, (ast.For, ast.AsyncFor))
+        and isinstance(statement.iter, (ast.List, ast.Tuple, ast.Set))
+        and statement.iter.elts
+    ):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    return frozenset()
+
+
+def _with_target_late_shadow_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    source = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        if not source.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{source.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
+        return frozenset()
+    if len(tree.body) != 1 or not isinstance(tree.body[0], (ast.With, ast.AsyncWith)):
+        return frozenset()
+    return frozenset(
+        alias
+        for item in tree.body[0].items
+        if item.optional_vars is not None
+        for alias in _target_bound_priority_aliases(item.optional_vars, aliases)
+    )
+
+
+def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(decoded_line)
+    except SyntaxError:
+        if not decoded_line.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
+        return frozenset()
+
+    pending = list(reversed(tree.body))
+    assigned_aliases: set[bytes] = set()
+    while pending:
+        statement = pending.pop()
+        assigned_aliases.update(_statement_bound_priority_aliases(statement, aliases))
+        assigned_aliases.update(_named_expression_bound_priority_aliases(statement, aliases))
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(
+            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
+        )
+    return frozenset(assigned_aliases)
+
+
+def _named_expression_bound_priority_aliases(node: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    assigned_aliases: set[bytes] = set()
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.NamedExpr):
+            assigned_aliases.update(_target_bound_priority_aliases(child.target, aliases))
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+    return frozenset(assigned_aliases)
+
+
+def _line_indent_width(line: bytes) -> int:
+    return len(line) - len(line.lstrip(b" \t"))
+
+
+def _compound_header_keyword(structural_line: bytes) -> bytes | None:
+    stripped = structural_line.lstrip()
+    for keyword in (b"async def", b"elif", b"else", b"except", b"finally", b"if", b"for", b"while", b"try"):
+        if stripped == keyword + b":" or stripped.startswith(keyword + b" ") or stripped.startswith(keyword + b":"):
+            return keyword
+    return None
+
+
+def _line_end_offset(candidate: bytes, line_start: int) -> int:
+    line_end = candidate.find(b"\n", line_start)
+    return len(candidate) if line_end == -1 else line_end + 1
+
+
+def _compound_header_start(line_start: int, structural_line: bytes) -> int:
+    header_match = _COMPOUND_HEADER_MATCH_PATTERN.search(structural_line)
+    if header_match is None:
+        return line_start
+    prefix = structural_line[: header_match.start()]
+    if _is_embedded_top_level_prefix(prefix):
+        return line_start + header_match.start()
+    return line_start
+
+
+def _first_body_statement_segment(
+    candidate: bytes, header_line_end: int, header_indent: int, _depth: int = 0
+) -> tuple[int, int] | None:
+    line_start = header_line_end
+    while line_start < len(candidate):
+        line_end = _line_end_offset(candidate, line_start)
+        line = candidate[line_start:line_end]
+        structural_line = _python_structural_line_bytes(line).rstrip()
+        if not structural_line:
+            line_start = line_end
+            continue
+        if _line_indent_width(line) <= header_indent:
+            return None
+
+        statement_end = line_end
+        paren_depth = _line_parenthesis_delta(line)
+        while (
+            _line_has_explicit_continuation(candidate[line_start:statement_end]) or paren_depth > 0
+        ) and statement_end < len(candidate):
+            continuation_start = statement_end
+            statement_end = _line_end_offset(candidate, continuation_start)
+            paren_depth += _line_parenthesis_delta(candidate[continuation_start:statement_end])
+
+        if structural_line.endswith(b":") and _depth < _MAX_BODY_STATEMENT_NESTING:
+            nested_segment = _first_body_statement_segment(
+                candidate, statement_end, _line_indent_width(line), _depth + 1
+            )
+            if nested_segment is not None:
+                statement_end = nested_segment[1]
+        return line_start, statement_end
+    return None
+
+
+def _definition_time_usage_segments(candidate: bytes, usage_start: int, usage_end: int) -> list[tuple[int, int]]:
+    """Complete retained definition-time expressions with enough syntax to parse."""
+    line_start = candidate.rfind(b"\n", 0, usage_start) + 1
+    segments: list[tuple[int, int]] = []
+    cursor = usage_end
+    structural_usage = _python_structural_line_bytes(candidate[line_start:usage_end]).lstrip()
+
+    if structural_usage.startswith(b"@"):
+        while cursor < len(candidate):
+            next_line_end = _line_end_offset(candidate, cursor)
+            next_line = candidate[cursor:next_line_end]
+            structural_next = _python_structural_line_bytes(next_line).lstrip()
+            if structural_next.startswith(b"@"):
+                segments.append((cursor, next_line_end))
+                cursor = next_line_end
+                continue
+            if not structural_next.startswith((b"def ", b"async def ", b"class ")):
+                return segments
+            header_start = cursor
+            header_end = next_line_end
+            parenthesis_depth = _line_parenthesis_delta(next_line)
+            while (
+                _line_has_explicit_continuation(candidate[header_start:header_end]) or parenthesis_depth > 0
+            ) and header_end < len(candidate):
+                continuation_start = header_end
+                header_end = _line_end_offset(candidate, continuation_start)
+                parenthesis_depth += _line_parenthesis_delta(candidate[continuation_start:header_end])
+            segments.append((header_start, header_end))
+            body_segment = _first_body_statement_segment(candidate, header_end, _line_indent_width(next_line))
+            if body_segment is not None:
+                segments.append(body_segment)
+            return segments
+        return segments
+
+    if structural_usage.startswith((b"def ", b"async def ", b"class ")):
+        body_segment = _first_body_statement_segment(
+            candidate,
+            usage_end,
+            _line_indent_width(candidate[line_start:usage_end]),
+        )
+        if body_segment is not None:
+            segments.append(body_segment)
+    return segments
+
+
+def _nearby_prior_source_segments(candidate: bytes, before_offset: int) -> list[tuple[int, int]]:
+    """Return a small non-comment context immediately before a retained usage."""
+    segments: list[tuple[int, int]] = []
+    selected_bytes = 0
+    search_end = before_offset
+    while search_end > 0 and len(segments) < 8 and selected_bytes < _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // 2:
+        line_end = search_end - 1 if candidate[search_end - 1 : search_end] == b"\n" else search_end
+        line_start = candidate.rfind(b"\n", 0, line_end) + 1
+        if line_start >= search_end:
+            break
+        line = candidate[line_start:search_end]
+        search_end = line_start
+        structural_line = _python_structural_line_bytes(line).strip()
+        if not structural_line:
+            continue
+        if not line[:1].isspace() and not _is_embedded_top_level_prefix(
+            line[: len(line) - len(line.lstrip(b"\x00\xff \t\r"))]
+        ):
+            continue
+        prefix_length = len(line) - len(line.lstrip(b"\x00\xff"))
+        selected_bytes += len(line) - prefix_length
+        segments.append((line_start + prefix_length, line_start + len(line)))
+    return list(reversed(segments))
+
+
+def _following_usage_call_segments(candidate: bytes, usage_start: int, usage_end: int) -> list[tuple[int, int]]:
+    """Return the immediate call of a name assigned by a retained usage line."""
+    usage_line_start = candidate.rfind(b"\n", 0, usage_start) + 1
+    binding_name = _simple_late_binding_name(candidate[usage_line_start:usage_end])
+    if binding_name is None:
+        return []
+    next_line_end = _line_end_offset(candidate, usage_end)
+    if next_line_end <= usage_end:
+        return []
+    next_line = candidate[usage_end:next_line_end]
+    if binding_name not in _callable_root_names(_python_structural_line_bytes(next_line)):
+        return []
+    return [(usage_end, next_line_end)]
+
+
+def _previous_header_context_segments(
+    candidate: bytes,
+    before_line_start: int,
+    indent: int,
+    keywords: set[bytes],
+) -> list[tuple[int, int]]:
+    search_end = before_line_start
+    while search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < indent:
+            return []
+        if previous_indent != indent:
+            continue
+        framed_header_start = _same_line_compound_header_start(structural_line, previous_line_start)
+        header_line = (
+            structural_line[framed_header_start - previous_line_start :]
+            if framed_header_start is not None
+            else structural_line
+        )
+        keyword = _compound_header_keyword(header_line)
+        if keyword not in keywords or not header_line.endswith(b":"):
+            continue
+        header_start = framed_header_start or _compound_header_start(previous_line_start, structural_line)
+        header_segment = (header_start, previous_line_start + len(previous_line))
+        body_segment = _first_body_statement_segment(candidate, previous_line_start + len(previous_line), indent)
+        if body_segment is None:
+            return [header_segment]
+        return [header_segment, body_segment]
+    return []
+
+
+def _try_else_context_segments(candidate: bytes, clause_line_start: int, indent: int) -> list[tuple[int, int]]:
+    except_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"except"})
+    try_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    if try_context and except_context:
+        return [*try_context, *except_context]
+    return []
+
+
+def _matching_clause_context_segments(
+    candidate: bytes,
+    clause_line_start: int,
+    indent: int,
+    clause_keyword: bytes | None,
+) -> list[tuple[int, int]]:
+    if clause_keyword in {b"else", b"elif"}:
+        context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"if", b"for", b"while"})
+        if context:
+            return context
+        if clause_keyword == b"else":
+            return _try_else_context_segments(candidate, clause_line_start, indent)
+    if clause_keyword in {b"except", b"finally"}:
+        return _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    return []
+
+
+def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> list[tuple[int, int]]:
+    line_end = candidate.find(b"\n", line_start)
+    if line_end == -1:
+        line_end = len(candidate)
+    current_indent = _line_indent_width(candidate[line_start:line_end])
+    if current_indent == 0:
+        return []
+
+    segments: list[tuple[int, int]] = []
+    search_end = line_start
+    while current_indent > 0 and search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < current_indent and structural_line.endswith(b":"):
+            header_start = _compound_header_start(previous_line_start, structural_line)
+            header_segment = (header_start, previous_line_start + len(previous_line))
+            clause_context = _matching_clause_context_segments(
+                candidate,
+                previous_line_start,
+                previous_indent,
+                _compound_header_keyword(structural_line),
+            )
+            segments.append(header_segment)
+            segments.extend(reversed(clause_context))
+            current_indent = previous_indent
+    return list(reversed(segments))
+
+
+def _candidate_start_with_enclosing_header(candidate: bytes, start: int) -> int:
+    line_start = candidate.rfind(b"\n", 0, start) + 1
+    line_end = candidate.find(b"\n", start)
+    if line_end == -1:
+        line_end = len(candidate)
+    if _line_indent_width(candidate[line_start:line_end]) == 0:
+        return start
+    header_segments = _enclosing_compound_header_segments(candidate, line_start)
+    return header_segments[0][0] if header_segments else start
+
+
+def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(segment_ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int, int]]) -> bytes:
+    if len(segment_ranges) == 1:
+        start, end = segment_ranges[0]
+        return candidate[start:end]
+    return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
+
+
+def _select_prioritized_embedded_python_snippets(
+    candidates: list[_EmbeddedPythonCandidate],
+    bounded: bytes | None = None,
+) -> tuple[list[_EmbeddedPythonCandidate], list[tuple[int, int]]]:
+    selected: list[_EmbeddedPythonCandidate] = []
+    selected_spans: set[tuple[int, int]] = set()
+    priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
+    selected_default_candidates = 0
+    selected_priority_candidates = 0
+    omitted_budgeted_spans: list[tuple[int, int]] = []
+    for candidate, span, real_ranges in candidates:
+        if span in selected_spans:
+            continue
+        has_priority_marker = (
+            _span_contains_priority_offset(span, priority_offsets)
+            if bounded is not None
+            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(bytes(candidate).lower()) is not None
+        )
+        oversized_priority_candidate = (
+            has_priority_marker and bounded is not None and len(candidate) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+        )
+        if oversized_priority_candidate:
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_spans.append(span)
+                continue
+            candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
+                bytes(candidate), span, priority_offsets
+            )
+            if span in selected_spans:
+                continue
+            selected_priority_candidates += 1
+        elif selected_default_candidates >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
+            if not has_priority_marker:
+                omitted_budgeted_spans.append(span)
+                continue
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_spans.append(span)
+                continue
+            if bounded is not None:
+                candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
+                    bytes(candidate), span, priority_offsets
+                )
+            else:
+                candidate = bytes(candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES])
+                span = (span[0], span[0] + len(candidate))
+                real_ranges = (span,)
+            if span in selected_spans:
+                continue
+            selected_priority_candidates += 1
+        else:
+            selected_default_candidates += 1
+            if not has_priority_marker and len(candidate) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+                span = (span[0], span[0] + len(candidate))
+                real_ranges = (span,)
+                if span in selected_spans:
+                    continue
+            candidate = bytes(candidate)
+        selected_spans.add(span)
+        selected.append((candidate, span, real_ranges))
+    return selected, omitted_budgeted_spans
+
+
+def _prioritized_embedded_python_snippets(
+    candidates: list[_EmbeddedPythonCandidate],
+    bounded: bytes | None = None,
+) -> list[_EmbeddedPythonCandidate]:
+    selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
+    return selected
+
+
+def _complete_brace_truncated_line_candidate(
+    bounded: bytes,
+    span: tuple[int, int],
+) -> tuple[bytes, tuple[int, int]] | None:
+    """Extend a failed block candidate through its remaining indented lines."""
+    if span[1] >= len(bounded) or bounded[span[1] : span[1] + 1] != b"}":
+        return None
+    line_end = bounded.find(b"\n", span[1])
+    end = len(bounded) if line_end < 0 else line_end + 1
+    if end <= span[1]:
+        return None
+
+    header_end = bounded.find(b"\n", span[0], span[1])
+    if header_end < 0:
+        return bounded[span[0] : end], (span[0], end)
+    header_indent = _line_indent_width(bounded[span[0] : header_end + 1])
+    byte_limit = min(len(bounded), span[0] + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    while end < byte_limit:
+        next_line_end = bounded.find(b"\n", end, byte_limit)
+        next_end = byte_limit if next_line_end < 0 else next_line_end + 1
+        line = bounded[end:next_end]
+        null_offset = line.find(b"\x00")
+        if null_offset >= 0:
+            break
+        structural_line = _python_structural_line_bytes(line)
+        if structural_line.strip() and _line_indent_width(line) <= header_indent:
+            break
+        end = next_end
+    return bounded[span[0] : end], (span[0], end)
+
+
+def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
+    if len(data) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
+        return [data]
+    return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
+
+
+def _python_structural_line_bytes(line: bytes) -> bytes:
+    structural = bytearray()
+    quote_marker: bytes | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        if quote_marker is not None:
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if len(quote_marker) == 1 and line[index] == ord("\\"):
+                escaped = True
+                index += 1
+                continue
+            if line.startswith(quote_marker, index):
+                index += len(quote_marker)
+                quote_marker = None
+                continue
+            index += 1
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            break
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote_marker = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            quote_marker = bytes([byte])
+            index += 1
+            continue
+        structural.append(byte)
+        index += 1
+    return bytes(structural)
+
+
+def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            end = _find_unescaped_marker(line, quote, index)
+            if end == -1:
+                return quote
+            index = end + len(quote)
+            quote = None
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            return None
+        if (line.startswith(b'"""', index) or line.startswith(b"'''", index)) and not _is_escaped_marker(line, index):
+            quote = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            single_quote = byte
+            index += 1
+            escaped = False
+            while index < len(line):
+                current = line[index]
+                if escaped:
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == single_quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return quote
+
+
+def _find_unescaped_marker(line: bytes, marker: bytes, start: int) -> int:
+    index = line.find(marker, start)
+    while index != -1:
+        if not _is_escaped_marker(line, index):
+            return index
+        index = line.find(marker, index + 1)
+    return -1
+
+
+def _is_escaped_marker(line: bytes, index: int) -> bool:
+    backslashes = 0
+    position = index - 1
+    while position >= 0 and line[position] == ord("\\"):
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
+
+
+def _line_has_explicit_continuation(line: bytes) -> bool:
+    return _python_structural_line_bytes(line).rstrip().endswith(b"\\")
+
+
+def _line_parenthesis_delta(line: bytes) -> int:
+    structural = _python_structural_line_bytes(line)
+    return (
+        structural.count(b"(")
+        + structural.count(b"[")
+        + structural.count(b"{")
+        - structural.count(b")")
+        - structural.count(b"]")
+        - structural.count(b"}")
+    )
+
+
+def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    return _triple_quote_state_after_line(line, quote)
+
+
+def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
+    if not prefix:
+        return True
+    stripped_prefix = prefix.strip()
+    if stripped_prefix == b"":
+        return False
+    return not any(0x20 <= byte < 0x7F for byte in stripped_prefix)
+
+
+def _context_statement_start(line: bytes) -> int | None:
+    for match in _EMBEDDED_PYTHON_CONTEXT_START_PATTERN.finditer(line):
+        if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    for match in _EMBEDDED_PYTHON_STATIC_MEMBER_CONTEXT_START_PATTERN.finditer(line):
+        if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    for match in _EMBEDDED_PYTHON_STATIC_MAPPING_CALL_CONTEXT_START_PATTERN.finditer(line):
+        if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    structural_line = _python_structural_line_bytes(line)
+    for match in _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN.finditer(structural_line):
+        if _is_embedded_top_level_prefix(structural_line[: match.start()]):
+            return match.start()
+    return None
+
+
+def _assignment_targets(tree: ast.AST) -> list[str]:
+    targets: list[str] = []
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                targets.extend(_assignment_target_names(target))
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets.extend(_assignment_target_names(statement.target))
+    return targets
+
+
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assignment_target_names(element)]
+    return []
+
+
+def _assignment_target_root_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assignment_target_root_names(target.value)
+    if isinstance(target, (ast.Attribute, ast.Subscript)):
+        return _assignment_target_root_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assignment_target_root_names(element)]
+    return []
+
+
+def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(context + statement)
+    statement_str, _statement_byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        statement_tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return False
+
+    targets = _assignment_targets(statement_tree)
+    if not targets:
+        return False
+    if any(
+        _expression_is_priority_alias_reference(value, set())
+        for _target, value in _assignment_targets_and_values_in_tree(statement_tree)
+    ):
+        return True
+
+    probe = code_str + "\n" + "\n".join(call for target in targets for call in _priority_assignment_probe_calls(target))
+    try:
+        probe_tree = ast.parse(probe)
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+    try:
+        return bool(
+            _resolve_alias_aware_high_risk_calls(probe_tree)
+            or JITScriptDetector._dangerous_builtin_calls_in_tree(probe_tree)
+        )
+    except RecursionError:
+        return True
+
+
+def _tree_imports_priority_module(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(_is_priority_module_name(alias.name) for alias in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module is not None and _is_priority_module_name(node.module):
+            return True
+    return False
+
+
+def _compact_tracked_builtins_import_statement(statement: bytes) -> bytes | None:
+    tracked_imports = _canonical_builtins_member_import_aliases(
+        statement, frozenset({"dict", "getattr", "vars", "setattr", "delattr"})
+    )
+    if not tracked_imports:
+        return None
+    imports = ", ".join(
+        alias.name if (alias.asname or alias.name) == alias.name else f"{alias.name} as {alias.asname}"
+        for alias in tracked_imports
+    )
+    return f"from builtins import {imports}\n".encode()
+
+
+def _canonical_builtins_member_import_aliases(statement: bytes, member_names: frozenset[str]) -> list[ast.alias]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+
+    def selected_member_imports(statements: list[ast.stmt]) -> list[ast.alias] | None:
+        member_imports: list[ast.alias] = []
+        for child in statements:
+            if isinstance(child, ast.Pass):
+                continue
+            if isinstance(child, ast.Expr):
+                try:
+                    ast.literal_eval(child.value)
+                except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
+                    return None
+                continue
+            if isinstance(child, ast.If):
+                try:
+                    condition = ast.literal_eval(child.test)
+                except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
+                    return None
+                selected_branch = child.body if bool(condition) else child.orelse
+                nested_imports = selected_member_imports(selected_branch)
+                if nested_imports is None:
+                    return None
+                member_imports.extend(nested_imports)
+                continue
+            if not isinstance(child, ast.ImportFrom) or child.module != "builtins":
+                return None
+            member_imports.extend(alias for alias in child.names if alias.name in member_names)
+        return member_imports
+
+    return selected_member_imports(tree.body) or []
+
+
+def _canonical_builtins_dict_import_aliases(statement: bytes) -> list[ast.alias]:
+    return _canonical_builtins_member_import_aliases(statement, frozenset({"dict"}))
+
+
+def _builtins_dict_import_alias_names(statement: bytes) -> set[str]:
+    return {alias.asname or "dict" for alias in _canonical_builtins_dict_import_aliases(statement)}
+
+
+def _builtins_helper_import_alias_bindings(statement: bytes) -> dict[str, str]:
+    helper_names = frozenset({"getattr", "vars", "setattr", "delattr"})
+    return {
+        alias.asname or alias.name: alias.name
+        for alias in _canonical_builtins_member_import_aliases(statement, helper_names)
+    }
+
+
+def _is_priority_prefix_context_statement(
+    context: bytes,
+    statement: bytes,
+    active_priority_names: set[str] | None = None,
+) -> bool:
+    descriptor_reference = _simple_late_assignment_value_reference(statement)
+    if (
+        active_priority_names
+        and descriptor_reference is not None
+        and descriptor_reference.split(".", maxsplit=1)[0] in active_priority_names
+    ):
+        return True
+    if (
+        active_priority_names
+        and not _python_identifier_names(statement).isdisjoint(active_priority_names)
+        and any(
+            marker in statement
+            for marker in (b"__dict__", b"setattr", b"delattr", b".update", b"__setitem__", b"setdefault")
+        )
+    ):
+        return True
+    aliases = (
+        frozenset(name.encode("utf-8") for name in active_priority_names)
+        if active_priority_names is not None
+        else _priority_import_aliases(context)
+    )
+    if (
+        aliases
+        and _runpy_priority_member_update_key(statement, _python_structural_line_bytes(statement), aliases) is not None
+    ):
+        return True
+    if aliases and _runpy_priority_namespace_update_binding(statement, aliases) is not None:
+        return True
+    if aliases and _runpy_priority_deleted_member_key(statement, aliases) is not None:
+        return True
+    if aliases:
+        if descriptor_reference is not None and (
+            descriptor_reference == "dict"
+            or descriptor_reference.startswith("dict.")
+            or descriptor_reference.endswith(".dict")
+            or descriptor_reference.endswith((".dict.pop", ".dict.__delitem__", ".pop", ".__delitem__"))
+        ):
+            return True
+        alias_names = {alias.decode("utf-8") for alias in aliases}
+        saved_delete_aliases = {
+            match.group(1).decode("utf-8")
+            for match in re.finditer(
+                rb"(?m)^\s*([A-Za-z_]\w*)\s*=\s*(?:(?:builtins\.)?dict|[A-Za-z_]\w*\s*\.\s*__dict__)"
+                rb"\s*\.\s*(?:pop|__delitem__)\b",
+                context,
+            )
+        }
+        for forwarded_alias, forwarded_dependency in re.findall(
+            rb"(?m)^\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*$",
+            context,
+        ):
+            if forwarded_dependency.decode("utf-8") in saved_delete_aliases:
+                saved_delete_aliases.add(forwarded_alias.decode("utf-8"))
+        if _simple_late_assignment_value_reference(statement) in saved_delete_aliases:
+            return True
+        statement_identifiers = _python_identifier_names(statement)
+        if not statement_identifiers.isdisjoint(saved_delete_aliases) and not statement_identifiers.isdisjoint(
+            alias_names
+        ):
+            return True
+        if not statement_identifiers.isdisjoint(alias_names) and any(
+            marker in statement for marker in (b"del ", b".pop", b"__delitem__", b"delattr")
+        ):
+            return True
+    if aliases and (
+        re.match(rb"\s*import\s+builtins(?:\s+as\s+[A-Za-z_]\w*)?(?:\s|$)", statement) is not None
+        or re.match(rb"\s*from\s+builtins\s+import\s+dict(?:\s+as\s+[A-Za-z_]\w*)?(?:\s|$)", statement) is not None
+    ):
+        return True
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(code_str)
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+    if aliases:
+        tracked_builtins_helper_references = {
+            "builtins.getattr",
+            "builtins.vars",
+            "builtins.setattr",
+            "builtins.delattr",
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                targets = [node.target]
+            else:
+                continue
+            if any(_simple_reference_name(target) in tracked_builtins_helper_references for target in targets):
+                return True
+        for target, value in _assignment_targets_and_values_in_tree(tree):
+            if target and _simple_reference_name(value) in tracked_builtins_helper_references:
+                return True
+    if _tree_imports_priority_module(tree):
+        return True
+    return _is_priority_assignment_context(context, statement)
+
+
+def _is_prefix_context_shadow_statement(context: bytes, statement: bytes) -> bool:
+    if not context:
+        return False
+    context_names = _prefix_context_binding_names(context)
+    if not context_names:
+        return False
+    return not _statement_defined_names(statement).isdisjoint(context_names)
+
+
+def _statement_defined_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
+                names.update(_assignment_target_root_names(target))
+    return names
+
+
+def _statement_bound_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
+    return names
+
+
+def _statement_referenced_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+
+def _drop_context_statement_index(context: list[bytes]) -> int:
+    later_references: set[str] = set()
+    for index in range(len(context) - 1, -1, -1):
+        if _is_deferred_annotations_directive(context[index]):
+            continue
+        defined_names = _statement_defined_names(context[index])
+        if defined_names.isdisjoint(later_references):
+            return index
+        later_references.difference_update(defined_names)
+        later_references.update(_statement_referenced_names(context[index]))
+    return len(context)
+
+
+def _prefix_context_binding_names(context: bytes) -> set[str]:
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(context)
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
+    return names
+
+
+def _is_deferred_annotations_directive(statement: bytes) -> bool:
+    return b"__future__" in statement and b"annotations" in statement and _source_defers_annotations(statement)
+
+
+def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dict[int, bytes]:
+    """Return bounded top-level dangerous imports and aliases from a prefix window."""
+    requested_offsets = sorted({offset for offset in offsets if 0 <= offset <= len(data)})
+    if not requested_offsets:
+        return {}
+    contexts: dict[int, bytes] = {}
+    context: list[bytes] = []
+    context_size = 0
+    active_priority_names: set[str] = set()
+    compact_alias_expressions: dict[str, bytes] = {}
+    retained_context_names: set[str] = set()
+    lines = data.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    current_offset = 0
+    for line in lines:
+        line_offsets.append(current_offset)
+        current_offset += len(line)
+
+    index = 0
+    requested_index = 0
+    multiline_quote: bytes | None = None
+
+    def capture_offsets_before(end: int) -> None:
+        nonlocal requested_index
+        snapshot: bytes | None = None
+        while requested_index < len(requested_offsets) and requested_offsets[requested_index] < end:
+            if snapshot is None:
+                snapshot = b"".join(context)
+            contexts[requested_offsets[requested_index]] = snapshot
+            requested_index += 1
+
+    while index < len(lines):
+        capture_offsets_before(line_offsets[index] + len(lines[index]))
+        if requested_index >= len(requested_offsets):
+            return contexts
+        start = _context_statement_start(lines[index])
+        if start is None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            index += 1
+            continue
+        if multiline_quote is not None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            index += 1
+            continue
+
+        statement_line_quote = _multiline_string_state_after_line(lines[index], None)
+        statement_lines = [lines[index][start:]]
+        paren_depth = _line_parenthesis_delta(statement_lines[0])
+        while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
+            index += 1
+            capture_offsets_before(line_offsets[index] + len(lines[index]))
+            continuation = lines[index]
+            statement_lines.append(continuation)
+            paren_depth += _line_parenthesis_delta(continuation)
+        if re.match(rb"\s*if\s+[^:\n]+\s*:\s*$", statement_lines[0]) is not None:
+            while index + 1 < len(lines) and lines[index + 1][:1].isspace():
+                index += 1
+                statement_lines.append(lines[index])
+
+        statement = b"".join(statement_lines).rstrip() + b"\n"
+        statement = _compact_tracked_builtins_import_statement(statement) or statement
+        preserves_deferred_annotations = _is_deferred_annotations_directive(statement) and _source_defers_annotations(
+            b"".join(lines[: index + 1])
+        )
+        compact_forward = _simple_forwarded_alias_assignment(statement)
+        compact_priority_statement = False
+        if compact_forward is not None:
+            target_name, dependency_name, expression = compact_forward
+            retained_expression = compact_alias_expressions.get(dependency_name)
+            if retained_expression is None and dependency_name == "builtins":
+                retained_expression = b"builtins"
+            if retained_expression is None and (
+                dependency_name in active_priority_names
+                or dependency_name in DANGEROUS_BUILTINS
+                or dependency_name in _BUILTINS_MODULE_NAMES
+            ):
+                retained_expression = expression
+            if retained_expression is not None:
+                statement = target_name.encode("utf-8") + b" = " + retained_expression + b"\n"
+                compact_alias_expressions[target_name] = retained_expression
+                compact_priority_statement = True
+            elif (
+                dependency_name not in DANGEROUS_BUILTINS
+                and dependency_name not in _BUILTINS_MODULE_NAMES
+                and dependency_name not in retained_context_names
+                and target_name not in retained_context_names
+            ):
+                multiline_quote = statement_line_quote
+                index += 1
+                continue
+        else:
+            binding_name = _simple_late_binding_name(_python_structural_line_bytes(statement))
+            if binding_name is not None:
+                compact_alias_expressions.pop(binding_name, None)
+
+        current_context = b"".join(context)
+        if (
+            not compact_priority_statement
+            and not preserves_deferred_annotations
+            and not _is_priority_prefix_context_statement(current_context, statement, active_priority_names)
+            and not _is_prefix_context_shadow_statement(current_context, statement)
+        ):
+            multiline_quote = statement_line_quote
+            index += 1
+            continue
+        if len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            index += 1
+            continue
+        while context and context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            drop_index = (
+                next(
+                    (
+                        context_index
+                        for context_index, context_statement in enumerate(context)
+                        if _simple_forwarded_alias_assignment(context_statement) is not None
+                    ),
+                    len(context),
+                )
+                if compact_priority_statement
+                else _drop_context_statement_index([*context, statement])
+            )
+            if drop_index >= len(context):
+                break
+            context_size -= len(context.pop(drop_index))
+        context.append(statement)
+        context_size += len(statement)
+        if compact_priority_statement:
+            defined_names = {target_name}
+            bound_names = defined_names
+            priority_aliases: set[str] = set()
+        else:
+            defined_names = _statement_defined_names(statement)
+            bound_names = _statement_bound_names(statement)
+            priority_aliases = (
+                {alias.decode("utf-8") for alias in _priority_import_aliases(statement)}
+                if re.match(rb"\s*(?:import|from)\b", statement) is not None
+                else set()
+            )
+        active_priority_names.difference_update(bound_names - priority_aliases)
+        active_priority_names.update(priority_aliases)
+        retained_context_names.update(defined_names)
+        index += 1
+
+    final_context = b"".join(context)
+    for offset in requested_offsets[requested_index:]:
+        contexts[offset] = final_context
+    return contexts
+
+
+def _extract_priority_prefix_context(data: bytes) -> bytes:
+    """Return bounded top-level dangerous imports and aliases from a prefix window."""
+    return _priority_prefix_contexts_at_offsets(data, [len(data)]).get(len(data), b"")
+
+
+def _append_single_window_prefix_context_windows(
+    extraction_windows: list[tuple[bytes, bool]],
+    bounded: bytes,
+) -> None:
+    if not any(marker in bounded for marker in _BUILTIN_ALIAS_CONTEXT_MARKERS):
+        return
+    starts = [
+        match.start()
+        for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)
+        if match.start() > 0 and not _is_redundant_forwarding_source_start(bounded, match.start())
+    ]
+    # The base extraction window already covers the first default candidates.
+    # Add contextual windows only for late candidates that need prefix state.
+    selected_starts = _deduplicated_context_starts(
+        bounded,
+        starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+    )
+    selected_starts = list(dict.fromkeys(selected_starts))
+    contexts = _priority_prefix_contexts_at_offsets(bounded, selected_starts)
+    for start in selected_starts:
+        context = contexts.get(start, b"")
+        if context:
+            extraction_windows.append((context + b"\n" + bounded[start:], True))
+
+
+def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    windows = _embedded_python_scan_windows(data)
+    if len(windows) == 1:
+        extraction_windows = [(windows[0], False), *_contextual_priority_framed_windows(windows[0])]
+        _append_single_window_prefix_context_windows(extraction_windows, windows[0])
+        return extraction_windows
+
+    prefix, tail = windows
+    extraction_windows = [(prefix, False), *_contextual_priority_framed_windows(prefix), (tail, False)]
+    tail_start = len(data) - len(tail)
+    contextual_tail_offset = tail.find(b"\n") + 1
+    if contextual_tail_offset == 0:
+        contextual_tail_offset = len(tail)
+    contextual_tail = tail[contextual_tail_offset:]
+    prefix_context_end = min(len(prefix), tail_start + contextual_tail_offset)
+    import_context = _extract_priority_prefix_context(data[:prefix_context_end])
+    if import_context:
+        contextual_source = import_context + b"\n" + contextual_tail
+        extraction_windows.append((contextual_source, True))
+        if len(contextual_source) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
+            extraction_windows.extend(_contextual_priority_framed_windows(contextual_source))
+        tail_starts = [
+            match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(contextual_tail) if match.start() > 0
+        ]
+        context_aliases = _priority_import_aliases(import_context)
+        priority_tail_start_values, proved_rule_codes = _tail_starts_for_priority_alias_uses(
+            contextual_tail,
+            tail_starts,
+            context_aliases,
+            deferred_annotations=(
+                b"__future__" in import_context
+                and b"annotations" in import_context
+                and _source_defers_annotations(import_context)
+            ),
+        )
+        priority_tail_starts = set(priority_tail_start_values)
+        for priority_offset in _priority_import_offsets(contextual_tail):
+            insertion_index = bisect_right(tail_starts, priority_offset)
+            if insertion_index:
+                priority_tail_starts.add(tail_starts[insertion_index - 1])
+        tail_starts = [
+            start
+            for start in tail_starts
+            if start in priority_tail_starts or not _is_redundant_forwarding_source_start(contextual_tail, start)
+        ]
+        priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
+        default_tail_starts = [] if len(contextual_tail) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES else tail_starts
+        selected_starts = _deduplicated_context_starts(
+            contextual_tail,
+            sorted(
+                set(default_tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS])
+                | set(priority_tail_start_list)
+                | set(tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:])
+            ),
+        )
+        selected_starts = list(dict.fromkeys(selected_starts))
+        contextual_tail_base = len(import_context) + 1
+        selected_contexts = _priority_prefix_contexts_at_offsets(
+            contextual_source,
+            [contextual_tail_base + start for start in selected_starts],
+        )
+        targeted_contextual_windows = [
+            (
+                selected_contexts.get(contextual_tail_base + start, import_context) + b"\n" + contextual_tail[start:],
+                True,
+            )
+            for start in selected_starts
+        ]
+        if proved_rule_codes and targeted_contextual_windows:
+            proof_suffix = b"".join(
+                _PROVEN_HIGH_RISK_CALL_PROBES[rule_code][1]
+                for rule_code in sorted(proved_rule_codes)
+                if rule_code in _PROVEN_HIGH_RISK_CALL_PROBES
+            )
+            proof_window, include_full_source = targeted_contextual_windows[0]
+            targeted_contextual_windows[0] = (proof_window + proof_suffix, include_full_source)
+        contextual_windows = [] if proved_rule_codes else _contextual_priority_framed_windows(contextual_source)
+        fallback_contextual_windows = [] if proved_rule_codes else [*contextual_windows, (contextual_source, True)]
+        extraction_windows[0:0] = [*targeted_contextual_windows, *fallback_contextual_windows]
+    return extraction_windows
+
+
+def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    first_line_end = data.find(b"\n")
+    if first_line_end < 0 or not any(marker in data[first_line_end + 1 :] for marker in (b"\x00", b"\xff")):
+        return []
+    if b"import" not in data or not _priority_import_offsets(data):
+        return []
+    potential_framed_calls: list[tuple[int, bytes, bytes]] = []
+    offset = 0
+    multiline_quote: bytes | None = None
+    for line in data.splitlines(keepends=True):
+        code_start = 0
+        while code_start < len(line) and not 0x20 <= line[code_start] < 0x7F:
+            code_start += 1
+        structural_line = _python_structural_line_bytes(line[code_start:])
+        if (
+            multiline_quote is None
+            and code_start
+            and (
+                b"(" in structural_line
+                or b"=" in structural_line
+                or structural_line.rstrip().endswith(b"\\")
+                or re.match(rb"\s*(?:if|elif|else)\b", structural_line) is not None
+            )
+        ):
+            potential_framed_calls.append((offset + code_start, line[code_start:], structural_line))
+        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        offset += len(line)
+    if not potential_framed_calls:
+        return []
+    full_context = _extract_priority_prefix_context(data)
+    aliases = _priority_import_aliases(full_context)
+    if not aliases:
+        return []
+    framed_call_starts = [
+        start
+        for start, raw_line, structural_line in potential_framed_calls
+        if (
+            _line_calls_priority_alias(structural_line, aliases)
+            or _line_calls_priority_getattr_alias(raw_line, aliases)
+            or _line_is_continued_priority_alias_piece(structural_line, aliases)
+            or _line_starts_continued_priority_getattr(structural_line)
+            or _line_parenthesis_delta(structural_line) > 0
+            or _runpy_priority_namespace_update_binding(raw_line, aliases) is not None
+            or _runpy_priority_member_update_key(raw_line, structural_line, aliases) is not None
+            or (
+                _simple_late_binding_name(structural_line) is not None
+                and not _python_identifier_names(raw_line).isdisjoint({alias.decode("utf-8") for alias in aliases})
+            )
+            or re.match(rb"\s*(?:if|elif|else)\b", structural_line) is not None
+        )
+    ]
+    priority_starts = _bounded_priority_tail_starts(framed_call_starts)
+    contextual_windows: list[tuple[bytes, bool]] = []
+    for start in dict.fromkeys(priority_starts):
+        import_context = _extract_priority_prefix_context(data[:start])
+        if import_context:
+            contextual_windows.append((import_context + b"\n" + data[start:], True))
+    return contextual_windows
+
+
+def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
+    if len(tail_starts) <= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+        return tail_starts
+    head_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS // 2
+    tail_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS - head_count
+    return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
+
+
+def _deduplicated_context_starts(data: bytes, starts: list[int]) -> list[int]:
+    selected: list[int] = []
+    for start in dict.fromkeys(starts):
+        if selected and start - selected[-1] <= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+            intervening = data[selected[-1] : start]
+            if b"\x00" not in intervening and b"\xff" not in intervening:
+                continue
+        selected.append(start)
+    return selected
+
+
+def _embedded_python_analysis_incomplete_finding(
+    *,
+    framework: str,
+    context: str,
+    reason: str,
+    message: str,
+    max_scan_bytes: int | None = None,
+    omitted_snippets: int | None = None,
+    candidates_count: int | None = None,
+) -> "JITScriptFinding":
+    details: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "reason": reason,
+    }
+    if max_scan_bytes is not None:
+        details["max_scan_bytes"] = max_scan_bytes
+    if omitted_snippets is not None:
+        details["omitted_snippets"] = omitted_snippets
+    if candidates_count is not None:
+        details["candidate_snippets"] = candidates_count
+
+    return create_jit_finding(
+        message=message,
+        severity="INFO",
+        context=context,
+        pattern=None,
+        recommendation="Treat JIT/embedded Python coverage as inconclusive and review the model source.",
+        confidence=1.0,
+        details=details,
+        framework=framework,
+        code_snippet=None,
+        type="analysis_incomplete",
+        operation=None,
+        builtin=None,
+        import_=None,
+    )
+
+
+def _tail_starts_for_priority_alias_uses(
+    tail: bytes,
+    tail_starts: list[int],
+    aliases: frozenset[bytes],
+    *,
+    deferred_annotations: bool = False,
+) -> tuple[list[int], frozenset[str]]:
+    selected_starts: list[int] = []
+    if not tail_starts or not aliases:
+        return selected_starts, frozenset()
+    usage_lines, proved_rule_codes = _priority_alias_usage_lines(
+        tail,
+        aliases,
+        min(len(tail), _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES),
+        deferred_annotations=deferred_annotations,
+    )
+    for usage_start, _usage_end in usage_lines:
+        start_index = bisect_right(tail_starts, usage_start) - 1
+        if start_index >= 0:
+            selected_starts.append(tail_starts[start_index])
+    return selected_starts, proved_rule_codes
+
+
+def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
+    """Return whether any raw regex hit sits outside AST-validated source."""
+    for raw_start, raw_end in raw_spans:
+        if not any(parsed_start <= raw_start and raw_end <= parsed_end for parsed_start, parsed_end in parsed_spans):
+            return True
+    return False
+
+
+def _parsed_real_spans(
+    real_ranges: tuple[tuple[int, int], ...],
+    parsed_byte_length: int,
+    compact_length: int,
+) -> list[tuple[int, int]]:
+    if parsed_byte_length >= compact_length:
+        return list(real_ranges)
+
+    remaining = parsed_byte_length
+    parsed_spans: list[tuple[int, int]] = []
+    for start, end in real_ranges:
+        if remaining <= 0:
+            break
+        segment_length = end - start
+        consumed = min(segment_length, remaining)
+        if consumed > 0:
+            parsed_spans.append((start, start + consumed))
+            remaining -= consumed
+        if remaining > 0:
+            remaining -= 1
+    return parsed_spans
+
+
+def _compact_snippet_mutates_module_name(
+    tree: ast.Module,
+    target_name: str,
+    *,
+    evaluate_annotations: bool = True,
+) -> bool:
+    namespace_helper_aliases = {"globals", "locals"}
+    dict_descriptor_aliases = {"dict"}
+    module_mapping_aliases: set[str] = set()
+    module_mapping_update_aliases: set[str] = set()
+    module_mapping_setitem_aliases: set[str] = set()
+
+    def is_module_mapping(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id in module_mapping_aliases) or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in namespace_helper_aliases
+            and not node.args
+            and not node.keywords
+        )
+
+    def static_target_key(node: ast.AST) -> bool:
+        return _static_getattr_member_name(node) == target_name
+
+    def update_writes_target(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
+        if any(keyword.arg == target_name for keyword in keywords):
+            return True
+        if any(
+            isinstance(argument, ast.Dict) and any(key is not None and static_target_key(key) for key in argument.keys)
+            for argument in arguments
+        ):
+            return True
+        return any(
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Dict)
+            and any(key is not None and static_target_key(key) for key in keyword.value.keys)
+            for keyword in keywords
+        )
+
+    def call_writes_print(call: ast.Call) -> bool:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and is_module_mapping(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name):
+            if call.func.id in module_mapping_update_aliases:
+                method = "update"
+            elif call.func.id in module_mapping_setitem_aliases:
+                method = "__setitem__"
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in dict_descriptor_aliases
+            and call.args
+            and is_module_mapping(call.args[0])
+        ):
+            method = call.func.attr
+            arguments = call.args[1:]
+        if method == "update":
+            return update_writes_target(arguments, call.keywords)
+        return method in {"__setitem__", "setdefault"} and bool(arguments) and static_target_key(arguments[0])
+
+    def target_writes_print(target: ast.AST) -> bool:
+        return isinstance(target, ast.Subscript) and is_module_mapping(target.value) and static_target_key(target.slice)
+
+    def clear_alias(name: str) -> None:
+        namespace_helper_aliases.discard(name)
+        dict_descriptor_aliases.discard(name)
+        module_mapping_aliases.discard(name)
+        module_mapping_update_aliases.discard(name)
+        module_mapping_setitem_aliases.discard(name)
+
+    def bind_alias(name: str, value: ast.AST | None) -> None:
+        helper_reference = _simple_reference_name(value) if value is not None else None
+        mapping_value = value is not None and is_module_mapping(value)
+        update_value = isinstance(value, ast.Attribute) and value.attr == "update" and is_module_mapping(value.value)
+        setitem_value = (
+            isinstance(value, ast.Attribute)
+            and value.attr in {"__setitem__", "setdefault"}
+            and is_module_mapping(value.value)
+        )
+        clear_alias(name)
+        if helper_reference in namespace_helper_aliases:
+            namespace_helper_aliases.add(name)
+        elif helper_reference in dict_descriptor_aliases:
+            dict_descriptor_aliases.add(name)
+        elif mapping_value:
+            module_mapping_aliases.add(name)
+        elif update_value:
+            module_mapping_update_aliases.add(name)
+        elif setitem_value:
+            module_mapping_setitem_aliases.add(name)
+
+    def state_snapshot() -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+        return (
+            set(namespace_helper_aliases),
+            set(dict_descriptor_aliases),
+            set(module_mapping_aliases),
+            set(module_mapping_update_aliases),
+            set(module_mapping_setitem_aliases),
+        )
+
+    def restore_state(state: tuple[set[str], set[str], set[str], set[str], set[str]]) -> None:
+        for current, saved in zip(
+            (
+                namespace_helper_aliases,
+                dict_descriptor_aliases,
+                module_mapping_aliases,
+                module_mapping_update_aliases,
+                module_mapping_setitem_aliases,
+            ),
+            state,
+            strict=True,
+        ):
+            current.clear()
+            current.update(saved)
+
+    def scan_statements(statements: Sequence[ast.stmt]) -> bool:
+        for statement in statements:
+            targets: Sequence[ast.AST] = []
+            value: ast.AST | None = None
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+                value = statement.value
+            elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+                targets = [statement.target]
+                value = statement.value
+            if any(target_writes_print(target) for target in targets):
+                return True
+            for expression in _deterministically_evaluated_statement_expressions(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            ):
+                if any(call_writes_print(call) for call in _deterministically_executed_expression_calls(expression)):
+                    return True
+            if isinstance(statement, ast.If) and _static_late_truth_value(statement.test) is None:
+                initial_state = state_snapshot()
+                branch_states: list[tuple[set[str], set[str], set[str], set[str], set[str]]] = []
+                for branch in (statement.body, statement.orelse):
+                    restore_state(initial_state)
+                    if scan_statements(_compact_deterministically_executed_statements(branch)):
+                        return True
+                    branch_states.append(state_snapshot())
+                restore_state(
+                    (
+                        set().union(*(state[0] for state in branch_states)),
+                        set().union(*(state[1] for state in branch_states)),
+                        set().union(*(state[2] for state in branch_states)),
+                        set().union(*(state[3] for state in branch_states)),
+                        set().union(*(state[4] for state in branch_states)),
+                    )
+                )
+                continue
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                bind_alias(targets[0].id, value)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                clear_alias(statement.name)
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    clear_alias(alias.asname or alias.name.split(".", maxsplit=1)[0])
+        return False
+
+    return scan_statements(_compact_deterministically_executed_statements(tree.body))
+
+
+def _compact_module_scope_context(tree: ast.Module) -> tuple[dict[ast.AST, ast.AST], set[int]]:
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    executed_statement_ids = {id(statement) for statement in _compact_deterministically_executed_statements(tree.body)}
+    return parents, executed_statement_ids
+
+
+def _is_conditionally_evaluated_expression(
+    node: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+) -> bool:
+    current = node
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, ast.BoolOp):
+            branch = current
+            while branch not in parent.values and branch in parents:
+                branch = parents[branch]
+            if branch in parent.values:
+                index = parent.values.index(branch)
+                preceding = parent.values[:index]
+                if isinstance(parent.op, ast.And):
+                    if any(_static_late_truth_value(value) is not True for value in preceding):
+                        return True
+                elif any(_static_late_truth_value(value) is not False for value in preceding):
+                    return True
+        elif isinstance(parent, ast.IfExp) and _static_late_truth_value(parent.test) is None:
+            if current is not parent.test:
+                return True
+        elif isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp)):
+            first_iter = parent.generators[0].iter
+            if node is first_iter or node in ast.walk(first_iter):
+                current = parent
+                continue
+            definitely_reached = True
+            for generator in parent.generators:
+                if node is generator.iter or node in ast.walk(generator.iter):
+                    return not definitely_reached
+                definitely_reached = definitely_reached and _static_late_iter_truth(generator.iter) is True
+                for condition in generator.ifs:
+                    if node is condition or node in ast.walk(condition):
+                        return not definitely_reached
+                    definitely_reached = definitely_reached and _static_late_truth_value(condition) is True
+            if not definitely_reached:
+                return True
+        elif isinstance(parent, ast.GeneratorExp):
+            first_iter = parent.generators[0].iter
+            if node is not first_iter and node not in ast.walk(first_iter):
+                return True
+        current = parent
+    return False
+
+
+def _update_compact_runpy_aliases(
+    statement: ast.stmt,
+    runpy_aliases: set[str],
+    *,
+    for_suppression: bool = False,
+) -> None:
+    def clear_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            runpy_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_target(element)
+
+    def bind_target(target: ast.AST, value: ast.AST, aliases_before: frozenset[str]) -> None:
+        if isinstance(target, ast.Name):
+            source_is_alias = isinstance(value, ast.Name) and value.id in aliases_before
+            runpy_aliases.discard(target.id)
+            if source_is_alias:
+                runpy_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_target(target_item, value_item, aliases_before)
+            else:
+                clear_target(target)
+
+    aliases_before = frozenset(runpy_aliases)
+    condition_is_unknown = not isinstance(statement, ast.If) or _static_late_truth_value(statement.test) is None
+    if (
+        for_suppression
+        and condition_is_unknown
+        and isinstance(statement, (ast.If, ast.Try, ast.Match, ast.While, ast.For, ast.AsyncFor))
+    ):
+
+        class PossibleBindingVisitor(ast.NodeVisitor):
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, ast.Store):
+                    runpy_aliases.discard(node.id)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                runpy_aliases.discard(node.name)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                runpy_aliases.discard(node.name)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                runpy_aliases.discard(node.name)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        PossibleBindingVisitor().visit(statement)
+        return
+    if isinstance(statement, ast.Import):
+        for alias in statement.names:
+            local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            runpy_aliases.discard(local_name)
+            if alias.name == "runpy":
+                runpy_aliases.add(local_name)
+    elif isinstance(statement, ast.ImportFrom):
+        for alias in statement.names:
+            clear_target(ast.Name(id=alias.asname or alias.name))
+    elif isinstance(statement, ast.Assign):
+        for target in statement.targets:
+            bind_target(target, statement.value, aliases_before)
+    elif isinstance(statement, ast.AnnAssign):
+        if statement.value is not None:
+            bind_target(statement.target, statement.value, aliases_before)
+    elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+        clear_target(statement.target)
+    elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        runpy_aliases.discard(statement.name)
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        for item in statement.items:
+            if item.optional_vars is not None:
+                clear_target(item.optional_vars)
+    elif isinstance(statement, ast.Delete):
+        for target in statement.targets:
+            clear_target(target)
+    for node in ast.walk(statement):
+        if not isinstance(node, ast.NamedExpr):
+            continue
+        clear_target(node.target)
+        if not for_suppression and isinstance(node.value, ast.Name) and node.value.id in aliases_before:
+            runpy_aliases.add(node.target.id)
+
+
+def _is_compact_module_scope_node(
+    node: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+    executed_statement_ids: set[int],
+) -> bool:
+    statement = node if isinstance(node, ast.stmt) else None
+    current = node
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False
+        if statement is None and isinstance(parent, ast.stmt):
+            statement = parent
+        current = parent
+    return statement is not None and id(statement) in executed_statement_ids
+
+
+def _compact_builtins_mutation_alias_state(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
+    builtins_aliases = {"builtins", "__builtins__"}
+    vars_helper_aliases = {"vars", "builtins.vars", "__builtins__.vars"}
+    dict_descriptor_aliases = {"dict", "builtins.dict", "__builtins__.dict"}
+    mapping_aliases = {"__builtins__"}
+    mapping_update_aliases: set[str] = set()
+    mapping_setitem_aliases: set[str] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_aliases
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in vars_helper_aliases
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_aliases
+            )
+        )
+
+    def clear_name(name: str) -> None:
+        builtins_aliases.discard(name)
+        vars_helper_aliases.difference_update({name, f"{name}.vars"})
+        dict_descriptor_aliases.difference_update({name, f"{name}.dict"})
+        mapping_aliases.discard(name)
+        mapping_update_aliases.discard(name)
+        mapping_setitem_aliases.discard(name)
+
+    def bind_name(name: str, value: ast.AST) -> None:
+        reference = _simple_reference_name(value)
+        aliases_builtins = reference in builtins_aliases
+        aliases_vars = reference in vars_helper_aliases
+        aliases_dict = reference in dict_descriptor_aliases
+        aliases_mapping = is_builtins_mapping(value)
+        aliases_update = (
+            isinstance(value, ast.Attribute) and value.attr == "update" and is_builtins_mapping(value.value)
+        )
+        aliases_setitem = (
+            isinstance(value, ast.Attribute)
+            and value.attr in {"__setitem__", "setdefault"}
+            and is_builtins_mapping(value.value)
+        )
+        clear_name(name)
+        if aliases_builtins:
+            builtins_aliases.add(name)
+            vars_helper_aliases.add(f"{name}.vars")
+            dict_descriptor_aliases.add(f"{name}.dict")
+        if aliases_vars:
+            vars_helper_aliases.add(name)
+        if aliases_dict:
+            dict_descriptor_aliases.add(name)
+        if aliases_mapping:
+            mapping_aliases.add(name)
+        if aliases_update:
+            mapping_update_aliases.add(name)
+        if aliases_setitem:
+            mapping_setitem_aliases.add(name)
+
+    def bind_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            bind_name(target.id, value)
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_target(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                clear_name(target_name)
+
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                clear_name(local_name)
+                if alias.name == "builtins":
+                    builtins_aliases.add(local_name)
+                    vars_helper_aliases.add(f"{local_name}.vars")
+                    dict_descriptor_aliases.add(f"{local_name}.dict")
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                clear_name(alias.asname or alias.name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_target(target, statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_target(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    clear_name(target_name)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            clear_name(statement.name)
+    return (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    )
+
+
+def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = None) -> bool:
+    if tree is None:
+        try:
+            tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+        except (RecursionError, SyntaxError, ValueError):
+            return True
+    if not isinstance(tree, ast.Module) or _compact_snippet_mutates_module_name(
+        tree,
+        "print",
+        evaluate_annotations=not _source_defers_annotations(code_str.encode("utf-8")),
+    ):
+        return True
+    (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    ) = _compact_builtins_mutation_alias_state(tree)
+    if "print" in _late_mutated_truthy_builtin_names(
+        code_str.encode("utf-8"),
+        builtins_aliases,
+        set(),
+        builtin_dict_mapping_aliases=mapping_aliases,
+        builtin_dict_descriptor_aliases=dict_descriptor_aliases,
+        builtin_dict_mapping_update_aliases=mapping_update_aliases,
+        builtin_dict_mapping_setitem_aliases=mapping_setitem_aliases,
+        canonical_builtin_helper_aliases=dict.fromkeys(vars_helper_aliases, "vars"),
+    ):
+        return True
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    for node in ast.walk(tree):
+        if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
+            return True
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in node.names
+        ):
+            return True
+    return False
+
+
+def _compact_snippet_shadowed_print_statement_ids(statements: Sequence[ast.stmt]) -> set[int]:
+    """Return statements at or after the first deterministic module-scope print mutation."""
+    if not statements:
+        return set()
+    tree = ast.Module(body=list(statements), type_ignores=[])
+    source = ast.unparse(tree)
+    if not _compact_snippet_has_shadowed_print(source, tree):
+        return set()
+
+    first_shadow_index = 0
+    last_unshadowed_index = len(statements) - 1
+    while first_shadow_index < last_unshadowed_index:
+        candidate_index = (first_shadow_index + last_unshadowed_index) // 2
+        prefix_tree = ast.Module(body=list(statements[: candidate_index + 1]), type_ignores=[])
+        if _compact_snippet_has_shadowed_print(ast.unparse(prefix_tree), prefix_tree):
+            last_unshadowed_index = candidate_index
+        else:
+            first_shadow_index = candidate_index + 1
+    return {id(statement) for statement in statements[first_shadow_index:]}
+
+
+def _compact_statement_print_shadow_transition(
+    statement: ast.stmt,
+    builtins_aliases: Collection[str],
+) -> bool | None:
+    """Return the direct module-scope print shadow state after a statement."""
+
+    def writes_print(target: ast.AST) -> bool:
+        return "print" in _assignment_target_names(target)
+
+    def is_builtin_print(value: ast.AST | None) -> bool:
+        if value is None:
+            return False
+        reference = _simple_reference_name(value)
+        return bool(
+            reference is not None
+            and reference.endswith(".print")
+            and reference.removesuffix(".print") in builtins_aliases
+        )
+
+    if isinstance(statement, ast.Assign) and any(writes_print(target) for target in statement.targets):
+        return not is_builtin_print(statement.value)
+    if isinstance(statement, ast.AnnAssign) and writes_print(statement.target):
+        return statement.value is None or not is_builtin_print(statement.value)
+    if isinstance(statement, ast.AugAssign) and writes_print(statement.target):
+        return True
+    if isinstance(statement, ast.Delete) and any(writes_print(target) for target in statement.targets):
+        return False
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == "print":
+        return True
+    if isinstance(statement, ast.Import) and any(
+        (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "print" for alias in statement.names
+    ):
+        return True
+    if isinstance(statement, ast.ImportFrom):
+        for alias in statement.names:
+            if (alias.asname or alias.name) != "print":
+                continue
+            return statement.module not in builtins_aliases
+    return None
+
+
+def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
+    if not isinstance(tree, ast.Module):
+        return {"setattr", "builtins.setattr", "__builtins__.setattr"}
+    local_setattr_shadowed = _compact_snippet_mutates_module_name(
+        tree,
+        "setattr",
+        evaluate_annotations=not any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(alias.name == "annotations" for alias in statement.names)
+            for statement in tree.body
+        ),
+    )
+    builtins_setattr_shadowed = False
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    (
+        builtins_aliases,
+        vars_helper_aliases,
+        dict_descriptor_aliases,
+        mapping_aliases,
+        mapping_update_aliases,
+        mapping_setitem_aliases,
+    ) = _compact_builtins_mutation_alias_state(tree)
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_aliases
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in vars_helper_aliases
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_aliases
+            )
+        )
+
+    def update_writes_setattr(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
+        if any(keyword.arg == "setattr" for keyword in keywords):
+            return True
+        if any(
+            isinstance(argument, ast.Dict)
+            and any(key is not None and _static_getattr_member_name(key) == "setattr" for key in argument.keys)
+            for argument in arguments
+        ):
+            return True
+        return any(
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Dict)
+            and any(key is not None and _static_getattr_member_name(key) == "setattr" for key in keyword.value.keys)
+            for keyword in keywords
+        )
+
+    def call_writes_setattr(call: ast.Call) -> bool:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and is_builtins_mapping(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name) and call.func.id in mapping_update_aliases:
+            method = "update"
+        elif isinstance(call.func, ast.Name) and call.func.id in mapping_setitem_aliases:
+            method = "__setitem__"
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and _simple_reference_name(call.func.value) in dict_descriptor_aliases
+            and call.args
+            and is_builtins_mapping(call.args[0])
+        ):
+            method = call.func.attr
+            arguments = call.args[1:]
+        if method == "update":
+            return update_writes_setattr(arguments, call.keywords)
+        return (
+            method in {"__setitem__", "setdefault"}
+            and bool(arguments)
+            and _static_getattr_member_name(arguments[0]) == "setattr"
+        )
+
+    for node in ast.walk(tree):
+        if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
+            continue
+        if isinstance(node, ast.Call) and call_writes_setattr(node):
+            builtins_setattr_shadowed = True
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "setattr":
+            local_setattr_shadowed = True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "setattr":
+            local_setattr_shadowed = True
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name.split(".", maxsplit=1)[0]) == "setattr" for alias in node.names
+        ):
+            local_setattr_shadowed = True
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and node.attr == "setattr"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in builtins_aliases
+        ):
+            builtins_setattr_shadowed = True
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and _static_getattr_member_name(node.slice) == "setattr"
+            and (
+                (isinstance(node.value, ast.Name) and node.value.id == "__builtins__")
+                or (
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "__dict__"
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id in builtins_aliases
+                )
+            )
+        ):
+            builtins_setattr_shadowed = True
+    shadowed_references: set[str] = set()
+    if local_setattr_shadowed or builtins_setattr_shadowed:
+        shadowed_references.add("setattr")
+    if builtins_setattr_shadowed:
+        shadowed_references.update({"builtins.setattr", "__builtins__.setattr"})
+    if "builtins" not in builtins_aliases:
+        shadowed_references.add("builtins.setattr")
+    if "__builtins__" not in builtins_aliases:
+        shadowed_references.add("__builtins__.setattr")
+    return shadowed_references
+
+
+def _compact_snippet_shadowed_setattr_references_by_statement(
+    statements: Sequence[ast.stmt],
+) -> dict[int, set[str]]:
+    relevant_references = {"setattr", "builtins.setattr", "__builtins__.setattr"}
+    shadowed_by_statement: dict[int, set[str]] = {}
+    for index, statement in enumerate(statements):
+        if not any(
+            isinstance(node, ast.Call) and _simple_reference_name(node.func) in relevant_references
+            for node in ast.walk(statement)
+        ):
+            continue
+        prefix_tree = ast.Module(body=list(statements[: index + 1]), type_ignores=[])
+        shadowed_by_statement[id(statement)] = _compact_snippet_shadowed_setattr_references(prefix_tree)
+    return shadowed_by_statement
+
+
+def _compact_snippet_shadowed_delattr_references_by_statement(
+    statements: Sequence[ast.stmt],
+) -> dict[int, set[str]]:
+    relevant_references = {"delattr", "builtins.delattr", "__builtins__.delattr"}
+    shadowed_by_statement: dict[int, set[str]] = {}
+    for index, statement in enumerate(statements):
+        if not any(
+            isinstance(node, ast.Call) and _simple_reference_name(node.func) in relevant_references
+            for node in ast.walk(statement)
+        ):
+            continue
+        prefix_tree = ast.Module(body=list(statements[: index + 1]), type_ignores=[])
+        source = ast.unparse(prefix_tree)
+        parents, executed_statement_ids = _compact_module_scope_context(prefix_tree)
+        local_shadowed = _compact_snippet_mutates_module_name(
+            prefix_tree,
+            "delattr",
+            evaluate_annotations=not _source_defers_annotations(source.encode("utf-8")),
+        ) or any(
+            _is_compact_module_scope_node(node, parents, executed_statement_ids)
+            and (
+                (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "delattr")
+                or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "delattr")
+                or (
+                    isinstance(node, (ast.Import, ast.ImportFrom))
+                    and any((alias.asname or alias.name.split(".", maxsplit=1)[0]) == "delattr" for alias in node.names)
+                )
+            )
+            for node in ast.walk(prefix_tree)
+        )
+        (
+            builtins_aliases,
+            vars_helper_aliases,
+            dict_descriptor_aliases,
+            mapping_aliases,
+            mapping_update_aliases,
+            mapping_setitem_aliases,
+        ) = _compact_builtins_mutation_alias_state(prefix_tree)
+        builtins_shadowed = "delattr" in _late_mutated_truthy_builtin_names(
+            source.encode("utf-8"),
+            builtins_aliases,
+            set(),
+            builtin_dict_mapping_aliases=mapping_aliases,
+            builtin_dict_descriptor_aliases=dict_descriptor_aliases,
+            builtin_dict_mapping_update_aliases=mapping_update_aliases,
+            builtin_dict_mapping_setitem_aliases=mapping_setitem_aliases,
+            canonical_builtin_helper_aliases=dict.fromkeys(vars_helper_aliases, "vars"),
+        )
+        shadowed_references: set[str] = set()
+        if local_shadowed or builtins_shadowed:
+            shadowed_references.add("delattr")
+        if builtins_shadowed:
+            shadowed_references.update({"builtins.delattr", "__builtins__.delattr"})
+        shadowed_by_statement[id(statement)] = shadowed_references
+    return shadowed_by_statement
+
+
+def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
+    return bool(_compact_snippet_shadowed_setattr_references(tree))
+
+
+def _compact_snippet_deleted_print_setdefault_members(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[str]:
+    if "setdefault" not in code_str or "print" not in code_str:
+        return set()
+    source = textwrap.dedent(code_str.lstrip("\x00"))
+    try:
+        tree = ast.parse(source)
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    mapping_aliases: set[str] = set()
+    descriptor_aliases: dict[str, str] = {}
+    bound_method_aliases: dict[str, str] = {}
+    deleted_members: set[str] = set()
+    safe_members: set[str] = set()
+    local_dict_shadowed = False
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
+
+    def mapping_targets_runpy(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in runpy_aliases
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _simple_reference_name(node.func) in {"vars", "builtins.vars"}
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in runpy_aliases
+            )
+        )
+
+    def record_call(call: ast.Call) -> None:
+        method: str | None = None
+        arguments = call.args
+        if isinstance(call.func, ast.Attribute) and mapping_targets_runpy(call.func.value):
+            method = call.func.attr
+        elif isinstance(call.func, ast.Name) and call.func.id in bound_method_aliases:
+            method = bound_method_aliases[call.func.id]
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "dict"
+            and not local_dict_shadowed
+            and call.args
+            and mapping_targets_runpy(call.args[0])
+        ):
+            method = call.func.attr
+            arguments = call.args[1:]
+        elif (
+            isinstance(call.func, ast.Name)
+            and call.func.id in descriptor_aliases
+            and call.args
+            and mapping_targets_runpy(call.args[0])
+        ):
+            method = descriptor_aliases[call.func.id]
+            arguments = call.args[1:]
+        if method == "clear":
+            deleted_members.update(_RUNPY_PRIORITY_MEMBER_NAMES)
+            safe_members.clear()
+        elif method in {"pop", "__delitem__"} and arguments:
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                deleted_members.add(member_name)
+                safe_members.discard(member_name)
+        elif method == "__setitem__" and len(arguments) >= 2:
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name is None:
+                deleted_members.clear()
+                safe_members.clear()
+            elif member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                deleted_members.discard(member_name)
+                safe_members.discard(member_name)
+        elif method in {"update", "__ior__"}:
+
+            def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+                member_name = _runpy_static_member_key(key_node)
+                if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                    deleted_members.discard(member_name)
+                    safe_members.discard(member_name)
+
+            def invalidate_all() -> None:
+                deleted_members.clear()
+                safe_members.clear()
+
+            for argument in arguments:
+                _replay_static_update_items(argument, record_item, invalidate_all)
+            for keyword in call.keywords:
+                if keyword.arg is None:
+                    _replay_static_update_items(keyword.value, record_item, invalidate_all)
+                elif keyword.arg in _RUNPY_PRIORITY_MEMBER_NAMES:
+                    deleted_members.discard(keyword.arg)
+                    safe_members.discard(keyword.arg)
+        elif (
+            method == "setdefault"
+            and len(arguments) >= 2
+            and isinstance(arguments[1], ast.Name)
+            and arguments[1].id == "print"
+        ):
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name in deleted_members:
+                safe_members.add(member_name)
+
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    for statement in _compact_deterministically_executed_statements(tree.body):
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    mapping_aliases.discard(target.id)
+                    descriptor_aliases.pop(target.id, None)
+                    bound_method_aliases.pop(target.id, None)
+                    if target.id == "dict":
+                        local_dict_shadowed = not (
+                            isinstance(statement.value, ast.Name)
+                            and statement.value.id == "dict"
+                            and not local_dict_shadowed
+                        )
+                    if mapping_targets_runpy(statement.value):
+                        mapping_aliases.add(target.id)
+                    elif isinstance(statement.value, ast.Attribute):
+                        if mapping_targets_runpy(statement.value.value) and statement.value.attr in {
+                            "pop",
+                            "__delitem__",
+                            "__setitem__",
+                            "clear",
+                            "setdefault",
+                            "update",
+                            "__ior__",
+                        }:
+                            bound_method_aliases[target.id] = statement.value.attr
+                        elif (
+                            isinstance(statement.value.value, ast.Name)
+                            and statement.value.value.id == "dict"
+                            and not local_dict_shadowed
+                            and statement.value.attr
+                            in {"pop", "__delitem__", "__setitem__", "clear", "setdefault", "update", "__ior__"}
+                        ):
+                            descriptor_aliases[target.id] = statement.value.attr
+                elif (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    deleted_members.discard(target.attr)
+                    safe_members.discard(target.attr)
+                elif isinstance(target, ast.Subscript) and mapping_targets_runpy(target.value):
+                    member_name = _runpy_static_member_key(target.slice)
+                    if member_name is None:
+                        deleted_members.clear()
+                        safe_members.clear()
+                    elif member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.discard(member_name)
+                        safe_members.discard(member_name)
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
+            if mapping_targets_runpy(statement.target):
+
+                def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+                    member_name = _runpy_static_member_key(key_node)
+                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.discard(member_name)
+                        safe_members.discard(member_name)
+
+                def invalidate_all() -> None:
+                    deleted_members.clear()
+                    safe_members.clear()
+
+                _replay_static_update_items(statement.value, record_item, invalidate_all)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    deleted_members.add(target.attr)
+                elif isinstance(target, ast.Subscript) and mapping_targets_runpy(target.value):
+                    member_name = _runpy_static_member_key(target.slice)
+                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.add(member_name)
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
+            for call in _deterministically_executed_expression_calls(value):
+                record_call(call)
+        _update_compact_runpy_aliases(statement, runpy_aliases, for_suppression=True)
+    return safe_members
+
+
+def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    if "delattr" not in code_str or "setdefault" not in code_str or "print" not in code_str:
+        return set()
+    source = textwrap.dedent(code_str)
+    try:
+        tree = ast.parse(source)
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    if _compact_snippet_has_shadowed_print(code_str, tree):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    builtins_aliases = {"builtins"}
+    safe_members: set[str] = set()
+    inactive_delattr_members: set[str] = set()
+    preserved_members: set[str] = set()
+    captured_unsafe_members: dict[str, str] = {}
+    called_unsafe_members: set[str] = set()
+    local_delattr_shadowed = False
+    builtins_delattr_shadowed = False
+
+    def active_delattr_reference(reference: str | None) -> bool:
+        if reference == "delattr":
+            return not local_delattr_shadowed and not builtins_delattr_shadowed
+        if reference == "builtins.delattr":
+            return not builtins_delattr_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".delattr")
+            and reference.removesuffix(".delattr") in builtins_aliases
+            and not builtins_delattr_shadowed
+        )
+
+    def runpy_mapping_owner(node: ast.AST) -> str | None:
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in runpy_aliases
+        ):
+            return node.value.id
+        return None
+
+    def record_delattr_shadow(target: ast.AST, value: ast.AST) -> None:
+        nonlocal local_delattr_shadowed, builtins_delattr_shadowed
+        value_reference = _simple_reference_name(value)
+        if isinstance(target, ast.Name) and target.id == "delattr":
+            local_delattr_shadowed = not active_delattr_reference(value_reference)
+        elif (
+            isinstance(target, ast.Attribute)
+            and target.attr == "delattr"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_delattr_shadowed = not active_delattr_reference(value_reference)
+
+    for statement in _deterministically_executed_statements(tree.body):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                if alias.name == "builtins":
+                    builtins_aliases.add(local_name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                record_delattr_shadow(target, statement.value)
+                if isinstance(target, ast.Name):
+                    if (
+                        isinstance(statement.value, ast.Attribute)
+                        and isinstance(statement.value.value, ast.Name)
+                        and statement.value.value.id in runpy_aliases
+                        and statement.value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                        and statement.value.attr not in safe_members
+                    ):
+                        captured_unsafe_members[target.id] = statement.value.attr
+                    else:
+                        captured_unsafe_members.pop(target.id, None)
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                ):
+                    if isinstance(statement.value, ast.Name) and statement.value.id == "print":
+                        safe_members.add(target.attr)
+                    else:
+                        safe_members.discard(target.attr)
+                        preserved_members.discard(target.attr)
+        for value in _deterministically_evaluated_statement_expressions(statement):
+            for node in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(node.func)
+                if isinstance(node.func, ast.Name) and node.func.id in captured_unsafe_members:
+                    called_unsafe_members.add(captured_unsafe_members[node.func.id])
+                    continue
+                if (
+                    not active_delattr_reference(reference)
+                    and reference is not None
+                    and reference.endswith("delattr")
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in runpy_aliases
+                    and (member_name := _runpy_static_member_key(node.args[1])) is not None
+                ):
+                    inactive_delattr_members.add(member_name)
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "setdefault"
+                    and runpy_mapping_owner(node.func.value) is not None
+                    and len(node.args) >= 2
+                    and (member_name := _runpy_static_member_key(node.args[0])) is not None
+                    and member_name in safe_members
+                    and member_name in inactive_delattr_members
+                ):
+                    preserved_members.add(member_name)
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in runpy_aliases
+                    and node.func.attr in preserved_members
+                ):
+                    preserved_members.add(node.func.attr)
+        _update_compact_runpy_aliases(statement, runpy_aliases, for_suppression=True)
+    return {(f"runpy.{member_name}", "S108") for member_name in preserved_members - called_unsafe_members}
+
+
+def _compact_snippet_runpy_print_overwrite_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    source = textwrap.dedent(code_str.lstrip("\x00"))
+    try:
+        tree = ast.parse(source)
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
+    runpy_aliases = set(inherited_runpy_aliases)
+    runpy_alias_ids = dict.fromkeys(inherited_runpy_aliases, 0)
+    cached_runpy_id: int | None = 0
+    next_runpy_id = 1
+    mapping_aliases: dict[str, int] = {}
+    safe_members: set[tuple[int, str]] = set()
+    suppressed_calls: set[tuple[str, str]] = set()
+    unsafe_called_members: set[str] = set()
+    importlib_aliases: set[str] = set()
+    reload_aliases: set[str] = set()
+    sys_aliases: set[str] = set()
+    sys_modules_aliases: set[str] = set()
+    sys_modules_pop_aliases: set[str] = set()
+    sys_modules_clear_aliases: set[str] = set()
+    class_mutated_module_ids: set[int] = set()
+    current_print_is_shadowed = False
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def clear_reload_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            reload_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_reload_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_reload_target(element)
+
+    def bind_reload_target(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: frozenset[str],
+        importlib_before: frozenset[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            reference = _simple_reference_name(value)
+            reload_aliases.discard(target.id)
+            if reference in aliases_before or (
+                reference is not None
+                and reference.endswith(".reload")
+                and reference.removesuffix(".reload") in importlib_before
+            ):
+                reload_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_reload_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_reload_target(target_item, value_item, aliases_before, importlib_before)
+            else:
+                clear_reload_target(target)
+
+    def clear_module_helper_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            sys_aliases.discard(target.id)
+            sys_modules_aliases.discard(target.id)
+            sys_modules_pop_aliases.discard(target.id)
+            sys_modules_clear_aliases.discard(target.id)
+            importlib_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_module_helper_target(element)
+
+    def bind_module_helper_target(
+        target: ast.AST,
+        value: ast.AST,
+        sys_before: frozenset[str],
+        modules_before: frozenset[str],
+        pop_before: frozenset[str],
+        clear_before: frozenset[str],
+        importlib_before: frozenset[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            reference = _simple_reference_name(value)
+            clear_module_helper_target(target)
+            if isinstance(value, ast.Name):
+                if value.id in sys_before:
+                    sys_aliases.add(target.id)
+                elif value.id in modules_before:
+                    sys_modules_aliases.add(target.id)
+                elif value.id in pop_before:
+                    sys_modules_pop_aliases.add(target.id)
+                elif value.id in clear_before:
+                    sys_modules_clear_aliases.add(target.id)
+                elif value.id in importlib_before:
+                    importlib_aliases.add(target.id)
+            elif (
+                isinstance(value, ast.Attribute)
+                and value.attr == "modules"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in sys_before
+            ):
+                sys_modules_aliases.add(target.id)
+            elif isinstance(value, ast.Attribute) and value.attr in {"pop", "__delitem__", "clear"}:
+                is_modules_mapping = (isinstance(value.value, ast.Name) and value.value.id in modules_before) or (
+                    isinstance(value.value, ast.Attribute)
+                    and value.value.attr == "modules"
+                    and isinstance(value.value.value, ast.Name)
+                    and value.value.value.id in sys_before
+                )
+                if is_modules_mapping:
+                    if value.attr == "clear":
+                        sys_modules_clear_aliases.add(target.id)
+                    else:
+                        sys_modules_pop_aliases.add(target.id)
+            elif reference in importlib_before:
+                importlib_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_module_helper_target(
+                        target_item,
+                        value_item,
+                        sys_before,
+                        modules_before,
+                        pop_before,
+                        clear_before,
+                        importlib_before,
+                    )
+            else:
+                clear_module_helper_target(target)
+
+    def runpy_mapping_id(
+        node: ast.AST,
+        aliases: Mapping[str, int] | None = None,
+        runpy_ids: Mapping[str, int] | None = None,
+    ) -> int | None:
+        current_aliases = mapping_aliases if aliases is None else aliases
+        current_runpy_ids = runpy_alias_ids if runpy_ids is None else runpy_ids
+        if isinstance(node, ast.Name):
+            return current_aliases.get(node.id)
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and isinstance(node.value, ast.Name):
+            return current_runpy_ids.get(node.value.id)
+        return None
+
+    def record_member_value(
+        module_id: int,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if member_name not in _RUNPY_PRIORITY_MEMBER_NAMES:
+            return
+        member_key = (module_id, member_name)
+        if isinstance(value, ast.Name) and value.id == "print":
+            if not conditional and not current_print_is_shadowed and module_id not in class_mutated_module_ids:
+                safe_members.add(member_key)
+        else:
+            safe_members.discard(member_key)
+
+    def invalidate_module(module_id: int) -> None:
+        safe_members.difference_update({member for member in safe_members if member[0] == module_id})
+
+    def record_module_attribute_value(
+        module_id: int,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if member_name == "__class__":
+            class_mutated_module_ids.add(module_id)
+            invalidate_module(module_id)
+            return
+        record_member_value(module_id, member_name, value, conditional=conditional)
+
+    def record_update(module_id: int, call: ast.Call, *, conditional: bool) -> None:
+        def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
+            record_member_value(
+                module_id,
+                _runpy_static_member_key(key_node),
+                value_node,
+                conditional=conditional,
+            )
+
+        for argument in call.args:
+            _replay_static_update_items(argument, record_item, lambda: invalidate_module(module_id))
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                _replay_static_update_items(keyword.value, record_item, lambda: invalidate_module(module_id))
+            else:
+                record_member_value(module_id, keyword.arg, keyword.value, conditional=conditional)
+
+    def is_sys_modules_mapping(
+        node: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in active_sys_aliases
+        )
+
+    def invalidate_cached_runpy_name(module_name: str | None) -> None:
+        nonlocal cached_runpy_id
+        if module_name in {"runpy", None}:
+            cached_runpy_id = None
+
+    def invalidate_cached_runpy_assignment(
+        target: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> None:
+        if isinstance(target, ast.Subscript) and is_sys_modules_mapping(
+            target.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            invalidate_cached_runpy_name(_static_getattr_member_name(target.slice))
+
+    def invalidate_cached_runpy_update(
+        call: ast.Call,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        nonlocal cached_runpy_id
+        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(
+            call.func.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            return False
+        if call.func.attr == "__setitem__" and len(call.args) >= 2:
+            invalidate_cached_runpy_name(_static_getattr_member_name(call.args[0]))
+            return True
+        if call.func.attr not in {"update", "__ior__"}:
+            return False
+
+        def invalidate_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+            invalidate_cached_runpy_name(_static_getattr_member_name(key_node))
+
+        def invalidate_all() -> None:
+            nonlocal cached_runpy_id
+            cached_runpy_id = None
+
+        for argument in call.args:
+            _replay_static_update_items(argument, invalidate_item, invalidate_all)
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                _replay_static_update_items(keyword.value, invalidate_item, invalidate_all)
+            else:
+                invalidate_cached_runpy_name(keyword.arg)
+        return True
+
+    def bind_runpy_target(target: ast.AST, value: ast.AST, aliases_before: Mapping[str, int]) -> None:
+        if isinstance(target, ast.Name):
+            module_id = aliases_before.get(value.id) if isinstance(value, ast.Name) else None
+            runpy_alias_ids.pop(target.id, None)
+            if module_id is not None:
+                runpy_alias_ids[target.id] = module_id
+        elif isinstance(target, ast.Starred):
+            bind_runpy_target(target.value, ast.Constant(value=None), aliases_before)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_runpy_target(target_item, value_item, aliases_before)
+            else:
+                for target_item in target.elts:
+                    bind_runpy_target(target_item, ast.Constant(value=None), aliases_before)
+
+    def bind_mapping_target(target: ast.AST, value: ast.AST, aliases_before: Mapping[str, int]) -> None:
+        if isinstance(target, ast.Name):
+            module_id = runpy_mapping_id(value, aliases_before)
+            mapping_aliases.pop(target.id, None)
+            if module_id is not None:
+                mapping_aliases[target.id] = module_id
+        elif isinstance(target, ast.Starred):
+            bind_mapping_target(target.value, ast.Constant(value=None), aliases_before)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_mapping_target(target_item, value_item, aliases_before)
+            else:
+                for target_item in target.elts:
+                    bind_mapping_target(target_item, ast.Constant(value=None), aliases_before)
+
+    def record_assignment_target(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Starred):
+            record_assignment_target(target.value, value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)):
+                for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                    record_assignment_target(target_item, value_item)
+            else:
+                for target_item in target.elts:
+                    record_assignment_target(target_item, ast.Constant(value=None))
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and (module_id := runpy_alias_ids.get(target.value.id)) is not None
+        ):
+            record_module_attribute_value(module_id, target.attr, value)
+        elif isinstance(target, ast.Subscript) and (module_id := runpy_mapping_id(target.value)) is not None:
+            member_name = _runpy_static_member_key(target.slice)
+            if member_name is None:
+                invalidate_module(module_id)
+            else:
+                record_member_value(module_id, member_name, value)
+
+    executed_statements = _deterministically_executed_statements(tree.body)
+    builtins_aliases = {"builtins", "__builtins__"}
+    for executed_statement in executed_statements:
+        if isinstance(executed_statement, ast.Import):
+            for alias in executed_statement.names:
+                if alias.name == "builtins":
+                    builtins_aliases.add(alias.asname or "builtins")
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    first_print_shadow_index = next(
+        (index for index, statement in enumerate(executed_statements) if id(statement) in shadowed_print_statement_ids),
+        len(executed_statements),
+    )
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
+    for statement_index, statement in enumerate(executed_statements):
+        current_shadowed_setattr_references = shadowed_setattr_references_by_statement.get(id(statement), set())
+        runpy_alias_ids_before = dict(runpy_alias_ids)
+        mapping_aliases_before = dict(mapping_aliases)
+        reload_aliases_before = frozenset(reload_aliases)
+        importlib_aliases_before = frozenset(importlib_aliases)
+        sys_aliases_before = frozenset(sys_aliases)
+        sys_modules_aliases_before = frozenset(sys_modules_aliases)
+        sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
+        sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                mapping_aliases.pop(local_name, None)
+                runpy_alias_ids.pop(local_name, None)
+                importlib_aliases.discard(local_name)
+                reload_aliases.discard(local_name)
+                clear_module_helper_target(ast.Name(id=local_name))
+                if alias.name == "importlib":
+                    importlib_aliases.add(local_name)
+                elif alias.name == "sys":
+                    sys_aliases.add(local_name)
+                elif alias.name == "runpy":
+                    if cached_runpy_id is None:
+                        cached_runpy_id = next_runpy_id
+                        next_runpy_id += 1
+                    runpy_alias_ids[local_name] = cached_runpy_id
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "sys":
+            for alias in statement.names:
+                local_name = alias.asname or alias.name
+                clear_module_helper_target(ast.Name(id=local_name))
+                if alias.name == "modules":
+                    sys_modules_aliases.add(local_name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_runpy_target(target, statement.value, runpy_alias_ids_before)
+                bind_mapping_target(target, statement.value, mapping_aliases_before)
+                bind_module_helper_target(
+                    target,
+                    statement.value,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                    importlib_aliases_before,
+                )
+                bind_reload_target(target, statement.value, reload_aliases_before, importlib_aliases_before)
+                record_assignment_target(target, statement.value)
+                invalidate_cached_runpy_assignment(target, sys_aliases_before, sys_modules_aliases_before)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_runpy_target(statement.target, statement.value, runpy_alias_ids_before)
+            bind_mapping_target(statement.target, statement.value, mapping_aliases_before)
+            bind_module_helper_target(
+                statement.target,
+                statement.value,
+                sys_aliases_before,
+                sys_modules_aliases_before,
+                sys_modules_pop_aliases_before,
+                sys_modules_clear_aliases_before,
+                importlib_aliases_before,
+            )
+            bind_reload_target(
+                statement.target,
+                statement.value,
+                reload_aliases_before,
+                importlib_aliases_before,
+            )
+            record_assignment_target(statement.target, statement.value)
+            invalidate_cached_runpy_assignment(
+                statement.target,
+                sys_aliases_before,
+                sys_modules_aliases_before,
+            )
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    mapping_aliases.pop(target.id, None)
+                    runpy_alias_ids.pop(target.id, None)
+                    clear_module_helper_target(target)
+                    reload_aliases.discard(target.id)
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and (
+                        (isinstance(target.value, ast.Name) and target.value.id in sys_modules_aliases)
+                        or (
+                            isinstance(target.value, ast.Attribute)
+                            and target.value.attr == "modules"
+                            and isinstance(target.value.value, ast.Name)
+                            and target.value.value.id in sys_aliases
+                        )
+                    )
+                    and _static_getattr_member_name(target.slice) == "runpy"
+                ):
+                    cached_runpy_id = None
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            mapping_aliases.pop(statement.name, None)
+            runpy_alias_ids.pop(statement.name, None)
+            clear_module_helper_target(ast.Name(id=statement.name))
+            reload_aliases.discard(statement.name)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name
+                clear_module_helper_target(ast.Name(id=local_name))
+                reload_aliases.discard(local_name)
+                if statement.module == "importlib" and alias.name == "reload":
+                    reload_aliases.add(local_name)
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
+            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, _value: invalidate_cached_runpy_name(_static_getattr_member_name(key)),
+                    lambda: invalidate_cached_runpy_name("runpy"),
+                )
+            elif (module_id := runpy_mapping_id(statement.target)) is not None:
+                replay_module_id = module_id
+
+                def record_replay_item(
+                    key: ast.AST,
+                    value: ast.AST,
+                    module_id: int = replay_module_id,
+                ) -> None:
+                    record_member_value(module_id, _runpy_static_member_key(key), value)
+
+                def invalidate_replay_module(module_id: int = replay_module_id) -> None:
+                    invalidate_module(module_id)
+
+                _replay_static_update_items(
+                    statement.value,
+                    record_replay_item,
+                    invalidate_replay_module,
+                )
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            clear_reload_target(statement.target)
+            clear_module_helper_target(statement.target)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    clear_reload_target(item.optional_vars)
+                    clear_module_helper_target(item.optional_vars)
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
+            expression_runpy_alias_ids = (
+                runpy_alias_ids_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else runpy_alias_ids
+            )
+            expression_mapping_aliases = (
+                mapping_aliases_before if isinstance(statement, ast.Assign) else mapping_aliases
+            )
+            for node in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(node.func)
+                active_runpy_alias_ids = _name_aliases_before_call(value, node, expression_runpy_alias_ids)
+                active_mapping_aliases = _name_aliases_before_call(value, node, expression_mapping_aliases)
+                (
+                    active_sys_aliases,
+                    active_sys_modules_aliases,
+                    active_sys_modules_pop_aliases,
+                    active_sys_modules_clear_aliases,
+                    active_importlib_aliases,
+                ) = _module_helper_aliases_before_call(
+                    value,
+                    node,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                    importlib_aliases_before,
+                )
+                active_reload_aliases = _reload_aliases_before_call(
+                    value,
+                    node,
+                    reload_aliases_before,
+                    set(active_importlib_aliases),
+                )
+                if invalidate_cached_runpy_update(node, active_sys_aliases, active_sys_modules_aliases):
+                    continue
+                if (
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference not in current_shadowed_setattr_references
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and (module_id := active_runpy_alias_ids.get(node.args[0].id)) is not None
+                ):
+                    record_module_attribute_value(
+                        module_id,
+                        _runpy_static_member_key(node.args[1]),
+                        node.args[2],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    (reload_argument := _static_call_argument(node, 0, "module")) is not None
+                    and isinstance(reload_argument, ast.Name)
+                    and (module_id := active_runpy_alias_ids.get(reload_argument.id)) is not None
+                    and (
+                        reference in active_reload_aliases
+                        or (
+                            reference is not None
+                            and reference.endswith(".reload")
+                            and reference.removesuffix(".reload") in active_importlib_aliases
+                        )
+                    )
+                ):
+                    invalidate_module(module_id)
+                    continue
+                evicted_name = _static_sys_modules_eviction_name(
+                    node,
+                    set(active_sys_aliases),
+                    set(active_sys_modules_aliases),
+                    set(active_sys_modules_pop_aliases),
+                    set(active_sys_modules_clear_aliases),
+                )
+                if evicted_name in {"runpy", "*"}:
+                    cached_runpy_id = None
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and (
+                        module_id := runpy_mapping_id(
+                            node.func.value,
+                            active_mapping_aliases,
+                            active_runpy_alias_ids,
+                        )
+                    )
+                    is not None
+                ):
+                    if node.func.attr == "clear":
+                        invalidate_module(module_id)
+                        continue
+                    if node.func.attr in {"update", "__ior__"}:
+                        for nested in ast.walk(
+                            ast.Tuple(elts=[*node.args, *(keyword.value for keyword in node.keywords)])
+                        ):
+                            if (
+                                isinstance(nested, ast.Call)
+                                and isinstance(nested.func, ast.Attribute)
+                                and isinstance(nested.func.value, ast.Name)
+                                and (nested_module_id := active_runpy_alias_ids.get(nested.func.value.id)) is not None
+                                and nested.func.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                                and (nested_module_id, nested.func.attr) not in safe_members
+                            ):
+                                unsafe_called_members.add(nested.func.attr)
+                        record_update(
+                            module_id,
+                            node,
+                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                        )
+                        continue
+                    if node.func.attr == "__setitem__" and len(node.args) >= 2:
+                        record_member_value(
+                            module_id,
+                            _runpy_static_member_key(node.args[0]),
+                            node.args[1],
+                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                        )
+                        continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and (module_id := active_runpy_alias_ids.get(node.func.value.id)) is not None
+                ):
+                    if (module_id, node.func.attr) in safe_members:
+                        suppressed_calls.add((f"runpy.{node.func.attr}", "S108"))
+                    elif node.func.attr in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        unsafe_called_members.add(node.func.attr)
+            for named_expression in _deterministic_named_expressions(value):
+                bind_module_helper_target(
+                    named_expression.target,
+                    named_expression.value,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                    importlib_aliases_before,
+                )
+                bind_reload_target(
+                    named_expression.target,
+                    named_expression.value,
+                    reload_aliases_before,
+                    importlib_aliases_before,
+                )
+        _update_compact_runpy_aliases(statement, runpy_aliases, for_suppression=True)
+        for alias_name in tuple(runpy_alias_ids):
+            if alias_name not in runpy_aliases:
+                runpy_alias_ids.pop(alias_name, None)
+        print_shadow_transition = _compact_statement_print_shadow_transition(statement, builtins_aliases)
+        if print_shadow_transition is not None:
+            current_print_is_shadowed = print_shadow_transition
+        elif statement_index == first_print_shadow_index:
+            current_print_is_shadowed = True
+    return {call for call in suppressed_calls if call[0].rpartition(".")[2] not in unsafe_called_members}
+
+
+def _compact_snippet_shadowed_helper_runpy_high_risk_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    print_is_shadowed = _compact_snippet_has_shadowed_print(code_str, tree)
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    if not print_is_shadowed and not shadowed_setattr_references:
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    dangerous_members: set[str] = set()
+    high_risk_calls: set[tuple[str, str]] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
+    for statement in executed_statements:
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(statement.value, ast.Name)
+                    and statement.value.id == "print"
+                ):
+                    if id(statement) in shadowed_print_statement_ids:
+                        dangerous_members.add(target.attr)
+                    else:
+                        dangerous_members.discard(target.attr)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for call in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(call.func)
+                if (
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and len(call.args) >= 3
+                    and isinstance(call.args[0], ast.Name)
+                    and call.args[0].id in runpy_aliases
+                    and (member_name := _runpy_static_member_key(call.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(call.args[2], ast.Name)
+                    and call.args[2].id == "print"
+                ):
+                    current_shadowed_setattr_references = shadowed_setattr_references_by_statement.get(
+                        id(statement), set()
+                    )
+                    if (
+                        id(statement) in shadowed_print_statement_ids
+                        or reference in current_shadowed_setattr_references
+                    ):
+                        dangerous_members.add(member_name)
+                    else:
+                        dangerous_members.discard(member_name)
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id in runpy_aliases
+                    and call.func.attr in dangerous_members
+                ):
+                    high_risk_calls.add((f"runpy.{call.func.attr}", "S108"))
+        _update_compact_runpy_aliases(statement, runpy_aliases)
+    return high_risk_calls
+
+
+def _compact_snippet_shadowed_setattr_typed_high_risk_calls(code_str: str) -> set[tuple[str, str]]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    shadowed_setattr_references = _compact_snippet_shadowed_setattr_references(tree)
+    if not shadowed_setattr_references:
+        return set()
+    typed_aliases: dict[str, str] = {}
+    dangerous_members: set[tuple[str, str]] = set()
+    high_risk_calls: set[tuple[str, str]] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    def bind_typed_alias(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            if (owner := typed_aliases.get(_simple_reference_name(value) or "")) is None:
+                typed_aliases.pop(target.id, None)
+            else:
+                typed_aliases[target.id] = owner
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_typed_alias(target_item, value_item)
+        else:
+            for target_name in _assignment_target_names(target):
+                typed_aliases.pop(target_name, None)
+
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
+    for statement in executed_statements:
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                if alias.name in {"ctypes", "webbrowser"}:
+                    typed_aliases[local_name] = alias.name
+                else:
+                    typed_aliases.pop(local_name, None)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                typed_aliases.pop(alias.asname or alias.name, None)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_typed_alias(target, statement.value)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_typed_alias(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                for target_name in _assignment_target_names(target):
+                    typed_aliases.pop(target_name, None)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            typed_aliases.pop(statement.name, None)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for call in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(call.func)
+                if (
+                    reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference in shadowed_setattr_references_by_statement.get(id(statement), set())
+                    and len(call.args) >= 3
+                    and isinstance(call.args[0], ast.Name)
+                    and call.args[0].id in typed_aliases
+                    and isinstance(call.args[2], ast.Name)
+                    and call.args[2].id == "print"
+                ):
+                    member_name = _static_getattr_member_name(call.args[1])
+                    owner = typed_aliases[call.args[0].id]
+                    if member_name is not None and _typed_member_high_risk_call(owner, member_name) is not None:
+                        dangerous_members.add((owner, member_name))
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and (call_owner := typed_aliases.get(call.func.value.id)) is not None
+                    and (call_owner, call.func.attr) in dangerous_members
+                    and (high_risk_call := _typed_member_high_risk_call(call_owner, call.func.attr)) is not None
+                ):
+                    high_risk_calls.add(high_risk_call)
+    return high_risk_calls
+
+
+def _compact_snippet_captured_runpy_high_risk_calls(
+    code_str: str,
+    inherited_runpy_aliases: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
+    """Return runpy calls reached through aliases captured before a safe member overwrite."""
+    if (not inherited_runpy_aliases and "runpy" not in code_str) or "print" not in code_str:
+        return set()
+    try:
+        tree = ast.parse(textwrap.dedent(code_str.lstrip("\x00")))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+    runpy_aliases = set(inherited_runpy_aliases)
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
+        executed_statements
+    )
+    first_safe_write: dict[str, int] = {}
+    captured_members: dict[str, tuple[str, int]] = {}
+    dangerous_calls: set[tuple[str, str]] = set()
+
+    def clear_captured_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            captured_members.pop(target.id, None)
+        elif isinstance(target, ast.Starred):
+            clear_captured_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_captured_target(element)
+
+    def bind_captured_target(target: ast.AST, value: ast.AST, lineno: int) -> None:
+        if isinstance(target, ast.Name):
+            captured: tuple[str, int] | None = None
+            if (
+                isinstance(value, ast.Attribute)
+                and isinstance(value.value, ast.Name)
+                and value.value.id in runpy_aliases
+                and value.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+            ):
+                captured = (value.attr, lineno)
+            elif isinstance(value, ast.Name):
+                captured = captured_members.get(value.id)
+            captured_members.pop(target.id, None)
+            if captured is not None:
+                captured_members[target.id] = captured
+        elif isinstance(target, ast.Starred):
+            clear_captured_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_captured_target(target_item, value_item, lineno)
+            else:
+                clear_captured_target(target)
+
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    for statement in executed_statements:
+        if not _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                captured_members.pop(local_name, None)
+                if alias.name == "runpy":
+                    runpy_aliases.add(local_name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in runpy_aliases
+                    and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(statement.value, ast.Name)
+                    and statement.value.id == "print"
+                ):
+                    first_safe_write.setdefault(target.attr, statement.lineno)
+                else:
+                    bind_captured_target(target, statement.value, statement.lineno)
+        elif isinstance(statement, ast.AnnAssign):
+            if statement.value is not None:
+                bind_captured_target(statement.target, statement.value, statement.lineno)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                clear_captured_target(target)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            captured_members.pop(statement.name, None)
+        elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                captured_members.pop(alias.asname or alias.name.split(".", maxsplit=1)[0], None)
+        elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+            clear_captured_target(statement.target)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    clear_captured_target(item.optional_vars)
+        for value in _deterministically_evaluated_statement_expressions(statement, evaluate_annotations=False):
+            for node in _deterministically_executed_expression_calls(value):
+                if (
+                    (reference := _simple_reference_name(node.func))
+                    in {"setattr", "builtins.setattr", "__builtins__.setattr"}
+                    and reference not in shadowed_setattr_references_by_statement.get(id(statement), set())
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in runpy_aliases
+                    and (member_name := _runpy_static_member_key(node.args[1])) in _RUNPY_PRIORITY_MEMBER_NAMES
+                    and isinstance(node.args[2], ast.Name)
+                    and node.args[2].id == "print"
+                ):
+                    first_safe_write.setdefault(member_name, node.lineno)
+                    continue
+                if not isinstance(node.func, ast.Name):
+                    continue
+                captured = captured_members.get(node.func.id)
+                if captured is None:
+                    continue
+                member_name, capture_line = captured
+                safe_line = first_safe_write.get(member_name)
+                if safe_line is not None and capture_line < safe_line < node.lineno:
+                    dangerous_calls.add((f"runpy.{member_name}", "S108"))
+        _update_compact_runpy_aliases(statement, runpy_aliases)
+    return dangerous_calls
+
+
+def _typed_member_high_risk_call(owner_name: str, member_name: str) -> tuple[str, str] | None:
+    if owner_name == "webbrowser" and member_name in {"get", "open", "open_new", "open_new_tab"}:
+        return (f"webbrowser.{member_name}", "S109")
+    if owner_name == "ctypes" and member_name in _TYPED_PROOF_MEMBER_NAMES:
+        return (f"ctypes.{member_name}", "S110")
+    return None
+
+
+def _compact_deterministic_exception_name(
+    statement: ast.stmt,
+    exception_aliases: dict[str, str],
+) -> str | None:
+    if isinstance(statement, ast.Raise) and isinstance(statement.exc, ast.Call):
+        reference = _simple_reference_name(statement.exc.func)
+        if reference is not None:
+            return exception_aliases.get(reference, exception_aliases.get(reference.rsplit(".", 1)[-1]))
+    if (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.BinOp)
+        and isinstance(statement.value.op, (ast.Div, ast.FloorDiv, ast.Mod))
+    ):
+        try:
+            denominator = ast.literal_eval(statement.value.right)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+        if denominator == 0:
+            return "ZeroDivisionError"
+    return None
+
+
+def _compact_handler_catches_exception(
+    handler: ast.ExceptHandler,
+    exception_name: str,
+    exception_aliases: dict[str, str],
+) -> bool:
+    if handler.type is None:
+        return True
+    handled_nodes = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    raised_type = getattr(builtins, exception_name, None)
+    if not isinstance(raised_type, type) or not issubclass(raised_type, BaseException):
+        return False
+    for handled_node in handled_nodes:
+        reference = _simple_reference_name(handled_node)
+        if reference is None:
+            continue
+        handled_name = exception_aliases.get(reference, exception_aliases.get(reference.rsplit(".", 1)[-1]))
+        handled_type = getattr(builtins, handled_name or "", None)
+        if (
+            isinstance(handled_type, type)
+            and issubclass(handled_type, BaseException)
+            and issubclass(raised_type, handled_type)
+        ):
+            return True
+    return False
+
+
+def _compact_deterministically_executed_statements(statements: list[ast.stmt]) -> list[ast.stmt]:
+    """Flatten the small, statically determined control-flow shapes used by compact replay proofs."""
+    executed: list[ast.stmt] = []
+    exception_aliases = {name: name for name in _BUILTIN_EXCEPTION_TYPE_NAMES}
+    builtins_aliases = {"builtins"}
+    non_raising_module_aliases: set[str] = set()
+
+    def update_non_raising_module_aliases(statement: ast.stmt) -> None:
+        aliases_before = frozenset(non_raising_module_aliases)
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                non_raising_module_aliases.discard(local_name)
+                if alias.name in {"ctypes", "runpy", "webbrowser"}:
+                    non_raising_module_aliases.add(local_name)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                non_raising_module_aliases.discard(alias.asname or alias.name)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            value = statement.value
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                for target_name in _assignment_target_names(target):
+                    non_raising_module_aliases.discard(target_name)
+                    if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
+                        non_raising_module_aliases.add(target_name)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            non_raising_module_aliases.discard(statement.name)
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            non_raising_module_aliases.difference_update(_assignment_target_names(statement.target))
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    non_raising_module_aliases.difference_update(_assignment_target_names(item.optional_vars))
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                non_raising_module_aliases.difference_update(_assignment_target_names(target))
+        for evaluated_expression in _deterministically_evaluated_statement_expressions(
+            statement, evaluate_annotations=False
+        ):
+            for node in ast.walk(evaluated_expression):
+                if isinstance(node, ast.NamedExpr):
+                    non_raising_module_aliases.difference_update(_assignment_target_names(node.target))
+
+    def statement_is_non_raising(statement: ast.stmt) -> bool:
+        if isinstance(statement, ast.Pass):
+            return True
+        if isinstance(statement, ast.Assign):
+            return all(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in non_raising_module_aliases
+                and isinstance(statement.value, ast.Name)
+                and statement.value.id == "print"
+                for target in statement.targets
+            )
+        return bool(
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Attribute)
+            and isinstance(statement.target.value, ast.Name)
+            and statement.target.value.id in non_raising_module_aliases
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == "print"
+        )
+
+    def update_exception_aliases(statement: ast.stmt) -> None:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "builtins":
+                    builtins_aliases.add(alias.asname or "builtins")
+            return
+        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            exception_aliases.pop(statement.name, None)
+            return
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            return
+        value_reference = _simple_reference_name(statement.value)
+        canonical = (
+            exception_aliases.get(value_reference, exception_aliases.get(value_reference.rsplit(".", 1)[-1]))
+            if value_reference is not None
+            else None
+        )
+        target = statement.targets[0]
+        if isinstance(target, ast.Name):
+            if canonical is None:
+                exception_aliases.pop(target.id, None)
+            else:
+                exception_aliases[target.id] = canonical
+        elif (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            keys = {target.attr, *(f"{alias}.{target.attr}" for alias in builtins_aliases)}
+            if canonical is None:
+                for key in keys:
+                    exception_aliases.pop(key, None)
+            else:
+                for key in keys:
+                    exception_aliases[key] = canonical
+
+    def visit(block: list[ast.stmt]) -> str | None:
+        for statement in block:
+            executed.append(statement)
+            update_exception_aliases(statement)
+            update_non_raising_module_aliases(statement)
+            if isinstance(statement, ast.Break):
+                return "break"
+            if isinstance(statement, ast.Continue):
+                return "continue"
+            if isinstance(statement, ast.Return):
+                return "return"
+            if isinstance(statement, ast.ClassDef):
+                module_aliases_before = set(non_raising_module_aliases)
+                visit(statement.body)
+                non_raising_module_aliases.clear()
+                non_raising_module_aliases.update(module_aliases_before)
+            elif isinstance(statement, ast.If) and isinstance(statement.test, ast.Constant):
+                outcome = visit(statement.body if bool(statement.test.value) else statement.orelse)
+                if outcome is not None:
+                    return outcome
+            elif isinstance(statement, (ast.For, ast.AsyncFor)) and isinstance(statement.iter, (ast.List, ast.Tuple)):
+                if len(statement.iter.elts) == 1:
+                    loop_binding = ast.Assign(targets=[statement.target], value=statement.iter.elts[0])
+                    ast.copy_location(loop_binding, statement)
+                    ast.fix_missing_locations(loop_binding)
+                    executed.append(loop_binding)
+                    outcome = visit(statement.body)
+                    if outcome != "break":
+                        visit(statement.orelse)
+                    if outcome == "return":
+                        return outcome
+            elif isinstance(statement, ast.While) and _static_late_truth_value(statement.test) is False:
+                outcome = visit(statement.orelse)
+                if outcome is not None:
+                    return outcome
+            elif isinstance(statement, ast.Try):
+                exception_name: str | None = None
+                deterministic_body: list[ast.stmt] = []
+                body_is_deterministic = True
+                for body_statement in statement.body:
+                    exception_name = _compact_deterministic_exception_name(body_statement, exception_aliases)
+                    if exception_name is not None:
+                        deterministic_body.append(body_statement)
+                        break
+                    if not statement_is_non_raising(body_statement):
+                        body_is_deterministic = False
+                        break
+                    deterministic_body.append(body_statement)
+                if not body_is_deterministic:
+                    visit(statement.finalbody)
+                    continue
+                body_outcome = visit(deterministic_body)
+                if exception_name is None:
+                    if body_outcome is None:
+                        body_outcome = visit(statement.orelse)
+                else:
+                    handler = next(
+                        (
+                            candidate
+                            for candidate in statement.handlers
+                            if _compact_handler_catches_exception(candidate, exception_name, exception_aliases)
+                        ),
+                        None,
+                    )
+                    if handler is not None:
+                        handler_body = handler.body
+                        if handler.name is not None:
+                            handler_binding = ast.Assign(
+                                targets=[ast.Name(id=handler.name, ctx=ast.Store())],
+                                value=ast.Constant(value=None),
+                            )
+                            ast.copy_location(handler_binding, handler)
+                            ast.fix_missing_locations(handler_binding)
+                            handler_body = [handler_binding, *handler_body]
+                        body_outcome = visit(handler_body)
+                final_outcome = visit(statement.finalbody)
+                if final_outcome is not None:
+                    return final_outcome
+                if body_outcome is not None:
+                    return body_outcome
+        return None
+
+    visit(statements)
+    return executed
+
+
+def _compact_snippet_replay_proven_rule_codes(code_str: str) -> frozenset[str]:
+    source = code_str.encode("utf-8", errors="ignore")
+    aliases = _priority_import_aliases(source)
+    if not aliases:
+        return frozenset()
+    _usage_lines, proved_rule_codes = _priority_alias_usage_lines(
+        source,
+        aliases,
+        0,
+        deferred_annotations=_source_defers_annotations(source),
+    )
+    return proved_rule_codes
+
+
+def _compact_snippet_typed_print_overwrite_replay(
+    code_str: str,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    source = textwrap.dedent(code_str)
+    if "print" not in source:
+        return set(), set()
+    try:
+        tree = ast.parse(source)
+    except (RecursionError, SyntaxError, ValueError):
+        return set(), set()
+    deferred_annotations = _source_defers_annotations(source.encode("utf-8"))
+    typed_aliases: dict[str, tuple[str, int]] = {}
+    cached_typed_identities: dict[str, tuple[str, int]] = {
+        "webbrowser": ("webbrowser", 0),
+        "ctypes": ("ctypes", 0),
+    }
+    next_typed_generation = {"webbrowser": 1, "ctypes": 1}
+    builtins_aliases = {"builtins", "__builtins__"}
+    executed_statements = _compact_deterministically_executed_statements(tree.body)
+    for statement in executed_statements:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "builtins":
+                    builtins_aliases.add(alias.asname or "builtins")
+    mutated_truthy_builtins = _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set())
+    if mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
+        return set(), set()
+    module_parents, module_statement_ids = _compact_module_scope_context(tree)
+    local_getattr_shadowed = _compact_snippet_mutates_module_name(
+        tree,
+        "getattr",
+        evaluate_annotations=not deferred_annotations,
+    ) or any(
+        _is_compact_module_scope_node(node, module_parents, module_statement_ids)
+        and (
+            (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "getattr")
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "getattr")
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any((alias.asname or alias.name.split(".", maxsplit=1)[0]) == "getattr" for alias in node.names)
+            )
+        )
+        for node in ast.walk(tree)
+    )
+    vars_helper_aliases: set[str] = set()
+    setattr_helper_aliases: set[str] = set()
+    dict_helper_aliases: set[str] = set()
+    dict_update_aliases: set[str] = set()
+    dict_setitem_aliases: set[str] = set()
+    builtins_mapping_aliases: set[str] = set()
+    builtins_mapping_update_aliases: set[str] = set()
+    builtins_mapping_setitem_aliases: set[str] = set()
+    mapping_aliases: dict[str, tuple[str, int]] = {}
+    safe_members: set[tuple[tuple[str, int], str]] = set()
+    deleted_members: set[tuple[tuple[str, int], str]] = set()
+    safe_called_members: set[tuple[str, str]] = set()
+    unsafe_called_members: set[tuple[str, str]] = set()
+    importlib_aliases: set[str] = set()
+    reload_aliases: set[str] = set()
+    sys_aliases: set[str] = set()
+    sys_modules_aliases: set[str] = set()
+    sys_modules_pop_aliases: set[str] = set()
+    sys_modules_clear_aliases: set[str] = set()
+    class_mutated_owners: set[tuple[str, int]] = set()
+    current_print_is_shadowed = False
+    local_setattr_shadowed = False
+    builtins_setattr_shadowed = False
+    local_vars_shadowed = False
+    builtins_vars_shadowed = False
+    local_dict_shadowed = False
+    builtins_dict_shadowed = False
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def class_scope_path(node: ast.AST) -> tuple[ast.ClassDef, ...]:
+        path: list[ast.ClassDef] = []
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, ast.ClassDef):
+                path.append(current)
+        path.reverse()
+        return tuple(path)
+
+    def clear_reload_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            reload_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_reload_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_reload_target(element)
+
+    def bind_reload_target(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: frozenset[str],
+        importlib_before: frozenset[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            reference = _simple_reference_name(value)
+            reload_aliases.discard(target.id)
+            if reference in aliases_before or (
+                reference is not None
+                and reference.endswith(".reload")
+                and reference.removesuffix(".reload") in importlib_before
+            ):
+                reload_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_reload_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_reload_target(target_item, value_item, aliases_before, importlib_before)
+            else:
+                clear_reload_target(target)
+
+    def clear_module_helper_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            sys_aliases.discard(target.id)
+            sys_modules_aliases.discard(target.id)
+            sys_modules_pop_aliases.discard(target.id)
+            sys_modules_clear_aliases.discard(target.id)
+            importlib_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_module_helper_target(element)
+
+    def bind_module_helper_target(
+        target: ast.AST,
+        value: ast.AST,
+        sys_before: frozenset[str],
+        modules_before: frozenset[str],
+        pop_before: frozenset[str],
+        clear_before: frozenset[str],
+        importlib_before: frozenset[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            clear_module_helper_target(target)
+            if isinstance(value, ast.Name):
+                if value.id in sys_before:
+                    sys_aliases.add(target.id)
+                elif value.id in modules_before:
+                    sys_modules_aliases.add(target.id)
+                elif value.id in pop_before:
+                    sys_modules_pop_aliases.add(target.id)
+                elif value.id in clear_before:
+                    sys_modules_clear_aliases.add(target.id)
+                elif value.id in importlib_before:
+                    importlib_aliases.add(target.id)
+            elif (
+                isinstance(value, ast.Attribute)
+                and value.attr == "modules"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in sys_before
+            ):
+                sys_modules_aliases.add(target.id)
+            elif isinstance(value, ast.Attribute) and value.attr in {"pop", "__delitem__", "clear"}:
+                is_modules_mapping = (isinstance(value.value, ast.Name) and value.value.id in modules_before) or (
+                    isinstance(value.value, ast.Attribute)
+                    and value.value.attr == "modules"
+                    and isinstance(value.value.value, ast.Name)
+                    and value.value.value.id in sys_before
+                )
+                if is_modules_mapping:
+                    if value.attr == "clear":
+                        sys_modules_clear_aliases.add(target.id)
+                    else:
+                        sys_modules_pop_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_module_helper_target(
+                        target_item,
+                        value_item,
+                        sys_before,
+                        modules_before,
+                        pop_before,
+                        clear_before,
+                        importlib_before,
+                    )
+            else:
+                clear_module_helper_target(target)
+
+    def active_setattr_reference(reference: str | None) -> bool:
+        if reference in setattr_helper_aliases:
+            return True
+        if reference == "setattr":
+            return not local_setattr_shadowed and not builtins_setattr_shadowed
+        if reference == "builtins.setattr":
+            return not builtins_setattr_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".setattr")
+            and reference.removesuffix(".setattr") in builtins_aliases
+            and not builtins_setattr_shadowed
+        )
+
+    def active_vars_reference(reference: str | None) -> bool:
+        if reference in vars_helper_aliases:
+            return True
+        if reference == "vars":
+            return not local_vars_shadowed and not builtins_vars_shadowed
+        if reference == "builtins.vars":
+            return not builtins_vars_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".vars")
+            and reference.removesuffix(".vars") in builtins_aliases
+            and not builtins_vars_shadowed
+        )
+
+    def active_getattr_reference(reference: str | None) -> bool:
+        if "getattr" in mutated_truthy_builtins:
+            return False
+        if reference == "getattr":
+            return not local_getattr_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".getattr")
+            and reference.removesuffix(".getattr") in builtins_aliases
+        )
+
+    def active_dict_reference(reference: str | None) -> bool:
+        if reference in dict_helper_aliases:
+            return True
+        if reference == "dict":
+            return not local_dict_shadowed and not builtins_dict_shadowed
+        if reference == "builtins.dict":
+            return not builtins_dict_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".dict")
+            and reference.removesuffix(".dict") in builtins_aliases
+            and not builtins_dict_shadowed
+        )
+
+    def active_dict_update_reference(reference: str | None) -> bool:
+        if reference in dict_update_aliases:
+            return True
+        if reference is None or not reference.endswith(".update"):
+            return False
+        return active_dict_reference(reference.removesuffix(".update"))
+
+    def active_dict_setitem_reference(reference: str | None) -> bool:
+        if reference in dict_setitem_aliases:
+            return True
+        if reference is None or not reference.endswith(".__setitem__"):
+            return False
+        return active_dict_reference(reference.removesuffix(".__setitem__"))
+
+    def active_dict_setdefault_reference(reference: str | None) -> bool:
+        if reference is None or not reference.endswith(".setdefault"):
+            return False
+        return active_dict_reference(reference.removesuffix(".setdefault"))
+
+    def owner_name(
+        node: ast.AST,
+        aliases: Mapping[str, tuple[str, int]] | None = None,
+        typed_ids: Mapping[str, tuple[str, int]] | None = None,
+    ) -> tuple[str, int] | None:
+        current_aliases = mapping_aliases if aliases is None else aliases
+        current_typed_ids = typed_aliases if typed_ids is None else typed_ids
+        if isinstance(node, ast.NamedExpr):
+            return owner_name(node.value, current_aliases, current_typed_ids)
+        if isinstance(node, ast.Name):
+            return current_aliases.get(node.id)
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in current_typed_ids
+        ):
+            return current_typed_ids[node.value.id]
+        if (
+            isinstance(node, ast.Call)
+            and active_vars_reference(_simple_reference_name(node.func))
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in current_typed_ids
+        ):
+            return current_typed_ids[node.args[0].id]
+        if (
+            isinstance(node, ast.Call)
+            and active_getattr_reference(_simple_reference_name(node.func))
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in current_typed_ids
+            and _static_getattr_member_name(node.args[1]) == "__dict__"
+        ):
+            return current_typed_ids[node.args[0].id]
+        return None
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return is_builtins_mapping(node.value)
+        if isinstance(node, ast.Name):
+            return node.id == "__builtins__" or node.id in builtins_mapping_aliases
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in builtins_aliases
+        ):
+            return True
+        if not isinstance(node, ast.Call):
+            return False
+        return (
+            active_vars_reference(_simple_reference_name(node.func))
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in builtins_aliases
+        )
+
+    def record_member(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if owner is None or member_name is None or _typed_member_high_risk_call(owner[0], member_name) is None:
+            return
+        member_key = (owner, member_name)
+        deleted_members.discard(member_key)
+        if isinstance(value, ast.Name) and value.id == "print":
+            if not conditional and not current_print_is_shadowed and owner not in class_mutated_owners:
+                safe_members.add(member_key)
+        elif (
+            isinstance(value, ast.Attribute)
+            and value.attr == member_name
+            and isinstance(value.value, ast.Name)
+            and typed_aliases.get(value.value.id) == owner
+        ):
+            return
+        else:
+            safe_members.discard(member_key)
+
+    def record_member_delete(owner: tuple[str, int] | None, member_name: str | None) -> None:
+        if owner is None or member_name is None or _typed_member_high_risk_call(owner[0], member_name) is None:
+            return
+        member_key = (owner, member_name)
+        safe_members.discard(member_key)
+        deleted_members.add(member_key)
+
+    def record_member_delete_call(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        *,
+        conditional: bool,
+    ) -> None:
+        if owner is None:
+            return
+        if conditional or member_name is None:
+            invalidate_owner_state(owner)
+        else:
+            record_member_delete(owner, member_name)
+
+    def record_member_setdefault(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if owner is None or member_name is None:
+            return
+        member_key = (owner, member_name)
+        if member_key in deleted_members:
+            record_member(owner, member_name, value, conditional=conditional)
+
+    def record_attribute(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        if owner is not None and member_name == "__class__":
+            class_mutated_owners.add(owner)
+            safe_members.difference_update({member for member in safe_members if member[0] == owner})
+            return
+        record_member(owner, member_name, value, conditional=conditional)
+
+    def record_assignment_target(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: Mapping[str, tuple[str, int]],
+        mapping_aliases_before: Mapping[str, tuple[str, int]],
+    ) -> None:
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            record_attribute(aliases_before.get(target.value.id), target.attr, value)
+        elif isinstance(target, ast.Subscript):
+            owner = owner_name(target.value, mapping_aliases_before, aliases_before)
+            member_name = _static_getattr_member_name(target.slice)
+            if owner is not None and member_name is None:
+                safe_members.difference_update({member for member in safe_members if member[0] == owner})
+                deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
+            else:
+                record_member(owner, member_name, value)
+        elif isinstance(target, ast.Starred):
+            record_assignment_target(
+                target.value,
+                ast.Constant(value=None),
+                aliases_before,
+                mapping_aliases_before,
+            )
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    record_assignment_target(target_item, value_item, aliases_before, mapping_aliases_before)
+            else:
+                for target_item in target.elts:
+                    record_assignment_target(
+                        target_item,
+                        ast.Constant(value=None),
+                        aliases_before,
+                        mapping_aliases_before,
+                    )
+
+    def invalidate_owner_state(owner: tuple[str, int]) -> None:
+        safe_members.difference_update({member for member in safe_members if member[0] == owner})
+        deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
+
+    def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
+
+        def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
+            record_member(
+                owner,
+                _static_getattr_member_name(key_node),
+                value_node,
+                conditional=conditional,
+            )
+
+        for argument in call.args:
+            _replay_static_update_items(argument, record_item, lambda: invalidate_owner_state(owner))
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                record_member(owner, keyword.arg, keyword.value, conditional=conditional)
+            else:
+                _replay_static_update_items(keyword.value, record_item, lambda: invalidate_owner_state(owner))
+
+    def is_sys_modules_mapping(
+        node: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in active_sys_aliases
+        )
+
+    def invalidate_cached_module_name(module_name: str | None) -> None:
+        if module_name is None:
+            cached_typed_identities.clear()
+        elif module_name in {"webbrowser", "ctypes"}:
+            cached_typed_identities.pop(module_name, None)
+
+    def invalidate_sys_modules_assignment(
+        target: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> None:
+        if isinstance(target, ast.Subscript) and is_sys_modules_mapping(
+            target.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            invalidate_cached_module_name(_static_getattr_member_name(target.slice))
+
+    def invalidate_sys_modules_update(
+        call: ast.Call,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(
+            call.func.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            return False
+        if call.func.attr in {"__setitem__", "setdefault"} and len(call.args) >= 2:
+            module_name = _static_getattr_member_name(call.args[0])
+            if call.func.attr == "__setitem__" or module_name not in cached_typed_identities:
+                invalidate_cached_module_name(module_name)
+            return True
+        if call.func.attr not in {"update", "__ior__"}:
+            return False
+        found_static_item = False
+
+        def invalidate_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+            nonlocal found_static_item
+            found_static_item = True
+            invalidate_cached_module_name(_static_getattr_member_name(key_node))
+
+        def invalidate_all() -> None:
+            cached_typed_identities.clear()
+
+        for argument in call.args:
+            _replay_static_update_items(argument, invalidate_item, invalidate_all)
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                found_static_item = True
+                invalidate_cached_module_name(keyword.arg)
+            else:
+                _replay_static_update_items(keyword.value, invalidate_item, invalidate_all)
+        if not found_static_item and not call.args and not call.keywords:
+            return True
+        return True
+
+    def record_typed_call(call: ast.Call, active_aliases: Mapping[str, tuple[str, int]]) -> None:
+        if not isinstance(call.func, ast.Attribute) or not isinstance(call.func.value, ast.Name):
+            return
+        owner = active_aliases.get(call.func.value.id)
+        if owner is None or _typed_member_high_risk_call(owner[0], call.func.attr) is None:
+            return
+        canonical_member = (owner[0], call.func.attr)
+        if (owner, call.func.attr) in safe_members:
+            safe_called_members.add(canonical_member)
+        else:
+            unsafe_called_members.add(canonical_member)
+
+    def record_nested_typed_calls(
+        call: ast.Call,
+        active_aliases: Mapping[str, tuple[str, int]],
+    ) -> None:
+        payload = ast.Tuple(elts=[*call.args, *(keyword.value for keyword in call.keywords)])
+        for nested_call in _deterministically_executed_expression_calls(payload):
+            aliases_before_call = _name_aliases_before_call(payload, nested_call, active_aliases)
+            record_typed_call(nested_call, aliases_before_call)
+
+    def record_builtins_helper_assignment(member_name: str | None, value: ast.AST) -> None:
+        nonlocal builtins_dict_shadowed, builtins_setattr_shadowed, builtins_vars_shadowed
+        value_reference = _simple_reference_name(value)
+        if member_name == "setattr":
+            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+        elif member_name == "vars":
+            builtins_vars_shadowed = not active_vars_reference(value_reference)
+        elif member_name == "dict":
+            builtins_dict_shadowed = not active_dict_reference(value_reference)
+
+    def record_builtins_update(call: ast.Call) -> None:
+        for argument in call.args:
+            for key_node, value_node in _runpy_static_update_items(argument) or []:
+                record_builtins_helper_assignment(_static_getattr_member_name(key_node), value_node)
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                record_builtins_helper_assignment(keyword.arg, keyword.value)
+            elif keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                for dict_key_node, dict_value_node in zip(keyword.value.keys, keyword.value.values, strict=True):
+                    if dict_key_node is not None:
+                        record_builtins_helper_assignment(_static_getattr_member_name(dict_key_node), dict_value_node)
+
+    def invalidate_builtins_mapping_helpers() -> None:
+        record_builtins_helper_assignment("dict", ast.Constant(value=None))
+        record_builtins_helper_assignment("setattr", ast.Constant(value=None))
+        record_builtins_helper_assignment("vars", ast.Constant(value=None))
+
+    def bind_mapping_alias(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: Mapping[str, tuple[str, int]] | None = None,
+    ) -> None:
+        if isinstance(target, ast.Name):
+            owner = owner_name(value, aliases_before)
+            mapping_aliases.pop(target.id, None)
+            if owner is not None:
+                mapping_aliases[target.id] = owner
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                bind_mapping_alias(target_item, value_item, aliases_before)
+        elif isinstance(target, ast.Starred):
+            bind_mapping_alias(target.value, ast.Constant(value=None), aliases_before)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for target_item in target.elts:
+                bind_mapping_alias(target_item, ast.Constant(value=None), aliases_before)
+
+    def clear_local_mapping_alias(name: str) -> None:
+        mapping_aliases.pop(name, None)
+        builtins_mapping_aliases.discard(name)
+        builtins_mapping_update_aliases.discard(name)
+        builtins_mapping_setitem_aliases.discard(name)
+
+    def bind_builtins_mapping_alias(name: str, value: ast.AST) -> None:
+        kind: str | None = None
+        if is_builtins_mapping(value):
+            kind = "mapping"
+        elif isinstance(value, ast.Attribute) and is_builtins_mapping(value.value):
+            if value.attr in {"update", "__ior__"}:
+                kind = "update"
+            elif value.attr == "__setitem__":
+                kind = "setitem"
+        elif isinstance(value, ast.Name):
+            if value.id in builtins_mapping_aliases:
+                kind = "mapping"
+            elif value.id in builtins_mapping_update_aliases:
+                kind = "update"
+            elif value.id in builtins_mapping_setitem_aliases:
+                kind = "setitem"
+        builtins_mapping_aliases.discard(name)
+        builtins_mapping_update_aliases.discard(name)
+        builtins_mapping_setitem_aliases.discard(name)
+        if kind == "mapping":
+            builtins_mapping_aliases.add(name)
+        elif kind == "update":
+            builtins_mapping_update_aliases.add(name)
+        elif kind == "setitem":
+            builtins_mapping_setitem_aliases.add(name)
+
+    def bind_local_helper_alias(name: str, value: ast.AST) -> None:
+        value_reference = _simple_reference_name(value)
+        helper_bindings = (
+            (vars_helper_aliases, active_vars_reference),
+            (setattr_helper_aliases, active_setattr_reference),
+            (dict_helper_aliases, active_dict_reference),
+            (dict_update_aliases, active_dict_update_reference),
+            (dict_setitem_aliases, active_dict_setitem_reference),
+        )
+        for aliases, is_active in helper_bindings:
+            if is_active(value_reference):
+                aliases.add(name)
+            else:
+                aliases.discard(name)
+
+    def bind_typed_alias(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: Mapping[str, tuple[str, int]] | None = None,
+    ) -> None:
+        current_aliases = typed_aliases if aliases_before is None else aliases_before
+        if isinstance(target, ast.Name):
+            identity = current_aliases.get(_simple_reference_name(value) or "")
+            typed_aliases.pop(target.id, None)
+            if identity is not None:
+                typed_aliases[target.id] = identity
+        elif isinstance(target, ast.Starred):
+            bind_typed_alias(target.value, ast.Constant(value=None), current_aliases)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_typed_alias(target_item, value_item, current_aliases)
+            else:
+                for target_item in target.elts:
+                    bind_typed_alias(target_item, ast.Constant(value=None), current_aliases)
+
+    def record_setattr_shadow(target: ast.AST, value: ast.AST) -> None:
+        nonlocal local_setattr_shadowed, builtins_setattr_shadowed
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                record_setattr_shadow(target_item, value_item)
+            return
+        value_reference = _simple_reference_name(value)
+        if isinstance(target, ast.Name) and target.id == "setattr":
+            local_setattr_shadowed = not active_setattr_reference(value_reference)
+        elif (
+            isinstance(target, ast.Attribute)
+            and target.attr == "setattr"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+
+    def record_vars_shadow(target: ast.AST, value: ast.AST) -> None:
+        nonlocal local_vars_shadowed, builtins_vars_shadowed
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                record_vars_shadow(target_item, value_item)
+            return
+        value_reference = _simple_reference_name(value)
+        if isinstance(target, ast.Name) and target.id == "vars":
+            local_vars_shadowed = not active_vars_reference(value_reference)
+        elif (
+            isinstance(target, ast.Attribute)
+            and target.attr == "vars"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_vars_shadowed = not active_vars_reference(value_reference)
+
+    def record_dict_shadow(target: ast.AST, value: ast.AST) -> None:
+        nonlocal local_dict_shadowed, builtins_dict_shadowed
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            for target_item, value_item in zip(target.elts, value.elts, strict=False):
+                record_dict_shadow(target_item, value_item)
+            return
+        value_reference = _simple_reference_name(value)
+        if isinstance(target, ast.Name) and target.id == "dict":
+            local_dict_shadowed = not active_dict_reference(value_reference)
+        elif (
+            isinstance(target, ast.Attribute)
+            and target.attr == "dict"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_dict_shadowed = not active_dict_reference(value_reference)
+
+    def invalidate_rebound_target(target: ast.AST) -> None:
+        nonlocal local_setattr_shadowed, builtins_setattr_shadowed, local_vars_shadowed, builtins_vars_shadowed
+        nonlocal local_dict_shadowed, builtins_dict_shadowed
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                invalidate_rebound_target(element)
+            return
+        if isinstance(target, ast.Starred):
+            invalidate_rebound_target(target.value)
+            return
+        if isinstance(target, ast.Name):
+            typed_aliases.pop(target.id, None)
+            clear_local_mapping_alias(target.id)
+            clear_module_helper_target(target)
+            reload_aliases.discard(target.id)
+            vars_helper_aliases.discard(target.id)
+            setattr_helper_aliases.discard(target.id)
+            dict_helper_aliases.discard(target.id)
+            dict_update_aliases.discard(target.id)
+            dict_setitem_aliases.discard(target.id)
+            if target.id == "vars":
+                local_vars_shadowed = True
+            elif target.id == "setattr":
+                local_setattr_shadowed = True
+            elif target.id == "dict":
+                local_dict_shadowed = True
+        elif isinstance(target, ast.Attribute):
+            if isinstance(target.value, ast.Name):
+                owner = typed_aliases.get(target.value.id)
+                if owner is not None:
+                    safe_members.discard((owner, target.attr))
+                if target.value.id in builtins_aliases:
+                    if target.attr == "vars":
+                        builtins_vars_shadowed = True
+                    elif target.attr == "setattr":
+                        builtins_setattr_shadowed = True
+                    elif target.attr == "dict":
+                        builtins_dict_shadowed = True
+        elif isinstance(target, ast.Subscript):
+            owner = owner_name(target.value)
+            member_name = _static_getattr_member_name(target.slice)
+            if owner is not None and member_name is not None:
+                safe_members.discard((owner, member_name))
+
+    def invalidate_match_pattern(pattern: ast.pattern) -> None:
+        for node in ast.walk(pattern):
+            if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+            elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                invalidate_rebound_target(ast.Name(id=node.rest, ctx=ast.Store()))
+
+    def invalidate_dynamic_bindings(statement: ast.stmt) -> None:
+        class BindingVisitor(ast.NodeVisitor):
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.visit(node.value)
+                for target in node.targets:
+                    invalidate_rebound_target(target)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                self.visit(node.annotation)
+                if node.value is not None:
+                    self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                self.visit(node.value)
+                invalidate_rebound_target(node.target)
+
+            def visit_Delete(self, node: ast.Delete) -> None:
+                for target in node.targets:
+                    invalidate_rebound_target(target)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    invalidate_rebound_target(ast.Name(id=local_name, ctx=ast.Store()))
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                for alias in node.names:
+                    invalidate_rebound_target(ast.Name(id=alias.asname or alias.name, ctx=ast.Store()))
+
+            def visit_For(self, node: ast.For) -> None:
+                self.visit(node.iter)
+                invalidate_rebound_target(node.target)
+                for child in [*node.body, *node.orelse]:
+                    self.visit(child)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                self.visit(node.iter)
+                invalidate_rebound_target(node.target)
+                for child in [*node.body, *node.orelse]:
+                    self.visit(child)
+
+            def visit_With(self, node: ast.With) -> None:
+                for item in node.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        invalidate_rebound_target(item.optional_vars)
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+                for item in node.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        invalidate_rebound_target(item.optional_vars)
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                if node.type is not None:
+                    self.visit(node.type)
+                if node.name is not None:
+                    invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for child in node.body:
+                    self.visit(child)
+
+            def visit_Match(self, node: ast.Match) -> None:
+                self.visit(node.subject)
+                for case in node.cases:
+                    invalidate_match_pattern(case.pattern)
+                    if case.guard is not None:
+                        self.visit(case.guard)
+                    for child in case.body:
+                        self.visit(child)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
+                for expression in [*node.decorator_list, *node.bases]:
+                    self.visit(expression)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+
+        BindingVisitor().visit(statement)
+
+    def lexical_scope_snapshot() -> tuple[Any, ...]:
+        return (
+            dict(typed_aliases),
+            set(builtins_aliases),
+            set(vars_helper_aliases),
+            set(setattr_helper_aliases),
+            set(dict_helper_aliases),
+            set(dict_update_aliases),
+            set(dict_setitem_aliases),
+            set(builtins_mapping_aliases),
+            set(builtins_mapping_update_aliases),
+            set(builtins_mapping_setitem_aliases),
+            dict(mapping_aliases),
+            set(importlib_aliases),
+            set(reload_aliases),
+            set(sys_aliases),
+            set(sys_modules_aliases),
+            set(sys_modules_pop_aliases),
+            set(sys_modules_clear_aliases),
+            local_setattr_shadowed,
+            local_vars_shadowed,
+            local_dict_shadowed,
+        )
+
+    def restore_lexical_scope(snapshot: tuple[Any, ...]) -> None:
+        nonlocal local_setattr_shadowed, local_vars_shadowed, local_dict_shadowed
+        mappings = (typed_aliases, mapping_aliases)
+        sets = (
+            builtins_aliases,
+            vars_helper_aliases,
+            setattr_helper_aliases,
+            dict_helper_aliases,
+            dict_update_aliases,
+            dict_setitem_aliases,
+            builtins_mapping_aliases,
+            builtins_mapping_update_aliases,
+            builtins_mapping_setitem_aliases,
+            importlib_aliases,
+            reload_aliases,
+            sys_aliases,
+            sys_modules_aliases,
+            sys_modules_pop_aliases,
+            sys_modules_clear_aliases,
+        )
+        for mapping, saved in zip(mappings, (snapshot[0], snapshot[10]), strict=True):
+            mapping.clear()
+            mapping.update(saved)
+        for current, saved in zip(sets, (*snapshot[1:10], *snapshot[11:17]), strict=True):
+            current.clear()
+            current.update(saved)
+        local_setattr_shadowed, local_vars_shadowed, local_dict_shadowed = snapshot[17:20]
+
+    executed_statement_ids = {id(statement) for statement in executed_statements}
+    shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    shadowed_delattr_references_by_statement = _compact_snippet_shadowed_delattr_references_by_statement(
+        executed_statements
+    )
+    first_print_shadow_index = next(
+        (index for index, statement in enumerate(executed_statements) if id(statement) in shadowed_print_statement_ids),
+        len(executed_statements),
+    )
+    class_scope_stack: list[tuple[ast.ClassDef, tuple[Any, ...]]] = []
+    for statement_index, statement in enumerate(executed_statements):
+        statement_scope = class_scope_path(statement)
+        common_scope_length = 0
+        while (
+            common_scope_length < len(class_scope_stack)
+            and common_scope_length < len(statement_scope)
+            and class_scope_stack[common_scope_length][0] is statement_scope[common_scope_length]
+        ):
+            common_scope_length += 1
+        while len(class_scope_stack) > common_scope_length:
+            _scope, snapshot = class_scope_stack.pop()
+            restore_lexical_scope(snapshot)
+        for scope in statement_scope[common_scope_length:]:
+            class_scope_stack.append((scope, lexical_scope_snapshot()))
+        typed_aliases_before = dict(typed_aliases)
+        mapping_aliases_before = dict(mapping_aliases)
+        reload_aliases_before = frozenset(reload_aliases)
+        importlib_aliases_before = frozenset(importlib_aliases)
+        sys_aliases_before = frozenset(sys_aliases)
+        sys_modules_aliases_before = frozenset(sys_modules_aliases)
+        sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
+        sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
+        uncertain_if = isinstance(statement, ast.If) and not isinstance(statement.test, ast.Constant)
+        uncertain_try = statement.__class__.__name__ == "TryStar" or (
+            isinstance(statement, ast.Try)
+            and not any(
+                id(child) in executed_statement_ids
+                for child in [
+                    *statement.body,
+                    *statement.orelse,
+                    *(handler_statement for handler in statement.handlers for handler_statement in handler.body),
+                ]
+            )
+        )
+        if uncertain_if or uncertain_try:
+            invalidate_dynamic_bindings(statement)
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                clear_local_mapping_alias(local_name)
+                typed_aliases.pop(local_name, None)
+                reload_aliases.discard(local_name)
+                clear_module_helper_target(ast.Name(id=local_name))
+                if alias.name == "webbrowser":
+                    identity = cached_typed_identities.get("webbrowser")
+                    if identity is None:
+                        identity = ("webbrowser", next_typed_generation["webbrowser"])
+                        next_typed_generation["webbrowser"] += 1
+                        cached_typed_identities["webbrowser"] = identity
+                    typed_aliases[local_name] = identity
+                elif alias.name == "ctypes":
+                    identity = cached_typed_identities.get("ctypes")
+                    if identity is None:
+                        identity = ("ctypes", next_typed_generation["ctypes"])
+                        next_typed_generation["ctypes"] += 1
+                        cached_typed_identities["ctypes"] = identity
+                    typed_aliases[local_name] = identity
+                elif alias.name == "builtins":
+                    builtins_aliases.add(local_name)
+                elif alias.name == "importlib":
+                    importlib_aliases.add(local_name)
+                elif alias.name == "sys":
+                    sys_aliases.add(local_name)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name
+                typed_aliases.pop(local_name, None)
+                clear_local_mapping_alias(local_name)
+                clear_module_helper_target(ast.Name(id=local_name))
+                reload_aliases.discard(local_name)
+                if statement.module == "importlib" and alias.name == "reload":
+                    reload_aliases.add(local_name)
+                elif statement.module == "sys" and alias.name == "modules":
+                    sys_modules_aliases.add(local_name)
+        elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            typed_aliases.pop(statement.name, None)
+            clear_local_mapping_alias(statement.name)
+            clear_module_helper_target(ast.Name(id=statement.name))
+            reload_aliases.discard(statement.name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_typed_alias(target, statement.value, typed_aliases_before)
+                record_setattr_shadow(target, statement.value)
+                record_vars_shadow(target, statement.value)
+                record_dict_shadow(target, statement.value)
+                record_assignment_target(
+                    target,
+                    statement.value,
+                    typed_aliases_before,
+                    mapping_aliases_before,
+                )
+                invalidate_sys_modules_assignment(target, sys_aliases_before, sys_modules_aliases_before)
+                if isinstance(target, ast.Name):
+                    bind_local_helper_alias(target.id, statement.value)
+                    bind_builtins_mapping_alias(target.id, statement.value)
+                bind_module_helper_target(
+                    target,
+                    statement.value,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                    importlib_aliases_before,
+                )
+                bind_reload_target(target, statement.value, reload_aliases_before, importlib_aliases_before)
+                bind_mapping_alias(target, statement.value, mapping_aliases_before)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            bind_typed_alias(statement.target, statement.value, typed_aliases_before)
+            record_setattr_shadow(statement.target, statement.value)
+            record_vars_shadow(statement.target, statement.value)
+            record_dict_shadow(statement.target, statement.value)
+            record_assignment_target(
+                statement.target,
+                statement.value,
+                typed_aliases_before,
+                mapping_aliases_before,
+            )
+            invalidate_sys_modules_assignment(
+                statement.target,
+                sys_aliases_before,
+                sys_modules_aliases_before,
+            )
+            if isinstance(statement.target, ast.Name):
+                bind_local_helper_alias(statement.target.id, statement.value)
+                bind_builtins_mapping_alias(statement.target.id, statement.value)
+            bind_module_helper_target(
+                statement.target,
+                statement.value,
+                sys_aliases_before,
+                sys_modules_aliases_before,
+                sys_modules_pop_aliases_before,
+                sys_modules_clear_aliases_before,
+                importlib_aliases_before,
+            )
+            bind_reload_target(
+                statement.target,
+                statement.value,
+                reload_aliases_before,
+                importlib_aliases_before,
+            )
+            bind_mapping_alias(statement.target, statement.value)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    record_member_delete(typed_aliases.get(target.value.id), target.attr)
+                elif isinstance(target, ast.Subscript):
+                    record_member_delete(
+                        owner_name(target.value),
+                        _static_getattr_member_name(target.slice),
+                    )
+                for target_name in _assignment_target_names(target):
+                    typed_aliases.pop(target_name, None)
+                    clear_local_mapping_alias(target_name)
+                    clear_module_helper_target(ast.Name(id=target_name))
+                    reload_aliases.discard(target_name)
+                if (
+                    isinstance(target, ast.Subscript)
+                    and (
+                        (isinstance(target.value, ast.Name) and target.value.id in sys_modules_aliases)
+                        or (
+                            isinstance(target.value, ast.Attribute)
+                            and target.value.attr == "modules"
+                            and isinstance(target.value.value, ast.Name)
+                            and target.value.value.id in sys_aliases
+                        )
+                    )
+                    and (module_name := _static_getattr_member_name(target.slice)) in {"webbrowser", "ctypes"}
+                ):
+                    cached_typed_identities.pop(module_name, None)
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
+            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, _value: invalidate_cached_module_name(_static_getattr_member_name(key)),
+                    cached_typed_identities.clear,
+                )
+            elif is_builtins_mapping(statement.target):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, value: record_builtins_helper_assignment(_static_getattr_member_name(key), value),
+                    invalidate_builtins_mapping_helpers,
+                )
+            elif (target_owner := owner_name(statement.target)) is not None:
+
+                def invalidate_target_owner() -> None:
+                    safe_members.difference_update({member for member in safe_members if member[0] == target_owner})
+                    deleted_members.difference_update(
+                        {member for member in deleted_members if member[0] == target_owner}
+                    )
+
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, value: record_member(target_owner, _static_getattr_member_name(key), value),
+                    invalidate_target_owner,
+                )
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            invalidate_rebound_target(statement.target)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    invalidate_rebound_target(item.optional_vars)
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                invalidate_match_pattern(case.pattern)
+        for value in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not deferred_annotations,
+        ):
+            expression_typed_aliases = (
+                typed_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else typed_aliases
+            )
+            expression_mapping_aliases = (
+                mapping_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else mapping_aliases
+            )
+            for node in _deterministically_executed_expression_calls(value):
+                reference = _simple_reference_name(node.func)
+                active_typed_aliases = _name_aliases_before_call(value, node, expression_typed_aliases)
+                active_mapping_aliases = _name_aliases_before_call(value, node, expression_mapping_aliases)
+                (
+                    active_sys_aliases,
+                    active_sys_modules_aliases,
+                    active_sys_modules_pop_aliases,
+                    active_sys_modules_clear_aliases,
+                    active_importlib_aliases,
+                ) = _module_helper_aliases_before_call(
+                    value,
+                    node,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                    importlib_aliases_before,
+                )
+                active_reload_aliases = _reload_aliases_before_call(
+                    value,
+                    node,
+                    reload_aliases_before,
+                    set(active_importlib_aliases),
+                )
+                record_typed_call(node, active_typed_aliases)
+                if invalidate_sys_modules_update(node, active_sys_aliases, active_sys_modules_aliases):
+                    continue
+                if (
+                    (reload_argument := _static_call_argument(node, 0, "module")) is not None
+                    and isinstance(reload_argument, ast.Name)
+                    and reload_argument.id in active_typed_aliases
+                    and (
+                        reference in active_reload_aliases
+                        or (
+                            reference is not None
+                            and reference.endswith(".reload")
+                            and reference.removesuffix(".reload") in active_importlib_aliases
+                        )
+                    )
+                ):
+                    reload_owner = active_typed_aliases[reload_argument.id]
+                    safe_members.difference_update({member for member in safe_members if member[0] == reload_owner})
+                evicted_owner = _static_sys_modules_eviction_name(
+                    node,
+                    set(active_sys_aliases),
+                    set(active_sys_modules_aliases),
+                    set(active_sys_modules_pop_aliases),
+                    set(active_sys_modules_clear_aliases),
+                )
+                if evicted_owner == "*":
+                    cached_typed_identities.clear()
+                    continue
+                if evicted_owner in {
+                    "webbrowser",
+                    "ctypes",
+                }:
+                    cached_typed_identities.pop(evicted_owner, None)
+                    continue
+                if isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_update_aliases:
+                    record_builtins_update(node)
+                    continue
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in builtins_mapping_setitem_aliases
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                    continue
+                if active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
+                    record_builtins_update(node)
+                    continue
+                if (
+                    active_dict_setitem_reference(reference)
+                    and len(node.args) >= 3
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"update", "__ior__"}
+                    and is_builtins_mapping(node.func.value)
+                ):
+                    record_builtins_update(node)
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setitem__"
+                    and is_builtins_mapping(node.func.value)
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                    continue
+                if (
+                    active_setattr_reference(reference)
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in builtins_aliases
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    continue
+                if (
+                    active_setattr_reference(reference)
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_attribute(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setattr__"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in active_typed_aliases
+                    and len(node.args) >= 2
+                ):
+                    record_attribute(
+                        active_typed_aliases[node.func.value.id],
+                        _static_getattr_member_name(node.args[0]),
+                        node.args[1],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    reference in {"object.__setattr__", "builtins.object.__setattr__"}
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_attribute(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
+                    and reference not in shadowed_delattr_references_by_statement.get(id(statement), set())
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__delattr__"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in active_typed_aliases
+                    and node.args
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.func.value.id],
+                        _static_getattr_member_name(node.args[0]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    reference in {"object.__delattr__", "builtins.object.__delattr__"}
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    active_dict_update_reference(reference)
+                    and node.args
+                    and (
+                        update_owner := owner_name(
+                            node.args[0],
+                            active_mapping_aliases,
+                            active_typed_aliases,
+                        )
+                    )
+                    is not None
+                ):
+                    record_nested_typed_calls(node, active_typed_aliases)
+                    record_update(
+                        update_owner,
+                        node,
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
                     )
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
