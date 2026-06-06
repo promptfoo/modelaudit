@@ -1,0 +1,585 @@
+diff --git a/modelaudit/detectors/jit_script.py b/modelaudit/detectors/jit_script.py
+index 452e162e..869b836e 100644
+--- a/modelaudit/detectors/jit_script.py
++++ b/modelaudit/detectors/jit_script.py
+@@ -997,25 +997,44 @@ def _unsafe_typed_member_aliases(
+     candidate: bytes,
+     _inherited_typed_aliases: Mapping[str, str],
+ ) -> dict[str, _TypedMemberCallableValue]:
+-    typed_aliases: dict[str, str] = {}
++    typed_aliases: dict[str, tuple[str, int]] = {}
++    cached_typed_identities: dict[str, tuple[str, int]] = {
++        "ctypes": ("ctypes", 0),
++        "webbrowser": ("webbrowser", 0),
++    }
++    next_typed_identity = 1
+     builtins_aliases = {"builtins", "__builtins__"}
+-    safe_members: set[tuple[str, str]] = set()
+-    unknown_members: set[tuple[str, str]] = set()
+-    member_callable_values: dict[tuple[str, str], _TypedMemberCallableValue] = {}
++    safe_members: set[tuple[tuple[str, int], str]] = set()
++    unknown_members: set[tuple[tuple[str, int], str]] = set()
++    deleted_members: set[tuple[tuple[str, int], str]] = set()
++    member_callable_values: dict[tuple[tuple[str, int], str], _TypedMemberCallableValue] = {}
+     callable_aliases: dict[str, _TypedMemberCallableValue] = {}
++    sys_aliases: set[str] = set()
++    sys_modules_aliases: set[str] = set()
++    sys_modules_pop_aliases: set[str] = set()
++    sys_modules_clear_aliases: set[str] = set()
+     print_is_builtin = True
+     builtins_print_is_builtin = True
+     setattr_is_builtin = True
+ 
+-    def typed_member(node: ast.AST) -> tuple[str, str] | None:
++    def current_typed_identity(module_name: str) -> tuple[str, int]:
++        nonlocal next_typed_identity
++        identity = cached_typed_identities.get(module_name)
++        if identity is None:
++            identity = (module_name, next_typed_identity)
++            cached_typed_identities[module_name] = identity
++            next_typed_identity += 1
++        return identity
++
++    def typed_member(node: ast.AST) -> tuple[tuple[str, int], str] | None:
+         if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+             return None
+-        module_name = typed_aliases.get(node.value.id)
+-        if module_name is None or _typed_member_high_risk_call(module_name, node.attr) is None:
++        owner = typed_aliases.get(node.value.id)
++        if owner is None or _typed_member_high_risk_call(owner[0], node.attr) is None:
+             return None
+-        return module_name, node.attr
++        return owner, node.attr
+ 
+-    def typed_mapping_owner(node: ast.AST) -> str | None:
++    def typed_mapping_owner(node: ast.AST) -> tuple[str, int] | None:
+         if isinstance(node, ast.Attribute) and node.attr == "__dict__" and isinstance(node.value, ast.Name):
+             return typed_aliases.get(node.value.id)
+         if (
+@@ -1027,17 +1046,17 @@ def _unsafe_typed_member_aliases(
+             return typed_aliases.get(node.args[0].id)
+         return None
+ 
+-    def static_member_target(target: ast.AST) -> tuple[str, str] | None:
++    def static_member_target(target: ast.AST) -> tuple[tuple[str, int], str] | None:
+         direct_member = typed_member(target)
+         if direct_member is not None:
+             return direct_member
+         if not isinstance(target, ast.Subscript):
+             return None
+-        module_name = typed_mapping_owner(target.value)
++        owner = typed_mapping_owner(target.value)
+         member_name = _static_getattr_member_name(target.slice)
+-        if module_name is None or member_name is None or _typed_member_high_risk_call(module_name, member_name) is None:
++        if owner is None or member_name is None or _typed_member_high_risk_call(owner[0], member_name) is None:
+             return None
+-        return module_name, member_name
++        return owner, member_name
+ 
+     def expression_callable_value(value: ast.AST) -> _TypedMemberCallableValue | None:
+         reference = _simple_reference_name(value)
+@@ -1046,7 +1065,8 @@ def _unsafe_typed_member_aliases(
+         member = typed_member(value)
+         if member is None or member in safe_members or member in unknown_members:
+             return None
+-        return member_callable_values.get(member, frozenset({(*member, False)}))
++        owner, member_name = member
++        return member_callable_values.get(member, frozenset({(owner[0], member_name, False)}))
+ 
+     def is_safe_print_reference(value: ast.AST) -> bool:
+         nonlocal print_is_builtin, builtins_print_is_builtin
+@@ -1060,8 +1080,9 @@ def _unsafe_typed_member_aliases(
+             and builtins_print_is_builtin
+         )
+ 
+-    def record_member_state(module_name: str, member_name: str, value: ast.AST) -> None:
+-        member = (module_name, member_name)
++    def record_member_state(owner: tuple[str, int], member_name: str, value: ast.AST) -> None:
++        member = (owner, member_name)
++        deleted_members.discard(member)
+         if is_safe_print_reference(value):
+             safe_members.add(member)
+             unknown_members.discard(member)
+@@ -1077,6 +1098,13 @@ def _unsafe_typed_member_aliases(
+         unknown_members.add(member)
+         member_callable_values.pop(member, None)
+ 
++    def record_member_delete(owner: tuple[str, int], member_name: str) -> None:
++        member = (owner, member_name)
++        safe_members.discard(member)
++        unknown_members.discard(member)
++        member_callable_values.pop(member, None)
++        deleted_members.add(member)
++
+     def bind_name(target_name: str, value: ast.AST | None) -> None:
+         nonlocal print_is_builtin, setattr_is_builtin
+         callable_value = expression_callable_value(value) if value is not None else None
+@@ -1126,37 +1154,141 @@ def _unsafe_typed_member_aliases(
+             for index, element in enumerate(target.elts):
+                 bind_target(element, values[index] if index < len(values) else None)
+ 
++    def delete_target(target: ast.AST) -> None:
++        member = static_member_target(target)
++        if member is not None:
++            record_member_delete(*member)
++            return
++        if isinstance(target, ast.Name):
++            bind_name(target.id, None)
++        elif isinstance(target, ast.Starred):
++            delete_target(target.value)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            for element in target.elts:
++                delete_target(element)
++
++    def clear_module_helper_target(target: ast.AST) -> None:
++        if isinstance(target, ast.Name):
++            sys_aliases.discard(target.id)
++            sys_modules_aliases.discard(target.id)
++            sys_modules_pop_aliases.discard(target.id)
++            sys_modules_clear_aliases.discard(target.id)
++        elif isinstance(target, ast.Starred):
++            clear_module_helper_target(target.value)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            for element in target.elts:
++                clear_module_helper_target(element)
++
++    def bind_module_helper_target(
++        target: ast.AST,
++        value: ast.AST,
++        sys_before: Collection[str],
++        modules_before: Collection[str],
++        pop_before: Collection[str],
++        clear_before: Collection[str],
++    ) -> None:
++        if isinstance(target, ast.Name):
++            clear_module_helper_target(target)
++            if isinstance(value, ast.Name):
++                if value.id in sys_before:
++                    sys_aliases.add(target.id)
++                elif value.id in modules_before:
++                    sys_modules_aliases.add(target.id)
++                elif value.id in pop_before:
++                    sys_modules_pop_aliases.add(target.id)
++                elif value.id in clear_before:
++                    sys_modules_clear_aliases.add(target.id)
++            elif (
++                isinstance(value, ast.Attribute)
++                and value.attr == "modules"
++                and isinstance(value.value, ast.Name)
++                and value.value.id in sys_before
++            ):
++                sys_modules_aliases.add(target.id)
++            elif isinstance(value, ast.Attribute) and value.attr in {"pop", "__delitem__", "clear"}:
++                is_modules_mapping = (isinstance(value.value, ast.Name) and value.value.id in modules_before) or (
++                    isinstance(value.value, ast.Attribute)
++                    and value.value.attr == "modules"
++                    and isinstance(value.value.value, ast.Name)
++                    and value.value.value.id in sys_before
++                )
++                if is_modules_mapping:
++                    if value.attr == "clear":
++                        sys_modules_clear_aliases.add(target.id)
++                    else:
++                        sys_modules_pop_aliases.add(target.id)
++        elif isinstance(target, ast.Starred):
++            clear_module_helper_target(target.value)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
++                for target_item, value_item in zip(target.elts, value.elts, strict=True):
++                    bind_module_helper_target(
++                        target_item,
++                        value_item,
++                        sys_before,
++                        modules_before,
++                        pop_before,
++                        clear_before,
++                    )
++            else:
++                clear_module_helper_target(target)
++
++    def invalidate_cached_typed_identity(module_name: str | None) -> None:
++        if module_name == "*":
++            cached_typed_identities.clear()
++        elif module_name in {"ctypes", "webbrowser"}:
++            cached_typed_identities.pop(module_name, None)
++
+     def record_helper_call(call: ast.Call) -> None:
+         nonlocal builtins_print_is_builtin
+ 
+-        def record_static_update(module_name: str, update: ast.AST) -> None:
++        def record_static_update(owner: tuple[str, int], update: ast.AST) -> None:
+             def record_item(key: ast.AST, value: ast.AST) -> None:
+                 member_name = _static_getattr_member_name(key)
+-                if member_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
+-                    record_member_state(module_name, member_name, value)
++                if member_name is not None and _typed_member_high_risk_call(owner[0], member_name) is not None:
++                    record_member_state(owner, member_name, value)
+ 
+             def invalidate_unknown() -> None:
+                 for member_name in _TYPED_PROOF_MEMBER_NAMES:
+-                    if _typed_member_high_risk_call(module_name, member_name) is not None:
+-                        member = (module_name, member_name)
++                    if _typed_member_high_risk_call(owner[0], member_name) is not None:
++                        member = (owner, member_name)
+                         safe_members.discard(member)
+                         unknown_members.add(member)
++                        deleted_members.discard(member)
+                         member_callable_values.pop(member, None)
+ 
+             _replay_static_update_items(update, record_item, invalidate_unknown)
+ 
+         reference = _simple_reference_name(call.func)
++        evicted_name = _static_sys_modules_eviction_name(
++            call,
++            set(sys_aliases),
++            set(sys_modules_aliases),
++            set(sys_modules_pop_aliases),
++            set(sys_modules_clear_aliases),
++        )
++        if evicted_name is not None:
++            invalidate_cached_typed_identity(evicted_name)
++            return
+         if reference in {"setattr", "builtins.setattr", "__builtins__.setattr"} and len(call.args) >= 3:
+             helper_is_builtin = reference != "setattr" or setattr_is_builtin
+             owner = call.args[0]
+             member_name = _static_getattr_member_name(call.args[1])
+             if helper_is_builtin and isinstance(owner, ast.Name) and member_name is not None:
+-                module_name = typed_aliases.get(owner.id)
+-                if module_name is not None and _typed_member_high_risk_call(module_name, member_name) is not None:
+-                    record_member_state(module_name, member_name, call.args[2])
++                typed_owner = typed_aliases.get(owner.id)
++                if typed_owner is not None and _typed_member_high_risk_call(typed_owner[0], member_name) is not None:
++                    record_member_state(typed_owner, member_name, call.args[2])
+                 elif owner.id in builtins_aliases and member_name == "print":
+                     builtins_print_is_builtin = is_safe_print_reference(call.args[2])
+             return
++        if reference in {"delattr", "builtins.delattr", "__builtins__.delattr"} and len(call.args) >= 2:
++            owner = call.args[0]
++            member_name = _static_getattr_member_name(call.args[1])
++            if isinstance(owner, ast.Name) and member_name is not None:
++                typed_owner = typed_aliases.get(owner.id)
++                if typed_owner is not None and _typed_member_high_risk_call(typed_owner[0], member_name) is not None:
++                    record_member_delete(typed_owner, member_name)
++            return
+         if not isinstance(call.func, ast.Attribute):
+             return
+         if call.func.attr == "__setitem__" and len(call.args) >= 2:
+@@ -1175,6 +1307,26 @@ def _unsafe_typed_member_aliases(
+             if module_name is not None and member_name is not None:
+                 record_member_state(module_name, member_name, call.args[value_index])
+             return
++        if call.func.attr == "setdefault" and len(call.args) >= 2:
++            mapping_owner = typed_mapping_owner(call.func.value)
++            key_index = 0
++            value_index = 1
++            if (
++                mapping_owner is None
++                and reference in {"dict.setdefault", "builtins.dict.setdefault", "__builtins__.dict.setdefault"}
++                and len(call.args) >= 3
++            ):
++                mapping_owner = typed_mapping_owner(call.args[0])
++                key_index = 1
++                value_index = 2
++            member_name = _static_getattr_member_name(call.args[key_index])
++            if (
++                mapping_owner is not None
++                and member_name is not None
++                and (mapping_owner, member_name) in deleted_members
++            ):
++                record_member_state(mapping_owner, member_name, call.args[value_index])
++            return
+         if call.func.attr != "update":
+             return
+         mapping_node = call.func.value
+@@ -1183,7 +1335,7 @@ def _unsafe_typed_member_aliases(
+             for argument in call.args:
+                 record_static_update(module_name, argument)
+             for member_name, value in keyword_values.items():
+-                if _typed_member_high_risk_call(module_name, member_name) is not None:
++                if _typed_member_high_risk_call(module_name[0], member_name) is not None:
+                     record_member_state(module_name, member_name, value)
+             return
+         if reference not in {"dict.update", "builtins.dict.update", "__builtins__.dict.update"} or not call.args:
+@@ -1192,9 +1344,133 @@ def _unsafe_typed_member_aliases(
+             for argument in call.args[1:]:
+                 record_static_update(module_name, argument)
+             for member_name, value in keyword_values.items():
+-                if _typed_member_high_risk_call(module_name, member_name) is not None:
++                if _typed_member_high_risk_call(module_name[0], member_name) is not None:
+                     record_member_state(module_name, member_name, value)
+ 
++    def binding_snapshot() -> tuple[Any, ...]:
++        return (
++            dict(typed_aliases),
++            dict(callable_aliases),
++            set(builtins_aliases),
++            set(sys_aliases),
++            set(sys_modules_aliases),
++            set(sys_modules_pop_aliases),
++            set(sys_modules_clear_aliases),
++            print_is_builtin,
++            setattr_is_builtin,
++        )
++
++    def restore_bindings(snapshot: tuple[Any, ...]) -> None:
++        nonlocal print_is_builtin, setattr_is_builtin
++        typed_aliases.clear()
++        typed_aliases.update(snapshot[0])
++        callable_aliases.clear()
++        callable_aliases.update(snapshot[1])
++        builtins_aliases.clear()
++        builtins_aliases.update(snapshot[2])
++        sys_aliases.clear()
++        sys_aliases.update(snapshot[3])
++        sys_modules_aliases.clear()
++        sys_modules_aliases.update(snapshot[4])
++        sys_modules_pop_aliases.clear()
++        sys_modules_pop_aliases.update(snapshot[5])
++        sys_modules_clear_aliases.clear()
++        sys_modules_clear_aliases.update(snapshot[6])
++        print_is_builtin, setattr_is_builtin = snapshot[7:9]
++
++    def replay_statement(statement: ast.stmt) -> None:
++        sys_aliases_before = frozenset(sys_aliases)
++        sys_modules_aliases_before = frozenset(sys_modules_aliases)
++        sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
++        sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
++        for expression in _deterministically_evaluated_statement_expressions(
++            statement,
++            evaluate_annotations=False,
++        ):
++            for call in _deterministically_executed_expression_calls(expression):
++                record_helper_call(call)
++        if isinstance(statement, ast.Import):
++            for alias in statement.names:
++                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
++                bind_name(local_name, None)
++                clear_module_helper_target(ast.Name(id=local_name))
++                if alias.name in {"ctypes", "webbrowser"}:
++                    typed_aliases[local_name] = current_typed_identity(alias.name)
++                elif alias.name == "sys":
++                    sys_aliases.add(local_name)
++        elif isinstance(statement, ast.ImportFrom):
++            for alias in statement.names:
++                target_name = alias.asname or alias.name
++                bind_name(target_name, None)
++                clear_module_helper_target(ast.Name(id=target_name))
++                if (
++                    statement.module in {"ctypes", "webbrowser"}
++                    and _typed_member_high_risk_call(statement.module, alias.name) is not None
++                ):
++                    owner = current_typed_identity(statement.module)
++                    member = (owner, alias.name)
++                    if member not in safe_members and member not in unknown_members:
++                        callable_aliases[target_name] = member_callable_values.get(
++                            member, frozenset({(owner[0], alias.name, False)})
++                        )
++                elif statement.module == "sys" and alias.name == "modules":
++                    sys_modules_aliases.add(target_name)
++        elif isinstance(statement, ast.Assign):
++            for target in statement.targets:
++                bind_target(target, statement.value)
++                bind_module_helper_target(
++                    target,
++                    statement.value,
++                    sys_aliases_before,
++                    sys_modules_aliases_before,
++                    sys_modules_pop_aliases_before,
++                    sys_modules_clear_aliases_before,
++                )
++        elif isinstance(statement, ast.AnnAssign):
++            bind_target(statement.target, statement.value)
++            if statement.value is not None:
++                bind_module_helper_target(
++                    statement.target,
++                    statement.value,
++                    sys_aliases_before,
++                    sys_modules_aliases_before,
++                    sys_modules_pop_aliases_before,
++                    sys_modules_clear_aliases_before,
++                )
++        elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
++            bind_target(statement.target, None)
++            clear_module_helper_target(statement.target)
++        elif isinstance(statement, (ast.With, ast.AsyncWith)):
++            for item in statement.items:
++                if item.optional_vars is not None:
++                    bind_target(item.optional_vars, None)
++                    clear_module_helper_target(item.optional_vars)
++        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            bind_name(statement.name, None)
++            clear_module_helper_target(ast.Name(id=statement.name))
++        elif isinstance(statement, ast.ClassDef):
++            bind_name(statement.name, None)
++            clear_module_helper_target(ast.Name(id=statement.name))
++            class_bindings = binding_snapshot()
++            for child in _compact_deterministically_executed_statements(statement.body):
++                replay_statement(child)
++            restore_bindings(class_bindings)
++        elif isinstance(statement, ast.Delete):
++            for target in statement.targets:
++                if isinstance(target, ast.Subscript) and (
++                    (isinstance(target.value, ast.Name) and target.value.id in sys_modules_aliases)
++                    or (
++                        isinstance(target.value, ast.Attribute)
++                        and target.value.attr == "modules"
++                        and isinstance(target.value.value, ast.Name)
++                        and target.value.value.id in sys_aliases
++                    )
++                ):
++                    invalidate_cached_typed_identity(_static_getattr_member_name(target.slice))
++                delete_target(target)
++                clear_module_helper_target(target)
++        _update_compact_builtins_aliases(statement, builtins_aliases)
++
+     for line, statements in _compact_prefix_module_lines(candidate):
+         if not statements:
+             for alias_name in list(typed_aliases):
+@@ -1205,48 +1481,7 @@ def _unsafe_typed_member_aliases(
+                     callable_aliases.pop(alias_name, None)
+             continue
+         for statement in statements:
+-            for expression in _deterministically_evaluated_statement_expressions(
+-                statement,
+-                evaluate_annotations=False,
+-            ):
+-                for call in _deterministically_executed_expression_calls(expression):
+-                    record_helper_call(call)
+-            if isinstance(statement, ast.Import):
+-                for alias in statement.names:
+-                    local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+-                    bind_name(local_name, None)
+-                    if alias.name in {"ctypes", "webbrowser"}:
+-                        typed_aliases[local_name] = alias.name
+-            elif isinstance(statement, ast.ImportFrom):
+-                for alias in statement.names:
+-                    target_name = alias.asname or alias.name
+-                    bind_name(target_name, None)
+-                    if (
+-                        statement.module in {"ctypes", "webbrowser"}
+-                        and _typed_member_high_risk_call(statement.module, alias.name) is not None
+-                    ):
+-                        member = (statement.module, alias.name)
+-                        if member not in safe_members and member not in unknown_members:
+-                            callable_aliases[target_name] = member_callable_values.get(
+-                                member, frozenset({(*member, False)})
+-                            )
+-            elif isinstance(statement, ast.Assign):
+-                for target in statement.targets:
+-                    bind_target(target, statement.value)
+-            elif isinstance(statement, ast.AnnAssign):
+-                bind_target(statement.target, statement.value)
+-            elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+-                bind_target(statement.target, None)
+-            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+-                for item in statement.items:
+-                    if item.optional_vars is not None:
+-                        bind_target(item.optional_vars, None)
+-            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+-                bind_name(statement.name, None)
+-            elif isinstance(statement, ast.Delete):
+-                for target in statement.targets:
+-                    bind_target(target, None)
+-            _update_compact_builtins_aliases(statement, builtins_aliases)
++            replay_statement(statement)
+     return callable_aliases
+ 
+ 
+@@ -14207,7 +14442,7 @@ def _compact_snippet_typed_print_overwrite_replay(
+                     typed_member_callable_aliases[target.id] = candidate
+                 return
+             if not candidate:
+-                typed_member_callable_aliases[target.id] = previous
++                typed_member_callable_aliases.pop(target.id, None)
+                 return
+             typed_member_callable_aliases[target.id] = merge_typed_member_callable_values(previous, candidate)
+         elif isinstance(target, ast.Starred):
+diff --git a/tests/detectors/test_jit_script_detector.py b/tests/detectors/test_jit_script_detector.py
+index 7b6b33ef..4b166e8d 100644
+--- a/tests/detectors/test_jit_script_detector.py
++++ b/tests/detectors/test_jit_script_detector.py
+@@ -9523,6 +9523,84 @@ class TestJITScriptDetector:
+ 
+         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+ 
++    def test_prefix_typed_member_aliases_distinguish_reimported_module_identity(self) -> None:
++        prefix = (
++            b"import sys\nimport webbrowser as old\nold.open = print\n"
++            b"sys.modules.pop('webbrowser')\nimport webbrowser as fresh\nalias = fresh.open\n"
++        )
++
++        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
++
++        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
++
++    def test_prefix_typed_member_aliases_respect_safe_setdefault_after_delete(self) -> None:
++        prefix = b"import webbrowser as wb\ndel wb.open\nwb.__dict__.setdefault('open', print)\nalias = wb.open\n"
++
++        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
++
++        assert "alias" not in aliases
++
++    def test_prefix_typed_member_aliases_replay_executing_class_body(self) -> None:
++        prefix = (
++            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
++            b"class Restore:\n    wb.open = original\nalias = wb.open\n"
++        )
++
++        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, {})
++
++        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
++
++    def test_scan_model_clears_callable_alias_overwritten_in_all_branches(self) -> None:
++        source = (
++            b"from webbrowser import open as opener\n"
++            b"if condition:\n    opener = print\nelse:\n    opener = print\n"
++            b"opener('safe')\n"
++        )
++
++        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
++
++        assert not any(
++            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
++            for finding in findings
++        )
++
++    @pytest.mark.parametrize(
++        ("prefix", "expected"),
++        [
++            (
++                b"import sys\nimport webbrowser as old\nold.open = print\n"
++                b"sys.modules.pop('webbrowser')\nimport webbrowser as fresh\nalias = fresh.open\n",
++                True,
++            ),
++            (
++                b"import webbrowser as wb\ndel wb.open\nwb.__dict__.setdefault('open', print)\nalias = wb.open\n",
++                False,
++            ),
++            (
++                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
++                b"class Restore:\n    wb.open = original\nalias = wb.open\n",
++                True,
++            ),
++        ],
++    )
++    def test_scan_model_replays_prefix_member_state_across_split(
++        self,
++        prefix: bytes,
++        expected: bool,
++    ) -> None:
++        call_padding = b"# gap\n" * (
++            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# gap\n") + 8
++        )
++        source = b"\x00\xff" + prefix + call_padding + b"alias('https://example.invalid')\n"
++
++        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
++        detected = any(
++            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
++            for finding in findings
++        )
++
++        assert detected is expected
++
+     def test_prefix_typed_aliases_discover_deterministic_indented_tail_import(self) -> None:
+         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+         prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\n"
