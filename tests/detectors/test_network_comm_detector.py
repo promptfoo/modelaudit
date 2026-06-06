@@ -1818,6 +1818,21 @@ class TestNetworkCommDetector:
 
         assert any(finding.get("url") == url for finding in findings)
 
+    @pytest.mark.parametrize(
+        ("label", "secret"),
+        [
+            ("api_key%3DSECRET123", "SECRET123"),
+            ("AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        ],
+    )
+    def test_cloud_authority_credential_material_is_redacted(self, label: str, secret: str) -> None:
+        url = f"https://{label}.blob.core.windows.net/container/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "hook.py")
+
+        assert secret not in json.dumps(findings, sort_keys=True)
+        assert any("<redacted>.blob.core.windows.net" in finding.get("url", "") for finding in findings)
+
     @pytest.mark.parametrize("key", ["api_key", "password", "service_token"])
     def test_paired_sensitive_url_path_segments_redact_the_following_value(self, key: str) -> None:
         """Routes that encode credentials as adjacent key/value segments should redact the value."""
@@ -2820,6 +2835,19 @@ def test_network_finding_limit_prioritizes_nested_url_in_cloud_wrapper() -> None
     assert findings[-1]["truncated_finding"]["type"] == "cloud_storage_url"
 
 
+def test_network_finding_limit_deduplicates_cloud_nested_url_before_distinct_endpoint() -> None:
+    nested_url = "https://evil-c2.com/payload"
+    distinct_url = "https://distinct.example/path"
+    data = (
+        b"https://storage.googleapis.com/bucket/model?next=https%3A%2F%2Fevil-c2.com%2Fpayload " + distinct_url.encode()
+    )
+
+    findings = NetworkCommDetector({"max_findings": 4}).scan(data, "tokens.txt")
+
+    assert sum(finding.get("url") == nested_url for finding in findings) == 1
+    assert any(finding.get("url") == distinct_url for finding in findings)
+
+
 @pytest.mark.parametrize("secret", ["45.33.32.156", "secret-value.example.com"])
 def test_network_finding_limit_suppresses_colon_query_credentials(secret: str) -> None:
     """Colon-style query credentials must not reappear through endpoint scanners."""
@@ -2928,6 +2956,15 @@ def test_split_source_url_credentials_do_not_reappear(secret: str) -> None:
     findings = NetworkCommDetector().scan(data, "tokens.txt")
 
     assert secret not in json.dumps(findings, sort_keys=True)
+
+
+@pytest.mark.parametrize("endpoint", ["45.33.32.156", "unrelated.example.com"])
+def test_closed_sensitive_url_literal_does_not_suppress_later_endpoint(endpoint: str) -> None:
+    data = f'requests.get("https://example.com/api_key/")\n{endpoint}'.encode()
+
+    findings = NetworkCommDetector().scan(data, "hook.py")
+
+    assert endpoint in json.dumps(findings, sort_keys=True)
 
 
 def test_split_source_url_near_match_preserves_endpoint() -> None:

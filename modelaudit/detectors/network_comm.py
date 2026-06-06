@@ -580,6 +580,14 @@ def _is_cloud_authority_identifier(labels: list[str], index: int) -> bool:
     """Preserve bucket/account labels that are part of known cloud storage authorities."""
     if index != 0 or len(labels) < 2:
         return False
+    label = labels[index]
+    decoded = _decode_path_token(label)
+    if (
+        decoded == _PATH_TOKEN_DECODE_LIMIT_SENTINEL
+        or _redact_sensitive_path_assignment(label) is not None
+        or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded) is not None
+    ):
+        return False
     provider_host = ".".join(labels[1:]).lower()
     return (
         provider_host in _PATH_STYLE_CLOUD_HOSTS
@@ -1223,7 +1231,14 @@ def _is_split_sensitive_url_value(data: bytes, match_start: int) -> bool:
         byte >= 128 or byte in b"\\\"' +(){}[]\t\r\n" or byte in b"rRuUbBfF" for byte in gap_without_comments
     )
     path_continuation = all(byte >= 128 or byte in b"\\\"'" for byte in gap)
-    if not source_composition and not path_continuation:
+    continuation_evidence = (
+        b"+" in gap_without_comments
+        or b"\\" in gap
+        or b"{" in gap
+        or sum(gap.count(quote) for quote in (b"'", b'"')) >= 2
+        or any(byte >= 128 for byte in gap)
+    )
+    if (not source_composition and not path_continuation) or not continuation_evidence:
         return False
 
     raw_url = preceding_url_match.group().decode("utf-8", errors="ignore")
@@ -1733,6 +1748,7 @@ class NetworkCommDetector:
         self._pending_url_context: tuple[int, int, str] | None = None
         self._url_context_scan_complete = False
         self._evidence_redaction_classifications = 0
+        self._cloud_nested_url_findings: set[tuple[int, str]] = set()
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -1762,6 +1778,7 @@ class NetworkCommDetector:
         self.truncated_finding_type = None
         self.truncated_finding = None
         self._evidence_redaction_classifications = 0
+        self._cloud_nested_url_findings = set()
         if self.max_findings is None:
             self._url_contexts = self._index_url_contexts(data)
             self._url_context_starts = [start for start, _end, _url in self._url_contexts]
@@ -1954,6 +1971,8 @@ class NetworkCommDetector:
         for url_start, _url_end, url in url_contexts:
             if self.max_findings is not None:
                 for nested_url in _decoded_nested_urls(url):
+                    if (url_start, nested_url) in self._cloud_nested_url_findings:
+                        continue
                     if not self._record_url_finding(nested_url, url_start, context):
                         return
             if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None and not self._record_url_finding(
@@ -2017,6 +2036,7 @@ class NetworkCommDetector:
                     for nested_url in _decoded_nested_urls(url):
                         if not self._record_url_finding(nested_url, match.start(), context):
                             return
+                        self._cloud_nested_url_findings.add((match.start(), nested_url))
 
                 # Skip duplicates
                 if url in seen_urls:
