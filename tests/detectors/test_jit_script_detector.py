@@ -7308,6 +7308,16 @@ class TestJITScriptDetector:
 
         assert detected is should_detect
 
+    def test_scan_model_ignores_safe_class_local_module_alias_call(self) -> None:
+        source = b"import webbrowser as wb\nclass C:\n    wb = object()\n    wb.open = print\n    wb.open('safe')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
         [
