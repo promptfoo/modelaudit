@@ -11,6 +11,7 @@ import posixpath
 import re
 import tarfile
 import tempfile
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 from ..core_results import (
@@ -64,6 +65,8 @@ _SAFE_TARGET_PREFIXES = (
 # Exact safe _target_ values for utility namespaces that also contain unsafe
 # callables. Keep this list narrow instead of trusting whole namespaces.
 _SAFE_TARGETS = {
+    "transformers.utils.PushToHubMixin.save_pretrained",
+    "transformers.utils.hub.PushToHubMixin.save_pretrained",
     "torch.utils.data.BatchSampler",
     "torch.utils.data.ConcatDataset",
     "torch.utils.data.DataLoader",
@@ -91,13 +94,69 @@ _DANGEROUS_TARGETS = {
     "os.execl",
     "os.execle",
     "os.execlp",
+    "os.execlpe",
     "os.execv",
     "os.execve",
     "os.execvp",
     "os.execvpe",
+    "posix.execv",
+    "posix.execve",
+    "nt.execv",
+    "nt.execve",
     "os.spawn",
     "os.spawnl",
     "os.spawnle",
+    "os.spawnlp",
+    "os.spawnlpe",
+    "os.spawnv",
+    "os.spawnve",
+    "os.spawnvp",
+    "os.spawnvpe",
+    "nt.spawnv",
+    "nt.spawnve",
+    "os.posix_spawn",
+    "os.posix_spawnp",
+    "os.fork",
+    "posix.fork",
+    "os.forkpty",
+    "posix.forkpty",
+    "pty.fork",
+    "os.kill",
+    "posix.kill",
+    "nt.kill",
+    "os.killpg",
+    "posix.killpg",
+    "signal.raise_signal",
+    "signal.pthread_kill",
+    "signal.alarm",
+    "signal.setitimer",
+    "signal.signal",
+    "sys.exit",
+    "os.abort",
+    "posix.abort",
+    "nt.abort",
+    "os._exit",
+    "posix._exit",
+    "nt._exit",
+    "posix.system",
+    "posix.posix_spawn",
+    "posix.posix_spawnp",
+    "nt.system",
+    "os.startfile",
+    "nt.startfile",
+    "runpy.run_module",
+    "runpy.run_path",
+    "operator.call",
+    "asyncio.run",
+    "threading.Thread.start",
+    "multiprocessing.Process.start",
+    "multiprocessing.Pool",
+    "multiprocessing.pool.Pool",
+    "multiprocessing.Manager",
+    "multiprocessing.connection.Client",
+    "multiprocessing.connection.Listener",
+    "multiprocessing.managers.BaseManager.start",
+    "multiprocessing.managers.SyncManager.start",
     "subprocess.call",
     "subprocess.run",
     "subprocess.Popen",
@@ -106,7 +165,108 @@ _DANGEROUS_TARGETS = {
     "builtins.eval",
     "builtins.exec",
     "builtins.__import__",
+    "hydra.compose",
+    "hydra.compose.compose",
+    "hydra.initialize",
+    "hydra.initialize.initialize",
+    "hydra.initialize.initialize_config_dir",
+    "hydra.initialize.initialize_config_module",
+    "hydra.initialize_config_dir",
+    "hydra.initialize_config_module",
+    "hydra.core.config_store.ConfigStore.store",
+    "hydra.core.config_store.ConfigStoreWithProvider.store",
+    "hydra.core.global_hydra.GlobalHydra.clear",
+    "hydra.core.global_hydra.GlobalHydra.initialize",
+    "hydra.core.global_hydra.GlobalHydra.set_instance",
+    "hydra.core.utils._save_config",
+    "hydra.core.utils.configure_log",
+    "hydra.core.utils.run_job",
     "importlib.import_module",
+    "hydra._internal.utils._locate",
+    "hydra.utils._locate",
+    "hydra.utils.get_class",
+    "hydra.utils.get_method",
+    "hydra.utils.get_object",
+    "hydra.utils.get_static_method",
+    "importlib.machinery.SourceFileLoader.load_module",
+    "importlib.machinery.SourceFileLoader.exec_module",
+    "importlib.machinery.SourcelessFileLoader.load_module",
+    "importlib.machinery.SourcelessFileLoader.exec_module",
+    "importlib.machinery.ExtensionFileLoader.load_module",
+    "importlib.machinery.ExtensionFileLoader.exec_module",
+    "zipimport.zipimporter.load_module",
+    "zipimport.zipimporter.exec_module",
+    "pydoc.importfile",
+    "logging.config.dictConfig",
+    "logging.config.fileConfig",
+    "site.addpackage",
+    "site.addsitedir",
+    "site.execsitecustomize",
+    "site.execusercustomize",
+    "site.main",
+    "builtins.open",
+    "io.open",
+    "_io.open",
+    "io.open_code",
+    "_io.open_code",
+    "io.FileIO",
+    "_io.FileIO",
+    "codecs.open",
+    "configparser.ConfigParser.read",
+    "configparser.RawConfigParser.read",
+    "filecmp.cmp",
+    "filecmp.cmpfiles",
+    "linecache.checkcache",
+    "linecache.getline",
+    "linecache.getlines",
+    "linecache.updatecache",
+    "logging.FileHandler",
+    "logging.handlers.BaseRotatingHandler",
+    "logging.handlers.RotatingFileHandler",
+    "logging.handlers.SysLogHandler",
+    "logging.handlers.TimedRotatingFileHandler",
+    "logging.handlers.WatchedFileHandler",
+    "omegaconf.OmegaConf.load",
+    "omegaconf.OmegaConf.save",
+    "omegaconf.OmegaConf.clear_resolver",
+    "omegaconf.OmegaConf.clear_resolvers",
+    "omegaconf.OmegaConf.legacy_register_resolver",
+    "omegaconf.OmegaConf.register_new_resolver",
+    "omegaconf.OmegaConf.register_resolver",
+    "omegaconf.omegaconf.OmegaConf.load",
+    "omegaconf.omegaconf.OmegaConf.save",
+    "omegaconf.omegaconf.OmegaConf.clear_resolver",
+    "omegaconf.omegaconf.OmegaConf.clear_resolvers",
+    "omegaconf.omegaconf.OmegaConf.legacy_register_resolver",
+    "omegaconf.omegaconf.OmegaConf.register_new_resolver",
+    "omegaconf.omegaconf.OmegaConf.register_resolver",
+    "tokenize.open",
+    "bz2.BZ2File",
+    "bz2.open",
+    "dbm.open",
+    "gzip.GzipFile",
+    "gzip.open",
+    "lzma.LZMAFile",
+    "lzma.open",
+    "shelve.open",
+    "sqlite3.Connection",
+    "sqlite3.connect",
+    "tarfile.TarFile",
+    "tarfile.TarFile.extract",
+    "tarfile.TarFile.extractall",
+    "tarfile.TarFile.open",
+    "tarfile.open",
+    "tempfile.NamedTemporaryFile",
+    "tempfile.TemporaryDirectory",
+    "tempfile.TemporaryFile",
+    "tempfile.mkdtemp",
+    "tempfile.mkstemp",
+    "tempfile.mktemp",
+    "zipfile.Path",
+    "zipfile.PyZipFile",
+    "zipfile.ZipFile",
+    "zipfile.ZipFile.extract",
+    "zipfile.ZipFile.extractall",
     "pickle.loads",
     "pickle.load",
     "cloudpickle.loads",
@@ -127,20 +287,787 @@ _DANGEROUS_TARGETS = {
     "torch.load",
     "torch.package.PackageImporter",
     "torch.package.PackageImporter.load_pickle",
+    "torch.save",
     "torch.serialization.load",
+    "torch.serialization.save",
+    "torch.classes.load_library",
+    "torch.ops.load_library",
     "torch.utils.cpp_extension._import_module_from_library",
     "torch.utils.cpp_extension._jit_compile",
     "torch.utils.cpp_extension._run_ninja_build",
     "torch.utils.cpp_extension.load",
     "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
+    "transformers.pipeline",
+    "transformers.dynamic_module_utils._compute_local_source_files_hash",
+    "transformers.dynamic_module_utils.check_imports",
+    "transformers.dynamic_module_utils.check_python_requirements",
+    "transformers.dynamic_module_utils.create_dynamic_module",
+    "transformers.dynamic_module_utils.custom_object_save",
+    "transformers.dynamic_module_utils.get_cached_module_file",
+    "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+    "transformers.dynamic_module_utils.get_class_in_module",
+    "transformers.dynamic_module_utils.get_imports",
+    "transformers.dynamic_module_utils.get_relative_import_files",
+    "transformers.dynamic_module_utils.get_relative_imports",
+    "transformers.dynamic_module_utils.init_hf_modules",
+    "transformers.dynamic_module_utils.resolve_trust_remote_code",
+    "transformers.pipelines.audio_classification.ffmpeg_read",
+    "transformers.pipelines.audio_utils.ffmpeg_read",
+    "transformers.testing_utils.run_command",
+    "transformers.utils.cached_file",
+    "transformers.utils.hub.PushToHubMixin._create_repo",
+    "transformers.utils.hub.PushToHubMixin._upload_modified_files",
+    "transformers.utils.hub.cached_file",
+    "transformers.utils.hub.cached_files",
+    "transformers.utils.hub.create_branch",
+    "transformers.utils.hub.create_commit",
+    "transformers.utils.hub.create_repo",
+    "transformers.utils.hub.create_and_tag_model_card",
+    "transformers.utils.hub.define_sagemaker_information",
+    "transformers.utils.hub.download_url",
+    "transformers.utils.hub.get_file_from_repo",
+    "transformers.utils.hub.get_checkpoint_shard_files",
+    "transformers.utils.hub.has_file",
+    "transformers.utils.hub.hf_hub_download",
+    "transformers.utils.hub.http_get",
+    "transformers.utils.hub.httpx.get",
+    "transformers.utils.hub.list_repo_templates",
+    "transformers.utils.hub.list_repo_tree",
+    "transformers.utils.hub.requests.get",
+    "transformers.utils.hub.snapshot_download",
+    "transformers.utils.import_utils._LazyModule._get_module",
+    "transformers.utils.import_utils.clear_import_cache",
+    "transformers.utils.import_utils.create_import_structure_from_path",
+    "transformers.utils.import_utils.define_import_structure",
+    "transformers.utils.import_utils.direct_transformers_import",
+    "tensorflow.load_op_library",
+    "numpy.fromfile",
+    "numpy.fromregex",
+    "numpy.genfromtxt",
+    "numpy.lib._datasource.DataSource._cache",
+    "numpy.lib._datasource.DataSource._findfile",
+    "numpy.lib._datasource.DataSource.exists",
+    "numpy.lib._datasource.DataSource.open",
+    "numpy.lib._datasource.open",
+    "numpy.lib._format_impl.open_memmap",
+    "numpy.lib._npyio_impl.fromregex",
+    "numpy.lib._npyio_impl.genfromtxt",
+    "numpy.lib._npyio_impl.load",
+    "numpy.lib._npyio_impl.loadtxt",
+    "numpy.lib._npyio_impl.NpzFile",
+    "numpy.lib._npyio_impl.save",
+    "numpy.lib._npyio_impl.savez",
+    "numpy.lib._npyio_impl.savez_compressed",
+    "numpy.lib._npyio_impl.savetxt",
+    "numpy.lib.format.open_memmap",
+    "numpy.lib.npyio.DataSource._cache",
+    "numpy.lib.npyio.DataSource._findfile",
+    "numpy.lib.npyio.DataSource.exists",
+    "numpy.lib.npyio.DataSource.open",
+    "numpy.lib.npyio.fromregex",
+    "numpy.lib.npyio.genfromtxt",
+    "numpy.lib.npyio.load",
+    "numpy.lib.npyio.loadtxt",
+    "numpy.lib.npyio.NpzFile",
+    "numpy.lib.npyio.recfromcsv",
+    "numpy.lib.npyio.recfromtxt",
+    "numpy.lib.npyio.save",
+    "numpy.lib.npyio.savez",
+    "numpy.lib.npyio.savez_compressed",
+    "numpy.lib.npyio.savetxt",
+    "numpy.load",
+    "numpy.loadtxt",
+    "numpy.memmap",
+    "numpy._core.memmap.memmap",
+    "numpy._core.multiarray.fromfile",
+    "numpy._core.records.fromfile",
+    "numpy.core.memmap.memmap",
+    "numpy.core.multiarray.fromfile",
+    "numpy.core.records.fromfile",
+    "numpy.ndarray.dump",
+    "numpy.ndarray.tofile",
+    "numpy.rec.fromfile",
+    "numpy.recfromcsv",
+    "numpy.recfromtxt",
+    "numpy.distutils.exec_command._exec_command",
+    "numpy.distutils.exec_command.exec_command",
+    "numpy.save",
+    "numpy.savez",
+    "numpy.savez_compressed",
+    "numpy.savetxt",
+    "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
+    "requests.request",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
+    "requests.api.request",
+    "requests.api.get",
+    "requests.api.post",
+    "requests.api.put",
+    "requests.api.patch",
+    "requests.api.delete",
+    "requests.api.head",
+    "requests.api.options",
+    "requests.Session.request",
+    "requests.Session.get",
+    "requests.Session.post",
+    "requests.Session.put",
+    "requests.Session.patch",
+    "requests.Session.delete",
+    "requests.Session.head",
+    "requests.Session.options",
+    "requests.Session.send",
+    "requests.sessions.Session.request",
+    "requests.sessions.Session.get",
+    "requests.sessions.Session.post",
+    "requests.sessions.Session.put",
+    "requests.sessions.Session.patch",
+    "requests.sessions.Session.delete",
+    "requests.sessions.Session.head",
+    "requests.sessions.Session.options",
+    "requests.sessions.Session.send",
+    "httpx.request",
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+    "httpx._api.request",
+    "httpx._api.get",
+    "httpx._api.post",
+    "httpx._api.put",
+    "httpx._api.patch",
+    "httpx._api.delete",
+    "httpx._api.head",
+    "httpx._api.options",
+    "httpx.Client.request",
+    "httpx.Client.get",
+    "httpx.Client.post",
+    "httpx.Client.put",
+    "httpx.Client.patch",
+    "httpx.Client.delete",
+    "httpx.Client.head",
+    "httpx.Client.options",
+    "httpx.Client.send",
+    "httpx._client.Client.request",
+    "httpx._client.Client.get",
+    "httpx._client.Client.post",
+    "httpx._client.Client.put",
+    "httpx._client.Client.patch",
+    "httpx._client.Client.delete",
+    "httpx._client.Client.head",
+    "httpx._client.Client.options",
+    "httpx._client.Client.send",
+    "urllib3.request",
+    "urllib3.HTTPConnectionPool.request",
+    "urllib3.HTTPConnectionPool.urlopen",
+    "urllib3.HTTPSConnectionPool.request",
+    "urllib3.HTTPSConnectionPool.urlopen",
+    "urllib3.PoolManager.request",
+    "urllib3.PoolManager.urlopen",
+    "urllib3.ProxyManager.request",
+    "urllib3.ProxyManager.urlopen",
+    "urllib3.poolmanager.PoolManager.request",
+    "urllib3.poolmanager.PoolManager.urlopen",
+    "urllib3.poolmanager.ProxyManager.request",
+    "urllib3.poolmanager.ProxyManager.urlopen",
+    "urllib3.connectionpool.HTTPConnectionPool.request",
+    "urllib3.connectionpool.HTTPConnectionPool.urlopen",
+    "urllib3.connectionpool.HTTPSConnectionPool.request",
+    "urllib3.connectionpool.HTTPSConnectionPool.urlopen",
+    "urllib3._request_methods.RequestMethods.request",
+    "urllib.request.OpenerDirector.open",
+    "urllib.request.URLopener.open",
+    "urllib.request.URLopener.open_file",
+    "urllib.request.URLopener.open_ftp",
+    "urllib.request.URLopener.open_http",
+    "urllib.request.URLopener.open_https",
+    "urllib.request.URLopener.open_local_file",
+    "urllib.request.URLopener.retrieve",
+    "urllib.request.FancyURLopener.open",
+    "urllib.request.FancyURLopener.open_file",
+    "urllib.request.FancyURLopener.open_ftp",
+    "urllib.request.FancyURLopener.open_http",
+    "urllib.request.FancyURLopener.open_https",
+    "urllib.request.FancyURLopener.open_local_file",
+    "urllib.request.FancyURLopener.retrieve",
+    "ftplib.FTP",
+    "ftplib.FTP_TLS",
+    "ftplib.FTP.connect",
+    "ftplib.FTP_TLS.connect",
+    "imaplib.IMAP4",
+    "imaplib.IMAP4_SSL",
+    "imaplib.IMAP4.open",
+    "imaplib.IMAP4_SSL.open",
+    "nntplib.NNTP",
+    "nntplib.NNTP_SSL",
+    "poplib.POP3",
+    "poplib.POP3_SSL",
+    "smtplib.LMTP",
+    "smtplib.LMTP.connect",
+    "smtplib.SMTP",
+    "smtplib.SMTP_SSL",
+    "smtplib.SMTP.connect",
+    "smtplib.SMTP_SSL.connect",
+    "telnetlib.Telnet",
+    "nntplib.NNTP._create_socket",
+    "nntplib.NNTP_SSL._create_socket",
+    "poplib.POP3._create_socket",
+    "poplib.POP3_SSL._create_socket",
+    "telnetlib.Telnet.open",
+    "http.client.HTTPConnection.request",
+    "http.client.HTTPSConnection.request",
+    "http.client.HTTPConnection.connect",
+    "http.client.HTTPSConnection.connect",
+    "http.client.HTTPConnection.send",
+    "http.client.HTTPSConnection.send",
+    "http.client.HTTPConnection.getresponse",
+    "http.client.HTTPSConnection.getresponse",
+    "http.client.HTTPConnection.endheaders",
+    "http.client.HTTPSConnection.endheaders",
+    "http.client.HTTPConnection._send_output",
+    "http.client.HTTPSConnection._send_output",
+    "http.client.HTTPResponse.read",
+    "http.client.HTTPResponse.read1",
+    "http.client.HTTPResponse.readinto",
+    "http.client.HTTPResponse.readinto1",
+    "http.client.HTTPResponse.readline",
+    "http.client.HTTPResponse.readlines",
+    "http.client.HTTPResponse.peek",
+    "socket.create_connection",
+    "socket.create_server",
+    "socketserver.TCPServer",
+    "socketserver.UDPServer",
+    "socketserver.ThreadingTCPServer",
+    "socketserver.ThreadingUDPServer",
+    "http.server.HTTPServer",
+    "http.server.ThreadingHTTPServer",
+    "wsgiref.simple_server.WSGIServer",
+    "wsgiref.simple_server.make_server",
+    "socket.getaddrinfo",
+    "socket.getfqdn",
+    "socket.gethostbyaddr",
+    "socket.gethostbyname",
+    "socket.gethostbyname_ex",
+    "socket.getnameinfo",
+    "socket.socket.connect",
+    "socket.socket.connect_ex",
+    "socket.socket.bind",
+    "socket.socket.listen",
+    "socket.socket.accept",
+    "socket.socket.send",
+    "socket.socket.sendall",
+    "socket.socket.sendfile",
+    "socket.socket.sendto",
+    "socket.socket.sendmsg",
+    "socket.socket.recv",
+    "socket.socket.recvfrom",
+    "socket.socket.recv_into",
+    "socket.socket.recvfrom_into",
+    "socket.socket.recvmsg",
+    "socket.socket.recvmsg_into",
+    "socket.SocketType.connect",
+    "socket.SocketType.connect_ex",
+    "socket.SocketType.bind",
+    "socket.SocketType.listen",
+    "socket.SocketType.accept",
+    "socket.SocketType.send",
+    "socket.SocketType.sendall",
+    "socket.SocketType.sendfile",
+    "socket.SocketType.sendto",
+    "socket.SocketType.sendmsg",
+    "socket.SocketType.recv",
+    "socket.SocketType.recvfrom",
+    "socket.SocketType.recv_into",
+    "socket.SocketType.recvfrom_into",
+    "socket.SocketType.recvmsg",
+    "socket.SocketType.recvmsg_into",
+    "socket.send_fds",
+    "socket.recv_fds",
+    "_socket.socket.connect",
+    "_socket.socket.connect_ex",
+    "_socket.socket.bind",
+    "_socket.socket.listen",
+    "_socket.socket.accept",
+    "_socket.socket.send",
+    "_socket.socket.sendall",
+    "_socket.socket.sendto",
+    "_socket.socket.sendmsg",
+    "_socket.socket.recv",
+    "_socket.socket.recvfrom",
+    "_socket.socket.recv_into",
+    "_socket.socket.recvfrom_into",
+    "_socket.socket.recvmsg",
+    "_socket.socket.recvmsg_into",
+    "_socket.SocketType.connect",
+    "_socket.SocketType.connect_ex",
+    "_socket.SocketType.bind",
+    "_socket.SocketType.listen",
+    "_socket.SocketType.accept",
+    "_socket.SocketType.send",
+    "_socket.SocketType.sendall",
+    "_socket.SocketType.sendto",
+    "_socket.SocketType.sendmsg",
+    "_socket.SocketType.recv",
+    "_socket.SocketType.recvfrom",
+    "_socket.SocketType.recv_into",
+    "_socket.SocketType.recvfrom_into",
+    "_socket.SocketType.recvmsg",
+    "_socket.SocketType.recvmsg_into",
+    "_socket.getaddrinfo",
+    "_socket.gethostbyaddr",
+    "_socket.gethostbyname",
+    "_socket.gethostbyname_ex",
+    "_socket.getnameinfo",
+    "socket.socket",
+    "socket.SocketType",
+    "socket.socketpair",
+    "_socket.socket",
+    "_socket.SocketType",
+    "_socket.socketpair",
+    "os.pipe",
+    "posix.pipe",
+    "nt.pipe",
+    "os.pipe2",
+    "posix.pipe2",
+    "nt.pipe2",
+    "os.open",
+    "posix.open",
+    "nt.open",
+    "os.read",
+    "posix.read",
+    "nt.read",
+    "os.readv",
+    "posix.readv",
+    "os.pread",
+    "posix.pread",
+    "os.preadv",
+    "posix.preadv",
+    "os.write",
+    "posix.write",
+    "nt.write",
+    "os.close",
+    "posix.close",
+    "nt.close",
+    "os.closerange",
+    "posix.closerange",
+    "nt.closerange",
+    "os.dup",
+    "posix.dup",
+    "nt.dup",
+    "os.dup2",
+    "posix.dup2",
+    "nt.dup2",
+    "os.writev",
+    "posix.writev",
+    "os.pwrite",
+    "posix.pwrite",
+    "os.pwritev",
+    "posix.pwritev",
+    "os.sendfile",
+    "posix.sendfile",
+    "os.copy_file_range",
+    "posix.copy_file_range",
+    "os.splice",
+    "posix.splice",
+    "os.readlink",
+    "posix.readlink",
+    "nt.readlink",
+    "os.listdir",
+    "posix.listdir",
+    "nt.listdir",
+    "os.scandir",
+    "posix.scandir",
+    "nt.scandir",
+    "os.chdir",
+    "posix.chdir",
+    "nt.chdir",
+    "os.fchdir",
+    "posix.fchdir",
+    "os.umask",
+    "posix.umask",
+    "nt.umask",
+    "os.chroot",
+    "posix.chroot",
+    "os.setuid",
+    "posix.setuid",
+    "os.seteuid",
+    "posix.seteuid",
+    "os.setgid",
+    "posix.setgid",
+    "os.setegid",
+    "posix.setegid",
+    "os.setreuid",
+    "posix.setreuid",
+    "os.setregid",
+    "posix.setregid",
+    "os.setresuid",
+    "posix.setresuid",
+    "os.setresgid",
+    "posix.setresgid",
+    "os.setgroups",
+    "posix.setgroups",
+    "os.initgroups",
+    "posix.initgroups",
+    "os.setsid",
+    "posix.setsid",
+    "os.setpgid",
+    "posix.setpgid",
+    "os.setpgrp",
+    "posix.setpgrp",
+    "os.tcsetpgrp",
+    "posix.tcsetpgrp",
+    "os.putenv",
+    "posix.putenv",
+    "nt.putenv",
+    "os.unsetenv",
+    "posix.unsetenv",
+    "nt.unsetenv",
+    "os.environ.clear",
+    "os.environ.pop",
+    "os.environ.popitem",
+    "os.environ.setdefault",
+    "os.environ.update",
+    "os.environ.__setitem__",
+    "os.environ.__delitem__",
+    "os.environ.__ior__",
+    "os.environb.clear",
+    "os.environb.pop",
+    "os.environb.popitem",
+    "os.environb.setdefault",
+    "os.environb.update",
+    "os.environb.__setitem__",
+    "os.environb.__delitem__",
+    "os.environb.__ior__",
+    "sys.path.append",
+    "sys.path.clear",
+    "sys.path.extend",
+    "sys.path.insert",
+    "sys.path.pop",
+    "sys.path.remove",
+    "sys.path.reverse",
+    "sys.path.sort",
+    "sys.path.__setitem__",
+    "sys.path.__delitem__",
+    "sys.path.__iadd__",
+    "sys.path.__imul__",
+    "sys.modules.clear",
+    "sys.modules.pop",
+    "sys.modules.popitem",
+    "sys.modules.setdefault",
+    "sys.modules.update",
+    "sys.modules.__setitem__",
+    "sys.modules.__delitem__",
+    "sys.modules.__ior__",
+    "resource.setrlimit",
+    "resource.prlimit",
+    "os.stat",
+    "os.access",
+    "os.fstat",
+    "os.statvfs",
+    "os.fstatvfs",
+    "os.path.exists",
+    "os.path.lexists",
+    "os.path.isfile",
+    "os.path.isdir",
+    "os.path.islink",
+    "os.path.ismount",
+    "os.path.getatime",
+    "os.path.getctime",
+    "os.path.getmtime",
+    "os.path.getsize",
+    "os.path.realpath",
+    "os.path.samefile",
+    "os.path.sameopenfile",
+    "posix.stat",
+    "posix.access",
+    "posix.fstat",
+    "posix.statvfs",
+    "posix.fstatvfs",
+    "posixpath.exists",
+    "posixpath.lexists",
+    "posixpath.isfile",
+    "posixpath.isdir",
+    "posixpath.islink",
+    "posixpath.ismount",
+    "posixpath.getatime",
+    "posixpath.getctime",
+    "posixpath.getmtime",
+    "posixpath.getsize",
+    "posixpath.realpath",
+    "posixpath.samefile",
+    "posixpath.sameopenfile",
+    "nt.stat",
+    "nt.access",
+    "nt.fstat",
+    "ntpath.exists",
+    "ntpath.lexists",
+    "ntpath.isfile",
+    "ntpath.isdir",
+    "ntpath.islink",
+    "ntpath.ismount",
+    "ntpath.getatime",
+    "ntpath.getctime",
+    "ntpath.getmtime",
+    "ntpath.getsize",
+    "ntpath.realpath",
+    "ntpath.samefile",
+    "ntpath.sameopenfile",
+    "genericpath.exists",
+    "genericpath.isfile",
+    "genericpath.isdir",
+    "genericpath.getatime",
+    "genericpath.getctime",
+    "genericpath.getmtime",
+    "genericpath.getsize",
+    "genericpath.samefile",
+    "genericpath.sameopenfile",
+    "os.lstat",
+    "posix.lstat",
+    "nt.lstat",
+    "glob.glob",
+    "os.mkdir",
+    "posix.mkdir",
+    "nt.mkdir",
+    "os.makedirs",
+    "pathlib.Path.open",
+    "pathlib.PosixPath.open",
+    "pathlib.WindowsPath.open",
+    "pathlib.Path.mkdir",
+    "pathlib.PosixPath.mkdir",
+    "pathlib.WindowsPath.mkdir",
+    "pathlib.Path.touch",
+    "pathlib.PosixPath.touch",
+    "pathlib.WindowsPath.touch",
+    "pathlib.Path.read_bytes",
+    "pathlib.PosixPath.read_bytes",
+    "pathlib.WindowsPath.read_bytes",
+    "pathlib.Path.read_text",
+    "pathlib.PosixPath.read_text",
+    "pathlib.WindowsPath.read_text",
+    "pathlib.Path.readlink",
+    "pathlib.PosixPath.readlink",
+    "pathlib.WindowsPath.readlink",
+    "pathlib.Path.iterdir",
+    "pathlib.PosixPath.iterdir",
+    "pathlib.WindowsPath.iterdir",
+    "pathlib.Path.stat",
+    "pathlib.Path.exists",
+    "pathlib.Path.is_file",
+    "pathlib.Path.is_dir",
+    "pathlib.Path.is_symlink",
+    "pathlib.Path.is_mount",
+    "pathlib.Path.is_socket",
+    "pathlib.Path.is_fifo",
+    "pathlib.Path.is_block_device",
+    "pathlib.Path.is_char_device",
+    "pathlib.PosixPath.stat",
+    "pathlib.PosixPath.exists",
+    "pathlib.PosixPath.is_file",
+    "pathlib.PosixPath.is_dir",
+    "pathlib.PosixPath.is_symlink",
+    "pathlib.PosixPath.is_mount",
+    "pathlib.PosixPath.is_socket",
+    "pathlib.PosixPath.is_fifo",
+    "pathlib.PosixPath.is_block_device",
+    "pathlib.PosixPath.is_char_device",
+    "pathlib.WindowsPath.stat",
+    "pathlib.WindowsPath.exists",
+    "pathlib.WindowsPath.is_file",
+    "pathlib.WindowsPath.is_dir",
+    "pathlib.WindowsPath.is_symlink",
+    "pathlib.WindowsPath.is_mount",
+    "pathlib.WindowsPath.is_socket",
+    "pathlib.WindowsPath.is_fifo",
+    "pathlib.WindowsPath.is_block_device",
+    "pathlib.WindowsPath.is_char_device",
+    "pathlib.Path.lstat",
+    "pathlib.PosixPath.lstat",
+    "pathlib.WindowsPath.lstat",
+    "pathlib.Path.resolve",
+    "pathlib.PosixPath.resolve",
+    "pathlib.WindowsPath.resolve",
+    "pathlib.Path.samefile",
+    "pathlib.PosixPath.samefile",
+    "pathlib.WindowsPath.samefile",
+    "pathlib.Path.owner",
+    "pathlib.PosixPath.owner",
+    "pathlib.WindowsPath.owner",
+    "pathlib.Path.group",
+    "pathlib.PosixPath.group",
+    "pathlib.WindowsPath.group",
+    "pathlib.Path.write_bytes",
+    "pathlib.PosixPath.write_bytes",
+    "pathlib.WindowsPath.write_bytes",
+    "pathlib.Path.write_text",
+    "pathlib.PosixPath.write_text",
+    "pathlib.WindowsPath.write_text",
+    "os.remove",
+    "posix.remove",
+    "nt.remove",
+    "os.unlink",
+    "posix.unlink",
+    "nt.unlink",
+    "os.rename",
+    "posix.rename",
+    "nt.rename",
+    "os.renames",
+    "os.replace",
+    "posix.replace",
+    "nt.replace",
+    "os.rmdir",
+    "posix.rmdir",
+    "nt.rmdir",
+    "os.removedirs",
+    "os.symlink",
+    "posix.symlink",
+    "nt.symlink",
+    "os.link",
+    "posix.link",
+    "nt.link",
+    "os.truncate",
+    "posix.truncate",
+    "nt.truncate",
+    "os.ftruncate",
+    "posix.ftruncate",
+    "nt.ftruncate",
+    "os.fsync",
+    "posix.fsync",
+    "nt.fsync",
+    "os.fdatasync",
+    "posix.fdatasync",
+    "os.chmod",
+    "posix.chmod",
+    "nt.chmod",
+    "os.fchmod",
+    "posix.fchmod",
+    "nt.fchmod",
+    "os.chown",
+    "posix.chown",
+    "os.fchown",
+    "posix.fchown",
+    "os.lchown",
+    "posix.lchown",
+    "os.utime",
+    "posix.utime",
+    "nt.utime",
+    "os.mknod",
+    "posix.mknod",
+    "os.mkfifo",
+    "posix.mkfifo",
+    "os.getxattr",
+    "posix.getxattr",
+    "os.listxattr",
+    "posix.listxattr",
+    "os.setxattr",
+    "posix.setxattr",
+    "os.removexattr",
+    "posix.removexattr",
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.copyfileobj",
+    "shutil.copytree",
+    "shutil.copymode",
+    "shutil.copystat",
+    "shutil.chown",
+    "shutil.disk_usage",
+    "shutil.which",
+    "shutil.make_archive",
+    "shutil.move",
     "shutil.rmtree",
+    "shutil.unpack_archive",
+    "pathlib.Path.chmod",
+    "pathlib.PosixPath.chmod",
+    "pathlib.WindowsPath.chmod",
+    "pathlib.Path.lchmod",
+    "pathlib.PosixPath.lchmod",
+    "pathlib.WindowsPath.lchmod",
     "pathlib.Path.unlink",
+    "pathlib.PosixPath.unlink",
+    "pathlib.WindowsPath.unlink",
+    "pathlib.Path.rename",
+    "pathlib.PosixPath.rename",
+    "pathlib.WindowsPath.rename",
+    "pathlib.Path.replace",
+    "pathlib.PosixPath.replace",
+    "pathlib.WindowsPath.replace",
+    "pathlib.Path.rmdir",
+    "pathlib.PosixPath.rmdir",
+    "pathlib.WindowsPath.rmdir",
+    "pathlib.Path.symlink_to",
+    "pathlib.PosixPath.symlink_to",
+    "pathlib.WindowsPath.symlink_to",
+    "pathlib.Path.hardlink_to",
+    "pathlib.PosixPath.hardlink_to",
+    "pathlib.WindowsPath.hardlink_to",
+    "pathlib.Path.link_to",
+    "pathlib.PosixPath.link_to",
+    "pathlib.WindowsPath.link_to",
     "webbrowser.open",
+    "webbrowser.open_new",
+    "webbrowser.open_new_tab",
+    "ssl.create_default_context",
+    "ssl.SSLContext.load_cert_chain",
+    "ssl.SSLContext.load_verify_locations",
+    "importlib.resources.open_binary",
+    "importlib.resources.open_text",
+    "importlib.resources.read_binary",
+    "importlib.resources.read_text",
+    "pkgutil.get_data",
+    "os.add_dll_directory",
+    "nt.add_dll_directory",
+    "_ctypes.dlopen",
     "ctypes.CDLL",
+    "ctypes.OleDLL",
+    "ctypes.PyDLL",
+    "ctypes.WinDLL",
+    "ctypes._dlopen",
+    "ctypes.cdll.LoadLibrary",
+    "ctypes.oledll.LoadLibrary",
+    "ctypes.pydll.LoadLibrary",
+    "ctypes.windll.LoadLibrary",
+    "ctypes.pythonapi.PyRun_AnyFile",
+    "ctypes.pythonapi.PyRun_AnyFileEx",
+    "ctypes.pythonapi.PyRun_AnyFileExFlags",
+    "ctypes.pythonapi.PyRun_AnyFileFlags",
+    "ctypes.pythonapi.PyRun_File",
+    "ctypes.pythonapi.PyRun_FileEx",
+    "ctypes.pythonapi.PyRun_FileExFlags",
+    "ctypes.pythonapi.PyRun_FileFlags",
+    "ctypes.pythonapi.PyRun_InteractiveLoop",
+    "ctypes.pythonapi.PyRun_InteractiveLoopFlags",
+    "ctypes.pythonapi.PyRun_InteractiveOne",
+    "ctypes.pythonapi.PyRun_InteractiveOneFlags",
+    "ctypes.pythonapi.PyRun_SimpleFile",
+    "ctypes.pythonapi.PyRun_SimpleFileEx",
+    "ctypes.pythonapi.PyRun_SimpleFileExFlags",
+    "ctypes.pythonapi.PyRun_SimpleString",
+    "ctypes.pythonapi.PyRun_SimpleStringFlags",
+    "ctypes.pythonapi.PyRun_String",
+    "ctypes.pythonapi.PyRun_StringFlags",
+    "ctypes.util.find_library",
+    "numpy.ctypeslib.load_library",
     "code.interact",
     "pty.spawn",
 }
+_DANGEROUS_TARGET_PREFIXES = (
+    "ctypes.cdll.",
+    "ctypes.oledll.",
+    "ctypes.pydll.",
+    "ctypes.windll.",
+)
+_DANGEROUS_NUMPY_TARGET_SUFFIXES = (".dump", ".tofile")
+_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES = (".from_pretrained", ".push_to_hub", ".save_pretrained")
+_TARGET_CALL_ALIAS_SUFFIX = ".__call__"
 
 # Patterns in _target_ that are suspicious even if not exact matches
 _SUSPICIOUS_TARGET_PATTERNS = (
@@ -177,6 +1104,9 @@ NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", "
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS = 100_000
+NEMO_MAX_CONFIG_TRAVERSAL_DEPTH = 128
+NEMO_MAX_CONFIG_TRAVERSAL_NODES = 100_000
+NEMO_MAX_CONFIG_EVIDENCE_CHARS = 256
 NEMO_EXECUTABLE_INITIAL_PROBE_BYTES = 1024
 NEMO_EXECUTABLE_PE_PROBE_BYTES = (1024 * 1024) + 4
 
@@ -190,6 +1120,24 @@ _NESTED_OPERATIONAL_CHECK_NAMES = {
     "xml_model_routing_incomplete": "XML Model Routing",
 }
 _NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
+
+
+class _NemoConfigTraversalLimit(Exception):
+    """Raised when parsed YAML cannot be traversed within the safety budget."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _redact_config_evidence(value: str) -> str:
+    """Bound attacker-controlled config evidence before storing diagnostics."""
+    return redact_evidence_string(value, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+
+
+def _append_config_path(path_prefix: str, component: str) -> str:
+    separator = "" if not path_prefix or component.startswith("[") else "."
+    return _redact_config_evidence(f"{path_prefix}{separator}{component}")
 
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
@@ -216,9 +1164,11 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
     return None
 
 
-def _is_runtime_truthy(value: Any) -> bool:
-    """Return whether a Hydra argument would be truthy when passed to Python."""
-    return bool(value)
+def _unwrap_target_call_aliases(target: str) -> str:
+    """Return the underlying callable for trailing ``.__call__`` aliases."""
+    while target.endswith(_TARGET_CALL_ALIAS_SUFFIX):
+        target = target[: -len(_TARGET_CALL_ALIAS_SUFFIX)]
+    return target
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -840,6 +1790,16 @@ class NemoScanner(BaseScanner):
                     details={"config_file": config_file},
                 )
                 return False
+            except RecursionError:
+                logger.debug("YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
+                self._mark_config_traversal_inconclusive(
+                    result,
+                    config_file=config_file,
+                    archive_path=archive_path,
+                    reason="nemo_config_yaml_complexity_limit",
+                    message="YAML config exceeded parser complexity limits",
+                )
+                return False
 
         if not isinstance(config, dict | list):
             self._mark_inconclusive_scan_result(
@@ -856,8 +1816,20 @@ class NemoScanner(BaseScanner):
             )
             return False
 
-        self._check_hydra_targets(config, config_file, archive_path, result)
-        for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+        try:
+            self._check_hydra_targets(config, config_file, archive_path, result)
+            referenced_members = self._collect_nemo_member_references(config)
+        except _NemoConfigTraversalLimit as exc:
+            self._mark_config_traversal_inconclusive(
+                result,
+                config_file=config_file,
+                archive_path=archive_path,
+                reason=exc.reason,
+                message=str(exc),
+            )
+            return False
+
+        for config_path, referenced_member_name in referenced_members:
             nemo_owned_entries.add(referenced_member_name)
             referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
             if referenced_member_name in scanned_member_entries:
@@ -874,6 +1846,30 @@ class NemoScanner(BaseScanner):
             if referenced_member_scanned:
                 scanned_member_entries.add(referenced_member_name)
         return True
+
+    def _mark_config_traversal_inconclusive(
+        self,
+        result: ScanResult,
+        *,
+        config_file: str,
+        archive_path: str,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Record bounded YAML traversal failures without retaining raw config evidence."""
+        display_config_file = _redact_config_evidence(config_file)
+        self._mark_inconclusive_scan_result(
+            result,
+            reason=reason,
+            check_name="NeMo Config Traversal",
+            message=f"{message}: {display_config_file}",
+            location=f"{archive_path}:{display_config_file}",
+            details={
+                "config_file": display_config_file,
+                "max_traversal_depth": NEMO_MAX_CONFIG_TRAVERSAL_DEPTH,
+                "max_traversal_nodes": NEMO_MAX_CONFIG_TRAVERSAL_NODES,
+            },
+        )
 
     @staticmethod
     def _is_root_config_member_name(member_name: str) -> bool:
@@ -1971,29 +2967,86 @@ class NemoScanner(BaseScanner):
     ) -> list[tuple[str, str]]:
         """Collect internal `nemo:` artifact references from a parsed config."""
         collected: list[tuple[str, str]] = []
-
-        if isinstance(config, list):
-            for index, item in enumerate(config):
-                collected.extend(
-                    cls._collect_nemo_member_references(
-                        item,
-                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
-                    )
-                )
-            return collected
-
-        if isinstance(config, dict):
-            for key, value in config.items():
-                current_path = f"{path_prefix}.{key}" if path_prefix else key
-                collected.extend(cls._collect_nemo_member_references(value, current_path))
-            return collected
-
-        if isinstance(config, str):
-            member_name = cls._extract_nemo_member_reference(config)
+        for config_path, value, _parent, _key in cls._iter_config_nodes(config, path_prefix=path_prefix):
+            if not isinstance(value, str):
+                continue
+            member_name = cls._extract_nemo_member_reference(value)
             if member_name is not None:
-                return [(path_prefix or "$", member_name)]
+                collected.append((config_path or "$", member_name))
 
-        return []
+        return collected
+
+    @classmethod
+    def _iter_config_nodes(
+        cls,
+        config: Any,
+        *,
+        path_prefix: str = "",
+    ) -> Iterator[tuple[str, Any, dict[Any, Any] | None, Any]]:
+        """Yield parsed config nodes while bounding depth, work, and YAML alias cycles."""
+        visited_nodes = 0
+        expanded_containers: set[int] = set()
+
+        def walk(
+            value: Any,
+            config_path: str,
+            depth: int,
+            ancestors: frozenset[int],
+            parent: dict[Any, Any] | None,
+            key: Any,
+        ) -> Iterator[tuple[str, Any, dict[Any, Any] | None, Any]]:
+            nonlocal visited_nodes
+            visited_nodes += 1
+            if visited_nodes > NEMO_MAX_CONFIG_TRAVERSAL_NODES:
+                raise _NemoConfigTraversalLimit(
+                    "nemo_config_traversal_node_limit",
+                    "YAML config exceeded the traversal node safety limit",
+                )
+
+            if isinstance(value, dict | list):
+                identity = id(value)
+                if identity in ancestors:
+                    raise _NemoConfigTraversalLimit(
+                        "nemo_config_recursive_alias",
+                        "YAML config contains a recursive alias",
+                    )
+                if depth > NEMO_MAX_CONFIG_TRAVERSAL_DEPTH:
+                    raise _NemoConfigTraversalLimit(
+                        "nemo_config_traversal_depth_limit",
+                        "YAML config exceeded the traversal depth safety limit",
+                    )
+
+            yield config_path, value, parent, key
+
+            if isinstance(value, dict | list):
+                # YAML aliases reuse container identities; expand each once to bound
+                # repeated work and duplicate diagnostics while retaining cycle checks.
+                if identity in expanded_containers:
+                    return
+                expanded_containers.add(identity)
+                child_ancestors = ancestors | {identity}
+                if isinstance(value, dict):
+                    if "_target_" in value:
+                        child_path = _append_config_path(config_path, "_target_")
+                        yield from walk(
+                            value["_target_"],
+                            child_path,
+                            depth + 1,
+                            child_ancestors,
+                            value,
+                            "_target_",
+                        )
+                    for child_key, child_value in value.items():
+                        if child_key == "_target_":
+                            continue
+                        child_path = _append_config_path(config_path, str(child_key))
+                        yield from walk(child_value, child_path, depth + 1, child_ancestors, value, child_key)
+                else:
+                    for index, child_value in enumerate(value):
+                        child_path = _append_config_path(config_path, f"[{index}]")
+                        yield from walk(child_value, child_path, depth + 1, child_ancestors, None, index)
+
+        yield from walk(config, path_prefix, 0, frozenset(), None, None)
 
     @staticmethod
     def _extract_nemo_member_reference(value: str) -> str | None:
@@ -2132,29 +3185,10 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
         path_prefix: str = "",
     ) -> None:
-        """Recursively check _target_ values in Hydra config."""
-        if isinstance(config, list):
-            for index, item in enumerate(config):
-                if isinstance(item, dict | list):
-                    self._check_hydra_targets(
-                        item,
-                        config_name,
-                        archive_path,
-                        result,
-                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
-                    )
-            return
-
-        if not isinstance(config, dict):
-            return
-
-        for key, value in config.items():
-            current_path = f"{path_prefix}.{key}" if path_prefix else key
-
+        """Check _target_ values in Hydra config within shared traversal bounds."""
+        for config_path, value, _parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, current_path, config_name, archive_path, result, config)
-            elif isinstance(value, dict | list):
-                self._check_hydra_targets(value, config_name, archive_path, result, current_path)
+                self._evaluate_target(value, config_path, config_name, archive_path, result)
 
     def _evaluate_target(
         self,
@@ -2163,26 +3197,41 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
-        target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
+        display_target = _redact_config_evidence(target)
+        display_config_path = _redact_config_evidence(config_path)
+        display_config_name = _redact_config_evidence(config_name)
+        callable_target = _unwrap_target_call_aliases(target)
         # Escaped interpolation openers can become active after repeated OmegaConf/Hydra resolution passes.
         if _HYDRA_INTERPOLATION_OPENER in target:
             self._add_interpolated_target_check(target, config_path, config_name, archive_path, result)
             return
 
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
+        if (
+            callable_target in _DANGEROUS_TARGETS
+            or callable_target.startswith(_DANGEROUS_TARGET_PREFIXES)
+            or (callable_target.startswith("numpy.") and callable_target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
+            or (
+                callable_target not in _SAFE_TARGETS
+                and callable_target.startswith("transformers.")
+                and callable_target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
+            )
+        ):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
-                message=(f"{CVE_2025_23304_ID}: Dangerous _target_ '{target}' at {config_path} in {config_name}"),
+                message=(
+                    f"{CVE_2025_23304_ID}: Dangerous _target_ "
+                    f"'{display_target}' at {display_config_path} in {display_config_name}"
+                ),
                 severity=IssueSeverity.CRITICAL,
-                location=f"{archive_path}:{config_name}",
+                location=f"{archive_path}:{display_config_name}",
                 details={
-                    "target": target,
-                    "config_path": config_path,
-                    "config_file": config_name,
+                    "target": display_target,
+                    "config_path": display_config_path,
+                    "config_file": display_config_name,
                     "cve_id": CVE_2025_23304_ID,
                     "cvss": CVE_2025_23304_CVSS,
                     "cwe": CVE_2025_23304_CWE,
@@ -2190,7 +3239,7 @@ class NemoScanner(BaseScanner):
                     "remediation": CVE_2025_23304_REMEDIATION,
                 },
                 why=(
-                    f"The _target_ field '{target}' in this NeMo "
+                    f"The _target_ field '{display_target}' in this NeMo "
                     f"config specifies a dangerous Python callable. "
                     f"When hydra.utils.instantiate() processes this "
                     f"config, it will execute arbitrary code "
@@ -2200,8 +3249,10 @@ class NemoScanner(BaseScanner):
             return
 
         # Trusted namespaces can still hide obviously dangerous leaf names.
-        if target in _SAFE_TARGETS or any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
-            pattern = _find_suspicious_safe_prefixed_target_pattern(target)
+        if callable_target in _SAFE_TARGETS or any(
+            callable_target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES
+        ):
+            pattern = _find_suspicious_safe_prefixed_target_pattern(callable_target)
             if pattern is not None:
                 self._add_suspicious_target_check(
                     target,
@@ -2215,14 +3266,14 @@ class NemoScanner(BaseScanner):
             result.add_check(
                 name="Hydra _target_ Safety Check",
                 passed=True,
-                message=(f"Safe _target_ '{target}' at {config_path} in {config_name}"),
-                location=f"{archive_path}:{config_name}",
-                details={"target": target, "config_path": config_path},
+                message=(f"Safe _target_ '{display_target}' at {display_config_path} in {display_config_name}"),
+                location=f"{archive_path}:{display_config_name}",
+                details={"target": display_target, "config_path": display_config_path},
             )
             return
 
         # Check for suspicious patterns in target (only for non-safe targets)
-        pattern = _find_suspicious_target_pattern(target)
+        pattern = _find_suspicious_target_pattern(callable_target)
         if pattern is not None:
             self._add_suspicious_target_check(target, pattern, config_path, config_name, archive_path, result)
             return
@@ -2231,13 +3282,16 @@ class NemoScanner(BaseScanner):
         result.add_check(
             name="Hydra _target_ Review",
             passed=False,
-            message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
+            message=(
+                f"Unknown _target_ '{display_target}' at "
+                f"{display_config_path} in {display_config_name} - requires manual review"
+            ),
             severity=IssueSeverity.INFO,
-            location=f"{archive_path}:{config_name}",
+            location=f"{archive_path}:{display_config_name}",
             details={
-                "target": target,
-                "config_path": config_path,
-                "config_file": config_name,
+                "target": display_target,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
             },
         )
 
@@ -2288,21 +3342,24 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
     ) -> None:
+        display_target = _redact_config_evidence(target)
+        display_config_path = _redact_config_evidence(config_path)
+        display_config_name = _redact_config_evidence(config_name)
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
             passed=False,
             message=(
                 f"{CVE_2025_23304_ID}: Suspicious _target_ "
-                f"'{target}' (contains '{pattern}') at "
-                f"{config_path} in {config_name}"
+                f"'{display_target}' (contains '{pattern}') at "
+                f"{display_config_path} in {display_config_name}"
             ),
             severity=IssueSeverity.CRITICAL,
-            location=f"{archive_path}:{config_name}",
+            location=f"{archive_path}:{display_config_name}",
             details={
-                "target": target,
+                "target": display_target,
                 "pattern": pattern,
-                "config_path": config_path,
-                "config_file": config_name,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
                 "cve_id": CVE_2025_23304_ID,
                 "cvss": CVE_2025_23304_CVSS,
                 "cwe": CVE_2025_23304_CWE,
@@ -2310,18 +3367,3 @@ class NemoScanner(BaseScanner):
                 "remediation": CVE_2025_23304_REMEDIATION,
             },
         )
-
-    @staticmethod
-    def _numpy_load_allows_pickle(target_config: dict[str, Any] | None) -> bool:
-        """Return whether a Hydra numpy.load target enables pickle loading."""
-        if not isinstance(target_config, dict):
-            return False
-
-        if "allow_pickle" in target_config:
-            return _is_runtime_truthy(target_config["allow_pickle"])
-
-        positional_args = target_config.get("_args_")
-        if isinstance(positional_args, list) and len(positional_args) >= 3:
-            return _is_runtime_truthy(positional_args[2])
-
-        return False
