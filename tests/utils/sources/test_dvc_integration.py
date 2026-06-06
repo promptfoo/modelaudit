@@ -1791,7 +1791,6 @@ class TestDvcCliIntegration:
         from click.testing import CliRunner
 
         from modelaudit import cli as cli_module
-        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
@@ -1809,7 +1808,10 @@ class TestDvcCliIntegration:
 
         monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_with_info)
 
-        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
+        result = CliRunner().invoke(
+            cli_module.cli,
+            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
+        )
 
         assert result.exit_code == 0
         output_data = json.loads(result.output)
@@ -1837,7 +1839,6 @@ class TestDvcCliIntegration:
         from click.testing import CliRunner
 
         from modelaudit import cli as cli_module
-        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
@@ -1849,7 +1850,10 @@ class TestDvcCliIntegration:
 
         monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_then_rewrite_pointer)
 
-        result = CliRunner().invoke(cli, ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"])
+        result = CliRunner().invoke(
+            cli_module.cli,
+            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
+        )
 
         assert result.exit_code == 2
         output_data = json.loads(result.output)
@@ -1892,7 +1896,6 @@ class TestDvcCliIntegration:
         from click.testing import CliRunner
 
         from modelaudit import cli as cli_module
-        from modelaudit.cli import cli
 
         real_scan = cli_module.scan_model_directory_or_file
 
@@ -1906,7 +1909,7 @@ class TestDvcCliIntegration:
         monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_without_sibling_asset)
 
         result = CliRunner().invoke(
-            cli,
+            cli_module.cli,
             ["scan", str(dvc_file), str(shards[0]), "--format", "json", "--no-cache"],
         )
 
