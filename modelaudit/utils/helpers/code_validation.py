@@ -1,10 +1,7 @@
-"""Python code validation utilities using py_compile."""
+"""Python code validation utilities."""
 
 import ast
 import logging
-import os
-import py_compile
-import tempfile
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -26,23 +23,9 @@ def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool,
         return False, "Empty or invalid code string"
 
     try:
-        # First try AST parsing for quick syntax check
-        ast.parse(code)
-
-        # Then use py_compile for more thorough validation
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
-            tmp.write(code)
-            tmp.flush()
-            tmp_name = tmp.name
-            tmp.close()  # Close before py_compile (required on Windows)
-
-        try:
-            py_compile.compile(tmp_name, doraise=True)
-            return True, None
-        except py_compile.PyCompileError as e:
-            return False, str(e)
-        finally:
-            os.unlink(tmp_name)
+        tree = ast.parse(code, filename=filename)
+        compile(tree, filename, "exec", dont_inherit=True)
+        return True, None
 
     except SyntaxError as e:
         error_msg = f"Syntax error at line {e.lineno}: {e.msg}"
