@@ -8483,6 +8483,79 @@ class TestJITScriptDetector:
         )
 
     @pytest.mark.parametrize(
+        "restore",
+        [
+            b"class C:\n    wb.open = original\n    wb.open('https://example.invalid')\n    wb = object()\n",
+            b"wb.__setattr__('open', original)\nwb.open('https://example.invalid')\n",
+            b"object.__setattr__(wb, 'open', original)\nwb.open('https://example.invalid')\n",
+            b"del wb.open\nwb.__dict__.setdefault('open', original)\nwb.open('https://example.invalid')\n",
+        ],
+    )
+    def test_scan_model_keeps_typed_calls_after_order_sensitive_restores(self, restore: bytes) -> None:
+        source = b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n" + restore
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_treats_comprehension_typed_write_as_conditional(self) -> None:
+        source = (
+            b"import webbrowser as wb\n"
+            b"[wb.__dict__.update(open=print) for _ in values]\n"
+            b"wb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "replacement",
+        [
+            b"sys.modules['webbrowser'] = replacement\n",
+            b"sys.modules.update({'webbrowser': replacement})\n",
+        ],
+    )
+    def test_scan_model_invalidates_typed_cache_after_sys_modules_replacement(self, replacement: bytes) -> None:
+        source = (
+            b"import webbrowser as wb, sys\noriginal = wb.open\nwb.open = print\n"
+            b"replacement = type(sys)('webbrowser')\nreplacement.open = original\n"
+            + replacement
+            + b"import webbrowser as fresh\nfresh.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "middle",
+        [
+            b"wb.open('safe')\nwb.open = original\n",
+            b"choice = 1 if flag else 2\nwb.open('safe')\n",
+            b"[value for value in (wb.__dict__.update(open=print) or [1])]\nwb.open('safe')\n",
+        ],
+    )
+    def test_scan_model_preserves_ordered_typed_safe_calls(self, middle: bytes) -> None:
+        source = b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n" + middle
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
         ("deletion", "should_detect"),
         [
             (b"flag and rp.__dict__.pop('run_path', None)\n", True),
