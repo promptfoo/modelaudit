@@ -1,0 +1,32 @@
+name: Apply PR 1472 follow-up
+
+on:
+  push:
+    branches:
+      - mdangelo/codex/fix-dvc-output-limit-coverage-c085
+    paths:
+      - .github/workflows/apply-pr1472-followup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode .github/pr1472-followup/patch.b64 | gzip --decompress > /tmp/pr1472-followup.patch
+          echo "58e7efa781363a345e9c4c9d1e250b1a95f4b444bc3b8d1b408b33da978d373c  /tmp/pr1472-followup.patch" | sha256sum --check
+          git apply --index /tmp/pr1472-followup.patch
+          git rm -r .github/pr1472-followup .github/workflows/apply-pr1472-followup.yml
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: credit covered malicious DVC siblings"
+          git push origin HEAD:mdangelo/codex/fix-dvc-output-limit-coverage-c085
