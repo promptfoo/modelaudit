@@ -1433,6 +1433,47 @@ class TestJITScriptDetector:
             is should_detect
         )
 
+    @pytest.mark.parametrize("clause", [b"else:", b"elif flag:", b"except Exception:"])
+    def test_scan_model_keeps_priority_import_after_standalone_continuation_header(self, clause: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_starts = b"".join(
+            f"value_{index} = {index}\n".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2)
+        )
+        source = (
+            b"\x00\xff"
+            + leading_starts
+            + clause
+            + b" from webbrowser import open as opener; opener('https://example.invalid')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(("condition", "should_detect"), [(b"True", False), (b"False", True)])
+    def test_scan_model_preserves_context_for_same_line_continuation_import(
+        self,
+        condition: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"\x00\xffif "
+            + condition
+            + b":\n    pass\nelse: from webbrowser import open as opener; opener('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
     def test_scan_model_detects_indented_priority_import_after_default_cap(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -8668,6 +8709,59 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
             for finding in findings
         )
+
+    @pytest.mark.parametrize(
+        ("comprehension", "should_detect"),
+        [
+            (b"[wb.__dict__.update(open=print) for _ in [0]]", False),
+            (b"[wb.__dict__.update(open=print) for _ in []]", True),
+            (b"[wb.__dict__.update(open=print) for _ in [0] if False]", True),
+        ],
+    )
+    def test_scan_model_replays_only_definitely_executed_comprehension_typed_write(
+        self,
+        comprehension: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = b"import webbrowser as wb\n" + comprehension + b"\nwb.open('https://example.invalid')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    def test_scan_model_replays_definitely_executed_comprehension_runpy_write(self) -> None:
+        source = b"import runpy as rp\n[rp.__dict__.update(run_path=print) for _ in [0]]\nrp.run_path('payload.py')\n"
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(("restored_attribute", "should_detect"), [(b"print", False), (b"input", True)])
+    def test_scan_model_tracks_direct_builtin_print_restoration(
+        self,
+        restored_attribute: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import builtins, webbrowser as wb\nprint = object()\nprint = builtins."
+            + restored_attribute
+            + b"\nwb.open = print\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
 
     @pytest.mark.parametrize(
         "replacement",
