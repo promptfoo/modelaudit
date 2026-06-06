@@ -10716,6 +10716,63 @@ def _compact_snippet_shadowed_setattr_references_by_statement(
     return shadowed_by_statement
 
 
+def _compact_snippet_shadowed_delattr_references_by_statement(
+    statements: Sequence[ast.stmt],
+) -> dict[int, set[str]]:
+    relevant_references = {"delattr", "builtins.delattr", "__builtins__.delattr"}
+    shadowed_by_statement: dict[int, set[str]] = {}
+    for index, statement in enumerate(statements):
+        if not any(
+            isinstance(node, ast.Call) and _simple_reference_name(node.func) in relevant_references
+            for node in ast.walk(statement)
+        ):
+            continue
+        prefix_tree = ast.Module(body=list(statements[: index + 1]), type_ignores=[])
+        source = ast.unparse(prefix_tree)
+        parents, executed_statement_ids = _compact_module_scope_context(prefix_tree)
+        local_shadowed = _compact_snippet_mutates_module_name(
+            prefix_tree,
+            "delattr",
+            evaluate_annotations=not _source_defers_annotations(source.encode("utf-8")),
+        ) or any(
+            _is_compact_module_scope_node(node, parents, executed_statement_ids)
+            and (
+                (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "delattr")
+                or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "delattr")
+                or (
+                    isinstance(node, (ast.Import, ast.ImportFrom))
+                    and any((alias.asname or alias.name.split(".", maxsplit=1)[0]) == "delattr" for alias in node.names)
+                )
+            )
+            for node in ast.walk(prefix_tree)
+        )
+        (
+            builtins_aliases,
+            vars_helper_aliases,
+            dict_descriptor_aliases,
+            mapping_aliases,
+            mapping_update_aliases,
+            mapping_setitem_aliases,
+        ) = _compact_builtins_mutation_alias_state(prefix_tree)
+        builtins_shadowed = "delattr" in _late_mutated_truthy_builtin_names(
+            source.encode("utf-8"),
+            builtins_aliases,
+            set(),
+            builtin_dict_mapping_aliases=mapping_aliases,
+            builtin_dict_descriptor_aliases=dict_descriptor_aliases,
+            builtin_dict_mapping_update_aliases=mapping_update_aliases,
+            builtin_dict_mapping_setitem_aliases=mapping_setitem_aliases,
+            canonical_builtin_helper_aliases=dict.fromkeys(vars_helper_aliases, "vars"),
+        )
+        shadowed_references: set[str] = set()
+        if local_shadowed or builtins_shadowed:
+            shadowed_references.add("delattr")
+        if builtins_shadowed:
+            shadowed_references.update({"builtins.delattr", "__builtins__.delattr"})
+        shadowed_by_statement[id(statement)] = shadowed_references
+    return shadowed_by_statement
+
+
 def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
     return bool(_compact_snippet_shadowed_setattr_references(tree))
 
@@ -10785,7 +10842,10 @@ def _compact_snippet_deleted_print_setdefault_members(
         ):
             method = descriptor_aliases[call.func.id]
             arguments = call.args[1:]
-        if method in {"pop", "__delitem__"} and arguments:
+        if method == "clear":
+            deleted_members.update(_RUNPY_PRIORITY_MEMBER_NAMES)
+            safe_members.clear()
+        elif method in {"pop", "__delitem__"} and arguments:
             member_name = _runpy_static_member_key(arguments[0])
             if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
                 deleted_members.add(member_name)
@@ -10851,6 +10911,7 @@ def _compact_snippet_deleted_print_setdefault_members(
                             "pop",
                             "__delitem__",
                             "__setitem__",
+                            "clear",
                             "setdefault",
                             "update",
                             "__ior__",
@@ -10861,7 +10922,7 @@ def _compact_snippet_deleted_print_setdefault_members(
                             and statement.value.value.id == "dict"
                             and not local_dict_shadowed
                             and statement.value.attr
-                            in {"pop", "__delitem__", "__setitem__", "setdefault", "update", "__ior__"}
+                            in {"pop", "__delitem__", "__setitem__", "clear", "setdefault", "update", "__ior__"}
                         ):
                             descriptor_aliases[target.id] = statement.value.attr
                 elif (
@@ -11362,11 +11423,15 @@ def _compact_snippet_runpy_print_overwrite_calls(
 
     executed_statements = _deterministically_executed_statements(tree.body)
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    first_print_shadow_index = next(
+        (index for index, statement in enumerate(executed_statements) if id(statement) in shadowed_print_statement_ids),
+        len(executed_statements),
+    )
     shadowed_setattr_references_by_statement = _compact_snippet_shadowed_setattr_references_by_statement(
         executed_statements
     )
-    for statement in executed_statements:
-        current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
+    for statement_index, statement in enumerate(executed_statements):
+        current_print_is_shadowed = statement_index > first_print_shadow_index
         current_shadowed_setattr_references = shadowed_setattr_references_by_statement.get(id(statement), set())
         runpy_alias_ids_before = dict(runpy_alias_ids)
         mapping_aliases_before = dict(mapping_aliases)
@@ -11592,6 +11657,9 @@ def _compact_snippet_runpy_print_overwrite_calls(
                     )
                     is not None
                 ):
+                    if node.func.attr == "clear":
+                        invalidate_module(module_id)
+                        continue
                     if node.func.attr in {"update", "__ior__"}:
                         for nested in ast.walk(
                             ast.Tuple(elts=[*node.args, *(keyword.value for keyword in node.keywords)])
@@ -12211,6 +12279,23 @@ def _compact_snippet_typed_print_overwrite_replay(
     mutated_truthy_builtins = _late_mutated_truthy_builtin_names(source.encode("utf-8"), builtins_aliases, set())
     if mutated_truthy_builtins.intersection(_EAGER_LATE_GENERATOR_CONSUMERS):
         return set(), set()
+    module_parents, module_statement_ids = _compact_module_scope_context(tree)
+    local_getattr_shadowed = _compact_snippet_mutates_module_name(
+        tree,
+        "getattr",
+        evaluate_annotations=not deferred_annotations,
+    ) or any(
+        _is_compact_module_scope_node(node, module_parents, module_statement_ids)
+        and (
+            (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "getattr")
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "getattr")
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any((alias.asname or alias.name.split(".", maxsplit=1)[0]) == "getattr" for alias in node.names)
+            )
+        )
+        for node in ast.walk(tree)
+    )
     vars_helper_aliases: set[str] = set()
     setattr_helper_aliases: set[str] = set()
     dict_helper_aliases: set[str] = set()
@@ -12382,6 +12467,17 @@ def _compact_snippet_typed_print_overwrite_replay(
             and not builtins_vars_shadowed
         )
 
+    def active_getattr_reference(reference: str | None) -> bool:
+        if "getattr" in mutated_truthy_builtins:
+            return False
+        if reference == "getattr":
+            return not local_getattr_shadowed
+        return bool(
+            reference is not None
+            and reference.endswith(".getattr")
+            and reference.removesuffix(".getattr") in builtins_aliases
+        )
+
     def active_dict_reference(reference: str | None) -> bool:
         if reference in dict_helper_aliases:
             return True
@@ -12441,6 +12537,15 @@ def _compact_snippet_typed_print_overwrite_replay(
             and node.args[0].id in current_typed_ids
         ):
             return current_typed_ids[node.args[0].id]
+        if (
+            isinstance(node, ast.Call)
+            and active_getattr_reference(_simple_reference_name(node.func))
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in current_typed_ids
+            and _static_getattr_member_name(node.args[1]) == "__dict__"
+        ):
+            return current_typed_ids[node.args[0].id]
         return None
 
     def is_builtins_mapping(node: ast.AST) -> bool:
@@ -12494,6 +12599,19 @@ def _compact_snippet_typed_print_overwrite_replay(
         member_key = (owner, member_name)
         safe_members.discard(member_key)
         deleted_members.add(member_key)
+
+    def record_member_delete_call(
+        owner: tuple[str, int] | None,
+        member_name: str | None,
+        *,
+        conditional: bool,
+    ) -> None:
+        if owner is None:
+            return
+        if conditional or member_name is None:
+            invalidate_owner_state(owner)
+        else:
+            record_member_delete(owner, member_name)
 
     def record_member_setdefault(
         owner: tuple[str, int] | None,
@@ -12557,10 +12675,11 @@ def _compact_snippet_typed_print_overwrite_replay(
                         mapping_aliases_before,
                     )
 
+    def invalidate_owner_state(owner: tuple[str, int]) -> None:
+        safe_members.difference_update({member for member in safe_members if member[0] == owner})
+        deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
+
     def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
-        def invalidate_owner() -> None:
-            safe_members.difference_update({member for member in safe_members if member[0] == owner})
-            deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
 
         def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
             record_member(
@@ -12571,12 +12690,12 @@ def _compact_snippet_typed_print_overwrite_replay(
             )
 
         for argument in call.args:
-            _replay_static_update_items(argument, record_item, invalidate_owner)
+            _replay_static_update_items(argument, record_item, lambda: invalidate_owner_state(owner))
         for keyword in call.keywords:
             if keyword.arg is not None:
                 record_member(owner, keyword.arg, keyword.value, conditional=conditional)
             else:
-                _replay_static_update_items(keyword.value, record_item, invalidate_owner)
+                _replay_static_update_items(keyword.value, record_item, lambda: invalidate_owner_state(owner))
 
     def is_sys_modules_mapping(
         node: ast.AST,
@@ -13039,8 +13158,15 @@ def _compact_snippet_typed_print_overwrite_replay(
 
     executed_statement_ids = {id(statement) for statement in executed_statements}
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
+    shadowed_delattr_references_by_statement = _compact_snippet_shadowed_delattr_references_by_statement(
+        executed_statements
+    )
+    first_print_shadow_index = next(
+        (index for index, statement in enumerate(executed_statements) if id(statement) in shadowed_print_statement_ids),
+        len(executed_statements),
+    )
     class_scope_stack: list[tuple[ast.ClassDef, tuple[Any, ...]]] = []
-    for statement in executed_statements:
+    for statement_index, statement in enumerate(executed_statements):
         statement_scope = class_scope_path(statement)
         common_scope_length = 0
         while (
@@ -13054,7 +13180,7 @@ def _compact_snippet_typed_print_overwrite_replay(
             restore_lexical_scope(snapshot)
         for scope in statement_scope[common_scope_length:]:
             class_scope_stack.append((scope, lexical_scope_snapshot()))
-        current_print_is_shadowed = id(statement) in shadowed_print_statement_ids
+        current_print_is_shadowed = statement_index > first_print_shadow_index
         typed_aliases_before = dict(typed_aliases)
         mapping_aliases_before = dict(mapping_aliases)
         reload_aliases_before = frozenset(reload_aliases)
@@ -13426,6 +13552,44 @@ def _compact_snippet_typed_print_overwrite_replay(
                     )
                     continue
                 if (
+                    reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
+                    and reference not in shadowed_delattr_references_by_statement.get(id(statement), set())
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__delattr__"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in active_typed_aliases
+                    and node.args
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.func.value.id],
+                        _static_getattr_member_name(node.args[0]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
+                    reference in {"object.__delattr__", "builtins.object.__delattr__"}
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_typed_aliases
+                ):
+                    record_member_delete_call(
+                        active_typed_aliases[node.args[0].id],
+                        _static_getattr_member_name(node.args[1]),
+                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                    )
+                    continue
+                if (
                     active_dict_update_reference(reference)
                     and node.args
                     and (
@@ -13474,6 +13638,20 @@ def _compact_snippet_typed_print_overwrite_replay(
                         node.args[2],
                         conditional=_is_conditionally_evaluated_expression(node, parents),
                     )
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "clear"
+                    and (
+                        clear_owner := owner_name(
+                            node.func.value,
+                            active_mapping_aliases,
+                            active_typed_aliases,
+                        )
+                    )
+                    is not None
+                ):
+                    invalidate_owner_state(clear_owner)
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -14497,6 +14675,10 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     if len(node.args) >= 2 and (member_name := _runpy_static_member_key(node.args[0])) is not None:
                         record_runpy_setdefault(member_name, node.args[1], inactive=False)
                     continue
+            if node.func.attr == "clear" and is_runpy_mapping(node.func.value):
+                invalidate_runpy_mapping_update()
+                deleted_runpy_members.update(_RUNPY_PRIORITY_MEMBER_NAMES)
+                continue
             if node.func.attr in {"pop", "__delitem__"}:
                 descriptor = node.func.value
                 if is_runpy_mapping(descriptor):
