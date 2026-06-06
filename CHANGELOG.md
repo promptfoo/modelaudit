@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
@@ -226,7 +227,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - classify noncanonical Keras versions inside wholly vulnerable numeric ranges and avoid over-attributing wildcard fixed lines
 - preserve selected content-routed and exact-name cloud/JFrog artifacts, structurally filter renamed JFrog ZIPs, share cloud probe and download budgets, isolate selective directory caches, and exclude confidently unselected shared-suffix formats
-- preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - detect TorchServe MAR handler execution primitives reached through dynamic imports, namespace lookups, literal selection, callbacks, and partial callables without flagging statically unreachable paths
 - omit sensitive LightGBM model excerpts and network values from finding evidence
 - fail closed when TensorFlow SavedModel graph traversal exceeds bounded node or function budgets

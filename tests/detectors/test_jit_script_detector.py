@@ -8674,6 +8674,9 @@ class TestJITScriptDetector:
         [
             b"sys.modules['webbrowser'] = replacement\n",
             b"sys.modules.update({'webbrowser': replacement})\n",
+            b"sys.modules |= {'webbrowser': replacement}\n",
+            b"sys.modules[module_name] = replacement\n",
+            b"sys.modules.update(replacements)\n",
         ],
     )
     def test_scan_model_invalidates_typed_cache_after_sys_modules_replacement(self, replacement: bytes) -> None:
@@ -8690,6 +8693,135 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
             for finding in findings
         )
+
+    @pytest.mark.parametrize(
+        "replacement",
+        [
+            b"sys.modules['runpy'] = replacement\n",
+            b"sys.modules.update({'runpy': replacement})\n",
+            b"sys.modules.__setitem__('runpy', replacement)\n",
+            b"sys.modules |= {'runpy': replacement}\n",
+            b"sys.modules[module_name] = replacement\n",
+            b"sys.modules.update(replacements)\n",
+        ],
+    )
+    def test_scan_model_invalidates_runpy_cache_after_sys_modules_replacement(self, replacement: bytes) -> None:
+        source = (
+            b"import runpy as rp, sys\noriginal = rp.run_path\nrp.run_path = print\n"
+            b"replacement = type(sys)('runpy')\nreplacement.run_path = original\n"
+            + replacement
+            + b"import runpy as fresh\nfresh.run_path('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            b"sys.modules.setdefault('runpy', replacement)\n",
+            b"sys.modules['other'] = replacement\n",
+            b"sys.modules.update({'other': replacement})\n",
+        ],
+    )
+    def test_scan_model_preserves_runpy_cache_across_unrelated_sys_modules_write(self, mutation: bytes) -> None:
+        source = (
+            b"import runpy as rp, sys\nrp.run_path = print\n"
+            b"replacement = type(sys)('runpy')\nreplacement.run_path = original\n"
+            + mutation
+            + b"import runpy as fresh\nfresh.run_path('safe')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("middle", "should_detect"),
+        [
+            (b"wb.__dict__.update(**maybe_original)\n", True),
+            (b"wb.__dict__[member_name] = original\n", True),
+            (b"wb.__dict__.__setitem__(member_name, original)\n", True),
+            (b"wb.__dict__ |= maybe_original\n", True),
+            (b"wb.__dict__.update(other=original)\n", False),
+        ],
+    )
+    def test_scan_model_invalidates_typed_delete_proof_after_mapping_update(
+        self,
+        middle: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\ndel wb.open\n"
+            + middle
+            + b"wb.__dict__.setdefault('open', print)\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("middle", "should_detect"),
+        [
+            (b"rp.__dict__.update(**maybe_original)\n", True),
+            (b"rp.__dict__[member_name] = original\n", True),
+            (b"rp.__dict__.__setitem__(member_name, original)\n", True),
+            (b"rp.__dict__ |= maybe_original\n", True),
+            (b"rp.__dict__.update(other=original)\n", False),
+        ],
+    )
+    def test_scan_model_invalidates_runpy_delete_proof_after_mapping_update(
+        self,
+        middle: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = (
+            b"import runpy as rp\noriginal = rp.run_path\ndel rp.run_path\n"
+            + middle
+            + b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
+            for finding in findings
+        )
+        assert detected is should_detect
+
+    @pytest.mark.parametrize(
+        ("expression", "should_detect"),
+        [
+            (b"(setattr(wb, 'open', print), wb.open('safe'))\n", False),
+            (b"(wb.open('https://example.invalid'), setattr(wb, 'open', print))\n", True),
+        ],
+    )
+    def test_scan_model_orders_typed_writes_and_calls_within_expression(
+        self,
+        expression: bytes,
+        should_detect: bool,
+    ) -> None:
+        source = b"import webbrowser as wb\n" + expression
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        detected = any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+        assert detected is should_detect
 
     @pytest.mark.parametrize(
         "middle",

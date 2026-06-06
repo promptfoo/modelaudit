@@ -10789,6 +10789,35 @@ def _compact_snippet_deleted_print_setdefault_members(
             member_name = _runpy_static_member_key(arguments[0])
             if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
                 deleted_members.add(member_name)
+                safe_members.discard(member_name)
+        elif method == "__setitem__" and len(arguments) >= 2:
+            member_name = _runpy_static_member_key(arguments[0])
+            if member_name is None:
+                deleted_members.clear()
+                safe_members.clear()
+            elif member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                deleted_members.discard(member_name)
+                safe_members.discard(member_name)
+        elif method in {"update", "__ior__"}:
+
+            def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+                member_name = _runpy_static_member_key(key_node)
+                if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                    deleted_members.discard(member_name)
+                    safe_members.discard(member_name)
+
+            def invalidate_all() -> None:
+                deleted_members.clear()
+                safe_members.clear()
+
+            for argument in arguments:
+                _replay_static_update_items(argument, record_item, invalidate_all)
+            for keyword in call.keywords:
+                if keyword.arg is None:
+                    _replay_static_update_items(keyword.value, record_item, invalidate_all)
+                elif keyword.arg in _RUNPY_PRIORITY_MEMBER_NAMES:
+                    deleted_members.discard(keyword.arg)
+                    safe_members.discard(keyword.arg)
         elif (
             method == "setdefault"
             and len(arguments) >= 2
@@ -10821,14 +10850,18 @@ def _compact_snippet_deleted_print_setdefault_members(
                         if mapping_targets_runpy(statement.value.value) and statement.value.attr in {
                             "pop",
                             "__delitem__",
+                            "__setitem__",
                             "setdefault",
+                            "update",
+                            "__ior__",
                         }:
                             bound_method_aliases[target.id] = statement.value.attr
                         elif (
                             isinstance(statement.value.value, ast.Name)
                             and statement.value.value.id == "dict"
                             and not local_dict_shadowed
-                            and statement.value.attr in {"pop", "__delitem__", "setdefault"}
+                            and statement.value.attr
+                            in {"pop", "__delitem__", "__setitem__", "setdefault", "update", "__ior__"}
                         ):
                             descriptor_aliases[target.id] = statement.value.attr
                 elif (
@@ -10838,6 +10871,29 @@ def _compact_snippet_deleted_print_setdefault_members(
                     and target.attr in _RUNPY_PRIORITY_MEMBER_NAMES
                 ):
                     deleted_members.discard(target.attr)
+                    safe_members.discard(target.attr)
+                elif isinstance(target, ast.Subscript) and mapping_targets_runpy(target.value):
+                    member_name = _runpy_static_member_key(target.slice)
+                    if member_name is None:
+                        deleted_members.clear()
+                        safe_members.clear()
+                    elif member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.discard(member_name)
+                        safe_members.discard(member_name)
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
+            if mapping_targets_runpy(statement.target):
+
+                def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+                    member_name = _runpy_static_member_key(key_node)
+                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+                        deleted_members.discard(member_name)
+                        safe_members.discard(member_name)
+
+                def invalidate_all() -> None:
+                    deleted_members.clear()
+                    safe_members.clear()
+
+                _replay_static_update_items(statement.value, record_item, invalidate_all)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
                 if (
@@ -11186,6 +11242,69 @@ def _compact_snippet_runpy_print_overwrite_calls(
             else:
                 record_member_value(module_id, keyword.arg, keyword.value, conditional=conditional)
 
+    def is_sys_modules_mapping(
+        node: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in active_sys_aliases
+        )
+
+    def invalidate_cached_runpy_name(module_name: str | None) -> None:
+        nonlocal cached_runpy_id
+        if module_name in {"runpy", None}:
+            cached_runpy_id = None
+
+    def invalidate_cached_runpy_assignment(
+        target: ast.AST,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> None:
+        if isinstance(target, ast.Subscript) and is_sys_modules_mapping(
+            target.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            invalidate_cached_runpy_name(_static_getattr_member_name(target.slice))
+
+    def invalidate_cached_runpy_update(
+        call: ast.Call,
+        active_sys_aliases: Collection[str],
+        active_modules_aliases: Collection[str],
+    ) -> bool:
+        nonlocal cached_runpy_id
+        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(
+            call.func.value,
+            active_sys_aliases,
+            active_modules_aliases,
+        ):
+            return False
+        if call.func.attr == "__setitem__" and len(call.args) >= 2:
+            invalidate_cached_runpy_name(_static_getattr_member_name(call.args[0]))
+            return True
+        if call.func.attr not in {"update", "__ior__"}:
+            return False
+
+        def invalidate_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+            invalidate_cached_runpy_name(_static_getattr_member_name(key_node))
+
+        def invalidate_all() -> None:
+            nonlocal cached_runpy_id
+            cached_runpy_id = None
+
+        for argument in call.args:
+            _replay_static_update_items(argument, invalidate_item, invalidate_all)
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                _replay_static_update_items(keyword.value, invalidate_item, invalidate_all)
+            else:
+                invalidate_cached_runpy_name(keyword.arg)
+        return True
+
     def bind_runpy_target(target: ast.AST, value: ast.AST, aliases_before: Mapping[str, int]) -> None:
         if isinstance(target, ast.Name):
             module_id = aliases_before.get(value.id) if isinstance(value, ast.Name) else None
@@ -11235,7 +11354,11 @@ def _compact_snippet_runpy_print_overwrite_calls(
         ):
             record_module_attribute_value(module_id, target.attr, value)
         elif isinstance(target, ast.Subscript) and (module_id := runpy_mapping_id(target.value)) is not None:
-            record_member_value(module_id, _runpy_static_member_key(target.slice), value)
+            member_name = _runpy_static_member_key(target.slice)
+            if member_name is None:
+                invalidate_module(module_id)
+            else:
+                record_member_value(module_id, member_name, value)
 
     executed_statements = _deterministically_executed_statements(tree.body)
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
@@ -11291,6 +11414,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 )
                 bind_reload_target(target, statement.value, reload_aliases_before, importlib_aliases_before)
                 record_assignment_target(target, statement.value)
+                invalidate_cached_runpy_assignment(target, sys_aliases_before, sys_modules_aliases_before)
         elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
             bind_runpy_target(statement.target, statement.value, runpy_alias_ids_before)
             bind_mapping_target(statement.target, statement.value, mapping_aliases_before)
@@ -11310,6 +11434,11 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 importlib_aliases_before,
             )
             record_assignment_target(statement.target, statement.value)
+            invalidate_cached_runpy_assignment(
+                statement.target,
+                sys_aliases_before,
+                sys_modules_aliases_before,
+            )
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
                 if isinstance(target, ast.Name):
@@ -11344,7 +11473,13 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 if statement.module == "importlib" and alias.name == "reload":
                     reload_aliases.add(local_name)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
-            if (module_id := runpy_mapping_id(statement.target)) is not None:
+            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, _value: invalidate_cached_runpy_name(_static_getattr_member_name(key)),
+                    lambda: invalidate_cached_runpy_name("runpy"),
+                )
+            elif (module_id := runpy_mapping_id(statement.target)) is not None:
                 replay_module_id = module_id
 
                 def record_replay_item(
@@ -11405,6 +11540,8 @@ def _compact_snippet_runpy_print_overwrite_calls(
                     reload_aliases_before,
                     set(active_importlib_aliases),
                 )
+                if invalidate_cached_runpy_update(node, active_sys_aliases, active_sys_modules_aliases):
+                    continue
                 if (
                     reference in {"setattr", "builtins.setattr", "__builtins__.setattr"}
                     and reference not in current_shadowed_setattr_references
@@ -12393,11 +12530,13 @@ def _compact_snippet_typed_print_overwrite_replay(
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
             record_attribute(aliases_before.get(target.value.id), target.attr, value)
         elif isinstance(target, ast.Subscript):
-            record_member(
-                owner_name(target.value, mapping_aliases_before, aliases_before),
-                _static_getattr_member_name(target.slice),
-                value,
-            )
+            owner = owner_name(target.value, mapping_aliases_before, aliases_before)
+            member_name = _static_getattr_member_name(target.slice)
+            if owner is not None and member_name is None:
+                safe_members.difference_update({member for member in safe_members if member[0] == owner})
+                deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
+            else:
+                record_member(owner, member_name, value)
         elif isinstance(target, ast.Starred):
             record_assignment_target(
                 target.value,
@@ -12421,6 +12560,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     def record_update(owner: tuple[str, int], call: ast.Call, *, conditional: bool = False) -> None:
         def invalidate_owner() -> None:
             safe_members.difference_update({member for member in safe_members if member[0] == owner})
+            deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
 
         def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
             record_member(
@@ -12451,7 +12591,9 @@ def _compact_snippet_typed_print_overwrite_replay(
         )
 
     def invalidate_cached_module_name(module_name: str | None) -> None:
-        if module_name in {"webbrowser", "ctypes"}:
+        if module_name is None:
+            cached_typed_identities.clear()
+        elif module_name in {"webbrowser", "ctypes"}:
             cached_typed_identities.pop(module_name, None)
 
     def invalidate_sys_modules_assignment(
@@ -13069,19 +13211,30 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ):
                     cached_typed_identities.pop(module_name, None)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
-            if is_builtins_mapping(statement.target):
+            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, _value: invalidate_cached_module_name(_static_getattr_member_name(key)),
+                    cached_typed_identities.clear,
+                )
+            elif is_builtins_mapping(statement.target):
                 _replay_static_update_items(
                     statement.value,
                     lambda key, value: record_builtins_helper_assignment(_static_getattr_member_name(key), value),
                     invalidate_builtins_mapping_helpers,
                 )
             elif (target_owner := owner_name(statement.target)) is not None:
+
+                def invalidate_target_owner() -> None:
+                    safe_members.difference_update({member for member in safe_members if member[0] == target_owner})
+                    deleted_members.difference_update(
+                        {member for member in deleted_members if member[0] == target_owner}
+                    )
+
                 _replay_static_update_items(
                     statement.value,
                     lambda key, value: record_member(target_owner, _static_getattr_member_name(key), value),
-                    lambda: safe_members.difference_update(
-                        {member for member in safe_members if member[0] == target_owner}
-                    ),
+                    invalidate_target_owner,
                 )
         elif isinstance(statement, (ast.For, ast.AsyncFor)):
             invalidate_rebound_target(statement.target)
@@ -13102,9 +13255,6 @@ def _compact_snippet_typed_print_overwrite_replay(
             expression_mapping_aliases = (
                 mapping_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else mapping_aliases
             )
-            for call in _deterministically_executed_expression_calls(value):
-                active_typed_aliases = _name_aliases_before_call(value, call, expression_typed_aliases)
-                record_typed_call(call, active_typed_aliases)
             for named_expression in _deterministic_named_expressions(value):
                 target_name = named_expression.target.id
                 canonical_module = expression_typed_aliases.get(_simple_reference_name(named_expression.value) or "")
@@ -13301,12 +13451,21 @@ def _compact_snippet_typed_print_overwrite_replay(
                             active_typed_aliases,
                         )
                     ) is not None:
-                        record_member(
-                            setitem_owner,
-                            _static_getattr_member_name(node.args[1]),
-                            node.args[2],
-                            conditional=_is_conditionally_evaluated_expression(node, parents),
-                        )
+                        member_name = _static_getattr_member_name(node.args[1])
+                        if member_name is None:
+                            safe_members.difference_update(
+                                {member for member in safe_members if member[0] == setitem_owner}
+                            )
+                            deleted_members.difference_update(
+                                {member for member in deleted_members if member[0] == setitem_owner}
+                            )
+                        else:
+                            record_member(
+                                setitem_owner,
+                                member_name,
+                                node.args[2],
+                                conditional=_is_conditionally_evaluated_expression(node, parents),
+                            )
                     continue
                 if active_dict_setdefault_reference(reference) and len(node.args) >= 3:
                     record_member_setdefault(
@@ -13347,12 +13506,21 @@ def _compact_snippet_typed_print_overwrite_replay(
                     is not None
                     and len(node.args) >= 2
                 ):
-                    record_member(
-                        setitem_owner,
-                        _static_getattr_member_name(node.args[0]),
-                        node.args[1],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
-                    )
+                    member_name = _static_getattr_member_name(node.args[0])
+                    if member_name is None:
+                        safe_members.difference_update(
+                            {member for member in safe_members if member[0] == setitem_owner}
+                        )
+                        deleted_members.difference_update(
+                            {member for member in deleted_members if member[0] == setitem_owner}
+                        )
+                    else:
+                        record_member(
+                            setitem_owner,
+                            member_name,
+                            node.args[1],
+                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                        )
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -13458,6 +13626,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
     vars_helper_names = {"vars", "builtins.vars"}
     importlib_aliases: set[str] = set()
     reload_aliases: set[str] = set()
+    sys_aliases: set[str] = set()
+    sys_modules_names: set[str] = set()
     safe_runpy_members: set[str] = set()
     deleted_runpy_members: set[str] = set()
     dangerous_runpy_value_names: dict[str, str] = {}
@@ -13552,6 +13722,45 @@ def _compact_snippet_inactive_restore_high_risk_calls(
             return node.id in runpy_mapping_names
         return mapping_owner_name(node) is not None
 
+    def is_sys_modules_mapping(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id in sys_modules_names) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in sys_aliases
+        )
+
+    def mark_runpy_cache_replaced(module_name: str | None) -> None:
+        nonlocal runpy_cache_evicted
+        if module_name in {"runpy", None}:
+            runpy_cache_evicted = True
+
+    def record_sys_modules_update(call: ast.Call) -> bool:
+        nonlocal runpy_cache_evicted
+        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(call.func.value):
+            return False
+        if call.func.attr == "__setitem__" and len(call.args) >= 2:
+            mark_runpy_cache_replaced(_static_getattr_member_name(call.args[0]))
+            return True
+        if call.func.attr not in {"update", "__ior__"}:
+            return False
+
+        def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+            mark_runpy_cache_replaced(_static_getattr_member_name(key_node))
+
+        def invalidate_all() -> None:
+            nonlocal runpy_cache_evicted
+            runpy_cache_evicted = True
+
+        for argument in call.args:
+            _replay_static_update_items(argument, record_item, invalidate_all)
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                _replay_static_update_items(keyword.value, record_item, invalidate_all)
+            else:
+                mark_runpy_cache_replaced(keyword.arg)
+        return True
+
     def record_builtins_member_value(member_name: str, value: ast.AST) -> None:
         nonlocal builtins_dict_shadowed, builtins_getattr_shadowed, builtins_vars_shadowed
         value_reference = _simple_reference_name(value)
@@ -13617,6 +13826,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
         def invalidate_unknown() -> None:
             if not inactive:
                 safe_runpy_members.clear()
+                deleted_runpy_members.clear()
                 active_state_members_seen.update(_RUNPY_PRIORITY_MEMBER_NAMES)
 
         def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
@@ -13635,6 +13845,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
 
     def invalidate_runpy_mapping_update() -> None:
         safe_runpy_members.clear()
+        deleted_runpy_members.clear()
         active_state_members_seen.update(_RUNPY_PRIORITY_MEMBER_NAMES)
 
     def clear_local_alias_state(name: str) -> None:
@@ -13664,6 +13875,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
         vars_helper_names.discard(name)
         importlib_aliases.discard(name)
         reload_aliases.discard(name)
+        sys_aliases.discard(name)
+        sys_modules_names.discard(name)
         dangerous_runpy_value_names.pop(name, None)
 
     def dangerous_runpy_member(value: ast.AST) -> str | None:
@@ -13708,8 +13921,11 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 clear_local_alias_state(local_name)
                 if alias.name == "builtins":
                     builtins_aliases.add(local_name)
+                elif alias.name == "sys":
+                    sys_aliases.add(local_name)
                 elif alias.name == "runpy" and runpy_cache_evicted:
                     safe_runpy_members.clear()
+                    deleted_runpy_members.clear()
                     active_state_members_seen.update(_RUNPY_PRIORITY_MEMBER_NAMES)
                     runpy_cache_evicted = False
                 if alias.name == "runpy":
@@ -13723,6 +13939,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 clear_local_alias_state(local_name)
                 if statement.module == "importlib" and alias.name == "reload":
                     reload_aliases.add(local_name)
+                elif statement.module == "sys" and alias.name == "modules":
+                    sys_modules_names.add(local_name)
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 bind_dangerous_runpy_target(target, statement.value)
@@ -13737,6 +13955,10 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     )
                     if not (isinstance(statement.value, ast.Name) and statement.value.id == target.id):
                         clear_local_alias_state(target.id)
+                    if isinstance(statement.value, ast.Name) and statement.value.id in sys_aliases:
+                        sys_aliases.add(target.id)
+                    elif is_sys_modules_mapping(statement.value):
+                        sys_modules_names.add(target.id)
                     if value_reference in reload_aliases or (
                         value_reference is not None
                         and value_reference.endswith(".reload")
@@ -13755,6 +13977,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                         dangerous_runpy_value_names[target.id] = source_dangerous_member
                     else:
                         dangerous_runpy_value_names.pop(target.id, None)
+                if isinstance(target, ast.Subscript) and is_sys_modules_mapping(target.value):
+                    mark_runpy_cache_replaced(_static_getattr_member_name(target.slice))
                 if (
                     isinstance(target, ast.Name)
                     and value_reference is not None
@@ -13943,12 +14167,12 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     active_state_members_seen.add(target.attr)
                     if target.value.id in proven_runpy_aliases:
                         record_runpy_member_value(target.attr, statement.value, inactive=False)
-                elif (
-                    isinstance(target, ast.Subscript)
-                    and is_runpy_mapping(target.value)
-                    and (member_name := _runpy_static_member_key(target.slice)) is not None
-                ):
-                    record_runpy_member_value(member_name, statement.value, inactive=False)
+                elif isinstance(target, ast.Subscript) and is_runpy_mapping(target.value):
+                    member_name = _runpy_static_member_key(target.slice)
+                    if member_name is None:
+                        invalidate_runpy_mapping_update()
+                    else:
+                        record_runpy_member_value(member_name, statement.value, inactive=False)
                 elif (
                     isinstance(target, ast.Attribute)
                     and target.attr == "dict"
@@ -13994,8 +14218,23 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     record_builtins_member_value("getattr", statement.value)
         elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
             bind_dangerous_runpy_target(statement.target, statement.value)
+            if isinstance(statement.target, ast.Name):
+                sys_aliases.discard(statement.target.id)
+                sys_modules_names.discard(statement.target.id)
+                if isinstance(statement.value, ast.Name) and statement.value.id in sys_aliases:
+                    sys_aliases.add(statement.target.id)
+                elif is_sys_modules_mapping(statement.value):
+                    sys_modules_names.add(statement.target.id)
+            elif isinstance(statement.target, ast.Subscript) and is_sys_modules_mapping(statement.target.value):
+                mark_runpy_cache_replaced(_static_getattr_member_name(statement.target.slice))
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
-            if is_builtins_mapping(statement.target):
+            if is_sys_modules_mapping(statement.target):
+                _replay_static_update_items(
+                    statement.value,
+                    lambda key, _value: mark_runpy_cache_replaced(_static_getattr_member_name(key)),
+                    lambda: mark_runpy_cache_replaced("runpy"),
+                )
+            elif is_builtins_mapping(statement.target):
                 for key_node, value_node in _runpy_static_update_items(statement.value) or []:
                     if (member_name := builtins_member_name(key_node)) is not None:
                         record_builtins_member_value(member_name, value_node)
@@ -14032,8 +14271,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                     record_runpy_delete(target.attr)
                 elif (
                     isinstance(target, ast.Subscript)
-                    and isinstance(target.value, ast.Attribute)
-                    and target.value.attr == "modules"
+                    and is_sys_modules_mapping(target.value)
                     and _static_getattr_member_name(target.slice) == "runpy"
                 ):
                     runpy_cache_evicted = True
@@ -14063,6 +14301,8 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 high_risk_calls.add((f"runpy.{member_name}", "S108"))
                 continue
             reference = _simple_reference_name(node.func)
+            if record_sys_modules_update(node):
+                continue
             if (
                 node.args
                 and isinstance(node.args[0], ast.Name)
@@ -14090,8 +14330,12 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 record_runpy_update(node, inactive=False)
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in runpy_mapping_setitem_names:
-                if len(node.args) >= 2 and (member_name := _runpy_static_member_key(node.args[0])) is not None:
-                    record_runpy_member_value(member_name, node.args[1], inactive=False)
+                if len(node.args) >= 2:
+                    member_name = _runpy_static_member_key(node.args[0])
+                    if member_name is None:
+                        invalidate_runpy_mapping_update()
+                    else:
+                        record_runpy_member_value(member_name, node.args[1], inactive=False)
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in runpy_mapping_setdefault_names:
                 if len(node.args) >= 2 and (member_name := _runpy_static_member_key(node.args[0])) is not None:
@@ -14201,6 +14445,14 @@ def _compact_snippet_inactive_restore_high_risk_calls(
                 if is_builtins_mapping(descriptor):
                     if len(node.args) >= 2 and (member_name := builtins_member_name(node.args[0])) is not None:
                         record_builtins_member_value(member_name, node.args[1])
+                    continue
+                if is_runpy_mapping(descriptor):
+                    if len(node.args) >= 2:
+                        member_name = _runpy_static_member_key(node.args[0])
+                        if member_name is None:
+                            invalidate_runpy_mapping_update()
+                        else:
+                            record_runpy_member_value(member_name, node.args[1], inactive=False)
                     continue
                 if (
                     isinstance(descriptor, ast.Name)
