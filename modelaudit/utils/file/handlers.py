@@ -507,17 +507,26 @@ class ParallelShardHandler:
                         progress_callback(f"Scanned shard {completed_shards}/{total_shards}", percentage)
 
                 except Exception as e:
-                    logger.error(f"Error scanning shard {shard}: {e}")
+                    from ...scanners._evidence_redaction import (
+                        redact_evidence_string,
+                        redact_untrusted_error_message,
+                    )
+
+                    safe_shard = redact_evidence_string(shard, max_chars=500)
+                    safe_shard_name = redact_evidence_string(Path(shard).name, max_chars=500)
+                    safe_error = redact_untrusted_error_message(e)
+                    logger.error("Error scanning shard %s: %s", safe_shard, safe_error)
                     success = False
                     _mark_inconclusive_scan_outcome(result, "shard_scan_error")
                     result.add_check(
                         name="Shard Scan",
                         passed=False,
-                        message=f"Error scanning shard: {Path(shard).name}",
+                        message=f"Error scanning shard: {safe_shard_name}",
                         severity=IssueSeverity.INFO,
-                        location=shard,
+                        location=safe_shard,
                         details={
-                            "error": str(e),
+                            "error": safe_error,
+                            "exception_type": type(e).__name__,
                             "analysis_incomplete": True,
                             "scan_outcome": "inconclusive",
                             "scan_outcome_reason": "shard_scan_error",

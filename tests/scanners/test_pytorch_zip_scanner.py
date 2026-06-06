@@ -14,6 +14,7 @@ from modelaudit_picklescan.call_graph import import_only_module_requires_origin_
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors import jit_script as jit_script_module
+from modelaudit.detectors import network_comm as network_comm_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult, mark_inconclusive_scan_result
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
@@ -1203,6 +1204,12 @@ def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> N
     assert size_checks[0].details["skipped_count"] == len(size_checks[0].details["zip_entries"])
     assert size_checks[0].details["analysis_incomplete"] is True
     assert size_checks[0].details["max_scan_bytes"] == 4
+    assert not any(
+        check.status == CheckStatus.PASSED
+        and check.name in {"JIT/Script Code Execution Detection", "Network Communication Detection"}
+        and check.location == str(model_path)
+        for check in result.checks
+    )
 
 
 def test_pytorch_zip_jit_detector_byte_budget_marks_inconclusive(tmp_path: Path) -> None:
@@ -1278,6 +1285,12 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     assert leaked_member_secret not in result.to_json()
     assert leaked_error_secret not in result.to_json()
     assert "<redacted>" in details["zip_entries"][0]
+    assert not any(
+        check.status == CheckStatus.PASSED
+        and check.name in {"JIT/Script Code Execution Detection", "Network Communication Detection"}
+        and check.location == str(model_path)
+        for check in result.checks
+    )
 
 
 def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
@@ -1433,6 +1446,61 @@ def test_pytorch_zip_raw_detector_exception_marks_scan_inconclusive(
     assert leaked_secret not in caplog.text
     assert not any(
         check.name == clean_check_name and check.status == CheckStatus.PASSED and check.location == str(model_path)
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_preserves_raw_detector_failures_across_pickle_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Merging pickle members must retain every failed detector and remove false passes."""
+    model_path = tmp_path / "multi-pickle-detector-errors.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"member": "first"}, protocol=4))
+        zip_file.writestr("archive/extra.pkl", pickle.dumps({"member": "second"}, protocol=4))
+
+    original_jit_scan = jit_script_module.JITScriptDetector.scan_model
+    original_network_scan = network_comm_module.NetworkCommDetector.scan
+
+    def selective_jit_failure(
+        detector: jit_script_module.JITScriptDetector,
+        data: bytes,
+        model_type: str,
+        context: str,
+    ) -> list[Any]:
+        if context.endswith("archive/data.pkl"):
+            raise RuntimeError("first pickle JIT failure")
+        return original_jit_scan(detector, data, model_type, context)
+
+    def selective_network_failure(
+        detector: network_comm_module.NetworkCommDetector,
+        data: bytes,
+        context: str,
+    ) -> list[Any]:
+        if context.endswith("archive/extra.pkl"):
+            raise RuntimeError("second pickle network failure")
+        return original_network_scan(detector, data, context)
+
+    monkeypatch.setattr(jit_script_module.JITScriptDetector, "scan_model", selective_jit_failure)
+    monkeypatch.setattr(network_comm_module.NetworkCommDetector, "scan", selective_network_failure)
+
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 0}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["raw_detector_failed_detectors"] == [
+        "jit_script",
+        "network_communication",
+    ]
+    assert {failure["detector"] for failure in result.metadata["raw_detector_analysis_failures"]} == {
+        "jit_script",
+        "network_communication",
+    }
+    assert not any(
+        check.status == CheckStatus.PASSED
+        and check.name in {"JIT/Script Code Execution Detection", "Network Communication Detection"}
         for check in result.checks
     )
 
@@ -7036,6 +7104,39 @@ def test_pytorch_zip_nested_inconclusive_reason_propagates_to_parent() -> None:
         "PyTorch model is missing 'data.pkl', which is unusual for standard PyTorch models."
     )
     assert structure_check.details == {"missing_file": "data.pkl"}
+
+
+def test_pytorch_zip_nested_raw_detector_failure_survives_parent_metadata_restore() -> None:
+    """Nested raw-detector failures must suppress later parent clean checks."""
+    parent_result = ScanResult(scanner_name="pytorch_zip")
+    parent_result.add_check(
+        name="JIT/Script Code Execution Detection",
+        passed=True,
+        message="No JIT/Script code execution risks detected",
+        location="parent.pt",
+    )
+    nested_result = ScanResult(scanner_name="zip")
+    nested_result.metadata["raw_detector_analysis_failures"] = [
+        {
+            "detector": "jit_script",
+            "context": "parent.pt:archive/nested.zip",
+            "coverage_gap": "analysis_failed",
+        }
+    ]
+    nested_result.metadata["raw_detector_failed_detectors"] = ["jit_script"]
+    mark_inconclusive_scan_result(nested_result, "raw_detector_analysis_incomplete")
+    nested_result.finish(success=False)
+
+    PyTorchZipScanner._merge_nested_zip_result(parent_result, nested_result, "archive/nested.zip")
+    scanner = PyTorchZipScanner()
+    scanner.add_jit_script_findings([], parent_result, model_type="pytorch", context="parent.pt")
+
+    assert parent_result.metadata["raw_detector_failed_detectors"] == ["jit_script"]
+    assert parent_result.metadata["raw_detector_analysis_failures"][0]["detector"] == "jit_script"
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.PASSED
+        for check in parent_result.checks
+    )
 
 
 def test_pytorch_zip_scanner_checks_timeout_between_nested_archives(

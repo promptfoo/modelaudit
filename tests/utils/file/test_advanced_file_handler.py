@@ -41,7 +41,7 @@ class OperationalFailureScanner:
     name = "operational_failure_scanner"
 
     def scan(self, shard_path: str) -> ScanResult:
-        raise RuntimeError(f"cannot scan {Path(shard_path).name}")
+        raise RuntimeError(f"cannot scan {Path(shard_path).name}: {Path(shard_path).read_text()}")
 
 
 class IncompleteShardScanner:
@@ -69,6 +69,45 @@ class RawDetectorMemoryMappedScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         raise NotImplementedError
+
+
+class MixedRawDetectorShardScanner(BaseScanner):
+    """Emit different raw-detector outcomes across parallel shard workers."""
+
+    name = "mixed_raw_detector_shards"
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        shard_name = Path(path).name
+        if "secret-failure" in shard_name:
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="embedded_secrets",
+                context=path,
+                error=RuntimeError("secret detector failed"),
+            )
+        elif "network-failure" in shard_name:
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="network_communication",
+                context=path,
+                error=RuntimeError("network detector failed"),
+            )
+        else:
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=path,
+            )
+            result.add_check(
+                name="Network Communication Detection",
+                passed=True,
+                message="No network communication patterns detected",
+                location=path,
+            )
+        result.finish(success="scan_outcome" not in result.metadata)
+        return result
 
 
 class PatternMemoryMappedScanner:
@@ -645,8 +684,9 @@ class TestAdvancedFileHandler:
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
+        leaked_secret = "SHARD-ERROR-SECRET-123456"
         shard_path = tmp_path / "model-00001-of-00001.safetensors"
-        shard_path.write_bytes(b"safe")
+        shard_path.write_text(leaked_secret)
         handler = ParallelShardHandler(
             {
                 "shards": [str(shard_path)],
@@ -666,6 +706,77 @@ class TestAdvancedFileHandler:
         shard_checks = [check for check in result.checks if check.name == "Shard Scan"]
         assert len(shard_checks) == 1
         assert shard_checks[0].severity == IssueSeverity.INFO
+        assert shard_checks[0].details["error"] == "<redacted>"
+        assert leaked_secret not in result.to_json()
+
+    def test_parallel_shards_preserve_raw_detector_failures_and_remove_clean_checks(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Shard merge order must not erase failures or preserve contradictory clean checks."""
+        shard_paths = [
+            tmp_path / "secret-failure.pt",
+            tmp_path / "network-failure.pt",
+            tmp_path / "clean.pt",
+        ]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            MixedRawDetectorShardScanner,
+        )
+
+        result = handler.scan_shards()
+
+        assert result.success is False
+        assert result.metadata["raw_detector_failed_detectors"] == [
+            "embedded_secrets",
+            "network_communication",
+        ]
+        assert {failure["detector"] for failure in result.metadata["raw_detector_analysis_failures"]} == {
+            "embedded_secrets",
+            "network_communication",
+        }
+        assert not any(
+            check.status.value == "passed"
+            and check.name in {"Embedded Secrets Detection", "Network Communication Detection"}
+            for check in result.checks
+        )
+
+    def test_parallel_shard_raw_detector_failure_reporting_is_bounded(self, tmp_path: Path) -> None:
+        """Repeated per-shard detector failures should emit one check and bounded contexts."""
+        shard_paths = [tmp_path / f"secret-failure-{index}.pt" for index in range(25)]
+        for shard_path in shard_paths:
+            shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path) for shard_path in shard_paths],
+                "total_shards": len(shard_paths),
+                "total_size": sum(shard_path.stat().st_size for shard_path in shard_paths),
+            },
+            MixedRawDetectorShardScanner,
+        )
+
+        result = handler.scan_shards()
+
+        coverage_checks = [
+            check
+            for check in result.checks
+            if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+        ]
+        coverage_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("scan_outcome_reason") == "raw_detector_analysis_incomplete"
+            and issue.details.get("detector") == "embedded_secrets"
+        ]
+        assert len(coverage_checks) == 1
+        assert len(coverage_issues) == 1
+        assert len(result.metadata["raw_detector_analysis_failures"]) == 20
 
     def test_parallel_shards_inherit_scan_context(self, tmp_path: Path) -> None:
         """Shard workers preserve an enclosing source-sensitive scan snapshot."""

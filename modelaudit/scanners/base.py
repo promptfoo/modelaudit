@@ -15,6 +15,9 @@ from ..analysis.unified_context import UnifiedMLContext
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     OPERATIONAL_ERROR_METADATA_KEY,
+    RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON,
+    RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
+    RAW_DETECTOR_FAILURES_METADATA_KEY,
     SCAN_OUTCOME_METADATA_KEY,
     Check,
     CheckStatus,
@@ -58,9 +61,6 @@ TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
-RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_incomplete"
-RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
-RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY: Final[str] = "raw_detector_failed_detectors"
 _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
     {
         # S1xx — direct code-execution primitives (os/sys/subprocess/eval/compile/__import__/
@@ -612,24 +612,7 @@ class BaseScanner(ABC):
 
     @staticmethod
     def _remove_failed_raw_detector_clean_checks(result: ScanResult) -> None:
-        failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
-        if not isinstance(failed_detectors, list):
-            return
-        clean_check_names = {
-            "embedded_secrets": {"Embedded Secrets Detection"},
-            "jit_script": {"JIT/Script Code Execution Detection", "JIT/Script Code Execution Summary"},
-            "network_communication": {"Network Communication Detection", "Network Communication Summary"},
-        }
-        failed_clean_checks = {
-            check_name for detector in failed_detectors for check_name in clean_check_names.get(detector, set())
-        }
-        if not failed_clean_checks:
-            return
-        result.checks = [
-            check
-            for check in result.checks
-            if not (check.name in failed_clean_checks and check.status == CheckStatus.PASSED)
-        ]
+        result.remove_failed_raw_detector_clean_checks()
 
     def check_for_embedded_secrets(
         self,
