@@ -101,6 +101,10 @@ _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
+_STRONG_HOSTNAME_AUTHORIZATION_SCHEMES = frozenset(
+    {"aws4-hmac-sha256", "basic", "bearer", "digest", "negotiate", "oauth"}
+)
+_COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "org"})
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9])"
     rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
@@ -580,7 +584,32 @@ def _authorization_assignment_scheme(segment: str) -> str | None:
 def _authorization_scheme_has_payload(scheme: str, following_value: str | None) -> bool:
     if following_value is None or _AUTHORIZATION_SCHEME_PATTERN.fullmatch(scheme) is None:
         return False
+    decoded_following_value = _decode_path_token(following_value)
+    endpoint_key, separator, _endpoint_value = decoded_following_value.partition("=")
+    if separator and _is_endpoint_location_key(endpoint_key):
+        return False
     return not _looks_like_known_artifact_filename(following_value)
+
+
+def _hostname_authorization_scheme_has_payload(
+    scheme: str,
+    following_value: str | None,
+    labels: list[str],
+    scheme_index: int,
+) -> bool:
+    if not _authorization_scheme_has_payload(scheme, following_value):
+        return False
+    assert following_value is not None
+    if scheme.casefold() in _STRONG_HOSTNAME_AUTHORIZATION_SCHEMES or _looks_like_hostname_credential_value(
+        following_value
+    ):
+        return True
+
+    suffix_labels = 2
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2].casefold() in _COMMON_COUNTRY_CODE_PUBLIC_SUFFIX_LABELS:
+        suffix_labels = 3
+    labels_after_payload = len(labels) - (scheme_index + 2)
+    return labels_after_payload >= suffix_labels
 
 
 def _compound_path_segment_ends_with_sensitive_key(segment: str) -> bool:
@@ -663,10 +692,8 @@ def _redact_hostname_tokens(hostname: str) -> str:
         if redact_next_value:
             labels[index] = _REDACTED_PATH_TOKEN
             following_value = next((candidate for candidate in labels[index + 1 :] if candidate), None)
-            redact_next_value = (
-                authorization_value_pending
-                and len(labels) - index >= 4
-                and _authorization_scheme_has_payload(decoded, following_value)
+            redact_next_value = authorization_value_pending and _hostname_authorization_scheme_has_payload(
+                decoded, following_value, labels, index
             )
             authorization_value_pending = False
             continue

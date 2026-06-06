@@ -144,6 +144,22 @@ class TestNetworkCommDetector:
 
         assert redacted == "https://auth.<redacted>.<redacted>.example.com/path"
 
+    def test_authorization_hostname_preserves_multi_label_registrable_domain(self) -> None:
+        """An ambiguous auth scheme must not consume a country-code registrable label."""
+        url = "https://auth.token.example.co.uk/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.example.co.uk/path"
+
+    def test_authorization_hostname_redacts_short_bearer_payload(self) -> None:
+        """A strong auth scheme still redacts a short payload immediately before the TLD."""
+        url = "https://auth.Bearer.SECRET.com/path"
+
+        redacted = network_comm.redact_url_for_finding(url)
+
+        assert redacted == "https://auth.<redacted>.<redacted>.com/path"
+
     def test_detect_urls_redacts_value_after_over_encoded_hostname_key(self) -> None:
         """Decode-depth exhaustion on a hostname key must also redact its following value."""
         encoded_key = "".join(f"%{ord(character):02X}" for character in "api_key")
@@ -433,6 +449,19 @@ class TestNetworkCommDetector:
         redacted = network_comm.redact_url_for_finding(url)
 
         assert redacted == "https://evil.example/path;authorization=<redacted>;model.bin"
+
+    def test_authorization_matrix_assignment_preserves_following_endpoint(self) -> None:
+        """A scheme-only Authorization parameter must not suppress a following destination field."""
+        ip = "45.33.32.156"
+        url = f"https://evil.example/path;authorization=Bearer;next={ip}/model.bin"
+
+        findings = NetworkCommDetector().scan(url.encode(), "metadata.txt")
+
+        assert any(
+            finding.get("url") == f"https://evil.example/path;authorization=<redacted>;next={ip}/model.bin"
+            for finding in findings
+        )
+        assert any(finding.get("ip") == ip for finding in findings)
 
     @pytest.mark.parametrize("separator", ["&", "&amp;"])
     def test_ampersand_delimited_path_tokens_are_redacted(self, separator: str) -> None:
