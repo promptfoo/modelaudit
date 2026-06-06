@@ -1542,6 +1542,10 @@ class TestAdvancedFileHandler:
             "modelaudit.utils.file.handlers._scan_advanced_large_file_internal",
             mutate_family_during_scan,
         )
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
 
         reset_cache_manager()
         try:
