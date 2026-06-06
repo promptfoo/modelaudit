@@ -6,7 +6,8 @@ import marshal
 import pytest
 
 from modelaudit.scanners import keras_utils
-from modelaudit.scanners.base import ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.scanners.keras_utils import (
     check_lambda_list_function,
     check_subclassed_model,
@@ -14,6 +15,116 @@ from modelaudit.scanners.keras_utils import (
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
 )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [("math", "eval"), ("math", "EVAL"), ("numpy", "system")],
+)
+def test_h5_lambda_function_names_require_dangerous_module_context(module_name: str, function_name: str) -> None:
+    """A safe module must not become critical solely from an unresolved attribute name."""
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous(module_name, function_name) is False
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [(None, "eval"), (None, "os.system"), ("", "open"), ("os", "identity"), ("subprocess", "run")],
+)
+def test_h5_lambda_unqualified_dangerous_functions_and_risky_modules_are_flagged(
+    module_name: str | None,
+    function_name: str,
+) -> None:
+    """Unqualified builtins and risky module roots must remain critical."""
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous(module_name, function_name) is True
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    ["compat.v1.py_func", "raw_ops.PyFunc", "load_op_library", "py_function"],
+)
+def test_h5_lambda_framework_callback_bridges_are_always_dangerous(function_name: str) -> None:
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous("tensorflow", function_name) is True
+
+
+def test_h5_lambda_safe_module_generic_dangerous_name_stays_noncritical() -> None:
+    assert KerasH5Scanner._is_lambda_module_reference_dangerous("tensorflow", "io.system") is False
+
+
+def _check_h5_lambda_config(layer_config: dict[str, object]) -> ScanResult:
+    scanner = KerasH5Scanner()
+    scanner.current_file_path = "lambda_fixture.h5"
+    result = ScanResult("keras_test")
+    scanner._check_lambda_layer(layer_config, result, "lambda_1")
+    return result
+
+
+def test_h5_lambda_source_and_auxiliary_callback_evidence_is_omitted() -> None:
+    source_secret = "H5_SOURCE_SECRET_C020"
+    auxiliary_secret = "H5_AUXILIARY_SECRET_C020"
+
+    result = _check_h5_lambda_config(
+        {
+            "function": f"lambda x: eval('{source_secret}')",
+            "output_shape": f"lambda x: exec('{auxiliary_secret}')",
+            "output_shape_type": "lambda",
+        }
+    )
+
+    serialized = json.dumps(result.to_dict())
+    assert source_secret not in serialized
+    assert auxiliary_secret not in serialized
+    callback_fields = {
+        check.details.get("callback_field")
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+    }
+    assert callback_fields == {"function", "output_shape"}
+    assert all("code_preview" not in check.details for check in result.checks)
+    assert all("code_analysis" not in check.details for check in result.checks)
+
+
+def test_h5_lambda_module_reference_redaction_preserves_severity() -> None:
+    dangerous_module_secret = "PRIVATE_MODULE_C020"
+    dangerous_function_secret = "PRIVATE_FUNCTION_C020"
+    dangerous_result = _check_h5_lambda_config(
+        {
+            "function": dangerous_function_secret,
+            "function_type": "function",
+            "module": f"os.{dangerous_module_secret}",
+        }
+    )
+
+    dangerous_checks = [
+        check
+        for check in dangerous_result.checks
+        if check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dangerous_checks) == 1
+    assert dangerous_checks[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_checks[0].details["module_omitted"] == "artifact_controlled_lambda_reference"
+    assert dangerous_checks[0].details["function_omitted"] == "artifact_controlled_lambda_reference"
+    dangerous_serialized = json.dumps(dangerous_result.to_dict())
+    assert dangerous_module_secret not in dangerous_serialized
+    assert dangerous_function_secret not in dangerous_serialized
+
+    safe_module_result = _check_h5_lambda_config(
+        {
+            "function": "eval",
+            "function_type": "function",
+            "module": "math",
+        }
+    )
+    safe_module_checks = [
+        check
+        for check in safe_module_result.checks
+        if check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(safe_module_checks) == 1
+    assert safe_module_checks[0].severity == IssueSeverity.WARNING
+    assert safe_module_checks[0].details["allowlist_status"] == "not_allowlisted"
+    assert not any(check.severity == IssueSeverity.CRITICAL for check in safe_module_checks)
 
 
 class _LowerCountingText(str):
