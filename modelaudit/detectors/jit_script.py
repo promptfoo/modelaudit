@@ -39,6 +39,7 @@ _FunctionAliasSummary = tuple[
     tuple[tuple[str, int], ...],
 ]
 _ContainerValue = TypeVar("_ContainerValue")
+_TypedMemberCallableValue = frozenset[tuple[str, str, bool]]
 
 
 def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
@@ -12458,7 +12459,7 @@ def _compact_snippet_typed_print_overwrite_replay(
     builtins_mapping_update_aliases: set[str] = set()
     builtins_mapping_setitem_aliases: set[str] = set()
     mapping_aliases: dict[str, tuple[str, int]] = {}
-    typed_member_callable_aliases: dict[str, tuple[str, str, bool]] = {}
+    typed_member_callable_aliases: dict[str, _TypedMemberCallableValue] = {}
     safe_members: set[tuple[tuple[str, int], str]] = set()
     deleted_members: set[tuple[tuple[str, int], str]] = set()
     safe_called_members: set[tuple[str, str]] = set()
@@ -13084,21 +13085,30 @@ def _compact_snippet_typed_print_overwrite_replay(
 
     def typed_member_callable_value(
         value: ast.AST,
-        member_aliases: Mapping[str, tuple[str, str, bool]],
+        member_aliases: Mapping[str, _TypedMemberCallableValue],
         module_aliases: Mapping[str, tuple[str, int]],
-    ) -> tuple[str, str, bool] | None:
+    ) -> _TypedMemberCallableValue:
         if isinstance(value, ast.Name):
-            return member_aliases.get(value.id)
+            return member_aliases.get(value.id, frozenset())
         if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
             owner = module_aliases.get(value.value.id)
             if owner is not None and _typed_member_high_risk_call(owner[0], value.attr) is not None:
-                return owner[0], value.attr, (owner, value.attr) in safe_members
-        return None
+                return frozenset({(owner[0], value.attr, (owner, value.attr) in safe_members)})
+        return frozenset()
+
+    def merge_typed_member_callable_values(
+        *values: _TypedMemberCallableValue,
+    ) -> _TypedMemberCallableValue:
+        merged: dict[tuple[str, str], bool] = {}
+        for owner_name_value, member_name, is_safe in (item for value in values for item in value):
+            member = (owner_name_value, member_name)
+            merged[member] = merged.get(member, True) and is_safe
+        return frozenset((*member, is_safe) for member, is_safe in merged.items())
 
     def bind_typed_member_callable_alias(
         target: ast.AST,
         value: ast.AST,
-        member_aliases_before: Mapping[str, tuple[str, str, bool]] | None = None,
+        member_aliases_before: Mapping[str, _TypedMemberCallableValue] | None = None,
         module_aliases_before: Mapping[str, tuple[str, int]] | None = None,
     ) -> None:
         current_member_aliases = (
@@ -13108,7 +13118,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         if isinstance(target, ast.Name):
             member = typed_member_callable_value(value, current_member_aliases, current_module_aliases)
             typed_member_callable_aliases.pop(target.id, None)
-            if member is not None:
+            if member:
                 typed_member_callable_aliases[target.id] = member
         elif isinstance(target, ast.Starred):
             bind_typed_member_callable_alias(
@@ -13148,16 +13158,13 @@ def _compact_snippet_typed_print_overwrite_replay(
             if preserves_builtins_alias:
                 active_print_builtins_aliases.add(target.id)
             if previous is None:
-                if candidate is not None:
+                if candidate:
                     typed_member_callable_aliases[target.id] = candidate
                 return
-            if candidate is None:
+            if not candidate:
                 typed_member_callable_aliases[target.id] = previous
                 return
-            if previous[:2] == candidate[:2]:
-                typed_member_callable_aliases[target.id] = (*previous[:2], previous[2] and candidate[2])
-                return
-            typed_member_callable_aliases[target.id] = candidate if not candidate[2] else previous
+            typed_member_callable_aliases[target.id] = merge_typed_member_callable_values(previous, candidate)
         elif isinstance(target, ast.Starred):
             merge_uncertain_typed_member_callable_alias(target.value, ast.Constant(value=None))
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -13519,10 +13526,8 @@ def _compact_snippet_typed_print_overwrite_replay(
                     and _typed_member_high_risk_call(statement.module, alias.name) is not None
                 ):
                     identity = current_typed_identity(statement.module)
-                    typed_member_callable_aliases[local_name] = (
-                        statement.module,
-                        alias.name,
-                        (identity, alias.name) in safe_members,
+                    typed_member_callable_aliases[local_name] = frozenset(
+                        {(statement.module, alias.name, (identity, alias.name) in safe_members)}
                     )
                 elif statement.module == "importlib" and alias.name == "reload":
                     reload_aliases.add(local_name)
@@ -13721,13 +13726,13 @@ def _compact_snippet_typed_print_overwrite_replay(
                 )
                 record_typed_call(node, active_typed_aliases)
                 if isinstance(node.func, ast.Name) and node.func.id in active_typed_member_callable_aliases:
-                    owner_name_value, imported_member_name, imported_safe = active_typed_member_callable_aliases[
+                    for owner_name_value, imported_member_name, imported_safe in active_typed_member_callable_aliases[
                         node.func.id
-                    ]
-                    if imported_safe:
-                        safe_called_members.add((owner_name_value, imported_member_name))
-                    else:
-                        unsafe_called_members.add((owner_name_value, imported_member_name))
+                    ]:
+                        if imported_safe:
+                            safe_called_members.add((owner_name_value, imported_member_name))
+                        else:
+                            unsafe_called_members.add((owner_name_value, imported_member_name))
                 if invalidate_sys_modules_update(node, active_sys_aliases, active_sys_modules_aliases):
                     continue
                 if (

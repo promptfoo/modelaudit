@@ -8801,6 +8801,22 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_keeps_all_uncertain_imported_callable_identities(self) -> None:
+        source = (
+            b"from webbrowser import open as opener\n"
+            b"from ctypes import CDLL as loader\n"
+            b"import webbrowser as wb\nimport ctypes as c\n"
+            b"wb.open = print\nc.CDLL = print\n"
+            b"if condition:\n    opener = loader\n"
+            b"opener('payload')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
     def test_scan_model_tracks_dict_setdefault_alias_for_typed_member_restore(self) -> None:
         source = (
             b"import webbrowser as wb\n"
