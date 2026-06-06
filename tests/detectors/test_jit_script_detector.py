@@ -8829,6 +8829,35 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_keeps_dangerous_import_after_uncertain_member_restore(self) -> None:
+        source = (
+            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+            b"from webbrowser import open as opener\n"
+            b"if condition:\n    wb.open = original\n    from webbrowser import open as opener\n"
+            b"opener('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_rejects_uncertain_builtin_print_helper_mutation(self) -> None:
+        source = (
+            b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+            b"if condition:\n    setattr(builtins, 'print', original)\n"
+            b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
+        )
+
+        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         "mutation",
         [

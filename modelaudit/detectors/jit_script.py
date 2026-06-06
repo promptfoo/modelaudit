@@ -13656,7 +13656,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                         and _typed_member_high_risk_call(node.module, alias.name) is not None
                     ):
                         identity = current_typed_identity(node.module)
-                        candidate = frozenset({(node.module, alias.name, (identity, alias.name) in safe_members)})
+                        active_safe_members = safe_members if dynamic_safe_members is None else dynamic_safe_members
+                        candidate = frozenset(
+                            {(node.module, alias.name, (identity, alias.name) in active_safe_members)}
+                        )
                     invalidate_rebound_target(ast.Name(id=local_name, ctx=ast.Store()))
                     if previous is not None and candidate is not None:
                         typed_member_callable_aliases[local_name] = merge_typed_member_callable_values(
@@ -13667,6 +13670,46 @@ def _compact_snippet_typed_print_overwrite_replay(
                         typed_member_callable_aliases[local_name] = previous
                     elif candidate is not None:
                         typed_member_callable_aliases[local_name] = candidate
+
+            def visit_Call(self, node: ast.Call) -> None:
+                self.generic_visit(node)
+                reference = _simple_reference_name(node.func)
+                if isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_update_aliases:
+                    record_builtins_update(node)
+                elif (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in builtins_mapping_setitem_aliases
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                elif active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
+                    record_builtins_update(node)
+                elif (
+                    active_dict_setitem_reference(reference)
+                    and len(node.args) >= 3
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"update", "__ior__"}
+                    and is_builtins_mapping(node.func.value)
+                ):
+                    record_builtins_update(node)
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setitem__"
+                    and is_builtins_mapping(node.func.value)
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                elif (
+                    active_setattr_reference(reference)
+                    and len(node.args) >= 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id in active_print_builtins_aliases
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
 
             def visit_For(self, node: ast.For) -> None:
                 self.visit(node.iter)
