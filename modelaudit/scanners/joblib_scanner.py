@@ -132,10 +132,14 @@ class JoblibScanner(BaseScanner):
         self.pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
-        self.max_decompressed_size = self.config.get(
-            "max_decompressed_size",
-            10 * 1024 * 1024 * 1024,
-        )  # 10GB for large ML models
+        decompressed_read_budget = (
+            self.max_file_read_size if self.max_file_read_size > 0 else self.default_max_file_read_size
+        )
+        configured_decompressed_size = self._normalize_positive_int_config(
+            self.config.get("max_decompressed_size", decompressed_read_budget),
+            decompressed_read_budget,
+        )
+        self.max_decompressed_size = min(configured_decompressed_size, decompressed_read_budget)
         self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
     @classmethod
