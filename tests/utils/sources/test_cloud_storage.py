@@ -33,6 +33,7 @@ from modelaudit.utils.sources.cloud_storage import (
     get_cloud_object_size,
     get_fs_protocol,
     is_cloud_url,
+    is_sensitive_credential_key,
     redact_cloud_error_for_display,
     redact_stream_error_for_display,
     redact_stream_url_for_display,
@@ -184,6 +185,11 @@ class TestCloudURLDetection:
 
 
 class TestCloudURLRedaction:
+    def test_deeply_encoded_structured_key_fails_closed(self) -> None:
+        encoded_access_token = "access%252525255Ftoken"
+
+        assert is_sensitive_credential_key(encoded_access_token) is True
+
     def test_redact_url_for_display_strips_credentials_and_query(self) -> None:
         url = "https://user:pass@example.com:8443/path/to/model.bin?X-Amz-Signature=secret#fragment"
         assert redact_url_for_display(url) == "https://example.com:8443/path/to/model.bin"
@@ -195,6 +201,21 @@ class TestCloudURLRedaction:
     def test_redact_url_for_display_strips_percent_encoded_query_params(self) -> None:
         url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret"
         assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://bucket.s3.amazonaws.com/model.pkl;token=SECRET",
+            "https://bucket.s3.amazonaws.com/model.pkl%3Btoken%3DSECRET",
+        ],
+    )
+    def test_redact_url_for_display_strips_path_credentials(self, url: str) -> None:
+        assert redact_url_for_display(url) == "https://bucket.s3.amazonaws.com/model.pkl"
+
+    def test_redact_url_for_display_preserves_bare_semicolon_filename(self) -> None:
+        url = "https://bucket.s3.amazonaws.com/model;v1.pkl"
+
+        assert redact_url_for_display(url) == url
 
     def test_redact_url_for_display_preserves_non_structural_path_escapes(self) -> None:
         url = "https://bucket.s3.amazonaws.com/models/bert%20base%2Fmodel.pkl"
@@ -297,6 +318,32 @@ class TestCloudURLRedaction:
         )
         assert "deadbeef" not in redacted
         assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_normalizes_schemeless_encoded_query(self) -> None:
+        message = "bucket/path/model.pkl%3FX-Amz-Signature%3Dsecret"
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted == "bucket/path/model.pkl?X-Amz-Signature=<redacted>"
+        assert "secret" not in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Authorization: Bearer HEADER-SECRET",
+            "X-Amz-Security-Token: HEADER-SECRET",
+        ],
+    )
+    def test_redact_cloud_error_for_display_redacts_header_credentials(self, message: str) -> None:
+        redacted = redact_cloud_error_for_display(message)
+
+        assert redacted.endswith(": <redacted>")
+        assert "HEADER-SECRET" not in redacted
+
+    def test_redact_cloud_error_for_display_preserves_benign_header(self) -> None:
+        message = "Tokenizer: sentencepiece"
+
+        assert redact_cloud_error_for_display(message) == message
 
     def test_redact_cloud_error_for_display_normalizes_percent_encoded_url_prefix(self) -> None:
         message = (
@@ -562,6 +609,32 @@ def test_analyze_cloud_target_redacts_protocol_stripped_metadata_error_path(
 ) -> None:
     url = "s3://bucket/path/"
     hidden_path = "bucket/path/hidden.pkl?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory"}
+        raise PermissionError(f"metadata denied for {path}")
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [hidden_path]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+    serialized = json.dumps(result)
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_errors"][0]["path"].endswith("X-Amz-Signature=<redacted>")
+    assert "secret" not in serialized
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_redacts_encoded_protocol_stripped_metadata_error_path(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    hidden_path = "bucket/path/hidden.pkl%3FX-Amz-Signature%3Dsecret"
     fs = make_fs_mock()
 
     def info_side_effect(path: str) -> dict[str, object]:

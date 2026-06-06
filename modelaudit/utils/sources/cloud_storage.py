@@ -40,6 +40,10 @@ _BARE_ASSIGNMENT_RE = re.compile(
     r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)=(?P<value>[^\s&#;,)}\]]+)",
     re.IGNORECASE,
 )
+_HEADER_KEY_RE = re.compile(
+    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)\s*:",
+    re.IGNORECASE,
+)
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
 _URL_TOKEN_RE = re.compile(
@@ -54,7 +58,7 @@ _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
     r"%(?:25)*(?P<delimiter>3f|3d|26|23|3b)",
     re.IGNORECASE,
 )
-_PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23)", re.IGNORECASE)
+_PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
 _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
     r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
     re.IGNORECASE,
@@ -160,21 +164,25 @@ def redact_url_for_display(url: str) -> str:
         if parts.port is not None:
             netloc = f"{netloc}:{parts.port}"
 
-        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        safe_path = _strip_url_path_assignments_for_display(parts.path)
+        return urlunsplit((parts.scheme, netloc, safe_path, "", ""))
     except Exception:
         return "<cloud URL redacted>"
 
 
 def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
     """Remove signed URL credentials from provider exception text."""
-    redacted = normalize_escaped_url_delimiters_for_display(str(message))
+    redacted = _normalize_percent_encoded_url_delimiters_for_display(
+        normalize_escaped_url_delimiters_for_display(str(message))
+    )
     if source_url:
         normalized_source_url = normalize_escaped_url_delimiters_for_display(source_url)
         redacted = redacted.replace(normalized_source_url, redact_url_for_display(normalized_source_url))
     redacted = _URL_TOKEN_RE.sub(lambda match: _redact_embedded_url_for_display(match.group(0)), redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
     redacted = _BARE_ASSIGNMENT_RE.sub(_redact_bare_sensitive_assignment, redacted)
-    return _QUERY_PARAM_RE.sub(_redact_sensitive_query_param, redacted)
+    redacted = _QUERY_PARAM_RE.sub(_redact_sensitive_query_param, redacted)
+    return _redact_sensitive_header_assignments(redacted)
 
 
 def normalize_escaped_url_delimiters_for_display(value: str) -> str:
@@ -285,6 +293,27 @@ def _redact_bare_sensitive_assignment(match: re.Match[str]) -> str:
     return f"{key}=<redacted>"
 
 
+def _redact_sensitive_header_assignments(value: str) -> str:
+    matches = [match for match in _HEADER_KEY_RE.finditer(value) if _is_sensitive_assignment_key(match.group("key"))]
+    for match in reversed(matches):
+        value_end = len(value)
+        for delimiter in ("\r", "\n", ",", ";"):
+            delimiter_index = value.find(delimiter, match.end())
+            if delimiter_index >= 0:
+                value_end = min(value_end, delimiter_index)
+        value = f"{value[: match.start()]}{match.group('key')}: <redacted>{value[value_end:]}"
+    return value
+
+
+def _strip_url_path_assignments_for_display(path: str) -> str:
+    safe_segments: list[str] = []
+    for segment in path.split("/"):
+        base, *parameters = segment.split(";")
+        safe_parameters = [parameter for parameter in parameters if "=" not in parameter]
+        safe_segments.append(";".join((base, *safe_parameters)))
+    return "/".join(safe_segments)
+
+
 def _is_sensitive_assignment_key(key: str) -> bool:
     decoded_key = key
     for _ in range(_MAX_QUERY_VALUE_DECODE_PASSES):
@@ -292,6 +321,9 @@ def _is_sensitive_assignment_key(key: str) -> bool:
         if next_key == decoded_key:
             break
         decoded_key = next_key
+    else:
+        if unquote_plus(decoded_key) != decoded_key:
+            return True
 
     normalized_key = decoded_key.casefold()
     key_tokens = {token for token in re.split(r"[^a-z0-9]+", normalized_key) if token}

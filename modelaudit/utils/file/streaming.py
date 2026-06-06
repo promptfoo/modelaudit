@@ -35,13 +35,18 @@ def stream_source_path(url: str) -> str:
         if decoded_path == parsed_path:
             break
         parsed_path = decoded_path
+        fallback_prefix: str | None = None
         for index, character in enumerate(parsed_path):
             if character not in "?#":
                 continue
             prefix = parsed_path[:index]
             encoded_suffix = parsed_path[index + 1 :]
-            if Path(prefix).suffix or any(delimiter in encoded_suffix for delimiter in "=&;"):
+            if Path(prefix).suffix:
                 return prefix or url
+            if fallback_prefix is None and any(delimiter in encoded_suffix for delimiter in "=&;"):
+                fallback_prefix = prefix
+        if fallback_prefix is not None:
+            return fallback_prefix or url
     return parsed_path or url
 
 

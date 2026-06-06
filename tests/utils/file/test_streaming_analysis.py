@@ -24,6 +24,7 @@ def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     four_times_encoded_signed_url = "https://bucket.example/model.pkl%2525253FX-Amz-Signature%2525253Dsecret"
     literal_question_mark = "https://bucket.example/model%3Fv1.pkl"
     double_encoded_literal_question_mark = "https://bucket.example/model%253Fv1.pkl"
+    literal_question_mark_with_signed_query = "https://bucket.example/model%3Fv1.pkl%3FX-Amz-Signature%3Dsecret"
 
     assert streaming.stream_source_path(signed_url) == "/model.pkl"
     assert streaming.stream_source_path(double_encoded_signed_url) == "/model.pkl"
@@ -31,6 +32,8 @@ def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     assert streaming.can_stream_analyze(double_encoded_signed_url, PickleScanner()) is True
     assert streaming.stream_source_path(literal_question_mark) == "/model?v1.pkl"
     assert streaming.stream_source_path(double_encoded_literal_question_mark) == "/model?v1.pkl"
+    assert streaming.stream_source_path(literal_question_mark_with_signed_query) == "/model?v1.pkl"
+    assert streaming.can_stream_analyze(literal_question_mark_with_signed_query, PickleScanner()) is True
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

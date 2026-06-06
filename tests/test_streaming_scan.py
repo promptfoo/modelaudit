@@ -212,6 +212,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     parsed_credentials = {
         "Authorization": "Bearer nested-auth-secret",
         "client_secret": "nested-client-secret",
+        "access%252525255Ftoken": "deeply-encoded-token-secret",
         "tokenizer": "sentencepiece",
     }
     fragment_url = "https://collector.example/callback#access_token=fragment-secret"
@@ -300,6 +301,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "X-Amz-Signature",
         "nested-auth-secret",
         "nested-client-secret",
+        "deeply-encoded-token-secret",
     ):
         assert leaked not in json_text
         assert leaked not in sarif_text
@@ -364,6 +366,7 @@ def test_streaming_transformed_and_escaped_credentials_are_redacted() -> None:
             "normalized_query": "token=TRANSFORMED-STREAM-SECRET",
             "opaque_url": opaque_url,
             "escaped_url": escaped_url,
+            "authorization_header": "Authorization: Bearer HEADER-STREAM-SECRET",
         }
     )
     scan_result.finish(success=True)
@@ -381,6 +384,7 @@ def test_streaming_transformed_and_escaped_credentials_are_redacted() -> None:
         "OPAQUE-QUERY-SECRET",
         "OPAQUE-FRAGMENT-SECRET",
         "ENCODED-STREAM-SECRET",
+        "HEADER-STREAM-SECRET",
     ):
         assert secret not in json_text
         assert secret not in sarif_text
