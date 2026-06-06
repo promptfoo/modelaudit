@@ -2479,6 +2479,28 @@ def _r_open_bracket_starts_subscript(
             delimiter_pairs,
         ):
             return False
+        expression_start = _r_next_code_position(text, opener_position + 1, non_code_spans)
+        if expression_start is None or expression_start >= cursor:
+            return False
+        if delimiter_pairs is not None:
+            ranges = _r_top_level_comma_separated_ranges(
+                text,
+                opener_position + 1,
+                cursor,
+                non_code_spans,
+                delimiter_pairs,
+            )
+            if ranges is None or len(ranges) != 1:
+                return False
+            if _r_expression_has_obvious_adjacent_values(
+                text,
+                expression_start,
+                cursor,
+                non_code_spans,
+                delimiter_pairs,
+                allow_equal_assignment=True,
+            ):
+                return False
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
         return opener_prefix is None
     if text[cursor] == "}":
@@ -2554,6 +2576,8 @@ def _r_open_bracket_starts_subscript(
     while operator_cursor >= 0 and text[operator_cursor].isspace():
         operator_cursor -= 1
     if operator_cursor >= 0 and text[operator_cursor] in "$@:":
+        if not _r_token_can_start_call(token):
+            return False
         if text[operator_cursor] == ":":
             operator_start = operator_cursor
             while operator_start >= 0 and text[operator_start] == ":":
@@ -2805,6 +2829,13 @@ def _contains_r_expression_credential_assignment(text: str) -> bool:
         target_match
         for target_match in _R_LEFTWARD_CREDENTIAL_TARGET_RE.finditer(text)
         if not _position_is_in_spans(target_match.start("operator"), non_code_spans)
+        and (
+            text[target_match.start("operator")] != "="
+            or (
+                (target_match.start("operator") == 0 or text[target_match.start("operator") - 1] not in "<>=!")
+                and (target_match.start("operator") + 1 >= len(text) or text[target_match.start("operator") + 1] != "=")
+            )
+        )
     ]
     equals_positions = {
         target_match.start("operator") for target_match in target_matches if text[target_match.start("operator")] == "="
