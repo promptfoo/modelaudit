@@ -11,6 +11,8 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from pydantic import AnyUrl, BaseModel
+
 try:
     from modelaudit_picklescan import shared_source_sensitive_caches
 except ImportError:
@@ -28,7 +30,7 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Check, Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -101,7 +103,7 @@ from modelaudit.utils.file.large_file_handler import (
     scan_large_file,
     should_use_large_file_handler,
 )
-from modelaudit.utils.file.streaming import stream_analyze_file
+from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -114,6 +116,19 @@ from modelaudit.utils.sources._huggingface_cache import (
     _get_hf_cache_roots,
     _path_has_part,
     _resolve_hf_cache_path,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    is_sensitive_credential_key,
+    is_stream_url,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_cloud_error_for_display as _redact_cloud_error_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_stream_error_for_display as _redact_stream_error_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
+    redact_stream_url_for_display as _redact_stream_url_for_display,
 )
 
 logger = logging.getLogger("modelaudit.core")
@@ -327,6 +342,90 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
+
+
+def _redacted_stream_url_for_reporting(stream_url: str) -> str:
+    """Return a stream source identifier safe for persisted scan output."""
+    return _redact_stream_url_for_display(stream_url)
+
+
+def _redacted_scan_path_for_reporting(path: str) -> str:
+    if is_stream_url(path):
+        return f"stream://{_redacted_stream_url_for_reporting(path[9:])}"
+    return path
+
+
+def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
+    if is_stream_url(path):
+        return _redact_stream_error_for_display(error, path[9:])
+    return str(error)
+
+
+def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
+    if isinstance(value, BaseModel):
+        return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
+    if isinstance(value, AnyUrl):
+        return _redact_stream_value_for_reporting(str(value), stream_url, report_url)
+    if isinstance(value, os.PathLike):
+        return _redact_stream_value_for_reporting(os.fspath(value), stream_url, report_url)
+    if isinstance(value, str):
+        return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return b"<binary data>"
+        return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
+    if isinstance(value, bytearray):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return bytearray(b"<binary data>")
+        return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
+    if isinstance(value, dict):
+        redacted_mapping: dict[Any, Any] = {}
+        for key, item in value.items():
+            redacted_key = _redact_stream_value_for_reporting(key, stream_url, report_url)
+            redacted_mapping[redacted_key] = (
+                "<redacted>"
+                if is_sensitive_credential_key(key)
+                else _redact_stream_value_for_reporting(item, stream_url, report_url)
+            )
+        return redacted_mapping
+    if isinstance(value, list):
+        return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+    if isinstance(value, set):
+        return {_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+    return value
+
+
+def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, report_url: str) -> None:
+    for attr in ("location", "message", "why", "rule_code", "type", "name"):
+        value = getattr(record, attr, None)
+        if isinstance(value, str):
+            setattr(record, attr, _redact_stream_value_for_reporting(value, stream_url, report_url))
+    if record.details:
+        record.details = _redact_stream_value_for_reporting(record.details, stream_url, report_url)
+    if record.model_extra:
+        redacted_extra = _redact_stream_value_for_reporting(record.model_extra, stream_url, report_url)
+        record.model_extra.clear()
+        record.model_extra.update(redacted_extra)
+
+
+def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
+    """Strip signed query material from scanner-owned records before aggregation."""
+    for issue in scan_result.issues:
+        _redact_stream_record_for_reporting(issue, stream_url, report_url)
+    for check in scan_result.checks:
+        _redact_stream_record_for_reporting(check, stream_url, report_url)
+
+    if scan_result.metadata:
+        scan_result.metadata = _redact_stream_value_for_reporting(scan_result.metadata, stream_url, report_url)
+        scan_result._refresh_metadata_dependent_state()
 
 
 def _start_phase_timing(phase_timings: dict[str, float] | None) -> float | None:
@@ -1142,41 +1241,43 @@ def scan_model_directory_or_file(
 
     try:
         # Handle streaming paths
-        if path.startswith("stream://"):
+        if is_stream_url(path):
             # Extract the actual URL
             stream_url = path[9:]  # Remove "stream://" prefix
+            report_url = _redacted_stream_url_for_reporting(stream_url)
             if progress_callback:
-                progress_callback(f"Streaming analysis: {stream_url}", 0.0)
+                progress_callback(f"Streaming analysis: {report_url}", 0.0)
 
             # Perform streaming analysis
             from modelaudit.scanners import get_scanner_for_file
 
-            scanner = get_scanner_for_file(stream_url, config=config)
+            scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
                 scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
+                    _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
                     # Use helper function to add scan result to Pydantic model
-                    _add_scan_result_to_model(results, scan_metadata, scan_result, stream_url)
+                    _add_scan_result_to_model(results, scan_metadata, scan_result, report_url)
 
                     # Add asset
-                    _add_asset_to_results(results, stream_url, scan_result)
+                    _add_asset_to_results(results, report_url, scan_result)
 
                     if not analysis_complete:
                         _add_issue_to_model(
                             results,
                             "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
-                            location=stream_url,
+                            location=report_url,
                             details={"analysis_complete": False},
                         )
                 else:
-                    raise ValueError(f"Streaming analysis failed for {stream_url}")
+                    raise ValueError(f"Streaming analysis failed for {report_url}")
             else:
-                raise ValueError(f"No scanner available for {stream_url}")
+                raise ValueError(f"No scanner available for {report_url}")
 
             # Return early for streaming - finalize the model
             try:
@@ -2197,15 +2298,20 @@ def scan_model_directory_or_file(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
     except Exception as e:
-        logger.exception(f"Error during scan: {e!s}")
+        report_path = _redacted_scan_path_for_reporting(path)
+        report_error = _redacted_scan_error_for_reporting(e, path)
+        if is_stream_url(path):
+            logger.error(f"Error during scan: {report_error}")
+        else:
+            logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
         _add_issue_to_model(
             results,
-            f"Error during scan: {e!s}",
+            f"Error during scan: {report_error}",
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
-        _add_error_asset_to_results(results, path)
+        _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
 

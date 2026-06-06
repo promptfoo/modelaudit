@@ -72,7 +72,10 @@ from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cloud_url,
+    is_stream_url,
     redact_cloud_error_for_display,
+    redact_stream_error_for_display,
+    redact_stream_url_for_display,
     redact_url_for_display,
 )
 from .utils.sources.huggingface import (
@@ -97,6 +100,8 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
+    if is_stream_url(path):
+        return f"stream://{redact_stream_url_for_display(path[9:])}"
     if is_cloud_url(path):
         return redact_url_for_display(path)
     if is_jfrog_url_like(path):
@@ -104,8 +109,15 @@ def _display_path(path: str) -> str:
     return redact_huggingface_url_for_display(path)
 
 
+def _display_scan_path(path: str) -> str:
+    """Return a persisted scan path safe for generated reports."""
+    return _display_path(path)
+
+
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
+    if is_stream_url(path):
+        return redact_stream_error_for_display(error, path[9:])
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 
@@ -174,11 +186,11 @@ class _ScanPathState:
         added_path = False
         for asset in streaming_result.assets:
             if asset.path:
-                self.scanned_paths.append(asset.path)
+                self.scanned_paths.append(_display_scan_path(asset.path))
                 added_path = True
 
         if not added_path and fallback_path is not None:
-            self.scanned_paths.append(fallback_path)
+            self.scanned_paths.append(_display_scan_path(fallback_path))
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -862,11 +874,15 @@ def _write_scan_sbom(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
     if asset_paths and scan_and_delete:
-        paths_for_sbom = asset_paths
+        paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
     else:
-        paths_for_sbom = path_state.scanned_paths if path_state.scanned_paths else expanded_paths
+        paths_for_sbom = (
+            path_state.scanned_paths
+            if path_state.scanned_paths
+            else [_display_scan_path(path) for path in expanded_paths]
+        )
 
     sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
     with open(sbom, "w", encoding="utf-8") as sbom_file:
@@ -1061,7 +1077,7 @@ def _create_path_progress_callback(
 
         progress_tracker.stats.total_bytes = total_bytes
         progress_tracker.stats.total_items = total_items
-        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {actual_path}")
+        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {_display_scan_path(actual_path)}")
     except (ImportError, RecursionError):
         return None
 
@@ -1207,7 +1223,7 @@ def _scan_local_or_downloaded_path(
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
         else:
-            path_state.scanned_paths.append(actual_path)
+            path_state.scanned_paths.append(_display_scan_path(actual_path))
 
         visible_issues = [
             issue for issue in list(scan_results.issues) if verbose or issue.severity != IssueSeverity.DEBUG
@@ -1252,13 +1268,16 @@ def _scan_local_or_downloaded_path(
         elif runtime.show_styled_output:
             click.echo(f"Error scanning {display_path}")
 
-        logger.error(f"Error during scan of {display_path}: {display_error}", exc_info=verbose)
+        logger.error(
+            f"Error during scan of {display_path}: {display_error}",
+            exc_info=verbose and not (is_stream_url(actual_path) or is_cloud_url(path)),
+        )
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
-        path_state.scanned_paths.append(actual_path)
+        path_state.scanned_paths.append(_display_scan_path(actual_path))
 
         if progress_tracker:
-            progress_tracker.report_error(exc)
+            progress_tracker.report_error(Exception(display_error))
 
 
 def _resolve_scan_source_for_path(
@@ -1632,7 +1651,8 @@ def _resolve_scan_source_for_path(
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
-                click.echo(f"Error analyzing {redact_url_for_display(path)}: {exc!s}", err=True)
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {redact_url_for_display(path)}: {error_msg}", err=True)
                 audit_result.has_errors = True
                 return None
 
@@ -1747,7 +1767,7 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}", exc_info=verbose)
+                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}")
                 click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
 
             audit_result.has_errors = True
@@ -2558,13 +2578,18 @@ def scan_command(
                     )
 
             except Exception as exc:
-                logger.error(f"Unexpected error processing {path}: {exc!s}", exc_info=verbose)
-                click.echo(f"Unexpected error processing {path}: {exc!s}", err=True)
-                path_state.scanned_paths.append(source_result.actual_path)
+                display_path = _display_path(path)
+                display_error = _display_error(exc, path)
+                logger.error(
+                    f"Unexpected error processing {display_path}: {display_error}",
+                    exc_info=verbose and not is_stream_url(path),
+                )
+                click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
+                path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
                 audit_result.has_errors = True
 
                 if progress_tracker:
-                    progress_tracker.report_error(exc)
+                    progress_tracker.report_error(Exception(display_error))
 
             finally:
                 path_state.defer_temp_cleanup(
