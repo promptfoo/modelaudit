@@ -1021,7 +1021,7 @@ class TestNetworkCommDetector:
                 "evil-c2.com",
             ),
             (
-                "https://benign.example/download?token=https://evil-c2.com/payload",
+                "https://benign.example/download?api_key_hint=https://evil-c2.com/payload",
                 "domain_name",
                 "domain",
                 "evil-c2.com",
@@ -1060,14 +1060,14 @@ class TestNetworkCommDetector:
             ),
         ],
     )
-    def test_sensitive_components_preserve_unsupported_uri_endpoints(
+    def test_redirect_components_preserve_unsupported_uri_endpoints(
         self,
         component_separator: str,
         nested_uri: str,
         expected_findings: set[tuple[str, str, object]],
     ) -> None:
-        """Sensitive outer keys must not hide endpoints carried by other URI schemes."""
-        url = f"https://benign.example/download{component_separator}token={nested_uri}"
+        """Ordinary redirect keys must not hide endpoints carried by other URI schemes."""
+        url = f"https://benign.example/download{component_separator}next={nested_uri}"
 
         findings = NetworkCommDetector().scan(url.encode(), "hook.py")
 
@@ -1080,15 +1080,15 @@ class TestNetworkCommDetector:
         ("url", "nested_url"),
         [
             (
-                "https://benign.example/download?token=https%3A%2F%2Fevil-c2.com%2Fpayload",
+                "https://benign.example/download?next=https%3A%2F%2Fevil-c2.com%2Fpayload",
                 "https://evil-c2.com/payload",
             ),
             (
-                "https://benign.example/download#token=https%253A%252F%252Fevil-c2.com%252Fpayload",
+                "https://benign.example/download#redirect=https%253A%252F%252Fevil-c2.com%252Fpayload",
                 "https://evil-c2.com/payload",
             ),
             (
-                "https://benign.example/download?api_key=https%3A%2F%2F45.33.32.156%2Fpayload",
+                "https://benign.example/download?api_key_hint=https%3A%2F%2F45.33.32.156%2Fpayload",
                 "https://45.33.32.156/payload",
             ),
         ],
@@ -1103,11 +1103,11 @@ class TestNetworkCommDetector:
         ("url", "nested_uri"),
         [
             (
-                "https://benign.example/?token=tcp%3A%2F%2Fevil-c2.com%3A4444%2Fpayload",
+                "https://benign.example/?next=tcp%3A%2F%2Fevil-c2.com%3A4444%2Fpayload",
                 "tcp://evil-c2.com:4444/payload",
             ),
             (
-                "https://benign.example/#token=redis%3A%2F%2F45.33.32.156%3A6379%2F0",
+                "https://benign.example/#redirect=redis%3A%2F%2F45.33.32.156%3A6379%2F0",
                 "redis://45.33.32.156:6379/0",
             ),
         ],
@@ -2598,6 +2598,47 @@ def test_network_finding_limit_prioritizes_raw_nested_url() -> None:
     assert findings[-1]["truncated_finding"]["url"] == "https://benign.example/download"
 
 
+@pytest.mark.parametrize(
+    ("key", "secret"),
+    [
+        ("api_key", "https://evil-c2.com/payload"),
+        ("authorization", "tcp://evil-c2.com:4444/payload"),
+        ("client%5Fsecret", "https://45.33.32.156/payload"),
+    ],
+)
+@pytest.mark.parametrize("component_separator", ["?", "#"])
+@pytest.mark.parametrize("max_findings", [None, 1])
+def test_network_finding_limit_does_not_emit_nested_url_credentials(
+    key: str,
+    secret: str,
+    component_separator: str,
+    max_findings: int | None,
+) -> None:
+    """URL-valued credentials must not be re-emitted as independent endpoint findings."""
+    encoded_secret = quote(secret, safe="")
+    data = f"https://benign.example/download{component_separator}{key}={encoded_secret}".encode()
+    config = {} if max_findings is None else {"max_findings": max_findings}
+
+    findings = NetworkCommDetector(config).scan(data, "tokens.txt")
+
+    serialized = json.dumps(findings, sort_keys=True)
+    assert secret not in serialized
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == "https://benign.example/download"
+
+
+def test_network_finding_limit_preserves_nested_url_for_sensitive_key_near_match() -> None:
+    """A key name that merely extends a sensitive token must not hide its endpoint."""
+    nested_url = "https://evil-c2.com/payload"
+    encoded_url = quote(nested_url, safe="")
+    data = f"https://benign.example/download?api_key_hint={encoded_url}".encode()
+
+    findings = NetworkCommDetector({"max_findings": 1}).scan(data, "tokens.txt")
+
+    assert findings[0]["type"] == "url_detected"
+    assert findings[0]["url"] == nested_url
+
+
 def test_network_finding_limit_prioritizes_nested_url_in_cloud_wrapper() -> None:
     """Cloud URL handling must not consume the only slot before its encoded destination."""
     nested_url = "https://evil-c2.com/payload"
@@ -2629,6 +2670,30 @@ def test_network_finding_limit_preserves_colon_query_near_match() -> None:
     findings = NetworkCommDetector({"max_findings": 2}).scan(data, "tokens.txt")
 
     assert any(finding.get("ip") == ip for finding in findings)
+
+
+def test_author_prose_does_not_exhaust_evidence_redaction_budget() -> None:
+    """Words beginning with auth must not suppress later endpoint findings."""
+    near_matches = ("author", "oauth", "reauth")
+    data = b"\n".join(
+        f"{near_matches[index % len(near_matches)]} note endpoint=45.33.32.{index}".encode() for index in range(1, 40)
+    )
+    detector = NetworkCommDetector()
+
+    findings = detector.scan(data, "model-card.txt")
+
+    assert any(finding.get("ip") == "45.33.32.39" for finding in findings)
+    assert detector._evidence_redaction_classifications == 0
+
+
+@pytest.mark.parametrize("key", ["auth", "authorization", "service_token"])
+def test_bounded_auth_hint_still_suppresses_endpoint_shaped_credentials(key: str) -> None:
+    """Anchoring the auth hint must preserve credential-value suppression."""
+    secret = "45.33.32.156"
+
+    findings = NetworkCommDetector().scan(f"{key}={secret}".encode(), "tokens.txt")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
 
 
 @pytest.mark.parametrize(

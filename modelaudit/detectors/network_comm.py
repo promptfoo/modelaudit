@@ -96,8 +96,9 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9])"
     rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
-    rb"(?![_-](?:cache|count|hint)\b)",
+    rb"\b(?![_-](?:cache|count|hint)\b)",
     re.IGNORECASE,
 )
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
@@ -1136,7 +1137,9 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
     seen: set[str] = set()
     for component in (parsed.query, parsed.fragment):
         for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
-            _key, separator, value = field.partition("=")
+            key, separator, value = field.partition("=")
+            if separator and _is_sensitive_path_key(_decode_query_component(key)):
+                continue
             candidate = value if separator else field
             decoded = candidate
             decode_limit_exhausted = False
