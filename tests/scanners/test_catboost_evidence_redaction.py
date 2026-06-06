@@ -1672,6 +1672,7 @@ def test_non_password_docker_options_are_preserved(text: str) -> None:
     "text",
     [
         "echo hunter2 | docker login -u alice --password-stdin registry.evil",
+        'os.system("echo hunter2 | docker login -u alice --password-stdin registry.evil")',
         "docker login -u alice --password-stdin registry.evil <<< hunter2",
         "docker login -u alice --password-stdin registry.evil <<EOF\nhunter2\nEOF",
     ],
@@ -1712,6 +1713,8 @@ def test_sshpass_inline_env_and_file_passwords_are_redacted(text: str) -> None:
     "text",
     [
         "SSHPASS=hunter2 other-command user@evil.example",
+        "sshpass=public sshpass -e ssh user@evil.example",
+        "deploy_pass=public sshpass -eDEPLOY_PASS ssh user@evil.example",
         "sshpass -f /run/secrets/password ssh user@evil.example",
     ],
 )

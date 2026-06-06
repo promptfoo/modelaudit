@@ -328,13 +328,13 @@ DOCKER_LOGIN_PASSWORD_STDIN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:(?![;&|\n]).){0,1024}?(?<!\w)--password-stdin(?![\w-])"
 )
 SSHPASS_DEFAULT_ENV_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(?P<prefix>\bSSHPASS\s*=\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
-    r"(?=\s+sshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-e(?![\w-]))"
+    rf"(?s)(?P<prefix>(?<!\w)SSHPASS\s*=\s*)(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
+    r"(?=(?:(?![;&|\n]).){0,1024}\bsshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-e(?![\w-]))"
 )
 SSHPASS_NAMED_ENV_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(?P<prefix>\b(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*)"
+    rf"(?s)(?P<prefix>(?<!\w)(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*)"
     rf"(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
-    r"(?=\s+sshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-e(?P=name)(?![A-Za-z0-9_]))"
+    r"(?=(?:(?![;&|\n]).){0,1024}\bsshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-e(?P=name)(?![A-Za-z0-9_]))"
 )
 SSHPASS_INLINE_FILE_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)\bsshpass\b(?:(?![;&|\n]).){0,1024}?(?<!\w)-f(?![\w-])(?:=|\s+)\s*<\("
@@ -2403,13 +2403,14 @@ def _find_shell_heredoc_body_range(text: str, start: int) -> tuple[int, int] | N
 
 
 def _redact_inline_stdin_emitter(fragment: str) -> str:
-    emitter = re.fullmatch(
-        r"(?is)(?P<prefix>\s*(?:echo|printf)\b(?:\s+(?:--|-[A-Za-z]+))?\s+)(?P<value>.+?)(?P<suffix>\s*)",
+    emitter = re.search(
+        r"(?is)(?P<prefix>\b(?:echo|printf)\b(?:\s+(?:--|-[A-Za-z]+))*\s+)"
+        r"(?P<value>.+?)(?P<suffix>\s*)$",
         fragment,
     )
     if emitter is None:
         return fragment
-    return f"{emitter.group('prefix')}{REDACTED_EVIDENCE_VALUE}{emitter.group('suffix')}"
+    return f"{fragment[: emitter.start()]}{emitter.group('prefix')}{REDACTED_EVIDENCE_VALUE}{emitter.group('suffix')}"
 
 
 def _redact_inline_password_sources(text: str) -> str:

