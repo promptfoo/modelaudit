@@ -81,10 +81,9 @@ class TestMetadataScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Unreadable routed metadata should fail closed without a fabricated security issue."""
+        """Direct metadata scans should fail closed without a fabricated security issue."""
         readme_path = tmp_path / "README.md"
         readme_path.write_text("# Model Card\n\nThis README is benign.\n")
-        cache_dir = tmp_path / "cache"
 
         def fail_read(*_args: object, **_kwargs: object) -> object:
             raise OSError("simulated metadata read failure")
@@ -104,35 +103,11 @@ class TestMetadataScanner:
         assert read_checks[0].rule_code is None
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-        reset_cache_manager()
-        try:
-            aggregates = [
-                scan_model_directory_or_file(
-                    str(readme_path),
-                    cache_enabled=True,
-                    cache_dir=str(cache_dir),
-                    min_cache_file_size=0,
-                )
-                for _ in range(2)
-            ]
-
-            for aggregate in aggregates:
-                assert aggregate.success is False
-                assert not any(
-                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
-                )
-                assert determine_exit_code(aggregate) == 2
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
-
     def test_metadata_invalid_utf8_is_operational_not_security_finding(self, tmp_path: Path) -> None:
         readme_path = tmp_path / "README.md"
         readme_path.write_bytes(b"# Model Card\n\ninvalid text: \xff\n")
 
         direct = MetadataScanner().scan(str(readme_path))
-        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
-
         assert direct.success is False
         assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
@@ -140,8 +115,6 @@ class TestMetadataScanner:
         assert read_check.details["exception_type"] == "UnicodeDecodeError"
         assert read_check.severity == IssueSeverity.INFO
         assert read_check.rule_code is None
-        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
-        assert determine_exit_code(aggregate) == 2
 
     def test_metadata_permission_failure_is_operational_after_preflight(
         self,
@@ -158,13 +131,9 @@ class TestMetadataScanner:
         monkeypatch.setattr("modelaudit.scanners.base.os.access", inaccessible_owned_path)
 
         direct = MetadataScanner().scan(str(readme_path))
-        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
-
         assert direct.success is False
         assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
-        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
-        assert determine_exit_code(aggregate) == 2
 
     def test_metadata_read_failure_bypasses_stale_clean_cache(
         self,

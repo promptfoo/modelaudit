@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
+- stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
+
 ## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
 
 ### Bug Fixes
@@ -204,7 +211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files
+- harden CLI scan, SBOM, metadata, and scanner-catalog output writes against links, reparse points, and special files; preserve Windows ownership and ACLs, and reject EFS-encrypted destinations that cannot be replaced without changing recipients
+- omit attacker-controlled Keras H5 Lambda names, module/function references, source, bytecode, code-analysis, malformed config, compiler-error, nested-key, and fake wrapped-layer evidence; clean up temporary Python compiler artifacts; fail closed on malformed scalar functions; and avoid substring-only malformed-source warnings
 - fail closed on standalone and Keras ZIP HDF5 scans when `h5py` is unavailable, including content-routed and extensionless user-block files, while preserving overlapping format findings and invalidating stale cached results
 - mark unresolved DVC outputs as incomplete scan coverage instead of scanning pointer text as clean
 - redact secret-bearing TensorFlow MetaGraph executable previews and correlation examples

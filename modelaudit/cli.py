@@ -406,6 +406,21 @@ def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, pare
             _close_windows_handle(verification_handle)
 
 
+def _windows_output_is_encrypted(fd: int) -> bool:
+    """Return whether a pinned Windows output handle uses EFS encryption."""
+    file_attribute_encrypted = getattr(stat, "FILE_ATTRIBUTE_ENCRYPTED", 0x00004000)
+    return bool(getattr(os.fstat(fd), "st_file_attributes", 0) & file_attribute_encrypted)
+
+
+def _reject_windows_encrypted_output(output_path: str, fd: int) -> None:
+    """Fail closed when atomic replacement cannot preserve EFS recipients."""
+    if _windows_output_is_encrypted(fd):
+        raise _OutputWriteError(
+            f"Refusing to replace encrypted output because its EFS protection cannot be preserved: "
+            f"{_display_path(output_path)}"
+        )
+
+
 def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_name: str) -> tuple[int, Path]:
     """Create a writable Windows temp file whose handle can be renamed securely."""
     import ctypes
@@ -430,12 +445,13 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
     delete_access = 0x00010000
     file_read_attributes = 0x0080
     write_dac = 0x00040000
+    write_owner = 0x00080000
     create_new = 1
     file_attribute_normal = 0x00000080
     temp_path = absolute_path.parent / temp_name
     temp_handle = create_file(
         str(temp_path),
-        generic_write | delete_access | file_read_attributes | write_dac,
+        generic_write | delete_access | file_read_attributes | write_dac | write_owner,
         0,
         None,
         create_new,
@@ -460,7 +476,7 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
 
 
 def _open_windows_existing_output_file(output_path: str, absolute_path: Path) -> int:
-    """Open an existing Windows output with real DACL-enforced write access."""
+    """Open a Windows output with DACL-enforced write and replacement access."""
     import ctypes
     import ctypes.wintypes as wintypes
     import msvcrt
@@ -482,6 +498,7 @@ def _open_windows_existing_output_file(output_path: str, absolute_path: Path) ->
     file_write_data = 0x0002
     file_read_attributes = 0x0080
     read_control = 0x00020000
+    delete_access = 0x00010000
     file_share_read = 0x00000001
     file_share_write = 0x00000002
     file_share_delete = 0x00000004
@@ -489,7 +506,7 @@ def _open_windows_existing_output_file(output_path: str, absolute_path: Path) ->
     file_flag_open_reparse_point = 0x00200000
     handle = create_file(
         str(absolute_path),
-        file_write_data | file_read_attributes | read_control,
+        file_write_data | file_read_attributes | read_control | delete_access,
         file_share_read | file_share_write | file_share_delete,
         None,
         open_existing,
@@ -513,7 +530,7 @@ def _open_windows_existing_output_file(output_path: str, absolute_path: Path) ->
 
 
 def _copy_windows_output_security(output_path: str, source_fd: int, target_fd: int) -> None:
-    """Copy the DACL from a validated Windows output handle."""
+    """Copy ownership and the DACL from a validated Windows output handle."""
     import ctypes
     import ctypes.wintypes as wintypes
     import msvcrt
@@ -558,17 +575,21 @@ def _copy_windows_output_security(output_path: str, source_fd: int, target_fd: i
     msvcrt_windows: Any = msvcrt
     source_handle = msvcrt_windows.get_osfhandle(source_fd)
     target_handle = msvcrt_windows.get_osfhandle(target_fd)
+    owner = wintypes.LPVOID()
+    group = wintypes.LPVOID()
     dacl = wintypes.LPVOID()
     security_descriptor = wintypes.LPVOID()
     se_file_object = 1
+    owner_security_information = 0x00000001
+    group_security_information = 0x00000002
     dacl_security_information = 0x00000004
-    security_information = dacl_security_information
+    security_information = owner_security_information | group_security_information | dacl_security_information
     result = get_security_info(
         source_handle,
         se_file_object,
         security_information,
-        None,
-        None,
+        ctypes.byref(owner),
+        ctypes.byref(group),
         ctypes.byref(dacl),
         None,
         ctypes.byref(security_descriptor),
@@ -596,8 +617,8 @@ def _copy_windows_output_security(output_path: str, source_fd: int, target_fd: i
             target_handle,
             se_file_object,
             security_information,
-            None,
-            None,
+            owner,
+            group,
             dacl,
             None,
         )
@@ -936,6 +957,8 @@ def _preflight_output_text_file(output_path: str) -> None:
                 initial_stat,
                 parent_fd=parent_fd,
             )
+            if os.name == "nt":
+                _reject_windows_encrypted_output(output_path, existing_fd)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         if nofollow:
@@ -1034,6 +1057,8 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
                 initial_stat,
                 parent_fd=parent_fd,
             )
+            if os.name == "nt":
+                _reject_windows_encrypted_output(output_path, existing_fd)
             current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
             if current_stat is None or not os.path.samestat(initial_stat, current_stat):
                 raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")

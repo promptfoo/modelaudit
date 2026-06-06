@@ -1163,6 +1163,54 @@ def test_scan_preflights_windows_temp_creation_before_scan_work(
     assert [close_call.args for close_call in close_handle.call_args_list] == [(202,), (101,)]
 
 
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_windows_efs_output_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    """EFS reports must fail closed before scanning or creating a replacement."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    output_path.write_text("sentinel")
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+    create_temp = MagicMock(side_effect=AssertionError("temporary output must not be created"))
+    close_handle = MagicMock()
+
+    monkeypatch.setattr(cli_module, "Path", type(tmp_path))
+    monkeypatch.setattr(cli_module.os, "name", "nt")
+    monkeypatch.setattr(cli_module, "_open_output_parent_directory", lambda _path: (output_path, None, 101))
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_existing_output_path",
+        lambda *_args, **_kwargs: output_path.stat(),
+    )
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: 202)
+    monkeypatch.setattr(
+        cli_module,
+        "_open_existing_output_file",
+        lambda *_args, **_kwargs: os.open(output_path, os.O_WRONLY),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_reject_windows_encrypted_output",
+        MagicMock(side_effect=cli_module._OutputWriteError("EFS protection cannot be preserved")),
+    )
+    monkeypatch.setattr(cli_module, "_open_windows_output_temp_file", create_temp)
+    monkeypatch.setattr(cli_module, "_close_windows_handle", close_handle)
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "EFS protection cannot be preserved" in result.output
+    resolve_scan_paths.assert_not_called()
+    create_temp.assert_not_called()
+    assert output_path.read_text() == "sentinel"
+    assert [close_call.args for close_call in close_handle.call_args_list] == [(202,), (101,)]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
 def test_cli_report_writers_stage_new_output_in_private_directory(
     tmp_path: Path,
@@ -1689,7 +1737,7 @@ def test_windows_output_rename_uses_absolute_destination_path(
 def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Existing reports need DACL-enforced write access plus identity metadata."""
+    """Existing reports need DACL-enforced write, replace, and metadata access."""
     captured: dict[str, object] = {}
 
     class CreateFileW:
@@ -1731,7 +1779,7 @@ def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
     assert output_fd == 7
     assert captured == {
         "path": str(destination_path),
-        "desired_access": 0x0002 | 0x0080 | 0x00020000,
+        "desired_access": 0x0002 | 0x0080 | 0x00020000 | 0x00010000,
         "share_mode": 0x00000001 | 0x00000002 | 0x00000004,
         "creation_disposition": 3,
         "flags": 0x00200000,
@@ -1787,7 +1835,7 @@ def test_windows_output_temp_file_uses_normal_attributes(monkeypatch: pytest.Mon
     assert temp_path == destination_path.parent / ".modelaudit-output.tmp"
     assert captured == {
         "path": str(temp_path),
-        "desired_access": 0x40000000 | 0x00010000 | 0x0080 | 0x00040000,
+        "desired_access": 0x40000000 | 0x00010000 | 0x0080 | 0x00040000 | 0x00080000,
         "share_mode": 0,
         "creation_disposition": 1,
         "flags": 0x00000080,
@@ -1796,8 +1844,34 @@ def test_windows_output_temp_file_uses_normal_attributes(monkeypatch: pytest.Mon
     }
 
 
-def test_windows_output_security_preserves_protected_dacl(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Atomic replacement must preserve the DACL and inheritance state."""
+@pytest.mark.parametrize(("file_attributes", "expected"), [(0, False), (0x00004000, True)])
+def test_windows_output_encryption_state_comes_from_pinned_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    file_attributes: int,
+    expected: bool,
+) -> None:
+    """EFS preservation must inspect the opened file rather than its path."""
+    monkeypatch.setattr(
+        cli_module.os,
+        "fstat",
+        lambda fd: types.SimpleNamespace(fd=fd, st_file_attributes=file_attributes),
+    )
+
+    assert cli_module._windows_output_is_encrypted(17) is expected
+
+
+def test_windows_output_rejects_efs_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Atomic replacement must not silently replace EFS recipient metadata."""
+    monkeypatch.setattr(cli_module, "_windows_output_is_encrypted", lambda _fd: True)
+
+    with pytest.raises(cli_module._OutputWriteError, match="EFS protection cannot be preserved"):
+        cli_module._reject_windows_encrypted_output("output.txt", 17)
+
+
+def test_windows_output_security_preserves_owner_group_and_protected_dacl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomic replacement must preserve ownership, DACL, and inheritance state."""
     import ctypes.wintypes as wintypes
 
     captured: dict[str, object] = {}
@@ -1818,8 +1892,8 @@ def test_windows_output_security_preserves_protected_dacl(monkeypatch: pytest.Mo
             descriptor: Any,
         ) -> int:
             captured["get"] = (source_handle, object_type, security_information)
-            assert owner is None
-            assert group is None
+            ctypes.cast(owner, ctypes.POINTER(wintypes.LPVOID)).contents.value = 11
+            ctypes.cast(group, ctypes.POINTER(wintypes.LPVOID)).contents.value = 22
             ctypes.cast(dacl, ctypes.POINTER(wintypes.LPVOID)).contents.value = 33
             ctypes.cast(descriptor, ctypes.POINTER(wintypes.LPVOID)).contents.value = 44
             return 0
@@ -1852,8 +1926,8 @@ def test_windows_output_security_preserves_protected_dacl(monkeypatch: pytest.Mo
                 target_handle,
                 object_type,
                 security_information,
-                owner,
-                group,
+                owner.value,
+                group.value,
                 dacl.value,
             )
             return 0
@@ -1882,14 +1956,14 @@ def test_windows_output_security_preserves_protected_dacl(monkeypatch: pytest.Mo
     cli_module._copy_windows_output_security("output.txt", 5, 6)
 
     assert captured == {
-        "get": (1005, 1, 0x00000004),
+        "get": (1005, 1, 0x00000001 | 0x00000002 | 0x00000004),
         "descriptor": 44,
         "set": (
             1006,
             1,
-            0x00000004 | 0x80000000,
-            None,
-            None,
+            0x00000001 | 0x00000002 | 0x00000004 | 0x80000000,
+            11,
+            22,
             33,
         ),
         "freed": 44,
