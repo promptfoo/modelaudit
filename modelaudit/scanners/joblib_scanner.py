@@ -139,7 +139,9 @@ class JoblibScanner(BaseScanner):
             self.config.get("max_decompressed_size", decompressed_read_budget),
             decompressed_read_budget,
         )
-        self.max_decompressed_size = min(configured_decompressed_size, decompressed_read_budget)
+        self.max_decompressed_size = configured_decompressed_size
+        if self.max_file_read_size > 0:
+            self.max_decompressed_size = min(self.max_decompressed_size, self.max_file_read_size)
         self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
     @classmethod

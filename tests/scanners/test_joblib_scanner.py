@@ -34,6 +34,10 @@ def test_joblib_default_decompressed_cap_tracks_file_read_budget() -> None:
 
     assert scanner.max_decompressed_size == 2 * 1024 * 1024
 
+    scanner = JoblibScanner({"max_file_read_size": 0, "max_decompressed_size": 1024 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 1024 * 1024 * 1024
+
     scanner = JoblibScanner({"max_file_read_size": 2 * 1024 * 1024, "max_decompressed_size": 4 * 1024 * 1024})
 
     assert scanner.max_decompressed_size == 2 * 1024 * 1024
