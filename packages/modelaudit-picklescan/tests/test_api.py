@@ -5823,6 +5823,11 @@ def test_with_call_graph_findings_records_source_fingerprint_metadata(
     module_path = tmp_path / "safe_module.py"
     module_path.write_text("def safe():\n    return 1\n")
     monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [finder for finder in sys.meta_path if ":unreusable:" not in _meta_path_finder_resolution_identity(finder)],
+    )
 
     report = PickleReport(
         source="safe-module.pkl",
