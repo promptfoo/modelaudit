@@ -1271,6 +1271,19 @@ def test_directory_can_replace_entries_rejects_darwin_extended_acl(
     assert cli_module._directory_can_replace_entries(Path("/"))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ACL metadata is required")
+def test_directory_can_replace_entries_rejects_linux_access_acl_for_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root-owned directory can still be replaceable through a POSIX ACL."""
+    monkeypatch.setattr(cli_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(Path, "stat", lambda _path: types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755))
+    monkeypatch.setattr(cli_module.os, "listxattr", lambda _path: ["system.posix_acl_access"], raising=False)
+    monkeypatch.setattr(cli_module.os, "geteuid", lambda: 0)
+
+    assert cli_module._directory_can_replace_entries(Path("/protected"))
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
 def test_cli_report_writers_do_not_disclose_output_through_late_hard_link(
     tmp_path: Path,

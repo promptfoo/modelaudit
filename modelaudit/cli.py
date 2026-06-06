@@ -187,6 +187,13 @@ def _directory_can_replace_entries(path: Path) -> bool:
                 os.close(directory_fd)
         except OSError:
             return True
+    elif hasattr(os, "listxattr"):
+        try:
+            if "system.posix_acl_access" in os.listxattr(path):
+                return True
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                return True
 
     writable_by_others = bool(path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
     if path_stat.st_uid != 0 or writable_by_others:
