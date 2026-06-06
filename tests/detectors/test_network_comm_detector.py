@@ -1021,12 +1021,6 @@ class TestNetworkCommDetector:
                 "evil-c2.com",
             ),
             (
-                "https://benign.example/download?token=https://evil-c2.com/payload",
-                "domain_name",
-                "domain",
-                "evil-c2.com",
-            ),
-            (
                 "https://benign.example/download?next=evil-c2.com",
                 "domain_name",
                 "domain",
@@ -1060,14 +1054,14 @@ class TestNetworkCommDetector:
             ),
         ],
     )
-    def test_sensitive_components_preserve_unsupported_uri_endpoints(
+    def test_nonsensitive_components_preserve_unsupported_uri_endpoints(
         self,
         component_separator: str,
         nested_uri: str,
         expected_findings: set[tuple[str, str, object]],
     ) -> None:
-        """Sensitive outer keys must not hide endpoints carried by other URI schemes."""
-        url = f"https://benign.example/download{component_separator}token={nested_uri}"
+        """Redirect-like outer keys must not hide endpoints carried by other URI schemes."""
+        url = f"https://benign.example/download{component_separator}next={nested_uri}"
 
         findings = NetworkCommDetector().scan(url.encode(), "hook.py")
 
@@ -1080,15 +1074,15 @@ class TestNetworkCommDetector:
         ("url", "nested_url"),
         [
             (
-                "https://benign.example/download?token=https%3A%2F%2Fevil-c2.com%2Fpayload",
+                "https://benign.example/download?next=https%3A%2F%2Fevil-c2.com%2Fpayload",
                 "https://evil-c2.com/payload",
             ),
             (
-                "https://benign.example/download#token=https%253A%252F%252Fevil-c2.com%252Fpayload",
+                "https://benign.example/download#redirect=https%253A%252F%252Fevil-c2.com%252Fpayload",
                 "https://evil-c2.com/payload",
             ),
             (
-                "https://benign.example/download?api_key=https%3A%2F%2F45.33.32.156%2Fpayload",
+                "https://benign.example/download?callback=https%3A%2F%2F45.33.32.156%2Fpayload",
                 "https://45.33.32.156/payload",
             ),
         ],
@@ -1103,11 +1097,11 @@ class TestNetworkCommDetector:
         ("url", "nested_uri"),
         [
             (
-                "https://benign.example/?token=tcp%3A%2F%2Fevil-c2.com%3A4444%2Fpayload",
+                "https://benign.example/?next=tcp%3A%2F%2Fevil-c2.com%3A4444%2Fpayload",
                 "tcp://evil-c2.com:4444/payload",
             ),
             (
-                "https://benign.example/#token=redis%3A%2F%2F45.33.32.156%3A6379%2F0",
+                "https://benign.example/#redirect=redis%3A%2F%2F45.33.32.156%3A6379%2F0",
                 "redis://45.33.32.156:6379/0",
             ),
         ],
@@ -1117,6 +1111,31 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(url.encode(), "hook.py")
 
         assert any(finding.get("type") == "url_detected" and finding.get("url") == nested_uri for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            (
+                "https://benign.example/download?token=https://evil-c2.com:4444/payload",
+                "evil-c2.com",
+            ),
+            (
+                "https://benign.example/download?api_key=https%3A%2F%2F45.33.32.156%3A4444%2Fpayload",
+                "45.33.32.156",
+            ),
+            (
+                "https://benign.example/download#authorization=tcp%3A%2F%2Fevil-c2.com%3A4444%2Fpayload",
+                "evil-c2.com",
+            ),
+        ],
+    )
+    def test_sensitive_query_url_values_emit_only_redacted_endpoint_marker(self, url: str, secret: str) -> None:
+        """URL-shaped credentials remain visible as a signal without exposing their value."""
+        findings = NetworkCommDetector({"max_findings": 1}).scan(url.encode(), "tokens.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert secret not in serialized
+        assert any(finding.get("url") == network_comm._SENSITIVE_NESTED_URL for finding in findings)
 
     def test_encoded_nested_endpoint_in_cloud_url_remains_finding(self) -> None:
         """Nested endpoints must be decoded before generic URL-scheme filtering."""
@@ -2819,6 +2838,23 @@ def test_sensitive_hint_near_match_skips_shared_evidence_redactor(monkeypatch: p
     data = (f"api_key_hint=public endpoint={ip} ".encode()) * 100
 
     findings = NetworkCommDetector().scan(data, "tokens.txt")
+
+    assert sum(finding.get("ip") == ip for finding in findings) == 100
+
+
+def test_sensitive_hint_prose_near_match_skips_shared_evidence_redactor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prose words beginning with auth must not consume endpoint-classification budget."""
+    monkeypatch.setattr(
+        network_comm,
+        "_redact_network_evidence",
+        lambda _text: (_ for _ in ()).throw(AssertionError("shared redactor should not run")),
+    )
+    ip = "45.33.32.156"
+    data = b"".join(f"author {index} endpoint={ip}\n".encode() for index in range(100))
+
+    findings = NetworkCommDetector().scan(data, "model-card.txt")
 
     assert sum(finding.get("ip") == ip for finding in findings) == 100
 

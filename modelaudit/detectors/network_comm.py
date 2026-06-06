@@ -96,12 +96,13 @@ _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _URL_COMPONENT_SEPARATOR_PATTERN = re.compile(r"&amp;|[&;]", re.IGNORECASE)
 _AUTHORIZATION_SCHEME_PATTERN = re.compile(r"[a-z][a-z0-9!#$%&'*+.^_`|~-]*", re.IGNORECASE)
 _SENSITIVE_EVIDENCE_HINT_PATTERN = re.compile(
-    rb"(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
+    rb"(?:api[_-]?key|auth(?:orization)?\b|credential|password|passwd|proxy[_-]?authorization|pwd|secret|token)"
     rb"(?![_-](?:cache|count|hint)\b)",
     re.IGNORECASE,
 )
 _EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
 _EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
+_SENSITIVE_NESTED_URL = "redacted://redacted.invalid/sensitive-endpoint"
 _OVER_ENCODED_NESTED_URL = "overencoded://redacted.invalid/nested-endpoint"
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
@@ -1012,6 +1013,8 @@ def _is_match_redacted_from_url_component(component: str, match_start: int, valu
 
     key, separator, field_value = component[field_start:field_end].partition("=")
     value_lower = value.lower()
+    if separator and _is_sensitive_path_key(key):
+        return True
     nested_url_candidates = (field_value, _decode_path_token(field_value))
     for candidate in nested_url_candidates:
         if candidate == _PATH_TOKEN_DECODE_LIMIT_SENTINEL:
@@ -1136,8 +1139,9 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
     seen: set[str] = set()
     for component in (parsed.query, parsed.fragment):
         for field in _URL_COMPONENT_SEPARATOR_PATTERN.split(component):
-            _key, separator, value = field.partition("=")
+            key, separator, value = field.partition("=")
             candidate = value if separator else field
+            sensitive_field = bool(separator and _is_sensitive_path_key(key))
             decoded = candidate
             decode_limit_exhausted = False
             for _ in range(_MAX_PATH_TOKEN_DECODE_PASSES):
@@ -1153,7 +1157,7 @@ def _decoded_nested_urls(url: str) -> Iterator[str]:
 
             found_nested_url = False
             for match in _URI_IN_TEXT_PATTERN.finditer(decoded):
-                nested_url = match.group()
+                nested_url = _SENSITIVE_NESTED_URL if sensitive_field else match.group()
                 if nested_url not in seen:
                     seen.add(nested_url)
                     found_nested_url = True
