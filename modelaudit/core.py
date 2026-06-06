@@ -1300,55 +1300,20 @@ def _resolve_directory_scan_target(
 ) -> tuple[Path | None, bool, bool]:
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
     is_symlink = file_path.is_symlink()
-    if is_symlink and not file_path.exists():
-        broken_symlink_error: OSError | None
-        try:
-            file_path.resolve(strict=True).stat()
-        except FileNotFoundError as e:
-            broken_symlink_error = e
-        except (OSError, RuntimeError) as e:
-            _add_issue_to_model(
-                results,
-                "Directory entry unavailable during discovery",
-                severity=IssueSeverity.INFO.value,
-                location=str(file_path),
-                details={
-                    "error": str(e),
-                    "analysis_incomplete": True,
-                    "scan_outcome": "inconclusive",
-                    "scan_outcome_reason": "directory_entry_unavailable",
-                },
-            )
-            return None, False, True
-        else:
-            try:
-                # Validate only that link metadata is readable. The canonical
-                # resolved path below remains the sole target used for scanning.
-                os.readlink(file_path)
-            except OSError as e:
-                broken_symlink_error = e
-            else:
-                broken_symlink_error = (
-                    None if file_path.exists() else FileNotFoundError("Symlink target does not exist")
-                )
-        if broken_symlink_error is not None:
-            _add_issue_to_model(
-                results,
-                "Broken symlink encountered",
-                severity=IssueSeverity.INFO.value,
-                location=str(file_path),
-                details={
-                    "error": str(broken_symlink_error),
-                    "analysis_incomplete": True,
-                    "scan_outcome": "inconclusive",
-                    "scan_outcome_reason": "directory_entry_unavailable",
-                },
-            )
-            return None, False, True
     try:
         # Strict resolution of valid relative file symlinks is unreliable on
         # some Windows versions. Resolve once and verify that target directly.
         resolved_file = file_path.resolve()
+        if is_symlink and resolved_file == file_path.absolute():
+            try:
+                raw_target = Path(os.readlink(file_path))
+            except OSError as e:
+                if not file_path.exists():
+                    raise FileNotFoundError("Symlink target does not exist") from e
+                raise
+            if not raw_target.is_absolute():
+                raw_target = file_path.parent / raw_target
+            resolved_file = raw_target.resolve()
         resolved_file.stat()
     except (OSError, RuntimeError) as e:
         if is_symlink and isinstance(e, FileNotFoundError):

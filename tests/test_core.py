@@ -1567,6 +1567,50 @@ def test_resolve_directory_scan_target_reports_missing_symlink_when_windows_stat
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_resolve_directory_scan_target_recovers_valid_relative_windows_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid relative link remains scannable when Windows leaves it lexically unresolved."""
+    target_path = tmp_path / "blobs" / "model.bin"
+    target_path.parent.mkdir()
+    target_path.write_bytes(b"safe")
+    link_path = tmp_path / "snapshots" / "abc123" / "model.bin"
+    link_path.parent.mkdir(parents=True)
+    link_path.symlink_to(Path("../../blobs/model.bin"))
+    base_dir = tmp_path.resolve()
+    results = core_module.create_initial_audit_result()
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+
+    def lexical_link_resolve(path: Path, strict: bool = False) -> Path:
+        if path == link_path:
+            return path.absolute()
+        return original_resolve(path, strict=strict)
+
+    def link_metadata_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == link_path:
+            return os.lstat(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "resolve", lexical_link_resolve)
+    monkeypatch.setattr(Path, "stat", link_metadata_stat)
+
+    resolved, is_hf_cache_symlink, entry_unavailable = core_module._resolve_directory_scan_target(
+        link_path,
+        base_dir,
+        is_hf_cache=False,
+        hf_cache_root=None,
+        results=results,
+    )
+
+    assert resolved == target_path.resolve()
+    assert is_hf_cache_symlink is False
+    assert entry_unavailable is False
+    assert results.issues == []
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_resolve_directory_scan_target_classifies_symlink_loop_as_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
