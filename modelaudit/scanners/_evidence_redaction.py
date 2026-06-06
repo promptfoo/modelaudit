@@ -9,12 +9,16 @@ import json
 import re
 import textwrap
 import tokenize
+import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from typing import Any, Final
-from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
-from modelaudit.detectors.network_comm import _redact_url_path_tokens
+from modelaudit.detectors.network_comm import (
+    _is_azure_container_authority,
+    _redact_url_path_tokens,
+)
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
@@ -26,10 +30,34 @@ STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
+MAX_PERCENT_DECODE_PASSES: Final[int] = 32
+MAX_SENSITIVE_EVIDENCE_KEY_CHARS: Final[int] = 512
 REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 UNRESOLVED_VALUE_CALL_LOOKAHEAD_CHARS: Final[int] = 512
+UNSAFE_ASCII_EVIDENCE_TRANSLATION: Final[dict[int, None]] = dict.fromkeys((*range(9), 11, 12, *range(14, 32), 127))
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r'(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s"<>]+')
+SHELL_OPERATOR_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:\|\||&&|[|;])\s*(?:sh|bash|rm|curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?|nc|netcat)\b"
+)
+STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"AIza[0-9A-Za-z_-]{35}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[opsur]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"glpat-[A-Za-z0-9_-]{20}|"
+    r"hf_[A-Za-z0-9]{30,}|"
+    r"npm_[A-Za-z0-9]{36}|"
+    r"sq0atp-[0-9A-Za-z_-]{22}|"
+    r"sq0csp-[0-9A-Za-z_-]{43}|"
+    r"(?:stripe|[sr]k)_live_[A-Za-z0-9]{24}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])|[A-Za-z0-9]{24,})|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")(?![A-Za-z0-9])"
+)
+PERCENT_ENCODED_SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.+/=-]){7,}")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -54,6 +82,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "client_secret",
         "client-secret",
         "credential",
+        "google_access_id",
+        "google-access-id",
+        "googleaccessid",
         "password",
         "passwd",
         "pwd",
@@ -80,7 +111,7 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_.-]?key[_.-]?id|access[_.-]?key|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|"
-    r"client[_.-]?secret|credential|"
+    r"client[_.-]?secret|credential|google[_.-]?access[_.-]?id|"
     r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
     r"(?!(?:[_.-](?:cache|count))\b)"
     r"(?:[_.-][a-z0-9]+)*"
@@ -89,7 +120,8 @@ CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*))?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
-    r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
+    r"RefreshToken|refreshToken|GoogleAccessId|googleAccessId|SAS|Secret|SecretKey|secretKey|"
+    r"Signature|Sig|Token)"
     r"(?:[A-Z][A-Za-z0-9]*)?"
 )
 AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
@@ -107,9 +139,9 @@ SENSITIVE_CONTAINER_KEY: Final[str] = (
 )
 SEPARATED_SENSITIVE_R_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[._-])*"
-    r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
-    r"credential|password|passwd|private[._-]?key|pwd|refresh[._-]?token|sas|secret|"
-    r"secret[._-]?key|signature|sig|token)"
+    r"(?:access[._-]?key(?:[._-]?id)?|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|"
+    r"client[._-]?secret|credential|google[._-]?access[._-]?id|password|passwd|private[._-]?key|"
+    r"pwd|refresh[._-]?token|sas|secret|secret[._-]?key|signature|sig|token)"
     r"(?:[._-][a-z0-9]+)*"
 )
 SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
@@ -118,9 +150,10 @@ SENSITIVE_R_BARE_ASSIGNMENT_KEY: Final[str] = (
 )
 SEPARATED_SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
     r"(?:[a-z0-9]+[\s._-]+)*"
-    r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
-    r"client[\s._-]*secret|credential|password|passwd|private[\s._-]*key|pwd|"
-    r"refresh[\s._-]*token|sas|secret|secret[\s._-]*key|signature|sig|token)"
+    r"(?:access[\s._-]*key(?:[\s._-]*id)?|access[\s._-]*token|api[\s._-]*key|apikey|"
+    r"auth[\s._-]*token|client[\s._-]*secret|credential|google[\s._-]*access[\s._-]*id|"
+    r"password|passwd|private[\s._-]*key|pwd|refresh[\s._-]*token|sas|secret|"
+    r"secret[\s._-]*key|signature|sig|token)"
     r"(?:[\s._-]+[a-z0-9]+)*"
 )
 SENSITIVE_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
@@ -179,6 +212,9 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNQUOTED_VALUE_PATTERN}"
 )
+SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
+)
 INDEXED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})(?:\[[a-z0-9_-]{{0,32}}\])+\s*[:=]\s*"
     rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
@@ -212,6 +248,13 @@ GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)"
     rf"(?P<openers>{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
 )
+CONTROL_SPLIT_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)(?=(?P<key>{DETAIL_KEY_PATTERN})\s*[:=])")
+CONTROL_SPLIT_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?=(?P<quote>[\"'])(?P<key>{DETAIL_KEY_PATTERN})(?P=quote)\s*:)"
+)
+CONTROL_SPLIT_FLAG_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?=(?:^|\s)-{{1,2}}(?P<key>{DETAIL_KEY_PATTERN})\s+)"
+)
 EMBEDDED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<quote>[\"']?)(?P<key>{DETAIL_KEY_PATTERN})(?P=quote)\s*:"
 )
@@ -224,6 +267,7 @@ SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "authorization",
     "clientsecret",
     "credential",
+    "googleaccessid",
     "password",
     "passwd",
     "privatekey",
@@ -234,6 +278,11 @@ SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "secret",
     "sig",
     "token",
+)
+SENSITIVE_EVIDENCE_CONTAINER_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\A(?:[a-z0-9]+[._-])*(?:{SENSITIVE_CONTAINER_KEY}|authentication)"
+    rf"(?:[._-](?:headers?|values?))?\Z",
+    re.IGNORECASE,
 )
 QUOTED_AUTHORIZATION_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(?P<prefix>authorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
@@ -691,7 +740,70 @@ def _redact_malformed_url(raw_url: str) -> str:
     if "@" not in rest:
         return f"{scheme}{REDACTED_EVIDENCE_VALUE}"
 
-    return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
+    authority_and_path = rest.rsplit("@", 1)[1]
+    authority, path_separator, path_tail = authority_and_path.partition("/")
+    path = f"/{path_tail}" if path_separator else ""
+    safe_path = _redact_url_path_tokens(scheme[:-3].lower(), authority.lower(), path)
+    return f"{scheme}{REDACTED_URL_CREDENTIALS}@{authority}{safe_path}"
+
+
+def _url_text_for_match(match: re.Match[str]) -> str:
+    """Trim source syntax only when the URL starts inside a single-quoted literal."""
+    raw_url = match.group(0)
+    if _active_quote_before(match.string, match.start()) != "'":
+        return raw_url
+
+    escaped = False
+    for index, character in enumerate(raw_url):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "'":
+            if raw_url[index + 1 :].startswith("@"):
+                continue
+            return raw_url[:index]
+    return raw_url
+
+
+def _active_quote_before(text: str, end: int) -> str | None:
+    scan_start = max(text.rfind("\n", 0, end) + 1, end - STRUCTURED_REDACTION_PARSE_LIMIT)
+    quote: str | None = None
+    escaped = False
+    for index in range(scan_start, end):
+        character = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character not in {"'", '"'}:
+            continue
+        if (
+            character == "'"
+            and index > scan_start
+            and index + 1 < end
+            and text[index - 1].isalnum()
+            and text[index + 1].isalnum()
+        ):
+            continue
+        quote = character
+    return quote
+
+
+def _source_literal_suffix_for_url_match(match: re.Match[str], raw_url: str) -> str:
+    consumed_suffix = match.group(0)[len(raw_url) :]
+    return consumed_suffix if consumed_suffix.startswith("'") else ""
+
+
+def _shell_operator_suffix(value: str) -> tuple[int, str] | None:
+    match = SHELL_OPERATOR_COMMAND_RE.search(value)
+    if match is None:
+        return None
+    return match.start(), match.group(0)
 
 
 def _redact_url_query_value(value: str, url_depth: int) -> str:
@@ -710,24 +822,31 @@ def _redact_url_query_value(value: str, url_depth: int) -> str:
 
 
 def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
-    raw_url = match.group(0)
+    raw_url = _url_text_for_match(match)
+    source_literal_suffix = _source_literal_suffix_for_url_match(match, raw_url)
+    if source_literal_suffix:
+        source_literal_suffix = _redact_url_query_value(source_literal_suffix, url_depth)
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
-        return _redact_malformed_url(raw_url)
+        return f"{_redact_malformed_url(raw_url)}{source_literal_suffix}"
 
+    hostname = parsed.hostname or ""
     netloc = parsed.netloc
     if "@" in netloc:
-        netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
-    hostname = parsed.hostname or ""
+        authority_prefix, _separator, authority_hostname = netloc.rpartition("@")
+        if not _is_azure_container_authority(parsed.scheme.lower(), hostname, authority_prefix):
+            netloc = f"{REDACTED_URL_CREDENTIALS}@{authority_hostname}"
     path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path)
 
     query_items = []
-    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
+    query_shell_suffix = _shell_operator_suffix(parsed.query)
+    query = parsed.query[: query_shell_suffix[0]] if query_shell_suffix is not None else parsed.query
+    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", query))
     raw_query_values = [segment.partition("=")[2] for segment in normalized_query.split("&")]
     for index, (key, value) in enumerate(parse_qsl(normalized_query, keep_blank_values=True)):
-        if _is_sensitive_detail_key(_normalize_query_key(key)):
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        if (redacted_key := _redacted_query_key(key)) is not None:
+            query_items.append((redacted_key, REDACTED_EVIDENCE_VALUE))
             continue
         redacted_value = _redact_url_query_value(value, url_depth=url_depth)
         encoded_nested_url = index < len(raw_query_values) and "%3a%2f%2f" in raw_query_values[index].lower()
@@ -738,27 +857,177 @@ def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
         else:
             query_items.append((key, redacted_value))
 
-    return urlunsplit(
-        (
-            parsed.scheme,
-            netloc,
-            path,
-            urlencode(query_items, doseq=True, safe="<>"),
-            "",
+    safe_query = urlencode(query_items, doseq=True, safe="<>|;")
+    if query_shell_suffix is not None:
+        safe_query = f"{safe_query}{query_shell_suffix[1]}"
+
+    fragment_shell_suffix = _shell_operator_suffix(parsed.fragment)
+    safe_fragment = f"{REDACTED_EVIDENCE_VALUE}{fragment_shell_suffix[1]}" if fragment_shell_suffix is not None else ""
+
+    return f"{urlunsplit((parsed.scheme, netloc, path, safe_query, safe_fragment))}{source_literal_suffix}"
+
+
+def _decode_percent_layer_with_spans(
+    value: str,
+    source_spans: list[tuple[int, int]],
+) -> tuple[str, list[tuple[int, int]]]:
+    decoded_chars: list[str] = []
+    decoded_spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(value):
+        if (
+            index + 2 < len(value)
+            and value[index] == "%"
+            and all(char in "0123456789abcdefABCDEF" for char in value[index + 1 : index + 3])
+        ):
+            decoded_chars.append(chr(int(value[index + 1 : index + 3], 16)))
+            decoded_spans.append((source_spans[index][0], source_spans[index + 2][1]))
+            index += 3
+            continue
+
+        decoded_chars.append(value[index])
+        decoded_spans.append(source_spans[index])
+        index += 1
+
+    return "".join(decoded_chars), decoded_spans
+
+
+def _redact_percent_encoded_standalone_secret_spans(raw_value: str) -> str:
+    decoded = raw_value
+    source_spans = [(index, index + 1) for index in range(len(raw_value))]
+    secret_spans: list[tuple[int, int]] = []
+    for _ in range(MAX_PERCENT_DECODE_PASSES):
+        next_decoded, next_source_spans = _decode_percent_layer_with_spans(decoded, source_spans)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+        source_spans = next_source_spans
+        for secret_match in STANDALONE_SECRET_RE.finditer(decoded):
+            secret_spans.append(
+                (
+                    source_spans[secret_match.start()][0],
+                    source_spans[secret_match.end() - 1][1],
+                )
+            )
+    else:
+        next_decoded, _ = _decode_percent_layer_with_spans(decoded, source_spans)
+        if next_decoded != decoded:
+            return REDACTED_EVIDENCE_VALUE
+
+    if not secret_spans:
+        return raw_value
+
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in sorted(secret_spans):
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(end, merged_spans[-1][1]))
+        else:
+            merged_spans.append((start, end))
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in merged_spans:
+        parts.extend((raw_value[cursor:start], REDACTED_EVIDENCE_VALUE))
+        cursor = end
+    parts.append(raw_value[cursor:])
+    return "".join(parts)
+
+
+def _redact_percent_encoded_secret_text(raw_value: str, *, url_depth: int) -> str:
+    if "%" not in raw_value:
+        return raw_value
+
+    decoded = raw_value
+    for _ in range(MAX_PERCENT_DECODE_PASSES):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+        if STANDALONE_SECRET_RE.search(decoded):
+            return REDACTED_EVIDENCE_VALUE
+        normalized_decoded = _remove_unsafe_evidence_characters(decoded)
+        redacted_decoded = redact_evidence_string(
+            normalized_decoded,
+            max_chars=None,
+            _url_depth=url_depth,
+            _decode_percent=False,
         )
+        if redacted_decoded != normalized_decoded:
+            return redacted_decoded
+    else:
+        # Excessively nested encoding is attacker-controlled and too opaque to
+        # preserve safely in evidence.
+        return REDACTED_EVIDENCE_VALUE
+    return raw_value
+
+
+def _redact_percent_encoded_secret_candidate(match: re.Match[str], *, url_depth: int = 0) -> str:
+    raw_value = match.group(0)
+    span_redacted = _redact_percent_encoded_standalone_secret_spans(raw_value)
+    if span_redacted == raw_value:
+        return _redact_percent_encoded_secret_text(raw_value, url_depth=url_depth)
+    if span_redacted == REDACTED_EVIDENCE_VALUE:
+        return span_redacted
+    return PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(
+        lambda nested_match: _redact_percent_encoded_secret_text(nested_match.group(0), url_depth=url_depth),
+        span_redacted,
     )
+
+
+def _remove_unsafe_evidence_characters(text: str) -> str:
+    """Remove model-controlled characters that can alter rendered evidence."""
+    if text.isascii():
+        return text.translate(UNSAFE_ASCII_EVIDENCE_TRANSLATION)
+
+    safe_characters: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char in {"\n", "\r", "\t"} or category not in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+            safe_characters.append(char)
+    return "".join(safe_characters)
+
+
+def _controls_split_sensitive_assignment(text: str, compact_text: str) -> bool:
+    """Return whether removing controls reveals a previously split credential key."""
+    original_positions = [index for index, char in enumerate(text) if char not in {"\r", "\n", "\t"}]
+    exact_sensitive_keys = {
+        variant
+        for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES
+        for variant in (suffix, f"{suffix}s", f"{suffix}value", f"{suffix}values")
+    }
+    for pattern in (CONTROL_SPLIT_ASSIGNMENT_KEY_RE, CONTROL_SPLIT_QUOTED_KEY_RE, CONTROL_SPLIT_FLAG_KEY_RE):
+        for match in pattern.finditer(compact_text):
+            key = match.group("key")
+            if not _is_sensitive_detail_key(key):
+                continue
+            key_start, key_end = match.span("key")
+            if key_start >= len(original_positions) or key_end <= key_start:
+                continue
+            original_start = original_positions[key_start]
+            original_end = original_positions[key_end - 1] + 1
+            original_key = text[original_start:original_end]
+            control_indexes = [index for index, char in enumerate(original_key) if char in {"\r", "\n", "\t"}]
+            if not control_indexes:
+                continue
+            if _canonicalize_detail_key(key) in exact_sensitive_keys:
+                return True
+            if any(
+                (index > 0 and original_key[index - 1] in {"_", "-", "."})
+                or (index + 1 < len(original_key) and original_key[index + 1] in {"_", "-", "."})
+                for index in control_indexes
+            ):
+                return True
+    return False
 
 
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
     """Recognize credential assignments nested inside encoded query values."""
-    decoded = value
-    for _ in range(3):
-        next_decoded = unquote_plus(decoded)
-        if next_decoded == decoded:
-            break
-        decoded = next_decoded
+    decoded, decoding_complete = _decode_query_component(value)
+    if not decoding_complete:
+        return True
     return bool(
         NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+        or _decoded_component_contains_sensitive_assignment(decoded)
         or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
@@ -772,7 +1041,7 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
 def _contains_nested_url_secret(value: str) -> bool:
     """Detect credential-bearing URLs embedded inside decoded query values."""
     for match in URL_RE.finditer(value):
-        raw_url = match.group(0)
+        raw_url = _url_text_for_match(match)
         try:
             parsed = urlsplit(raw_url)
         except ValueError:
@@ -782,17 +1051,67 @@ def _contains_nested_url_secret(value: str) -> bool:
 
         hostname = parsed.hostname or ""
         if "@" in parsed.netloc:
-            return True
+            authority_prefix, _separator, _authority_hostname = parsed.netloc.rpartition("@")
+            if not _is_azure_container_authority(parsed.scheme.lower(), hostname, authority_prefix):
+                return True
         if _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path) != parsed.path:
             return True
         normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
         if any(
-            _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
-            or _contains_nested_sensitive_query_assignment(query_value)
+            _query_key_is_sensitive(key) or _contains_nested_sensitive_query_assignment(query_value)
             for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
         ):
             return True
     return False
+
+
+def _decode_query_component(value: str) -> tuple[str, bool]:
+    """Decode a query component within the URL redaction budget."""
+    decoded = value
+    for _ in range(MAX_URL_QUERY_REDACTION_DEPTH):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            return decoded, True
+        decoded = next_decoded
+    return decoded, unquote_plus(decoded) == decoded
+
+
+def _decoded_component_contains_sensitive_assignment(decoded: str) -> bool:
+    if any(
+        pattern.search(decoded) is not None
+        for pattern in (
+            SENSITIVE_ASSIGNMENT_RE,
+            QUOTED_SENSITIVE_ASSIGNMENT_RE,
+            AUTHORIZATION_VALUE_RE,
+            AUTH_SCHEME_VALUE_RE,
+        )
+    ):
+        return True
+    return any(_is_sensitive_detail_key(match.group("key")) for match in SENSITIVE_FLAG_VALUE_RE.finditer(decoded))
+
+
+def _redacted_query_key(key: str) -> str | None:
+    """Return a safe key when an encoded query key must be redacted."""
+    decoded, decoding_complete = _decode_query_component(key)
+    if not decoding_complete:
+        return "credential"
+
+    assignment_match = NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+    if assignment_match is not None:
+        assignment = decoded[assignment_match.start() :].lstrip("?&;")
+        if assignment.lower().startswith("amp;"):
+            assignment = assignment[4:]
+        candidate_key = _normalize_query_key(re.split(r"[:=]", assignment, maxsplit=1)[0].strip())
+        return candidate_key if _is_sensitive_detail_key(candidate_key) else "credential"
+
+    if _decoded_component_contains_sensitive_assignment(decoded):
+        return "credential"
+
+    return decoded if _is_sensitive_detail_key(_normalize_query_key(decoded)) else None
+
+
+def _query_key_is_sensitive(key: str) -> bool:
+    return _redacted_query_key(key) is not None
 
 
 def _normalize_query_key(key: str) -> str:
@@ -938,6 +1257,24 @@ def _find_balanced_container_end(text: str, start: int, *, max_scan_chars: int |
     return None
 
 
+def _contains_only_redacted_marker_values(container_text: str) -> bool:
+    try:
+        parsed = ast.literal_eval(container_text)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return False
+
+    def is_redacted(value: Any) -> bool:
+        if isinstance(value, str):
+            return value == REDACTED_EVIDENCE_VALUE
+        if isinstance(value, dict):
+            return bool(value) and all(is_redacted(key) and is_redacted(child) for key, child in value.items())
+        if isinstance(value, list | tuple | set):
+            return bool(value) and all(is_redacted(child) for child in value)
+        return False
+
+    return is_redacted(parsed)
+
+
 def _redact_container_assignments(text: str) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
@@ -953,15 +1290,14 @@ def _redact_container_assignments(text: str) -> str:
         if container_start == 0 and text[container_end:].strip():
             search_index = container_end
             continue
-        if REDACTED_EVIDENCE_VALUE in container_text:
-            search_index = container_end
-            continue
-
         if _is_sensitive_detail_key(match.group("key")):
+            if _contains_only_redacted_marker_values(container_text):
+                search_index = container_end
+                continue
             redacted_chunks.append(text[last_index : match.start()])
             redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
             last_index = container_end
-        else:
+        elif REDACTED_EVIDENCE_VALUE not in container_text:
             redacted_container = _redact_structured_evidence(container_text, max_chars=len(container_text))
             if redacted_container is not None and redacted_container != container_text:
                 redacted_chunks.append(text[last_index:container_start])
@@ -988,10 +1324,9 @@ def _redact_call_assignments(text: str) -> str:
         if not _is_sensitive_detail_key(match.group("key")):
             search_index = match.end()
             continue
-        if container_end is not None and REDACTED_EVIDENCE_VALUE in text[container_start:container_end]:
+        if container_end is not None and _contains_only_redacted_marker_values(text[container_start:container_end]):
             search_index = container_end
             continue
-
         redacted_chunks.append(text[last_index : match.start()])
         redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
         if container_end is None:
@@ -1232,8 +1567,8 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
         return True
 
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(value).readline))
-    except (IndentationError, tokenize.TokenError):
+        tokens = list(tokenize.generate_tokens(io.StringIO(value.replace("\r", " ")).readline))
+    except (IndentationError, UnicodeError, tokenize.TokenError):
         return False
     significant = [
         token
@@ -2005,9 +2340,11 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
             else:
                 _append_ast_node_replacement(text, offsets, value_node, replacements)
     else:
-        token_input = text.replace("\x00", " ")
+        token_input = text.replace("\x00", " ").replace("\r", " ")
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+        except UnicodeError:
+            return REDACTED_EVIDENCE_VALUE
         except (IndentationError, tokenize.TokenError):
             return text
         depths = _token_depths(tokens)
@@ -2164,9 +2501,11 @@ def _append_token_value_replacement(
 
 def _redact_sensitive_keyed_calls(text: str) -> str:
     """Redact credential values/defaults in bounded key/value call patterns."""
-    token_input = text.replace("\x00", " ")
+    token_input = text.replace("\x00", " ").replace("\r", " ")
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return text
 
@@ -2341,9 +2680,11 @@ def _comparison_value_end(
 
 def _redact_sensitive_comparisons(text: str) -> str:
     """Redact literal comparison operands for sensitive code targets."""
-    token_input = text.replace("\x00", " ")
+    token_input = text.replace("\x00", " ").replace("\r", " ")
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return text
 
@@ -2431,7 +2772,10 @@ def _redact_python_expression_assignments(text: str) -> str:
         return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text.replace("\x00", " ")).readline))
+        token_input = text.replace("\x00", " ").replace("\r", " ")
+        tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except UnicodeError:
+        return REDACTED_EVIDENCE_VALUE
     except (IndentationError, tokenize.TokenError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
@@ -2592,12 +2936,17 @@ def _looks_like_r_evidence(text: str) -> bool:
     return False
 
 
-def _lookahead_ends_inside_r_rightward_target(text: str, lookahead_text: str) -> bool:
-    if len(lookahead_text) >= len(text):
-        return False
+def _lookahead_ends_inside_r_rightward_target(
+    text: str,
+    lookahead_text: str,
+    *,
+    source_truncated: bool = False,
+) -> bool:
     match = TRUNCATED_R_RIGHTWARD_TARGET_RE.search(lookahead_text)
     if match is None:
         return False
+    if len(lookahead_text) >= len(text):
+        return source_truncated
     next_character = text[len(lookahead_text)]
     target_fragment = re.sub(r"^->{1,2}\s*", "", match.group(0))
     target_continues = re.match(r"[A-Za-z0-9._$@]", next_character) is not None
@@ -2611,14 +2960,22 @@ def _lookahead_ends_inside_r_rightward_target(text: str, lookahead_text: str) ->
     return re.match(r"\s*(?:async\s+)?def\s+", statement_prefix) is None
 
 
-def _unfinished_value_call_sensitivity(text: str, lookahead_text: str) -> bool | None:
-    if len(lookahead_text) >= len(text):
+def _unfinished_value_call_sensitivity(
+    text: str,
+    lookahead_text: str,
+    *,
+    source_truncated: bool = False,
+) -> bool | None:
+    if len(lookahead_text) >= len(text) and not source_truncated:
         return None
 
     tokens: list[tokenize.TokenInfo] = []
     try:
-        for token in tokenize.generate_tokens(io.StringIO(lookahead_text.replace("\x00", " ")).readline):
+        token_input = lookahead_text.replace("\x00", " ").replace("\r", " ")
+        for token in tokenize.generate_tokens(io.StringIO(token_input).readline):
             tokens.append(token)
+    except UnicodeError:
+        return True
     except (IndentationError, tokenize.TokenError):
         # Incomplete bounded lookahead may end mid-token; partial tokens still support conservative classification.
         pass
@@ -2708,7 +3065,42 @@ def _common_dedent_prefix(text: str, dedented: str) -> str:
     return ""
 
 
-def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
+def _statement_value_end(text: str, start: int) -> int:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index in range(start, len(text)):
+        character = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}" and depth > 0:
+            depth -= 1
+        elif character in ";\r\n" and depth == 0:
+            return index
+    return len(text)
+
+
+def _redact_compound_sensitive_assignments(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    for match in SENSITIVE_COMPOUND_ASSIGNMENT_START_RE.finditer(text):
+        value_end = _statement_value_end(text, match.end())
+        value = text[match.end() : value_end]
+        if re.search(r"(?i)\b(?:and|or)\b|\.\.", value) is not None:
+            replacements.append((match.end(), value_end))
+    return _replace_spans(text, replacements)
+
+
+def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: bool = True) -> str:
     effective_max_chars = max(len(text), len(REDACTED_EVIDENCE_VALUE))
     parseable_python_evidence = _is_parseable_python_evidence(text)
     parenthesized_python_evidence = parseable_python_evidence and text.lstrip().startswith("(")
@@ -2734,6 +3126,14 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
         redacted = _redact_rightward_assignment_expressions(redacted)
     redacted = _redact_sensitive_literal_pairs(redacted)
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=url_depth), redacted)
+    redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
+    if decode_percent:
+        redacted = PERCENT_ENCODED_SECRET_CANDIDATE_RE.sub(
+            lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=url_depth),
+            redacted,
+        )
+    if not r_evidence and (not python_evidence or ".." in redacted):
+        redacted = _redact_compound_sensitive_assignments(redacted)
     if python_evidence:
         redacted = _redact_python_expression_assignments(redacted)
     elif not python_evidence:
@@ -2768,8 +3168,9 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0) -> str:
             value_start = match.start() + len(match.group("prefix"))
             value_end, _continued = _unparseable_assignment_value_end(match.string, value_start)
             try:
-                value_tokens = list(tokenize.generate_tokens(io.StringIO(match.string[value_start:value_end]).readline))
-            except (IndentationError, tokenize.TokenError):
+                token_input = match.string[value_start:value_end].replace("\r", " ")
+                value_tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+            except (IndentationError, UnicodeError, tokenize.TokenError):
                 value_tokens = []
             if _tokens_contain_dangerous_call(value_tokens):
                 return match.group(0)
@@ -2878,17 +3279,68 @@ def _redact_quoted_structured_literal(text: str, max_chars: int) -> str | None:
     return _truncate(redacted_unquoted, max_chars)
 
 
-def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth: int = 0) -> str:
+def redact_evidence_string(
+    text: str,
+    max_chars: int | None = 180,
+    *,
+    _url_depth: int = 0,
+    _decode_percent: bool = True,
+    _compact_controls: bool = True,
+) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
+    raw_text = text
     if max_chars is None:
-        return _redact_evidence_content(text, url_depth=_url_depth)
+        text = _remove_unsafe_evidence_characters(raw_text)
+        source_exceeds_limit = False
+        source_truncated = False
+    else:
+        limit = max(0, max_chars)
+        source_exceeds_limit = len(raw_text) > limit
+        normalization_end = limit + REDACTION_LOOKAHEAD_CHARS + 1
+        source_truncated = len(raw_text) > normalization_end
+        text = _remove_unsafe_evidence_characters(raw_text[:normalization_end])
 
-    limit = max(0, max_chars)
+    compact_redacted: str | None = None
+    if _compact_controls:
+        control_text = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
+        compact_text = control_text.replace("\r", "").replace("\n", "").replace("\t", "")
+        if compact_text != control_text and _controls_split_sensitive_assignment(control_text, compact_text):
+            compact_candidate = redact_evidence_string(
+                compact_text,
+                max_chars=max_chars,
+                _url_depth=_url_depth,
+                _decode_percent=_decode_percent,
+                _compact_controls=False,
+            )
+            compact_baseline = compact_text if max_chars is None else _truncate(compact_text, max(0, max_chars))
+            if compact_candidate != compact_baseline:
+                compact_redacted = compact_candidate
+
+    def finalize(redacted: str) -> str:
+        baseline = text if max_chars is None else _truncate(text, max(0, max_chars))
+        if compact_redacted is not None and redacted == baseline:
+            return compact_redacted
+        return redacted
+
+    if max_chars is None:
+        return finalize(_redact_evidence_content(text, url_depth=_url_depth, decode_percent=_decode_percent))
+
     bounded_text = text[:limit]
     lookahead_text = text[: limit + REDACTION_LOOKAHEAD_CHARS]
-    unfinished_value_call_sensitivity = _unfinished_value_call_sensitivity(text, lookahead_text)
-    if _lookahead_ends_inside_r_rightward_target(text, lookahead_text) or unfinished_value_call_sensitivity is True:
-        return _truncate(REDACTED_EVIDENCE_VALUE, limit)
+    unfinished_value_call_sensitivity = _unfinished_value_call_sensitivity(
+        text,
+        lookahead_text,
+        source_truncated=source_truncated,
+    )
+    if (
+        _lookahead_ends_inside_r_rightward_target(
+            text,
+            lookahead_text,
+            source_truncated=source_truncated,
+        )
+        or unfinished_value_call_sensitivity is True
+    ):
+        return finalize(_truncate(REDACTED_EVIDENCE_VALUE, limit))
     if unfinished_value_call_sensitivity is False:
         lookahead_text = text[: limit + UNRESOLVED_VALUE_CALL_LOOKAHEAD_CHARS]
     raw_replacements = _r_raw_assignment_replacements(lookahead_text)
@@ -2897,15 +3349,20 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
             bounded_text,
             [(start, min(end, limit)) for start, end in raw_replacements if start < limit],
         )
-    bounded_redacted = _redact_evidence_content(bounded_text, url_depth=_url_depth)
-    if len(text) <= limit:
-        return _truncate(bounded_redacted, limit)
+    bounded_redacted = _redact_evidence_content(
+        bounded_text,
+        url_depth=_url_depth,
+        decode_percent=_decode_percent,
+    )
+    if not source_exceeds_limit:
+        return finalize(_truncate(bounded_redacted, limit))
     if bounded_redacted == REDACTED_EVIDENCE_VALUE:
-        return _truncate(REDACTED_EVIDENCE_VALUE, limit)
+        return finalize(_truncate(REDACTED_EVIDENCE_VALUE, limit))
 
     lookahead_redacted = _redact_evidence_content(
         lookahead_text,
         url_depth=_url_depth,
+        decode_percent=_decode_percent,
     )
     common_length = 0
     for bounded_character, lookahead_character in zip(bounded_redacted, lookahead_redacted, strict=False):
@@ -2915,7 +3372,7 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
     safe_redacted_prefix = lookahead_redacted[:common_length]
 
     if safe_redacted_prefix == REDACTED_EVIDENCE_VALUE:
-        return _truncate(REDACTED_EVIDENCE_VALUE, limit)
+        return finalize(_truncate(REDACTED_EVIDENCE_VALUE, limit))
     if (
         REDACTED_EVIDENCE_VALUE in lookahead_redacted
         and REDACTED_EVIDENCE_VALUE not in safe_redacted_prefix
@@ -2924,8 +3381,8 @@ def redact_evidence_string(text: str, max_chars: int | None = 180, *, _url_depth
         safe_redacted_prefix = f"{safe_redacted_prefix}{REDACTED_EVIDENCE_VALUE}"
 
     if max_chars <= 3:
-        return safe_redacted_prefix[:limit]
-    return f"{safe_redacted_prefix[: max_chars - 3]}..."
+        return finalize(safe_redacted_prefix[:limit])
+    return finalize(f"{safe_redacted_prefix[: max_chars - 3]}...")
 
 
 def _strip_bracket_suffixes(key: str) -> str:
@@ -2949,6 +3406,19 @@ def _is_sensitive_detail_key(key: str) -> bool:
             or canonical.endswith(f"{suffix}values")
             for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES
         )
+    )
+
+
+def is_sensitive_evidence_key(key: str) -> bool:
+    """Return whether a field name identifies a credential-bearing value."""
+    if len(key) > MAX_SENSITIVE_EVIDENCE_KEY_CHARS:
+        return True
+    normalized = unicodedata.normalize("NFKC", _strip_bracket_suffixes(key)).casefold()
+    normalized_container = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return (
+        _is_sensitive_detail_key(normalized)
+        or re.fullmatch(SENSITIVE_CONTAINER_KEY, normalized) is not None
+        or SENSITIVE_EVIDENCE_CONTAINER_KEY_RE.fullmatch(normalized_container) is not None
     )
 
 

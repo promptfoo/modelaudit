@@ -5,13 +5,16 @@ duplicate caching logic between core.py and scanners/base.py.
 """
 
 import functools
+import io
 import logging
 import os
 import time
+import zipfile
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 from ...cache.optimized_config import get_config_extractor
+from ..file.hdf5 import find_hdf5_signature_offset
 
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
@@ -78,6 +81,85 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
         or _is_read_failure_aware_content_route(file_path)
         or _is_read_failure_aware_scanner_path(file_path)
     )
+
+
+def _h5py_availability() -> bool:
+    """Return whether Keras HDF5 analysis is available in this process."""
+    try:
+        from ...scanners.keras_h5_scanner import HAS_H5PY
+    except Exception:
+        return False
+
+    return HAS_H5PY
+
+
+def add_optional_dependency_availability_to_version_context(version_context: dict[str, Any]) -> dict[str, Any]:
+    """Key caches on optional dependencies that change scan coverage."""
+    return {
+        **version_context,
+        "optional_dependency_availability": {"h5py": _h5py_availability()},
+    }
+
+
+def _hdf5_h5py_availability(file_path: str) -> bool | None:
+    """Return h5py availability for validated HDF5 files."""
+    if find_hdf5_signature_offset(file_path) is None:
+        return None
+    return _h5py_availability()
+
+
+def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
+    """Bypass stale HDF5 cache entries when Keras H5 analysis is unavailable."""
+    return _hdf5_h5py_availability(file_path) is False
+
+
+def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
+    """Bypass HDF5 caches when the owning scanner cannot currently open the file."""
+    is_hdf5 = find_hdf5_signature_offset(file_path) is not None
+    has_embedded_keras_hdf5 = _has_embedded_keras_hdf5_weights(file_path)
+    if not is_hdf5 and not has_embedded_keras_hdf5:
+        return False
+    if not _h5py_runtime_available():
+        return True
+    if has_embedded_keras_hdf5:
+        return False
+
+    try:
+        from ...scanners.keras_h5_scanner import KerasH5Scanner
+
+        return not KerasH5Scanner.can_handle(file_path)
+    except Exception:
+        return True
+
+
+def _h5py_runtime_available() -> bool:
+    """Return whether h5py can create and close an in-memory HDF5 file."""
+    if not _h5py_availability():
+        return False
+    try:
+        from ...scanners.keras_h5_scanner import h5py
+
+        with h5py.File(io.BytesIO(), "w"):
+            pass
+    except Exception:
+        return False
+    return True
+
+
+def _has_embedded_keras_hdf5_weights(file_path: str) -> bool:
+    """Return whether a Keras ZIP contains its standard HDF5 weights member."""
+    try:
+        from ..file.detection import _normalize_archive_member_name
+
+        with zipfile.ZipFile(file_path) as archive:
+            member_names = {
+                _normalize_archive_member_name(info.filename)
+                for info in archive.infolist()
+                if info.filename and not info.is_dir()
+            }
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return "config.json" in member_names and "model.weights.h5" in member_names
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
@@ -185,6 +267,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
                     return func(*args, **kwargs)
 
+                if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+                    logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
+                    return func(*args, **kwargs)
+
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
                     return func(*args, **kwargs)
@@ -208,7 +294,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
-                version_context = cache_config.get_version_context()
+                if cache_manager.cache is None:
+                    return func(*args, **kwargs)
+                version_context = add_optional_dependency_availability_to_version_context(
+                    cache_config.get_version_context()
+                )
 
                 def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""
@@ -233,36 +323,51 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 # Use optimized cache lookup with stat reuse
                 logger.debug(f"Attempting cached scan for {file_path}")
 
-                # Try cache first with optimized lookup
-                cached_result = cache_manager.get_cached_result_with_stat(
-                    file_path,
-                    file_stat,
-                    version_context=version_context,
-                )
+                pre_scan_identity = None
+                try:
+                    cached_result, pre_scan_identity = cache_manager.get_cached_result_with_identity(
+                        file_path,
+                        version_context=version_context,
+                    )
 
-                if cached_result is not None:
-                    logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-                    result_dict = cached_result
-                else:
-                    # Cache miss - perform scan
-                    logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
-                    scan_start = time.perf_counter()
-                    result_dict = cached_func_wrapper(file_path)
-                    if not isinstance(result_dict, dict):
-                        logger.debug(
-                            f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
-                        )
-                        return result_dict
-                    if should_cache_scan_result(result_dict):
-                        scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
-                        cache_manager.store_result(
-                            file_path,
-                            result_dict,
-                            scan_duration_ms,
-                            version_context=version_context,
-                        )
+                    if cached_result is not None:
+                        logger.debug(f"Cache hit for {os.path.basename(file_path)}")
+                        result_dict = cached_result
                     else:
-                        logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
+                        # Cache miss - perform scan
+                        logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
+                        if pre_scan_identity is None:
+                            logger.debug(f"Bypassing cache store for {file_path}: stable identity unavailable")
+                            return func(*args, **kwargs)
+                        pre_scan_stat, pre_scan_hash, pre_scan_change_token, pre_scan_ancestor_identity = (
+                            pre_scan_identity
+                        )
+                        scan_start = time.perf_counter()
+                        result_dict = cached_func_wrapper(file_path)
+                        if not isinstance(result_dict, dict):
+                            logger.debug(
+                                f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
+                            )
+                            return result_dict
+                        if should_cache_scan_result(result_dict):
+                            scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
+                            cache_manager.store_result(
+                                file_path,
+                                result_dict,
+                                scan_duration_ms,
+                                version_context=version_context,
+                                expected_file_stat=pre_scan_stat,
+                                expected_file_hash=pre_scan_hash,
+                                expected_change_token=pre_scan_change_token,
+                                expected_ancestor_identity=pre_scan_ancestor_identity,
+                            )
+                        else:
+                            logger.debug(
+                                f"Skipping cache store for operational result from {os.path.basename(file_path)}"
+                            )
+                finally:
+                    if pre_scan_identity is not None:
+                        cache_manager.cache.release_ancestor_identity(pre_scan_identity[-1])
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:

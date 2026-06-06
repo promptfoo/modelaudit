@@ -8,19 +8,33 @@ from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import _is_torch7_signature as is_torch7_signature
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, is_sensitive_evidence_key, redact_evidence_string
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 TORCH7_SIGNATURE_READ_BYTES = 4096
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 5000
+PRINTABLE_TEXT_OVERLAP_CHARS = 64
 MIN_TORCH7_SIZE = 8
 CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
-EXEC_PRIMITIVE_CALL_PATTERN = re.compile(
-    r"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
+EXEC_PRIMITIVE_NAME_PATTERN = (
+    r"(?:os\s*(?:\.\s*execute|\[\s*['\"]execute['\"]\s*\])|"
+    r"io\s*(?:\.\s*popen|\[\s*['\"]popen['\"]\s*\])|"
+    r"loadstring|dofile|loadfile|setfenv|getfenv)"
+)
+EXEC_PRIMITIVE_CALL_PATTERN = re.compile(rf"(?i)(?:\(\s*)*\b{EXEC_PRIMITIVE_NAME_PATTERN}\s*(?:\)\s*)*\(")
+EXECUTION_ASSIGNMENT_TARGET_PATTERN = re.compile(
+    r"(?i)(?P<target>\b(?:local\s+)?[a-z_][\w.]*(?:\s*\[[^\]\n]{1,120}\])*\s*=\s*)"
+)
+EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN = re.compile(
+    r"(?is)^(?:(?:[a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(\s*|\(\s*)*(?:function\s*\(\s*\)\s*return\s*)?$"
+)
+COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN = re.compile(
+    r"(?is)^\s*(?P<value>.+)\s*(?P<operator>(?<!\w)(?:or|and)(?!\w)|\.\.)\s*(?P<wrapper>.*)$"
 )
 NETWORK_OR_SHELL_PATTERN = re.compile(
     r"(?i)\b("
@@ -209,13 +223,95 @@ class Torch7Scanner(BaseScanner):
             payload,
             PRINTABLE_TEXT_PATTERN,
             self.max_extracted_strings,
+            overlap_chars=PRINTABLE_TEXT_OVERLAP_CHARS,
         )
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 3] + "..."
+        protected_targets: list[str] = []
+        protected_parts: list[str] = []
+        placeholder_prefix = "__MODELAUDIT_TORCH7_TARGET_"
+        while placeholder_prefix in text:
+            placeholder_prefix = f"_{placeholder_prefix}"
+        cursor = 0
+
+        for match in EXECUTION_ASSIGNMENT_TARGET_PATTERN.finditer(text):
+            if match.start() < cursor:
+                continue
+            statement_end = Torch7Scanner._statement_end(text, match.end())
+            execution_match = EXEC_PRIMITIVE_CALL_PATTERN.search(text, match.end(), statement_end)
+            if execution_match is None:
+                continue
+
+            value_prefix = text[match.end() : execution_match.start()]
+            leading_execution_parentheses = re.match(r"(?:\(\s*)*", execution_match.group(0))
+            wrapper_prefix = value_prefix + (
+                leading_execution_parentheses.group(0) if leading_execution_parentheses is not None else ""
+            )
+            replacement_end = match.end()
+            replacement_suffix = ""
+            if EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN.fullmatch(wrapper_prefix) is None:
+                compound_match = COMPOUND_EXECUTION_VALUE_PREFIX_PATTERN.fullmatch(value_prefix)
+                target_name = match.group("target").rsplit("=", 1)[0].strip()
+                if target_name.lower().startswith("local "):
+                    target_name = target_name[6:].strip()
+                compound_wrapper = (
+                    compound_match.group("wrapper") + leading_execution_parentheses.group(0)
+                    if compound_match is not None and leading_execution_parentheses is not None
+                    else ""
+                )
+                if (
+                    compound_match is None
+                    or not is_sensitive_evidence_key(target_name)
+                    or EXECUTION_VALUE_WRAPPER_PREFIX_PATTERN.fullmatch(compound_wrapper) is None
+                ):
+                    continue
+                replacement_end = execution_match.start()
+                replacement_suffix = (
+                    f"{REDACTED_EVIDENCE_VALUE} {compound_match.group('operator').lower()} "
+                    f"{compound_match.group('wrapper')}"
+                )
+
+            protected_parts.append(text[cursor : match.start()])
+            protected_targets.append(redact_evidence_string(match.group("target"), max_chars=None))
+            protected_parts.append(f"{placeholder_prefix}{len(protected_targets) - 1}__{replacement_suffix}")
+            cursor = replacement_end
+
+        protected_parts.append(text[cursor:])
+        protected = "".join(protected_parts)
+        redacted = redact_evidence_string(protected, max_chars=None)
+        for index, target in enumerate(protected_targets):
+            redacted = redacted.replace(f"{placeholder_prefix}{index}__", target)
+        if len(redacted) <= max_chars:
+            return redacted
+        if max_chars <= 3:
+            return redacted[:max_chars]
+        return f"{redacted[: max_chars - 3]}..."
+
+    @staticmethod
+    def _statement_end(text: str, start: int) -> int:
+        quote: str | None = None
+        escaped = False
+        depth = 0
+        for index in range(start, len(text)):
+            character = text[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+            elif character in "([{":
+                depth += 1
+            elif character in ")]}" and depth > 0:
+                depth -= 1
+            elif character in ";\r\n" and depth == 0:
+                return index
+        return len(text)
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []
