@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+import zipfile
 from collections.abc import Iterator
 from importlib.abc import MetaPathFinder
 from importlib.machinery import (
@@ -20,6 +21,7 @@ from importlib.machinery import (
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from zipimport import zipimporter
 
 import pytest
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
@@ -1406,6 +1408,79 @@ def test_import_hook_identity_tracks_bound_method_state() -> None:
     assert _picklescan_import_hook_identity(hook.find_spec) != picklescan_identity
 
 
+def test_scan_cache_rejects_file_finder_subclass_importer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = str(tmp_path / "custom-import-root")
+    Path(path_entry).mkdir()
+
+    class StatefulFileFinder(FileFinder):
+        def __init__(self, path: str, state: str) -> None:
+            super().__init__(path, (SourceFileLoader, SOURCE_SUFFIXES))
+            self.state = state
+
+    finder = StatefulFileFinder(path_entry, "safe")
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprint_metadata = _call_graph_fingerprint_metadata()
+    assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+    finder.state = "malicious"
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_rejects_custom_file_finder_loader_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path_entry = str(tmp_path / "custom-loader-root")
+    Path(path_entry).mkdir()
+
+    class SafeLoader(SourceFileLoader):
+        pass
+
+    class MaliciousLoader(SourceFileLoader):
+        pass
+
+    finder = FileFinder(path_entry, (SafeLoader, SOURCE_SUFFIXES))
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprint_metadata = _call_graph_fingerprint_metadata()
+    assert any(path_entry in identity for identity in fingerprint_metadata["resolution_context"]["path_importers"])
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "_private_metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
+    }
+
+    assert cache.store_result(
+        str(file_path), scan_result, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+
+    object.__getattribute__(finder, "__dict__")["_loaders"] = [(suffix, MaliciousLoader) for suffix in SOURCE_SUFFIXES]
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 @pytest.mark.parametrize("descriptor_kind", ["classmethod", "staticmethod"])
 def test_import_hook_identity_includes_descriptor_method_code(descriptor_kind: str) -> None:
     def original_find_spec(*_args: object) -> None:
@@ -1433,6 +1508,28 @@ def test_cache_resolution_context_matches_picklescan_metadata() -> None:
         "path_hooks": list(path_hooks),
         "path_importers": list(path_importers),
     }
+
+
+def test_resolution_context_rejects_mutated_zipimporter_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "modules.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("sample.py", "value = 1\n")
+
+    path_entry = str(archive_path)
+    finder = zipimporter(path_entry)
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+
+    assert not _source_resolution_context()["path_importers"]
+    assert not _picklescan_source_resolution_context()[2]
+
+    object.__getattribute__(finder, "__dict__")["archive"] = str(tmp_path / "other.zip")
+
+    assert any(path_entry in identity for identity in _source_resolution_context()["path_importers"])
+    assert any(path_entry in identity for identity in _picklescan_source_resolution_context()[2])
 
 
 def test_cache_module_validation_does_not_execute_custom_path_hooks(

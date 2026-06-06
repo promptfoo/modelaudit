@@ -14,7 +14,16 @@ import time
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
-from importlib.machinery import BYTECODE_SUFFIXES, EXTENSION_SUFFIXES, SOURCE_SUFFIXES, FileFinder, ModuleSpec
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    ExtensionFileLoader,
+    FileFinder,
+    ModuleSpec,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 from pathlib import Path
 from types import FunctionType, MethodType, ModuleType
 from typing import Any, BinaryIO
@@ -39,6 +48,22 @@ _UNREUSABLE_HOOK_STATE_IDENTITY = "<unreusable-hook-state>"
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
 _TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
+_STANDARD_FILE_FINDER_LOADERS = tuple(
+    (suffix, loader)
+    for loader, suffixes in (
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    for suffix in suffixes
+)
+_TRUSTED_FILE_FINDER_METHODS = tuple(
+    (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
+)
+_TRUSTED_ZIPIMPORTER_METHODS = tuple(
+    (name, getattr(zipimporter, name))
+    for name in ("__init__", "find_spec", "get_code", "get_data", "get_filename", "get_source", "is_package")
+)
 
 AncestorEntry = tuple[str, int, int, int, int, int]
 _DARWIN_STABLE_SYMLINK_ALIASES = {
@@ -367,12 +392,55 @@ def _meta_path_finder_resolution_identity(finder: object) -> str:
     return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
 
 
+def _path_importer_methods_are_trusted(
+    importer_type: type[object],
+    trusted_methods: tuple[tuple[str, object], ...],
+) -> bool:
+    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
+
+
+def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
+    try:
+        instance_state = object.__getattribute__(finder, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    if not isinstance(instance_state, dict):
+        return False
+    if type(finder) is zipimporter:
+        if not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+            return False
+        try:
+            expected_state = object.__getattribute__(zipimporter(cache_key), "__dict__")
+        except (AttributeError, ImportError, OSError, TypeError):
+            return False
+        return (
+            isinstance(expected_state, dict)
+            and set(instance_state) == set(expected_state)
+            and instance_state.get("archive") == expected_state.get("archive")
+            and instance_state.get("prefix") == expected_state.get("prefix")
+            and instance_state.get("_files") is expected_state.get("_files")
+        )
+    if type(finder) is not FileFinder:
+        return False
+    if not _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+        return False
+    finder_path = instance_state.get("path")
+    loaders = instance_state.get("_loaders")
+    return (
+        set(instance_state) <= {"_loaders", "path", "_path_mtime", "_path_cache", "_relaxed_path_cache"}
+        and isinstance(finder_path, str)
+        and os.path.abspath(finder_path) == os.path.abspath(cache_key)
+        and isinstance(loaders, list)
+        and tuple(loaders) == _STANDARD_FILE_FINDER_LOADERS
+    )
+
+
 def _source_resolution_context() -> dict[str, list[str]]:
     nonstandard_importers = []
     for entry in sys.path:
         cache_key = entry or os.getcwd()
         finder = sys.path_importer_cache.get(cache_key)
-        if finder is None or isinstance(finder, (FileFinder, zipimporter)):
+        if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
             continue
         nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
     return {

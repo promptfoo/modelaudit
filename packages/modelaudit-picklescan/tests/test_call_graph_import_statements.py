@@ -13,10 +13,18 @@ import sys
 import threading
 import zipfile
 from contextvars import copy_context
-from importlib.machinery import EXTENSION_SUFFIXES, FrozenImporter, ModuleSpec
+from importlib.machinery import (
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    FileFinder,
+    FrozenImporter,
+    ModuleSpec,
+    SourceFileLoader,
+)
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
+from zipimport import zipimporter
 
 import pytest
 
@@ -2531,6 +2539,115 @@ def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoki
         report = scan_bytes(
             _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
             source="path-entry-spec-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_treats_file_finder_subclass_as_untrusted_without_invoking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_file_finder_subclass"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def invoke(value):\n    return value\n", encoding="utf-8")
+    marker = tmp_path / "file_finder_subclass_called"
+
+    class CustomFileFinder(FileFinder):
+        def find_spec(self, fullname: str, target: object | None = None) -> ModuleSpec | None:
+            del target
+            marker.write_text(fullname, encoding="utf-8")
+            return super().find_spec(fullname)
+
+    path_entry = str(tmp_path)
+    finder = CustomFileFinder(path_entry, (SourceFileLoader, SOURCE_SUFFIXES))
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="file-finder-subclass-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_treats_custom_file_finder_loader_as_untrusted_without_invoking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_custom_file_finder_loader"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text("def invoke(value):\n    return value\n", encoding="utf-8")
+    marker = tmp_path / "custom_file_finder_loader_called"
+
+    class CustomLoader(SourceFileLoader):
+        def __init__(self, fullname: str, path: str) -> None:
+            marker.write_text(f"{fullname}:{path}", encoding="utf-8")
+            super().__init__(fullname, path)
+
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, (CustomLoader, SOURCE_SUFFIXES))
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="custom-file-finder-loader-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_treats_shadowed_zipimporter_as_untrusted_without_invoking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_shadowed_zipimporter"
+    archive_path = tmp_path / "modules.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(f"{module_name}.py", "def invoke(value):\n    return value\n")
+    marker = tmp_path / "shadowed_zipimporter_called"
+
+    finder = zipimporter(str(archive_path))
+    original_find_spec = finder.find_spec
+
+    def shadowed_find_spec(fullname: str, target: Any = None) -> ModuleSpec | None:
+        marker.write_text(fullname, encoding="utf-8")
+        return original_find_spec(fullname, target)
+
+    object.__getattribute__(finder, "__dict__")["find_spec"] = shadowed_find_spec
+    path_entry = str(archive_path)
+    monkeypatch.setattr(sys, "path", [path_entry, *sys.path])
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, finder)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="shadowed-zipimporter-call-graph-source.pkl",
         )
     finally:
         _clear_call_graph_caches()
