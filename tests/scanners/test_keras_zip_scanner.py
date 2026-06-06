@@ -26,13 +26,11 @@ from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils as keras_utils_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.keras_zip_scanner import (
-    _HDF5_SIGNATURE_SCAN_MAX_BYTES,
-    KerasZipScanner,
-    _has_get_file_reference,
-)
+from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, hdf5_metadata_checksum
+from modelaudit.utils.helpers import cache_decorator as cache_decorator_module
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 try:
@@ -229,7 +227,7 @@ def _embed_plausible_hdf5_superblock(payload: bytes, signature_offset: int) -> b
     superblock.extend(b"\xff" * 8)
     superblock.extend(len(output).to_bytes(8, "little"))
     superblock.extend((signature_offset + 48).to_bytes(8, "little"))
-    superblock.extend(b"\x00" * 4)
+    superblock.extend(hdf5_metadata_checksum(bytes(superblock)).to_bytes(4, "little"))
     output[signature_offset : signature_offset + len(superblock)] = superblock
     output[signature_offset + len(superblock) : signature_offset + len(superblock) + 4] = b"OHDR"
     return bytes(output)
@@ -977,6 +975,59 @@ class TestKerasZipScanner:
 
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
+    def test_embedded_hdf5_cache_bypass_depends_on_runtime_h5py(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        keras_path = tmp_path / "embedded-weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", "{}")
+            archive.writestr("model.weights.h5", b"placeholder")
+
+        monkeypatch.setattr(cache_decorator_module, "_h5py_runtime_available", lambda: True)
+        assert cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis(str(keras_path)) is False
+
+        monkeypatch.setattr(cache_decorator_module, "_h5py_runtime_available", lambda: False)
+        assert cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis(str(keras_path)) is True
+
+    def test_embedded_hdf5_weights_use_cache_when_h5py_is_available(self, tmp_path: Path) -> None:
+        """Fully analyzed embedded HDF5 weights should retain normal cache behavior."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+        cache_dir = tmp_path / "embedded-hdf5-cache"
+
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(first) == 0
+
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            first_stats = cache_manager.get_stats()
+            assert first_stats["total_entries"] > 0
+
+            second = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(second) == 0
+
+            second_stats = cache_manager.get_stats()
+            assert second_stats["total_entries"] == first_stats["total_entries"]
+            assert second_stats["cache_hits"] > first_stats["cache_hits"]
+        finally:
+            reset_cache_manager()
+
     def test_embedded_weights_missing_h5py_returns_exit2_and_skips_cache(
         self,
         tmp_path: Path,
@@ -1033,6 +1084,167 @@ class TestKerasZipScanner:
                 )
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_embedded_weights_missing_h5py_invalidates_stale_cache_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A clean cached Keras ZIP must not hide newly unavailable HDF5 analysis."""
+        reason = "keras_zip_embedded_weights_h5py_unavailable"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+        cache_dir = tmp_path / "stale-missing-h5py-cache"
+
+        reset_cache_manager()
+        try:
+            original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                lambda _path: False,
+            )
+            first_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(first_result) == 0
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                original_bypass,
+            )
+
+            monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+            monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+            second_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = second_result.file_metadata[str(keras_path)]
+
+            assert determine_exit_code(second_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+        finally:
+            reset_cache_manager()
+
+    def test_embedded_weights_runtime_h5py_failure_bypasses_stale_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+        cache_dir = tmp_path / "runtime-h5py-failure-cache"
+
+        reset_cache_manager()
+        try:
+            original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                lambda _path: False,
+            )
+            clean_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(clean_result) == 0
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            cached_entries = cache_manager.get_stats()["total_entries"]
+            assert cached_entries > 0
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                original_bypass,
+            )
+
+            def fail_h5py_open(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("simulated h5py runtime failure")
+
+            monkeypatch.setattr(keras_zip_scanner_module.h5py, "File", fail_h5py_open)
+
+            failed_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = failed_result.file_metadata[str(keras_path)]
+
+            assert determine_exit_code(failed_result) == 2
+            assert "keras_zip_scan_failed" in metadata["scan_outcome_reasons"]
+            assert cache_manager.get_stats()["total_entries"] == cached_entries
+        finally:
+            reset_cache_manager()
+
+    def test_normalized_embedded_weights_bypass_stale_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        weights_path = create_regular_weights_h5(tmp_path)
+        keras_path = tmp_path / "normalized-members.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("./config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("./metadata.json", json.dumps({"keras_version": "3.13.2"}))
+            archive.write(weights_path, "./model.weights.h5")
+        cache_dir = tmp_path / "normalized-members-cache"
+
+        reset_cache_manager()
+        try:
+            original_bypass = cache_decorator_module.should_bypass_cache_for_unavailable_hdf5_analysis
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                lambda _path: False,
+            )
+            clean_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert determine_exit_code(clean_result) == 0
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+            monkeypatch.setattr(
+                cache_decorator_module,
+                "should_bypass_cache_for_unavailable_hdf5_analysis",
+                original_bypass,
+            )
+
+            def fail_h5py_open(*_args: Any, **_kwargs: Any) -> None:
+                raise RuntimeError("simulated normalized-member h5py failure")
+
+            monkeypatch.setattr(keras_zip_scanner_module.h5py, "File", fail_h5py_open)
+
+            failed_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = failed_result.file_metadata[str(keras_path)]
+
+            assert determine_exit_code(failed_result) == 2
+            assert "keras_zip_scan_failed" in metadata["scan_outcome_reasons"]
         finally:
             reset_cache_manager()
 
@@ -1107,6 +1319,10 @@ class TestKerasZipScanner:
         result = KerasZipScanner().scan(str(keras_path))
 
         assert "keras_zip_embedded_weights_h5py_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        assert "keras_h5_h5py_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not any(
+            check.name in {"Embedded Weights H5PY Library Check", "H5PY Library Check"} for check in result.checks
+        )
         python_op_findings = [issue for issue in result.issues if issue.details.get("op_type") == "PythonOp"]
         assert bool(python_op_findings) is malicious
         assert (
@@ -1443,7 +1659,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Missing h5py must fail closed when a bounded probe cannot rule out a large HDF5 user block."""
         hdf5_signature_offset = 16 * 1024 * 1024
-        assert hdf5_signature_offset > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        assert hdf5_signature_offset > HDF5_SIGNATURE_SCAN_MAX_BYTES
         weights_payload = bytearray(hdf5_signature_offset + 8)
         weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
         keras_path = tmp_path / "oversized_userblock.keras"
@@ -1464,7 +1680,7 @@ class TestKerasZipScanner:
         assert any(
             check.name == "Embedded Weights HDF5 Signature Probe"
             and check.status == CheckStatus.FAILED
-            and check.details["hdf5_signature_probe_max_bytes"] == _HDF5_SIGNATURE_SCAN_MAX_BYTES
+            and check.details["hdf5_signature_probe_max_bytes"] == HDF5_SIGNATURE_SCAN_MAX_BYTES
             and check.details["scan_outcome_reason"] == reason
             for check in result.checks
         )
@@ -1478,7 +1694,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Probe-incomplete weights must still report generic pickle findings before failing closed."""
         pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
-        payload_size = _HDF5_SIGNATURE_SCAN_MAX_BYTES + 1
+        payload_size = (16 * 1024 * 1024) + 8
         weights_payload = pickle_payload + bytes(payload_size - len(pickle_payload))
         keras_path = tmp_path / "oversized_disguised_pickle.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
@@ -1514,9 +1730,9 @@ class TestKerasZipScanner:
         nested_zip_path = tmp_path / "disguised_weights.zip"
         with zipfile.ZipFile(nested_zip_path, "w") as nested_zip:
             nested_zip.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
-            nested_zip.writestr("padding.bin", bytes(_HDF5_SIGNATURE_SCAN_MAX_BYTES))
+            nested_zip.writestr("padding.bin", bytes(16 * 1024 * 1024))
 
-        assert nested_zip_path.stat().st_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        assert nested_zip_path.stat().st_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
         keras_path = tmp_path / "oversized_disguised_zip.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
@@ -1537,6 +1753,30 @@ class TestKerasZipScanner:
             and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
             for issue in result.issues
         )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+    def test_non_hdf5_weights_before_next_legal_signature_offset_avoid_hdf5_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A size above the byte cap must not fail HDF5 checks when every legal offset was probed."""
+        weights_payload = bytes(HDF5_SIGNATURE_SCAN_MAX_BYTES + 1)
+        keras_path = tmp_path / "large_non_hdf5_weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", weights_payload)
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+        result = KerasZipScanner(config={"scanners": ["keras_zip"]}).scan(str(keras_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert not any(check.name == "Embedded Weights HDF5 Signature Probe" for check in result.checks)
+        assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
@@ -1581,6 +1821,7 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
         assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     @pytest.mark.parametrize(
         ("config", "reason", "expected_check_name"),

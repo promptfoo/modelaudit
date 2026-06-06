@@ -5,6 +5,8 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
 """
 
+import hashlib
+import json
 import logging
 import mmap
 import os
@@ -18,7 +20,11 @@ from contextvars import copy_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+from ..helpers.cache_decorator import (
+    add_optional_dependency_availability_to_version_context,
+    should_bypass_cache_for_safetensors_header_limit,
+    should_bypass_cache_for_unavailable_hdf5_analysis,
+)
 from ..sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _trusted_hf_blobs_root
 
 if TYPE_CHECKING:
@@ -1309,17 +1315,14 @@ def scan_advanced_large_file(
         logger.debug(f"Bypassing advanced-file cache for bounded SafeTensors header failure: {file_path}")
         return scanner.scan(file_path)  # type: ignore[no-any-return]
 
-    # A representative-file cache key cannot safely describe sibling shard
-    # targets, identities, or coverage changes. Re-evaluate sharded families on
-    # every scan so retargeted aliases and missing members fail closed.
-    if (
-        ShardedModelDetector.detect_shards(
-            file_path,
-            allowed_paths=allowed_shard_paths,
-            allowed_targets=allowed_shard_targets,
-        )
-        is not None
-    ):
+    shard_info = ShardedModelDetector.detect_shards(
+        file_path,
+        allowed_paths=allowed_shard_paths,
+        allowed_targets=allowed_shard_targets,
+    )
+
+    # If caching is disabled, proceed with direct scan
+    if not cache_enabled:
         return _scan_advanced_large_file_internal(
             file_path,
             scanner,
@@ -1328,9 +1331,8 @@ def scan_advanced_large_file(
             allowed_shard_paths=allowed_shard_paths,
             allowed_shard_targets=allowed_shard_targets,
         )
-
-    # If caching is disabled, proceed with direct scan
-    if not cache_enabled:
+    if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
+        logger.debug(f"Bypassing advanced-file cache because HDF5 analysis is unavailable: {file_path}")
         return _scan_advanced_large_file_internal(
             file_path,
             scanner,
@@ -1347,12 +1349,19 @@ def scan_advanced_large_file(
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
         version_config = dict(config)
+        if shard_info is not None:
+            serialized_shard_info = json.dumps(shard_info, sort_keys=True, separators=(",", ":"), default=str)
+            version_config["advanced_shard_family_fingerprint"] = hashlib.sha256(
+                serialized_shard_info.encode("utf-8")
+            ).hexdigest()
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
             version_config["advanced_allowed_shard_paths"] = sorted(
                 {str(Path(path).resolve()) for path in allowed_shard_paths}
             )
-        version_context = build_cache_version_context(version_config)
+        version_context = add_optional_dependency_availability_to_version_context(
+            build_cache_version_context(version_config)
+        )
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:

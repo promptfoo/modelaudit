@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.cache.cache_manager import reset_cache_manager
+from modelaudit.cache.cache_manager import get_cache_manager, reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
@@ -1108,6 +1108,8 @@ class TestAdvancedFileHandler:
         reset_cache_manager()
         try:
             first = scan_advanced_large_file(str(shard_one), scanner)
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            cached_entries = cache_manager.get_stats()["total_entries"]
             shard_two.unlink()
             shard_two.symlink_to(outside_target)
             second = scan_advanced_large_file(str(shard_one), scanner)
@@ -1115,8 +1117,10 @@ class TestAdvancedFileHandler:
             reset_cache_manager()
 
         assert first.success is True
+        assert cached_entries > 0
         assert second.success is False
         assert "out_of_scope_model_shards" in second.metadata["scan_outcome_reasons"]
+        assert cache_manager.get_stats()["total_entries"] == cached_entries
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
