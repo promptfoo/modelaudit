@@ -8,7 +8,7 @@ from fsspec.implementations.local import LocalFileSystem
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import streaming
-from modelaudit.utils.file._streaming_read_cap import STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+from modelaudit.utils.file.streaming import STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
 
 
 class HeaderOnlyScanner(BaseScanner):
@@ -17,6 +17,20 @@ class HeaderOnlyScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         del path
         raise RuntimeError("full scan is not available for streaming fallback")
+
+
+class RecordingStreamScanner(HeaderOnlyScanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_size: int | None = None
+
+    def scan_stream(self, file_obj: object, size: int, source: str = "<stream>") -> ScanResult:
+        del file_obj, source
+        self.seen_size = size
+        result = ScanResult(scanner_name=self.name)
+        result.bytes_scanned = size
+        result.finish(success=True)
+        return result
 
 
 class _FakeLargeRemoteFile:
@@ -90,10 +104,10 @@ def test_stream_analyze_file_default_read_is_bounded_for_large_remote(
     assert analysis_complete is False
     assert result is not None
     assert result.issues == []
-    assert result.bytes_scanned == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.bytes_scanned == len(payload)
     assert result.success is False
     assert result.metadata["max_bytes"] == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
-    assert result.metadata["bytes_analyzed"] == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.metadata["bytes_analyzed"] == len(payload)
     assert result.metadata["bytes_complete"] is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
@@ -123,6 +137,31 @@ def test_stream_analyze_file_bounded_large_remote_still_reports_header_payload(
     assert result.metadata["scan_outcome"] == "inconclusive"
 
 
+def test_stream_analyze_file_passes_actual_short_read_size_to_scanner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"short-read"
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
+        payload=payload,
+        read_sizes=read_sizes,
+    )
+    scanner = RecordingStreamScanner()
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file("s3://bucket/large.pkl", scanner)
+
+    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert scanner.seen_size == len(payload)
+    assert analysis_complete is False
+    assert result is not None
+    assert result.bytes_scanned == len(payload)
+    assert result.metadata["bytes_analyzed"] == len(payload)
+
+
 def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,6 +188,27 @@ def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
     assert result.metadata["bytes_analyzed"] == 4
     assert result.metadata["bytes_complete"] is False
     assert result.metadata["scan_outcome"] == "inconclusive"
+
+
+def test_stream_analyze_file_prefers_streaming_specific_config_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/large.joblib",
+        HeaderOnlyScanner(config={"max_file_size": 8, "streaming_max_bytes": 3}),
+    )
+
+    assert read_sizes == [3]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.bytes_scanned == 3
+    assert result.metadata["max_bytes"] == 3
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

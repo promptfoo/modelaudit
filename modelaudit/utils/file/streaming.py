@@ -16,6 +16,21 @@ from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud
 from .detection import _has_zip_magic
 
 _MAX_STREAM_SOURCE_PATH_DECODE_PASSES = 4
+STREAMING_ANALYSIS_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+
+
+def resolve_streaming_max_bytes(max_bytes: object = None) -> int:
+    """Return a bounded positive streaming-analysis read limit."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        return STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    return max_bytes
+
+
+def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner") -> object:
+    configured_stream_max = scanner.config.get("streaming_max_bytes")
+    if configured_stream_max is not None:
+        return configured_stream_max
+    return scanner.config.get("max_file_size")
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
@@ -90,7 +105,7 @@ def _mark_streaming_analysis_incomplete(result: "ScanResult", *, header_only_fal
 def stream_analyze_file(
     url: str,
     scanner: "BaseScanner",
-    max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
+    max_bytes: int | None = None,
 ) -> tuple["ScanResult | None", bool]:
     from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 
@@ -126,13 +141,19 @@ def stream_analyze_file(
         if file_size == 0:
             return None, True
 
-        # Determine how much to read
-        bytes_to_read = min(file_size, max_bytes)
-        bytes_complete = bytes_to_read >= file_size
+        configured_max_bytes: object = max_bytes
+        if configured_max_bytes is None:
+            configured_max_bytes = _streaming_max_bytes_from_scanner_config(scanner)
+        resolved_max_bytes = resolve_streaming_max_bytes(configured_max_bytes)
+
+        # Determine how much to request from the remote object.
+        bytes_to_read = min(file_size, resolved_max_bytes)
 
         # Read partial content
         with fs.open(url, "rb") as f:
             content = f.read(bytes_to_read)
+        bytes_read = len(content)
+        bytes_complete = bytes_read >= file_size
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)
@@ -163,9 +184,9 @@ def stream_analyze_file(
                         temp_file.seek(0)
                         if method_name == "scan_stream" and needs_size:
                             if _scan_stream_accepts_source_keyword(method):
-                                scan_result = method(temp_file, bytes_to_read, source=url)
+                                scan_result = method(temp_file, bytes_read, source=url)
                             else:
-                                scan_result = method(temp_file, bytes_to_read)
+                                scan_result = method(temp_file, bytes_read)
                         else:
                             scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
                         break
@@ -213,7 +234,7 @@ def stream_analyze_file(
                             details={
                                 "pattern": pattern.decode("utf-8", errors="ignore"),
                                 "detection_method": "streaming_header_scan",
-                                "bytes_analyzed": bytes_to_read,
+                                "bytes_analyzed": bytes_read,
                                 "file_size": file_size,
                                 "analysis_complete": False,
                             },
@@ -255,14 +276,15 @@ def stream_analyze_file(
 
         result = ScanResult(scanner_name="streaming")
         scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
-        result.bytes_scanned = scanned or bytes_to_read
+        result.bytes_scanned = scanned or bytes_read
         result.issues = issues
         result.metadata = {
             "streaming_analysis": True,
-            "bytes_analyzed": bytes_to_read,
+            "bytes_analyzed": bytes_read,
             "bytes_complete": bytes_complete,
             "analysis_complete": analysis_complete,
             "file_size": file_size,
+            "max_bytes": resolved_max_bytes,
         }
         result.metadata.update(metadata)
         if not analysis_complete:
