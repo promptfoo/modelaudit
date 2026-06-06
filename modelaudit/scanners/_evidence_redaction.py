@@ -534,6 +534,12 @@ def _r_non_code_spans(text: str) -> list[tuple[int, int]]:
             continue
 
         character = text[cursor]
+        if character == "%":
+            operator_end = text.find("%", cursor + 1)
+            if operator_end >= 0 and "\n" not in text[cursor + 1 : operator_end]:
+                cursor = operator_end + 1
+                continue
+
         if character == "#":
             comment_end = text.find("\n", cursor)
             if comment_end < 0:

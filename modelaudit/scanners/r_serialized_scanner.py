@@ -581,6 +581,7 @@ def _r_named_argument_value_is_complete(
         target_close,
         non_code_spans,
         delimiter_pairs,
+        allow_equal_assignment=False,
     ):
         return False
     span_index = bisect_right(non_code_spans, first_code, key=lambda span: span[0]) - 1
@@ -894,6 +895,7 @@ def _r_expression_has_obvious_adjacent_values(
     non_code_spans: list[tuple[int, int]],
     delimiter_pairs: dict[int, int],
     *,
+    allow_equal_assignment: bool = True,
     allow_newline_separator: bool = False,
     unterminated_literal_starts: set[int] | None = None,
 ) -> bool:
@@ -989,6 +991,7 @@ def _r_expression_has_obvious_adjacent_values(
                     closer,
                     non_code_spans,
                     delimiter_pairs,
+                    allow_equal_assignment=character in "({",
                     allow_newline_separator=character == "{",
                     unterminated_literal_starts=unterminated_literal_starts,
                 )
@@ -1074,7 +1077,12 @@ def _r_expression_has_obvious_adjacent_values(
             continue
         if character == "%":
             operator_end = text.find("%", cursor + 1, stop)
-            if expects_value or operator_end < 0 or native_pipe_call_required:
+            if (
+                expects_value
+                or operator_end < 0
+                or native_pipe_call_required
+                or "\n" in text[cursor + 1 : operator_end]
+            ):
                 return True
             expects_value = True
             namespace_receiver_is_valid = False
@@ -1107,7 +1115,8 @@ def _r_expression_has_obvious_adjacent_values(
                 operator = "=="
             else:
                 if (
-                    expects_value
+                    not allow_equal_assignment
+                    or expects_value
                     or native_pipe_call_required
                     or not _r_assignment_target_is_valid(
                         text,
@@ -1473,12 +1482,20 @@ def _r_expression_start_has_valid_boundary(
             )
             if opener_position is None:
                 return True
-            return _r_identifier_before_position(text, opener_position, non_code_spans) in {
+            identifier_span = _r_identifier_span_before_position(text, opener_position, non_code_spans)
+            if identifier_span is not None and text[identifier_span[0] : identifier_span[1]] in {
                 "for",
                 "function",
                 "if",
                 "while",
-            } or _r_lambda_shorthand_before_position(
+            }:
+                return _r_expression_start_has_valid_boundary(
+                    text,
+                    identifier_span[0],
+                    non_code_spans,
+                    delimiter_pairs,
+                )
+            return _r_lambda_shorthand_before_position(
                 text,
                 opener_position,
                 non_code_spans,
@@ -1646,6 +1663,7 @@ def _r_delimited_expression_can_start_call(
             closer_position,
             non_code_spans,
             delimiter_pairs,
+            allow_equal_assignment=text[opener_position] in "({",
             allow_newline_separator=text[opener_position] == "{",
         ):
             return False
@@ -2184,6 +2202,7 @@ def _r_control_header_is_complete(
             closer_position,
             non_code_spans,
             delimiter_pairs or {},
+            allow_equal_assignment=False,
             unterminated_literal_starts=unterminated_literal_starts,
         )
     )
@@ -2600,6 +2619,17 @@ def _r_identifier_before_position(
     position: int,
     non_code_spans: list[tuple[int, int]],
 ) -> str | None:
+    identifier_span = _r_identifier_span_before_position(text, position, non_code_spans)
+    if identifier_span is None:
+        return None
+    return text[identifier_span[0] : identifier_span[1]]
+
+
+def _r_identifier_span_before_position(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> tuple[int, int] | None:
     cursor = position - 1
     crossed_newline = False
     while cursor >= 0:
@@ -2622,10 +2652,11 @@ def _r_identifier_before_position(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    token = text[cursor + 1 : token_end]
+    token_start = cursor + 1
+    token = text[token_start:token_end]
     if crossed_newline and token not in {"else", "for", "function", "if", "repeat", "while"}:
         return None
-    return token
+    return token_start, token_end
 
 
 def _r_matching_open_delimiter_position(
