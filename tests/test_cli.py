@@ -9,7 +9,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -959,6 +959,7 @@ def test_cli_report_writers_normalize_unicode_encode_failure(
     assert "Unable to encode output" in str(exc_info.value)
     assert not output_path.exists()
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+    assert not list(tmp_path.glob(".modelaudit-output-*.probe"))
 
 
 def test_cli_report_writers_preserve_existing_output_on_unicode_encode_failure(tmp_path: Path) -> None:
@@ -1100,6 +1101,41 @@ def test_scan_preflights_report_destination_before_scan_work(
     assert not output_path.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hard-link installation is required")
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_hard_link_installation_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+    original_link = cli_module.os.link
+    original_supports_dir_fd = cli_module.os.supports_dir_fd
+
+    def reject_hard_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "simulated filesystem without hard links")
+
+    monkeypatch.setattr(cli_module.os, "link", reject_hard_link)
+    monkeypatch.setattr(
+        cli_module.os,
+        "supports_dir_fd",
+        {reject_hard_link if function is original_link else function for function in original_supports_dir_fd},
+    )
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "simulated filesystem without hard links" in result.output
+    resolve_scan_paths.assert_not_called()
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+    assert not list(tmp_path.glob(".modelaudit-output-*.probe"))
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
 @pytest.mark.parametrize("output_option", ["--output", "--sbom"])
 def test_scan_preflights_existing_report_metadata_before_scan_work(
@@ -1127,6 +1163,34 @@ def test_scan_preflights_existing_report_metadata_before_scan_work(
     resolve_scan_paths.assert_not_called()
     assert output_path.read_text() == "sentinel"
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX sticky-directory semantics are required")
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_sticky_directory_replacement_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    output_path.write_text("sentinel")
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_posix_output_replacement_permission",
+        MagicMock(side_effect=cli_module._OutputWriteError("simulated sticky-directory replacement denial")),
+    )
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "simulated sticky-directory replacement denial" in result.output
+    resolve_scan_paths.assert_not_called()
+    assert output_path.read_text() == "sentinel"
 
 
 @pytest.mark.parametrize("output_option", ["--output", "--sbom"])
@@ -1252,6 +1316,7 @@ def test_cli_report_writers_stage_new_output_in_private_directory(
     assert all(mode & 0o077 == 0 for mode in observed_stage_modes)
     assert json.loads(output_path.read_text())["scanners"]
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+    assert not list(tmp_path.glob(".modelaudit-output-*.probe"))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative installation is required")
@@ -1271,6 +1336,9 @@ def test_cli_report_writers_do_not_replace_destination_created_during_install(
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
     ) -> None:
+        if destination != output_path.name:
+            original_link(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            return
         assert dst_dir_fd is not None
         destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dst_dir_fd)
         with os.fdopen(destination_fd, "w") as destination_file:
@@ -1428,6 +1496,35 @@ def test_directory_can_replace_entries_rejects_linux_access_acl_for_root(
     monkeypatch.setattr(cli_module.os, "geteuid", lambda: 0)
 
     assert cli_module._directory_can_replace_entries(Path("/protected"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX sticky-directory semantics are required")
+def test_sticky_directory_replacement_rejects_unowned_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=1001)
+    output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=1002))
+    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
+    monkeypatch.setattr(cli_module.os, "geteuid", lambda: 1003)
+
+    with pytest.raises(cli_module._OutputWriteError, match=r"sticky directory.*Permission denied"):
+        cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX sticky-directory semantics are required")
+@pytest.mark.parametrize(
+    ("effective_uid", "parent_uid", "output_uid"), [(0, 1001, 1002), (1001, 1001, 1002), (1002, 1001, 1002)]
+)
+def test_sticky_directory_replacement_allows_privileged_or_owned_output(
+    monkeypatch: pytest.MonkeyPatch,
+    effective_uid: int,
+    parent_uid: int,
+    output_uid: int,
+) -> None:
+    parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=parent_uid)
+    output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=output_uid))
+    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
+    monkeypatch.setattr(cli_module.os, "geteuid", lambda: effective_uid)
+
+    cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
