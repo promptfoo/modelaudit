@@ -3580,6 +3580,9 @@ def test_lambda_named_reference_metadata_does_not_suppress_source_analysis(tmp_p
     ("module_name", "function_name", "expected_severity"),
     [
         ("os", "system", IssueSeverity.CRITICAL),
+        ("io", "open", IssueSeverity.CRITICAL),
+        ("io", "open_safe", IssueSeverity.WARNING),
+        ("platform", "system", IssueSeverity.WARNING),
         ("custom_package.transforms", "normalize", IssueSeverity.WARNING),
     ],
 )

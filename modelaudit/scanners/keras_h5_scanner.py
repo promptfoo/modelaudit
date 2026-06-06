@@ -220,6 +220,11 @@ class KerasH5Scanner(BaseScanner):
             "pyfuncstateless",
         }
     )
+    _DANGEROUS_LAMBDA_MODULE_FUNCTION_PAIRS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
+        {
+            ("io", "open"),
+        }
+    )
     _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
     _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
     _MAX_HDF5_LAYOUT_PROBE_ITEMS: ClassVar[int] = 4096
@@ -1519,6 +1524,10 @@ class KerasH5Scanner(BaseScanner):
             function_tokens = {
                 token.strip() for token in re.split(r"[^0-9A-Za-z_]+", normalized_function_name) if token.strip()
             }
+            normalized_module_name = module_name.strip().lower() if isinstance(module_name, str) else ""
+            function_leaf = normalized_function_name.rsplit(".", 1)[-1]
+            if (normalized_module_name, function_leaf) in cls._DANGEROUS_LAMBDA_MODULE_FUNCTION_PAIRS:
+                return True
             if function_tokens & cls._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES:
                 return True
             if (
