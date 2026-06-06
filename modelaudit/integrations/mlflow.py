@@ -232,12 +232,12 @@ def _runs_mlflow_repository_is_scoped(
     artifact_repository: Any,
     run_repository: Any,
     wrapper_uri: str,
-) -> bool:
+) -> bool | None:
     """Return whether MLflow resolved the run repository at the wrapper path."""
     repository_uri = getattr(run_repository, "artifact_uri", None)
     get_underlying_uri = getattr(artifact_repository, "get_underlying_uri", None)
     if not isinstance(repository_uri, str) or not callable(get_underlying_uri):
-        return False
+        return None
 
     try:
         expected_uri = get_underlying_uri(wrapper_uri, getattr(artifact_repository, "tracking_uri", None))
@@ -245,10 +245,12 @@ def _runs_mlflow_repository_is_scoped(
         try:
             expected_uri = get_underlying_uri(wrapper_uri)
         except Exception:
-            return False
+            return None
     except Exception:
-        return False
-    return isinstance(expected_uri, str) and repository_uri == expected_uri
+        return None
+    if not isinstance(expected_uri, str):
+        return None
+    return repository_uri == expected_uri
 
 
 def _local_runs_mlflow_sources(
@@ -273,13 +275,16 @@ def _local_runs_mlflow_sources(
     )
 
     run_artifact_path = artifact_path
-    if (
-        wrapper_path
-        and effective_path
-        and isinstance(wrapper_uri, str)
-        and not _runs_mlflow_repository_is_scoped(artifact_repository, run_repository, wrapper_uri)
-    ):
-        run_artifact_path = effective_path
+    if wrapper_path and effective_path and isinstance(wrapper_uri, str):
+        repository_is_scoped = _runs_mlflow_repository_is_scoped(
+            artifact_repository,
+            run_repository,
+            wrapper_uri,
+        )
+        if repository_is_scoped is None:
+            return None
+        if not repository_is_scoped:
+            run_artifact_path = effective_path
 
     sources = [_MlflowLocalSource(run_root, run_artifact_path, artifact_path)]
     if not effective_path or run_id is None or not callable(get_logged_model_repository):

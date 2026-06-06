@@ -498,7 +498,7 @@ def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_p
 
 @pytest.mark.parametrize(
     "repository_layout",
-    ["unscoped", "scoped", "unscoped_matching_suffix"],
+    ["unscoped", "scoped", "scoped_resolution_error", "unscoped_matching_suffix"],
 )
 def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, repository_layout: str) -> None:
     """Run repositories must apply the wrapper prefix exactly once."""
@@ -526,6 +526,8 @@ def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, reposit
         def get_underlying_uri(self, uri: str, tracking_uri: str | None = None) -> str:
             assert uri == "runs:/run-1/model"
             assert tracking_uri is None
+            if repository_layout == "scoped_resolution_error":
+                raise RuntimeError("tracking lookup failed")
             return self.underlying_uri
 
         @staticmethod
@@ -544,7 +546,7 @@ def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, reposit
     models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
     runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
 
-    if repository_layout == "scoped":
+    if repository_layout in {"scoped", "scoped_resolution_error"}:
         run_root = tmp_path / "run-artifacts" / "model"
         artifact_sizes = {
             "subdir/right.bin": 4,
@@ -601,10 +603,17 @@ def test_scan_mlflow_model_preserves_runs_subpath_prefix(tmp_path: Path, reposit
             max_total_size=4,
         )
 
-    assert result == scan_result
-    assert (download_dir / "subdir" / "right.bin").read_bytes() == b"xxxx"
-    assert not (download_dir / "subdir" / "wrong.bin").exists()
-    mock_scan.assert_called_once()
+    if repository_layout == "scoped_resolution_error":
+        assert determine_exit_code(result) == 2
+        assert result.checks[0].details["reason"] == "artifact_streaming_budget_unavailable"
+        assert not (download_dir / "subdir" / "right.bin").exists()
+        assert not (download_dir / "subdir" / "wrong.bin").exists()
+        mock_scan.assert_not_called()
+    else:
+        assert result == scan_result
+        assert (download_dir / "subdir" / "right.bin").read_bytes() == b"xxxx"
+        assert not (download_dir / "subdir" / "wrong.bin").exists()
+        mock_scan.assert_called_once()
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
