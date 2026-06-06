@@ -431,7 +431,7 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
     file_read_attributes = 0x0080
     write_dac = 0x00040000
     create_new = 1
-    file_attribute_temporary = 0x00000100
+    file_attribute_normal = 0x00000080
     temp_path = absolute_path.parent / temp_name
     temp_handle = create_file(
         str(temp_path),
@@ -439,7 +439,7 @@ def _open_windows_output_temp_file(output_path: str, absolute_path: Path, temp_n
         0,
         None,
         create_new,
-        file_attribute_temporary,
+        file_attribute_normal,
         None,
     )
     invalid_handle_value = ctypes.c_void_p(-1).value
@@ -881,12 +881,7 @@ def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int
                 if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
                     raise
                 attribute_names = []
-            preserved_names = (
-                attribute_names
-                if platform.system() == "Darwin"
-                else [name for name in attribute_names if name.startswith("user.") or name == "system.posix_acl_access"]
-            )
-            for name in preserved_names:
+            for name in attribute_names:
                 os.setxattr(target_fd, name, os.getxattr(source_fd, name))
     except OSError as exc:
         raise _OutputWriteError(
@@ -920,12 +915,19 @@ def _preflight_output_text_file(output_path: str) -> None:
     absolute_path: Path | None = None
     parent_fd: int | None = None
     parent_guard: int | None = None
+    parent_lock: int | None = None
     existing_fd: int | None = None
     parent_sync_fd: int | None = None
     staging_fd: int | None = None
     staging_name = ""
+    temp_fd: int | None = None
+    temp_path: Path | None = None
+    temp_name = ""
     try:
         absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
+        if os.name == "nt":
+            assert parent_guard is not None
+            parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
         initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
         if initial_stat is not None:
             existing_fd = _open_existing_output_file(
@@ -934,12 +936,33 @@ def _preflight_output_text_file(output_path: str) -> None:
                 initial_stat,
                 parent_fd=parent_fd,
             )
-        if parent_fd is None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+
+        if os.name == "nt":
+            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            temp_fd, temp_path = _open_windows_output_temp_file(output_path, absolute_path, temp_name)
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        elif parent_fd is not None:
+            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
+            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+            temp_name = "output.tmp"
+            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=staging_fd)
+        else:
             return
 
-        parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
-        staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-        staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+        if initial_stat is not None:
+            assert existing_fd is not None
+            assert temp_fd is not None
+            if os.name == "nt":
+                _copy_windows_output_security(output_path, existing_fd, temp_fd)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
+            else:
+                _copy_posix_output_metadata(output_path, existing_fd, temp_fd)
     except _OutputWriteError:
         raise
     except OSError as exc:
@@ -947,7 +970,12 @@ def _preflight_output_text_file(output_path: str) -> None:
             f"Unable to prepare output {_display_path(output_path)}: {exc.strerror or exc}"
         ) from exc
     finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
         if staging_fd is not None:
+            if temp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=staging_fd)
             staging_stat: os.stat_result | None = None
             with contextlib.suppress(OSError):
                 staging_stat = os.fstat(staging_fd)
@@ -963,6 +991,11 @@ def _preflight_output_text_file(output_path: str) -> None:
             os.close(existing_fd)
         if parent_fd is not None:
             os.close(parent_fd)
+        elif temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+        if parent_lock is not None:
+            _close_windows_handle(parent_lock)
         if parent_guard is not None:
             _close_windows_handle(parent_guard)
 

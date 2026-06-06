@@ -1101,6 +1101,69 @@ def test_scan_preflights_report_destination_before_scan_work(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_existing_report_metadata_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    """Unpreservable report metadata must fail before scan orchestration."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    output_path.write_text("sentinel")
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+
+    def reject_metadata(_output_path: str, _source_fd: int, _target_fd: int) -> None:
+        raise cli_module._OutputWriteError("simulated metadata preservation failure")
+
+    monkeypatch.setattr(cli_module, "_copy_posix_output_metadata", reject_metadata)
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "simulated metadata preservation failure" in result.output
+    resolve_scan_paths.assert_not_called()
+    assert output_path.read_text() == "sentinel"
+    assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
+
+
+@pytest.mark.parametrize("output_option", ["--output", "--sbom"])
+def test_scan_preflights_windows_temp_creation_before_scan_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_option: str,
+) -> None:
+    """Windows report staging failures must be discovered before scanning."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"not a pickle")
+    output_path = tmp_path / "report.json"
+    resolve_scan_paths = MagicMock(side_effect=AssertionError("scan path resolution must not start"))
+    close_handle = MagicMock()
+
+    monkeypatch.setattr(cli_module, "Path", type(tmp_path))
+    monkeypatch.setattr(cli_module.os, "name", "nt")
+    monkeypatch.setattr(cli_module, "_open_output_parent_directory", lambda _path: (output_path, None, 101))
+    monkeypatch.setattr(cli_module, "_validate_existing_output_path", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_open_windows_output_parent_lock", lambda *_args: 202)
+    monkeypatch.setattr(
+        cli_module,
+        "_open_windows_output_temp_file",
+        MagicMock(side_effect=cli_module._OutputWriteError("simulated Windows temp creation failure")),
+    )
+    monkeypatch.setattr(cli_module, "_close_windows_handle", close_handle)
+    monkeypatch.setattr(cli_module, "_resolve_scan_paths", resolve_scan_paths)
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file), output_option, str(output_path), "--no-cache"])
+
+    assert result.exit_code == 2
+    assert "simulated Windows temp creation failure" in result.output
+    resolve_scan_paths.assert_not_called()
+    assert [close_call.args for close_call in close_handle.call_args_list] == [(202,), (101,)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-relative staging is required")
 def test_cli_report_writers_stage_new_output_in_private_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1205,6 +1268,41 @@ def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert os.getxattr(output_path, attribute_name) == b"keep"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor metadata is required")
+def test_copy_posix_output_metadata_preserves_security_xattrs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomic replacement must retain security and trusted xattr namespaces."""
+    source_path = tmp_path / "source.json"
+    target_path = tmp_path / "target.json"
+    source_path.write_text("source")
+    target_path.write_text("target")
+    attribute_values = {
+        "security.selinux": b"label",
+        "trusted.modelaudit": b"trusted",
+        "user.modelaudit": b"user",
+    }
+    copied: dict[str, bytes] = {}
+
+    monkeypatch.setattr(cli_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cli_module, "_posix_fd_has_extended_acl", lambda _path, _fd: False)
+    monkeypatch.setattr(cli_module.os, "listxattr", lambda _fd: list(attribute_values), raising=False)
+    monkeypatch.setattr(cli_module.os, "getxattr", lambda _fd, name: attribute_values[name], raising=False)
+    monkeypatch.setattr(
+        cli_module.os, "setxattr", lambda _fd, name, value: copied.__setitem__(name, value), raising=False
+    )
+
+    with source_path.open("rb") as source_file, target_path.open("r+b") as target_file:
+        cli_module._copy_posix_output_metadata(
+            str(source_path),
+            source_file.fileno(),
+            target_file.fileno(),
+        )
+
+    assert copied == attribute_values
 
 
 def test_cli_report_writers_replace_hard_link_without_modifying_alias(tmp_path: Path) -> None:
@@ -1637,6 +1735,62 @@ def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
         "share_mode": 0x00000001 | 0x00000002 | 0x00000004,
         "creation_disposition": 3,
         "flags": 0x00200000,
+        "handle": 321,
+        "os_flags": os.O_WRONLY | getattr(os, "O_BINARY", 0),
+    }
+
+
+def test_windows_output_temp_file_uses_normal_attributes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Published Windows reports must not retain FILE_ATTRIBUTE_TEMPORARY."""
+    captured: dict[str, object] = {}
+
+    class CreateFileW:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            path: str,
+            desired_access: int,
+            share_mode: int,
+            _security_attributes: object,
+            creation_disposition: int,
+            flags: int,
+            _template: object,
+        ) -> int:
+            captured.update(
+                path=path,
+                desired_access=desired_access,
+                share_mode=share_mode,
+                creation_disposition=creation_disposition,
+                flags=flags,
+            )
+            return 321
+
+    create_file = CreateFileW()
+    kernel32 = types.SimpleNamespace(CreateFileW=create_file)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        types.SimpleNamespace(open_osfhandle=lambda handle, flags: captured.update(handle=handle, os_flags=flags) or 7),
+    )
+
+    destination_path = Path(r"C:\reports\output.txt")
+    temp_fd, temp_path = cli_module._open_windows_output_temp_file(
+        str(destination_path),
+        destination_path,
+        ".modelaudit-output.tmp",
+    )
+
+    assert temp_fd == 7
+    assert temp_path == destination_path.parent / ".modelaudit-output.tmp"
+    assert captured == {
+        "path": str(temp_path),
+        "desired_access": 0x40000000 | 0x00010000 | 0x0080 | 0x00040000,
+        "share_mode": 0,
+        "creation_disposition": 1,
+        "flags": 0x00000080,
         "handle": 321,
         "os_flags": os.O_WRONLY | getattr(os, "O_BINARY", 0),
     }
