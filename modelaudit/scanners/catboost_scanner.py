@@ -49,7 +49,7 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:import\s+os|import\s+subprocess|from\s+os\s+import)\b", re.IGNORECASE), "python import block"),
 ]
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
-_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{20,}={0,2})(?![A-Za-z0-9+/_=-])")
+_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{8,}={0,2})(?![A-Za-z0-9+/_=-])")
 _BASE64_LITERAL_PART_PATTERN = re.compile(
     r"(?is)(?:[rubf]{0,3})(?P<quote>[\"'])(?P<payload>[A-Za-z0-9+/_-]{2,}={0,2})(?P=quote)"
 )
@@ -64,6 +64,7 @@ _STRING_LITERAL_COLLECTION_PATTERN = re.compile(
 )
 _PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_HEX_EVIDENCE_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
 _UNICODE_OR_OCTAL_ESCAPE_PATTERN = re.compile(r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3})")
 _STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
     r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
@@ -201,9 +202,17 @@ def _redact_literal_collection_evidence(text: str) -> str:
             values = ast.literal_eval(match.group(0))
         except (SyntaxError, ValueError):
             return match.group(0)
-        if not isinstance(values, (list, tuple)) or not all(isinstance(value, str) for value in values):
+        if not isinstance(values, (list, tuple)):
             return match.group(0)
-        joined = "".join(values)
+        if all(isinstance(value, str) for value in values):
+            joined = "".join(values)
+        elif all(isinstance(value, bytes) for value in values):
+            try:
+                joined = b"".join(values).decode("ascii")
+            except UnicodeDecodeError:
+                return match.group(0)
+        else:
+            return match.group(0)
         if len(joined) > _MAX_ENCODED_EVIDENCE_CHARS:
             return match.group(0)
 
@@ -262,14 +271,13 @@ def _redact_reversible_percent_evidence(text: str) -> str:
 
 def _redact_reversible_hex_evidence(text: str) -> str:
     """Decode and sanitize reversible hex-escaped evidence before display."""
-
-    def replace_payload(match: re.Match[str]) -> str:
-        decoded_text = _decode_hex_escape_payload(match.group(0))
-        if not decoded_text:
-            return match.group(0)
-        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
-
-    return _HEX_ESCAPE_PATTERN.sub(replace_payload, text)
+    if _HEX_EVIDENCE_ESCAPE_PATTERN.search(text) is None:
+        return text
+    decoded_text = _HEX_EVIDENCE_ESCAPE_PATTERN.sub(
+        lambda match: _decode_hex_escape_payload(match.group(0)) or match.group(0),
+        text,
+    )
+    return _sanitize_decoded_reversible_evidence(decoded_text, text)
 
 
 def _redact_reversible_unicode_evidence(text: str) -> str:

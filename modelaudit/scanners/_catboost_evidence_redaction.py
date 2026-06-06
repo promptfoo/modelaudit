@@ -138,7 +138,8 @@ COMPACT_SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 )
 SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
-    r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|auth[_.-]?token|client[_.-]?secret|"
+    r"(?:access[_.-]?key(?:[_.-]?id)?|access[_.-]?token|api[_.-]?key|apikey|"
+    r"aws(?:accesskeyid|secretaccesskey|sessiontoken)|auth[_.-]?token|client[_.-]?secret|"
     r"auth|basic[_.-]?auth|cookie|credential|google[_.-]?access[_.-]?id|jwt|passphrase|password|passwd|"
     r"private[_.-]?key|pwd|"
     r"refresh[_.-]?token|sas|secret|"
@@ -2414,19 +2415,22 @@ def _redact_sensitive_function_value(raw_value: str) -> str:
 
 def _redact_sensitive_argv_pairs(text: str) -> str:
     """Redact adjacent quoted option/value pairs such as ['--api-key', 'secret']."""
-
-    def replace_pair(match: re.Match[str]) -> str:
+    replacements: list[tuple[int, int]] = []
+    search_start = 0
+    while match := SENSITIVE_ARGV_PAIR_RE.search(text, search_start):
         if match.group("collection_prefix") == ",":
             inside_list = text.rfind("[", 0, match.start()) > text.rfind("]", 0, match.start())
             inside_tuple = text.rfind("(", 0, match.start()) > text.rfind(")", 0, match.start())
             if not inside_list and not inside_tuple:
-                return match.group(0)
-        if _normalize_sensitive_function_key(_decode_key_escapes(match.group("key"))) is None:
-            return match.group(0)
-        quote = match.group("value_quote")
-        return f"{match.group('prefix')}{match.group('value_prefix')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+                search_start = match.start() + 1
+                continue
+        if _normalize_sensitive_function_key(_decode_key_escapes(match.group("key"))) is not None:
+            replacements.append((match.start("value"), match.end("value")))
+        search_start = match.start() + 1
 
-    return SENSITIVE_ARGV_PAIR_RE.sub(replace_pair, text)
+    for start, end in reversed(replacements):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
 
 
 def _redact_sensitive_setter_arguments(text: str) -> str:

