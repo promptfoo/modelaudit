@@ -2095,12 +2095,14 @@ def test_text_scanner_disabled_detectors_do_not_report_clean_coverage(tmp_path: 
 def test_text_scanner_fails_closed_when_secret_detector_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("token\n", encoding="utf-8")
+    leaked_secret = "UNSTRUCTURED-TEXT-SECRET-123456"
 
     def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
-        raise RuntimeError("simulated secret detector failure")
+        raise RuntimeError(f"secret detector rejected {leaked_secret}")
 
     monkeypatch.setattr(TextScanner, "collect_embedded_secret_findings", raise_detector_error)
 
@@ -2112,6 +2114,9 @@ def test_text_scanner_fails_closed_when_secret_detector_fails(
     assert not any(
         check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
     )
+    assert leaked_secret not in result.to_json()
+    assert leaked_secret not in caplog.text
+    assert "<redacted>" in result.to_json()
 
 
 def test_text_scanner_fails_closed_when_content_detector_coverage_is_truncated(tmp_path: Path) -> None:

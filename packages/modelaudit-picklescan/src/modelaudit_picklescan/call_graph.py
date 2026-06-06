@@ -66,16 +66,18 @@ _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
-_TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
-_STANDARD_FILE_FINDER_LOADERS = tuple(
-    (suffix, loader)
-    for loader, suffixes in (
-        (ExtensionFileLoader, EXTENSION_SUFFIXES),
-        (SourceFileLoader, SOURCE_SUFFIXES),
-        (SourcelessFileLoader, BYTECODE_SUFFIXES),
-    )
-    for suffix in suffixes
+_STANDARD_FILE_FINDER_LOADER_DETAILS = (
+    (ExtensionFileLoader, list(EXTENSION_SUFFIXES)),
+    (SourceFileLoader, list(SOURCE_SUFFIXES)),
+    (SourcelessFileLoader, list(BYTECODE_SUFFIXES)),
 )
+_STANDARD_FILE_FINDER_LOADER_IDENTITY = tuple(
+    (loader, tuple(suffixes)) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_DETAILS
+)
+_STANDARD_FILE_FINDER_LOADERS = tuple(
+    (suffix, loader) for loader, suffixes in _STANDARD_FILE_FINDER_LOADER_IDENTITY for suffix in suffixes
+)
+_STANDARD_FILE_FINDER_PATH_HOOK_CODE = FileFinder.path_hook(*_STANDARD_FILE_FINDER_LOADER_DETAILS).__code__
 _TRUSTED_FILE_FINDER_METHODS = tuple(
     (name, getattr(FileFinder, name)) for name in ("__init__", "find_spec", "_get_spec", "_fill_cache")
 )
@@ -1544,7 +1546,9 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
     if isinstance(value, bytes):
         return repr(value) if len(value) <= 256 else _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, type):
-        return f"{value.__module__}.{value.__qualname__}"
+        return f"{value.__module__}.{value.__qualname__}:{_UNREUSABLE_HOOK_STATE_IDENTITY}"
+    if isinstance(value, (CodeType, FunctionType, MethodType, ModuleType)):
+        return _UNREUSABLE_HOOK_STATE_IDENTITY
     if depth >= _MAX_HOOK_IDENTITY_DEPTH:
         return _UNREUSABLE_HOOK_STATE_IDENTITY
     if isinstance(value, tuple | list):
@@ -1576,16 +1580,45 @@ def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
     )
 
 
-def _hook_type_code(hook_type: type[object]) -> bytes:
-    code_parts: list[bytes] = []
+def _function_hook_state(function: FunctionType) -> str:
+    closure_values: list[object] = []
+    for cell in function.__closure__ or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            closure_values.append("<empty>")
+    referenced_globals = {
+        name: function.__globals__[name]
+        for name in sorted(set(function.__code__.co_names))
+        if name != "__builtins__" and name in function.__globals__
+    }
+    return "|".join(
+        (
+            f"closure={_bounded_hook_value_identity(tuple(closure_values))}",
+            f"defaults={_bounded_hook_value_identity(function.__defaults__ or ())}",
+            f"kwdefaults={_bounded_hook_value_identity(function.__kwdefaults__ or {})}",
+            f"globals={_bounded_hook_value_identity(referenced_globals)}",
+        )
+    )
+
+
+def _hook_type_methods(hook_type: type[object]) -> tuple[tuple[str, FunctionType], ...]:
+    methods: list[tuple[str, FunctionType]] = []
     for method_name in ("find_spec", "__call__"):
         for candidate_type in hook_type.__mro__:
             method = candidate_type.__dict__.get(method_name)
             if isinstance(method, (classmethod, staticmethod)):
                 method = method.__func__
             if isinstance(method, FunctionType):
-                code_parts.append(marshal.dumps(method.__code__))
+                methods.append((method_name, method))
                 break
+    return tuple(methods)
+
+
+def _hook_type_code(hook_type: type[object]) -> bytes:
+    code_parts: list[bytes] = []
+    for _method_name, method in _hook_type_methods(hook_type):
+        code_parts.append(marshal.dumps(method.__code__))
     return b"".join(code_parts)
 
 
@@ -1594,19 +1627,13 @@ def _import_hook_identity(hook: object) -> str:
         module = hook.__module__
         qualname = hook.__qualname__
         code = marshal.dumps(hook.__code__)
-        closure_values: list[object] = []
-        for cell in hook.__closure__ or ():
-            try:
-                closure_values.append(cell.cell_contents)
-            except ValueError:
-                closure_values.append("<empty>")
-        state = _bounded_hook_value_identity(tuple(closure_values))
+        state = _function_hook_state(hook)
     elif isinstance(hook, MethodType):
-        function = hook.__func__
+        function = cast(FunctionType, hook.__func__)
         module = function.__module__
         qualname = function.__qualname__
         code = marshal.dumps(function.__code__)
-        state = _bounded_hook_value_identity(hook.__self__)
+        state = f"self={_bounded_hook_value_identity(hook.__self__)}|function={_function_hook_state(function)}"
     elif isinstance(hook, type):
         module = hook.__module__
         qualname = hook.__qualname__
@@ -1633,14 +1660,43 @@ def _resolution_context_is_reusable(
     return all(":unreusable:" not in identity for identities in context for identity in identities)
 
 
+def _path_importer_methods_are_trusted(
+    importer_type: type[object],
+    trusted_methods: tuple[tuple[str, object], ...],
+) -> bool:
+    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
+
+
+def _is_standard_file_finder_path_hook(hook: object) -> bool:
+    if not isinstance(hook, FunctionType) or hook.__code__ is not _STANDARD_FILE_FINDER_PATH_HOOK_CODE:
+        return False
+    closure = hook.__closure__ or ()
+    if len(closure) != len(hook.__code__.co_freevars):
+        return False
+    closure_values = dict(zip(hook.__code__.co_freevars, (cell.cell_contents for cell in closure), strict=True))
+    if closure_values.get("cls") is not FileFinder:
+        return False
+    loader_details = closure_values.get("loader_details")
+    if not isinstance(loader_details, tuple):
+        return False
+    try:
+        normalized_details = tuple((loader, tuple(suffixes)) for loader, suffixes in loader_details)
+    except (TypeError, ValueError):
+        return False
+    return normalized_details == _STANDARD_FILE_FINDER_LOADER_IDENTITY
+
+
 def _path_hook_resolution_identity(hook: object) -> str:
-    """Return a stable identity while trusting only the original path-hook objects."""
-    for trusted_hook in _TRUSTED_PATH_HOOKS:
-        if hook is trusted_hook:
-            module = getattr(hook, "__module__", type(hook).__module__)
-            qualname = getattr(hook, "__qualname__", type(hook).__qualname__)
-            return f"trusted:{module}.{qualname}"
-    return _import_hook_identity(hook)
+    """Return a reusable identity only for unmodified standard path hooks."""
+    if hook is zipimporter:
+        if _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+            return "trusted:zipimport.zipimporter"
+        return "zipimport.zipimporter:unreusable:methods-changed"
+    if _is_standard_file_finder_path_hook(hook):
+        if _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+            return "trusted:importlib.machinery.FileFinder.path_hook"
+        return "importlib.machinery.FileFinder.path_hook:unreusable:methods-changed"
+    return f"untrusted:unreusable:{_import_hook_identity(hook)}"
 
 
 def _string_sequence_identity(values: Iterable[str]) -> str:
@@ -1678,13 +1734,6 @@ def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
 
 def _meta_path_finder_resolution_identity(finder: object) -> str:
     return _pytest_assertion_rewrite_identity(finder) or _import_hook_identity(finder)
-
-
-def _path_importer_methods_are_trusted(
-    importer_type: type[object],
-    trusted_methods: tuple[tuple[str, object], ...],
-) -> bool:
-    return all(getattr(importer_type, name, None) is method for name, method in trusted_methods)
 
 
 def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:

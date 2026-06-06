@@ -19,12 +19,13 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from pathlib import Path
-from types import ModuleType
+from types import FunctionType, ModuleType
 from typing import Any
 from zipimport import zipimporter
 
 import pytest
 from modelaudit_picklescan.call_graph import _import_hook_identity as _picklescan_import_hook_identity
+from modelaudit_picklescan.call_graph import _path_hook_resolution_identity as _picklescan_path_hook_resolution_identity
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -40,6 +41,7 @@ from modelaudit.cache.scan_results_cache import (
     AncestorIdentity,
     ScanResultsCache,
     _import_hook_identity,
+    _path_hook_resolution_identity,
     _source_resolution_context,
 )
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
@@ -842,6 +844,62 @@ def test_ancestor_monitor_ignores_unrelated_grandparent_churn(tmp_path: Path) ->
     assert cache.store_result(str(model_path), {"success": True}, **expected) is True
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires inotify path monitoring")
+@pytest.mark.parametrize(
+    ("model_subdirectory", "cache_subdirectory"),
+    [
+        (None, "cache"),
+        ("sub", "cache"),
+        ("sub", None),
+    ],
+    ids=["direct-parent-probe", "nested-sibling-probe", "intermediate-ancestor-probe"],
+)
+def test_cache_manager_does_not_cache_higher_ancestor_swap(
+    tmp_path: Path,
+    model_subdirectory: str | None,
+    cache_subdirectory: str | None,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    model_dir = scan_root / "models"
+    model_dir.mkdir(parents=True)
+    model_parent = model_dir / model_subdirectory if model_subdirectory is not None else model_dir
+    model_parent.mkdir(exist_ok=True)
+    model_path = _make_cacheable_file(model_parent, name="model.dat")
+    model_path.write_bytes(b"evil!:" + (b"x" * 2042))
+    displaced_root = tmp_path / "scan-root-displaced"
+
+    cache_dir = model_dir / cache_subdirectory if cache_subdirectory is not None else model_dir
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            scan_root.rename(displaced_root)
+            replacement_dir = scan_root / model_path.parent.relative_to(scan_root)
+            replacement_dir.mkdir(parents=True)
+            replacement_path = replacement_dir / model_path.name
+            replacement_path.write_bytes(b"clean:" + (b"y" * 2042))
+            prefix = Path(path).read_bytes()[:6].decode("utf-8")
+            replacement_path.unlink()
+            while replacement_dir != scan_root:
+                replacement_dir.rmdir()
+                replacement_dir = replacement_dir.parent
+            scan_root.rmdir()
+            displaced_root.rename(scan_root)
+            return {"payload_prefix": prefix}
+        return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
+
+    first = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
+    assert cache_manager.get_stats()["total_entries"] == 0
+    second = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+
+
 def test_cache_manager_cached_scan_does_not_cache_symlink_target_swap(tmp_path: Path) -> None:
     malicious_path = _make_cacheable_file(tmp_path, name="malicious.dat")
     clean_path = _make_cacheable_file(tmp_path, name="clean.dat")
@@ -1400,6 +1458,80 @@ def test_import_hook_identity_distinguishes_same_qualname_closures() -> None:
     assert source_hook.__qualname__ == bytecode_hook.__qualname__
     assert _import_hook_identity(source_hook) == _import_hook_identity(equivalent_source_hook)
     assert _import_hook_identity(source_hook) != _import_hook_identity(bytecode_hook)
+
+
+def test_import_hook_identity_tracks_function_defaults_and_keyword_defaults() -> None:
+    def hook(_path: str, target: str = "safe", *, mode: str = "source") -> tuple[str, str]:
+        return target, mode
+
+    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
+    initial_identities = tuple(identity(hook) for identity in identity_functions)
+
+    hook.__defaults__ = ("malicious",)
+
+    assert all(
+        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
+    )
+
+    hook.__defaults__ = ("safe",)
+    default_restored_identities = tuple(identity(hook) for identity in identity_functions)
+    hook.__kwdefaults__ = {"mode": "bytecode"}
+
+    assert all(
+        identity(hook) != initial
+        for identity, initial in zip(identity_functions, default_restored_identities, strict=True)
+    )
+
+
+def test_import_hook_identity_tracks_referenced_global_state() -> None:
+    namespace: dict[str, Any] = {"__name__": "modelaudit_hook_identity_test", "target": "safe"}
+    exec("def hook(_path):\n    return target\n", namespace)
+    hook = namespace["hook"]
+    assert isinstance(hook, FunctionType)
+    identity_functions = (_import_hook_identity, _picklescan_import_hook_identity)
+    initial_identities = tuple(identity(hook) for identity in identity_functions)
+
+    namespace["target"] = "malicious"
+
+    assert all(
+        identity(hook) != initial for identity, initial in zip(identity_functions, initial_identities, strict=True)
+    )
+
+
+def test_standard_file_finder_hook_identity_invalidates_when_methods_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_hook = next(
+        hook
+        for hook in sys.path_hooks
+        if _picklescan_path_hook_resolution_identity(hook) == "trusted:importlib.machinery.FileFinder.path_hook"
+    )
+    initial_cache_identity = _path_hook_resolution_identity(standard_hook)
+    initial_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+
+    def changed_find_spec(self: FileFinder, _fullname: str, _target: object = None) -> None:
+        return None
+
+    monkeypatch.setattr(FileFinder, "find_spec", changed_find_spec)
+
+    changed_cache_identity = _path_hook_resolution_identity(standard_hook)
+    changed_picklescan_identity = _picklescan_path_hook_resolution_identity(standard_hook)
+    assert changed_cache_identity != initial_cache_identity
+    assert changed_picklescan_identity != initial_picklescan_identity
+    assert ":unreusable:" in changed_cache_identity
+    assert ":unreusable:" in changed_picklescan_identity
+
+
+def test_arbitrary_startup_path_hook_is_never_trusted() -> None:
+    class StartupPathHook:
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    hook = StartupPathHook()
+
+    for identity in (_path_hook_resolution_identity(hook), _picklescan_path_hook_resolution_identity(hook)):
+        assert not identity.startswith("trusted:")
+        assert ":unreusable:" in identity
 
 
 def test_import_hook_identity_tracks_bound_method_state() -> None:

@@ -18,6 +18,9 @@ SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
 SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
 SCANNER_DEPENDENCY_IDS_METADATA_KEY: Final[str] = "scanner_dependency_ids"
 OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
+RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_incomplete"
+RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
+RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY: Final[str] = "raw_detector_failed_detectors"
 UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
 CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
 
@@ -128,6 +131,9 @@ def _merge_call_graph_source_fingerprints_metadata(
         merged["reusable"] = False
 
     return merged
+
+
+_MAX_RAW_DETECTOR_FAILURES: Final[int] = 20
 
 
 def scan_result_has_inconclusive_outcome(scan_result: "ScanResult") -> bool:
@@ -429,6 +435,54 @@ class ScanResult:
         """Backward-compatible public issue adder."""
         self._add_issue(message, severity=severity, location=location, details=details, why=why, rule_code=rule_code)
 
+    def reconcile_raw_detector_checks(self) -> None:
+        """Reconcile clean and coverage checks after raw-detector result aggregation."""
+        failed_detectors = self.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
+        failed_clean_checks: set[str] = set()
+        if isinstance(failed_detectors, list):
+            clean_check_names = {
+                "embedded_secrets": {"Embedded Secrets Detection"},
+                "jit_script": {"JIT/Script Code Execution Detection", "JIT/Script Code Execution Summary"},
+                "network_communication": {"Network Communication Detection", "Network Communication Summary"},
+            }
+            failed_clean_checks = {
+                check_name for detector in failed_detectors for check_name in clean_check_names.get(detector, set())
+            }
+
+        seen_coverage_detectors: set[str] = set()
+        reconciled_checks: list[Check] = []
+        for check in self.checks:
+            if check.name in failed_clean_checks and check.status == CheckStatus.PASSED:
+                continue
+            detector = check.details.get("detector")
+            if (
+                check.name == "Raw Detector Analysis Coverage"
+                and check.details.get("scan_outcome_reason") == RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON
+                and isinstance(detector, str)
+            ):
+                if detector in seen_coverage_detectors:
+                    continue
+                seen_coverage_detectors.add(detector)
+            reconciled_checks.append(check)
+        self.checks = reconciled_checks
+
+        seen_issue_detectors: set[str] = set()
+        reconciled_issues: list[Issue] = []
+        for issue in self.issues:
+            detector = issue.details.get("detector")
+            if issue.details.get("scan_outcome_reason") == RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON and isinstance(
+                detector, str
+            ):
+                if detector in seen_issue_detectors:
+                    continue
+                seen_issue_detectors.add(detector)
+            reconciled_issues.append(issue)
+        self.issues = reconciled_issues
+
+    def remove_failed_raw_detector_clean_checks(self) -> None:
+        """Backward-compatible wrapper for raw-detector check reconciliation."""
+        self.reconcile_raw_detector_checks()
+
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
         self.issues.extend(other.issues)
@@ -438,6 +492,8 @@ class ScanResult:
         self.success = self.success and other.success
         # Merge metadata dictionaries
         list_union_metadata_keys = {
+            RAW_DETECTOR_FAILURES_METADATA_KEY,
+            RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
             SCAN_OUTCOME_REASONS_METADATA_KEY,
             SCANNER_DEPENDENCY_IDS_METADATA_KEY,
             "skipped_scanner_ids",
@@ -458,8 +514,24 @@ class ScanResult:
             if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
                 existing_values = self.metadata[key]
                 for item in value:
+                    if key == RAW_DETECTOR_FAILURES_METADATA_KEY and len(existing_values) >= _MAX_RAW_DETECTOR_FAILURES:
+                        break
                     if item not in existing_values:
                         existing_values.append(item)
+                if key == RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY:
+                    existing_values.sort(key=str)
+                continue
+            if key == RAW_DETECTOR_FAILURES_METADATA_KEY and isinstance(value, list):
+                bounded_failures: list[Any] = []
+                for item in value:
+                    if item not in bounded_failures:
+                        bounded_failures.append(item)
+                    if len(bounded_failures) >= _MAX_RAW_DETECTOR_FAILURES:
+                        break
+                self.metadata[key] = bounded_failures
+                continue
+            if key == RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY and isinstance(value, list):
+                self.metadata[key] = sorted({item for item in value if isinstance(item, str)})
                 continue
             if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
                 self.metadata[key].update(value)
@@ -476,6 +548,7 @@ class ScanResult:
                 )
             else:
                 self._private_metadata[key] = _deep_mutable_copy(value)
+        self.reconcile_raw_detector_checks()
 
     def trust_merged_child_failures(self) -> None:
         """Allow a parent scanner to explicitly accept child failures it has reclassified as benign."""

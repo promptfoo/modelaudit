@@ -3474,3 +3474,8 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
             for child in sorted(value, key=repr)
         ]
     return value
+
+
+def redact_untrusted_error_message(_error: BaseException | str) -> str:
+    """Discard error text that may contain attacker-controlled model content."""
+    return REDACTED_EVIDENCE_VALUE

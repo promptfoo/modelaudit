@@ -2110,6 +2110,53 @@ def test_scan_stream_short_read_preserves_proven_oversized_frame_tamper() -> Non
     assert any(error.category == "short_read" for error in report.errors)
 
 
+def test_stream_report_copy_helpers_preserve_private_metadata() -> None:
+    private_metadata = {"call_graph_source_fingerprints": {"reusable": True}}
+    report = PickleReport(
+        source="metadata-preservation.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        notices=(
+            package_api.Notice(
+                message="Unproven oversized frame",
+                code="oversized_frame",
+                details={},
+            ),
+        ),
+        private_metadata=private_metadata,
+    )
+
+    copied_reports = (
+        package_api._without_unproven_oversized_frame_tamper(
+            report,
+            bytes_total=None,
+            stream_start_offset=0,
+        ),
+        package_api._with_unbounded_stream_notice(
+            report,
+            source=report.source,
+            bytes_scanned=8,
+            max_unbounded_read_bytes=8,
+        ),
+        package_api._with_known_stream_notice(
+            report,
+            source=report.source,
+            bytes_scanned=8,
+            bytes_total=16,
+            max_known_read_bytes=8,
+            stream_start_offset=0,
+        ),
+        package_api._with_short_read_error(
+            report,
+            source=report.source,
+            error=package_api._StreamShortReadError(expected_size=16, bytes_read=8, partial_payload=b"partial"),
+            stream_start_offset=0,
+        ),
+    )
+
+    assert all(copied.private_metadata == private_metadata for copied in copied_reports)
+
+
 def test_scan_stream_scans_partial_bytes_on_short_read() -> None:
     payload = pickle.dumps(MaliciousPayload(), protocol=4)
     expected_size = len(payload) + 8
@@ -6380,24 +6427,36 @@ def test_resolution_extension_fingerprint_rejects_path_replacement(
     assert _resolution_candidate_fingerprint(extension_path) == (False, None)
 
 
-def test_exact_trusted_path_hook_identity_survives_lazy_method_initialization(
+def test_standard_file_finder_path_hook_stops_being_trusted_after_method_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class LazyTrustedHook:
-        @classmethod
-        def find_spec(cls, _name: str) -> None:
-            return None
+    standard_hook = next(
+        hook
+        for hook in sys.path_hooks
+        if _path_hook_resolution_identity(hook) == "trusted:importlib.machinery.FileFinder.path_hook"
+    )
+    initial_identity = _path_hook_resolution_identity(standard_hook)
 
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._TRUSTED_PATH_HOOKS", (LazyTrustedHook,))
-    initial_identity = _path_hook_resolution_identity(LazyTrustedHook)
-
-    def initialized_find_spec(cls: type[LazyTrustedHook], _name: str) -> None:
+    def changed_find_spec(self: FileFinder, _name: str, _target: object = None) -> None:
         return None
 
-    monkeypatch.setattr(LazyTrustedHook, "find_spec", classmethod(initialized_find_spec))
+    monkeypatch.setattr(FileFinder, "find_spec", changed_find_spec)
 
-    assert _path_hook_resolution_identity(LazyTrustedHook) == initial_identity
-    assert _is_standard_path_hook(LazyTrustedHook)
+    changed_identity = _path_hook_resolution_identity(standard_hook)
+    assert changed_identity != initial_identity
+    assert ":unreusable:" in changed_identity
+    assert not _is_standard_path_hook(standard_hook)
+
+
+def test_arbitrary_path_hook_is_not_trusted_even_if_present_at_startup() -> None:
+    class StartupPathHook:
+        def __call__(self, _path: str) -> None:
+            raise ImportError
+
+    hook = StartupPathHook()
+
+    assert not _is_standard_path_hook(hook)
+    assert ":unreusable:" in _path_hook_resolution_identity(hook)
 
 
 def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:

@@ -958,6 +958,7 @@ def _without_unproven_oversized_frame_tamper(
         errors=report.errors,
         coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1002,6 +1003,7 @@ def _with_unbounded_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1053,6 +1055,7 @@ def _with_known_stream_notice(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1106,6 +1109,7 @@ def _with_short_read_error(
             opcode_scan_complete=False,
         ),
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 

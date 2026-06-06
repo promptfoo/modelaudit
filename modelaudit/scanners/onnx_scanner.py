@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from ._evidence_redaction import redact_untrusted_error_message
 from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger("modelaudit.scanners")
@@ -515,14 +516,15 @@ class OnnxScanner(BaseScanner):
                         raise_on_error=True,
                     )
                 except Exception as e:
-                    logger.warning("ONNX JIT/script detector analysis failed: %s", e)
+                    redacted_error = redact_untrusted_error_message(e)
+                    logger.warning("ONNX JIT/script detector analysis failed: %s", redacted_error)
                     self._mark_raw_detection_incomplete(
                         result,
                         path,
                         detector="jit_script",
                         reason="analysis_failed",
-                        message=f"ONNX JIT/script detector analysis failed: {e!s}",
-                        details={"exception": str(e), "exception_type": type(e).__name__},
+                        message=f"ONNX JIT/script detector analysis failed: {redacted_error}",
+                        details={"exception": redacted_error, "exception_type": type(e).__name__},
                     )
                 else:
                     self.add_jit_script_findings(
@@ -543,14 +545,15 @@ class OnnxScanner(BaseScanner):
                         raise_on_error=True,
                     )
                 except Exception as e:
-                    logger.warning("ONNX network detector analysis failed: %s", e)
+                    redacted_error = redact_untrusted_error_message(e)
+                    logger.warning("ONNX network detector analysis failed: %s", redacted_error)
                     self._mark_raw_detection_incomplete(
                         result,
                         path,
                         detector="network_communication",
                         reason="analysis_failed",
-                        message=f"ONNX network detector analysis failed: {e!s}",
-                        details={"exception": str(e), "exception_type": type(e).__name__},
+                        message=f"ONNX network detector analysis failed: {redacted_error}",
+                        details={"exception": redacted_error, "exception_type": type(e).__name__},
                     )
                 else:
                     self.add_network_communication_findings(
