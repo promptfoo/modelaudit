@@ -253,8 +253,8 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TextScanner",
         "description": "Scans ML-related text files",
         "extensions": [".txt", ".md", ".markdown", ".rst"],
-        "content_routed_filenames": ["readme", "model_card", "requirements.txt"],
-        "priority": 0,
+        "content_routed_filenames": ["requirements.txt"],
+        "priority": 11,
         "dependencies": [],
         "numpy_sensitive": False,
     },
@@ -547,7 +547,6 @@ def get_scanner_registry_metadata() -> dict[str, dict[str, Any]]:
 
         for list_key in (
             "content_routed_extensions",
-            "content_routed_filename_prefixes",
             "content_routed_filenames",
             "dependencies",
             "extensions",

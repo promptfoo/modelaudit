@@ -490,12 +490,6 @@ class ScannerRegistry:
         if filename in content_routed_filenames:
             return True
 
-        if any(
-            filename.startswith(str(prefix).lower())
-            for prefix in scanner_info.get("content_routed_filename_prefixes", [])
-        ):
-            return True
-
         allowed_extensions = {str(extension).lower() for extension in scanner_info.get("extensions", [])}
         allowed_extensions.discard("")
         if not allowed_extensions:

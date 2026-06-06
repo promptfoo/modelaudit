@@ -10,16 +10,18 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
-from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.models import create_initial_audit_result
+from modelaudit.scanner_results import Check, CheckStatus, ScanResult
 from modelaudit.utils.sources.dvc import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
     DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
     DVC_POINTER_TOO_LARGE_REASON,
     MAX_DVC_POINTER_BYTES,
+    DvcResolution,
     dvc_omitted_outputs_covered,
     resolve_dvc_file,
     resolve_dvc_file_status,
+    resolve_dvc_file_with_metadata,
 )
 
 
@@ -1126,7 +1128,7 @@ class TestDvcSecurity:
             # If allowed, should still point to the resolved location
             assert len(resolved) <= 1
 
-    def test_resource_exhaustion_prevention(self, tmp_path):
+    def test_resource_exhaustion_prevention(self, tmp_path: Path) -> None:
         """Test prevention of resource exhaustion via too many outputs."""
         # Create DVC file with excessive outputs
         dvc_content = "outs:\n"
@@ -1139,9 +1141,866 @@ class TestDvcSecurity:
         resolved = resolve_dvc_file(str(dvc_file))
         # Should be limited to MAX_OUTPUTS (100)
         assert len(resolved) <= 100
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.declared_output_count == 150
+        assert resolution.output_limit == 100
+        assert resolution.omitted_output_count == 50
+        assert resolution.analysis_incomplete is True
+        assert resolution.omitted_targets == []
+        assert resolution.unresolved_omitted_output_count == 50
+        assert resolution.unverified_omitted_output_count == 0
 
-    def test_duplicate_outputs_past_limit_are_discharged(self, tmp_path: Path) -> None:
-        """Repeated declarations do not create an unscanned physical artifact."""
+    def test_over_limit_dvc_scan_fails_closed_for_omitted_late_output(self, tmp_path: Path) -> None:
+        """A malicious output past the DVC cap must not look like complete clean coverage."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        dvc_lines.append(f"- path: {late_malicious.name}")
+
+        dvc_file = tmp_path / "over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == 100
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        asset_paths = {asset.path for asset in result.assets}
+        assert str(late_malicious) not in asset_paths
+        output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
+        assert len(output_limit_issues) == 1
+        assert output_limit_issues[0].message == "DVC output limit exceeded - not all declared outputs were scanned"
+        details = output_limit_issues[0].details
+        assert details["analysis_incomplete"] is True
+        assert details["scan_outcome"] == "inconclusive"
+        assert details["declared_output_count"] == 101
+        assert details["output_limit"] == 100
+        assert details["resolved_output_count"] == 100
+        assert details["omitted_output_count"] == 1
+        assert details["unresolved_omitted_output_count"] == 0
+        assert details["unverified_omitted_output_count"] == 0
+
+        cached_result = scan_model_directory_or_file(
+            str(dvc_file),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+        )
+        assert cached_result.success is False
+        assert determine_exit_code(cached_result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in cached_result.issues)
+
+    def test_duplicate_dvc_outputs_do_not_exhaust_cap_or_fail_closed(self, tmp_path: Path) -> None:
+        """Duplicate declarations do not omit any unique artifact or trigger repeated scans."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        dvc_file = tmp_path / "duplicate_outputs.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 101)
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(target)]
+        assert resolution.omitted_output_count == 1
+        assert resolution.omitted_targets == []
+        assert resolution.analysis_incomplete is False
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_dvc_tail_past_verification_window_does_not_fail_closed(self, tmp_path: Path) -> None:
+        """Repeated known outputs beyond the verification window do not represent omitted artifacts."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        dvc_file = tmp_path / "duplicate_tail.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 250)
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(target)]
+        assert resolution.omitted_output_count == 150
+        assert resolution.unverified_omitted_output_count == 0
+        assert resolution.analysis_incomplete is False
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_capped_dvc_scan_rejects_same_count_pointer_rewrite(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Coverage metadata must not discharge a pointer rewritten after resolution."""
+        benign = tmp_path / "benign.pkl"
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "rewritten.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 101)
+
+        from modelaudit import core
+
+        original_resolver = core.resolve_dvc_file_status
+
+        def resolve_then_rewrite(file_path: str) -> DvcResolution:
+            resolution = original_resolver(file_path)
+            dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late_malicious.pkl\n")
+            return resolution
+
+        monkeypatch.setattr(core, "resolve_dvc_file_status", resolve_then_rewrite)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+        assert not any(asset.path == str(late_malicious) for asset in result.assets)
+
+    def test_capped_dvc_revalidation_rejects_oversized_rewrite(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The post-scan pointer identity check must retain the bounded read limit."""
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 2)
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_POINTER_BYTES", 128)
+        target = tmp_path / "model.pkl"
+        target.write_bytes(pickle.dumps({"safe": True}))
+        dvc_file = tmp_path / "rewritten-large.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 3)
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.source_digest is not None
+
+        dvc_file.write_bytes(b"x" * 129)
+
+        assert (
+            dvc_omitted_outputs_covered(
+                str(dvc_file),
+                resolution,
+                lambda _target: True,
+                coverage_budget=0,
+            )
+            is False
+        )
+
+    def test_directory_scan_accepts_unchanged_duplicate_only_cap(self, tmp_path: Path) -> None:
+        """Stable duplicate declarations remain complete when the directory walk covers the target."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        dvc_file = tmp_path / "directory_duplicates.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 101)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert any(asset.path == str(benign) for asset in result.assets)
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_cli_keeps_capped_pointer_rewritten_during_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CLI pre-expansion must not discard a capped pointer that changes after resolution."""
+        from modelaudit import cli
+
+        benign = tmp_path / "benign.pkl"
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "cli_rewritten.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 101)
+        original_resolver = cli.resolve_dvc_file_with_metadata
+
+        def resolve_then_rewrite(file_path: str) -> DvcResolution:
+            resolution = original_resolver(file_path)
+            dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late_malicious.pkl\n")
+            return resolution
+
+        monkeypatch.setattr(cli, "resolve_dvc_file_with_metadata", resolve_then_rewrite)
+
+        resolved_paths = cli._resolve_scan_paths((str(dvc_file),), 0.0)
+
+        assert resolved_paths == [str(dvc_file)]
+
+    def test_dvc_tail_verification_is_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Duplicate padding beyond the verification budget must fail closed."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_TAIL_DECLARATIONS", 2)
+        dvc_file = tmp_path / "bounded_tail.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 203)
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert resolution.tail_verification_truncated is True
+        assert resolution.analysis_incomplete is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
+        assert len(issues) == 1
+        assert issues[0].details["tail_verification_truncated"] is True
+
+    def test_duplicate_dvc_tail_cannot_hide_new_output_past_verification_window(self, tmp_path: Path) -> None:
+        """A genuinely new output after duplicate padding must still fail closed."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "duplicate_tail_padding.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + f"- path: {late_malicious.name}\n")
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(benign)]
+        assert resolution.unverified_omitted_output_count == 1
+        assert resolution.analysis_incomplete is True
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_dvc_outputs_cannot_hide_unique_late_output(self, tmp_path: Path) -> None:
+        """Duplicate padding must not discharge a unique output beyond the declaration cap."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"ok": True}, f)
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_file = tmp_path / "duplicate_padding.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late_malicious.pkl\n")
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.targets == [str(benign)]
+        assert resolution.omitted_targets == [str(late_malicious)]
+        assert resolution.analysis_incomplete is True
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_accepts_over_limit_dvc_when_walk_covers_omitted_outputs(self, tmp_path: Path) -> None:
+        """Directory traversal should discharge the cap when it scans the omitted in-tree output."""
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "directory_over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert result.has_errors is False
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_detects_malicious_omitted_output(self, tmp_path: Path) -> None:
+        """Discharging the DVC cap must still scan and report a malicious omitted output."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        dvc_lines.append(f"- path: {late_malicious.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_malicious.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(late_malicious) in issue.location
+            for issue in result.issues
+        )
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_accepts_fully_covered_tail_past_verification_window(self, tmp_path: Path) -> None:
+        """A large in-tree DVC tail is covered by the already completed directory walk."""
+        dvc_lines = ["outs:"]
+        for index in range(205):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "directory_large_covered_tail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 205
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_rejects_skipped_tail_past_verification_window(self, tmp_path: Path) -> None:
+        """Tail verification must not treat a filtered path as directory-walk coverage."""
+        dvc_lines = ["outs:"]
+        for index in range(200):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+        skipped_target = tmp_path / "payload.py"
+        skipped_target.write_text("print('not scanned')\n")
+        dvc_lines.append(f"- path: {skipped_target.name}")
+
+        dvc_file = tmp_path / "directory_large_skipped_tail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_over_limit_dvc_stays_incomplete_for_skipped_output(self, tmp_path: Path) -> None:
+        """A filtered omitted output is not covered merely because it lives under the walked root."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        skipped_target = tmp_path / "payload.py"
+        skipped_target.write_text("print('not scanned by the ordinary directory walk')\n")
+        dvc_lines.append(f"- path: {skipped_target.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_skipped.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_accepts_covered_omitted_directory_output(self, tmp_path: Path) -> None:
+        """An omitted directory is covered when the walk scans all model files inside it."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        model_dir = tmp_path / "model_dir"
+        model_dir.mkdir()
+        nested_model = model_dir / "nested.pkl"
+        with nested_model.open("wb") as f:
+            pickle.dump({"nested": True}, f)
+        dvc_lines.append(f"- path: {model_dir.name}")
+
+        dvc_file = tmp_path / "directory_output.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert str(nested_model) in {asset.path for asset in result.assets}
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_stays_incomplete_for_unresolved_omitted_output(self, tmp_path: Path) -> None:
+        """An unsafe omitted output must not vacuously discharge the DVC cap."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_lines.append("- path: ../outside.pkl")
+        dvc_file = tmp_path / "directory_over_limit_unsafe.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
+        assert len(output_limit_issues) == 1
+        assert output_limit_issues[0].details["unresolved_omitted_output_count"] == 1
+
+    def test_over_limit_dvc_coverage_verification_is_bounded(self, tmp_path: Path) -> None:
+        """Directory coverage metadata must not resolve an unbounded omitted tail."""
+        dvc_file = tmp_path / "large_tail.dvc"
+        dvc_file.write_text("outs:\n" + "".join(f"- path: missing_{index:03}.pkl\n" for index in range(250)))
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+
+        assert resolution.declared_output_count == 250
+        assert resolution.omitted_output_count == 150
+        assert resolution.omitted_targets == []
+        assert resolution.unresolved_omitted_output_count == 100
+        assert resolution.unverified_omitted_output_count == 50
+
+    def test_in_limit_dvc_scan_remains_complete_for_benign_outputs(self, tmp_path: Path) -> None:
+        """Normal DVC pointers under the cap still expand and scan cleanly."""
+        targets = []
+        for index in range(2):
+            target = tmp_path / f"benign_{index}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            targets.append(target)
+
+        dvc_file = tmp_path / "in_limit.dvc"
+        dvc_file.write_text("outs:\n" + "".join(f"- path: {target.name}\n" for target in targets))
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.analysis_incomplete is False
+        assert resolution.omitted_output_count == 0
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == len(targets)
+        assert result.success is True
+        assert result.has_errors is False
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_cli_preserves_over_limit_dvc_pointer_for_core_fail_closed(self, tmp_path: Path) -> None:
+        """CLI pre-expansion should not discard DVC cap metadata before core sees it."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"model_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "cli_over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        assert _resolve_scan_paths((str(dvc_file),), 0.0) == [str(dvc_file)]
+
+    def test_cli_does_not_prewalk_directories_without_capped_dvc(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordinary directory scans must not pay the DVC coverage traversal cost."""
+        from modelaudit import cli as cli_module
+
+        monkeypatch.setattr(cli_module.os, "walk", lambda *_args, **_kwargs: pytest.fail("unexpected directory walk"))
+
+        assert cli_module._resolve_scan_paths((str(tmp_path),), 0.0) == [str(tmp_path)]
+
+    def test_cli_error_asset_does_not_count_as_dvc_coverage(self, tmp_path: Path) -> None:
+        """An operationally failed sibling scan must not discharge a capped output."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        failed_path = tmp_path / "failed.pkl"
+        failed_path.write_bytes(b"not-a-complete-scan")
+        failed_result = create_initial_audit_result()
+        failed_result.success = False
+        failed_result.has_errors = True
+        failed_result.assets.append(AssetModel(path=str(failed_path), type="error"))
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(failed_path), failed_result)
+
+        assert path_state.dvc_covered_paths == set()
+        assert path_state.dvc_covered_directories == set()
+
+    def test_cli_shard_check_paths_count_as_dvc_coverage(self, tmp_path: Path) -> None:
+        """Shard siblings scanned by the advanced handler must discharge capped outputs."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        first_shard = tmp_path / "model-00001-of-00002.safetensors"
+        second_shard = tmp_path / "model-00002-of-00002.safetensors"
+        first_shard.write_bytes(b"first")
+        second_shard.write_bytes(b"second")
+        shard_result = create_initial_audit_result()
+        shard_result.assets.append(AssetModel(path=str(first_shard), type="safetensors"))
+        shard_result.checks.append(
+            Check(
+                name="Sharded Model Detection",
+                status=CheckStatus.PASSED,
+                message="Detected complete sharded model",
+                details={"shards": [str(first_shard), str(second_shard)]},
+            )
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(first_shard), shard_result)
+
+        assert path_state.dvc_covered_paths == {str(first_shard), str(second_shard)}
+
+    def test_cli_orders_capped_pointer_after_sibling_paths(self, tmp_path: Path) -> None:
+        """Concrete sibling inputs should run before a capped pointer verifies their coverage."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        targets = []
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"model_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            targets.append(target)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "cli_sibling_coverage.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        resolved_paths = _resolve_scan_paths(tuple(str(path) for path in [dvc_file, *targets]), 0.0)
+
+        assert resolved_paths == [*(str(path) for path in targets), str(dvc_file)]
+
+    def test_cli_orders_uppercase_capped_pointer_after_sibling(self, tmp_path: Path) -> None:
+        """DVC pointer ordering should use the same case-insensitive suffix rule as core."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        late_target = tmp_path / "late.pkl"
+        benign.write_bytes(pickle.dumps({"benign": True}))
+        late_target.write_bytes(pickle.dumps({"late": True}))
+        dvc_file = tmp_path / "MODEL.DVC"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(late_target)), 0.0)
+
+        assert resolved_paths == [str(late_target), str(dvc_file)]
+
+    def test_cli_preserves_capped_pointer_with_non_model_sibling(self, tmp_path: Path) -> None:
+        """Coverage decisions occur after runtime filtering rather than during path expansion."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"model_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+        skipped_target = tmp_path / "payload.py"
+        skipped_target.write_text("print('filtered')\n")
+        dvc_lines.append(f"- path: {skipped_target.name}")
+
+        dvc_file = tmp_path / "cli_filtered_sibling.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(skipped_target)), 0.0)
+
+        assert resolved_paths == [str(skipped_target), str(dvc_file)]
+
+    def test_cli_preserves_capped_pointer_for_runtime_coverage(self, tmp_path: Path) -> None:
+        """Runtime filtering determines whether a sibling actually covers an omitted output."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        strict_target = tmp_path / "payload.py"
+        strict_target.write_text("print('strictly scanned')\n")
+        dvc_file = tmp_path / "cli_strict_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: payload.py\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(strict_target)), 0.0)
+
+        assert resolved_paths == [str(strict_target), str(dvc_file)]
+
+    def test_cli_orders_scannable_text_sibling_before_capped_pointer(self, tmp_path: Path) -> None:
+        """A text sibling is scanned before the capped pointer verifies coverage."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        vocabulary = tmp_path / "vocab.txt"
+        vocabulary.write_text("safe-token\n")
+        dvc_file = tmp_path / "cli_text_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: vocab.txt\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(vocabulary)), 0.0)
+
+        assert resolved_paths == [str(vocabulary), str(dvc_file)]
+
+    def test_cli_orders_sibling_directory_before_capped_pointer(self, tmp_path: Path) -> None:
+        """A sibling directory is scanned before the capped pointer verifies descendants."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        late_target = models_dir / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        dvc_file = tmp_path / "cli_directory_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/late.pkl\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(models_dir)), 0.0)
+
+        assert resolved_paths == [str(models_dir), str(dvc_file)]
+
+    def test_cli_directory_auto_defaults_preserve_capped_pointer(self, tmp_path: Path) -> None:
+        """Directory auto-defaults apply before the capped pointer verifies coverage."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        source_target = models_dir / "payload.py"
+        source_target.write_text("value = 1\n")
+        dvc_file = tmp_path / "cli_directory_source_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/payload.py\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(models_dir)), 0.0)
+
+        assert resolved_paths == [str(models_dir), str(dvc_file)]
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics are required")
+    def test_cli_keeps_pointer_for_directory_with_unwalked_symlink_subtree(self, tmp_path: Path) -> None:
+        """A sibling directory must not cover content reachable only through a symlink."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        malicious = real_dir / "malicious.pkl"
+        with malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        bundle_dir = tmp_path / "bundle"
+        bundle_dir.mkdir()
+        (bundle_dir / "linked").symlink_to(real_dir, target_is_directory=True)
+        dvc_file = tmp_path / "cli_symlinked_directory.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: bundle\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(bundle_dir)), 0.0)
+
+        assert resolved_paths == [str(bundle_dir), str(dvc_file)]
+
+    def test_cli_orders_under_limit_sibling_dvc_before_capped_pointer(self, tmp_path: Path) -> None:
+        """An under-limit sibling pointer should establish concrete coverage first."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        late_target = tmp_path / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        capped_pointer = tmp_path / "capped.dvc"
+        capped_pointer.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+        sibling_pointer = tmp_path / "late.dvc"
+        sibling_pointer.write_text("outs:\n- path: late.pkl\n")
+
+        resolved_paths = _resolve_scan_paths((str(capped_pointer), str(sibling_pointer)), 0.0)
+
+        assert resolved_paths == [str(sibling_pointer), str(capped_pointer)]
+
+    def test_single_pointer_discharges_omitted_file_scanned_through_directory(self, tmp_path: Path) -> None:
+        """A resolved first-window directory can cover an omitted descendant."""
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        late_target = models_dir / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        dvc_file = tmp_path / "directory_coverage.dvc"
+        dvc_file.write_text("outs:\n- path: models\n" + "- path: benign.pkl\n" * 99 + "- path: models/late.pkl\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 0
+        assert any(asset.path == str(late_target) for asset in result.assets)
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_single_pointer_discharges_omitted_directory_scanned_through_parent(self, tmp_path: Path) -> None:
+        """A resolved parent directory can cover an omitted nested directory."""
+        models_dir = tmp_path / "models"
+        nested_dir = models_dir / "nested"
+        nested_dir.mkdir(parents=True)
+        late_target = nested_dir / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        dvc_file = tmp_path / "nested_directory_coverage.dvc"
+        dvc_file.write_text("outs:\n- path: models\n" + "- path: benign.pkl\n" * 99 + "- path: models/nested\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 0
+        assert any(asset.path == str(late_target) for asset in result.assets)
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_canonical_tail_aliases_count_as_one_covered_output(self, tmp_path: Path) -> None:
+        """Lexical aliases of one target must not inflate the verification budget."""
+        benign = tmp_path / "benign.pkl"
+        late_target = tmp_path / "late.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        aliases = ["late.pkl", "./late.pkl", ".//late.pkl", ".///late.pkl", ".////late.pkl"]
+        dvc_file = tmp_path / "canonical_aliases.dvc"
+        dvc_file.write_text(
+            "outs:\n" + "- path: benign.pkl\n" * 200 + "".join(f"- path: {alias}\n" for alias in aliases)
+        )
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert resolution.unverified_omitted_output_count == 1
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_directory_tail_is_verified_once(self, tmp_path: Path) -> None:
+        """Duplicate tail declarations must not repeat recursive coverage work."""
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        directory = tmp_path / "models"
+        directory.mkdir()
+        dvc_file = tmp_path / "duplicate_directory_tail.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + "- path: models\n" * 1000)
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        verified: list[Path] = []
+
+        def record_covered(target: Path) -> bool:
+            verified.append(target)
+            return True
+
+        covered = dvc_omitted_outputs_covered(
+            str(dvc_file),
+            resolution,
+            record_covered,
+            coverage_budget=1,
+        )
+
+        assert covered is True
+        assert verified == [directory]
+
+    def test_cli_orders_unique_tail_sibling_before_duplicate_padded_pointer(self, tmp_path: Path) -> None:
+        """A unique late sibling should be scanned before the capped pointer verifies it."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        late_target = tmp_path / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+
+        dvc_file = tmp_path / "cli_duplicate_padding.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + "- path: late.pkl\n")
+
+        resolved_paths = _resolve_scan_paths((str(dvc_file), str(late_target)), 0.0)
+
+        assert resolved_paths == [str(late_target), str(dvc_file)]
+
+    def test_over_limit_dvc_recurses_into_resolved_directory_output(self, tmp_path: Path) -> None:
+        """Preserving an over-limit pointer must still recurse into directories in the scanned window."""
+        model_dir = tmp_path / "model_dir"
+        model_dir.mkdir()
+        nested_malicious = model_dir / "nested_malicious.pkl"
+        with nested_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+
+        dvc_lines = ["outs:", f"- path: {model_dir.name}"]
+        for index in range(99):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+        late_target = tmp_path / "late.pkl"
+        with late_target.open("wb") as f:
+            pickle.dump({"late": True}, f)
+        dvc_lines.append(f"- path: {late_target.name}")
+
+        dvc_file = tmp_path / "directory_first.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 100
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(nested_malicious) in issue.location
+            for issue in result.issues
+        )
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_duplicate_only_output_limit_is_complete(self, tmp_path: Path) -> None:
+        """A capped tail containing only duplicate declarations adds no coverage gap."""
         target = tmp_path / "model.pkl"
         with target.open("wb") as f:
             pickle.dump({"safe": True}, f)
@@ -1152,8 +2011,9 @@ class TestDvcSecurity:
         resolution = resolve_dvc_file_status(str(dvc_file))
 
         assert resolution.resolved_paths == (str(target),)
-        assert resolution.analysis_incomplete is True
-        assert resolution.incomplete_reason == DVC_OUTPUT_LIMIT_EXCEEDED_REASON
+        assert resolution.omitted_output_count == 1
+        assert resolution.analysis_incomplete is False
+        assert resolution.incomplete_reason is None
 
         results = scan_model_directory_or_file(str(dvc_file))
 
@@ -1161,136 +2021,6 @@ class TestDvcSecurity:
         assert results.has_errors is False
         assert results.success is True
         assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in results.issues)
-
-    def test_unique_output_past_limit_fails_closed(self, tmp_path: Path) -> None:
-        """A unique artifact after duplicate padding must remain an explicit gap."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        late_malicious = tmp_path / "late-malicious.pkl"
-        late_malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late-malicious.pkl\n")
-
-        resolution = resolve_dvc_file_status(str(dvc_file))
-        result = scan_model_directory_or_file(str(dvc_file))
-
-        assert resolution.omitted_targets == (str(late_malicious),)
-        assert str(late_malicious) not in {asset.path for asset in result.assets}
-        assert result.has_errors is True
-        assert result.success is False
-        assert determine_exit_code(result) == 2
-        cap_issue = next(issue for issue in result.issues if issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON)
-        assert cap_issue.details["pointer_digest"] == resolution.pointer_digest
-        assert cap_issue.details["resolved_outputs"] == list(resolution.resolved_paths)
-
-        cached_result = scan_model_directory_or_file(
-            str(dvc_file),
-            cache_enabled=True,
-            cache_dir=str(tmp_path / "cache"),
-        )
-        assert cached_result.success is False
-        assert determine_exit_code(cached_result) == 2
-        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in cached_result.issues)
-
-    def test_directory_scan_covers_and_detects_unique_late_output(self, tmp_path: Path) -> None:
-        """Independent directory coverage discharges the cap without hiding findings."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        late_malicious = tmp_path / "late-malicious.pkl"
-        late_malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late-malicious.pkl\n")
-
-        result = scan_model_directory_or_file(str(tmp_path))
-
-        assert determine_exit_code(result) == 1
-        assert str(late_malicious) in {asset.path for asset in result.assets}
-        assert any(issue.location and str(late_malicious) in issue.location for issue in result.issues)
-        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
-
-    def test_filtered_late_output_does_not_discharge_directory_coverage(self, tmp_path: Path) -> None:
-        """A file skipped by the directory prefilter remains an unscanned output."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        skipped = tmp_path / "payload.py"
-        skipped.write_text("print('not scanned')\n")
-        dvc_file = tmp_path / "filtered-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: payload.py\n")
-
-        result = scan_model_directory_or_file(str(tmp_path))
-
-        assert determine_exit_code(result) == 2
-        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
-
-    def test_duplicate_tail_past_verification_window_is_discharged(self, tmp_path: Path) -> None:
-        """Duplicate padding after the bounded window cannot manufacture a gap."""
-        target = tmp_path / "model.pkl"
-        target.write_bytes(pickle.dumps({"safe": True}))
-        dvc_file = tmp_path / "duplicate-tail.dvc"
-        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 250)
-
-        resolution = resolve_dvc_file_status(str(dvc_file))
-        result = scan_model_directory_or_file(str(dvc_file))
-
-        assert resolution.unverified_omitted_output_count == 0
-        assert result.files_scanned == 1
-        assert determine_exit_code(result) == 0
-        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
-
-    def test_unique_tail_past_verification_window_fails_closed(self, tmp_path: Path) -> None:
-        """A new physical output after duplicate padding remains an unresolved gap."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        late = tmp_path / "late.pkl"
-        late.write_bytes(pickle.dumps(_LateMaliciousPayload()))
-        dvc_file = tmp_path / "unique-tail.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + "- path: late.pkl\n")
-
-        resolution = resolve_dvc_file_status(str(dvc_file))
-        result = scan_model_directory_or_file(str(dvc_file))
-
-        assert resolution.unverified_omitted_output_count == 1
-        assert str(late) not in {asset.path for asset in result.assets}
-        assert determine_exit_code(result) == 2
-        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
-
-    def test_directory_scan_covers_tail_past_verification_window(self, tmp_path: Path) -> None:
-        """Actual directory assets can prove coverage for the bounded unverified tail."""
-        dvc_lines = ["outs:"]
-        for index in range(205):
-            target = tmp_path / f"model-{index:03}.pkl"
-            target.write_bytes(pickle.dumps({"index": index}))
-            dvc_lines.append(f"- path: {target.name}")
-        dvc_file = tmp_path / "large-tail.dvc"
-        dvc_file.write_text("\n".join(dvc_lines) + "\n")
-
-        result = scan_model_directory_or_file(str(tmp_path))
-
-        assert result.files_scanned == 205
-        assert determine_exit_code(result) == 0
-        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
-
-    def test_coverage_revalidates_bounded_omitted_outputs(self, tmp_path: Path) -> None:
-        """A same-count pointer rewrite cannot inherit stale coverage metadata."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        old_late = tmp_path / "old-late.pkl"
-        old_late.write_bytes(pickle.dumps({"old": True}))
-        new_late = tmp_path / "new-late.pkl"
-        new_late.write_bytes(pickle.dumps(_LateMaliciousPayload()))
-        dvc_file = tmp_path / "rewritten.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: old-late.pkl\n")
-        resolution = resolve_dvc_file_status(str(dvc_file))
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: new-late.pkl\n")
-
-        covered = dvc_omitted_outputs_covered(
-            str(dvc_file),
-            resolution,
-            lambda target: target == old_late,
-            coverage_budget=1,
-        )
-
-        assert covered is False
 
     def test_partially_materialized_directory_output_fails_closed(self, tmp_path: Path) -> None:
         """Declared DVC file and byte lower bounds must not be silently underfilled."""
@@ -1710,6 +2440,66 @@ class TestDvcSecurity:
 class TestDvcCliIntegration:
     """Test DVC integration through CLI."""
 
+    def test_cli_sibling_coverage_avoids_false_inconclusive_exit(self, tmp_path: Path) -> None:
+        """A fully covered expanded argument list should complete without a DVC cap error."""
+        import json
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        targets = []
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"model_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            targets.append(target)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "cli_covered.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["scan", "--format", "json", str(dvc_file), *(str(target) for target in targets)],
+        )
+
+        assert result.exit_code == 0, result.output
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 101
+        assert not any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
+
+    def test_cli_directory_sibling_scans_malicious_omitted_output(self, tmp_path: Path) -> None:
+        """Directory coverage must still surface a malicious omitted descendant."""
+        import json
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        with benign.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        malicious = models_dir / "malicious.pkl"
+        with malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        dvc_file = tmp_path / "cli_directory_sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/malicious.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--format", "json", str(dvc_file), str(models_dir)],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output)
+        assert any(issue.get("rule_code") == "S201" for issue in output_data["issues"])
+        assert not any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
+
     def test_cli_dvc_file_expansion(self, tmp_path: Path) -> None:
         """Test that CLI properly expands DVC files."""
         from click.testing import CliRunner
@@ -1775,150 +2565,6 @@ class TestDvcCliIntegration:
         assert any(issue.get("location") and str(late) in issue["location"] for issue in output_data["issues"])
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
-    def test_cli_benign_info_issue_does_not_become_operational_after_cap_discharge(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Ordinary informational findings must not turn a completed scan into exit 2."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        late = tmp_path / "late.pkl"
-        late.write_bytes(pickle.dumps({"late": True}))
-        dvc_file = tmp_path / "late-output.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
-
-        from click.testing import CliRunner
-
-        from modelaudit import cli as cli_module
-
-        real_scan = cli_module.scan_model_directory_or_file
-
-        def scan_with_info(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
-            result = real_scan(path, *args, **kwargs)
-            if path == str(late):
-                result.issues.append(
-                    Issue(
-                        message="Benign informational note",
-                        severity=IssueSeverity.INFO,
-                        location=path,
-                    )
-                )
-            return result
-
-        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_with_info)
-
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
-        )
-
-        assert result.exit_code == 0
-        output_data = json.loads(result.output)
-        assert output_data["success"] is True
-        assert output_data["has_errors"] is False
-        assert any(issue["message"] == "Benign informational note" for issue in output_data["issues"])
-        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
-
-    def test_cli_pointer_rewrite_cannot_discharge_prior_output_cap(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Coverage must remain bound to the DVC pointer that produced the cap issue."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        hidden = tmp_path / "hidden.pkl"
-        hidden.write_bytes(pickle.dumps({"hidden": True}))
-        late = tmp_path / "late.pkl"
-        late.write_bytes(pickle.dumps({"late": True}))
-        dvc_file = tmp_path / "mutable.dvc"
-        pointer_prefix = "outs:\n" + "- path: benign.pkl\n" * 100
-        dvc_file.write_text(pointer_prefix + "- path: hidden.pkl\n")
-
-        from click.testing import CliRunner
-
-        from modelaudit import cli as cli_module
-
-        real_scan = cli_module.scan_model_directory_or_file
-
-        def scan_then_rewrite_pointer(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
-            result = real_scan(path, *args, **kwargs)
-            if path == str(dvc_file):
-                dvc_file.write_text(pointer_prefix + "- path: late.pkl\n")
-            return result
-
-        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_then_rewrite_pointer)
-
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(late), "--format", "json", "--no-cache"],
-        )
-
-        assert result.exit_code == 2
-        output_data = json.loads(result.output)
-        assert output_data["success"] is False
-        assert output_data["has_errors"] is True
-        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
-
-    def test_cli_shard_check_coverage_discharges_output_cap(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A passed shard check can prove coverage of siblings omitted from assets."""
-        benign = tmp_path / "benign.pkl"
-        benign.write_bytes(pickle.dumps({"safe": True}))
-        shards = [
-            tmp_path / "model-00001-of-00002.safetensors",
-            tmp_path / "model-00002-of-00002.safetensors",
-        ]
-        for shard in shards:
-            shard.write_bytes(b"0123456789")
-        dvc_file = tmp_path / "shards.dvc"
-        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + f"- path: {shards[1].name}\n")
-
-        def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            if path == str(shards[0]):
-                result.add_check(
-                    name="Sharded Model Detection",
-                    passed=True,
-                    message="Detected sharded model",
-                    details={"shards": [str(shard) for shard in shards]},
-                )
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
-
-        from click.testing import CliRunner
-
-        from modelaudit import cli as cli_module
-
-        real_scan = cli_module.scan_model_directory_or_file
-
-        def scan_without_sibling_asset(path: str, *args: Any, **kwargs: Any) -> ModelAuditResultModel:
-            result = real_scan(path, *args, **kwargs)
-            if path == str(shards[0]):
-                result.assets = [asset for asset in result.assets if asset.path != str(shards[1])]
-                result.file_metadata.pop(str(shards[1]), None)
-            return result
-
-        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", scan_without_sibling_asset)
-
-        result = CliRunner().invoke(
-            cli_module.cli,
-            ["scan", str(dvc_file), str(shards[0]), "--format", "json", "--no-cache"],
-        )
-
-        assert result.exit_code == 0
-        output_data = json.loads(result.output)
-        assert output_data["success"] is True
-        assert output_data["has_errors"] is False
-        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
-
     def test_cli_scanner_selection_does_not_credit_excluded_sibling(self, tmp_path: Path) -> None:
         """An explicit sibling is not coverage when the selected scanner cannot analyze it."""
         benign = tmp_path / "benign.pkl"
@@ -1939,6 +2585,116 @@ class TestDvcCliIntegration:
 
         assert result.exit_code == 2
         output_data = json.loads(result.output)
+        assert output_data["success"] is False
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_scanner_selection_does_not_credit_excluded_directory_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A walked directory is not coverage for descendants excluded by scanner selection."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        excluded = models_dir / "metadata.yaml"
+        excluded.write_text("framework: pytorch\n")
+        dvc_file = tmp_path / "late-directory-output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/metadata.yaml\n")
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                str(dvc_file),
+                str(models_dir),
+                "--scanners",
+                "pickle",
+                "--format",
+                "json",
+                "--no-cache",
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["success"] is False
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_scanner_selection_credits_and_reports_selected_directory_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A selected malicious descendant discharges the cap without hiding its finding."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        malicious = models_dir / "payload.pkl"
+        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        dvc_file = tmp_path / "selected-directory-output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/payload.pkl\n")
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                str(dvc_file),
+                str(models_dir),
+                "--scanners",
+                "pickle",
+                "--format",
+                "json",
+                "--no-cache",
+            ],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert any(
+            issue.get("rule_code") == "S201" and issue.get("location") and str(malicious) in issue["location"]
+            for issue in output_data["issues"]
+        )
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_strict_mode_does_not_override_scanner_selection_for_coverage(self, tmp_path: Path) -> None:
+        """Strict filtering cannot make a file covered when its scanner remains excluded."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        excluded = tmp_path / "payload.py"
+        excluded.write_text("value = 1\n")
+        dvc_file = tmp_path / "strict-selected-output.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: payload.py\n")
+
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                str(dvc_file),
+                str(excluded),
+                "--strict",
+                "--scanners",
+                "pickle",
+                "--format",
+                "json",
+                "--no-cache",
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
         assert output_data["success"] is False
         assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
@@ -1966,6 +2722,137 @@ class TestDvcCliIntegration:
             and any("hidden_payload.pkl" in path for path in issue["details"]["unresolved_outputs"])
             for issue in output_data["issues"]
         )
+
+    def test_cli_capped_pointer_uses_actual_sibling_coverage(self, tmp_path: Path) -> None:
+        """A scanned sibling should discharge the cap without expanding the pointer."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        late_target = tmp_path / "late.pkl"
+        benign.write_bytes(pickle.dumps({"benign": True}))
+        late_target.write_bytes(pickle.dumps({"late": True}))
+        dvc_file = tmp_path / "capped.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(dvc_file), str(late_target), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 0
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 2
+        assert output_data["success"] is True
+        assert output_data["has_errors"] is False
+        assert output_data.get("content_hash") is None
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_streamed_directory_sibling_covers_omitted_output(self, tmp_path: Path) -> None:
+        """Streaming a sibling directory should provide concrete DVC coverage."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"benign": True}))
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        nested_target = models_dir / "nested.pkl"
+        nested_target.write_bytes(pickle.dumps({"nested": True}))
+        dvc_file = tmp_path / "streamed-directory.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/nested.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(dvc_file), str(models_dir), "--stream", "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 0
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 2
+        assert output_data["success"] is True
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_capped_pointer_respects_runtime_filtering_for_sibling_coverage(self, tmp_path: Path) -> None:
+        """A filtered sibling covers an omitted output only when strict mode scans it."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        benign = tmp_path / "benign.pkl"
+        source_target = tmp_path / "payload.py"
+        benign.write_bytes(pickle.dumps({"benign": True}))
+        source_target.write_text("value = 1\n")
+        dvc_file = tmp_path / "filtered-sibling.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: payload.py\n")
+
+        default_result = CliRunner().invoke(
+            cli,
+            ["scan", str(dvc_file), str(source_target), "--format", "json", "--no-cache"],
+        )
+        strict_result = CliRunner().invoke(
+            cli,
+            ["scan", str(dvc_file), str(source_target), "--strict", "--format", "json", "--no-cache"],
+        )
+
+        assert default_result.exit_code == 2
+        default_output = json.loads(default_result.output)
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in default_output["issues"])
+
+        assert strict_result.exit_code == 0
+        strict_output = json.loads(strict_result.output)
+        assert strict_output["files_scanned"] == 2
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in strict_output["issues"])
+
+    def test_cli_capped_pointer_preserves_shared_total_size_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sibling coverage must not split capped DVC outputs into fresh per-file budgets."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 2)
+        first = tmp_path / "first.pkl"
+        second = tmp_path / "second.pkl"
+        sibling = tmp_path / "sibling.pkl"
+        for target, value in ((first, "first"), (second, "second"), (sibling, "sibling")):
+            target.write_bytes(pickle.dumps({"payload": value * 20}))
+        max_size = max(first.stat().st_size, second.stat().st_size, sibling.stat().st_size)
+        assert first.stat().st_size + second.stat().st_size > max_size
+
+        dvc_file = tmp_path / "budgeted-capped.dvc"
+        dvc_file.write_text("outs:\n- path: first.pkl\n- path: second.pkl\n- path: sibling.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                str(dvc_file),
+                str(sibling),
+                "--max-size",
+                f"{max_size}B",
+                "--format",
+                "json",
+                "--no-cache",
+            ],
+        )
+
+        assert result.exit_code == 2
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 2
+        assert output_data["success"] is False
+        assert output_data["has_errors"] is True
+        assert any(
+            issue["details"].get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
+            and issue["details"].get("budget_type") == "total_size"
+            for issue in output_data["issues"]
+        )
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     def test_cli_partial_dvc_directory_output_scans_nested_payload(self, tmp_path: Path) -> None:
         """CLI partial DVC scans should traverse resolved directory outputs."""

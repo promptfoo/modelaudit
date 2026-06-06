@@ -1,7 +1,6 @@
 """Tests for HuggingFace URL handling."""
 
 import importlib
-import os
 import pickle
 import signal
 import struct
@@ -1315,7 +1314,6 @@ class TestModelDownload:
         mock_requests_get.assert_called_once()
         mock_snapshot_download.assert_not_called()
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -1331,7 +1329,6 @@ class TestModelDownload:
         _mock_get_model_size: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
-        _mock_monotonic: MagicMock,
     ) -> None:
         """Non-streaming acquisition should stop before a probe exceeds the scan deadline."""
 
@@ -1340,6 +1337,10 @@ class TestModelDownload:
             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
         with (
+            patch(
+                "modelaudit.utils.sources.huggingface.time",
+                SimpleNamespace(monotonic=MagicMock(return_value=100.0)),
+            ),
             patch.object(
                 _HuggingFaceProbeBudget,
                 "request_timeout",
@@ -1357,17 +1358,21 @@ class TestModelDownload:
         mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline")
     def test_download_model_starts_deadline_before_model_size_lookup(
         self,
         mock_get_model_size: MagicMock,
-        _mock_monotonic: MagicMock,
     ) -> None:
         """Optional model-size metadata must consume the end-to-end acquisition budget."""
         mock_get_model_size.side_effect = RuntimeError("stop after model-size lookup")
 
-        with pytest.raises(RuntimeError, match="stop after model-size lookup"):
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface.time",
+                SimpleNamespace(monotonic=MagicMock(return_value=100.0)),
+            ),
+            pytest.raises(RuntimeError, match="stop after model-size lookup"),
+        ):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
         mock_get_model_size.assert_called_once_with("test/model", 101.0)
@@ -1406,12 +1411,10 @@ class TestModelDownload:
             "test/model",
         )
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
     @patch("requests.get")
     def test_huggingface_prefix_rechecks_deadline_between_chunks(
         self,
         mock_requests_get: MagicMock,
-        _mock_monotonic: MagicMock,
     ) -> None:
         """A slow streaming response must not run past the acquisition deadline."""
         response = MagicMock()
@@ -1420,7 +1423,13 @@ class TestModelDownload:
         mock_requests_get.return_value = response
         budget = _HuggingFaceProbeBudget(remaining_bytes=1024, deadline=101.0)
 
-        with pytest.raises(ValueError, match=r"payload\.bin \(TimeoutError\)"):
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface.time",
+                SimpleNamespace(monotonic=MagicMock(side_effect=[100.0, 100.0, 102.0])),
+            ),
+            pytest.raises(ValueError, match=r"payload\.bin \(TimeoutError\)"),
+        ):
             _read_huggingface_prefix("test/model", "payload.bin", _HF_TEST_REVISION, budget, 1024)
 
         response.raise_for_status.assert_called_once_with()
@@ -1514,8 +1523,7 @@ class TestModelDownload:
 
         mock_terminate.assert_called_once_with(process)
 
-    @pytest.mark.skipif(not hasattr(os, "killpg"), reason="requires POSIX process groups")
-    @patch("modelaudit.utils.sources.huggingface.os.killpg")
+    @patch("modelaudit.utils.sources.huggingface.os.killpg", create=True)
     def test_download_worker_terminates_posix_process_group(self, mock_killpg: MagicMock) -> None:
         """Timeout cleanup must stop transfer helpers launched by the worker."""
         process = MagicMock()
@@ -2080,7 +2088,6 @@ class TestModelDownloadStreaming:
         assert all(call.kwargs["revision"] == _HF_TEST_REVISION for call in mock_hf_hub_download.call_args_list)
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2094,10 +2101,15 @@ class TestModelDownloadStreaming:
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
-        _mock_monotonic: MagicMock,
     ) -> None:
         """The scan deadline should stop acquisition before a late remote probe begins."""
-        with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface.time",
+                SimpleNamespace(monotonic=MagicMock(side_effect=[100.0, 100.0, 102.0])),
+            ),
+            pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"),
+        ):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
         _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)

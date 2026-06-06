@@ -15,11 +15,11 @@ from pathlib import Path
 from .file.filtering import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, should_skip_file
 from .sources.dvc import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
-    DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
     DvcResolution,
     dvc_omitted_outputs_covered,
     resolve_dvc_file,
     resolve_dvc_file_status,
+    resolve_dvc_file_with_metadata,
 )
 
 

