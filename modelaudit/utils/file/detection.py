@@ -982,6 +982,43 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "STACK_GLOBAL",
     }
 )
+_PROTOCOLLESS_BINARY_PICKLE_OPCODES: frozenset[str] = frozenset(
+    {
+        "ADDITEMS",
+        "BINBYTES",
+        "BINBYTES8",
+        "BINFLOAT",
+        "BINGET",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "BINPERSID",
+        "BINSTRING",
+        "BINUNICODE",
+        "BINUNICODE8",
+        "BYTEARRAY8",
+        "EMPTY_SET",
+        "FRAME",
+        "FROZENSET",
+        "LONG1",
+        "LONG4",
+        "LONG_BINGET",
+        "LONG_BINPUT",
+        "MEMOIZE",
+        "NEWFALSE",
+        "NEWOBJ_EX",
+        "NEWTRUE",
+        "NEXT_BUFFER",
+        "READONLY_BUFFER",
+        "SHORT_BINBYTES",
+        "SHORT_BINSTRING",
+        "SHORT_BINUNICODE",
+        "STACK_GLOBAL",
+        "TUPLE1",
+        "TUPLE2",
+        "TUPLE3",
+    }
+)
 
 
 def _read_proto_length_delimited_bounds_stream(
@@ -1575,6 +1612,47 @@ def _has_bounded_binary_pickle_security_signal(sample: bytes) -> bool:
     except Exception:
         return has_pre_stop_security_opcode
     return has_pre_stop_security_opcode
+
+
+def _looks_like_protocolless_binary_pickle_security_signal(
+    sample: bytes,
+    *,
+    sample_is_prefix: bool = False,
+) -> bool:
+    """Return whether a PROTO-less binary pickle prefix carries a security signal."""
+    if len(sample) < 2 or _looks_like_binary_pickle_protocol(sample[:4]) or sample[0] in PROTO0_1_START_BYTES:
+        return False
+
+    opcode_count = 0
+    has_binary_opcode = False
+    has_security_opcode = False
+    has_pre_stop_security_opcode = False
+    try:
+        for opcode, _arg, position in pickletools.genops(sample):
+            opcode_count += 1
+            opcode_name = opcode.name
+            if opcode_name == "PROTO":
+                return False
+            if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
+                has_binary_opcode = True
+            if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
+                has_security_opcode = True
+            if opcode_name in _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES:
+                has_pre_stop_security_opcode = True
+            if opcode_name == "STOP":
+                if opcode_count < 2 or not has_binary_opcode or not has_security_opcode:
+                    return False
+                stop_position = 0 if position is None else position
+                try:
+                    pickletools.dis(sample[: stop_position + 1], out=StringIO())
+                except Exception:
+                    return has_pre_stop_security_opcode
+                return True
+            if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                return False
+    except Exception:
+        return sample_is_prefix and opcode_count >= 2 and has_binary_opcode and has_pre_stop_security_opcode
+    return sample_is_prefix and opcode_count >= 2 and has_binary_opcode and has_pre_stop_security_opcode
 
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
@@ -3689,6 +3767,10 @@ def _detect_trusted_flax_foreign_content_routes(
     if (
         (include_unvalidated_pickle and _looks_like_binary_pickle_protocol(prefix[:4]))
         or _has_bounded_binary_pickle_security_signal(pickle_probe_sample)
+        or _looks_like_protocolless_binary_pickle_security_signal(
+            pickle_probe_sample,
+            sample_is_prefix=file_size > len(pickle_probe_sample),
+        )
         or _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
             sample_is_prefix=file_size > len(pickle_probe_sample),
@@ -3796,6 +3878,11 @@ def detect_format_from_magic_bytes(
 
     if file_path is not None:
         pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
+        if _looks_like_protocolless_binary_pickle_security_signal(
+            pickle_probe_sample,
+            sample_is_prefix=file_size > len(pickle_probe_sample),
+        ) and not _could_be_content_routed_flax_msgpack(file_path):
+            return "pickle"
         if _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
             sample_is_prefix=file_size > len(pickle_probe_sample),
@@ -4289,6 +4376,11 @@ def detect_file_format(path: str) -> str:
     ):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+    if _looks_like_protocolless_binary_pickle_security_signal(
+        pickle_probe_sample,
+        sample_is_prefix=size > len(pickle_probe_sample),
+    ) and not _could_be_content_routed_flax_msgpack(file_path):
+        return "pickle"
     if _looks_like_proto0_or_1_pickle(
         pickle_probe_sample,
         sample_is_prefix=size > len(pickle_probe_sample),

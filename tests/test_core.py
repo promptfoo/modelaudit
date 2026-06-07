@@ -13,6 +13,7 @@ import pickle
 import struct
 import subprocess
 import sys
+import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -191,6 +192,16 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
             return (os_module.system, ("echo core-dispatch-test",))
 
     return pickle.dumps(DangerousPayload(), protocol=protocol)
+
+
+def _build_protocolless_binary_malicious_pickle() -> bytes:
+    """Build a binary pickle gadget without the optional PROTO opcode."""
+    return b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+
+
+def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
+    """Build a harmless binary pickle scalar without the optional PROTO opcode."""
+    return b"\x8c\x02os\x94."
 
 
 def _require_tf_protos() -> None:
@@ -604,6 +615,14 @@ def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
         and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
         for issue in result.issues
     ), f"Expected S201 finding for {entry_name}, got: {[(i.location, i.message, i.details) for i in result.issues]}"
+
+
+def _assert_system_pickle_issue(result: ScanResult) -> None:
+    """Assert a pickle finding identifies the dangerous system global."""
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    ), f"Expected S201 system finding, got: {[(i.location, i.message, i.details) for i in result.issues]}"
 
 
 def _mock_sharded_scan_result(bytes_scanned: int, *, missing_shards: int = 0) -> ScanResult:
@@ -2021,6 +2040,69 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
 
     assert result.scanner_name == "zip"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_scan_file_routes_nested_protocolless_binary_pickle_with_misleading_suffix(
+    tmp_path: Path,
+    archive_kind: str,
+) -> None:
+    payload = _build_protocolless_binary_malicious_pickle()
+    entry_name = "payload.jpg"
+    archive_path = tmp_path / f"payload.{archive_kind}"
+    if archive_kind == "zip":
+        _create_misnamed_zip(archive_path, {entry_name: payload})
+    else:
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo(entry_name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == archive_kind
+    if archive_kind == "zip":
+        _assert_system_pickle_detected(result, entry_name)
+    else:
+        _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_compressed_protocolless_binary_pickle_with_misleading_suffix(tmp_path: Path) -> None:
+    compressed_payload = tmp_path / "payload.jpg.gz"
+    compressed_payload.write_bytes(gzip.compress(_build_protocolless_binary_malicious_pickle()))
+
+    result = scan_file(str(compressed_payload), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "compressed"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_does_not_route_protocolless_binary_pickle_scalar_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "notes.jpg"
+    near_match.write_bytes(_build_protocolless_binary_benign_scalar_pickle())
+
+    assert file_detection.detect_file_format(str(near_match)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert not result.issues
 
 
 def test_scan_file_routes_malicious_cntk_with_misleading_extension(tmp_path: Path) -> None:
