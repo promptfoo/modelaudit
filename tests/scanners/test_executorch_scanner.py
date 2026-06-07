@@ -7,18 +7,36 @@ import pytest
 
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.utils.file.detection import detect_file_format
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
-def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12", filename: str = "program.pte") -> Path:
+def create_executorch_binary(
+    tmp_path: Path,
+    *,
+    identifier: bytes = b"ET12",
+    filename: str = "program.pte",
+    payload: bytes = b"",
+) -> Path:
     binary_path = tmp_path / filename
     # Minimal valid FlatBuffer with the ExecuTorch file identifier.
-    binary_path.write_bytes(b"\x0c\x00\x00\x00" + identifier + b"\x04\x00\x04\x00\x04\x00\x00\x00")
+    binary_path.write_bytes(b"\x0c\x00\x00\x00" + identifier + b"\x04\x00\x04\x00\x04\x00\x00\x00" + payload)
     return binary_path
+
+
+def _valid_elf64_header() -> bytes:
+    header = bytearray(64)
+    header[:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    header[16:18] = (2).to_bytes(2, "little")
+    header[18:20] = (62).to_bytes(2, "little")
+    header[20:24] = (1).to_bytes(4, "little")
+    return bytes(header)
 
 
 def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Path:
@@ -123,6 +141,56 @@ def test_executorch_scanner_accepts_versioned_binary_program_header(tmp_path: Pa
     assert result.success is True
     assert result.bytes_scanned == file_path.stat().st_size
     assert not result.issues
+
+
+def test_executorch_scanner_analyzes_raw_payload_in_valid_binary_program(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(
+        tmp_path,
+        identifier=b"ET13",
+        payload=b"\x00" * 128 + b"os.system('id')" + b"\x00" * 64 + _valid_elf64_header() + b"\x00" * 64,
+    )
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.scanner_name == "executorch"
+    assert result.metadata["supplemental_scanners"] == ["pytorch_binary"]
+    assert result.bytes_scanned == file_path.stat().st_size
+    assert any(
+        check.name == "Embedded Code Pattern Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+    assert any(
+        issue.rule_code == "S501" and "Linux executable" in issue.message and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    assert result.success is False
+
+    aggregate = core.scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert aggregate.files_scanned == 1
+    assert core.determine_exit_code(aggregate) == 1
+    assert any("Linux executable" in issue.message for issue in aggregate.issues)
+
+
+def test_executorch_scanner_raw_payload_analysis_ignores_benign_near_match(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(
+        tmp_path,
+        identifier=b"ET13",
+        payload=b"\x00" * 128 + b"operator=acos.systematic_normalization" + b"\x00" * 128,
+    )
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata["supplemental_scanners"] == ["pytorch_binary"]
+    assert result.bytes_scanned == file_path.stat().st_size
+    assert not result.issues
+    assert any(
+        check.name == "Embedded Code Pattern Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
 
 
 def test_executorch_header_read_failure_is_inconclusive_not_security_finding(
