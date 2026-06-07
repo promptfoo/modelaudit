@@ -464,9 +464,9 @@ class TelemetryClient:
         """Build coarse telemetry properties for a file path."""
         return {
             "path_type": self._classify_path(path),
+            "source_type": self._classify_source_type(path),
             "file_extension": self._extract_file_extension(path),
-            "model_name": self._extract_model_name(path),
-            "model_reference": self._extract_model_reference(path),
+            "model_reference_type": self._extract_model_reference(path),
         }
 
     def _build_url_properties(self, url: str) -> dict[str, Any]:
@@ -474,8 +474,9 @@ class TelemetryClient:
         return {
             "domain": self._extract_domain(url),
             "path_type": self._classify_path(url),
-            "model_name": self._extract_model_name(url),
-            "model_reference": self._extract_model_reference(url),
+            "source_type": self._classify_source_type(url),
+            "file_extension": self._extract_file_extension(url),
+            "model_reference_type": self._extract_model_reference(url),
         }
 
     def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
@@ -603,59 +604,22 @@ class TelemetryClient:
                 logger.debug(f"Failed to send event to PostHog: {e}")
 
     def _extract_model_name(self, path: str) -> str | None:
-        """Extract model name from path or URL."""
+        """Deprecated privacy guard for legacy callers.
+
+        Telemetry must not emit raw filenames, repository IDs, bucket keys, or
+        other user-controlled model identifiers. Use `_extract_model_reference`
+        for a coarse source/extension bucket instead.
+        """
+        return None
+
+    def _extract_model_reference(self, path: str) -> str:
+        """Extract a coarse model reference class without preserving identity."""
         parsed = self._parse_url_reference(path)
         scheme = parsed.scheme.lower() if parsed else ""
-        is_http_url = scheme in {"http", "https"}
-        is_hf_shorthand = scheme == "hf"
-        url_host = self._extract_url_host(path) if parsed else None
-
-        # HuggingFace format: hf://org/model or https://huggingface.co/org/model
-        if is_hf_shorthand and parsed:
-            parts = [part for part in [url_host, *parsed.path.lstrip("/").split("/")] if part]
-            if len(parts) >= 2:
-                return f"{parts[0]}/{parts[1]}"
-        if (
-            is_http_url
-            and parsed
-            and url_host
-            and (url_host == "huggingface.co" or url_host.endswith(".huggingface.co"))
-        ):
-            parts = [part for part in parsed.path.lstrip("/").split("/") if part]
-            if len(parts) >= 2:
-                return f"{parts[0]}/{parts[1]}"
-
-        # PyTorch Hub format: pytorch://org/repo/model
-        if "pytorch" in path.lower() and "/" in path:
-            parts = (parsed.path if parsed and parsed.path else path).split("/")
-            return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-
-        # Local file: filename, or URL path leaf with query/fragment stripped.
-        name_source = parsed.path if parsed else path
-        if "/" in name_source or "\\" in name_source:
-            model_name = Path(name_source).name
-            if model_name:
-                return model_name
-
-        if parsed and url_host and url_host != "unknown":
-            return url_host
-
-        return name_source
-
-    def _extract_model_reference(self, path: str) -> str | None:
-        """Extract a secret-scrubbed model reference while preserving model identity."""
-        parsed = self._parse_url_reference(path)
-        if not parsed:
-            return self._extract_model_name(path)
-
-        try:
-            host = self._extract_url_host(path)
-            if not parsed.scheme or host == "unknown":
-                return self._extract_model_name(path)
-
-            return parsed._replace(netloc=host, params="", query="", fragment="").geturl()
-        except Exception:
-            return self._extract_model_name(path)
+        extension = self._extract_file_extension(path) or "no_extension"
+        if scheme:
+            return f"{self._classify_source_type(path)}:{extension}"
+        return f"{self._classify_path(path)}:{extension}"
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
@@ -682,8 +646,9 @@ class TelemetryClient:
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
-                "model_names": [self._extract_model_name(path) for path in paths],
-                "model_references": [self._extract_model_reference(path) for path in paths],
+                "model_reference_types": [self._extract_model_reference(path) for path in paths],
+                "file_extensions": [self._extract_file_extension(path) for path in paths],
+                "file_extension_counts": self._count_values([self._extract_file_extension(path) for path in paths]),
                 "source_types": source_types,
                 "path_types": path_types,
                 "source_type_counts": self._count_values(source_types),
@@ -733,8 +698,12 @@ class TelemetryClient:
                         "type": issue_type,
                         "severity": severity,
                         "location_type": self._classify_path(issue_location) if issue_location else "unknown",
-                        "model_name": self._extract_model_name(issue_location) if issue_location else None,
-                        "model_reference": self._extract_model_reference(issue_location) if issue_location else None,
+                        "location_file_extension": self._extract_file_extension(issue_location)
+                        if issue_location
+                        else None,
+                        "location_reference_type": self._extract_model_reference(issue_location)
+                        if issue_location
+                        else None,
                     }
                 )
 
@@ -755,7 +724,7 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
-                "model_references": [
+                "asset_reference_types": [
                     self._extract_model_reference(str(asset.get("path", "")))
                     for asset in assets
                     if isinstance(asset.get("path", ""), str) and asset.get("path")
@@ -922,18 +891,32 @@ class TelemetryClient:
             return "unknown"
 
     def _extract_domain(self, url: str) -> str:
-        """Extract domain from URL for analytics."""
-        return self._extract_url_host(url)
-
-    def _extract_url_host(self, url: str) -> str:
-        """Extract a sanitized URL host without userinfo for analytics."""
+        """Extract a provider bucket without preserving custom hostnames."""
         try:
             parsed = urlparse(url)
-            if not parsed.hostname:
-                return "unknown"
-            return f"{parsed.hostname}:{parsed.port}" if parsed.port is not None else parsed.hostname
         except Exception:
             return "unknown"
+
+        scheme = parsed.scheme.lower()
+        if scheme in {"s3", "gs", "azure", "hf", "pytorch"}:
+            return scheme
+
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return "unknown"
+        if hostname == "huggingface.co" or hostname.endswith(".huggingface.co"):
+            return "huggingface"
+        if hostname == "pytorch.org" or hostname.endswith(".pytorch.org"):
+            return "pytorch"
+        if hostname == "jfrog.io" or hostname.endswith(".jfrog.io"):
+            return "jfrog"
+        if hostname in {"localhost", "127.0.0.1", "::1"} or hostname.endswith(".local"):
+            return "local"
+        return "custom"
+
+    def _extract_url_host(self, url: str) -> str:
+        """Deprecated safe alias for callers that previously expected a host."""
+        return self._extract_domain(url)
 
     def _sanitize_error(self, error: Union[Exception, str]) -> str:
         """Sanitize error message to remove sensitive information."""
