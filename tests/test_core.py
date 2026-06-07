@@ -4849,7 +4849,7 @@ def test_scan_file_unavailable_keras_scanner_restores_whitelist_downgrade(
             name="Fallback Security Finding",
             passed=False,
             message="High confidence fallback anomaly",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.WARNING,
             rule_code="CUSTOM001",
         )
         result.finish(success=True)
@@ -4862,7 +4862,7 @@ def test_scan_file_unavailable_keras_scanner_restores_whitelist_downgrade(
     result = scan_file(str(disguised_keras), config={"cache_enabled": False})
 
     assert result.success is False
-    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].severity == IssueSeverity.WARNING
     assert result.issues[0].details["whitelist_downgrade_restored"] is True
     assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
 

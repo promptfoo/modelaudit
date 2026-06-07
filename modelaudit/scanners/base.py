@@ -286,6 +286,8 @@ class BaseScanner(ABC):
         # Only downgrade severities higher than INFO
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
             return False
+        if severity == IssueSeverity.CRITICAL:
+            return False
 
         if self._whitelist_downgrade_exempt(
             details=details,

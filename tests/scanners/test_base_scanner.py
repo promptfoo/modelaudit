@@ -494,8 +494,8 @@ def test_whitelist_downgrade_warning_to_info():
     assert result.issues[0].details.get("original_severity") == "WARNING"
 
 
-def test_whitelist_downgrade_critical_to_info():
-    """Test that whitelisted models have critical issues downgraded to INFO."""
+def test_whitelist_does_not_downgrade_critical_to_info():
+    """Trusted HuggingFace provenance must not hide critical issues."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     # Get a model from the whitelist
@@ -515,11 +515,38 @@ def test_whitelist_downgrade_critical_to_info():
     result = scanner._create_result()
     result._add_issue("Test critical", severity=IssueSeverity.CRITICAL)
 
-    # Should be downgraded to INFO
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
-    assert result.issues[0].details.get("whitelist_downgrade") is True
-    assert result.issues[0].details.get("original_severity") == "CRITICAL"
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_does_not_downgrade_critical_command_network_correlation() -> None:
+    """Neutral command/network criticals must still fail whitelisted HF scans."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Command/Network Correlation Check",
+        passed=False,
+        message="Correlated command and process/network indicators detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert len(result.checks) == 1
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
 def test_whitelist_no_downgrade_info():
@@ -904,8 +931,8 @@ def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_check_critical() -> None:
-    """Test that whitelisted models have critical checks downgraded to INFO."""
+def test_whitelist_does_not_downgrade_critical_check() -> None:
+    """Trusted HuggingFace provenance must not downgrade critical checks."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     # Get a model from the whitelist
@@ -930,19 +957,15 @@ def test_whitelist_downgrade_check_critical() -> None:
         severity=IssueSeverity.CRITICAL,
     )
 
-    # Verify the Issue was downgraded
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
-    assert result.issues[0].details.get("whitelist_downgrade") is True
-    assert result.issues[0].details.get("original_severity") == "CRITICAL"
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
 
-    # Verify the Check exists and severity is also downgraded
     assert len(result.checks) == 1
     assert result.checks[0].name == "Test Security Check"
     assert result.checks[0].status == CheckStatus.FAILED
-    assert result.checks[0].severity == IssueSeverity.INFO
-    assert result.checks[0].details.get("whitelist_downgrade") is True
-    assert result.checks[0].details.get("original_severity") == "CRITICAL"
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
 @pytest.mark.parametrize(
@@ -1138,7 +1161,7 @@ def test_whitelist_restores_downgrade_when_operational_metadata_set_after_check(
         name="Joblib Decompression",
         passed=False,
         message="Error decompressing joblib file",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.WARNING,
     )
     assert result.issues[0].severity.value == "info"
     assert result.issues[0].details.get("whitelist_downgrade") is True
@@ -1147,16 +1170,16 @@ def test_whitelist_restores_downgrade_when_operational_metadata_set_after_check(
     result.metadata["operational_error_reason"] = "joblib_decompression_failed"
     result.finish(success=False)
 
-    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].severity.value == "warning"
     assert result.issues[0].details.get("whitelist_downgrade") is None
     assert result.issues[0].details.get("whitelist_downgrade_restored") is True
-    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].severity == IssueSeverity.WARNING
     assert result.checks[0].details.get("whitelist_downgrade") is None
     assert result.checks[0].details.get("whitelist_downgrade_restored") is True
 
 
-def test_finish_recomputes_success_after_restoring_metadata_exempt_severity(tmp_path: Path) -> None:
-    """Restored CRITICAL findings must make finished results unsuccessful."""
+def test_finish_keeps_critical_whitelist_ineligible_after_metadata_exemption(tmp_path: Path) -> None:
+    """Critical findings stay critical even before late metadata exemptions."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     scanner = MockScanner()
@@ -1175,13 +1198,14 @@ def test_finish_recomputes_success_after_restoring_metadata_exempt_severity(tmp_
         message="Error decompressing joblib file",
         severity=IssueSeverity.CRITICAL,
     )
-    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
 
     result.metadata["operational_error"] = True
     result.metadata["operational_error_reason"] = "joblib_decompression_failed"
-    result.finish(success=True)
+    result.finish(success=not result.has_errors)
 
     assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade_restored") is None
     assert result.checks[0].severity == IssueSeverity.CRITICAL
     assert result.success is False
 
@@ -1204,7 +1228,7 @@ def test_finished_result_refreshes_whitelist_restore_after_late_inconclusive_met
         name="Late Coverage Check",
         passed=False,
         message="High confidence model anomaly detected",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.WARNING,
     )
     result.finish(success=True)
     assert result.issues[0].severity.value == "info"
@@ -1212,15 +1236,15 @@ def test_finished_result_refreshes_whitelist_restore_after_late_inconclusive_met
 
     mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
 
-    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].severity.value == "warning"
     assert result.issues[0].details.get("whitelist_downgrade") is None
     assert result.issues[0].details.get("whitelist_downgrade_restored") is True
-    assert result.checks[0].severity == IssueSeverity.CRITICAL
-    assert result.success is False
+    assert result.checks[0].severity == IssueSeverity.WARNING
+    assert result.success is True
 
 
-def test_finish_remembers_pre_finish_metadata_restored_critical(tmp_path: Path) -> None:
-    """Pre-finish metadata refreshes must still affect final success."""
+def test_finish_preserves_pre_finish_metadata_restored_warning(tmp_path: Path) -> None:
+    """Pre-finish metadata refreshes still restore warning severities."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     scanner = MockScanner()
@@ -1237,18 +1261,18 @@ def test_finish_remembers_pre_finish_metadata_restored_critical(tmp_path: Path) 
         name="Pre-Finish Coverage Check",
         passed=False,
         message="High confidence model anomaly detected",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.WARNING,
     )
     assert result.issues[0].severity.value == "info"
 
     mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
     assert result.end_time is None
-    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].severity.value == "warning"
 
     result.finish(success=True)
 
-    assert result.checks[0].severity == IssueSeverity.CRITICAL
-    assert result.success is False
+    assert result.checks[0].severity == IssueSeverity.WARNING
+    assert result.success is True
 
 
 def test_whitelist_downgrade_check_warning():
@@ -1341,13 +1365,31 @@ def test_whitelist_apply_downgrade_helper_none_details():
         model_source="huggingface",
     )
 
-    # Test with None details
-    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.CRITICAL, None)
+    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.WARNING, None)
 
     assert new_severity == IssueSeverity.INFO
     assert new_details is not None
     assert new_details.get("whitelist_downgrade") is True
-    assert new_details.get("original_severity") == "CRITICAL"
+    assert new_details.get("original_severity") == "WARNING"
+
+
+def test_whitelist_apply_downgrade_helper_keeps_critical_none_details() -> None:
+    """Critical findings without metadata must not be downgrade eligible."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.CRITICAL, None)
+
+    assert new_severity == IssueSeverity.CRITICAL
+    assert new_details == {}
 
 
 def test_whitelist_apply_downgrade_helper_existing_details():
