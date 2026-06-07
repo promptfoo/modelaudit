@@ -2,6 +2,7 @@
 
 import io
 import os
+import posixpath
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
@@ -613,6 +614,7 @@ class SevenZipScanner(BaseScanner):
                         prechecked_executable_files=frozenset(probed_executable_files),
                         nested_scan_files=frozenset(nested_scan_targets),
                         nested_probe_formats=nested_probe_formats,
+                        archive_member_names=safe_file_names,
                     )
                     and scan_complete
                 )
@@ -682,6 +684,7 @@ class SevenZipScanner(BaseScanner):
         nested_probe_formats: dict[str, str] = {}
         probes_complete = True
         probe_candidates: list[tuple[int, int, str]] = []
+        member_index = self._archive_member_name_index(file_names)
         supported_extensions = self._supported_nested_core_extensions()
         for index, file_name in enumerate(file_names):
             candidate_extensions = self._candidate_archive_extensions(file_name)
@@ -692,14 +695,15 @@ class SevenZipScanner(BaseScanner):
                 continue
 
             member_info = self._get_archive_member_info(archive, file_name)
-            symlink_state = self._preflight_member_symlink_state(member_info)
-            if symlink_state == "unknown":
+            if not self._preflight_member_link_safety(
+                archive,
+                member_index,
+                result,
+                archive_path,
+                file_name,
+                member_info,
+            ):
                 probes_complete = False
-                self._add_member_metadata_incomplete_check(result, archive_path, file_name)
-                continue
-            if symlink_state == "symlink":
-                probes_complete = False
-                self._add_preextraction_symlink_check(result, archive_path, file_name, member_info)
                 continue
 
             if getattr(member_info, "is_directory", False) is True:
@@ -964,6 +968,62 @@ class SevenZipScanner(BaseScanner):
             return "regular"
         return "unknown"
 
+    @staticmethod
+    def _canonical_archive_member_name(file_name: str) -> str:
+        canonical_name = posixpath.normpath(file_name.replace("\\", "/").lstrip("/"))
+        return "" if canonical_name == "." else canonical_name
+
+    @classmethod
+    def _archive_member_name_index(cls, file_names: list[str] | frozenset[str]) -> dict[str, str]:
+        member_index: dict[str, str] = {}
+        for file_name in file_names:
+            canonical_name = cls._canonical_archive_member_name(file_name)
+            if canonical_name:
+                member_index.setdefault(canonical_name, file_name)
+        return member_index
+
+    @classmethod
+    def _archive_member_ancestors(cls, file_name: str, member_index: dict[str, str]) -> list[str]:
+        canonical_name = cls._canonical_archive_member_name(file_name)
+        parts = [part for part in canonical_name.split("/") if part]
+        ancestors: list[str] = []
+        for index in range(1, len(parts)):
+            ancestor_name = member_index.get("/".join(parts[:index]))
+            if ancestor_name is not None:
+                ancestors.append(ancestor_name)
+        return ancestors
+
+    def _preflight_link_member(
+        self,
+        result: ScanResult,
+        archive_path: str,
+        file_name: str,
+        member_info: Any | None,
+    ) -> bool:
+        symlink_state = self._preflight_member_symlink_state(member_info)
+        if symlink_state == "unknown":
+            self._add_member_metadata_incomplete_check(result, archive_path, file_name)
+            return False
+        if symlink_state == "symlink":
+            self._add_preextraction_symlink_check(result, archive_path, file_name, member_info)
+            return False
+        return True
+
+    def _preflight_member_link_safety(
+        self,
+        archive: Any,
+        member_index: dict[str, str],
+        result: ScanResult,
+        archive_path: str,
+        file_name: str,
+        member_info: Any | None,
+    ) -> bool:
+        for ancestor_name in self._archive_member_ancestors(file_name, member_index):
+            ancestor_info = self._get_archive_member_info(archive, ancestor_name)
+            if not self._preflight_link_member(result, archive_path, ancestor_name, ancestor_info):
+                return False
+        return self._preflight_link_member(result, archive_path, file_name, member_info)
+
     def _add_member_metadata_incomplete_check(self, result: ScanResult, archive_path: str, file_name: str) -> None:
         finding_key = (archive_path, file_name)
         if finding_key in self._reported_member_metadata_gaps:
@@ -1116,6 +1176,7 @@ class SevenZipScanner(BaseScanner):
         prechecked_executable_files: frozenset[str] = frozenset(),
         nested_scan_files: frozenset[str] | None = None,
         nested_probe_formats: dict[str, str] | None = None,
+        archive_member_names: list[str] | frozenset[str] = frozenset(),
     ) -> bool:
         """Extract scannable files and run appropriate scanners on them"""
         scan_complete = not budget.should_stop()
@@ -1124,16 +1185,18 @@ class SevenZipScanner(BaseScanner):
         extractable_files: list[str] = []
         member_sizes: dict[str, int | None] = {}
         known_extract_bytes = 0
+        member_index = self._archive_member_name_index(archive_member_names or frozenset(scannable_files))
         for file_name in scannable_files:
             member_info = self._get_archive_member_info(archive, file_name)
-            symlink_state = self._preflight_member_symlink_state(member_info)
-            if symlink_state == "unknown":
+            if not self._preflight_member_link_safety(
+                archive,
+                member_index,
+                result,
+                archive_path,
+                file_name,
+                member_info,
+            ):
                 scan_complete = False
-                self._add_member_metadata_incomplete_check(result, archive_path, file_name)
-                continue
-            if symlink_state == "symlink":
-                scan_complete = False
-                self._add_preextraction_symlink_check(result, archive_path, file_name, member_info)
                 continue
 
             if getattr(member_info, "is_directory", False) is True:

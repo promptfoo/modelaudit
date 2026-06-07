@@ -1684,6 +1684,130 @@ class TestSevenZipScannerHardening:
         assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
         mock_archive.extract.assert_not_called()
 
+    def test_symlink_parent_member_blocks_child_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """A link-valued archive parent must block child extraction before py7zr writes."""
+
+        def getinfo(name: str) -> MagicMock:
+            if name == "link":
+                return MagicMock(
+                    filename="link",
+                    is_directory=False,
+                    is_symlink=True,
+                    is_junction=False,
+                    linkname="../outside",
+                    uncompressed=0,
+                )
+            return MagicMock(
+                filename=name,
+                is_directory=False,
+                is_symlink=False,
+                is_junction=False,
+                uncompressed=16,
+            )
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["link", "link/model.pkl"]
+            mock_archive.getinfo.side_effect = getinfo
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        symlink_checks = [c for c in result.checks if c.name == "7z Symlink Protection"]
+        assert result.success is False
+        assert len(symlink_checks) == 1
+        assert symlink_checks[0].location == f"{temp_7z_file}:link"
+        assert symlink_checks[0].details["checked_before_extraction"] is True
+        assert symlink_checks[0].details["symlink_target"] == "../outside"
+        mock_archive.extract.assert_not_called()
+        mock_scan_extracted_file.assert_not_called()
+
+    def test_unknown_parent_member_metadata_blocks_child_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """An explicit parent without link metadata must fail closed before child extraction."""
+
+        class LegacyParentInfo:
+            filename = "link"
+            is_directory = False
+            uncompressed = 0
+
+        def getinfo(name: str) -> MagicMock | LegacyParentInfo:
+            if name == "link":
+                return LegacyParentInfo()
+            return MagicMock(
+                filename=name,
+                is_directory=False,
+                is_symlink=False,
+                is_junction=False,
+                uncompressed=16,
+            )
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["link", "link/model.pkl"]
+            mock_archive.getinfo.side_effect = getinfo
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        metadata_checks = [c for c in result.checks if c.name == "7z Member Metadata"]
+        assert result.success is False
+        assert len(metadata_checks) == 1
+        assert metadata_checks[0].details["entry"] == "link"
+        assert metadata_checks[0].details["analysis_incomplete"] is True
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        mock_archive.extract.assert_not_called()
+        mock_scan_extracted_file.assert_not_called()
+
+    def test_nested_member_without_explicit_parent_still_extracts(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Regular nested files should not require separate directory metadata."""
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file", return_value=True),
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=16),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["dir/model.onnx"]
+            mock_archive.getinfo.return_value = MagicMock(
+                filename="dir/model.onnx",
+                is_directory=False,
+                is_symlink=False,
+                is_junction=False,
+                uncompressed=16,
+            )
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        assert result.success is True
+        assert [c for c in result.checks if c.name == "7z Member Metadata"] == []
+        assert [c for c in result.checks if c.name == "7z Symlink Protection"] == []
+        mock_archive.extract.assert_called_once()
+        assert mock_archive.extract.call_args.kwargs["targets"] == ["dir/model.onnx"]
+
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_real_symlink_member_is_blocked_before_extraction(
         self,
