@@ -4898,6 +4898,121 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
     assert expected_call in python_checks[0].details["reason"]
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_rule_code", "expected_call"),
+    [
+        (b"import operator, os\noperator.attrgetter('system')(os)('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\noperator.methodcaller('__getattribute__', 'system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"from operator import methodcaller\nimport subprocess\nmethodcaller('run', ['id'])(subprocess)\n",
+            "S103",
+            "subprocess.run",
+        ),
+    ],
+)
+def test_high_risk_python_calls_resolves_operator_accessor_execution(
+    source: bytes, expected_rule_code: str, expected_call: str
+) -> None:
+    calls = high_risk_python_calls_in_source(source)
+
+    assert any(call.rule_code == expected_rule_code and call.name == expected_call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"import operator, os\noperator.attrgetter('getcwd')(os)()\n",
+        b"import operator\noperator.methodcaller('lower')('SAFE')\n",
+        b"import operator, subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+    ],
+)
+def test_high_risk_python_calls_ignores_benign_operator_accessor_names(source: bytes) -> None:
+    calls = high_risk_python_calls_in_source(source)
+
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_rule_code", "expected_call"),
+    [
+        (
+            "import operator\nimport os\noperator.attrgetter('system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "from operator import attrgetter\n"
+            "import subprocess\n"
+            "runner = attrgetter('run')(subprocess)\n"
+            "runner(['id'], check=False)\n",
+            "S103",
+            "subprocess.run",
+        ),
+        (
+            "import operator\nimport os\noperator.methodcaller('system', 'id')(os)\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "from operator import methodcaller\n"
+            "import subprocess\n"
+            "methodcaller('run', ['id'], check=False)(subprocess)\n",
+            "S103",
+            "subprocess.run",
+        ),
+        (
+            "from operator import methodcaller\nimport os\nmethodcaller('__getattribute__', 'system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+    ],
+)
+def test_scan_zip_python_member_detects_operator_accessor_execution(
+    tmp_path: Path, source: str, expected_rule_code: str, expected_call: str
+) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.rule_code == expected_rule_code and expected_call in check.details["reason"] for check in python_checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import operator\nimport os\noperator.attrgetter('getcwd')(os)()\n",
+        ("from operator import attrgetter\nclass Safe:\n    system = 'label'\nvalue = attrgetter('system')(Safe())\n"),
+        "import operator\noperator.methodcaller('lower')('SAFE')\n",
+        "from operator import methodcaller\nimport os\nmethodcaller('getcwd')(os)\n",
+        "import operator\nimport subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+    ],
+)
+def test_scan_zip_python_member_ignores_benign_operator_accessor_names(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Path) -> None:
     """Mixed-risk source should yield one finding per rule code, sorted by code."""
     archive_path = tmp_path / "source_bundle.zip"

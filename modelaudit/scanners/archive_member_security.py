@@ -174,6 +174,7 @@ _STATIC_MUTABLE_BUILTIN_HELPER_REFERENCES = frozenset(
     {"builtins.getattr", "builtins.vars", "builtins.setattr", "builtins.delattr"}
 )
 _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES = frozenset({"contextlib.nullcontext"})
+_STATIC_OPERATOR_ACCESSOR_HELPER_REFERENCES = frozenset({"operator.attrgetter", "operator.methodcaller"})
 _STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES = frozenset(
     {"ctypes.LibraryLoader.__new__", "ctypes.LibraryLoader.__init__", "ctypes.LibraryLoader.__setattr__"}
 )
@@ -339,6 +340,7 @@ _TRACKED_STATIC_MEMBER_REFERENCES = (
     | _STATIC_MODULE_TYPE_REFERENCES
     | _STATIC_MUTABLE_BUILTIN_HELPER_REFERENCES
     | _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES
+    | _STATIC_OPERATOR_ACCESSOR_HELPER_REFERENCES
     | _STATIC_CTYPES_LIBRARY_LOADER_DISPATCH_REFERENCES
 )
 _TRACKED_STATIC_MODULE_ROOTS = frozenset(
@@ -559,6 +561,11 @@ _MODULE_LOCALS_MAPPING_ALIAS = "<module locals mapping>"
 _LOCAL_NAMESPACE_MAPPING_ALIAS = "<local mapping>"
 _TRACKED_MODULE_NAMESPACE_ALIASES = frozenset({_GLOBALS_MAPPING_ALIAS, _MODULE_LOCALS_MAPPING_ALIAS})
 _MODULE_NAMESPACE_WRITE_PREFIX = "<module namespace write>."
+_OPERATOR_ATTRGETTER_ALIAS_PREFIX = "<operator.attrgetter>"
+_OPERATOR_METHODCALLER_ALIAS_PREFIX = "<operator.methodcaller>"
+_OPERATOR_METHODCALLER_DYNAMIC_ACCESS_METHODS = frozenset(
+    {"__getattribute__", "__getattr__", "__getitem__", "get", "pop", "setdefault"}
+)
 
 
 def is_executable_archive_member_name(member_name: str) -> bool:
@@ -950,6 +957,29 @@ def _resolve_static_namespace_update_items(node: ast.AST) -> list[tuple[str, ast
             updates.append((resolved_key, element.elts[1]))
         return updates
     return None
+
+
+def _encode_operator_accessor_name(prefix: str, *fields: str) -> str:
+    return f"{prefix}{''.join(f'{len(field)}:{field}' for field in fields)}"
+
+
+def _decode_operator_accessor_name(name: str, prefix: str, field_count: int) -> tuple[str, ...] | None:
+    if not name.startswith(prefix):
+        return None
+    remainder = _strip_dunder_call_suffixes(name)[len(prefix) :]
+    fields: list[str] = []
+    for _index in range(field_count):
+        length_text, separator, value = remainder.partition(":")
+        if not separator or not length_text.isdecimal():
+            return None
+        field_length = int(length_text)
+        if field_length > len(value):
+            return None
+        fields.append(value[:field_length])
+        remainder = value[field_length:]
+    if remainder:
+        return None
+    return tuple(fields)
 
 
 def _is_static_non_string(node: ast.AST) -> bool:
@@ -1746,6 +1776,210 @@ def _expanded_static_call_args(node: ast.Call) -> list[ast.AST] | None:
     return expanded_args
 
 
+def _operator_accessor_target_node(node: ast.Call) -> ast.AST | None:
+    if node.keywords:
+        return None
+    expanded_args = _expanded_static_call_args(node)
+    if expanded_args is None or len(expanded_args) != 1:
+        return None
+    return expanded_args[0]
+
+
+def _resolve_operator_accessor_factory_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    helper_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    normalized_helper_names = frozenset(
+        _strip_dunder_call_suffixes(helper_name) for helper_name in helper_names or frozenset()
+    )
+    expanded_args = _expanded_static_call_args(node)
+    if expanded_args is None:
+        return None
+
+    accessor_names: set[str] = set()
+    if "operator.attrgetter" in normalized_helper_names and not node.keywords and len(expanded_args) == 1:
+        attr_name = _resolve_static_string(expanded_args[0])
+        if attr_name:
+            accessor_names.add(_encode_operator_accessor_name(_OPERATOR_ATTRGETTER_ALIAS_PREFIX, attr_name))
+
+    if "operator.methodcaller" in normalized_helper_names and expanded_args:
+        method_name = _resolve_static_string(expanded_args[0])
+        if method_name:
+            lookup_name = ""
+            if method_name in _OPERATOR_METHODCALLER_DYNAMIC_ACCESS_METHODS and len(expanded_args) >= 2:
+                lookup_name = _resolve_static_string(expanded_args[1]) or ""
+            accessor_names.add(
+                _encode_operator_accessor_name(_OPERATOR_METHODCALLER_ALIAS_PREFIX, method_name, lookup_name)
+            )
+
+    return frozenset(accessor_names) or None
+
+
+def _resolve_static_member_names(
+    target_roots: frozenset[str] | None,
+    member_name: str,
+    alias_scopes: _AliasScopes,
+) -> frozenset[str] | None:
+    if target_roots is None or not member_name:
+        return None
+    resolved_names = _apply_aliases_to_names(
+        frozenset(f"{target_root}.{member_name}" for target_root in target_roots),
+        alias_scopes,
+    )
+    return _augment_noncanonical_module_member_names(resolved_names, target_roots, member_name, alias_scopes)
+
+
+def _operator_attrgetter_member_names(accessor_names: frozenset[str] | None) -> frozenset[str]:
+    return frozenset(
+        decoded[0]
+        for accessor_name in accessor_names or frozenset()
+        if (decoded := _decode_operator_accessor_name(accessor_name, _OPERATOR_ATTRGETTER_ALIAS_PREFIX, 1)) is not None
+    )
+
+
+def _operator_methodcaller_fields(accessor_names: frozenset[str] | None) -> frozenset[tuple[str, str]]:
+    fields: set[tuple[str, str]] = set()
+    for accessor_name in accessor_names or frozenset():
+        decoded = _decode_operator_accessor_name(accessor_name, _OPERATOR_METHODCALLER_ALIAS_PREFIX, 2)
+        if decoded is not None:
+            fields.add((decoded[0], decoded[1]))
+    return frozenset(fields)
+
+
+def _resolve_operator_attrgetter_call_result_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    target_node = _operator_accessor_target_node(node)
+    if target_node is None:
+        return None
+    attr_names = _operator_attrgetter_member_names(
+        _resolve_static_reference_names(
+            node.func,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    )
+    if not attr_names:
+        return None
+    target_roots = _resolve_static_reference_names(
+        target_node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    resolved_names: set[str] = set()
+    for attr_name in attr_names:
+        resolved_names.update(_resolve_static_member_names(target_roots, attr_name, alias_scopes) or frozenset())
+    return frozenset(resolved_names) or None
+
+
+def _resolve_operator_methodcaller_dynamic_access_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    target_node = _operator_accessor_target_node(node)
+    if target_node is None:
+        return None
+    method_fields = _operator_methodcaller_fields(
+        _resolve_static_reference_names(
+            node.func,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    )
+    if not method_fields:
+        return None
+
+    target_roots: frozenset[str] | None = None
+    mapping_roots: frozenset[str] | None = None
+    resolved_names: set[str] = set()
+    for method_name, lookup_name in method_fields:
+        if not lookup_name:
+            continue
+        if method_name in {"__getattribute__", "__getattr__"}:
+            if target_roots is None:
+                target_roots = _resolve_static_reference_names(
+                    target_node,
+                    alias_scopes,
+                    allow_module_locals_mapping=allow_module_locals_mapping,
+                    allow_local_namespace_mapping=allow_local_namespace_mapping,
+                )
+            resolved_names.update(_resolve_static_member_names(target_roots, lookup_name, alias_scopes) or frozenset())
+            continue
+        if method_name in _NAMESPACE_LOOKUP_METHODS:
+            if mapping_roots is None:
+                mapping_roots = _resolve_namespace_mapping_roots(
+                    target_node,
+                    alias_scopes,
+                    allow_module_locals_mapping=allow_module_locals_mapping,
+                    allow_local_namespace_mapping=allow_local_namespace_mapping,
+                )
+            resolved_names.update(_resolve_static_member_names(mapping_roots, lookup_name, alias_scopes) or frozenset())
+    return frozenset(resolved_names) or None
+
+
+def _resolve_operator_methodcaller_invoked_method_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    target_node = _operator_accessor_target_node(node)
+    if target_node is None:
+        return None
+    method_names = frozenset(
+        method_name
+        for method_name, _lookup_name in _operator_methodcaller_fields(
+            _resolve_static_reference_names(
+                node.func,
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
+        )
+        if method_name not in _OPERATOR_METHODCALLER_DYNAMIC_ACCESS_METHODS
+    )
+    if not method_names:
+        return None
+    target_roots = _resolve_static_reference_names(
+        target_node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    resolved_names: set[str] = set()
+    for method_name in method_names:
+        resolved_names.update(_resolve_static_member_names(target_roots, method_name, alias_scopes) or frozenset())
+    return frozenset(resolved_names) or None
+
+
 def _resolve_ctypes_library_loader_instance_roots(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1990,6 +2224,30 @@ def _resolve_static_reference_names(
     )
     if sys_modules_names is not None:
         return sys_modules_names
+    operator_accessor_factory_names = _resolve_operator_accessor_factory_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if operator_accessor_factory_names is not None:
+        return operator_accessor_factory_names
+    operator_attrgetter_names = _resolve_operator_attrgetter_call_result_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if operator_attrgetter_names is not None:
+        return operator_attrgetter_names
+    operator_methodcaller_access_names = _resolve_operator_methodcaller_dynamic_access_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if operator_methodcaller_access_names is not None:
+        return operator_methodcaller_access_names
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         callable_names = _resolve_static_reference_names(
             node.value,
@@ -2124,6 +2382,8 @@ def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
         call_names.update(_WEBBROWSER_CONTROLLER_FACTORIES)
     if module == "ctypes":
         call_names.update(_CTYPES_LIBRARY_LOADER_OBJECTS | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS)
+    if module == "operator":
+        call_names.update(_STATIC_OPERATOR_ACCESSOR_HELPER_REFERENCES)
     for call_name in sorted(call_names):
         if not call_name.startswith(prefix):
             continue
@@ -5597,6 +5857,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             normalized_name = _normalized_high_risk_python_call_name(resolved_name)
             if normalized_name is not None:
                 self.risky_calls.add(normalized_name)
+        operator_method_names = _resolve_operator_methodcaller_invoked_method_names(
+            node,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+        for operator_method_name in operator_method_names or frozenset():
+            normalized_name = _normalized_high_risk_python_call_name(operator_method_name)
+            if normalized_name is not None:
+                self.risky_calls.add(normalized_name)
         self.visit(node.func)
         for argument in node.args:
             if (
@@ -5677,6 +5947,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             | _STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES
             | _STATIC_DISPATCH_DECORATOR_REFERENCES
             | _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES
+            | _STATIC_OPERATOR_ACCESSOR_HELPER_REFERENCES
         )
         if (
             not modeled_namespace_mutation
