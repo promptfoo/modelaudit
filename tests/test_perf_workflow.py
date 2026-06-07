@@ -27,10 +27,14 @@ def _load_perf_workflow() -> dict[str, Any]:
     return _load_workflow("perf.yml")
 
 
-def _benchmarks_job(workflow: dict[str, Any]) -> dict[str, Any]:
+def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
-    job = jobs["benchmarks"]
+    return jobs
+
+
+def _benchmarks_job(workflow: dict[str, Any]) -> dict[str, Any]:
+    job = _jobs(workflow)["benchmarks"]
     assert isinstance(job, dict)
     return job
 
@@ -122,8 +126,7 @@ def test_perf_workflow_runs_retained_memory_guard_as_blocking_step() -> None:
 
 def test_nightly_windows_lane_defers_performance_benchmarks_to_linux() -> None:
     workflow = _load_workflow("nightly.yml")
-    jobs = workflow["jobs"]
-    assert isinstance(jobs, dict)
+    jobs = _jobs(workflow)
 
     linux_steps = jobs["full-matrix"]["steps"]
     assert isinstance(linux_steps, list)
@@ -134,3 +137,16 @@ def test_nightly_windows_lane_defers_performance_benchmarks_to_linux() -> None:
     assert isinstance(windows_steps, list)
     windows_run = _step_by_name(windows_steps, "Run all Windows tests except performance benchmarks")["run"]
     assert '-m "not performance"' in windows_run
+
+
+def test_dependency_audit_runs_for_source_reachability_changes() -> None:
+    workflow = _load_workflow("test.yml")
+    job = _jobs(workflow)["dependency-audit"]
+    assert isinstance(job, dict)
+
+    condition = job["if"]
+    assert "github.event_name == 'pull_request'" in condition
+    assert "needs.changes.outputs.dependencies == 'true'" in condition
+    assert "needs.changes.outputs.workflows == 'true'" in condition
+    assert "needs.changes.outputs.python == 'true'" in condition
+    assert "needs.changes.outputs.picklescan == 'true'" in condition
