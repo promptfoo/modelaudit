@@ -1528,6 +1528,121 @@ class TestOciLayerScanner:
             for issue in result.issues
         )
 
+    def test_scan_layer_rejects_late_malicious_member_beyond_entry_budget(self, tmp_path: Path) -> None:
+        """Members after the raw-entry cap must not be extracted or reported as findings."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_text("safe")
+
+        layer_path = tmp_path / "late-malicious-entry.tar.gz"
+        with tarfile.open(layer_path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+            tar.add(benign_member, arcname="notes.txt")
+            tar.add(evil_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "late-malicious-entry.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_entries": 1}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_entry_count_exceeded",
+            tmp_path / "late-entry-cache",
+            max_oci_layer_entries=1,
+        )
+
+    def test_scan_layer_reports_early_malicious_member_before_extraction_budget_exhaustion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Aggregate extraction exhaustion should preserve already-scanned malicious members."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        filler = tmp_path / "filler.bin"
+        filler.write_bytes(b"A" * 256)
+
+        layer_path = tmp_path / "early-malicious-extraction.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+            tar.add(filler, arcname="filler.bin")
+
+        manifest_path = tmp_path / "early-malicious-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"max_oci_layer_extracted_bytes": evil_pickle.stat().st_size}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "early-malicious-extraction.manifest:early-malicious-extraction.tar.gz:payload.pkl"
+            in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_layer_rejects_late_malicious_member_beyond_extraction_budget(self, tmp_path: Path) -> None:
+        """A later malicious member outside the aggregate copied-byte budget must fail closed."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_bytes(b"safe notes")
+        max_extracted_bytes = benign_member.stat().st_size + evil_pickle.stat().st_size - 1
+
+        layer_path = tmp_path / "late-malicious-extraction.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(benign_member, arcname="notes.txt")
+            tar.add(evil_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "late-malicious-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_extracted_bytes": max_extracted_bytes}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["member"] == "payload.pkl"
+        assert checks[0].details["previous_extracted_bytes"] == benign_member.stat().st_size
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_extracted_size_exceeded",
+            tmp_path / "late-extraction-cache",
+            max_oci_layer_extracted_bytes=max_extracted_bytes,
+        )
+
+    def test_scan_layer_allows_members_at_aggregate_extraction_limit(self, tmp_path: Path) -> None:
+        """Benign members that exactly meet the aggregate extraction limit remain scannable."""
+        first_member = tmp_path / "first.txt"
+        first_member.write_bytes(b"A" * 128)
+        second_member = tmp_path / "second.txt"
+        second_member.write_bytes(b"B" * 128)
+        max_extracted_bytes = first_member.stat().st_size + second_member.stat().st_size
+
+        layer_path = tmp_path / "exact-extraction-limit.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(first_member, arcname="first.txt")
+            tar.add(second_member, arcname="second.txt")
+
+        manifest_path = tmp_path / "exact-extraction-limit.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_extracted_bytes": max_extracted_bytes}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 2
+        assert "oci_layer_extracted_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+
     def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
         """Embedded scan results should reference the OCI member, not temp extraction paths."""
         onnx_file = tmp_path / "model.onnx"

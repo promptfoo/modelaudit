@@ -225,6 +225,7 @@ class OciLayerScanner(BaseScanner):
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _DEFAULT_MAX_LAYER_ENTRIES: ClassVar[int] = 10000
     _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    _DEFAULT_MAX_EXTRACTED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     _DEFAULT_MAX_DECOMPRESSION_RATIO: ClassVar[float] = 250.0
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
     _PARENT_IDENTITY_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset({"file_size", "file_hashes"})
@@ -268,10 +269,39 @@ class OciLayerScanner(BaseScanner):
             self.config.get("compressed_max_decompressed_bytes"),
             self._DEFAULT_MAX_DECOMPRESSED_BYTES,
         )
+        self.max_extracted_bytes = self._resolve_max_extracted_bytes()
         self.max_decompression_ratio = self._normalize_positive_float_config(
             self.config.get("compressed_max_decompression_ratio"),
             self._DEFAULT_MAX_DECOMPRESSION_RATIO,
         )
+
+    def _resolve_max_extracted_bytes(self) -> int:
+        """Return the aggregate copied-member budget for one OCI layer."""
+        positive_limits: list[int] = []
+        configured_limit = self.config.get("max_oci_layer_extracted_bytes")
+        if configured_limit is not None:
+            if configured_limit != 0:
+                positive_limits.append(
+                    self._normalize_positive_int_config(
+                        configured_limit,
+                        self._DEFAULT_MAX_EXTRACTED_BYTES,
+                    )
+                )
+        else:
+            positive_limits.append(self._DEFAULT_MAX_EXTRACTED_BYTES)
+
+        for config_key in ("max_total_size", "max_file_size"):
+            configured_public_limit = self.config.get(config_key)
+            if configured_public_limit is None or configured_public_limit == 0:
+                continue
+            positive_limits.append(
+                self._normalize_positive_int_config(
+                    configured_public_limit,
+                    self._DEFAULT_MAX_EXTRACTED_BYTES,
+                )
+            )
+
+        return min(positive_limits) if positive_limits else 0
 
     @staticmethod
     def _normalize_positive_float_config(value: Any, default: float) -> float:
@@ -297,6 +327,32 @@ class OciLayerScanner(BaseScanner):
         self._mark_incomplete_coverage(result, reason)
         result.add_check(
             name="Layer Decompression Budget Check",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{manifest_path}:{layer_ref}",
+            details={
+                "layer": layer_ref,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                **details,
+            },
+            rule_code="S902",
+        )
+
+    def _add_layer_extraction_budget_check(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._mark_incomplete_coverage(result, reason)
+        result.add_check(
+            name="Layer Extraction Budget Check",
             passed=False,
             message=message,
             severity=IssueSeverity.INFO,
@@ -1078,16 +1134,14 @@ class OciLayerScanner(BaseScanner):
                     if preflight_member_limit == 0:
                         continue
 
-                hidden_entries_exceeded_limit = (
-                    tar_metrics is not None
-                    and tar_metrics.hidden_entries > 0
-                    and tar_metrics.raw_entries > self.max_layer_entries
+                raw_entries_exceeded_limit = (
+                    tar_metrics is not None and tar_metrics.raw_entries > self.max_layer_entries
                 )
                 hidden_entry_hard_limit = max(self.max_layer_entries, self._MIN_MAX_HIDDEN_TAR_ENTRIES)
                 hidden_entry_hard_limit_exceeded = (
                     tar_metrics is not None and tar_metrics.hidden_entries > hidden_entry_hard_limit
                 )
-                if hidden_entries_exceeded_limit or hidden_entry_hard_limit_exceeded:
+                if raw_entries_exceeded_limit or hidden_entry_hard_limit_exceeded:
                     assert tar_metrics is not None
                     scan_complete = False
                     self._add_layer_budget_check(
@@ -1096,7 +1150,7 @@ class OciLayerScanner(BaseScanner):
                         layer_ref=layer_ref,
                         reason="oci_layer_entry_count_exceeded",
                         message=(
-                            f"Layer {normalized_layer_ref} contains too many raw TAR entries "
+                            f"Layer {normalized_layer_ref} contains too many entries/raw TAR entries "
                             f"({tar_metrics.raw_entries} > {self.max_layer_entries})"
                         ),
                         details={
@@ -1107,15 +1161,16 @@ class OciLayerScanner(BaseScanner):
                     )
                     if hidden_entry_hard_limit_exceeded:
                         continue
-                    hidden_entry_member_limit = tar_metrics.visible_entries_within_limit
-                    if hidden_entry_member_limit == 0:
+                    entry_member_limit = tar_metrics.visible_entries_within_limit
+                    if entry_member_limit == 0:
                         continue
                     if preflight_member_limit is None:
-                        preflight_member_limit = hidden_entry_member_limit
+                        preflight_member_limit = entry_member_limit
                     else:
-                        preflight_member_limit = min(preflight_member_limit, hidden_entry_member_limit)
+                        preflight_member_limit = min(preflight_member_limit, entry_member_limit)
 
                 layer_entry_count = 0
+                extracted_member_bytes = 0
                 metadata_state = _LayerMetadataState()
                 with tarfile.open(layer_path, "r:gz") as tar:
                     while preflight_member_limit is None or layer_entry_count < preflight_member_limit:
@@ -1175,6 +1230,29 @@ class OciLayerScanner(BaseScanner):
                             )
                             continue
 
+                        member_size = max(0, member.size)
+                        projected_extracted_bytes = extracted_member_bytes + member_size
+                        if self.max_extracted_bytes > 0 and projected_extracted_bytes > self.max_extracted_bytes:
+                            scan_complete = False
+                            self._add_layer_extraction_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_extracted_size_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} extracted member bytes exceed "
+                                    f"limit ({projected_extracted_bytes} > {self.max_extracted_bytes})"
+                                ),
+                                details={
+                                    "member": name,
+                                    "member_size": member_size,
+                                    "extracted_bytes": projected_extracted_bytes,
+                                    "previous_extracted_bytes": extracted_member_bytes,
+                                    "max_extracted_bytes": self.max_extracted_bytes,
+                                },
+                            )
+                            break
+
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
                             scan_complete = False
@@ -1208,6 +1286,7 @@ class OciLayerScanner(BaseScanner):
                                 if header_prefix:
                                     tmp.write(header_prefix)
                                 shutil.copyfileobj(fileobj, tmp)
+                            extracted_member_bytes = projected_extracted_bytes
 
                             from .. import core
 
