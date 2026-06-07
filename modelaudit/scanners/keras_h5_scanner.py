@@ -21,11 +21,13 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import (
     get_cve_2024_3660_explanation,
+    get_cve_2025_1550_explanation,
     get_cve_2025_9905_explanation,
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
 from ..utils.file.hdf5 import find_hdf5_signature_offset
+from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -59,6 +61,112 @@ _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
 _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
     rf"(?i)^(?:{_KERAS_LOCAL_VERSION_SUFFIX}|"
     rf"{_KERAS_POST_SUFFIX}(?:{_KERAS_DEV_SUFFIX})?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
+)
+
+# CVE-2025-1550: Keras safe_mode bypass via arbitrary module references.
+_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
+_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "builtins",
+        "__builtin__",
+        "importlib",
+        "shutil",
+        "socket",
+        "http",
+        "pickle",
+        "marshal",
+        "ctypes",
+        "code",
+        "codeop",
+        "compileall",
+        "runpy",
+        "webbrowser",
+        "tempfile",
+        "signal",
+        "multiprocessing",
+        "threading",
+        "pty",
+        "commands",
+        "pdb",
+        "profile",
+        "trace",
+        "pip",
+        "setuptools",
+        "distutils",
+    }
+)
+_DANGEROUS_EXACT_MODULE_SYMBOLS: dict[str, frozenset[str]] = {
+    "_ctypes": frozenset({"dlopen"}),
+    "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
+    "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
+    "_interpreters": frozenset({"call", "exec"}),
+    "_io": frozenset({"open"}),
+    "_operator": frozenset({"attrgetter", "methodcaller"}),
+    "_pickle": frozenset({"load", "loads"}),
+    "_posixsubprocess": frozenset({"fork_exec"}),
+    "_socket": frozenset({"socket"}),
+    "_thread": frozenset({"start_new", "start_new_thread"}),
+    "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
+    "_xxsubinterpreters": frozenset({"run_string"}),
+    "io": frozenset({"open"}),
+    "nt": frozenset({"popen", "startfile", "system"}),
+    "operator": frozenset({"attrgetter", "methodcaller"}),
+    "posix": frozenset({"popen", "system"}),
+}
+_DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "nt": ("exec", "spawn"),
+    "posix": ("exec", "spawn"),
+}
+_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
+    {
+        "activation",
+        "activity_regularizer",
+        "backward_layer",
+        "beta_initializer",
+        "bias_constraint",
+        "bias_initializer",
+        "bias_regularizer",
+        "callable",
+        "cell",
+        "cells",
+        "depthwise_constraint",
+        "depthwise_initializer",
+        "depthwise_regularizer",
+        "embeddings_constraint",
+        "embeddings_initializer",
+        "embeddings_regularizer",
+        "fn",
+        "forward_layer",
+        "function",
+        "gamma_initializer",
+        "kernel_constraint",
+        "kernel_initializer",
+        "kernel_regularizer",
+        "layer",
+        "layers",
+        "learning_rate",
+        "loss",
+        "losses",
+        "metric",
+        "metrics",
+        "moving_mean_initializer",
+        "moving_variance_initializer",
+        "optimizer",
+        "output_activation",
+        "pointwise_constraint",
+        "pointwise_initializer",
+        "pointwise_regularizer",
+        "preprocessor",
+        "recurrent_activation",
+        "recurrent_constraint",
+        "recurrent_initializer",
+        "recurrent_regularizer",
+        "schedule",
+        "weighted_metrics",
+    }
 )
 
 
@@ -244,6 +352,7 @@ class KerasH5Scanner(BaseScanner):
         self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
+        self._checked_config_module_references: set[tuple[int, str, str]] = set()
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -265,6 +374,7 @@ class KerasH5Scanner(BaseScanner):
         """Scan a Keras model file for suspicious configurations"""
         # Initialize context for this file
         self._initialize_context(path)
+        self._checked_config_module_references.clear()
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -804,6 +914,13 @@ class KerasH5Scanner(BaseScanner):
             "training_config.weighted_metrics",
         )
         self._check_custom_loss_config(training_config.get("loss"), result, "training_config.loss")
+        for key in ("optimizer_config", "loss", "metrics", "weighted_metrics"):
+            self._check_nested_serialized_module_references(
+                training_config.get(key),
+                result,
+                f"training_config.{key}",
+                trusted_container=True,
+            )
 
     def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
         """Flag custom metrics embedded anywhere in a serialized metric tree."""
@@ -826,6 +943,13 @@ class KerasH5Scanner(BaseScanner):
 
         # Check for subclassed models (custom class names)
         check_subclassed_model(model_class, result, self.current_file_path)
+        self._check_layer_module_references(
+            model_config,
+            result,
+            "model_config",
+            check_config_fields=False,
+            check_nested=False,
+        )
 
         # Collect all layers
         layers = []
@@ -893,7 +1017,7 @@ class KerasH5Scanner(BaseScanner):
         lambda_layer_count = 0
 
         # Check each layer
-        for layer in layers:
+        for index, layer in enumerate(layers):
             if not isinstance(layer, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_model_layer_invalid_type")
                 result.add_check(
@@ -910,6 +1034,12 @@ class KerasH5Scanner(BaseScanner):
             layer_config = layer.get("config", {})
             is_lambda_layer = self._is_lambda_layer_class(layer_class)
             layer_count_key = "Lambda" if is_lambda_layer else layer_class
+            serialized_layer_name = layer.get("name")
+            layer_reference_name = (
+                str(serialized_layer_name)
+                if isinstance(serialized_layer_name, str) and serialized_layer_name.strip()
+                else f"layer_{index}"
+            )
             if not isinstance(layer_config, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
                 result.add_check(
@@ -922,6 +1052,9 @@ class KerasH5Scanner(BaseScanner):
                     details={"actual_type": type(layer_config).__name__, "expected_type": "dict"},
                 )
                 layer_config = {}
+
+            if not is_lambda_layer:
+                self._check_layer_module_references(layer, result, layer_reference_name)
 
             # Update layer count
             if layer_count_key in layer_counts:
@@ -1151,6 +1284,224 @@ class KerasH5Scanner(BaseScanner):
             details={"actual_type": type(nested_layer).__name__, "expected_type": "dict"},
         )
 
+    @staticmethod
+    def _config_reference_symbols(source: dict[str, Any], object_class: str) -> set[str]:
+        symbols = {object_class}
+        for key in ("config", "registered_name", "function", "function_name"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                symbols.add(value.strip())
+        return symbols
+
+    @classmethod
+    def _is_dangerous_exact_module_reference(
+        cls,
+        source: dict[str, Any],
+        module_value: str,
+        object_class: str,
+    ) -> bool:
+        symbols = cls._config_reference_symbols(source, object_class)
+        dangerous_symbols = _DANGEROUS_EXACT_MODULE_SYMBOLS.get(module_value, frozenset())
+        if symbols & dangerous_symbols:
+            return True
+        prefixes = _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES.get(module_value, ())
+        return any(symbol.startswith(prefixes) for symbol in symbols) if prefixes else False
+
+    def _check_config_module_reference(
+        self,
+        source: dict[str, Any],
+        key: str,
+        module_value: str,
+        object_class: str,
+        result: ScanResult,
+        layer_name: str,
+    ) -> None:
+        reference_key = (id(source), key, module_value)
+        if reference_key in self._checked_config_module_references:
+            return
+        self._checked_config_module_references.add(reference_key)
+
+        redacted_module_value = redact_evidence_string(module_value)
+        redacted_object_class = redact_evidence_string(object_class)
+        redacted_layer_name = redact_evidence_string(layer_name)
+        top_module = module_value.split(".")[0]
+        is_dangerous = top_module in _DANGEROUS_CONFIG_MODULE_ROOTS or self._is_dangerous_exact_module_reference(
+            source,
+            module_value,
+            object_class,
+        )
+        is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
+
+        if is_dangerous:
+            result.add_check(
+                name="CVE-2025-1550: Dangerous Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references dangerous module "
+                    f"'{redacted_module_value}' in {key} field - arbitrary code execution via safe_mode bypass"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                details={
+                    "layer_name": redacted_layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "Arbitrary dangerous module references in Keras H5 metadata can bypass safe_mode "
+                        "and execute attacker-controlled code during model loading."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
+                },
+                why=get_cve_2025_1550_explanation("dangerous_module"),
+            )
+        elif is_outside_allowlist and (
+            key == "fn_module" or object_class == "function" or self._is_lambda_layer_class(object_class)
+        ):
+            result.add_check(
+                name="CVE-2025-1550: Untrusted Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references non-allowlisted module "
+                    f"'{redacted_module_value}' in {key} field - potential safe_mode bypass"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                details={
+                    "layer_name": redacted_layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "Non-allowlisted callable module references may indicate safe_mode bypass "
+                        "paths in untrusted Keras H5 metadata."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
+                },
+                why=get_cve_2025_1550_explanation("untrusted_module"),
+            )
+
+    def _check_nested_serialized_module_references(
+        self,
+        config_value: Any,
+        result: ScanResult,
+        layer_name: str,
+        *,
+        trusted_container: bool = False,
+    ) -> None:
+        """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
+        pending: list[tuple[Any, str | None, bool]] = [(config_value, None, trusted_container)]
+        while pending:
+            node, parent_key, container_is_trusted = pending.pop()
+            if isinstance(node, list):
+                pending.extend((item, parent_key, container_is_trusted) for item in node)
+                continue
+            if not isinstance(node, dict):
+                continue
+
+            object_class = node.get("class_name")
+            serialized_shape = isinstance(object_class, str) and "config" in node
+            is_serialized_object = serialized_shape and (
+                container_is_trusted
+                or parent_key in _NESTED_SERIALIZED_OBJECT_KEYS
+                or "registered_name" in node
+                or object_class == "function"
+                or self._is_lambda_layer_class(object_class)
+            )
+            if is_serialized_object:
+                assert isinstance(object_class, str)
+                for key in ("module", "fn_module"):
+                    module_value = node.get(key)
+                    if isinstance(module_value, str) and module_value.strip():
+                        self._check_config_module_reference(
+                            node,
+                            key,
+                            module_value.strip(),
+                            object_class,
+                            result,
+                            layer_name,
+                        )
+
+            next_container_is_trusted = container_is_trusted and not is_serialized_object
+            pending.extend(
+                (value, str(key).lower(), next_container_is_trusted)
+                for key, value in node.items()
+                if key not in {"module", "fn_module", "class_name", "registered_name"}
+            )
+
+    def _check_layer_module_references(
+        self,
+        layer: dict[str, Any],
+        result: ScanResult,
+        layer_name: str,
+        *,
+        check_config_fields: bool = True,
+        check_nested: bool = True,
+    ) -> None:
+        """Check H5 layer config for CVE-2025-1550 module references beyond Lambda layers."""
+        layer_class = layer.get("class_name")
+        if not isinstance(layer_class, str) or "config" not in layer:
+            return
+
+        for key in ("module", "fn_module"):
+            layer_value = layer.get(key)
+            if isinstance(layer_value, str) and layer_value.strip():
+                self._check_config_module_reference(
+                    layer,
+                    key,
+                    layer_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
+                )
+
+        layer_config = layer.get("config")
+        if not isinstance(layer_config, dict):
+            return
+
+        if check_config_fields:
+            for key in ("module", "fn_module"):
+                config_value = layer_config.get(key)
+                if isinstance(config_value, str) and config_value.strip():
+                    self._check_config_module_reference(
+                        layer_config,
+                        key,
+                        config_value.strip(),
+                        layer_class,
+                        result,
+                        layer_name,
+                    )
+
+        if layer_class == "FlaxLayer":
+            self._check_nested_serialized_module_references(
+                layer_config.get("module"),
+                result,
+                layer_name,
+                trusted_container=True,
+            )
+
+        inbound_nodes = layer.get("inbound_nodes")
+        if isinstance(inbound_nodes, list):
+            for inbound_node in inbound_nodes:
+                if not isinstance(inbound_node, dict):
+                    continue
+                for key in ("args", "kwargs"):
+                    self._check_nested_serialized_module_references(
+                        inbound_node.get(key),
+                        result,
+                        layer_name,
+                        trusted_container=True,
+                    )
+
+        if check_nested:
+            self._check_nested_serialized_module_references(layer_config, result, layer_name)
+
     def _check_lambda_layer(
         self,
         layer_config: dict[str, Any],
@@ -1200,24 +1551,23 @@ class KerasH5Scanner(BaseScanner):
                 self.current_file_path,
                 callback_layer_name,
             )
-            if not encoded_function_handled:
-                nested_callable_reference = self._lambda_callable_dict_reference(function_str)
-                if nested_callable_reference is None:
-                    function_requires_review = True
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=False,
-                        message="Lambda layer contains unrecognized dict-format function metadata",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            **callback_details,
-                            "function_format": "dict",
-                            "parse_status": "unrecognized",
-                        },
-                        why="Unrecognized Lambda function metadata cannot be safely classified.",
-                        rule_code="S507",
-                    )
+            nested_callable_reference = self._lambda_callable_dict_reference(function_str)
+            if not encoded_function_handled and nested_callable_reference is None:
+                function_requires_review = True
+                result.add_check(
+                    name="Lambda Layer Code Analysis",
+                    passed=False,
+                    message="Lambda layer contains unrecognized dict-format function metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        **callback_details,
+                        "function_format": "dict",
+                        "parse_status": "unrecognized",
+                    },
+                    why="Unrecognized Lambda function metadata cannot be safely classified.",
+                    rule_code="S507",
+                )
         elif isinstance(function_str, list):
             encoded_function_handled = check_lambda_list_function(
                 function_str,
@@ -1438,8 +1788,9 @@ class KerasH5Scanner(BaseScanner):
     @staticmethod
     def _lambda_callable_dict_reference(function_dict: dict[str, Any]) -> tuple[Any, Any] | None:
         """Extract a module/function pair from a serialized callable dictionary."""
-        if "function_name" in function_dict:
-            return function_dict.get("module"), function_dict.get("function_name")
+        for function_key in ("function_name", "function", "registered_name"):
+            if function_key in function_dict:
+                return function_dict.get("module"), function_dict.get(function_key)
         function_config = function_dict.get("config")
         if "module" in function_dict and isinstance(function_config, str):
             return function_dict.get("module"), function_config
@@ -1779,18 +2130,33 @@ class KerasH5Scanner(BaseScanner):
                                 }
                             )
 
-                # Analyze model weights structure
-                if "model_weights" in h5_file:
+                # Analyze model weights structure without resolving HDF5 external links.
+                model_weights_link = h5_file.get("model_weights", getlink=True)
+                if model_weights_link is not None:
                     with suppress(Exception):
-                        weights_group = h5_file["model_weights"]
+                        if not isinstance(model_weights_link, h5py.HardLink):
+                            metadata["model_weights_external_reference"] = True
+                            return metadata
+
+                        weights_group = h5_file.get("model_weights", getlink=False)
+                        if not isinstance(weights_group, h5py.Group):
+                            return metadata
 
                         # Count parameters
                         total_params = 0
                         weight_layers = []
+                        skipped_external_weight_entries = False
 
-                        def count_params(name, obj):
-                            nonlocal total_params
+                        def count_params(name: str, link: Any) -> None:
+                            nonlocal total_params, skipped_external_weight_entries
+                            if not isinstance(link, h5py.HardLink):
+                                skipped_external_weight_entries = True
+                                return
+                            obj = weights_group.get(name, getlink=False)
                             if isinstance(obj, h5py.Dataset):
+                                if obj.external:
+                                    skipped_external_weight_entries = True
+                                    return
                                 param_count = obj.size
                                 total_params += param_count
                                 weight_layers.append(
@@ -1802,15 +2168,24 @@ class KerasH5Scanner(BaseScanner):
                                     }
                                 )
 
-                        weights_group.visititems(count_params)
+                        visited_links, visits_truncated = self._visit_hdf5_links(
+                            weights_group,
+                            count_params,
+                            max_links=self._MAX_HDF5_LINK_VISITS,
+                        )
 
                         metadata.update(
                             {
                                 "total_parameters": total_params,
                                 "weight_layers": len(weight_layers),
                                 "parameter_details": weight_layers[:10],  # First 10 layers
+                                "weight_link_visits": visited_links,
                             }
                         )
+                        if skipped_external_weight_entries:
+                            metadata["external_weight_entries_skipped"] = True
+                        if visits_truncated:
+                            metadata["weight_link_visits_truncated"] = True
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

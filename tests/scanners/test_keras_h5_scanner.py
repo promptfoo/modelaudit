@@ -1109,6 +1109,55 @@ def test_keras_h5_scanner_skips_generic_layer_names_attr_without_weight_groups(t
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_metadata_extract_skips_external_weight_links(tmp_path: Path) -> None:
+    """Metadata extraction must not resolve HDF5 ExternalLink entries while counting weights."""
+    model_path = tmp_path / "metadata_external_link.h5"
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "metadata_external_link",
+            "layers": [{"class_name": "Dense", "name": "dense", "config": {"units": 1}}],
+        },
+    }
+    with h5py.File(model_path, "w") as f:
+        f.attrs["model_config"] = json.dumps(model_config)
+        weights = f.create_group("model_weights")
+        weights.create_dataset("dense/kernel:0", data=[[1.0, 2.0]])
+        weights["external_kernel"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    metadata = KerasH5Scanner().extract_metadata(str(model_path))
+
+    assert "extraction_error" not in metadata
+    assert metadata["total_parameters"] == 2
+    assert metadata["weight_layers"] == 1
+    assert metadata["parameter_details"] == [{"name": "dense/kernel:0", "shape": [1, 2], "dtype": "float64", "size": 2}]
+    assert metadata["external_weight_entries_skipped"] is True
+
+
+def test_keras_h5_metadata_extract_counts_internal_weights(tmp_path: Path) -> None:
+    """Benign internal H5 weights should still be summarized for metadata output."""
+    model_path = tmp_path / "metadata_internal_weights.h5"
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "metadata_internal_weights",
+            "layers": [{"class_name": "Dense", "name": "dense", "config": {"units": 1}}],
+        },
+    }
+    with h5py.File(model_path, "w") as f:
+        f.attrs["model_config"] = json.dumps(model_config)
+        weights = f.create_group("model_weights")
+        weights.create_dataset("dense/kernel:0", data=[[1.0], [2.0]])
+        weights.create_dataset("dense/bias:0", data=[0.0])
+
+    metadata = KerasH5Scanner().extract_metadata(str(model_path))
+
+    assert "extraction_error" not in metadata
+    assert metadata["total_parameters"] == 3
+    assert metadata["weight_layers"] == 2
+    assert "external_weight_entries_skipped" not in metadata
+
+
 def test_keras_h5_scanner_bounds_legacy_layout_probe_before_external_reference_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2696,6 +2745,174 @@ def test_unrecognized_lambda_function_dict_still_uses_module_reference_check(tmp
         and check.severity == IssueSeverity.CRITICAL
         and check.details.get("module_omitted") == "artifact_controlled_lambda_reference"
         and check.details.get("function_omitted") == "artifact_controlled_lambda_reference"
+        for check in result.checks
+    )
+
+
+def test_lambda_function_dict_function_key_uses_module_reference_check(tmp_path: Path) -> None:
+    """Callable dict metadata using a function key must not bypass H5 Lambda module checks."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "function_key_dict_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "function_key_dict_module",
+                            "function": {
+                                "class_name": "function",
+                                "module": "posix",
+                                "function": "system",
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("reference_source") == "function_dict"
+        for check in result.checks
+    )
+
+
+def test_lambda_function_dict_safe_function_key_is_allowlisted(tmp_path: Path) -> None:
+    """Benign callable dict metadata should still pass the narrow Lambda allowlist."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "safe_function_key_dict_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "safe_function_key_dict_module",
+                            "function": {
+                                "class_name": "function",
+                                "module": "keras.activations",
+                                "function": "relu",
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("reference_source") == "function_dict"
+        and check.details.get("allowlist_status") == "allowlisted"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_lambda_encoded_dict_with_embedded_function_metadata_checks_both_paths(tmp_path: Path) -> None:
+    """Dict bytecode analysis must not hide dangerous callable metadata embedded beside code."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "encoded_dict_embedded_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "encoded_dict_embedded_module",
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": {"code": encoded_code},
+                                "module": "posix",
+                                "function": "system",
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("function_format") == "dict_bytecode"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("reference_source") == "function_dict"
+        for check in result.checks
+    )
+
+
+def test_lambda_encoded_dict_with_safe_embedded_function_metadata_is_not_critical(tmp_path: Path) -> None:
+    """Safe embedded callable metadata should not turn opaque Lambda bytecode into a critical finding."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "encoded_dict_safe_embedded_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "encoded_dict_safe_embedded_module",
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": {"code": encoded_code},
+                                "module": "keras.activations",
+                                "function": "relu",
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details.get("function_format") == "dict_bytecode"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
 
@@ -4570,6 +4787,118 @@ def test_generic_base_layer_class_still_triggers_custom_layer_warning(tmp_path: 
     result = KerasH5Scanner().scan(str(model_path))
 
     assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
+
+
+class TestCVE20251550H5ModuleReferences:
+    """H5 coverage for Keras safe_mode bypass module references outside Lambda-only checks."""
+
+    def test_dangerous_dense_layer_module_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_dense_dangerous_module",
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "dense_evil",
+                            "module": "os",
+                            "config": {"units": 1},
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_name"] == "dense_evil"
+        assert cve_issues[0].details["module"] == "os"
+
+    def test_nested_non_lambda_serialized_function_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_nested_activation_module",
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "dense_with_native_activation",
+                            "module": "keras.layers",
+                            "config": {
+                                "units": 1,
+                                "activation": {
+                                    "module": "posix",
+                                    "class_name": "function",
+                                    "config": "system",
+                                    "registered_name": "system",
+                                },
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_name"] == "dense_with_native_activation"
+        assert cve_issues[0].details["module"] == "posix"
+
+    def test_safe_keras_layer_module_is_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_safe_module",
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "dense_safe",
+                            "module": "keras.layers",
+                            "config": {"units": 1},
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
+
+    def test_non_callable_unknown_dense_module_is_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_unknown_dense_module",
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "dense_custom_module",
+                            "module": "custom_project.layers",
+                            "config": {"units": 1},
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
 
 
 class TestCVE20259905H5SafeMode:
