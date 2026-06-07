@@ -4654,6 +4654,36 @@ def test_scan_mlflow_uri_error(mock_scan_mlflow):
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_error_redacts_registry_credentials(
+    mock_scan_mlflow: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MLflow client errors must not expose registry URLs or auth material."""
+    raw_secret_parts = [
+        "user:pass",
+        "QUERYSECRET1234567890",
+        "HEADERSECRET1234567890",
+        "PROXYSECRET1234567890",
+    ]
+    mock_scan_mlflow.side_effect = RuntimeError(
+        "registry_uri=https://user:pass@mlflow.example.test/api?token=QUERYSECRET1234567890 "
+        "authorization=Bearer HEADERSECRET1234567890 "
+        "proxy-authorization=ApiKey PROXYSECRET1234567890"
+    )
+
+    caplog.set_level(logging.ERROR, logger="modelaudit")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "models:/PrivateModel/1"])
+
+    assert result.exit_code == 2
+    assert "Error downloading model from models:/PrivateModel/1" in result.output
+    assert "<redacted>" in result.output
+    for secret in raw_secret_parts:
+        assert secret not in result.output
+        assert secret not in caplog.text
+
+
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
     """Test MLflow URI scanning with JSON output format."""
     # Setup mock

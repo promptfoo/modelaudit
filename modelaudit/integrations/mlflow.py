@@ -175,6 +175,7 @@ def _redact_mlflow_error_for_display(error: object) -> str:
         return f"{match.group('prefix')}{quote}<redacted>{quote}"
 
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
+    redacted = redact_evidence_string(redacted, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
     if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
         return redacted
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."

@@ -2915,12 +2915,15 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_mlflow_uri(path):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
-            download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+            download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(display_path, fg='cyan')}")
             download_spinner.start()
         elif runtime.show_styled_output:
-            click.echo(f"Downloading from {path}...")
+            click.echo(f"Downloading from {display_path}...")
 
         try:
             record_download_started("mlflow", path)
@@ -2962,8 +2965,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            logger.error(f"Failed to download model from {path}: {exc!s}", exc_info=verbose)
-            click.echo(f"Error downloading model from {path}: {exc!s}", err=True)
+            error_msg = _redact_mlflow_error_for_display(exc)
+            logger.error(f"Failed to download model from {display_path}: {error_msg}", exc_info=verbose)
+            click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             return None
 
