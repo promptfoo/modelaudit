@@ -1,10 +1,19 @@
 """Automatic default configuration utilities for CLI behavior."""
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-gov)?-[a-z]+-\d"
+_S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+)
+_S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+)
 
 
 def _get_hostname(url: str) -> str:
@@ -13,6 +22,30 @@ def _get_hostname(url: str) -> str:
         return (urlparse(url).hostname or "").lower()
     except Exception:
         return ""
+
+
+def _get_scheme(url: str) -> str:
+    """Extract and normalize the URL scheme."""
+    try:
+        return urlparse(url).scheme.casefold()
+    except Exception:
+        return ""
+
+
+def _is_s3_https_host(hostname: str) -> bool:
+    return bool(
+        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+    )
+
+
+def _is_gcs_https_host(hostname: str) -> bool:
+    return hostname in {"storage.googleapis.com", "storage.cloud.google.com"} or hostname.endswith(
+        ".storage.googleapis.com"
+    )
+
+
+def _is_r2_https_host(hostname: str) -> bool:
+    return hostname.endswith(".r2.cloudflarestorage.com")
 
 
 def detect_input_type(path: str) -> str:
@@ -24,13 +57,10 @@ def detect_input_type(path: str) -> str:
     """
     # Cloud storage detection
     hostname = _get_hostname(path)
-    if (
-        path.startswith(("s3://", "r2://"))
-        or hostname.endswith(".s3.amazonaws.com")
-        or hostname.endswith(".r2.cloudflarestorage.com")
-    ):
+    scheme = _get_scheme(path)
+    if scheme in {"s3", "r2"} or _is_s3_https_host(hostname) or _is_r2_https_host(hostname):
         return "cloud_s3"
-    if path.startswith(("gs://", "gcs://")) or hostname == "storage.googleapis.com":
+    if scheme in {"gs", "gcs"} or _is_gcs_https_host(hostname):
         return "cloud_gcs"
     if path.startswith("az://") or hostname.endswith(".blob.core.windows.net"):
         return "cloud_azure"

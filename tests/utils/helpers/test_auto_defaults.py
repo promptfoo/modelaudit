@@ -2,6 +2,8 @@
 
 import tempfile
 
+import pytest
+
 from modelaudit.utils.auto_defaults import (
     detect_file_size,
     detect_input_type,
@@ -22,9 +24,28 @@ def test_detect_input_type_local():
 def test_detect_input_type_cloud():
     """Test detection of cloud storage types."""
     assert detect_input_type("s3://bucket/model.pt") == "cloud_s3"
+    assert detect_input_type("R2://bucket/model.pt") == "cloud_s3"
+    assert detect_input_type("https://bucket.s3.us-west-2.amazonaws.com/model.pt") == "cloud_s3"
+    assert detect_input_type("https://s3.us-west-2.amazonaws.com/bucket/model.pt") == "cloud_s3"
+    assert detect_input_type("https://bucket.account.r2.cloudflarestorage.com/model.pt") == "cloud_s3"
     assert detect_input_type("gs://bucket/model.pt") == "cloud_gcs"
+    assert detect_input_type("https://bucket.storage.googleapis.com/model.pt") == "cloud_gcs"
+    assert detect_input_type("https://storage.cloud.google.com/bucket/model.pt") == "cloud_gcs"
     assert detect_input_type("az://container/model.pt") == "cloud_azure"
     assert detect_input_type("https://account.blob.core.windows.net/container") == "cloud_azure"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://bucket.s3.us-west-2.amazonaws.com.evil.test/model.pt",
+        "https://storage.googleapis.com.evil.test/bucket/model.pt",
+        "https://bucket.storage.googleapis.com.evil.test/model.pt",
+        "https://account.r2.cloudflarestorage.com.evil.test/bucket/model.pt",
+    ],
+)
+def test_detect_input_type_rejects_cloud_host_suffix_tricks(url: str) -> None:
+    assert detect_input_type(url) == "local_file"
 
 
 def test_detect_input_type_registries():
@@ -69,6 +90,25 @@ def test_generate_auto_defaults_cloud():
     assert defaults["selective_download"] is True  # Cloud directories
     assert "timeout" in defaults
     assert defaults["timeout"] > 3600  # Cloud operations get longer timeout
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "R2://bucket/models/model.pkl",
+        "https://bucket.s3.us-west-2.amazonaws.com/model.pkl",
+        "https://s3.us-west-2.amazonaws.com/bucket/model.pkl",
+        "https://bucket.storage.googleapis.com/model.pkl",
+        "https://storage.cloud.google.com/bucket/model.pkl",
+    ],
+)
+def test_generate_auto_defaults_cloud_https_forms(path: str) -> None:
+    defaults = generate_auto_defaults([path])
+
+    assert defaults["use_cache"] is True
+    assert defaults["selective_download"] is True
+    assert defaults["max_file_size"] == 50 * 1024 * 1024 * 1024
+    assert defaults["timeout"] > 3600
 
 
 def test_parse_size_string():

@@ -116,6 +116,17 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
+_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-gov)?-[a-z]+-\d"
+_S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+)
+_S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+)
+
+
+class _CloudObjectMetadataSizeError(ValueError):
+    """Raised when strict directory sizing finds an unmeasurable listed object."""
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -133,16 +144,32 @@ def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> 
 
 def is_cloud_url(url: str) -> bool:
     """Return True if the URL points to a supported cloud storage provider."""
-    patterns = [
-        r"^s3://.+",
-        r"^gs://.+",
-        r"^gcs://.+",
-        r"^r2://.+",
-        r"^https?://[^/]+\.s3\.amazonaws\.com/.+",
-        r"^https?://storage.googleapis.com/.+",
-        r"^https?://[^/]+\.r2\.cloudflarestorage\.com/.+",
-    ]
-    return any(re.match(p, url, re.IGNORECASE) for p in patterns)
+    parsed = urlparse(url)
+    scheme = parsed.scheme.casefold()
+    if scheme in {"s3", "gs", "gcs", "r2"}:
+        return bool(parsed.netloc or parsed.path)
+    if scheme not in {"http", "https"}:
+        return False
+    hostname = (parsed.hostname or "").casefold()
+    return (_is_s3_https_host(hostname) or _is_gcs_https_host(hostname) or _is_r2_https_host(hostname)) and bool(
+        parsed.path and parsed.path != "/"
+    )
+
+
+def _is_s3_https_host(hostname: str) -> bool:
+    return bool(
+        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+    )
+
+
+def _is_gcs_https_host(hostname: str) -> bool:
+    return hostname in {"storage.googleapis.com", "storage.cloud.google.com"} or hostname.endswith(
+        ".storage.googleapis.com"
+    )
+
+
+def _is_r2_https_host(hostname: str) -> bool:
+    return hostname.endswith(".r2.cloudflarestorage.com")
 
 
 def is_stream_url(url: str) -> bool:
@@ -483,15 +510,15 @@ def _cloud_url_without_query(url: str) -> str:
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
-    scheme = parsed.scheme
+    scheme = parsed.scheme.casefold()
     hostname = (parsed.hostname or "").casefold()
 
     if scheme in {"http", "https"}:
-        if hostname.endswith(".s3.amazonaws.com"):
+        if _is_s3_https_host(hostname):
             return "s3"
-        elif hostname == "storage.googleapis.com":
+        elif _is_gcs_https_host(hostname):
             return "gcs"
-        elif hostname.endswith(".r2.cloudflarestorage.com"):
+        elif _is_r2_https_host(hostname):
             return "s3"
         else:
             raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
@@ -601,12 +628,24 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                     file_info = fs.info(file_path)
                     if "size" in file_info:
                         total_size += _parse_size_value(file_info["size"])
-                except Exception:
+                    elif strict:
+                        raise ValueError("cloud provider did not return file size")
+                except Exception as exc:
+                    if strict:
+                        raise _CloudObjectMetadataSizeError(
+                            "Unable to determine cloud object size for "
+                            f"{redact_url_for_display(url)}: metadata lookup failed for listed object "
+                            f"{_redact_cloud_path_for_display(file_path)}: "
+                            f"{redact_cloud_error_for_display(exc, str(file_path))}"
+                        ) from exc
                     continue
         if total_size > 0:
             return total_size
+    except _CloudObjectMetadataSizeError:
+        raise
     except Exception as exc:
         walk_error = exc
+        total_size = 0
 
     # Fallback to recursive ls if walk is unavailable
     def _collect(path: str) -> None:
@@ -627,8 +666,21 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             elif "size" in entry:
                 try:
                     total_size += _parse_size_value(entry["size"])
-                except Exception:
+                except Exception as exc:
+                    if strict:
+                        raise ValueError(
+                            "Unable to determine cloud object size for "
+                            f"{redact_url_for_display(url)}: invalid size metadata for listed object "
+                            f"{_redact_cloud_path_for_display(name)}: "
+                            f"{redact_cloud_error_for_display(exc, str(name))}"
+                        ) from exc
                     continue
+            elif strict and name:
+                raise ValueError(
+                    "Unable to determine cloud object size for "
+                    f"{redact_url_for_display(url)}: missing size metadata for listed object "
+                    f"{_redact_cloud_path_for_display(name)}"
+                )
 
     _collect(url)
     if total_size > 0:
@@ -1904,20 +1956,6 @@ def download_from_cloud(
                     click.echo(f"✓ Using cached version from {cached_path}")
                 return cached_path
 
-    # Check if we can use streaming analysis
-    if stream_analyze and metadata.get("type") == "file":
-        # Import here to avoid circular dependency
-        from modelaudit.utils.file.streaming import get_streaming_preview
-
-        # Try to get a preview first
-        preview = get_streaming_preview(url)
-        if preview and show_progress:
-            click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
-
-        # For streaming analysis, we don't need to download
-        # Return a special marker path (string to preserve prefix)
-        return f"stream://{url}"
-
     # Check size limits
     try:
         size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
@@ -1935,6 +1973,46 @@ def download_from_cloud(
     if size > 100_000_000 and show_progress:  # 100MB
         click.echo(f"⚠️  Downloading {metadata['human_size']} (estimated time: {metadata['estimated_time']})")
 
+    # Get filesystem before any acquisition, including stream previews, so size
+    # enforcement does not rely only on provider summary metadata.
+    fs_protocol = get_fs_protocol(url)
+    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+    fs = fsspec.filesystem(fs_protocol, **fs_args)
+
+    # Check if we can use streaming analysis. Preview reads are still cloud
+    # acquisition and must stay inside the same maximum-transfer budget.
+    if stream_analyze and metadata.get("type") == "file":
+        if max_size:
+            try:
+                stream_object_size = get_cloud_object_size(fs, url, strict=True)
+            except ValueError as exc:
+                raise ValueError(
+                    "Unable to enforce maximum cloud download size for "
+                    f"{redact_url_for_display(url)} because the object size could not be determined"
+                ) from exc
+            if stream_object_size is None:
+                raise ValueError(
+                    "Unable to enforce maximum cloud download size for "
+                    f"{redact_url_for_display(url)} because the object size could not be determined"
+                )
+            if stream_object_size > max_size:
+                raise ValueError(
+                    f"File size ({format_size(stream_object_size)}) exceeds maximum allowed size "
+                    f"({format_size(max_size)})"
+                )
+
+        # Import here to avoid circular dependency
+        from modelaudit.utils.file.streaming import get_streaming_preview
+
+        preview_max_bytes = min(max_size, 1024) if max_size else 1024
+        preview = get_streaming_preview(url, max_bytes=preview_max_bytes)
+        if preview and show_progress:
+            click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
+
+        # For streaming analysis, we don't need to download.
+        # Return a special marker path (string to preserve prefix).
+        return f"stream://{url}"
+
     # Create download directory
     if cache:
         # When using cache, download directly to cache location
@@ -1948,13 +2026,6 @@ def download_from_cloud(
 
     should_cleanup_temp_dir = cache is None and cache_dir is None
     try:
-        # Get filesystem
-        fs_protocol = get_fs_protocol(url)
-        fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
-
-        # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
-        fs = fsspec.filesystem(fs_protocol, **fs_args)
-
         files: list[dict[str, Any]] | None = None
         content_sniff_budget = _CloudContentSniffBudget(max_size) if max_size else None
         if metadata["type"] == "directory":

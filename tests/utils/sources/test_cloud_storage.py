@@ -155,10 +155,16 @@ class TestCloudURLDetection:
             "s3://bucket/key",
             "gs://my-bucket/model.pt",
             "r2://data/model.bin",
+            "R2://data/model.bin",
             "https://bucket.s3.amazonaws.com/file",
+            "https://bucket.s3.us-west-2.amazonaws.com/file",
+            "https://s3.us-west-2.amazonaws.com/bucket/file",
             "HTTPS://BUCKET.S3.AMAZONAWS.COM/file",
             "https://storage.googleapis.com/bucket/file",
+            "https://storage.cloud.google.com/bucket/file",
+            "https://bucket.storage.googleapis.com/file",
             "https://account.r2.cloudflarestorage.com/bucket/file",
+            "https://bucket.account.r2.cloudflarestorage.com/file",
         ]
         for url in valid:
             assert is_cloud_url(url), f"Failed to detect {url}"
@@ -167,6 +173,10 @@ class TestCloudURLDetection:
         invalid = [
             "https://huggingface.co/model",
             "ftp://example.com/file",
+            "https://bucket.s3.us-west-2.amazonaws.com.evil.test/file",
+            "https://storage.googleapis.com.evil.test/bucket/file",
+            "https://bucket.storage.googleapis.com.evil.test/file",
+            "https://account.r2.cloudflarestorage.com.evil.test/bucket/file",
             "",  # empty
         ]
         for url in invalid:
@@ -176,8 +186,13 @@ class TestCloudURLDetection:
         ("url", "expected_protocol"),
         [
             ("HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://BUCKET.S3.US-WEST-2.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://S3.US-WEST-2.AMAZONAWS.COM/bucket/model.pkl", "s3"),
             ("HTTPS://STORAGE.GOOGLEAPIS.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://STORAGE.CLOUD.GOOGLE.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://BUCKET.STORAGE.GOOGLEAPIS.COM/model.pkl", "gcs"),
             ("HTTPS://ACCOUNT.R2.CLOUDFLARESTORAGE.COM/bucket/model.pkl", "s3"),
+            ("R2://ACCOUNT/bucket/model.pkl", "s3"),
         ],
     )
     def test_resolves_mixed_case_https_provider_hosts(self, url: str, expected_protocol: str) -> None:
@@ -1991,9 +2006,16 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
 @patch("modelaudit.utils.file.streaming.get_streaming_preview")
-def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+def test_download_from_cloud_streaming_returns_stream_url(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
     url = "s3://bucket/model.pt"
+    mock_fs_class.return_value = make_fs_mock()
     mock_preview.return_value = None
     mock_analyze.return_value = {
         "type": "file",
@@ -2006,6 +2028,79 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
 
     assert result == f"stream://{url}"
+    mock_preview.assert_called_once_with(url, max_bytes=1024)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_stream_analyze_caps_preview_at_max_size(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/model.pt"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 4}
+    mock_fs_class.return_value = fs
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 4,
+        "name": "model.pt",
+        "human_size": "4 B",
+        "estimated_time": "instant",
+    }
+
+    result = download_from_cloud(
+        url,
+        cache_dir=tmp_path,
+        max_size=4,
+        use_cache=False,
+        stream_analyze=True,
+    )
+
+    assert result == f"stream://{url}"
+    fs.info.assert_called_once_with(url)
+    mock_preview.assert_called_once_with(url, max_bytes=4)
+    fs.get.assert_not_called()
+    fs.open.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_stream_analyze_rejects_late_size_before_preview(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/model.pt"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 8}
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 4,
+        "name": "model.pt",
+        "human_size": "4 B",
+        "estimated_time": "instant",
+    }
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_from_cloud(
+            url,
+            cache_dir=tmp_path,
+            max_size=4,
+            use_cache=False,
+            stream_analyze=True,
+        )
+
+    mock_preview.assert_not_called()
+    fs.get.assert_not_called()
+    fs.open.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2139,6 +2234,58 @@ class TestCloudObjectSize:
         assert size == 3072
         fs.walk.assert_called_once_with("s3://bucket/dir/")
         fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_strict_rejects_walk_metadata_failure(self) -> None:
+        """Strict directory sizing should not drop objects whose metadata lookup fails."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        visible = "s3://bucket/dir/model.bin"
+        hidden = "s3://bucket/dir/evil.pkl?X-Amz-Signature=secret"
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == url:
+                return {"type": "directory", "size": 0}
+            if path == visible:
+                return {"type": "file", "size": 1024}
+            if path == hidden:
+                raise PermissionError(f"metadata denied for {hidden}")
+            raise FileNotFoundError(path)
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [(url, [], [visible, hidden])]
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert "metadata lookup failed" in error
+        assert "evil.pkl" in error
+        assert "X-Amz-Signature" not in error
+        assert "secret" not in error
+        fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_non_strict_keeps_partial_walk_legacy_behavior(self) -> None:
+        """Uncapped callers may still use the best-effort size estimate."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        visible = "s3://bucket/dir/model.bin"
+        hidden = "s3://bucket/dir/hidden.bin"
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == url:
+                return {"type": "directory", "size": 0}
+            if path == visible:
+                return {"type": "file", "size": 1024}
+            if path == hidden:
+                raise PermissionError("metadata denied")
+            raise FileNotFoundError(path)
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [(url, [], [visible, hidden])]
+
+        size = get_cloud_object_size(fs, url)
+
+        assert size == 1024
 
     def test_get_cloud_object_size_error(self) -> None:
         """Test size retrieval returns None on error."""
