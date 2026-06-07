@@ -11,7 +11,7 @@ from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
-_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
+_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 10, 0)
 _TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_-]*)\s*$")
 _TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
 _TORCH_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
@@ -333,7 +333,7 @@ class WeightDistributionScanner(BaseScanner):
                     self.extraction_unsafe = True
                     self.extraction_unsafe_reason = (
                         "Blocked torch.load: weights_only=True is only treated as safe on stable "
-                        "PyTorch 2.6.0 or newer. Prerelease, dev, and unknown versions may still "
+                        "PyTorch 2.10.0 or newer. Prerelease, dev, and unknown versions may still "
                         "be vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
                     )
                     raise RuntimeError(self.extraction_unsafe_reason)

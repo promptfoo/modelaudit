@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- require PyTorch 2.10.0 or newer before weight-distribution scans call torch.load
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets

@@ -737,14 +737,18 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """Prerelease PyTorch versions must fail closed before torch.load."""
+        """Vulnerable and prerelease PyTorch versions must fail closed before torch.load."""
         for torch_version in [
+            "2.6.0",
+            "2.6.1",
+            "2.9.9",
             "2.6.0rc1",
             "2.6.0-rc1",
             "2.6.0_rc1",
             "2.6.0a0",
             "2.6.0pre",
             "2.6.0.dev20250101",
+            "2.10.0rc1",
             "2.10.0a0",
         ]:
             load_called = False
@@ -775,26 +779,26 @@ class TestWeightDistributionScanner:
             assert weights == {}
             assert scanner.extraction_unsafe
             assert scanner.extraction_unsafe_reason is not None
-            assert "stable PyTorch 2.6.0 or newer" in scanner.extraction_unsafe_reason
+            assert "stable PyTorch 2.10.0 or newer" in scanner.extraction_unsafe_reason
             assert load_called is False
 
     @pytest.mark.parametrize(
         "torch_version",
         [
-            "2.6.0",
-            "2.6.0+cpu",
-            "2.6.0.post1",
-            "2.6.0.post",
-            "2.6.0.post1+cpu",
-            "2.6.0_post1",
-            "2.6.0post2",
-            "2.6.0.post-3",
-            "2.6.0rev4",
-            "2.6.0-r5",
-            "2.6.0-6",
-            "2.6.0_rev7+cpu",
-            "2.6.0+cu124.gitabcdef",
-            "2.6.1",
+            "2.10.0",
+            "2.10.0+cpu",
+            "2.10.0.post1",
+            "2.10.0.post",
+            "2.10.0.post1+cpu",
+            "2.10.0_post1",
+            "2.10.0post2",
+            "2.10.0.post-3",
+            "2.10.0rev4",
+            "2.10.0-r5",
+            "2.10.0-6",
+            "2.10.0_rev7+cpu",
+            "2.10.0+cu124.gitabcdef",
+            "2.10.1",
         ],
     )
     def test_allows_torch_load_for_stable_patched_pytorch(
