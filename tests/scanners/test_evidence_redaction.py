@@ -173,6 +173,51 @@ def test_redacts_bare_quoted_authorization_assignments() -> None:
     assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
 
 
+def test_redacts_proxy_and_camel_case_auth_scheme_assignments() -> None:
+    """Scheme-bearing auth values should not leave the second token behind."""
+    text = (
+        "proxyAuthorization: ApiKey PROXYAUTHSECRET1234567890; "
+        "ProxyAuthorization = ApiKey PASCALPROXYSECRET1234567890; "
+        "XApiKey: ApiKey XAPIKEYSECRET1234567890; "
+        "xApiKey = ApiKey CAMELAPIKEYSECRET1234567890; "
+        "Proxy-Authorization: ApiKey HEADERPROXYSECRET1234567890; "
+        "Proxy Authorization: ApiKey SPACEDPROXYSECRET1234567890; "
+        'headers = {"proxyAuthorization": "ApiKey MAPPINGPROXYSECRET1234567890"}; '
+        "eval('1')"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (
+        "PROXYAUTHSECRET1234567890",
+        "PASCALPROXYSECRET1234567890",
+        "XAPIKEYSECRET1234567890",
+        "CAMELAPIKEYSECRET1234567890",
+        "HEADERPROXYSECRET1234567890",
+        "SPACEDPROXYSECRET1234567890",
+        "MAPPINGPROXYSECRET1234567890",
+    ):
+        assert secret not in redacted
+    assert "proxyAuthorization: <redacted>" in redacted
+    assert "ProxyAuthorization = <redacted>" in redacted
+    assert "XApiKey: <redacted>" in redacted
+    assert "xApiKey = <redacted>" in redacted
+    assert "Proxy-Authorization: <redacted>" in redacted
+    assert "Proxy Authorization: <redacted>" in redacted
+    assert '"proxyAuthorization": "<redacted>"' in redacted
+    assert "eval('1')" in redacted
+
+
+def test_preserves_camel_case_credential_control_near_matches() -> None:
+    """Credential-looking counters and controls should not be treated as secrets."""
+    text = (
+        "xApiKeyCount = 2; apiKeyTimeout = 30; clientSecretStatus = 'present'; "
+        "sessionTokenEnabled = True; proxyAuthorizationEnabled = True; tokenizer = 'visible'; eval('1')"
+    )
+
+    assert redact_evidence_string(text, max_chars=None) == text
+
+
 def test_redacts_escaped_json_mapping_secret_values() -> None:
     """Escaped JSON/config mappings embedded in strings should be sanitized."""
     text = r'payload="{\"api_key\":\"ESCAPEDJSONSECRET123\", \"safe\":\"ok\"}"'

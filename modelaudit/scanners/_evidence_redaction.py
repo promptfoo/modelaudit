@@ -117,12 +117,12 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[_.-][a-z0-9]+)*"
 )
 CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*))?"
+    r"(?:[A-Za-z][A-Za-z0-9]*)?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
     r"RefreshToken|refreshToken|GoogleAccessId|googleAccessId|SAS|Secret|SecretKey|secretKey|"
     r"Signature|Sig|Token)"
-    r"(?:[A-Z][A-Za-z0-9]*)?"
+    r"(?!(?:Cache|Count|Enabled|Status|Timeout)\b)(?:[A-Z][A-Za-z0-9]*)?"
 )
 AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
 AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
@@ -211,6 +211,12 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNQUOTED_VALUE_PATTERN}"
+)
+SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    r"(?:ApiKey|Bearer|Basic|Custom|Digest|Negotiate|NTLM|OAuth|Token|AWS4-HMAC-SHA256)"
+    r"[ \t]+[A-Za-z0-9._~+/_-]{8,}={0,2}"
 )
 SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
@@ -1168,6 +1174,10 @@ def _redact_unquoted_assignment(match: re.Match[str]) -> str:
         return match.group(0)
     if _assignment_value_starts_redacted_dangerous_call(match):
         return match.group(0)
+    return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _redact_sensitive_auth_scheme_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
@@ -3196,6 +3206,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = INDEXED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = CREDENTIALS_ASSIGNMENT_RE.sub(redact_unquoted_assignment, redacted)
+    redacted = SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE.sub(_redact_sensitive_auth_scheme_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(redact_scalar_assignment, redacted)
     if python_evidence:
         redacted = _redact_sensitive_comparisons(redacted)
