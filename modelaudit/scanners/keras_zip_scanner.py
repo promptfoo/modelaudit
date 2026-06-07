@@ -222,6 +222,11 @@ def _has_get_file_reference(values: list[str]) -> bool:
     return False
 
 
+def _is_truthy_get_file_extract_arg(value: Any) -> bool:
+    """Match the truthiness Keras applies when calling get_file."""
+    return bool(value)
+
+
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
@@ -1970,18 +1975,20 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _node_has_get_file_extract_true(node: dict[str, Any]) -> bool:
-        """Return True only for direct get_file extract=True argument positions."""
-        if node.get("extract") is True:
+        """Return True for direct get_file extraction argument positions."""
+        if "extract" in node and _is_truthy_get_file_extract_arg(node["extract"]):
             return True
 
         kwargs = node.get("kwargs")
-        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
+        if isinstance(kwargs, dict) and "extract" in kwargs and _is_truthy_get_file_extract_arg(kwargs["extract"]):
             return True
 
         args = node.get("args")
         if isinstance(args, list | tuple):
             # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
-            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+            return (len(args) > 2 and _is_truthy_get_file_extract_arg(args[2])) or (
+                len(args) > 7 and _is_truthy_get_file_extract_arg(args[7])
+            )
 
         return False
 
