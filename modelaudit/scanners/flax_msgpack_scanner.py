@@ -68,6 +68,15 @@ def _join_evidence_path(path: str, key: Any) -> str:
     return f"{path}/{key_str}" if path else key_str
 
 
+def _text_key_for_security_matching(key: Any) -> str | None:
+    if isinstance(key, str):
+        return key
+    if isinstance(key, bytes | bytearray):
+        with suppress(UnicodeDecodeError):
+            return bytes(key).decode("utf-8")
+    return None
+
+
 def _redact_evidence_fragment(value: Any, max_chars: int) -> str:
     text = _stringify_safe_evidence_fragment(value)
     if text == REDACTED_EVIDENCE_VALUE:
@@ -840,7 +849,7 @@ class FlaxMsgpackScanner(BaseScanner):
             for index, (k, v) in enumerate(value.items()):
                 if index >= self.max_items_per_container:
                     break
-                key_str = _stringify_evidence_fragment(k)
+                key_str = _text_key_for_security_matching(k) or _stringify_evidence_fragment(k)
                 safe_key_str = _stringify_safe_evidence_fragment(k)
                 key_location = _join_evidence_path(location, k)
                 self._check_jax_transform(
@@ -1225,15 +1234,19 @@ class FlaxMsgpackScanner(BaseScanner):
             "__import__",
         }
 
-        suspicious_top_level = found_keys & dangerous_keys
+        suspicious_top_level = {
+            key_text
+            for key in found_keys
+            if (key_text := _text_key_for_security_matching(key)) is not None and key_text in dangerous_keys
+        }
         if suspicious_top_level:
             result.add_check(
                 name="Top-Level Key Security Check",
                 passed=False,
-                message=f"Dangerous top-level keys detected: {suspicious_top_level}",
+                message=f"Dangerous top-level keys detected: {sorted(suspicious_top_level)}",
                 severity=IssueSeverity.CRITICAL,
                 location="root",
-                details={"dangerous_keys": list(suspicious_top_level)},
+                details={"dangerous_keys": sorted(suspicious_top_level)},
                 rule_code="S902",
             )
 
