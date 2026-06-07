@@ -444,6 +444,34 @@ def test_sbom_preserves_recorded_hash_for_remote_identifier() -> None:
     assert _property_value(component, "size") == str(len(recorded_content))
 
 
+@pytest.mark.parametrize("use_pydantic", [False, True])
+def test_sbom_redacts_signed_remote_component_identifier(use_pydantic: bool) -> None:
+    raw_path = "s3://user:password@model-bucket/private/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+    safe_path = "s3://model-bucket/private/model.pkl"
+    recorded_content = b"remote metadata-only component"
+    recorded_hash = hashlib.sha256(recorded_content).hexdigest()
+    metadata = {
+        "file_size": len(recorded_content),
+        "file_hashes": {"sha256": recorded_hash},
+    }
+
+    if use_pydantic:
+        result = create_initial_audit_result()
+        result.file_metadata[raw_path] = FileMetadataModel(**metadata)
+        sbom_text = generate_sbom_pydantic([raw_path], result)
+    else:
+        sbom_text = generate_sbom([raw_path], {"issues": [], "file_metadata": {raw_path: metadata}})
+
+    sbom_data: dict[str, Any] = json.loads(sbom_text)
+    component = _component_named(sbom_data, "model.pkl")
+    sbom_json = json.dumps(sbom_data)
+
+    assert component["bom-ref"] == safe_path
+    assert _sha256_values(component) == [recorded_hash]
+    for leaked in ("user:password", "deadbeef", "secret-token", "X-Amz-Signature"):
+        assert leaked not in sbom_json
+
+
 def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

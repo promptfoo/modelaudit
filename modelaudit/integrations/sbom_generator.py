@@ -4,6 +4,7 @@ import stat
 from collections.abc import Iterable
 from importlib.metadata import version as _pkg_version
 from typing import Any
+from urllib.parse import urlsplit
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -13,6 +14,11 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
+from ..utils.sources.cloud_storage import (
+    is_stream_url,
+    redact_stream_url_for_display,
+    redact_url_for_display,
+)
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 _MAX_SYMLINK_HOPS = 40
@@ -419,6 +425,26 @@ def _is_non_filesystem_identifier(path: str) -> bool:
     return "://" in path
 
 
+def _redact_component_identifier(path: str) -> str:
+    """Return a component identifier safe for persisted SBOM output."""
+    if not _is_non_filesystem_identifier(path):
+        return path
+    if is_stream_url(path):
+        return f"stream://{redact_stream_url_for_display(path[9:])}"
+    return redact_url_for_display(path)
+
+
+def _component_name_from_identifier(identifier: str) -> str:
+    """Return a stable display name from a local path or redacted remote identifier."""
+    if _is_non_filesystem_identifier(identifier):
+        try:
+            filename = os.path.basename(urlsplit(identifier).path)
+        except Exception:
+            filename = ""
+        return filename or identifier
+    return os.path.basename(identifier)
+
+
 def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
     """Collect ephemeral streamed assets whose scan-time metadata is authoritative."""
     trusted_paths: set[str] = set()
@@ -569,13 +595,15 @@ def _component_for_file_pydantic(
         license_expressions = _extract_license_expressions(metadata)
         props.extend(_create_metadata_properties(metadata))
 
+    component_identifier = _redact_component_identifier(path)
+
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
+    component_type = _get_component_type(component_identifier, metadata.model_dump() if metadata else None)
 
     # Create the component
     component = Component(
-        name=os.path.basename(path),
-        bom_ref=path,
+        name=_component_name_from_identifier(component_identifier),
+        bom_ref=component_identifier,
         type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,
@@ -702,11 +730,12 @@ def _component_for_file(
     props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+    component_identifier = _redact_component_identifier(path)
+    component_type = _get_component_type(component_identifier, metadata if isinstance(metadata, dict) else None)
 
     component = Component(
-        name=os.path.basename(path),
-        bom_ref=path,
+        name=_component_name_from_identifier(component_identifier),
+        bom_ref=component_identifier,
         type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,

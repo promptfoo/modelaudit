@@ -76,6 +76,7 @@ from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cloud_url,
+    is_sensitive_credential_key,
     is_stream_url,
     redact_cloud_error_for_display,
     redact_stream_error_for_display,
@@ -123,6 +124,78 @@ def _display_error(error: object, path: str) -> str:
     if is_stream_url(path):
         return redact_stream_error_for_display(error, path[9:])
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
+
+
+def _redact_source_text_for_persisted_output(text: str, source_path: str) -> str:
+    """Return report text with source URL credentials removed."""
+    safe_source_path = _display_scan_path(source_path)
+    redacted = text.replace(source_path, safe_source_path)
+    if is_stream_url(source_path):
+        redacted = redact_stream_error_for_display(redacted, source_path[9:])
+    elif is_jfrog_url_like(source_path):
+        redacted = redact_jfrog_error_for_display(redacted, source_path)
+    elif is_huggingface_url(source_path) or is_huggingface_file_url(source_path):
+        redacted = redact_huggingface_urls_in_text(redacted)
+    elif is_cloud_url(source_path) or "://" in source_path:
+        redacted = redact_cloud_error_for_display(redacted, source_path)
+    return redact_cloud_error_for_display(redacted)
+
+
+def _redact_source_mapping_key_for_persisted_output(value: Any, source_path: str) -> str | int | float | bool | None:
+    redacted = _redact_source_value_for_persisted_output(value, source_path)
+    if isinstance(redacted, (str, int, float, bool)) or redacted is None:
+        return redacted
+    return str(redacted)
+
+
+def _redact_source_value_for_persisted_output(value: Any, source_path: str) -> Any:
+    """Recursively redact source URL credentials before serializing reports."""
+    if hasattr(value, "model_dump"):
+        return _redact_source_value_for_persisted_output(value.model_dump(mode="python"), source_path)
+    if isinstance(value, os.PathLike):
+        return _redact_source_value_for_persisted_output(os.fspath(value), source_path)
+    if isinstance(value, str):
+        return _redact_source_text_for_persisted_output(value, source_path)
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return b"<binary data>"
+        return _redact_source_value_for_persisted_output(decoded, source_path).encode("utf-8")
+    if isinstance(value, bytearray):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return bytearray(b"<binary data>")
+        return bytearray(_redact_source_value_for_persisted_output(decoded, source_path), "utf-8")
+    if isinstance(value, dict):
+        redacted_mapping: dict[Any, Any] = {}
+        for key, item in value.items():
+            redacted_key = _redact_source_mapping_key_for_persisted_output(key, source_path)
+            redacted_mapping[redacted_key] = (
+                "<redacted>"
+                if is_sensitive_credential_key(key)
+                else _redact_source_value_for_persisted_output(item, source_path)
+            )
+        return redacted_mapping
+    if isinstance(value, list):
+        return [_redact_source_value_for_persisted_output(item, source_path) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_source_value_for_persisted_output(item, source_path) for item in value)
+    if isinstance(value, set):
+        return {_redact_source_value_for_persisted_output(item, source_path) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_source_value_for_persisted_output(item, source_path) for item in value)
+    return value
+
+
+def _redacted_result_dump_for_persisted_source_output(
+    result: ModelAuditResultModel,
+    source_path: str,
+) -> dict[str, Any]:
+    """Return a result dump safe for JSON/SARIF/SBOM persistence."""
+    redacted = _redact_source_value_for_persisted_output(result.model_dump(mode="python"), source_path)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 class _OutputWriteError(click.ClickException):
@@ -2587,7 +2660,9 @@ def _resolve_scan_source_for_path(
                     cache_dir=runtime.cache_dir,
                     **streaming_kwargs,
                 )
-                audit_result.aggregate_scan_result(streaming_result.model_dump())
+                audit_result.aggregate_scan_result(
+                    _redacted_result_dump_for_persisted_source_output(streaming_result, path)
+                )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
                 download_duration = time.time() - download_start
@@ -2701,7 +2776,9 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
-                audit_result.aggregate_scan_result(streaming_result.model_dump())
+                audit_result.aggregate_scan_result(
+                    _redacted_result_dump_for_persisted_source_output(streaming_result, path)
+                )
                 record_download_completed("pytorch_hub", time.time() - download_start, 0, path)
 
                 if runtime.show_styled_output:
@@ -2840,7 +2917,9 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
-                audit_result.aggregate_scan_result(streaming_result.model_dump())
+                audit_result.aggregate_scan_result(
+                    _redacted_result_dump_for_persisted_source_output(streaming_result, path)
+                )
                 record_download_completed("cloud_storage", time.time() - download_start, 0, path)
 
                 if runtime.show_styled_output:
@@ -2942,7 +3021,7 @@ def _resolve_scan_source_for_path(
                 **_scanner_selection_overrides(runtime),
             )
 
-            audit_result.aggregate_scan_result(results.model_dump())
+            audit_result.aggregate_scan_result(_redacted_result_dump_for_persisted_source_output(results, path))
             download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
             if download_refused:
                 if download_spinner:
@@ -3014,7 +3093,7 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Downloaded and scanned successfully")
 
-            audit_result.aggregate_scan_result(jfrog_results.model_dump())
+            audit_result.aggregate_scan_result(_redacted_result_dump_for_persisted_source_output(jfrog_results, path))
             record_download_completed("jfrog", time.time() - download_start, jfrog_results.bytes_scanned, path)
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
         except Exception as exc:

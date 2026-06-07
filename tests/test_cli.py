@@ -32,6 +32,7 @@ from modelaudit.cli import (
 )
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.scanner_results import Check, CheckStatus, IssueSeverity
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
@@ -4082,6 +4083,69 @@ def test_scan_cloud_url_with_issues(
 
     assert result.exit_code == 1
     mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.core.scan_model_streaming")
+@patch("modelaudit.utils.sources.cloud_storage.download_from_cloud_streaming")
+def test_scan_cloud_stream_json_redacts_source_result_identifiers(
+    mock_stream_download: MagicMock,
+    mock_stream_scan: MagicMock,
+    mock_is_cloud: MagicMock,
+) -> None:
+    """Source-native scan results must not persist signed source URLs."""
+    raw_url = "s3://user:password@bucket/private/model.pkl?X-Amz-Signature=deadbeef&token=secret-token&visible=yes"
+    safe_url = "s3://bucket/private/model.pkl"
+    mock_is_cloud.side_effect = lambda candidate: str(candidate).startswith("s3://")
+    mock_stream_download.return_value = iter(())
+    scan_result = create_mock_scan_result(
+        bytes_scanned=123,
+        issues=[
+            {
+                "message": f"Dangerous payload from {raw_url}",
+                "severity": "critical",
+                "location": raw_url,
+                "details": {
+                    "source": raw_url,
+                    "Authorization": "Bearer nested-secret",
+                    raw_url: {"source": raw_url},
+                },
+            }
+        ],
+        files_scanned=1,
+        assets=[{"path": raw_url, "type": "pickle", "is_streamed": True}],
+        file_metadata={raw_url: {"file_size": 123, "source_url": raw_url}},
+        scanners=["streaming"],
+    )
+    scan_result.checks = [
+        Check(
+            name=f"Checked {raw_url}",
+            status=CheckStatus.FAILED,
+            message=f"Checked source {raw_url}",
+            severity=IssueSeverity.CRITICAL,
+            location=raw_url,
+            details={"source": raw_url, "access_token": "nested-token"},
+        )
+    ]
+    scan_result.finalize_statistics()
+    mock_stream_scan.return_value = scan_result
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--no-cache", "--format", "json", raw_url])
+
+    assert result.exit_code == 1
+    payload = parse_click_json_output(result.output)
+    json_text = json.dumps(payload)
+    for leaked in (
+        raw_url,
+        "deadbeef",
+        "secret-token",
+        "nested-secret",
+        "nested-token",
+        "X-Amz-Signature",
+        "user:password",
+    ):
+        assert leaked not in json_text
+    assert safe_url in json_text
 
 
 @patch("modelaudit.cli.is_cloud_url")
