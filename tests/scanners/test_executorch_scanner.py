@@ -344,6 +344,79 @@ def test_executorch_duplicate_pickle_members_scan_malicious_first_entry(tmp_path
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
+def test_executorch_scans_hidden_extensionless_pickle_member(tmp_path: Path) -> None:
+    model_path = tmp_path / "hidden-extensionless-pickle.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("bytecode", _pickle_payload_with_eval("print('evil')"))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["bytecode"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "bytecode"
+        for issue in result.issues
+    )
+
+
+def test_executorch_hidden_pickle_discovery_does_not_short_circuit_on_data_pkl(tmp_path: Path) -> None:
+    model_path = tmp_path / "hidden-extensionless-with-data-pkl.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("payload", _pickle_payload_with_eval("print('evil')"))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["data.pkl", "payload"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
+        for issue in result.issues
+    )
+
+
+def test_executorch_pickle_discovery_ignores_plain_text_opcode_near_match(tmp_path: Path) -> None:
+    model_path = tmp_path / "benign-pickleish-text.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("bytecode", b"cat is a category label, not a GLOBAL opcode stream")
+        zipf.writestr("constants", b"I keep integer-looking notes in this checkpoint manifest")
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == []
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_executorch_pickle_discovery_failures_are_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    model_path = tmp_path / "unreadable-hidden-pickle-probe.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("payload", _pickle_payload_with_eval("print('evil')"))
+
+    original = ExecuTorchScanner._read_member_prefix
+
+    def fail_payload_probe(zip_file: zipfile.ZipFile, entry: zipfile.ZipInfo, length: int) -> bytes:
+        if entry.filename == "payload":
+            raise OSError("simulated hidden pickle probe failure")
+        return original(zip_file, entry, length)
+
+    monkeypatch.setattr(ExecuTorchScanner, "_read_member_prefix", staticmethod(fail_payload_probe))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["pickle_files"] == ["data.pkl"]
+    discovery_checks = [check for check in result.checks if check.name == "Pickle Discovery"]
+    assert len(discovery_checks) == 1
+    assert discovery_checks[0].details["zip_entries"] == ["payload"]
+    assert discovery_checks[0].details["scan_outcome_reason"] == "executorch_pickle_discovery_incomplete"
+
+
 def test_renamed_executorch_archive_duplicate_members_route_and_detect_shadowed_payload(tmp_path: Path) -> None:
     model_path = tmp_path / "duplicate-model.jpg"
     with zipfile.ZipFile(model_path, "w") as zipf:

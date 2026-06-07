@@ -1,16 +1,20 @@
 """Scanner for ExecuTorch model files (.pte)."""
 
 import os
+import pickletools
 import tempfile
 import zipfile
 from typing import Any, BinaryIO, ClassVar, cast
 
-from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
+    PROTO0_1_START_BYTES,
     _is_executorch_binary_signature,
     _is_valid_executorch_binary,
+    _looks_like_proto0_or_1_pickle,
     is_executorch_archive,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -20,6 +24,16 @@ from .picklescan_adapter import (
 )
 
 CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+_PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
+    b"\x80\x01",
+    b"\x80\x02",
+    b"\x80\x03",
+    b"\x80\x04",
+    b"\x80\x05",
+)
+_PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
+_PICKLE_DISCOVERY_INCOMPLETE_REASON = "executorch_pickle_discovery_incomplete"
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -54,6 +68,111 @@ class ExecuTorchScanner(BaseScanner):
     def _read_header(path: str, length: int = 4) -> bytes:
         with open(path, "rb") as f:
             return f.read(length)
+
+    @staticmethod
+    def _read_member_prefix(zip_file: zipfile.ZipFile, entry: zipfile.ZipInfo, length: int) -> bytes:
+        with zip_file.open(entry, "r") as member_file:
+            return member_file.read(min(length, entry.file_size))
+
+    @staticmethod
+    def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
+        if not any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            return False
+
+        op_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(sample):
+                op_count += 1
+                if opcode.name == "STOP" or op_count >= 4:
+                    return True
+        except ValueError as exc:
+            message = str(exc).lower()
+            return (
+                sample_is_prefix
+                and op_count >= 2
+                and ("exhausted before seeing stop" in message or "not enough data" in message or "expected" in message)
+            )
+
+        return sample_is_prefix and op_count >= 2
+
+    def _entry_looks_like_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+    ) -> bool:
+        data_start = self._read_member_prefix(zip_file, entry, _PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
+        if not data_start:
+            return False
+
+        if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            sample = self._read_member_prefix(zip_file, entry, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            return self._looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+
+        if data_start[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        sample = data_start
+        if entry.file_size > len(data_start):
+            sample = self._read_member_prefix(zip_file, entry, PROTO0_1_MAX_PROBE_BYTES)
+        return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+
+    def _discover_pickle_entries(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> list[zipfile.ZipInfo]:
+        pickle_entries: list[zipfile.ZipInfo] = []
+        seen_entries: set[int] = set()
+
+        def add_entry(entry: zipfile.ZipInfo) -> None:
+            entry_key = id(entry)
+            if entry_key in seen_entries:
+                return
+            pickle_entries.append(entry)
+            seen_entries.add(entry_key)
+
+        for entry in safe_entries:
+            if entry.filename.casefold().endswith(".pkl"):
+                add_entry(entry)
+
+        probe_failures: list[dict[str, Any]] = []
+        for entry in safe_entries:
+            if id(entry) in seen_entries or entry.is_dir():
+                continue
+            try:
+                if self._entry_looks_like_pickle(zip_file, entry):
+                    add_entry(entry)
+            except Exception as exc:
+                probe_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "location": f"{self.current_file_path}:{entry.filename}",
+                    }
+                )
+
+        if probe_failures:
+            mark_inconclusive_scan_result(result, _PICKLE_DISCOVERY_INCOMPLETE_REASON)
+            count = len(probe_failures)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="Pickle Discovery",
+                passed=False,
+                message=f"{count} ExecuTorch ZIP {noun} could not be inspected for hidden pickle payloads",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "zip_entries": [failure["zip_entry"] for failure in probe_failures],
+                    "entries": probe_failures,
+                    "failed_count": count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _PICKLE_DISCOVERY_INCOMPLETE_REASON,
+                },
+            )
+
+        return pickle_entries
 
     @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, exc: OSError) -> ScanResult:
@@ -151,7 +270,7 @@ class ExecuTorchScanner(BaseScanner):
                         continue
                     safe_entries.append(entry)
 
-                pickle_entries = [entry for entry in safe_entries if entry.filename.casefold().endswith(".pkl")]
+                pickle_entries = self._discover_pickle_entries(z, safe_entries, result)
                 pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
                 bytes_scanned = 0
@@ -231,5 +350,5 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
