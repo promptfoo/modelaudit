@@ -94,6 +94,34 @@ def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
     return local_file
 
 
+def _local_download_path_collision_key(path: Path) -> tuple[str, ...]:
+    """Return a filesystem-independent key for local path alias detection."""
+    return tuple(part.casefold() for part in path.resolve(strict=False).parts)
+
+
+def _prepare_jfrog_folder_download_targets(
+    download_dir: Path,
+    base_url: str,
+    files: list[dict[str, Any]],
+) -> list[Path]:
+    """Precompute selected JFrog folder destinations and reject local aliases."""
+    local_files: list[Path] = []
+    seen_targets: dict[tuple[str, ...], str] = {}
+    for file_info in files:
+        relative_path = _safe_jfrog_relative_path(base_url, str(file_info["path"]))
+        local_file = _safe_download_path(download_dir, relative_path)
+        collision_key = _local_download_path_collision_key(local_file)
+        previous_path = seen_targets.get(collision_key)
+        if previous_path is not None:
+            raise ValueError(
+                "Colliding local JFrog artifact paths: "
+                f"{previous_path} and {relative_path} resolve to the same local destination"
+            )
+        seen_targets[collision_key] = relative_path
+        local_files.append(local_file)
+    return local_files
+
+
 def _cleanup_failed_folder_download(
     download_dir: Path,
     *,
@@ -1773,8 +1801,19 @@ def download_jfrog_folder(
             shutil.rmtree(backup_dir, ignore_errors=True)
 
     try:
-        for file_info in files:
-            local_file: Path | None = None
+        local_files = _prepare_jfrog_folder_download_targets(download_dir, url, files)
+    except Exception:
+        _cleanup_failed_folder_download(
+            download_dir,
+            owns_download_dir=owns_download_dir,
+            downloaded_files=[],
+            current_file_candidates=[],
+        )
+        raise
+
+    try:
+        for file_info, prepared_local_file in zip(files, local_files, strict=True):
+            local_file = prepared_local_file
             downloaded_file: Path | None = None
             try:
                 if show_progress:
@@ -1783,9 +1822,6 @@ def download_jfrog_folder(
 
                 # Calculate relative path for local storage
                 file_url_parsed = urlparse(file_info["path"])
-                relative_path = _safe_jfrog_relative_path(url, str(file_info["path"]))
-
-                local_file = _safe_download_path(download_dir, relative_path)
                 local_file.parent.mkdir(parents=True, exist_ok=True)
                 expected_downloaded_file = local_file.parent / Path(file_url_parsed.path).name
                 _backup_existing_file(local_file)
