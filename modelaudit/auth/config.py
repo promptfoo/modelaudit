@@ -19,6 +19,43 @@ from ..utils._path_hardening import (
 
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
+API_HOST_ALLOWED_HOSTS_ENV = "MODELAUDIT_API_ALLOWED_HOSTS"
+_PROMPTFOO_API_HOST_SUFFIX = "promptfoo.app"
+
+
+def _normalize_api_hostname(hostname: str) -> str:
+    """Normalize hostnames before trust comparisons."""
+    return hostname.lower().rstrip(".")
+
+
+def _host_from_config_value(value: str) -> str:
+    """Normalize a configured hostname or base URL to a hostname."""
+    candidate = value.strip()
+    if not candidate:
+        return ""
+
+    try:
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+    except ValueError:
+        return ""
+
+    if parsed.hostname is None:
+        return ""
+    return _normalize_api_hostname(parsed.hostname)
+
+
+def _get_explicitly_trusted_api_hosts() -> set[str]:
+    """Return caller-configured hosts allowed to receive API bearer tokens."""
+    raw_hosts = os.getenv(API_HOST_ALLOWED_HOSTS_ENV, "")
+    return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
+
+
+def _is_promptfoo_api_host(hostname: str) -> bool:
+    return hostname == _PROMPTFOO_API_HOST_SUFFIX or hostname.endswith(f".{_PROMPTFOO_API_HOST_SUFFIX}")
+
+
+def _is_trusted_api_host(hostname: str) -> bool:
+    return _is_promptfoo_api_host(hostname) or hostname in _get_explicitly_trusted_api_hosts()
 
 
 def validate_api_host_for_bearer_auth(api_host: str) -> str:
@@ -34,7 +71,7 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
 
     try:
         parsed = urlparse(stripped_host)
-        hostname = parsed.hostname.lower() if parsed.hostname else None
+        hostname = _normalize_api_hostname(parsed.hostname) if parsed.hostname else None
         port = parsed.port
     except ValueError as error:
         raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL") from error
@@ -52,6 +89,11 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
         raise ValueError("API host for bearer-token authentication must include a hostname")
     if port == 0:
         raise ValueError("API host for bearer-token authentication must include a valid port")
+    if not _is_trusted_api_host(hostname):
+        raise ValueError(
+            "API host for bearer-token authentication must be a trusted Promptfoo API host "
+            f"or listed in {API_HOST_ALLOWED_HOSTS_ENV}"
+        )
 
     normalized_hostname = f"[{hostname}]" if ":" in hostname else hostname
     normalized_port = f":{port}" if port not in (None, 443) else ""
