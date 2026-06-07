@@ -166,6 +166,48 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     return result
 
 
+def _mlflow_download_safety_failure_result(
+    model_uri: str,
+    message: str,
+    details: dict[str, Any],
+) -> ModelAuditResultModel:
+    result = create_initial_audit_result()
+    result.scanner_names = ["mlflow"]
+    result.has_errors = True
+    result.success = False
+    safe_model_uri = redact_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_details = redact_evidence_value(details, max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+
+    why = (
+        "ModelAudit stages MLflow downloads in a private directory before scanning. "
+        "Refusing returned paths outside that directory prevents a registry or artifact backend "
+        "from redirecting the scan to unintended local files."
+    )
+    result.checks.append(
+        Check(
+            name="MLflow Download Path Check",
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+        )
+    )
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+            type="mlflow_download_path",
+        )
+    )
+    result.finalize_statistics()
+    return result
+
+
 def _redact_mlflow_error_for_display(error: object) -> str:
     redacted = redact_cloud_error_for_display(_redact_urls_in_text(str(error)))
 
@@ -1217,6 +1259,37 @@ def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, b
     return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 
+def _resolve_mlflow_download_path(model_uri: str, local_path: str, download_dir: str) -> str | ModelAuditResultModel:
+    try:
+        download_root = Path(download_dir).expanduser().resolve(strict=True)
+        returned_path = Path(local_path).expanduser().resolve(strict=True)
+    except (OSError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to verify MLflow artifact download path",
+            {
+                "reason": "artifact_download_path_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    if not returned_path.is_relative_to(download_root):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download returned a path outside the staging directory",
+            {"reason": "artifact_download_path_escape"},
+        )
+
+    scan_path = returned_path.parent if returned_path.is_file() else returned_path
+    if not scan_path.is_relative_to(download_root):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download resolved outside the staging directory",
+            {"reason": "artifact_download_scan_path_escape"},
+        )
+    return str(scan_path)
+
+
 def scan_mlflow_model(
     model_uri: str,
     *,
@@ -1302,8 +1375,9 @@ def scan_mlflow_model(
             local_path = download_result
         else:
             local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=download_dir)  # type: ignore[possibly-unbound-attribute]
-        # mlflow may return a file within the download directory; ensure directory path
-        download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        download_path = _resolve_mlflow_download_path(model_uri, local_path, download_dir)
+        if isinstance(download_path, ModelAuditResultModel):
+            return download_path
         cache_config = {"cache_enabled": cache_enabled, "cache_dir": scan_cache_dir}
 
         # Import here to avoid circular dependency

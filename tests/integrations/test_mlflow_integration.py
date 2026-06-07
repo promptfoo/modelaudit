@@ -1577,6 +1577,7 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
     cache_key = hashlib.sha256(b"models:/TestModel/1").hexdigest()[:16]
     expected_download_root = cache_dir / "mlflow"
     expected_download_dir = expected_download_root / f"{cache_key}-run"
+    expected_download_dir.mkdir(parents=True)
     mock_mkdtemp.return_value = str(expected_download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(expected_download_dir)
     mock_scan.return_value = {"bytes_scanned": 256, "issues": []}
@@ -1604,21 +1605,25 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
+def test_scan_mlflow_model_file_path(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test MLflow model scanning when download returns a file path."""
     # Mock MLflow
     mock_mlflow = MagicMock()
 
     # Create a temporary file path (simulating MLflow returning a file)
-    temp_dir = "/tmp/modelaudit_mlflow_test"
-    temp_file = "/tmp/modelaudit_mlflow_test/model.pkl"
-    mock_mlflow.artifacts.download_artifacts.return_value = temp_file
-    mock_mkdtemp.return_value = temp_dir
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    temp_file = temp_dir / "model.pkl"
+    temp_file.write_bytes(b"model")
+    mock_mlflow.artifacts.download_artifacts.return_value = str(temp_file)
+    mock_mkdtemp.return_value = str(temp_dir)
 
-    # Mock os.path.isfile to return True for our temp file
     with (
-        patch("os.path.isfile", return_value=True),
-        patch("os.path.dirname", return_value=temp_dir),
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
     ):
         mock_scan.return_value = {"bytes_scanned": 512, "issues": []}
@@ -1628,12 +1633,43 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
         # Verify scan was called with the directory path, not the file path
         mock_scan.assert_called_once()
         args, _kwargs = mock_scan.call_args
-        assert args[0] == temp_dir  # Should be directory, not file
+        assert args[0] == str(temp_dir.resolve())  # Should be directory, not file
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_download_return_outside_staging(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """MLflow backends must not redirect scanning outside ModelAudit's staging directory."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "modelaudit_mlflow_test"
+    download_dir.mkdir()
+    outside_model = tmp_path / "outside" / "model.pkl"
+    outside_model.parent.mkdir()
+    outside_model.write_bytes(b"model")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(outside_model)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.checks[0].name == "MLflow Download Path Check"
+    assert result.checks[0].details["reason"] == "artifact_download_path_escape"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+def test_scan_mlflow_model_download_error(mock_mkdtemp: MagicMock, mock_rmtree: MagicMock) -> None:
     """Test error handling when MLflow download fails."""
     # Mock MLflow with download error
     mock_mlflow = MagicMock()
@@ -1652,14 +1688,16 @@ def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
 
 
-def test_scan_mlflow_model_no_registry_uri():
+def test_scan_mlflow_model_no_registry_uri(tmp_path: Path) -> None:
     """Test MLflow model scanning without registry URI."""
     mock_mlflow = MagicMock()
-    mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
+    download_dir = tmp_path / "test"
+    download_dir.mkdir()
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
-        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value="/tmp/test"),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
         patch("modelaudit.core.scan_model_directory_or_file", return_value={}),
         patch("modelaudit.integrations.mlflow.shutil.rmtree"),
     ):
