@@ -1045,6 +1045,44 @@ class TestSevenZipScanner:
             assert issue.severity == IssueSeverity.CRITICAL
             assert "zip_bomb" in str(issue.details)
 
+    def test_max_entries_protection_uses_bounded_member_metadata(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Entry limits should fail closed without copying the complete 7z name table."""
+        scanner.max_entries = 2
+
+        def member_info(filename: str) -> MagicMock:
+            info = MagicMock()
+            info.filename = filename
+            return info
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+        ):
+            mock_archive = MagicMock()
+            mock_archive.files = [
+                member_info("file1.pkl"),
+                member_info("file2.pkl"),
+                member_info("file3.pkl"),
+                member_info("file4.pkl"),
+            ]
+            mock_archive.getnames.side_effect = AssertionError("getnames should not materialize all member names")
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        assert result.success is False
+        mock_archive.getnames.assert_not_called()
+        mock_archive.extract.assert_not_called()
+        limit_check = next(check for check in result.checks if check.name == "Archive Entry Limit")
+        assert limit_check.status == CheckStatus.FAILED
+        assert limit_check.details["file_count"] == 3
+        assert limit_check.details["limit"] == 2
+        assert result.metadata["total_files"] == 3
+
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_with_mixed_content(self, scanner, temp_7z_file):
         """Test scanning archive with mixed scannable and non-scannable content"""
