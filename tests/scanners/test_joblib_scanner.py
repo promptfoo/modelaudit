@@ -1,3 +1,8 @@
+import bz2
+import gzip
+import lzma
+import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +27,90 @@ def test_joblib_scanner_basic(tmp_path: Path) -> None:
 
     assert result.success is True
     assert result.bytes_scanned > 0
+
+
+def test_joblib_default_decompressed_cap_tracks_file_read_budget() -> None:
+    scanner = JoblibScanner()
+
+    assert scanner.max_decompressed_size == scanner.max_file_read_size
+
+    scanner = JoblibScanner({"max_file_read_size": 2 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 2 * 1024 * 1024
+
+    scanner = JoblibScanner({"max_file_read_size": 0, "max_decompressed_size": 1024 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 1024 * 1024 * 1024
+
+    scanner = JoblibScanner({"max_file_read_size": 2 * 1024 * 1024, "max_decompressed_size": 4 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 2 * 1024 * 1024
+
+    scanner = JoblibScanner({"max_file_size": 1024 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 1024 * 1024 * 1024
+
+    scanner = JoblibScanner({"max_file_size": 1024 * 1024 * 1024, "max_decompressed_size": 2 * 1024 * 1024 * 1024})
+
+    assert scanner.max_decompressed_size == 1024 * 1024 * 1024
+
+    scanner = JoblibScanner(
+        {
+            "max_file_size": 1024 * 1024 * 1024,
+            "max_file_read_size": 256 * 1024 * 1024,
+            "max_decompressed_size": 2 * 1024 * 1024 * 1024,
+        }
+    )
+
+    assert scanner.max_decompressed_size == 256 * 1024 * 1024
+
+
+@pytest.mark.parametrize("invalid_value", [None, 0, -1, True, False, 1.5, "1024"])
+def test_joblib_invalid_decompressed_cap_uses_read_budget(invalid_value: object) -> None:
+    scanner = JoblibScanner({"max_file_read_size": 4096, "max_decompressed_size": invalid_value})
+
+    assert scanner.max_decompressed_size == 4096
+
+
+@pytest.mark.parametrize(
+    "compress",
+    [zlib.compress, gzip.compress, bz2.compress, lzma.compress],
+    ids=["zlib", "gzip", "bz2", "lzma"],
+)
+def test_joblib_decompression_cap_is_exact_for_all_supported_codecs(
+    compress: Callable[[bytes], bytes],
+) -> None:
+    scanner = JoblibScanner({"max_decompressed_size": 128, "max_decompression_ratio": 1000.0})
+
+    assert scanner._safe_decompress(compress(b"A" * 128)) == b"A" * 128
+    with pytest.raises(ValueError, match=r"Decompressed size too large: 129 bytes \(max: 128\)"):
+        scanner._safe_decompress(compress(b"A" * 129))
+
+
+def test_joblib_scanner_respects_explicit_decompressed_cap(tmp_path: Path) -> None:
+    path = tmp_path / "model.joblib"
+    joblib.dump({"a": np.arange(5)}, path, compress=3)
+
+    result = JoblibScanner({"max_decompressed_size": 64 * 1024}).scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compression Bomb Detection" and check.status.value == "failed" for check in result.checks
+    )
+
+
+def test_joblib_scanner_fails_before_large_decompression_allocation(tmp_path: Path) -> None:
+    path = tmp_path / "oversized.joblib"
+    path.write_bytes(zlib.compress(b"A" * 4096))
+
+    result = JoblibScanner({"max_decompressed_size": 128, "max_decompression_ratio": 1000.0}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "joblib_wrapper_decode_failed"
+    failed_check = next(check for check in result.checks if check.name == "Compression Bomb Detection")
+    assert failed_check.status.value == "failed"
+    assert "Decompressed size too large" in failed_check.message
+    assert "max: 128" in failed_check.message
 
 
 def test_joblib_scanner_closes_bytesio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
