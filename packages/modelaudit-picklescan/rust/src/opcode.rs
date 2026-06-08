@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PROTOCOL0_LINE_OPERAND_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) enum ArgValue {
@@ -99,6 +99,13 @@ pub(crate) struct ParseError {
     pub(crate) message: String,
     pub(crate) exception_type: &'static str,
     pub(crate) report_index: Option<usize>,
+    kind: ParseErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseErrorKind {
+    Generic,
+    Protocol0LineOperandLimit,
 }
 
 impl ParseError {
@@ -107,6 +114,7 @@ impl ParseError {
             message: message.into(),
             exception_type: "ValueError",
             report_index: None,
+            kind: ParseErrorKind::Generic,
         }
     }
 
@@ -120,7 +128,23 @@ impl ParseError {
             message: format!("not enough data in stream to read {read_kind}"),
             exception_type: "ValueError",
             report_index: Some(index),
+            kind: ParseErrorKind::Generic,
         }
+    }
+
+    fn protocol0_line_operand_limit(read_kind: &'static str, index: usize) -> Self {
+        Self {
+            message: format!(
+                "{read_kind} protocol 0 line operand exceeds {MAX_PROTOCOL0_LINE_OPERAND_BYTES} bytes"
+            ),
+            exception_type: "ValueError",
+            report_index: Some(index),
+            kind: ParseErrorKind::Protocol0LineOperandLimit,
+        }
+    }
+
+    pub(crate) fn is_protocol0_line_operand_limit(&self) -> bool {
+        self.kind == ParseErrorKind::Protocol0LineOperandLimit
     }
 }
 pub(crate) fn parse_opcode(
@@ -586,20 +610,16 @@ fn read_line_bytes_kind(
         .map(|offset| *cursor + offset)
         .ok_or_else(|| {
             if payload_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
-                ParseError::new(format!(
-                    "{read_kind} protocol 0 line operand exceeds {MAX_PROTOCOL0_LINE_OPERAND_BYTES} bytes"
-                ))
-                .at(search_end)
+                ParseError::protocol0_line_operand_limit(read_kind, search_end)
             } else {
                 ParseError::new(format!("no newline found when trying to read {read_kind}"))
                     .at(report_index)
             }
         })?;
     if line_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
-        return Err(ParseError::new(format!(
-            "{read_kind} protocol 0 line operand exceeds {MAX_PROTOCOL0_LINE_OPERAND_BYTES} bytes"
-        ))
-        .at(line_end));
+        return Err(ParseError::protocol0_line_operand_limit(
+            read_kind, line_end,
+        ));
     }
     let value = payload[*cursor..line_end].to_vec();
     *cursor = line_end + 1;
@@ -878,6 +898,7 @@ mod tests {
         };
 
         assert_eq!(error.exception_type, "ValueError");
+        assert!(error.is_protocol0_line_operand_limit());
         assert!(error.message.contains("protocol 0 line operand exceeds"));
         assert_eq!(
             error.report_index,
