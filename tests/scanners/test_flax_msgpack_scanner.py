@@ -233,6 +233,36 @@ def test_flax_msgpack_byte_encoded_dangerous_top_level_key_is_critical(tmp_path:
     )
 
 
+def test_flax_msgpack_byte_encoded_standard_key_is_recognized(tmp_path: Path) -> None:
+    path = tmp_path / "byte_params_key.msgpack"
+    create_msgpack_file(path, {b"params": {b"weights": b"\x00" * 4096}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Flax Checkpoint Format Detection"
+        and check.status == CheckStatus.PASSED
+        and check.details["found_standard_keys"] == ["params"]
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_byte_encoded_shape_key_is_validated(tmp_path: Path) -> None:
+    path = tmp_path / "byte_shape_key.msgpack"
+    create_msgpack_file(path, {b"params": {b"shape": [-1, 2]}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Tensor Shape Validation"
+        and check.details["shape"] == [-1, 2]
+        and check.location == "root/params"
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_byte_encoded_function_metadata_key_is_value_aware(tmp_path: Path) -> None:
     path = tmp_path / "byte_restore_fn_key.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"restore_fn": "eval"})

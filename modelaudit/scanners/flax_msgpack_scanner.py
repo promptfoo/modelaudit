@@ -2039,16 +2039,17 @@ class FlaxMsgpackScanner(BaseScanner):
                 key = key_value.value
                 if key_value.is_container or key_value.type_name == "skipped":
                     key = f"<{key_value.type_name}_key>"
+                key_text = _text_for_security_matching(key)
                 key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
                 key_location = f"{location}/{safe_key_str}" if location else safe_key_str
-                if isinstance(key, str) and key in transformer_keys:
-                    direct_string_keys.add(key)
+                if key_text is not None and key_text in transformer_keys:
+                    direct_string_keys.add(key_text)
                 if top_level:
                     if len(summary.top_level_keys) < 50:
                         summary.top_level_keys.append(_redact_evidence_key(key))
-                    if isinstance(key, str) and len(key) <= 128:
-                        summary.top_level_string_keys.add(key)
-                        if key.startswith("__orbax"):
+                    if key_text is not None and len(key_text) <= 128:
+                        summary.top_level_string_keys.add(key_text)
+                        if key_text.startswith("__orbax"):
                             summary.orbax_format = True
 
                 value = self._read_stream_value(
@@ -2060,18 +2061,18 @@ class FlaxMsgpackScanner(BaseScanner):
                     location=key_location,
                     depth=depth + 1,
                     count_node=True,
-                    capture_sequence=key == "shape",
+                    capture_sequence=key_text == "shape",
                 )
                 self._check_suspicious_keys(key_str, value.value, key_location, result)
 
-                if key == "__jax_array__":
+                if key_text == "__jax_array__":
                     has_jax_array = True
 
                 if (
                     top_level
                     and value.type_name == "dict"
-                    and isinstance(key, str)
-                    and (value.direct_string_keys & transformer_keys or key.lower() in model_name_keys)
+                    and key_text is not None
+                    and (value.direct_string_keys & transformer_keys or key_text.lower() in model_name_keys)
                 ):
                     summary.has_nested_transformer_keys = True
 
