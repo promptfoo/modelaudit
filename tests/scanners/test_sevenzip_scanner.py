@@ -1097,6 +1097,39 @@ class TestSevenZipScanner:
         assert exceeded is True
         assert observed == names
 
+    def test_bounded_member_metadata_does_not_trust_underreported_length(self, scanner: SevenZipScanner) -> None:
+        """Iteration must retain the entry bound even when metadata length is inconsistent."""
+        scanner.max_entries = 2
+
+        class UnderreportedMemberSource:
+            def __len__(self) -> int:
+                return 1
+
+            def __iter__(self) -> Generator[str, None, None]:
+                yield from ("one.pkl", "two.pkl", "three.pkl", "four.pkl")
+
+        archive = MagicMock()
+        archive.files = UnderreportedMemberSource()
+
+        names, count, exceeded = scanner._bounded_archive_file_names(archive)
+
+        assert names == ["one.pkl", "two.pkl", "three.pkl"]
+        assert count == 3
+        assert exceeded is True
+
+    def test_real_py7zr_metadata_api_change_fails_closed(self, scanner: SevenZipScanner) -> None:
+        """A future py7zr metadata rename must not fall back to eager name collection."""
+
+        class MissingMetadataArchive:
+            __module__ = "py7zr.compat"
+
+            @staticmethod
+            def getnames() -> list[str]:
+                raise AssertionError("getnames must not materialize all member names")
+
+        with pytest.raises(ValueError, match="did not expose a bounded member source"):
+            scanner._bounded_archive_file_names(MissingMetadataArchive())
+
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_real_archive_entry_limit_does_not_call_getnames(
         self,

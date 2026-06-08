@@ -415,7 +415,7 @@ class SevenZipScanner(BaseScanner):
         try:
             observed_entry_count = len(member_source)
         except TypeError:
-            observed_entry_count = 0
+            pass
         else:
             if observed_entry_count > self.max_entries:
                 return [], observed_entry_count, True
