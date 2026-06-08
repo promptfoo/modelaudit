@@ -19,6 +19,7 @@ from modelaudit.utils.sources.pytorch_hub import (
     _supports_secure_cache_commit,
     download_pytorch_hub_model,
     download_pytorch_hub_model_streaming,
+    is_cleartext_pytorch_hub_url,
     is_pytorch_hub_url,
 )
 
@@ -41,6 +42,30 @@ class TestPytorchHubURLDetection:
         ]
         for url in invalid:
             assert not is_pytorch_hub_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://pytorch.org/hub/pytorch_vision_resnet/",
+        "HTTP://PYTORCH.ORG/hub/pytorch_vision_resnet/",
+    ],
+)
+def test_rejects_cleartext_pytorch_hub_urls(url: str) -> None:
+    assert not is_pytorch_hub_url(url)
+    assert is_cleartext_pytorch_hub_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://pytorch.org.evil.example/hub/pytorch_vision_resnet/",
+        "http://pytorch.org@evil.example/hub/pytorch_vision_resnet/",
+        "http://example.com/hub/pytorch_vision_resnet/",
+    ],
+)
+def test_cleartext_pytorch_hub_detection_rejects_hostname_near_matches(url: str) -> None:
+    assert not is_cleartext_pytorch_hub_url(url)
 
 
 @patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")

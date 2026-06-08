@@ -14,9 +14,10 @@ use crate::nested::{
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
     has_binary_pickle_prefix, has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
-    nested_pickle_probe_offsets, pickle_payload_extent,
+    nested_pickle_probe_offsets, pickle_payload_extent_result,
     protocol0_global_or_inst_prefix_has_import_reference_lines,
-    truncated_pickle_prefix_requires_fail_closed, NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
+    truncated_pickle_prefix_requires_fail_closed, DecodedNestedPayload, NestedProbeOffsets,
+    MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -5801,27 +5802,32 @@ impl<'a> ScanState<'a> {
                 .len()
                 .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
             let probe = &value[offset..end];
-            if let Some(payload_len) =
-                pickle_payload_extent(probe, self.options.max_nested_pickle_bytes)
-            {
-                let candidate = &probe[..payload_len];
-                let nested_has_execution_opcode = has_execution_opcode(candidate);
-                let surface_outcome =
-                    self.surface_nested_pickle_findings(candidate, "raw", position + offset);
-                self.add_nested_payload_finding(
-                    raw_nested_payload_finding(
-                        candidate.len(),
-                        position + offset,
-                        false,
-                        nested_has_execution_opcode,
-                    ),
-                    surface_outcome.promote_complete_payload(nested_has_execution_opcode),
-                );
-                if surface_outcome.should_stop_raw_probe_scan(nested_has_execution_opcode) {
+            match pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes) {
+                Ok(Some(payload_len)) => {
+                    let candidate = &probe[..payload_len];
+                    let nested_has_execution_opcode = has_execution_opcode(candidate);
+                    let surface_outcome =
+                        self.surface_nested_pickle_findings(candidate, "raw", position + offset);
+                    self.add_nested_payload_finding(
+                        raw_nested_payload_finding(
+                            candidate.len(),
+                            position + offset,
+                            false,
+                            nested_has_execution_opcode,
+                        ),
+                        surface_outcome.promote_complete_payload(nested_has_execution_opcode),
+                    );
+                    if surface_outcome.should_stop_raw_probe_scan(nested_has_execution_opcode) {
+                        return;
+                    }
+                    skip_offsets_before = offset.saturating_add(payload_len);
+                    continue;
+                }
+                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                    self.surface_nested_pickle_findings(probe, "raw", position + offset);
                     return;
                 }
-                skip_offsets_before = offset.saturating_add(payload_len);
-                continue;
+                Ok(None) | Err(_) => {}
             }
             if has_pickle_prefix(probe)
                 && has_execution_opcode(probe)
@@ -5868,14 +5874,23 @@ impl<'a> ScanState<'a> {
                     .len()
                     .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
                 let probe = &value[offset..end];
+                let payload_extent =
+                    pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
                 let complete_payload = last_stop_offset.is_some_and(|stop| offset < stop)
-                    && pickle_payload_extent(probe, self.options.max_nested_pickle_bytes).is_some();
+                    && matches!(&payload_extent, Ok(Some(_)));
+                let operand_limit_exceeded = payload_extent
+                    .as_ref()
+                    .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
                 let truncated_payload = remaining_len > self.options.max_nested_pickle_bytes
                     && truncated_pickle_prefix_requires_fail_closed(probe);
-                if !complete_payload && !malformed_payload && !truncated_payload {
+                if !complete_payload
+                    && !operand_limit_exceeded
+                    && !malformed_payload
+                    && !truncated_payload
+                {
                     continue;
                 }
                 if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
@@ -5956,7 +5971,9 @@ impl<'a> ScanState<'a> {
     fn is_data_only_encoded_nested_pickle_literal(&self, value: &str) -> bool {
         decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
             .into_iter()
-            .any(|(_, decoded)| !has_execution_opcode(&decoded))
+            .any(|candidate| {
+                !candidate.analysis_incomplete && !has_execution_opcode(&candidate.payload)
+            })
     }
 
     fn is_large_uninteresting_repeated_literal(&self, value: &str) -> bool {
@@ -6042,12 +6059,18 @@ impl<'a> ScanState<'a> {
 
     fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) -> bool {
         let mut decoded_payload_found = false;
-        for (encoding, decoded) in
-            decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
+        for DecodedNestedPayload {
+            encoding,
+            payload: decoded,
+            analysis_incomplete,
+        } in decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
         {
             decoded_payload_found = true;
             let nested_has_execution_opcode = has_execution_opcode(&decoded);
             let surface_outcome = self.surface_nested_pickle_findings(&decoded, encoding, position);
+            if analysis_incomplete {
+                continue;
+            }
             self.add_nested_payload_finding(
                 encoded_nested_payload_finding(
                     encoding,

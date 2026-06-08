@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - cover Keras H5 Lambda dict callable metadata, non-Lambda module references, and link-safe metadata extraction
+- bound Joblib decompression output to the configured scanner read budget
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
+- reject cleartext HTTP cloud storage and PyTorch Hub model sources
 - preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets
 - preserve registrable network domains and redact delimiter-split credentials in bounded finding evidence
