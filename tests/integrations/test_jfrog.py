@@ -34,6 +34,7 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.sources.jfrog import (
     JFROG_DOWNLOAD_CHUNK_SIZE,
     _filter_scannable_jfrog_files,
+    _local_download_path_collision_key,
     _scanner_ids_for_detected_jfrog_format,
     detect_jfrog_target_type,
     download_artifact,
@@ -747,6 +748,32 @@ class TestJFrogDownload:
         assert mock_get.call_args_list[1].args[0] == "https://evil.example/artifacts/model.bin"
         assert mock_get.call_args_list[1].kwargs["headers"] == {}
         assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_artifact_uses_explicit_safe_destination_filename(
+        self,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Folder downloads must avoid staging under a raw filesystem-ambiguous URL basename."""
+        response = MagicMock(spec=requests.Response)
+        response.status_code = 200
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_content.return_value = [b"data"]
+        mock_get.return_value = response
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.pkl ",
+            cache_dir=tmp_path,
+            _destination_filename="model.pkl%20",
+        )
+
+        assert result == tmp_path / "model.pkl%20"
+        assert result.read_bytes() == b"data"
+        assert not (tmp_path / "model.pkl ").exists()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_untrusted_download_redirect_enforces_streaming_budget(
@@ -1639,6 +1666,13 @@ class TestJFrogFolderListing:
 
 class TestJFrogFolderDownload:
     """Test JFrog folder download functionality."""
+
+    def test_local_download_path_collision_key_normalizes_unicode_and_case(self, tmp_path: Path) -> None:
+        """Canonical Unicode and case aliases must compare equally on every host."""
+        composed = tmp_path / "caf\N{LATIN SMALL LETTER E WITH ACUTE}" / "Model.pkl"
+        decomposed = tmp_path / "cafe\N{COMBINING ACUTE ACCENT}" / "model.pkl"
+
+        assert _local_download_path_collision_key(composed) == _local_download_path_collision_key(decomposed)
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
@@ -3578,6 +3612,194 @@ class TestJFrogFolderDownload:
 
         mock_download.assert_not_called()
         assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_trailing_dot_local_collisions(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Windows trailing-dot aliases must fail before either artifact is downloaded."""
+        mock_list.return_value = [
+            {
+                "name": "team/model.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/team/model.pkl",
+                "size": 8,
+                "human_size": "8 B",
+            },
+            {
+                "name": "team./model.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/team./model.pkl",
+                "size": 8,
+                "human_size": "8 B",
+            },
+        ]
+
+        with pytest.raises(ValueError, match="Colliding local JFrog artifact paths"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_file_directory_local_collisions(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A selected file must not alias another selected artifact's parent directory."""
+        mock_list.return_value = [
+            {
+                "name": "model.pkl/child.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pkl/child.pt",
+                "size": 8,
+                "human_size": "8 B",
+            },
+            {
+                "name": "Model.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/Model.pkl",
+                "size": 8,
+                "human_size": "8 B",
+            },
+        ]
+
+        with pytest.raises(ValueError, match="Colliding local JFrog artifact paths"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_ntfs_alternate_data_stream_paths(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """NTFS alternate data streams must not hide selected artifacts from directory scans."""
+        mock_list.return_value = [
+            {
+                "name": "model.pkl:payload",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pkl:payload",
+                "size": 8,
+                "human_size": "8 B",
+            }
+        ]
+
+        with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                selective=False,
+                show_progress=False,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_windows_reserved_device_names(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """DOS device basenames remain reserved even when an extension is present."""
+        mock_list.return_value = [
+            {
+                "name": "NUL.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/NUL.pkl",
+                "size": 8,
+                "human_size": "8 B",
+            }
+        ]
+
+        with pytest.raises(ValueError, match="Unsafe JFrog artifact path"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_allows_reserved_name_near_match(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Ordinary names that merely contain a reserved token must remain downloadable."""
+        artifact_url = "https://company.jfrog.io/artifactory/repo/models/null.pkl"
+        mock_list.return_value = [{"name": "null.pkl", "path": artifact_url, "size": 8, "human_size": "8 B"}]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"payload")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+        )
+
+        assert (tmp_path / "null.pkl").read_bytes() == b"payload"
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_uses_prepared_destination_filenames(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Raw URL basenames must not create transient aliases before the final rename."""
+        plain_url = "https://company.jfrog.io/artifactory/repo/models/model.pkl"
+        spaced_url = "https://company.jfrog.io/artifactory/repo/models/model.pkl "
+        mock_list.return_value = [
+            {"name": "model.pkl", "path": plain_url, "size": 8, "human_size": "8 B"},
+            {"name": "model.pkl ", "path": spaced_url, "size": 8, "human_size": "8 B"},
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            destination_filename = cast(str, kwargs.get("_destination_filename", Path(urlparse(url).path).name))
+            downloaded_file = cache_dir / destination_filename
+            downloaded_file.write_text(url, encoding="utf-8")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            selective=False,
+            show_progress=False,
+        )
+
+        assert (tmp_path / "model.pkl").read_text(encoding="utf-8") == plain_url
+        assert (tmp_path / "model.pkl%20").read_text(encoding="utf-8") == spaced_url
+        assert "_destination_filename" not in mock_download.call_args_list[0].kwargs
+        assert mock_download.call_args_list[1].kwargs["_destination_filename"] == "model.pkl%20"
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
