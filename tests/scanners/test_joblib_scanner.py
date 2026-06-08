@@ -1,4 +1,8 @@
+import bz2
+import gzip
+import lzma
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +45,28 @@ def test_joblib_default_decompressed_cap_tracks_file_read_budget() -> None:
     scanner = JoblibScanner({"max_file_read_size": 2 * 1024 * 1024, "max_decompressed_size": 4 * 1024 * 1024})
 
     assert scanner.max_decompressed_size == 2 * 1024 * 1024
+
+
+@pytest.mark.parametrize("invalid_value", [None, 0, -1, True, False, 1.5, "1024"])
+def test_joblib_invalid_decompressed_cap_uses_read_budget(invalid_value: object) -> None:
+    scanner = JoblibScanner({"max_file_read_size": 4096, "max_decompressed_size": invalid_value})
+
+    assert scanner.max_decompressed_size == 4096
+
+
+@pytest.mark.parametrize(
+    "compress",
+    [zlib.compress, gzip.compress, bz2.compress, lzma.compress],
+    ids=["zlib", "gzip", "bz2", "lzma"],
+)
+def test_joblib_decompression_cap_is_exact_for_all_supported_codecs(
+    compress: Callable[[bytes], bytes],
+) -> None:
+    scanner = JoblibScanner({"max_decompressed_size": 128, "max_decompression_ratio": 1000.0})
+
+    assert scanner._safe_decompress(compress(b"A" * 128)) == b"A" * 128
+    with pytest.raises(ValueError, match=r"Decompressed size too large: 129 bytes \(max: 128\)"):
+        scanner._safe_decompress(compress(b"A" * 129))
 
 
 def test_joblib_scanner_respects_explicit_decompressed_cap(tmp_path: Path) -> None:
