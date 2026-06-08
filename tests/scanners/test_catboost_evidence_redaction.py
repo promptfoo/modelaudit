@@ -1,5 +1,7 @@
 """Tests for scanner evidence redaction helpers."""
 
+import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
@@ -1556,6 +1558,17 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
     assert secret not in redacted
     assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
     assert "collector.evil.example" in redacted
+
+
+def test_command_substitution_credential_redaction_has_bounded_runtime() -> None:
+    code = (
+        "from modelaudit.scanners._catboost_evidence_redaction import "
+        "COMMAND_SUBSTITUTION_USER_PASSWORD_RE\n"
+        "payload = '-u:$(' + r'\\(' * 26\n"
+        "COMMAND_SUBSTITUTION_USER_PASSWORD_RE.sub('<redacted>', payload)\n"
+    )
+
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=3)
 
 
 def test_standalone_command_context_redacts_credential_arguments() -> None:

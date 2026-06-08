@@ -282,7 +282,7 @@ COMMAND_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_SUBSTITUTION_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>(?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)"
-    r"(?P<username>[^:\s\"';&|]*:)(?P<password>\$\((?:\\.|[^)])*\))"
+    r"(?P<username>[^:\s\"';&|]*:)(?P<password>\$\((?:\\.|[^\\)])*\))"
 )
 COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?<![?&/\w-])(?P<option>(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
