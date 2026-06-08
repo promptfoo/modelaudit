@@ -1,4 +1,6 @@
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import MagicMock
 from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
@@ -16,6 +18,20 @@ class HeaderOnlyScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         del path
         raise RuntimeError("full scan is not available for streaming fallback")
+
+
+def _mock_stream_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    declared_size: object,
+    payload: bytes,
+) -> MagicMock:
+    fs = MagicMock()
+    fs.info.return_value = {"size": declared_size}
+    fs.open.return_value.__enter__.return_value = BytesIO(payload)
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda _url: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda _protocol, **_kwargs: fs)
+    return fs
 
 
 def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
@@ -114,6 +130,72 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path: Path, monkeyp
     assert result.metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
+def test_stream_analyze_file_rejects_negative_declared_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = _mock_stream_filesystem(monkeypatch, declared_size=-1, payload=b"malicious payload")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is None
+    assert was_complete is False
+    fs.open.assert_not_called()
+
+
+def test_stream_analyze_file_marks_short_reads_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=8, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=8)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
+
+
+def test_stream_analyze_file_detects_underreported_size_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=2, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 3
+    assert result.metadata["bytes_complete"] is False
+
+
+def test_stream_analyze_file_detects_content_reported_as_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=0, payload=b"malicious payload")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 1
+    assert result.metadata["bytes_complete"] is False
+
+
+def test_stream_analyze_file_confirms_reported_empty_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = _mock_stream_filesystem(monkeypatch, declared_size=0, payload=b"")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is None
+    assert was_complete is True
+    fs.open.assert_called_once()
+
+
+def test_stream_analyze_file_fails_closed_when_declared_size_equals_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=4, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
 
 
 def test_stream_analyze_file_returns_clean_partial_scanner_result(

@@ -14,6 +14,13 @@ _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
     rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
+_S3_FIPS_PATH_STYLE_HTTPS_HOST_RE = re.compile(
+    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+)
+_S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
+    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+)
+_S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(r"^.+\.s3-accelerate(?:\.dualstack)?\.amazonaws\.com$")
 
 
 def _get_hostname(url: str) -> str:
@@ -34,7 +41,11 @@ def _get_scheme(url: str) -> str:
 
 def _is_s3_https_host(hostname: str) -> bool:
     return bool(
-        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
     )
 
 
@@ -58,11 +69,11 @@ def detect_input_type(path: str) -> str:
     # Cloud storage detection
     hostname = _get_hostname(path)
     scheme = _get_scheme(path)
-    if scheme in {"s3", "r2"} or _is_s3_https_host(hostname) or _is_r2_https_host(hostname):
+    if scheme in {"s3", "r2"} or (scheme == "https" and (_is_s3_https_host(hostname) or _is_r2_https_host(hostname))):
         return "cloud_s3"
-    if scheme in {"gs", "gcs"} or _is_gcs_https_host(hostname):
+    if scheme in {"gs", "gcs"} or (scheme == "https" and _is_gcs_https_host(hostname)):
         return "cloud_gcs"
-    if scheme == "az" or hostname.endswith(".blob.core.windows.net"):
+    if scheme == "az" or (scheme == "https" and hostname.endswith(".blob.core.windows.net")):
         return "cloud_azure"
 
     # HuggingFace detection

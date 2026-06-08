@@ -132,18 +132,31 @@ def stream_analyze_file(
     try:
         # Get file info first
         info = fs.info(fs_url)
-        file_size = info.get("size", 0)
-
-        if file_size == 0:
-            return None, True
+        file_size = int(info.get("size", 0))
+        if file_size < 0 or max_bytes <= 0:
+            raise ValueError("Streaming size metadata must be non-negative and read limits must be positive")
 
         # Determine how much to read
         bytes_to_read = min(file_size, max_bytes)
-        bytes_complete = bytes_to_read >= file_size
 
         # Read partial content
         with fs.open(fs_url, "rb") as f:
             content = f.read(bytes_to_read)
+            if not isinstance(content, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            bytes_complete = len(content) == file_size and file_size < max_bytes
+            if bytes_complete and file_size < max_bytes:
+                extra = f.read(1)
+                if not isinstance(extra, bytes):
+                    raise TypeError("cloud filesystem returned non-bytes content")
+                if extra:
+                    content += extra
+                    bytes_complete = False
+
+        if not content and bytes_complete:
+            return None, True
+
+        bytes_to_read = len(content)
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)

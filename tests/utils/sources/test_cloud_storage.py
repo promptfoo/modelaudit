@@ -163,6 +163,10 @@ class TestCloudURLDetection:
             "https://s3.us-west-2.amazonaws.com/bucket/file",
             "https://bucket.s3.cn-north-1.amazonaws.com.cn/file",
             "https://s3.us-iso-east-1.amazonaws.com/bucket/file",
+            "https://bucket.s3-fips.us-east-1.amazonaws.com/file",
+            "https://s3-fips.us-east-1.amazonaws.com/bucket/file",
+            "https://bucket.s3-accelerate.amazonaws.com/file",
+            "https://bucket.s3-accelerate.dualstack.amazonaws.com/file",
             "HTTPS://BUCKET.S3.AMAZONAWS.COM/file",
             "https://storage.googleapis.com/bucket/file",
             "https://storage.cloud.google.com/bucket/file",
@@ -178,6 +182,8 @@ class TestCloudURLDetection:
             "https://huggingface.co/model",
             "ftp://example.com/file",
             "https://bucket.s3.us-west-2.amazonaws.com.evil.test/file",
+            "https://bucket.s3-fips.us-east-1.amazonaws.com.evil.test/file",
+            "https://bucket.s3-accelerate.amazonaws.com.evil.test/file",
             "https://storage.googleapis.com.evil.test/bucket/file",
             "https://bucket.storage.googleapis.com.evil.test/file",
             "https://account.r2.cloudflarestorage.com.evil.test/bucket/file",
@@ -213,6 +219,18 @@ class TestCloudURLDetection:
             ),
             (
                 "https://s3.us-west-2.amazonaws.com/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {},
+            ),
+            (
+                "https://s3-fips.us-east-1.amazonaws.com/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {},
+            ),
+            (
+                "https://bucket.s3-accelerate.amazonaws.com/models/model.pkl",
                 "s3",
                 "s3://bucket/models/model.pkl",
                 {},
@@ -260,6 +278,25 @@ class TestCloudURLDetection:
         expected_args: dict[str, object],
     ) -> None:
         assert get_cloud_filesystem_config(url) == (expected_protocol, expected_path, expected_args)
+
+    @pytest.mark.parametrize(
+        ("url", "expected_path"),
+        [
+            (
+                "https://bucket.s3.amazonaws.com/models/my%20model.pkl",
+                "s3://bucket/models/my model.pkl",
+            ),
+            (
+                "https://storage.googleapis.com/bucket/models%2Fmy%2520model%25.pkl",
+                "gcs://bucket/models/my%20model%.pkl",
+            ),
+        ],
+    )
+    def test_decodes_provider_object_paths_exactly_once(self, url: str, expected_path: str) -> None:
+        protocol, path, _ = get_cloud_filesystem_config(url)
+
+        assert protocol in {"s3", "gcs"}
+        assert path == expected_path
 
     @pytest.mark.parametrize(
         ("url", "expected_protocol", "expected_path", "expected_args"),
@@ -2602,6 +2639,34 @@ class TestCloudObjectSize:
 
         fs.info.side_effect = info_side_effect
         fs.walk.return_value = [(url, [], [remote_path])]
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert len(error) < 1200
+        assert "secret" not in error
+
+    def test_get_cloud_object_size_strict_bounds_top_level_provider_diagnostics(self) -> None:
+        """Top-level info failures must not retain unbounded provider text."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/?token=secret"
+        fs.info.side_effect = PermissionError("info denied " + ("i" * 2000) + " token=secret")
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert len(error) < 1200
+        assert "secret" not in error
+
+    def test_get_cloud_object_size_strict_bounds_walk_and_listing_diagnostics(self) -> None:
+        """Combined traversal failures must remain bounded and redact URL secrets."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/?token=secret"
+        fs.info.return_value = {"type": "directory"}
+        fs.walk.side_effect = PermissionError("walk denied " + ("w" * 2000) + " token=secret")
+        fs.ls.side_effect = PermissionError("listing denied " + ("l" * 2000) + " token=secret")
 
         with pytest.raises(ValueError) as excinfo:
             get_cloud_object_size(fs, url, strict=True)

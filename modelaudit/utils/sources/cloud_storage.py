@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import unquote_plus, urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
 
 import click
 from yaspin import yaspin
@@ -124,6 +124,13 @@ _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
     rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
+_S3_FIPS_PATH_STYLE_HTTPS_HOST_RE = re.compile(
+    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+)
+_S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
+    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+)
+_S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(r"^.+\.s3-accelerate(?:\.dualstack)?\.amazonaws\.com$")
 
 
 class _CloudObjectMetadataSizeError(ValueError):
@@ -164,7 +171,11 @@ def _http_cloud_protocol(url: str) -> str | None:
 
 def _is_s3_https_host(hostname: str) -> bool:
     return bool(
-        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
     )
 
 
@@ -586,7 +597,7 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
     if parsed.query:
         return "https", url, {}
 
-    path = parsed.path.lstrip("/")
+    path = unquote(parsed.path).lstrip("/")
     bucket = ""
     key = ""
     if _is_r2_https_host(hostname):
@@ -602,9 +613,13 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         if parsed.port is not None:
             endpoint_host = f"{endpoint_host}:{parsed.port}"
         fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
-    elif _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname):
+    elif _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname):
         bucket, _, key = path.partition("/")
-    elif _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname):
+    elif (
+        _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+    ):
         bucket = hostname[: hostname.find(".s3")]
         key = path
     elif hostname.endswith(".storage.googleapis.com"):
@@ -695,7 +710,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         info = fs.info(url)
     except Exception as exc:
         if strict:
-            redacted_error = redact_cloud_error_for_display(exc, url)
+            redacted_error = _bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, url))
             raise ValueError(
                 f"Unable to read cloud object info for {redact_url_for_display(url)}: {redacted_error}"
             ) from exc
@@ -800,9 +815,8 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             error_parts.append(f"ls() failed: {redact_cloud_error_for_display(ls_error, url)}")
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
-        raise ValueError(
-            f"Unable to determine cloud object size for {redact_url_for_display(url)}: {'; '.join(error_parts)}"
-        )
+        bounded_errors = _bound_cloud_metadata_error_display("; ".join(error_parts))
+        raise ValueError(f"Unable to determine cloud object size for {redact_url_for_display(url)}: {bounded_errors}")
 
     return None
 
