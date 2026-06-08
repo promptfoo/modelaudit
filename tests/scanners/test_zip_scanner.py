@@ -1555,29 +1555,43 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "original = c.CDLL\nc.CDLL = print\nfor (c.CDLL,) in [(print,), (original,)]:\n    pass\n",
         "original = c.CDLL\nc.CDLL = print\nns = c.__dict__\nfor (ns['CDLL'],) in [(print,), (original,)]:\n    pass\n",
         "import contextlib\nwith contextlib.nullcontext(c.CDLL) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.nullcontext = lambda ignored: real(original)\n"
-        "with contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.update([('nullcontext', lambda **ignored: real(original))])\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.__ior__({'nullcontext': lambda **ignored: real(original)})\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "dict.__ior__(contextlib.__dict__, {'nullcontext': lambda **ignored: real(original)})\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.pop('nullcontext')\n"
-        "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "del contextlib.__dict__['nullcontext']\n"
-        "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "def enable():\n    contextlib.nullcontext = lambda ignored: real(original)\n"
-        "enable()\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.nullcontext = lambda ignored: real(original)\n"
+            + "with contextlib.nullcontext(print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.update([('nullcontext', lambda **ignored: real(original))])\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.__ior__({'nullcontext': lambda **ignored: real(original)})\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "dict.__ior__(contextlib.__dict__, {'nullcontext': lambda **ignored: real(original)})\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.pop('nullcontext')\n"
+            + "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "del contextlib.__dict__['nullcontext']\n"
+            + "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "def enable():\n    contextlib.nullcontext = lambda ignored: real(original)\n"
+            + "enable()\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_ctypes_risk_after_qualified_control_target(tmp_path: Path, mutation: str) -> None:
@@ -1604,9 +1618,11 @@ def test_scan_zip_preserves_ctypes_risk_after_qualified_control_target(tmp_path:
         "for (c.CDLL,) in [(c.CDLL,), (print,)]:\n    pass\n",
         "import contextlib\nc.CDLL = print\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
         "import contextlib\nc.CDLL = print\nwith contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\nc.CDLL = print\nreal = contextlib.nullcontext\ncontextlib.__dict__.pop('nullcontext')\n"
-        "contextlib.__dict__.setdefault('nullcontext', real)\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
+        (
+            "import contextlib\nc.CDLL = print\nreal = contextlib.nullcontext\ncontextlib.__dict__.pop('nullcontext')\n"
+            + "contextlib.__dict__.setdefault('nullcontext', real)\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_safe_final_qualified_control_target(tmp_path: Path, mutation: str) -> None:
@@ -2061,8 +2077,10 @@ def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_
         "del runpy.__dict__['run_path']\nrunpy.__dict__.setdefault('run_path', original)\n",
         "runpy.__dict__.pop('run_path')\nrunpy.__dict__.setdefault('run_path', original)\n",
         "import builtins\nbuiltins.delattr(runpy, 'run_path')\nrunpy.__dict__.setdefault('run_path', original)\n",
-        "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
-        "runpy.__dict__.setdefault('run_path', original)\n",
+        (
+            "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
+            + "runpy.__dict__.setdefault('run_path', original)\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_restored_runpy_execution_after_namespace_overwrite(tmp_path: Path, restore: str) -> None:
@@ -2104,8 +2122,10 @@ def test_scan_zip_preserves_restored_runpy_execution_after_namespace_overwrite(t
         "del runpy.__dict__['run_path']\nrunpy.__dict__.setdefault('run_path', len)\n",
         "runpy.__dict__.pop('run_path')\nrunpy.__dict__.setdefault('run_path', len)\n",
         "import builtins\nbuiltins.delattr(runpy, 'run_path')\nrunpy.__dict__.setdefault('run_path', len)\n",
-        "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
-        "runpy.__dict__.setdefault('run_path', len)\n",
+        (
+            "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
+            + "runpy.__dict__.setdefault('run_path', len)\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_safe_runpy_namespace_overwrite(tmp_path: Path, overwrite: str) -> None:
@@ -3619,8 +3639,10 @@ def test_scan_zip_allows_shadowed_direct_python_member_primitives(tmp_path: Path
             "ctypes.LibraryLoader.__setattr__ = restore\n"
             "loader._dlltype\nrunpy.run_path('safe')\n"
         ),
-        "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\nrunpy.run_path = print\n"
-        "del loader._dlltype\nloader._dlltype\nrunpy.run_path('safe')\n",
+        (
+            "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\nrunpy.run_path = print\n"
+            + "del loader._dlltype\nloader._dlltype\nrunpy.run_path('safe')\n"
+        ),
         (
             "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\n"
             "loader.label = object()\nrunpy.run_path = print\n"
