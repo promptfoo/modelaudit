@@ -2056,6 +2056,138 @@ def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(t
     _assert_system_pickle_issue(result)
 
 
+def test_scan_file_routes_padded_protocolless_binary_pickle_past_probe_limit(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    padding = b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 4)
+    disguised_pickle.write_bytes(padding + _build_protocolless_binary_malicious_pickle())
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_open_mark_protocolless_pickle_past_probe_limit(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    padding = b"\x8c\x01x0" * ((file_detection.PROTO0_1_MAX_PROBE_BYTES // 4) - 1) + b"N0N("
+    assert len(padding) == file_detection.PROTO0_1_MAX_PROBE_BYTES
+    disguised_pickle.write_bytes(padding + b"10" + _build_protocolless_binary_malicious_pickle())
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_protocolless_pickle_with_operand_split_at_probe_limit(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    padding = b"\x8c\x01x0" * ((file_detection.PROTO0_1_MAX_PROBE_BYTES // 4) - 2) + b"X\x0a\x00\x00\x00abcdefghij0"
+    disguised_pickle.write_bytes(padding + _build_protocolless_binary_malicious_pickle())
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_protocolless_prefix_before_proto_pickle(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    disguised_pickle.write_bytes(b"\x8f0" + _build_malicious_pickle(protocol=4))
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize(
+    ("opcode", "length_header"),
+    [
+        (b"B", struct.pack("<I", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"T", struct.pack("<i", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"X", struct.pack("<I", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"\x8b", struct.pack("<i", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"\x8d", struct.pack("<Q", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"\x8e", struct.pack("<Q", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+        (b"\x96", struct.pack("<Q", file_detection.PROTO0_1_MAX_PROBE_BYTES)),
+    ],
+)
+def test_scan_file_routes_large_protocolless_binary_operand_past_probe_limit(
+    tmp_path: Path,
+    opcode: bytes,
+    length_header: bytes,
+) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    operand = b"x" * file_detection.PROTO0_1_MAX_PROBE_BYTES
+    disguised_pickle.write_bytes(
+        opcode + length_header + operand + b"0" + _build_protocolless_binary_malicious_pickle()
+    )
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_truncated_protocolless_binary_pickle_with_security_signal(tmp_path: Path) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle()[:-1])
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x82\x01)R.",
+        b"\x83\x01\x00)R.",
+        b"\x84\x01\x00\x00\x00)R.",
+    ],
+)
+def test_scan_file_routes_protocolless_binary_pickle_extension_opcodes(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    disguised_pickle = tmp_path / "payload.jpg"
+    disguised_pickle.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any("extension" in issue.message.lower() for issue in result.issues)
+
+
 @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
 def test_scan_file_routes_nested_protocolless_binary_pickle_with_misleading_suffix(
     tmp_path: Path,
@@ -2091,9 +2223,14 @@ def test_scan_file_routes_compressed_protocolless_binary_pickle_with_misleading_
     _assert_system_pickle_issue(result)
 
 
-def test_scan_file_does_not_route_protocolless_binary_pickle_scalar_near_match(tmp_path: Path) -> None:
+@pytest.mark.parametrize("truncate_stop", [False, True])
+def test_scan_file_does_not_route_protocolless_binary_pickle_scalar_near_match(
+    tmp_path: Path,
+    truncate_stop: bool,
+) -> None:
     near_match = tmp_path / "notes.jpg"
-    near_match.write_bytes(_build_protocolless_binary_benign_scalar_pickle())
+    payload = _build_protocolless_binary_benign_scalar_pickle()
+    near_match.write_bytes(payload[:-1] if truncate_stop else payload)
 
     assert file_detection.detect_file_format(str(near_match)) == "unknown"
     assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
