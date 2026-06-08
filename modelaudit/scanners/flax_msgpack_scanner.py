@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -33,7 +34,7 @@ _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
-_STREAM_SAFE_WHITESPACE_REPEAT_PATTERN = re.compile(r"\\s(?:[+*]|\{\d+,\})")
+_STREAM_SAFE_WHITESPACE_REPEAT_PATTERN = re.compile(r"\\s(?:[+*]|\{[01],\})")
 
 
 class _StreamCoverageStopped(Exception):
@@ -99,45 +100,114 @@ def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
     return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
 
 
-def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
-    """Return whether bounded overlap cannot guarantee coverage for this regex."""
-    remaining = _STREAM_SAFE_WHITESPACE_REPEAT_PATTERN.sub("", pattern)
-    escaped = False
-    in_character_class = False
-    for index, char in enumerate(remaining):
-        if escaped:
-            escaped = False
+def _contains_suspicious_getattr(value: str) -> bool:
+    """Match the default unbounded getattr rule without catastrophic regex backtracking."""
+    lowered = value.lower()
+    search_offset = 0
+    has_getattr_call = False
+    while search_offset < len(value):
+        getattr_index = lowered.find("getattr", search_offset)
+        comma_index = value.find(",", search_offset)
+        if getattr_index == -1 and comma_index == -1:
+            return False
+        if getattr_index != -1 and (comma_index == -1 or getattr_index < comma_index):
+            open_index = getattr_index + len("getattr")
+            while open_index < len(value) and value[open_index].isspace():
+                open_index += 1
+            if open_index < len(value) and value[open_index] == "(":
+                has_getattr_call = True
+            search_offset = getattr_index + len("getattr")
             continue
-        if char == "\\":
-            escaped = True
-            continue
-        if char == "[":
-            in_character_class = True
-            continue
-        if char == "]" and in_character_class:
-            in_character_class = False
-            continue
-        if in_character_class:
-            continue
-        if char in {"*", "+"}:
-            return True
-        if char != "{":
-            continue
-        closing_index = remaining.find("}", index + 1)
-        if closing_index == -1:
-            continue
-        repeat_range = remaining[index + 1 : closing_index]
-        if re.fullmatch(r"\d*,", repeat_range):
-            return True
+
+        if comma_index == -1:
+            return False
+        if has_getattr_call:
+            quote_index = comma_index + 1
+            while quote_index < len(value) and value[quote_index].isspace():
+                quote_index += 1
+            if quote_index < len(value) and value[quote_index] in {'"', "'"}:
+                quote = value[quote_index]
+                end_quote = value.find(quote, quote_index + 1)
+                if end_quote != -1:
+                    attribute = value[quote_index + 1 : end_quote]
+                    if attribute.startswith("__") and attribute.endswith("__"):
+                        return True
+        search_offset = comma_index + 1
     return False
 
 
-def _pattern_literal_anchor(pattern: str) -> str | None:
-    """Return a useful literal token for conservative incomplete-coverage checks."""
-    literal_runs = re.findall(r"[A-Za-z0-9_]{3,}", pattern)
+def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
+    """Return whether bounded overlap cannot guarantee coverage for this regex."""
+    remaining = _STREAM_SAFE_WHITESPACE_REPEAT_PATTERN.sub("", pattern)
+    try:
+        parser = vars(re).get("_parser")
+        if parser is None:
+            return True
+        _, max_width = parser.parse(remaining, re.IGNORECASE).getwidth()
+    except Exception:
+        return True
+    return max_width > _STREAM_TEXT_OVERLAP_CHARS
+
+
+def _pattern_literal_anchors(pattern: str) -> tuple[str, ...] | None:
+    """Return literals required by a simple regex, or None when that cannot be proven."""
+    if "(?" in pattern:
+        return None
+    literal_runs: list[str] = []
+    current_run: list[str] = []
+    escaped = False
+    in_character_class = False
+    index = 0
+
+    def flush_run() -> None:
+        if len(current_run) >= 2:
+            literal_runs.append("".join(current_run).lower()[:64])
+        current_run.clear()
+
+    while index < len(pattern):
+        char = pattern[index]
+        if escaped:
+            escaped = False
+            flush_run()
+            if char in {"x", "u", "U", "N"}:
+                return None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            flush_run()
+            index += 1
+            continue
+        if char == "[":
+            in_character_class = True
+            flush_run()
+            index += 1
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            index += 1
+            continue
+        if in_character_class:
+            index += 1
+            continue
+        if char == "|":
+            return None
+        if char == "{":
+            flush_run()
+            closing_index = pattern.find("}", index + 1)
+            if closing_index == -1:
+                return None
+            index = closing_index + 1
+            continue
+        if char.isascii() and (char.isalnum() or char == "_"):
+            current_run.append(char)
+        else:
+            flush_run()
+        index += 1
+    flush_run()
     if not literal_runs:
         return None
-    return max(literal_runs, key=len).lower()
+    return tuple(dict.fromkeys(literal_runs))
 
 
 def _is_text_like_short_binary(value: bytes | bytearray) -> bool:
@@ -171,18 +241,20 @@ def _stringify_safe_evidence_fragment(value: Any) -> str:
     return _stringify_evidence_fragment(value)
 
 
-def _join_evidence_path(path: str, key: Any) -> str:
-    key_str = _stringify_safe_evidence_fragment(key)
-    return f"{path}/{key_str}" if path else key_str
-
-
 def _text_for_security_matching(value: Any) -> str | None:
+    if HAS_MSGPACK and isinstance(value, msgpack.ExtType):
+        value = value.data
     if isinstance(value, str):
         return value
     if isinstance(value, bytes | bytearray):
         with suppress(UnicodeDecodeError):
             return bytes(value).decode("utf-8")
     return None
+
+
+def _join_evidence_path(path: str, key: Any) -> str:
+    key_str = _stringify_safe_evidence_fragment(key)
+    return f"{path}/{key_str}" if path else key_str
 
 
 def _redact_evidence_fragment(value: Any, max_chars: int) -> str:
@@ -294,7 +366,7 @@ class FlaxMsgpackScanner(BaseScanner):
             (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
         )
         self._stream_unsafe_pattern_anchors = {
-            pattern: _pattern_literal_anchor(pattern)
+            pattern: _pattern_literal_anchors(pattern)
             for pattern in self.suspicious_patterns
             if _pattern_has_stream_unsafe_repeat(pattern)
         }
@@ -611,12 +683,20 @@ class FlaxMsgpackScanner(BaseScanner):
 
     @staticmethod
     def _add_jax_transform_check(transform: str, context: str, location: str, result: ScanResult) -> None:
+        safe_location = _redact_evidence_location(location)
+        if any(
+            check.name == "JAX Transform Security Check"
+            and check.location == safe_location
+            and check.details.get("transform") == transform
+            for check in result.checks
+        ):
+            return
         result.add_check(
             name="JAX Transform Security Check",
             passed=False,
             message=f"Suspicious JAX transform detected: {transform}",
             severity=IssueSeverity.CRITICAL,
-            location=_redact_evidence_location(location),
+            location=safe_location,
             details={
                 "transform": transform,
                 "context": _redact_evidence_sample(context),
@@ -1619,32 +1699,19 @@ class FlaxMsgpackScanner(BaseScanner):
             if matched:
                 break
 
-    def _analyze_large_text(
+    def _analyze_streamed_text_chunks(
         self,
-        value: str,
+        chunks: Iterable[str],
         location: str,
         result: ScanResult,
         *,
+        full_length: int,
+        finding_location: str,
+        coverage_details: dict[str, Any],
         check_jax_transform: bool,
         jax_location: str | None = None,
     ) -> None:
-        tail = ""
-        matched_transforms: dict[str, str] = {}
-        for offset in range(0, len(value), _STREAM_TEXT_CHUNK_BYTES):
-            window = tail + value[offset : offset + _STREAM_TEXT_CHUNK_BYTES]
-            window_lower = window.lower()
-            if check_jax_transform:
-                for transform in _DANGEROUS_JAX_TRANSFORMS:
-                    if transform not in matched_transforms and transform in window_lower:
-                        matched_transforms[transform] = window
-            tail = window[-_STREAM_TEXT_OVERLAP_CHARS:]
-
-        for transform, context in matched_transforms.items():
-            self._add_jax_transform_check(transform, context, jax_location or location, result)
-        self._check_suspicious_strings(value, location, result)
-
-    def _analyze_large_binary_text(self, value: bytes | bytearray, location: str, result: ScanResult) -> None:
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        """Analyze decoded text with bounded regex windows and conservative coverage checks."""
         raw_tail = ""
         normalized_tail = ""
         previous_chunk_ended_with_whitespace = False
@@ -1652,31 +1719,54 @@ class FlaxMsgpackScanner(BaseScanner):
         matched_patterns: dict[str, tuple[str, str]] = {}
         matched_transforms: dict[str, str] = {}
         unresolved_pattern_candidates: set[str] = set()
-        raw_value = memoryview(value)
+        seen_pattern_anchors: dict[str, set[str]] = {}
 
         def inspect_windows(raw_window: str, normalized_window: str) -> None:
             raw_window_lower = raw_window.lower()
             normalized_window_lower = normalized_window.lower()
-            for transform in _DANGEROUS_JAX_TRANSFORMS:
-                if transform not in matched_transforms and transform in raw_window_lower:
-                    matched_transforms[transform] = raw_window
+            if check_jax_transform:
+                for transform in _DANGEROUS_JAX_TRANSFORMS:
+                    if transform not in matched_transforms and transform in raw_window_lower:
+                        matched_transforms[transform] = raw_window
             for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
-                if pattern not in matched_patterns:
-                    match_sample: str | None = None
-                    if compiled_pattern.search(raw_window):
-                        match_sample = raw_window
-                    elif "\\s" in pattern and compiled_pattern.search(normalized_window):
-                        match_sample = normalized_window
-                    if match_sample is not None:
-                        matched_patterns[pattern] = (lowered_pattern, match_sample)
-
                 if pattern in self._stream_unsafe_pattern_anchors:
-                    anchor = self._stream_unsafe_pattern_anchors[pattern]
-                    if anchor is None or anchor in normalized_window_lower:
+                    anchors = self._stream_unsafe_pattern_anchors[pattern]
+                    window_has_all_anchors = anchors is None or all(
+                        anchor in normalized_window_lower for anchor in anchors
+                    )
+                    if anchors is None:
                         unresolved_pattern_candidates.add(pattern)
+                    else:
+                        seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
+                        seen_anchors.update(anchor for anchor in anchors if anchor in normalized_window_lower)
+                        if len(seen_anchors) == len(anchors):
+                            unresolved_pattern_candidates.add(pattern)
 
-        for offset in range(0, len(raw_value), _STREAM_TEXT_CHUNK_BYTES):
-            chunk = decoder.decode(raw_value[offset : offset + _STREAM_TEXT_CHUNK_BYTES], final=False)
+                    if (
+                        pattern == _UNBOUNDED_GETATTR_PATTERN
+                        and pattern not in matched_patterns
+                        and window_has_all_anchors
+                    ):
+                        match_sample: str | None = None
+                        if _contains_suspicious_getattr(raw_window):
+                            match_sample = raw_window
+                        elif _contains_suspicious_getattr(normalized_window):
+                            match_sample = normalized_window
+                        if match_sample is not None:
+                            matched_patterns[pattern] = (lowered_pattern, match_sample)
+                    continue
+
+                if pattern in matched_patterns:
+                    continue
+                match_sample = None
+                if compiled_pattern.search(raw_window):
+                    match_sample = raw_window
+                elif "\\s" in pattern and compiled_pattern.search(normalized_window):
+                    match_sample = normalized_window
+                if match_sample is not None:
+                    matched_patterns[pattern] = (lowered_pattern, match_sample)
+
+        for chunk in chunks:
             decoded_chars += len(chunk)
             normalized_chunk = _WHITESPACE_RUN_PATTERN.sub(" ", chunk)
             if previous_chunk_ended_with_whitespace and normalized_chunk.startswith(" "):
@@ -1690,23 +1780,15 @@ class FlaxMsgpackScanner(BaseScanner):
             raw_tail = raw_window[-_STREAM_TEXT_OVERLAP_CHARS:]
             normalized_tail = normalized_window[-_STREAM_TEXT_OVERLAP_CHARS:]
 
-        final_chunk = decoder.decode(b"", final=True)
-        if final_chunk:
-            decoded_chars += len(final_chunk)
-            normalized_chunk = _WHITESPACE_RUN_PATTERN.sub(" ", final_chunk)
-            if previous_chunk_ended_with_whitespace and normalized_chunk.startswith(" "):
-                normalized_chunk = normalized_chunk[1:]
-            inspect_windows(raw_tail + final_chunk, normalized_tail + normalized_chunk)
-
         for transform, context in matched_transforms.items():
-            self._add_jax_transform_check(transform, context, location, result)
+            self._add_jax_transform_check(transform, context, jax_location or location, result)
         for pattern, (lowered_pattern, sample) in matched_patterns.items():
             self._add_suspicious_string_check(
                 pattern,
                 lowered_pattern,
                 sample,
                 decoded_chars,
-                f"{location}[decoded_binary]",
+                finding_location,
                 result,
             )
 
@@ -1717,15 +1799,61 @@ class FlaxMsgpackScanner(BaseScanner):
                 result,
                 reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
                 name="Flax MessagePack Binary Pattern Coverage",
-                message="Large binary text contained an unresolved pattern beyond the streaming overlap",
+                message="Large text contained an unresolved pattern beyond the streaming overlap",
                 location=location,
                 details={
                     "pattern": unresolved_patterns[0],
                     "patterns": unresolved_patterns,
-                    "binary_size": len(value),
+                    "full_length": full_length,
                     "stream_overlap_chars": _STREAM_TEXT_OVERLAP_CHARS,
+                    **coverage_details,
                 },
             )
+
+    def _analyze_large_text(
+        self,
+        value: str,
+        location: str,
+        result: ScanResult,
+        *,
+        check_jax_transform: bool,
+        jax_location: str | None = None,
+    ) -> None:
+        chunks = (
+            value[offset : offset + _STREAM_TEXT_CHUNK_BYTES]
+            for offset in range(0, len(value), _STREAM_TEXT_CHUNK_BYTES)
+        )
+        self._analyze_streamed_text_chunks(
+            chunks,
+            location,
+            result,
+            full_length=len(value),
+            finding_location=location,
+            coverage_details={"text_length": len(value)},
+            check_jax_transform=check_jax_transform,
+            jax_location=jax_location,
+        )
+
+    def _analyze_large_binary_text(self, value: bytes | bytearray, location: str, result: ScanResult) -> None:
+        raw_value = memoryview(value)
+
+        def decoded_chunks() -> Iterable[str]:
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for offset in range(0, len(raw_value), _STREAM_TEXT_CHUNK_BYTES):
+                yield decoder.decode(raw_value[offset : offset + _STREAM_TEXT_CHUNK_BYTES], final=False)
+            final_chunk = decoder.decode(b"", final=True)
+            if final_chunk:
+                yield final_chunk
+
+        self._analyze_streamed_text_chunks(
+            decoded_chunks(),
+            location,
+            result,
+            full_length=len(value),
+            finding_location=f"{location}[decoded_binary]",
+            coverage_details={"binary_size": len(value)},
+            check_jax_transform=True,
+        )
 
     def _analyze_stream_scalar(
         self,
@@ -1761,7 +1889,7 @@ class FlaxMsgpackScanner(BaseScanner):
             if size > _STREAM_TEXT_CHUNK_BYTES:
                 self._analyze_large_binary_text(value, location, result)
             else:
-                decoded = bytes(value).decode("utf-8", errors="ignore")
+                decoded = bytes(value).decode("utf-8", errors="replace")
                 if check_string_jax_transform:
                     self._check_jax_transform("", decoded, location, result)
                 if len(decoded) > 50 or _is_text_like_short_binary(value):
@@ -2039,8 +2167,8 @@ class FlaxMsgpackScanner(BaseScanner):
                 key = key_value.value
                 if key_value.is_container or key_value.type_name == "skipped":
                     key = f"<{key_value.type_name}_key>"
-                key_text = _text_for_security_matching(key)
                 key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
+                key_text = _text_for_security_matching(key)
                 key_location = f"{location}/{safe_key_str}" if location else safe_key_str
                 if key_text is not None and key_text in transformer_keys:
                     direct_string_keys.add(key_text)

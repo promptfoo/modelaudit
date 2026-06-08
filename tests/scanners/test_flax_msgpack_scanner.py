@@ -5,7 +5,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,7 +19,11 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import _create_results
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
+from modelaudit.scanners.flax_msgpack_scanner import (
+    _UNBOUNDED_GETATTR_PATTERN,
+    FlaxMsgpackScanner,
+    _matching_jax_transforms,
+)
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
 
@@ -346,6 +350,47 @@ def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) 
         and issue.message == "Suspicious object attribute value detected: restore_fn"
         for issue in result.issues
     )
+
+
+def test_flax_msgpack_binary_function_metadata_value_still_critical(tmp_path: Path) -> None:
+    path = tmp_path / "binary_callable.msgpack"
+    create_msgpack_file(path, {"params": {"eval_fn": b"eval", "compiled_fn": b"exec"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    findings = {
+        check.message
+        for check in result.checks
+        if check.name == "Object Attribute Security Check" and check.status == CheckStatus.FAILED
+    }
+    assert "Suspicious object attribute value detected: eval_fn" in findings
+    assert "Suspicious object attribute value detected: compiled_fn" in findings
+
+
+def test_flax_msgpack_binary_function_metadata_near_matches_stay_benign(tmp_path: Path) -> None:
+    path = tmp_path / "binary_callable_near_match.msgpack"
+    create_msgpack_file(path, {"params": {"eval_fn": b"evaluate", "compiled_fn": b"\xffexec"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert not any(
+        check.name == "Object Attribute Security Check" and "attribute value" in check.message
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_deduplicates_transform_in_key_and_value(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_transform.msgpack"
+    create_msgpack_file(path, {"runtime_eval": "runtime_eval"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    transform_checks = [
+        check
+        for check in result.checks
+        if check.name == "JAX Transform Security Check" and check.details.get("transform") == "runtime_eval"
+    ]
+    assert len(transform_checks) == 1
 
 
 @pytest.mark.parametrize(
@@ -733,6 +778,16 @@ def test_flax_msgpack_large_binary_preserves_cross_chunk_findings(tmp_path: Path
     )
 
 
+def test_flax_msgpack_large_binary_does_not_join_tokens_across_invalid_utf8(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_invalid_utf8.msgpack"
+    payload = (b"x" * (64 * 1024 + 100)) + b"ev\xffal("
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert not any(check.name == "Code Pattern Security Check" for check in result.checks)
+
+
 def test_flax_msgpack_large_binary_preserves_long_whitespace_pattern(tmp_path: Path) -> None:
     path = tmp_path / "large_binary_whitespace_pattern.msgpack"
     stream_chunk_bytes = 64 * 1024
@@ -778,6 +833,68 @@ def test_flax_msgpack_large_binary_fails_closed_for_unresolved_unbounded_pattern
     coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
     assert coverage_check.details["analysis_incomplete"] is True
     assert coverage_check.details["stream_overlap_chars"] == 4096
+
+
+def test_flax_msgpack_large_binary_benign_getattr_prose_is_not_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_benign_getattr.msgpack"
+    payload = (b"x" * (64 * 1024 + 100)) + b" documentation mentions getattr helper only"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "payload"),
+    [
+        (r"(?:eval|harmless_long_anchor).*\(", b"eval" + (b"x" * 70000) + b"("),
+        (r"eval\s{2,}\(", b"eval" + (b" " * 70000) + b"("),
+        (r"BEGIN.{5000}END", b"BEGIN" + (b"x" * 5000) + b"END"),
+    ],
+)
+def test_flax_msgpack_large_binary_fails_closed_for_stream_unsafe_custom_patterns(
+    tmp_path: Path,
+    pattern: str,
+    payload: bytes,
+) -> None:
+    path = tmp_path / "large_binary_custom_pattern.msgpack"
+    create_msgpack_file(path, {"params": {"blob": (b"x" * (64 * 1024)) + payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == pattern
+
+
+def test_flax_msgpack_does_not_execute_stream_unsafe_regex_on_large_values(tmp_path: Path) -> None:
+    class FailIfSearched:
+        def search(self, _value: str) -> None:
+            if len(_value) > 64 * 1024:
+                raise AssertionError("stream-unsafe regex should not run on bounded windows")
+
+    for name, payload in (("binary", b"getattr(" * 10000), ("text", "getattr(" * 10000)):
+        path = tmp_path / f"large_unsafe_regex_{name}.msgpack"
+        create_msgpack_file(path, {"params": {"blob": payload}})
+        scanner = FlaxMsgpackScanner()
+        scanner._compiled_suspicious_patterns = cast(
+            Any,
+            tuple(
+                (
+                    pattern,
+                    FailIfSearched() if pattern == _UNBOUNDED_GETATTR_PATTERN else compiled,
+                    lowered,
+                )
+                for pattern, compiled, lowered in scanner._compiled_suspicious_patterns
+            ),
+        )
+
+        result = scanner.scan(str(path))
+
+        assert result.success is True
 
 
 def test_flax_msgpack_streams_shape_validation_beyond_evidence_limit(tmp_path: Path) -> None:
