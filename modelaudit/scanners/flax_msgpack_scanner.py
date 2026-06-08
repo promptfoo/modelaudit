@@ -35,6 +35,7 @@ _STREAM_TEXT_OVERLAP_CHARS = 4096
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _STREAM_SAFE_WHITESPACE_REPEAT_PATTERN = re.compile(r"\\s(?:[+*]|\{[01],\})")
+_JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
 
 
 class _StreamCoverageStopped(Exception):
@@ -192,11 +193,28 @@ def _pattern_literal_anchors(pattern: str) -> tuple[str, ...] | None:
             continue
         if char == "|":
             return None
-        if char == "{":
+        if char in {"?", "*"}:
+            if current_run:
+                current_run.pop()
+            elif index > 0 and pattern[index - 1] == ")":
+                return None
             flush_run()
+            index += 1
+            continue
+        if char == "{":
             closing_index = pattern.find("}", index + 1)
             if closing_index == -1:
                 return None
+            repeat_range = pattern[index + 1 : closing_index]
+            repeat_match = re.fullmatch(r"(\d+)(?:,\d*)?", repeat_range)
+            if repeat_match is None:
+                return None
+            if int(repeat_match.group(1)) == 0:
+                if current_run:
+                    current_run.pop()
+                elif index > 0 and pattern[index - 1] == ")":
+                    return None
+            flush_run()
             index = closing_index + 1
             continue
         if char.isascii() and (char.isalnum() or char == "_"):
@@ -684,13 +702,14 @@ class FlaxMsgpackScanner(BaseScanner):
     @staticmethod
     def _add_jax_transform_check(transform: str, context: str, location: str, result: ScanResult) -> None:
         safe_location = _redact_evidence_location(location)
-        if any(
-            check.name == "JAX Transform Security Check"
-            and check.location == safe_location
-            and check.details.get("transform") == transform
-            for check in result.checks
-        ):
+        seen_findings = result._private_metadata.get(_JAX_TRANSFORM_DEDUP_METADATA_KEY)
+        if not isinstance(seen_findings, set):
+            seen_findings = set()
+            result._private_metadata[_JAX_TRANSFORM_DEDUP_METADATA_KEY] = seen_findings
+        finding_key = (safe_location, transform)
+        if finding_key in seen_findings:
             return
+        seen_findings.add(finding_key)
         result.add_check(
             name="JAX Transform Security Check",
             passed=False,

@@ -4,6 +4,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,7 +19,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import _create_results
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import (
     _UNBOUNDED_GETATTR_PATTERN,
     FlaxMsgpackScanner,
@@ -391,6 +392,20 @@ def test_flax_msgpack_deduplicates_transform_in_key_and_value(tmp_path: Path) ->
         if check.name == "JAX Transform Security Check" and check.details.get("transform") == "runtime_eval"
     ]
     assert len(transform_checks) == 1
+
+
+def test_flax_msgpack_jax_transform_dedup_does_not_scan_existing_checks() -> None:
+    class NonIterableChecks(list[Check]):
+        def __iter__(self) -> Iterator[Check]:
+            raise AssertionError("transform deduplication must not scan prior checks")
+
+    result = ScanResult("flax_msgpack")
+    result.checks = NonIterableChecks()
+
+    FlaxMsgpackScanner._add_jax_transform_check("runtime_eval", "runtime_eval", "root/key", result)
+    FlaxMsgpackScanner._add_jax_transform_check("runtime_eval", "runtime_eval", "root/key", result)
+
+    assert len(result.checks) == 1
 
 
 @pytest.mark.parametrize(
@@ -861,6 +876,27 @@ def test_flax_msgpack_large_binary_fails_closed_for_stream_unsafe_custom_pattern
 ) -> None:
     path = tmp_path / "large_binary_custom_pattern.msgpack"
     create_msgpack_file(path, {"params": {"blob": (b"x" * (64 * 1024)) + payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == pattern
+
+
+@pytest.mark.parametrize(
+    ("pattern", "suffix"),
+    [(r"foo.*bar?END", b"baEND"), (r"foo.*(bar)?END", b"END")],
+)
+def test_flax_msgpack_large_binary_fails_closed_when_optional_regex_anchor_is_absent(
+    tmp_path: Path,
+    pattern: str,
+    suffix: bytes,
+) -> None:
+    path = tmp_path / "large_binary_optional_anchor.msgpack"
+    payload = b"foo" + (b"x" * 70000) + suffix
+    create_msgpack_file(path, {"params": {"blob": payload}})
 
     result = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]}).scan(str(path))
 
