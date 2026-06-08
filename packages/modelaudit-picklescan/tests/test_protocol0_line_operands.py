@@ -14,7 +14,8 @@ SCAN_LIMIT_OVERHEAD_BYTES = 16
 
 def _nested_overlong_protocol0_line_operand() -> bytes:
     # Protocol 0 line operand length includes the surrounding single quotes.
-    overlong_operand_body_bytes = MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1
+    overlong_line_operand_bytes = MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1
+    overlong_operand_body_bytes = overlong_line_operand_bytes - len(b"''")
     return b"cos\nsystem\n(S'" + (b"A" * overlong_operand_body_bytes) + b"'\ntR."
 
 
