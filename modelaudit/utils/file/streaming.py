@@ -11,11 +11,23 @@ import click
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
-from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud_error_for_display
+from modelaudit.utils.sources.cloud_storage import (
+    get_cloud_filesystem_config,
+    get_fs_protocol,
+    redact_cloud_error_for_display,
+)
 
 from .detection import _has_zip_magic
 
 _MAX_STREAM_SOURCE_PATH_DECODE_PASSES = 4
+
+
+def _get_streaming_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
+    """Resolve provider URLs while retaining support for non-cloud test filesystems."""
+    protocol = get_fs_protocol(url)
+    if protocol not in {"s3", "gcs"}:
+        return protocol, url, {}
+    return get_cloud_filesystem_config(url)
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
@@ -114,13 +126,12 @@ def stream_analyze_file(
             "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
-    fs_protocol = get_fs_protocol(url)
-    # Use anonymous access for public buckets
-    fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+    fs_protocol, fs_url, fs_args = _get_streaming_filesystem_config(url)
+    fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     try:
         # Get file info first
-        info = fs.info(url)
+        info = fs.info(fs_url)
         file_size = info.get("size", 0)
 
         if file_size == 0:
@@ -131,7 +142,7 @@ def stream_analyze_file(
         bytes_complete = bytes_to_read >= file_size
 
         # Read partial content
-        with fs.open(url, "rb") as f:
+        with fs.open(fs_url, "rb") as f:
             content = f.read(bytes_to_read)
 
         # Create a temporary in-memory file for scanning
@@ -291,11 +302,11 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> dict[str, Any] | N
         return None
 
     try:
-        fs_protocol = get_fs_protocol(url)
-        fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+        fs_protocol, fs_url, fs_args = _get_streaming_filesystem_config(url)
+        fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         # Read first few bytes
-        with fs.open(url, "rb") as f:
+        with fs.open(fs_url, "rb") as f:
             header = f.read(max_bytes)
 
         # Analyze header

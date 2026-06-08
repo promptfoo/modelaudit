@@ -33,6 +33,11 @@ def test_detect_input_type_cloud():
     assert detect_input_type("https://storage.cloud.google.com/bucket/model.pt") == "cloud_gcs"
     assert detect_input_type("az://container/model.pt") == "cloud_azure"
     assert detect_input_type("https://account.blob.core.windows.net/container") == "cloud_azure"
+    assert detect_input_type("AZ://container/model.pt") == "cloud_azure"
+    assert detect_input_type("https://bucket.s3.amazonaws.com./model.pt") == "cloud_s3"
+    assert detect_input_type("https://storage.googleapis.com./bucket/model.pt") == "cloud_gcs"
+    assert detect_input_type("https://bucket.s3.cn-north-1.amazonaws.com.cn/model.pt") == "cloud_s3"
+    assert detect_input_type("https://s3.us-iso-east-1.amazonaws.com/bucket/model.pt") == "cloud_s3"
 
 
 @pytest.mark.parametrize(

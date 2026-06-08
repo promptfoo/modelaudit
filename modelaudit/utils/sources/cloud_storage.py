@@ -117,12 +117,12 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
-_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-gov)?-[a-z]+-\d"
+_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
 _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
 
 
@@ -563,6 +563,65 @@ def get_fs_protocol(url: str) -> str:
         raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
 
 
+def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
+    """Return the fsspec protocol, canonical object path, and filesystem arguments."""
+    protocol = get_fs_protocol(url)
+    fs_args: dict[str, Any] = {"token": "anon"} if protocol == "gcs" else {}
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.casefold()
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError as exc:
+        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}") from exc
+
+    if scheme in {"s3", "gs", "gcs"}:
+        canonical_scheme = "gcs" if protocol == "gcs" else "s3"
+        canonical_url = urlunsplit((canonical_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+        return protocol, canonical_url, fs_args
+    if scheme == "r2":
+        canonical_url = urlunsplit(("s3", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+        return protocol, canonical_url, fs_args
+    if scheme != "https":
+        return protocol, url, fs_args
+    if parsed.query:
+        return "https", url, {}
+
+    path = parsed.path.lstrip("/")
+    bucket = ""
+    key = ""
+    if _is_r2_https_host(hostname):
+        host_prefix = hostname[: -len(".r2.cloudflarestorage.com")]
+        host_parts = host_prefix.split(".")
+        account = host_parts[-1]
+        if len(host_parts) > 1:
+            bucket = ".".join(host_parts[:-1])
+            key = path
+        else:
+            bucket, _, key = path.partition("/")
+        endpoint_host = f"{account}.r2.cloudflarestorage.com"
+        if parsed.port is not None:
+            endpoint_host = f"{endpoint_host}:{parsed.port}"
+        fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
+    elif _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname):
+        bucket, _, key = path.partition("/")
+    elif _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname):
+        bucket = hostname[: hostname.find(".s3")]
+        key = path
+    elif hostname.endswith(".storage.googleapis.com"):
+        bucket = hostname[: -len(".storage.googleapis.com")]
+        key = path
+    elif hostname in {"storage.googleapis.com", "storage.cloud.google.com"}:
+        bucket, _, key = path.partition("/")
+
+    if not bucket:
+        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+    canonical_scheme = "gcs" if protocol == "gcs" else "s3"
+    canonical_url = f"{canonical_scheme}://{bucket}"
+    if key:
+        canonical_url = f"{canonical_url}/{key}"
+    return protocol, canonical_url, fs_args
+
+
 def estimate_download_time(size_bytes: int, bandwidth_mbps: float = 10.0) -> str:
     """Estimate download time based on file size and bandwidth."""
     if size_bytes == 0:
@@ -650,41 +709,52 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             top_level_size_error = exc
 
     total_size = 0
+    measured_file_count = 0
+    walk_observed = False
     walk_error: Exception | None = None
     ls_error: Exception | None = None
 
     # Try using fs.walk to traverse directories
     try:
         for _, _, files in fs.walk(url):
+            walk_observed = True
             for file_path in files:
                 try:
                     file_info = fs.info(file_path)
                     if "size" in file_info:
                         total_size += _parse_size_value(file_info["size"])
+                        measured_file_count += 1
                     elif strict:
                         raise ValueError("cloud provider did not return file size")
                 except Exception as exc:
                     if strict:
+                        safe_path = _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(file_path))
+                        safe_error = _bound_cloud_metadata_error_display(
+                            redact_cloud_error_for_display(exc, str(file_path))
+                        )
                         raise _CloudObjectMetadataSizeError(
                             "Unable to determine cloud object size for "
                             f"{redact_url_for_display(url)}: metadata lookup failed for listed object "
-                            f"{_redact_cloud_path_for_display(file_path)}: "
-                            f"{redact_cloud_error_for_display(exc, str(file_path))}"
+                            f"{safe_path}: {safe_error}"
                         ) from exc
                     continue
-        if total_size > 0:
+        if walk_observed and (info.get("type") == "directory" or measured_file_count > 0):
             return total_size
     except _CloudObjectMetadataSizeError:
         raise
     except Exception as exc:
         walk_error = exc
         total_size = 0
+        measured_file_count = 0
 
     # Fallback to recursive ls if walk is unavailable
+    ls_observed = False
+
     def _collect(path: str) -> None:
-        nonlocal total_size, ls_error
+        nonlocal total_size, measured_file_count, ls_error, ls_observed
         try:
             entries = fs.ls(path, detail=True)
+            ls_observed = True
         except Exception as exc:
             if ls_error is None:
                 ls_error = exc
@@ -699,24 +769,25 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             elif "size" in entry:
                 try:
                     total_size += _parse_size_value(entry["size"])
+                    measured_file_count += 1
                 except Exception as exc:
                     if strict:
                         raise ValueError(
                             "Unable to determine cloud object size for "
                             f"{redact_url_for_display(url)}: invalid size metadata for listed object "
-                            f"{_redact_cloud_path_for_display(name)}: "
-                            f"{redact_cloud_error_for_display(exc, str(name))}"
+                            f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(name))}: "
+                            f"{_bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, str(name)))}"
                         ) from exc
                     continue
             elif strict and name:
                 raise ValueError(
                     "Unable to determine cloud object size for "
                     f"{redact_url_for_display(url)}: missing size metadata for listed object "
-                    f"{_redact_cloud_path_for_display(name)}"
+                    f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(name))}"
                 )
 
     _collect(url)
-    if total_size > 0:
+    if ls_observed and (info.get("type") == "directory" or measured_file_count > 0):
         return total_size
 
     if strict:
@@ -746,8 +817,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
             "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
-    fs_protocol = get_fs_protocol(url)
-    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+    fs_protocol, fs_url, fs_args = get_cloud_filesystem_config(url)
 
     try:
         # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
@@ -760,7 +830,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
             sanitize_error=_cloud_error_sanitizer(url),
         )
         def get_info():
-            return fs.info(url)
+            return fs.info(fs_url)
 
         info = get_info()
 
@@ -786,7 +856,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
 
         # List all files recursively
         # Ensure URL ends with / for proper globbing
-        glob_pattern = f"{url.rstrip('/')}/**"
+        glob_pattern = f"{fs_url.rstrip('/')}/**"
         for item in fs.glob(glob_pattern):
             try:
                 item_info = fs.info(item)
@@ -2008,8 +2078,7 @@ def download_from_cloud(
 
     # Get filesystem before any acquisition, including stream previews, so size
     # enforcement does not rely only on provider summary metadata.
-    fs_protocol = get_fs_protocol(url)
-    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+    fs_protocol, fs_url, fs_args = get_cloud_filesystem_config(url)
     fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     # Check if we can use streaming analysis. Preview reads are still cloud
@@ -2017,7 +2086,7 @@ def download_from_cloud(
     if stream_analyze and metadata.get("type") == "file":
         if max_size:
             try:
-                stream_object_size = get_cloud_object_size(fs, url, strict=True)
+                stream_object_size = get_cloud_object_size(fs, fs_url, strict=True)
             except ValueError as exc:
                 raise ValueError(
                     "Unable to enforce maximum cloud download size for "
@@ -2037,8 +2106,7 @@ def download_from_cloud(
         # Import here to avoid circular dependency
         from modelaudit.utils.file.streaming import get_streaming_preview
 
-        preview_max_bytes = min(max_size, 1024) if max_size else 1024
-        preview = get_streaming_preview(url, max_bytes=preview_max_bytes)
+        preview = None if max_size else get_streaming_preview(url, max_bytes=1024)
         if preview and show_progress:
             click.echo(f"📄 File preview: {preview.get('detected_format', 'unknown')} format")
 
@@ -2106,7 +2174,7 @@ def download_from_cloud(
             )
         else:
             try:
-                object_size = get_cloud_object_size(fs, url, strict=True)
+                object_size = get_cloud_object_size(fs, fs_url, strict=True)
             except ValueError as exc:
                 if max_size:
                     raise ValueError(
@@ -2154,7 +2222,7 @@ def download_from_cloud(
                 download_budget.consume(acquired_probe_bytes)
             for file_info in files:
                 file_url = file_info["path"]
-                local_path = _build_safe_local_path(url, file_url, download_path)
+                local_path = _build_safe_local_path(fs_url, file_url, download_path)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if show_progress:
@@ -2185,7 +2253,7 @@ def download_from_cloud(
                 sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
-                return _download_cloud_object(fs, url, local_file, download_budget)
+                return _download_cloud_object(fs, fs_url, local_file, download_budget)
 
             if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
                 with yaspin(text=f"Downloading {file_name}") as spinner:
@@ -2266,8 +2334,7 @@ def download_from_cloud_streaming(
         raise ValueError(f"Total size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
     # Get filesystem
-    fs_protocol = get_fs_protocol(url)
-    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+    fs_protocol, fs_url, fs_args = get_cloud_filesystem_config(url)
     fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     # Get list of files to download
@@ -2297,7 +2364,7 @@ def download_from_cloud_streaming(
             raise ValueError("No scannable model files found")
     else:
         # Single file
-        files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
+        files = [{"path": fs_url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
     acquired_probe_bytes = (
         content_sniff_budget.max_bytes - content_sniff_budget.remaining_bytes if content_sniff_budget is not None else 0
@@ -2325,7 +2392,7 @@ def download_from_cloud_streaming(
             is_last = i == total_files - 1
 
             # Build a safe local path relative to the requested cloud base path.
-            local_path = _build_safe_local_path(url, file_url, temp_dir)
+            local_path = _build_safe_local_path(fs_url, file_url, temp_dir)
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:

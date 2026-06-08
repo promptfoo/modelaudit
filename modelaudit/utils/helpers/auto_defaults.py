@@ -7,19 +7,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-gov)?-[a-z]+-\d"
+_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
 _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com$"
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
 )
 
 
 def _get_hostname(url: str) -> str:
     """Extract and normalize the hostname from a URL."""
     try:
-        return (urlparse(url).hostname or "").lower()
+        return (urlparse(url).hostname or "").casefold().rstrip(".")
     except Exception:
         return ""
 
@@ -62,7 +62,7 @@ def detect_input_type(path: str) -> str:
         return "cloud_s3"
     if scheme in {"gs", "gcs"} or _is_gcs_https_host(hostname):
         return "cloud_gcs"
-    if path.startswith("az://") or hostname.endswith(".blob.core.windows.net"):
+    if scheme == "az" or hostname.endswith(".blob.core.windows.net"):
         return "cloud_azure"
 
     # HuggingFace detection
