@@ -3126,7 +3126,10 @@ def auth() -> None:
 @click.option(
     "-h",
     "--host",
-    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+    help=(
+        "The API URL of the Promptfoo instance. Custom domains must also be configured through "
+        "MODELAUDIT_API_ALLOWED_HOSTS, MODELAUDIT_API_HOST, or API_HOST."
+    ),
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id: str | None, host: str | None, api_key: str | None) -> None:

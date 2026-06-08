@@ -260,6 +260,48 @@ def test_validate_api_host_for_bearer_auth_accepts_explicitly_allowed_https_host
     assert auth_config.validate_api_host_for_bearer_auth("https://api.internal/") == "https://api.internal"
 
 
+@pytest.mark.parametrize("env_name", ["MODELAUDIT_API_HOST", "API_HOST"])
+def test_validate_api_host_for_bearer_auth_trusts_exact_environment_host(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.delenv("MODELAUDIT_API_ALLOWED_HOSTS", raising=False)
+    for name in ("MODELAUDIT_API_HOST", "API_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(env_name, "https://ENTERPRISE.EXAMPLE:8443/")
+
+    assert (
+        auth_config.validate_api_host_for_bearer_auth("https://enterprise.example:9443")
+        == "https://enterprise.example:9443"
+    )
+    with pytest.raises(ValueError, match="trusted Promptfoo API host"):
+        auth_config.validate_api_host_for_bearer_auth("https://enterprise.example.attacker.test")
+
+
+@pytest.mark.parametrize(
+    "configured_host",
+    [
+        "http://attacker.example",
+        "https://trusted.example@attacker.example",
+        "https://attacker.example/path",
+        "https://attacker.example?query=value",
+        "https://attacker.example%2ftrusted.example",
+        "https://attacker.example:0",
+        "https://attacker.example:65536",
+    ],
+)
+def test_validate_api_host_for_bearer_auth_ignores_ambiguous_allowlist_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_host: str,
+) -> None:
+    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", configured_host)
+    monkeypatch.delenv("MODELAUDIT_API_HOST", raising=False)
+    monkeypatch.delenv("API_HOST", raising=False)
+
+    with pytest.raises(ValueError, match="trusted Promptfoo API host"):
+        auth_config.validate_api_host_for_bearer_auth("https://attacker.example")
+
+
 @pytest.mark.parametrize(
     "api_host",
     [
@@ -445,6 +487,19 @@ def test_auth_login_accepts_explicit_enterprise_https_host(monkeypatch: pytest.M
     assert "Successfully logged in" in result.output
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
     assert fake_config.api_host == "https://enterprise.example:8443"
+
+
+def test_auth_login_help_documents_custom_host_trust_configuration() -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    result = CliRunner().invoke(cli, ["auth", "login", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "MODELAUDIT_API_ALLOWED_HOSTS" in result.output
+    assert "MODELAUDIT_API_HOST" in result.output
+    assert "API_HOST" in result.output
 
 
 def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalized_host(

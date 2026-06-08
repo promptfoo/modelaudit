@@ -20,6 +20,7 @@ from ..utils._path_hardening import (
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
 API_HOST_ALLOWED_HOSTS_ENV = "MODELAUDIT_API_ALLOWED_HOSTS"
+_API_HOST_ENV_VARS = ("MODELAUDIT_API_HOST", "API_HOST")
 _PROMPTFOO_API_HOST_SUFFIX = "promptfoo.app"
 
 
@@ -31,15 +32,32 @@ def _normalize_api_hostname(hostname: str) -> str:
 def _host_from_config_value(value: str) -> str:
     """Normalize a configured hostname or base URL to a hostname."""
     candidate = value.strip()
-    if not candidate:
+    if (
+        not candidate
+        or "\\" in candidate
+        or "%" in candidate
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in candidate)
+    ):
         return ""
 
     try:
         parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        port = parsed.port
     except ValueError:
         return ""
 
-    if parsed.hostname is None:
+    if (
+        parsed.hostname is None
+        or (parsed.scheme and parsed.scheme.lower() != "https")
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port == 0
+    ):
         return ""
     return _normalize_api_hostname(parsed.hostname)
 
@@ -47,7 +65,8 @@ def _host_from_config_value(value: str) -> str:
 def _get_explicitly_trusted_api_hosts() -> set[str]:
     """Return caller-configured hosts allowed to receive API bearer tokens."""
     raw_hosts = os.getenv(API_HOST_ALLOWED_HOSTS_ENV, "")
-    return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
+    configured_values = [*raw_hosts.split(","), *(os.getenv(name, "") for name in _API_HOST_ENV_VARS)]
+    return {host for host in (_host_from_config_value(value) for value in configured_values) if host}
 
 
 def _is_promptfoo_api_host(hostname: str) -> bool:
@@ -92,7 +111,7 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
     if not _is_trusted_api_host(hostname):
         raise ValueError(
             "API host for bearer-token authentication must be a trusted Promptfoo API host "
-            f"or listed in {API_HOST_ALLOWED_HOSTS_ENV}"
+            f"or explicitly configured through {API_HOST_ALLOWED_HOSTS_ENV}, MODELAUDIT_API_HOST, or API_HOST"
         )
 
     normalized_hostname = f"[{hostname}]" if ":" in hostname else hostname
