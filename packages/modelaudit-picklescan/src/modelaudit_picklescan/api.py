@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import pickletools
 import tempfile
 import zipfile
 from collections.abc import Mapping
+from contextlib import suppress
 from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -221,19 +223,21 @@ class PickleScanner:
         path_obj = Path(path)
         size: int | None = None
         try:
-            size = path_obj.stat().st_size
-            if zipfile.is_zipfile(path_obj):
-                container_report = self._scan_pytorch_zip_file(
-                    path_obj,
-                    source=source,
-                    size=size,
-                    enrich_call_graph=enrich_call_graph,
-                )
-                if container_report is not None:
-                    return container_report
-                if _has_pytorch_checkpoint_suffix(path_obj):
-                    return _unsupported_zip_report(source=source, size=size)
             with path_obj.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if zipfile.is_zipfile(handle):
+                    handle.seek(0)
+                    container_report = self._scan_pytorch_zip_file(
+                        handle,
+                        source=source,
+                        size=size,
+                        enrich_call_graph=enrich_call_graph,
+                    )
+                    if container_report is not None:
+                        return container_report
+                    if _has_pytorch_checkpoint_suffix(path_obj):
+                        return _unsupported_zip_report(source=source, size=size)
+                handle.seek(0)
                 return self.scan_stream(
                     handle,
                     source=source,
@@ -261,13 +265,13 @@ class PickleScanner:
 
     def _scan_pytorch_zip_file(
         self,
-        path: Path,
+        path_or_stream: Path | BinaryIO,
         *,
         source: str,
         size: int,
         enrich_call_graph: bool = True,
     ) -> PickleReport | None:
-        preflight_entry_count = _read_zip_entry_count(path, size)
+        preflight_entry_count = _read_zip_entry_count(path_or_stream, size)
         if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
             return _pytorch_zip_entry_limit_report(
                 source=source,
@@ -275,7 +279,7 @@ class PickleScanner:
                 entry_count=preflight_entry_count,
             )
 
-        with zipfile.ZipFile(path, "r") as archive:
+        with zipfile.ZipFile(path_or_stream, "r") as archive:
             entries = _bounded_zip_entries(archive, source=source, size=size)
             if isinstance(entries, PickleReport):
                 return entries
@@ -387,37 +391,55 @@ def scan_file(
     return PickleScanner(options=options).scan_file(path, enrich_call_graph=enrich_call_graph)
 
 
-def _read_zip_entry_count(path: Path, file_size: int) -> int | None:
+def _read_zip_entry_count(path_or_stream: Path | BinaryIO, file_size: int) -> int | None:
     if file_size < _ZIP_EOCD_MIN_SIZE:
         return None
 
+    if isinstance(path_or_stream, Path):
+        try:
+            with path_or_stream.open("rb") as handle:
+                return _read_zip_entry_count_from_stream(handle, file_size)
+        except OSError:
+            return None
+
+    try:
+        position = path_or_stream.tell()
+    except (AttributeError, OSError, ValueError):
+        return None
+    try:
+        return _read_zip_entry_count_from_stream(path_or_stream, file_size)
+    finally:
+        with suppress(AttributeError, OSError, ValueError):
+            path_or_stream.seek(position)
+
+
+def _read_zip_entry_count_from_stream(handle: BinaryIO, file_size: int) -> int | None:
     tail_size = min(file_size, _ZIP_EOCD_MIN_SIZE + _ZIP_MAX_COMMENT_SIZE)
     try:
-        with path.open("rb") as handle:
-            handle.seek(file_size - tail_size)
-            tail = handle.read(tail_size)
-            eocd_index = _find_zip_eocd_index(tail)
-            if eocd_index is None:
-                return None
+        handle.seek(file_size - tail_size)
+        tail = handle.read(tail_size)
+        eocd_index = _find_zip_eocd_index(tail)
+        if eocd_index is None:
+            return None
 
-            entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
-            if entry_count != _ZIP64_SENTINEL_ENTRY_COUNT:
-                return entry_count
+        entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
+        if entry_count != _ZIP64_SENTINEL_ENTRY_COUNT:
+            return entry_count
 
-            eocd_offset = file_size - tail_size + eocd_index
-            locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
-            if locator_offset < 0:
-                return None
-            handle.seek(locator_offset)
-            locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
-            if not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
-                return None
-            zip64_eocd_offset = int.from_bytes(locator[8:16], "little")
-            handle.seek(zip64_eocd_offset)
-            zip64_eocd = handle.read(_ZIP64_EOCD_MIN_SIZE)
-            if len(zip64_eocd) < _ZIP64_EOCD_MIN_SIZE or not zip64_eocd.startswith(_ZIP64_EOCD_SIGNATURE):
-                return None
-            return int.from_bytes(zip64_eocd[32:40], "little")
+        eocd_offset = file_size - tail_size + eocd_index
+        locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+        if locator_offset < 0:
+            return None
+        handle.seek(locator_offset)
+        locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
+        if not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
+            return None
+        zip64_eocd_offset = int.from_bytes(locator[8:16], "little")
+        handle.seek(zip64_eocd_offset)
+        zip64_eocd = handle.read(_ZIP64_EOCD_MIN_SIZE)
+        if len(zip64_eocd) < _ZIP64_EOCD_MIN_SIZE or not zip64_eocd.startswith(_ZIP64_EOCD_SIGNATURE):
+            return None
+        return int.from_bytes(zip64_eocd[32:40], "little")
     except OSError:
         return None
 
@@ -1025,7 +1047,7 @@ def _with_known_stream_notice(
     notices = (
         *report.notices,
         Notice(
-            message="Known-size pickle stream scan stopped at configured byte limit",
+            message="Known-size pickle stream coverage could not be proven complete",
             severity=Severity.INFO,
             location=source,
             code="known_stream_truncated",
@@ -2044,9 +2066,32 @@ def _read_stream_payload(
                 spool.write(chunk)
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
+            if not stream_truncated and _known_stream_has_uncovered_data(stream):
+                stream_truncated = True
 
         spool.seek(0)
         return spool.read(), stream_truncated
+
+
+def _known_stream_has_uncovered_data(stream: BinaryIO) -> bool:
+    if not _stream_is_seekable(stream):
+        return True
+    try:
+        position = stream.tell()
+    except (AttributeError, OSError, ValueError):
+        return True
+
+    try:
+        trailing_data = bool(stream.read(1))
+    except Exception:
+        with suppress(AttributeError, OSError, ValueError):
+            stream.seek(position)
+        return True
+    if not trailing_data:
+        return False
+    with suppress(AttributeError, OSError, ValueError):
+        stream.seek(position)
+    return True
 
 
 def _engine_error_report(
