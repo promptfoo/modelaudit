@@ -1,4 +1,4 @@
-use crate::opcode::{parse_opcode, ParseError, ParsedOpcode};
+use crate::opcode::{parse_opcode, ParseError, ParsedOpcode, MAX_PROTOCOL0_LINE_OPERAND_BYTES};
 
 const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -211,11 +211,15 @@ pub(crate) fn pickle_payload_extent_result(
     let mut mark_depths: Vec<usize> = Vec::new();
     let mut structured_pickle_evidence = has_binary_pickle_prefix(value);
     while index < value.len() {
-        let parsed =
-            parse_opcode(value, index, value.len()).map_err(|error| PicklePayloadExtentError {
+        let parsed = parse_opcode(value, index, value.len()).map_err(|error| {
+            let structured_suffix_evidence =
+                protocol0_line_operand_limit_has_structured_evidence(value, index, &error);
+            PicklePayloadExtentError {
                 error,
-                structured_pickle_evidence,
-            })?;
+                structured_pickle_evidence: structured_pickle_evidence
+                    || structured_suffix_evidence,
+            }
+        })?;
         index = parsed.next;
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
             return Ok(None);
@@ -402,6 +406,7 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
     }
     has_binary_pickle_prefix(value)
         || protocol0_global_or_inst_prefix_has_complete_lines(value)
+        || protocol0_global_or_inst_prefix_has_oversized_name_line(value)
         || matches!(value[0], b'(' | b'd' | b'l' | b'I' | b'S' | b'V')
         || pickle_prefix_has_structured_opcodes(value, false)
 }
@@ -417,14 +422,7 @@ pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool
 }
 
 pub(crate) fn protocol0_global_or_inst_prefix_has_import_reference_lines(value: &[u8]) -> bool {
-    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
-        return false;
-    }
-    let mut fields = value[1..].splitn(3, |byte| *byte == b'\n');
-    let Some(module) = fields.next() else {
-        return false;
-    };
-    let Some(name) = fields.next() else {
+    let Some((module, name)) = protocol0_global_or_inst_prefix_fields(value) else {
         return false;
     };
     is_protocol0_import_reference(module) && is_protocol0_import_reference(name)
@@ -556,32 +554,83 @@ fn is_pickle_prefix_start_byte(byte: u8) -> bool {
     )
 }
 
-fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
-    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
-        return false;
-    }
-    let mut fields = value[1..].splitn(3, |byte| *byte == b'\n');
-    let Some(module) = fields.next() else {
+fn protocol0_global_or_inst_prefix_has_oversized_name_line(value: &[u8]) -> bool {
+    let Some((module, name_start)) = protocol0_global_or_inst_prefix_module_line(value) else {
         return false;
     };
-    let Some(name) = fields.next() else {
+    if !is_protocol0_import_reference(module) {
+        return false;
+    }
+
+    let bounded_name_end = value
+        .len()
+        .min(name_start.saturating_add(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1));
+    if value[name_start..bounded_name_end].contains(&b'\n') || bounded_name_end == value.len() {
+        return false;
+    }
+    value[bounded_name_end..].contains(&b'\n')
+}
+
+fn protocol0_line_operand_limit_has_structured_evidence(
+    value: &[u8],
+    opcode_index: usize,
+    error: &ParseError,
+) -> bool {
+    if !error.is_protocol0_line_operand_limit() {
+        return false;
+    }
+    if matches!(value.get(opcode_index).copied(), Some(b'c' | b'i')) {
+        return true;
+    }
+    let search_start = error.report_index.unwrap_or(0).min(value.len());
+    let Some(relative_newline) = value[search_start..].iter().position(|byte| *byte == b'\n')
+    else {
+        return false;
+    };
+    let suffix_start = search_start
+        .saturating_add(relative_newline)
+        .saturating_add(1);
+    has_execution_opcode(&value[suffix_start..])
+}
+
+fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
+    let Some((module, name)) = protocol0_global_or_inst_prefix_fields(value) else {
         return false;
     };
     is_protocol0_global_operand(module) && (name.is_empty() || is_protocol0_global_operand(name))
 }
 
 fn protocol0_global_or_inst_prefix_has_complete_lines(value: &[u8]) -> bool {
-    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
-        return false;
-    }
-    let mut fields = value[1..].splitn(3, |byte| *byte == b'\n');
-    let Some(module) = fields.next() else {
-        return false;
-    };
-    let Some(name) = fields.next() else {
+    let Some((module, name)) = protocol0_global_or_inst_prefix_fields(value) else {
         return false;
     };
     is_protocol0_global_operand(module) && is_protocol0_global_operand(name)
+}
+
+fn protocol0_global_or_inst_prefix_fields(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (module, name_start) = protocol0_global_or_inst_prefix_module_line(value)?;
+    let bounded_name_end = value.len().min(name_start.saturating_add(257));
+    let name = match value[name_start..bounded_name_end]
+        .iter()
+        .position(|byte| *byte == b'\n')
+    {
+        Some(relative_end) => &value[name_start..name_start + relative_end],
+        None if bounded_name_end == value.len() => &value[name_start..],
+        None => return None,
+    };
+    Some((module, name))
+}
+
+fn protocol0_global_or_inst_prefix_module_line(value: &[u8]) -> Option<(&[u8], usize)> {
+    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
+        return None;
+    }
+    let bounded_module_end = value.len().min(258);
+    let relative_end = value[1..bounded_module_end]
+        .iter()
+        .position(|byte| *byte == b'\n')?;
+    let module_end = 1 + relative_end;
+    Some((&value[1..module_end], module_end + 1))
 }
 
 fn protocol0_opcode_operands_are_plausible(opcode: &ParsedOpcode, value: &[u8]) -> bool {
@@ -622,6 +671,16 @@ fn nested_pickle_probe_offsets_with_limit(
     value: &[u8],
     limit: Option<usize>,
 ) -> NestedProbeOffsets {
+    if std::str::from_utf8(value)
+        .ok()
+        .is_some_and(is_whole_encoded_pickle_literal)
+    {
+        return NestedProbeOffsets {
+            offsets: Vec::new(),
+            limit_exceeded: false,
+        };
+    }
+
     let mut offsets = Vec::new();
     for index in 0..value.len().saturating_sub(1) {
         if has_pickle_prefix(&value[index..]) {
@@ -646,6 +705,18 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     max_window_chars: usize,
 ) -> Vec<String> {
     encoded_nested_literal_probe_windows_with_limit(value, max_window_chars).windows
+}
+
+pub(crate) fn is_whole_encoded_pickle_literal(value: &str) -> bool {
+    let stripped = value.trim();
+    let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(stripped);
+    let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(stripped);
+    (prefix_has_base64_pickle || prefix_has_hex_pickle)
+        && encoded_prefix_consumes_literal(
+            stripped,
+            prefix_has_base64_pickle,
+            prefix_has_hex_pickle,
+        )
 }
 
 pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
@@ -1108,333 +1179,4 @@ fn take_bytes_str(value: &str, count: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_MAX_NESTED_PICKLE_BYTES: usize = 2 * 1024 * 1024;
-
-    #[test]
-    fn encoded_prefix_gates_recognize_pickle_prefixes() {
-        assert!(base64_prefix_has_pickle_prefix("gAR9Lg=="));
-        assert!(hex_prefix_has_pickle_prefix("80047d2e"));
-        assert!(hex_prefix_has_pickle_prefix(r"\x80\x04\x7d\x2e"));
-    }
-
-    #[test]
-    fn encoded_prefix_gates_recognize_binary_protocols_1_to_5() {
-        for encoded in ["gAF9Lg==", "gAJ9Lg==", "gAN9Lg==", "gAR9Lg==", "gAV9Lg=="] {
-            assert!(base64_prefix_has_pickle_prefix(encoded));
-            let wrapped = format!("prefix-{encoded}-suffix");
-            let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
-            assert!(windows.iter().any(|window| window.starts_with(encoded)));
-        }
-
-        for protocol in 1..=5 {
-            let encoded = format!("800{protocol}7d2e");
-            assert!(hex_prefix_has_pickle_prefix(&encoded));
-            let wrapped = format!("prefix-{encoded}-suffix");
-            let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
-            assert!(windows.iter().any(|window| window.starts_with(&encoded)));
-        }
-    }
-
-    #[test]
-    fn pickle_prefix_recognizes_protocol1_binary_header() {
-        let payload = b"\x80\x01}.";
-
-        assert!(has_binary_pickle_prefix(payload));
-        assert!(looks_like_pickle_payload(
-            payload,
-            TEST_MAX_NESTED_PICKLE_BYTES
-        ));
-        assert_eq!(
-            pickle_payload_extent(payload, TEST_MAX_NESTED_PICKLE_BYTES),
-            Some(payload.len())
-        );
-    }
-
-    #[test]
-    fn encoded_prefix_gates_reject_benign_repeated_literals() {
-        assert!(!base64_prefix_has_pickle_prefix("AAAAAAAAAAAAAAAA"));
-        assert!(!hex_prefix_has_pickle_prefix("4141414141414141"));
-        assert!(!encoded_literal_may_contain_pickle(&"A".repeat(1024)));
-        assert!(
-            decode_possible_encoded_pickle(&"A".repeat(1024), TEST_MAX_NESTED_PICKLE_BYTES)
-                .is_empty()
-        );
-        assert!(detect_oversized_encoded_pickle_prefixes(
-            &"A".repeat(1024),
-            TEST_MAX_NESTED_PICKLE_BYTES
-        )
-        .is_empty());
-    }
-
-    #[test]
-    fn encoded_probe_windows_reject_benign_hexish_large_literals() {
-        let value = format!("{}os.system('id'){}", "A".repeat(4096), "B".repeat(4096));
-
-        assert!(encoded_nested_literal_probe_windows(&value, 4096).is_empty());
-    }
-
-    #[test]
-    fn encoded_probe_windows_keep_embedded_encoded_pickle_candidates() {
-        let value = format!("{}gAR9Lg=={}", "A".repeat(128), "B".repeat(128));
-        let windows = encoded_nested_literal_probe_windows(&value, 64);
-
-        assert!(encoded_literal_may_contain_pickle(&value));
-        assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
-    }
-
-    #[test]
-    fn encoded_probe_windows_report_limit_after_decoys_exhaust_cap() {
-        let mut value = String::new();
-        for index in 0..MAX_NESTED_PAYLOAD_PROBES {
-            value.push_str(&format!("gAR9Lg==-decoy-{index}|"));
-        }
-        let hidden_payload = "Y29zCnN5c3RlbQopUi4";
-        value.push_str(hidden_payload);
-        value.push_str(&"A".repeat(ENCODED_LITERAL_PROBE_CHARS + 1));
-
-        let probed = encoded_nested_literal_probe_windows_with_limit(&value, 64);
-
-        assert!(probed.limit_exceeded);
-        assert_eq!(probed.limit_exceeded_encoding, Some("base64"));
-        assert_eq!(probed.windows.len(), MAX_NESTED_PAYLOAD_PROBES);
-        assert!(!probed
-            .windows
-            .iter()
-            .any(|window| window.starts_with(hidden_payload)));
-    }
-
-    #[test]
-    fn encoded_probe_windows_skip_mid_scan_for_whole_encoded_literals() {
-        for value in ["gAR9Lg==", "80047d2e", r"\x80\x04\x7d\x2e"] {
-            let windows = encoded_nested_literal_probe_windows(value, 64);
-
-            assert_eq!(windows, vec![value.to_string()]);
-        }
-    }
-
-    #[test]
-    fn encoded_probe_windows_bound_mid_literal_scan_cost() {
-        let within_bound = format!(
-            "{}gAR9Lg=={}",
-            "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES.saturating_sub(16)),
-            "B".repeat(128)
-        );
-        let within_windows = encoded_nested_literal_probe_windows(&within_bound, 64);
-        assert!(within_windows
-            .iter()
-            .any(|window| window.starts_with("gAR9Lg==")));
-
-        let beyond_bound = format!(
-            "{}gAR9Lg=={}",
-            "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES + 16),
-            "B".repeat(ENCODED_LITERAL_PROBE_CHARS + 1)
-        );
-        let beyond_windows = encoded_nested_literal_probe_windows(&beyond_bound, 64);
-        assert!(!beyond_windows
-            .iter()
-            .any(|window| window.starts_with("gAR9Lg==")));
-        assert!(encoded_nested_literal_probe_coverage_incomplete(
-            &beyond_bound
-        ));
-    }
-
-    #[test]
-    fn encoded_probe_coverage_treats_trimmed_whole_literals_as_complete() {
-        let whole_literal = format!("gAR9{}\n", "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES));
-
-        assert!(!encoded_nested_literal_probe_coverage_incomplete(
-            &whole_literal
-        ));
-    }
-
-    #[test]
-    fn encoded_probe_windows_keep_protocol0_embedded_encoded_pickle_candidates() {
-        let value = format!("{}Y29zCnN5c3RlbQopUi4={}", "A".repeat(128), "B".repeat(128));
-        let windows = encoded_nested_literal_probe_windows(&value, 64);
-
-        assert!(windows
-            .iter()
-            .any(|window| window.starts_with("Y29zCnN5c3RlbQopUi4=")));
-    }
-
-    #[test]
-    fn wrapped_base64_nested_literals_ignore_comment_leaders() {
-        let value = "# this is doc\n# Y29zCnN5\n# c3RlbQopUi4=\n# more";
-        let decoded = decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES);
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].encoding, "base64");
-        assert_eq!(decoded[0].payload, b"cos\nsystem\n)R.");
-        assert!(!decoded[0].analysis_incomplete);
-    }
-
-    #[test]
-    fn encoded_nested_literals_keep_later_decoded_payloads() {
-        let decoded = decode_possible_encoded_pickle(
-            "gAR9LmNvcwpzeXN0ZW0KKVIu",
-            TEST_MAX_NESTED_PICKLE_BYTES,
-        );
-
-        assert!(decoded
-            .iter()
-            .any(|candidate| candidate.encoding == "base64" && candidate.payload == b"\x80\x04}."));
-        assert!(decoded
-            .iter()
-            .any(|candidate| candidate.encoding == "base64"
-                && candidate.payload == b"cos\nsystem\n)R."));
-    }
-
-    #[test]
-    fn decoded_payloads_preserve_protocol0_operand_limit_failures() {
-        let mut payload = b"cos\nsystem\n(S'".to_vec();
-        payload.resize(
-            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
-            b'A',
-        );
-        payload.extend_from_slice(b"'\ntR.");
-
-        let decoded = decoded_pickle_payloads(&payload, payload.len() + 16);
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, payload);
-        assert!(decoded[0].1);
-    }
-
-    #[test]
-    fn decoded_payloads_ignore_unstructured_protocol0_operand_limit_failures() {
-        let mut payload = b"S'".to_vec();
-        payload.resize(
-            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1,
-            b'A',
-        );
-
-        assert!(decoded_pickle_payloads(&payload, payload.len() + 16).is_empty());
-        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
-            .expect_err("overlong protocol 0 string should preserve its parse error");
-        assert!(!error.is_structured_protocol0_line_operand_limit());
-    }
-
-    #[test]
-    fn protocol0_operand_limit_requires_prior_structured_opcode() {
-        let mut payload = b"cos\nsystem\n(S'".to_vec();
-        payload.resize(
-            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
-            b'A',
-        );
-
-        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
-            .expect_err("overlong nested operand should preserve its parse error");
-        assert!(error.is_structured_protocol0_line_operand_limit());
-    }
-
-    #[test]
-    fn protocol0_operand_limit_tracks_structured_evidence_beyond_prefix_probe() {
-        let mut payload = b"(NNNNcos\nsystem\n(S'".to_vec();
-        payload.resize(
-            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
-            b'A',
-        );
-
-        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
-            .expect_err("structured evidence after setup opcodes should survive the operand cap");
-        assert!(error.is_structured_protocol0_line_operand_limit());
-    }
-
-    #[test]
-    fn encoded_probe_windows_keep_protocol0_escaped_hex_pickle_candidates() {
-        for encoded in [
-            r"\x28\x64\x2e",
-            r"\x49\x31\x0a\x2e",
-            r"\x53\x27\x78\x27\x0a\x2e",
-            r"\x56\x78\x0a\x2e",
-            r"\x63\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",
-            r"\X63\X6f\X73\X0a\X73\X79\X73\X74\X65\X6d\X0a\X2e",
-            r"\x64\x2e",
-            r"\x6c\x2e",
-            r"\x69\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",
-        ] {
-            let value = format!("prefix-{encoded}-suffix");
-            let windows = encoded_nested_literal_probe_windows(&value, 64);
-
-            assert!(
-                windows.iter().any(|window| window.starts_with(encoded)),
-                "missing escaped-hex candidate window for {encoded}"
-            );
-        }
-    }
-
-    #[test]
-    fn execution_opcode_detection_distinguishes_structural_nested_payloads() {
-        assert!(!has_execution_opcode(b"\x80\x04}q\x00."));
-        assert!(has_execution_opcode(
-            b"\x80\x04\x8c\x08builtins\x94\x8c\x05print\x94\x93\x8c\x02hi\x85R."
-        ));
-        assert!(has_execution_opcode(b"\x80\x04cos\nsystem\nPfake_id\n."));
-        assert!(looks_like_pickle_payload(
-            b"\x80\x04cos\nsystem\nPfake_id\n.",
-            TEST_MAX_NESTED_PICKLE_BYTES
-        ));
-        assert!(!has_execution_opcode(
-            b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
-        ));
-    }
-
-    #[test]
-    fn truncated_prefix_fail_closed_ignores_structural_protocol0_near_matches() {
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04]K\x01aK\x02aK\x03a"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04\x95\x1f\x00\x00\x00\x00"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04AAAAAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"\x80\x04\xff\xff\xff\xff"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"cos\nsystem\nAAAAAAAA"
-        ));
-        assert!(truncated_pickle_prefix_requires_fail_closed(
-            b"ios\nsystem\nAAAAAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"inner\x94\x8c\x04data\x94s.BBBBB"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"S'not-a-full-pickle'\nAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"Vnot-a-full-pickle\nAAAA"
-        ));
-        assert!(!truncated_pickle_prefix_requires_fail_closed(
-            b"}q\x00BBBBBBBB"
-        ));
-    }
-
-    #[test]
-    fn stack_validation_models_batch_container_mutation_and_protocol5_buffers() {
-        assert!(!looks_like_pickle_payload(
-            b"\x80\x04](ea.",
-            TEST_MAX_NESTED_PICKLE_BYTES
-        ));
-        assert!(looks_like_pickle_payload(
-            b"\x80\x05\x97.",
-            TEST_MAX_NESTED_PICKLE_BYTES
-        ));
-    }
-
-    #[test]
-    fn byte_bounded_string_windows_preserve_utf8_boundaries() {
-        assert_eq!(take_bytes_str("abc", 2), "ab");
-        assert_eq!(take_bytes_str("a\u{2603}b", 2), "a");
-        assert_eq!(take_bytes_str("a\u{2603}b", 4), "a\u{2603}");
-    }
-}
+mod tests;
