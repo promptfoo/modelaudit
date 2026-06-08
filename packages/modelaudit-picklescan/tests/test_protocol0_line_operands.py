@@ -12,6 +12,14 @@ MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_NESTED_PICKLE_BYTES = 2 * 1024 * 1024
 
 
+def _escaped_hex(payload: bytes) -> str:
+    return "".join(f"\\x{byte:02x}" for byte in payload)
+
+
+def _mixed_hex(payload: bytes) -> str:
+    return f"\\x{payload[0]:02x}{payload[1:].hex()}"
+
+
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
     payload = b"S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 2)) + b"'\n."
 
@@ -110,6 +118,47 @@ def test_scan_bytes_fails_closed_when_structure_follows_overlong_protocol0_opera
     assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
 
+@pytest.mark.parametrize("as_unicode", [False, True])
+def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_after_inst(
+    as_unicode: bool,
+) -> None:
+    nested_payload = b"(ios\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
+    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
+    payload = pickle.dumps(nested_value, protocol=4)
+
+    report = scan_bytes(
+        payload,
+        source="nested-inst-overlong-protocol0-string.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(nested_payload) + 16,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "INST"
+        and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    incomplete_notice = next(notice for notice in report.notices if notice.code == "nested_pickle_incomplete")
+    nested_notices = incomplete_notice.details.get("nested_notices")
+    assert isinstance(nested_notices, (list, tuple))
+    assert any(
+        isinstance(notice, Mapping)
+        and notice.get("code") == "parse_incomplete"
+        and isinstance(notice.get("details"), Mapping)
+        and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
+        for notice in nested_notices
+    )
+
+
 def test_scan_bytes_fails_closed_for_base64_overlong_first_global_operand() -> None:
     nested_payload = b"cos\n" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1)) + b"\n."
     encoded = base64.b64encode(nested_payload).decode("ascii")
@@ -131,6 +180,59 @@ def test_scan_bytes_fails_closed_for_base64_overlong_first_global_operand() -> N
         for finding in report.findings
     )
     assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "expected_rule"),
+    [("base64", "S601"), ("escaped_hex", "S602"), ("mixed_hex", "S602")],
+)
+@pytest.mark.parametrize("opcode_prefix", [b"c", b"(i"])
+def test_scan_bytes_fails_closed_for_oversized_encoded_custom_global_name(
+    opcode_prefix: bytes,
+    encoding: str,
+    expected_rule: str,
+) -> None:
+    nested_payload = opcode_prefix + b"custommodule\n" + (b"A" * (DEFAULT_MAX_NESTED_PICKLE_BYTES + 1)) + b"\n."
+    if encoding == "base64":
+        encoded = base64.b64encode(nested_payload).decode("ascii")
+    elif encoding == "escaped_hex":
+        encoded = _escaped_hex(nested_payload)
+    else:
+        encoded = _mixed_hex(nested_payload)
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source=f"oversized-custom-global-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("module", [b"config", b"os"])
+@pytest.mark.parametrize("encoding", ["base64", "escaped_hex", "mixed_hex"])
+def test_scan_bytes_ignores_oversized_encoded_global_like_prose(
+    module: bytes,
+    encoding: str,
+) -> None:
+    nested_text = b"c" + module + b"\n" + (b"A" * (DEFAULT_MAX_NESTED_PICKLE_BYTES + 1)) + b"\nplain footer\n"
+    if encoding == "base64":
+        encoded = base64.b64encode(nested_text).decode("ascii")
+    elif encoding == "escaped_hex":
+        encoded = _escaped_hex(nested_text)
+    else:
+        encoded = _mixed_hex(nested_text)
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source=f"oversized-{encoding}-global-like-prose.pkl",
+    )
+
+    assert not any(finding.rule_code in {"S601", "S602"} for finding in report.findings)
 
 
 @pytest.mark.parametrize("prefix", [b"cos\n", b"ios\n"])

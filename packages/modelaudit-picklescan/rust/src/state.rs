@@ -6001,18 +6001,18 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) {
+        let mut found_candidate = self.scan_oversized_encoded_pickle_prefixes(value, position);
         if !encoded_literal_may_contain_pickle(value) {
             return;
         }
 
-        let mut found_candidate = false;
-        if value.len() <= self.options.max_string_literal_scan_chars {
+        if !found_candidate && value.len() <= self.options.max_string_literal_scan_chars {
             found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
         } else {
             let value_len = string_char_len(value);
-            if value_len <= self.options.max_string_literal_scan_chars {
+            if !found_candidate && value_len <= self.options.max_string_literal_scan_chars {
                 found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
-            } else {
+            } else if !found_candidate {
                 self.record_literal_scan_truncated(
                     "string",
                     value_len,
@@ -6104,6 +6104,10 @@ impl<'a> ScanState<'a> {
             return true;
         }
 
+        self.scan_oversized_encoded_pickle_prefixes(value, position)
+    }
+
+    fn scan_oversized_encoded_pickle_prefixes(&mut self, value: &str, position: usize) -> bool {
         let mut oversized_prefix_found = false;
         for (encoding, payload_size) in
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)

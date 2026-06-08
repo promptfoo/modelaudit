@@ -62,6 +62,40 @@ fn encoded_prefix_gates_reject_benign_repeated_literals() {
 }
 
 #[test]
+fn oversized_base64_custom_global_name_uses_contiguous_structural_evidence() {
+    let encoded = "Y2N1c3RvbW1vZHVsZQpBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQou";
+    let max_nested_pickle_bytes = 64;
+
+    assert!(encoded_literal_may_contain_pickle(encoded));
+    assert!(base64_prefix_has_pickle_prefix(encoded));
+    assert_eq!(
+        detect_oversized_encoded_pickle_prefixes(encoded, max_nested_pickle_bytes),
+        vec![("base64", 81)]
+    );
+}
+
+#[test]
+fn oversized_mixed_hex_custom_global_name_preserves_token_boundaries() {
+    let encoded = format!(
+        r"\x63{}{}0a2e",
+        "637573746f6d6d6f64756c650a",
+        "41".repeat(65)
+    );
+
+    assert_eq!(
+        detect_oversized_encoded_pickle_prefixes(&encoded, 64),
+        vec![("escaped_hex", 81)]
+    );
+}
+
+#[test]
+fn oversized_dangerous_global_like_prose_is_not_a_pickle() {
+    let encoded = format!("636f730a{}0a706c61696e20666f6f7465720a", "41".repeat(65));
+
+    assert!(detect_oversized_encoded_pickle_prefixes(&encoded, 64).is_empty());
+}
+
+#[test]
 fn encoded_probe_windows_reject_benign_hexish_large_literals() {
     let value = format!("{}os.system('id'){}", "A".repeat(4096), "B".repeat(4096));
 
@@ -179,6 +213,22 @@ fn encoded_nested_literals_keep_later_decoded_payloads() {
 #[test]
 fn decoded_payloads_preserve_protocol0_operand_limit_failures() {
     let mut payload = b"cos\nsystem\n(S'".to_vec();
+    payload.resize(
+        payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
+        b'A',
+    );
+    payload.extend_from_slice(b"'\ntR.");
+
+    let decoded = decoded_pickle_payloads(&payload, payload.len() + 16);
+
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].0, payload);
+    assert!(decoded[0].1);
+}
+
+#[test]
+fn decoded_payloads_preserve_protocol0_operand_limit_after_inst() {
+    let mut payload = b"(ios\nsystem\n(S'".to_vec();
     payload.resize(
         payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
         b'A',
