@@ -60,6 +60,24 @@ def test_scan_stream_exact_declared_size_stays_clean() -> None:
     assert stream.tell() == len(payload)
 
 
+def test_scan_stream_exact_size_does_not_require_redundant_eof_rewind() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    class BrokenRewindStream(io.BytesIO):
+        def seek(self, *_args: object, **_kwargs: object) -> int:
+            raise OSError("rewind failed")
+
+    report = PickleScanner().scan_stream(
+        BrokenRewindStream(payload),
+        source="exact-known-size-broken-rewind.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
 def test_scan_stream_nonseekable_declared_boundary_fails_closed_without_probe() -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
 

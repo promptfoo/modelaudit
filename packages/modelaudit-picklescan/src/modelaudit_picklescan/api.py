@@ -2084,12 +2084,14 @@ def _known_stream_has_uncovered_data(stream: BinaryIO) -> bool:
     try:
         trailing_data = bool(stream.read(1))
     except Exception:
-        trailing_data = True
-    try:
-        stream.seek(position)
-    except (AttributeError, OSError, ValueError):
+        with suppress(AttributeError, OSError, ValueError):
+            stream.seek(position)
         return True
-    return trailing_data
+    if not trailing_data:
+        return False
+    with suppress(AttributeError, OSError, ValueError):
+        stream.seek(position)
+    return True
 
 
 def _engine_error_report(
