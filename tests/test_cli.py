@@ -23,6 +23,7 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _format_scan_output,
     _resolve_scan_runtime_config,
     _ScanPathState,
     _summarize_progress_tree,
@@ -112,6 +113,62 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
 
     result.finalize_statistics()
     return result
+
+
+def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -> None:
+    first_url = "s3://bucket/model.pkl?token=first-secret"
+    second_url = "s3://bucket/model.pkl?token=second-secret"
+    result = create_mock_scan_result(
+        issues=[
+            {
+                "message": f"Dangerous payload from {first_url}",
+                "severity": "critical",
+                "location": first_url,
+                "details": {
+                    first_url: {"finding": "first"},
+                    second_url: {"finding": "second"},
+                    "refreshToken": "nested-secret",
+                    "password_policy": "preserve-near-match",
+                },
+            }
+        ],
+        file_metadata={
+            first_url: {"file_size": 1, "source_url": first_url},
+            second_url: {"file_size": 2, "source_url": second_url},
+        },
+    )
+    original_metadata_keys = list(result.file_metadata)
+
+    output = _format_scan_output(
+        result,
+        [first_url, second_url],
+        output_format="json",
+        verbose=True,
+    )
+
+    payload: dict[str, Any] = json.loads(output)
+    assert list(result.file_metadata) == original_metadata_keys
+    assert len(payload["file_metadata"]) == 2
+    assert [metadata["file_size"] for metadata in payload["file_metadata"].values()] == [1, 2]
+    assert list(payload["issues"][0]["details"].values()) == [
+        {"finding": "first"},
+        {"finding": "second"},
+        "<redacted>",
+        "preserve-near-match",
+    ]
+    assert "first-secret" not in output
+    assert "second-secret" not in output
+    assert "nested-secret" not in output
+
+    text_output = _format_scan_output(
+        result,
+        [first_url, second_url],
+        output_format="text",
+        verbose=True,
+    )
+    assert "first-secret" not in text_output
+    assert "second-secret" not in text_output
+    assert "nested-secret" not in text_output
 
 
 def test_cli_help():

@@ -42,6 +42,7 @@ from .core import (
 )
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
+from .integrations.source_redaction import redact_source_value
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import IssueSeverity
@@ -2054,12 +2055,14 @@ def _format_scan_output(
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
             audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
-        return audit_result.model_dump_json(indent=2, exclude_none=True)
+        redacted_result = redact_source_value(audit_result.model_dump(mode="python", exclude_none=True))
+        return json.dumps(redacted_result, indent=2)
 
     if output_format == "sarif":
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
-    return format_text_output(audit_result.model_dump(), verbose)
+    redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
+    return format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
 
 
 def _emit_scan_output(
