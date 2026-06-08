@@ -1347,14 +1347,22 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
+    invocation_classification: (
+        tuple[
+            frozenset[int],
+            frozenset[int],
+            frozenset[tuple[str, str]],
+        ]
+        | None
+    )
     try:
-        invoked_global_positions = _invoked_global_positions(callable_invocations)
-        trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
-        trusted_reconstruction_references = _trusted_reconstruction_references(callable_invocations)
+        invocation_classification = (
+            _invoked_global_positions(callable_invocations),
+            _trusted_reconstruction_global_positions(callable_invocations),
+            _trusted_reconstruction_references(callable_invocations),
+        )
     except Exception as error:
-        invoked_global_positions = frozenset()
-        trusted_reconstruction_global_positions = frozenset()
-        trusted_reconstruction_references = frozenset()
+        invocation_classification = None
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
@@ -1418,8 +1426,14 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         source_snapshot_stable
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
+        and invocation_classification is not None
         and (inert_initialization_modules or trusted_import_references)
     ):
+        (
+            invoked_global_positions,
+            trusted_reconstruction_global_positions,
+            trusted_reconstruction_references,
+        ) = invocation_classification
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,

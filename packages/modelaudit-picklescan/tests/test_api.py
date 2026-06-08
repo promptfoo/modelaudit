@@ -6917,6 +6917,51 @@ def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
     assert updated.findings == (finding,)
 
 
+def test_with_call_graph_findings_keeps_import_warning_when_invocation_classification_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_classification_error(_callable_invocations: object) -> frozenset[int]:
+        raise RuntimeError("invocation classification failed")
+
+    monkeypatch.setattr(package_api, "_invoked_global_positions", raise_classification_error)
+    monkeypatch.setattr(
+        package_api,
+        "_proven_inert_initialization_modules",
+        lambda _report: frozenset({"decimal"}),
+    )
+    finding = Finding(
+        message="custom global may have been invoked",
+        severity=Severity.WARNING,
+        location="classification-error.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": "decimal",
+            "name": "Decimal",
+            "import_reference": "decimal.Decimal",
+            "position": 0,
+        },
+    )
+    report = PickleReport(
+        source="classification-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={"callable_invocations": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert any(
+        error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_import_invocation_classification"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
 def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
     reference = ("_xxsubinterpreters", "create")
     finding = Finding(
