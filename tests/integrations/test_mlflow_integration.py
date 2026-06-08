@@ -1,12 +1,14 @@
 import ctypes
 import ctypes.wintypes
 import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 
@@ -20,6 +22,7 @@ from modelaudit.integrations.mlflow import (
     _MlflowLocalSource,
     _normalize_mlflow_artifact_path,
     _opened_local_mlflow_path,
+    _redact_mlflow_error_for_display,
     _runs_mlflow_repository_is_scoped,
     _snapshot_local_mlflow_sources,
     scan_mlflow_model,
@@ -1160,6 +1163,65 @@ def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
+        "%252F%252Fuser%253ARELATIVEPASS123%2540mlflow.example%252Fmodel%253Ftoken%253DQUERYSECRET123",
+    ],
+)
+def test_redact_mlflow_error_handles_protocol_relative_userinfo(source: str) -> None:
+    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
+
+    assert "mlflow.example/model" in redacted
+    assert "RELATIVEPASS123" not in redacted
+    assert "QUERYSECRET123" not in redacted
+
+
+def test_redact_mlflow_error_handles_deeply_encoded_protocol_relative_userinfo() -> None:
+    source = "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123"
+    for _ in range(4):
+        source = quote(source, safe="")
+
+    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
+
+    assert "mlflow.example/model" in redacted
+    assert "RELATIVEPASS123" not in redacted
+    assert "QUERYSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "credentials=('user', 'CONTAINERSECRET123')",
+        "credentials=['user', 'CONTAINERSECRET123']",
+        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'}",
+        "credentials=[['user'], 'CONTAINERSECRET123']",
+        "credentials={'primary': {'username': 'user'}, 'value': 'CONTAINERSECRET123'}",
+        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'",
+    ],
+)
+def test_redact_mlflow_error_handles_credential_containers(details: str) -> None:
+    redacted = _redact_mlflow_error_for_display(details)
+
+    assert redacted == "credentials=<redacted>"
+    assert "CONTAINERSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Permission denied while calling token endpoint",
+        "OAuth token endpoint returned HTTP 401",
+        "Token refresh failed",
+        "Bearer authentication failed",
+        "Basic authentication is required",
+    ],
+)
+def test_redact_mlflow_error_preserves_benign_auth_diagnostics(message: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == message
+
+
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -1650,6 +1712,30 @@ def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
 
     # Verify cleanup still happens
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+def test_scan_mlflow_model_debug_log_redacts_source_uri(
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model_uri = "models:/PrivateModel/access_token=DEBUGSECRET123"
+    mock_mlflow = MagicMock()
+    mock_mlflow.artifacts.download_artifacts.side_effect = RuntimeError("Download failed")
+    mock_mkdtemp.return_value = "/tmp/modelaudit_mlflow_test"
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.mlflow"),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+        pytest.raises(RuntimeError, match="Download failed"),
+    ):
+        scan_mlflow_model(model_uri)
+
+    assert "models:/PrivateModel/access_token=<redacted>" in caplog.text
+    assert "DEBUGSECRET123" not in caplog.text
+    mock_rmtree.assert_called_once_with("/tmp/modelaudit_mlflow_test", ignore_errors=True)
 
 
 def test_scan_mlflow_model_no_registry_uri():

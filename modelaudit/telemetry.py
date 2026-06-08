@@ -604,6 +604,11 @@ class TelemetryClient:
 
     def _extract_model_name(self, path: str) -> str | None:
         """Extract model name from path or URL."""
+        if path.lower().startswith("models:/"):
+            safe_reference = self._sanitize_mlflow_reference(path)
+            model_reference = safe_reference[len("models:/") :].lstrip("/")
+            return model_reference.split("/", 1)[0] or None
+
         parsed = self._parse_url_reference(path)
         scheme = parsed.scheme.lower() if parsed else ""
         is_http_url = scheme in {"http", "https"}
@@ -644,6 +649,9 @@ class TelemetryClient:
 
     def _extract_model_reference(self, path: str) -> str | None:
         """Extract a secret-scrubbed model reference while preserving model identity."""
+        if path.lower().startswith("models:/"):
+            return self._sanitize_mlflow_reference(path)
+
         parsed = self._parse_url_reference(path)
         if not parsed:
             return self._extract_model_name(path)
@@ -656,6 +664,13 @@ class TelemetryClient:
             return parsed._replace(netloc=host, params="", query="", fragment="").geturl()
         except Exception:
             return self._extract_model_name(path)
+
+    @staticmethod
+    def _sanitize_mlflow_reference(path: str) -> str:
+        """Remove secret-shaped MLflow model identifiers before telemetry export."""
+        from .scanners._evidence_redaction import redact_evidence_string
+
+        return redact_evidence_string(path, max_chars=512)
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
@@ -707,6 +722,8 @@ class TelemetryClient:
             return "s3"
         if path.startswith("gs://"):
             return "gcs"
+        if path.startswith("models:/"):
+            return "mlflow"
         if path.startswith("http"):
             return "http"
         return "local"

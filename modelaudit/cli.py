@@ -109,6 +109,10 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
+    if path.startswith("models:/"):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        return _redact_mlflow_error_for_display(path)
     if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
     if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path):
@@ -2985,7 +2989,7 @@ def _resolve_scan_source_for_path(
                 click.echo("Download failed")
 
             error_msg = _redact_mlflow_error_for_display(exc)
-            logger.error(f"Failed to download model from {display_path}: {error_msg}", exc_info=verbose)
+            logger.error(f"Failed to download model from {display_path}: {error_msg}")
             click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             return None

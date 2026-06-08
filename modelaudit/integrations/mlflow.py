@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote
 
 from ..detectors.network_comm import _redact_urls_in_text
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
-from ..scanners._evidence_redaction import redact_evidence_string, redact_evidence_value
-from ..utils.sources.cloud_storage import redact_cloud_error_for_display
+from ..scanners._evidence_redaction import MAX_PERCENT_DECODE_PASSES, redact_evidence_string, redact_evidence_value
+from ..utils.sources.cloud_storage import redact_cloud_error_for_display, redact_url_for_display
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,22 @@ _IS_WINDOWS = os.name == "nt"
 _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])[\"']?"
-    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credential|password|secret|token)"
+    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credentials?|password|secret|token)"
     r"[\"']?\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;}\]]+)"
+)
+_MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE = re.compile(
+    r"(?ix)"
+    r"(?P<prefix>(?<![\w-])[\"']?"
+    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credentials?|password|secret|token)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?P<open>[({\[])",
+)
+_MLFLOW_PROTOCOL_RELATIVE_URL_RE = re.compile(
+    r"(?i)(?://|%(?:25)*2f%(?:25)*2f)[^\s\"'<>]+",
+)
+_MLFLOW_BENIGN_AUTH_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:bearer|basic|token)(?=\s+(?:authentication|endpoint|refresh|service)\b)",
 )
 
 
@@ -167,15 +181,85 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
 
 
 def _redact_mlflow_error_for_display(error: object) -> str:
-    redacted = redact_cloud_error_for_display(_redact_urls_in_text(str(error)))
-
     def _replace_sensitive_value(match: re.Match[str]) -> str:
         value = match.group("value")
         quote = value[0] if value[:1] in {'"', "'"} else ""
         return f"{match.group('prefix')}{quote}<redacted>{quote}"
 
+    def _redact_protocol_relative_url(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        decoded = candidate
+        for _ in range(MAX_PERCENT_DECODE_PASSES):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                break
+            decoded = next_decoded
+
+        if not decoded.startswith("//"):
+            return candidate
+        authority = decoded[2:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "@" not in authority:
+            return candidate
+
+        safe_url = redact_url_for_display(f"https:{decoded}")
+        return safe_url.removeprefix("https:")
+
+    def _redact_sensitive_containers(text: str) -> str:
+        parts: list[str] = []
+        cursor = 0
+        closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+
+        while match := _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE.search(text, cursor):
+            parts.append(text[cursor : match.start()])
+            parts.append(f"{match.group('prefix')}<redacted>")
+            stack = [closing_delimiters[match.group("open")]]
+            quote: str | None = None
+            escaped = False
+            index = match.end()
+
+            while index < len(text) and stack:
+                character = text[index]
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == quote:
+                        quote = None
+                elif character in {'"', "'"}:
+                    quote = character
+                elif character in closing_delimiters:
+                    stack.append(closing_delimiters[character])
+                elif character == stack[-1]:
+                    stack.pop()
+                index += 1
+
+            if stack:
+                cursor = len(text)
+                break
+            cursor = index
+
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, str(error))
+    redacted = _redact_sensitive_containers(redacted)
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-    redacted = redact_evidence_string(redacted, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
+    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
+
+    benign_auth_contexts: list[tuple[str, str]] = []
+
+    def _protect_benign_auth_context(match: re.Match[str]) -> str:
+        placeholder = f"MODELAUDITMLFLOWSAFECONTEXT{len(benign_auth_contexts)}"
+        benign_auth_contexts.append((placeholder, match.group(0)))
+        return placeholder
+
+    redacted = _MLFLOW_BENIGN_AUTH_CONTEXT_RE.sub(_protect_benign_auth_context, redacted)
+    redacted = redact_evidence_string(redacted, max_chars=None)
+    for placeholder, original in benign_auth_contexts:
+        redacted = redacted.replace(placeholder, original)
+
     if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
         return redacted
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
@@ -1289,7 +1373,7 @@ def scan_mlflow_model(
     download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
 
     try:
-        logger.debug(f"Downloading MLflow model {model_uri} to {download_dir}")
+        logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(
                 download_plan,

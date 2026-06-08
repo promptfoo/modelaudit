@@ -718,6 +718,45 @@ class TestTelemetryClient:
             assert "SECRET" not in json.dumps(download_props)
             assert "access:secret@" not in json.dumps(download_props)
 
+    def test_mlflow_telemetry_fields_redact_source_credentials(self) -> None:
+        """MLflow aliases must not expose secret-shaped identifiers in telemetry."""
+        mock_posthog = MagicMock()
+        model_uri = "models:/access_token=TELEMETRYSECRET1234567890@champion"
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_scan_started([model_uri], {"format": "json"})
+            started_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert started_props["model_names"] == ["access_token=<redacted>"]
+            assert started_props["model_references"] == ["models:/access_token=<redacted>"]
+            assert started_props["source_types"] == ["mlflow"]
+            assert "TELEMETRYSECRET1234567890" not in json.dumps(started_props)
+
+            client.record_download_started("mlflow", model_uri)
+            download_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert download_props["model_name"] == "access_token=<redacted>"
+            assert download_props["model_reference"] == "models:/access_token=<redacted>"
+            assert "TELEMETRYSECRET1234567890" not in json.dumps(download_props)
+
+            client.record_download_completed("mlflow", 2.0, 2048, model_uri)
+            completed_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert completed_props["model_name"] == "access_token=<redacted>"
+            assert completed_props["model_reference"] == "models:/access_token=<redacted>"
+            assert "TELEMETRYSECRET1234567890" not in json.dumps(completed_props)
+
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""
         with (
