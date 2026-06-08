@@ -602,6 +602,63 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
     return complete_sources
 
 
+def _remaining_shard_coverage_outcome(details: dict[str, Any]) -> tuple[str, str] | None:
+    """Return the next visible incomplete-coverage reason after missing peers are disproven."""
+    out_of_scope_count = details.get("out_of_scope_shard_count")
+    if isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
+        return (
+            "out_of_scope_model_shards",
+            f"Skipped {out_of_scope_count} model shard(s) resolving outside the direct scan directory; "
+            "scan coverage is incomplete.",
+        )
+
+    unreadable_count = details.get("unreadable_shard_count")
+    if isinstance(unreadable_count, int) and unreadable_count > 0:
+        return (
+            "unreadable_model_shards",
+            f"Unable to read {unreadable_count} model shard(s); scan coverage is incomplete.",
+        )
+
+    unvalidated_count = details.get("unvalidated_shard_count")
+    if isinstance(unvalidated_count, int) and unvalidated_count > 0:
+        return (
+            "unvalidated_model_shards",
+            f"Skipped {unvalidated_count} model shard(s) outside the validated family; scan coverage is incomplete.",
+        )
+
+    duplicate_count = details.get("duplicate_shard_count")
+    if isinstance(duplicate_count, int) and duplicate_count > 0:
+        return (
+            "duplicate_model_shard_targets",
+            f"Skipped {duplicate_count} model shard name(s) resolving to duplicate targets; "
+            "scan coverage is incomplete.",
+        )
+    return None
+
+
+def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, message: str) -> None:
+    """Replace a disproven missing-shard outcome with a remaining coverage failure."""
+    details = dict(record.details) if isinstance(record.details, dict) else {}
+    for field_name in (
+        "missing_shard_count",
+        "missing_shard_indices",
+        "missing_shard_indices_truncated",
+    ):
+        details.pop(field_name, None)
+    existing_reasons = details.get("scan_outcome_reasons")
+    if isinstance(existing_reasons, list):
+        remaining_reasons = [
+            existing_reason for existing_reason in existing_reasons if existing_reason != "missing_model_shards"
+        ]
+        if reason not in remaining_reasons:
+            remaining_reasons.append(reason)
+        details["scan_outcome_reasons"] = remaining_reasons
+    details.pop("scan_outcome_message", None)
+    details["scan_outcome_reason"] = reason
+    record.details = details
+    record.message = message
+
+
 def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
@@ -617,7 +674,23 @@ def _reconcile_cross_directory_shard_coverage(
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
         return normalized_path in complete_sources
 
+    def record_key(record: Check | Issue, reason: str) -> tuple[str, str] | None:
+        if not source_is_complete(record.location):
+            return None
+        assert isinstance(record.location, str)
+        normalized_location = os.path.normcase(os.path.normpath(os.path.abspath(record.location)))
+        return (normalized_location, reason)
+
     reconciled = False
+    existing_check_reasons = {
+        key
+        for check in results.checks
+        if check.name == "Sharded Model Coverage Check"
+        and isinstance(check.details, dict)
+        and isinstance((reason := check.details.get("scan_outcome_reason")), str)
+        and reason != "missing_model_shards"
+        and (key := record_key(check, reason)) is not None
+    }
     retained_checks: list[Check] = []
     for check in results.checks:
         details = check.details if isinstance(check.details, dict) else {}
@@ -627,16 +700,42 @@ def _reconcile_cross_directory_shard_coverage(
             and source_is_complete(check.location)
         ):
             reconciled = True
-            continue
+            replacement = _remaining_shard_coverage_outcome(details)
+            if replacement is None:
+                continue
+            reason, message = replacement
+            key = record_key(check, reason)
+            if key in existing_check_reasons:
+                continue
+            _update_missing_shard_coverage_record(check, reason, message)
+            if key is not None:
+                existing_check_reasons.add(key)
         retained_checks.append(check)
     results.checks = retained_checks
 
+    existing_issue_reasons = {
+        key
+        for issue in results.issues
+        if isinstance(issue.details, dict)
+        and isinstance((reason := issue.details.get("scan_outcome_reason")), str)
+        and reason != "missing_model_shards"
+        and (key := record_key(issue, reason)) is not None
+    }
     retained_issues: list[Issue] = []
     for issue in results.issues:
         details = issue.details if isinstance(issue.details, dict) else {}
         if details.get("scan_outcome_reason") == "missing_model_shards" and source_is_complete(issue.location):
             reconciled = True
-            continue
+            replacement = _remaining_shard_coverage_outcome(details)
+            if replacement is None:
+                continue
+            reason, message = replacement
+            key = record_key(issue, reason)
+            if key in existing_issue_reasons:
+                continue
+            _update_missing_shard_coverage_record(issue, reason, message)
+            if key is not None:
+                existing_issue_reasons.add(key)
         retained_issues.append(issue)
     results.issues = retained_issues
 
@@ -661,6 +760,7 @@ def _reconcile_cross_directory_shard_coverage(
             if metadata.get("scan_outcome") == "inconclusive":
                 metadata.pop("scan_outcome", None)
             metadata.pop("analysis_incomplete", None)
+            metadata.pop("scan_outcome_message", None)
         results.file_metadata[source_path] = FileMetadataModel(**metadata)
         reconciled = True
 

@@ -595,6 +595,10 @@ def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
             "missing_model_shards" not in metadata.model_dump().get("scan_outcome_reasons", [])
             for metadata in result.file_metadata.values()
         )
+        assert all(
+            "scan_outcome_message" not in metadata.model_dump(exclude_none=True)
+            for metadata in result.file_metadata.values()
+        )
 
 
 def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings() -> None:
@@ -714,6 +718,108 @@ def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> N
             assert metadata["scan_outcome_reason"] == "shard_scan_error"
             assert metadata["analysis_incomplete"] is True
             assert metadata["scan_outcome"] == "inconclusive"
+
+
+def test_cross_directory_shard_reconciliation_preserves_secondary_coverage_failure() -> None:
+    """Disproving missing peers must retain another incomplete-coverage explanation."""
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        validated_targets = {}
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            shards.append(shard_path)
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+        source_result = ScanResult(scanner_name="safetensors")
+        source_result.add_check(
+            name="Sharded Model Coverage Check",
+            passed=False,
+            message="Missing 1 expected model shard(s); scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=str(shards[0]),
+            details={
+                "missing_shard_count": 1,
+                "unreadable_shard_count": 1,
+                "unreadable_shards": [str(shards[0].with_name("unreadable.safetensors"))],
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "missing_model_shards",
+                "scan_outcome_reasons": ["missing_model_shards", "unreadable_model_shards"],
+                "scan_outcome_message": "Missing model shards prevented complete analysis.",
+            },
+        )
+        result = create_initial_audit_result()
+        result.success = False
+        result.checks = list(source_result.checks)
+        result.issues = list(source_result.issues)
+        for shard in shards:
+            result.file_metadata[str(shard)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards", "unreadable_model_shards"],
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.success is False
+        assert len(result.checks) == 1
+        assert result.checks[0].details["scan_outcome_reason"] == "unreadable_model_shards"
+        assert result.checks[0].details["scan_outcome_reasons"] == ["unreadable_model_shards"]
+        assert "scan_outcome_message" not in result.checks[0].details
+        assert "Unable to read 1 model shard(s)" in result.checks[0].message
+        assert len(result.issues) == 1
+        assert result.issues[0].details["scan_outcome_reason"] == "unreadable_model_shards"
+        assert result.issues[0].details["scan_outcome_reasons"] == ["unreadable_model_shards"]
+        assert "scan_outcome_message" not in result.issues[0].details
+        assert "Unable to read 1 model shard(s)" in result.issues[0].message
+
+
+def test_cross_directory_shard_reconciliation_clears_stale_outcome_message() -> None:
+    """Removing the final inconclusive reason must remove its stale explanation."""
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        validated_targets = {}
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            shards.append(shard_path)
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+        result = create_initial_audit_result()
+        result.success = False
+        for shard in shards:
+            result.file_metadata[str(shard)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+                scan_outcome_message="Scan analysis incomplete; failed closed because full coverage was not available.",
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.success is True
+        for metadata_model in result.file_metadata.values():
+            metadata = metadata_model.model_dump(exclude_none=True)
+            assert "analysis_incomplete" not in metadata
+            assert "scan_outcome" not in metadata
+            assert "scan_outcome_reason" not in metadata
+            assert "scan_outcome_reasons" not in metadata
+            assert "scan_outcome_message" not in metadata
 
 
 def test_scan_model_streaming_does_not_reconcile_duplicate_shard_targets(

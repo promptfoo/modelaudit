@@ -24,6 +24,7 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _explicit_local_shard_family_groups,
     _resolve_scan_runtime_config,
     _ScanPathState,
     _summarize_progress_tree,
@@ -633,6 +634,79 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
         issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
         for issue in output_payload["issues"]
     )
+
+
+def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tmp_path: Path) -> None:
+    """Explicit opt-in should keep independently templated shard families separate."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for family_name in ("model-a", "model-b"):
+        for shard_index, shard_directory_name in ((1, "left"), (2, "right")):
+            shard_dir = tmp_path / family_name / shard_directory_name
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_directory_does_not_assume_cross_directory_shard_family(tmp_path: Path) -> None:
+    """The explicit-family opt-in must not combine shards discovered through a directory input."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    for shard_index, family_name in ((1, "model-a"), (2, "model-b")):
+        shard_dir = tmp_path / family_name
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(tmp_path), "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_explicit_shard_family_groups_reject_resolved_non_shard_target(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A shard-looking symlink must not opt its non-shard target into reconciliation."""
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"not a shard")
+    shard_link = tmp_path / "model-00001-of-00002.safetensors"
+    shard_link.symlink_to(target)
+
+    assert _explicit_local_shard_family_groups((str(shard_link),)) == {}
 
 
 def test_scan_multiple_cross_directory_shards_requires_explicit_family_opt_in(tmp_path: Path) -> None:

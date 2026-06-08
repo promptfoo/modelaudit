@@ -68,7 +68,7 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
-from .utils.file.handlers import ValidatedShardTargets
+from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -1333,7 +1333,12 @@ class _ScanPathState:
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
     validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
-    explicit_shard_family_group: str | None = None
+    explicit_shard_family_groups: dict[str, str] = field(default_factory=dict)
+
+    def explicit_shard_family_group_for(self, path: str) -> str | None:
+        """Return the opt-in family group only for an exact explicit file argument."""
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return self.explicit_shard_family_groups.get(normalized_path)
 
     def record_validated_shard_targets(
         self,
@@ -1348,10 +1353,11 @@ class _ScanPathState:
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
+            explicit_family_group = self.explicit_shard_family_group_for(asset.path)
             post_scan_target = _snapshot_validated_shard_target(
                 asset.path,
-                family_group=self.explicit_shard_family_group,
-                family_group_policy="explicit" if self.explicit_shard_family_group else None,
+                family_group=explicit_family_group,
+                family_group_policy="explicit" if explicit_family_group else None,
             )
             if not post_scan_target:
                 continue
@@ -1581,6 +1587,65 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
     return expanded, missing_globs
+
+
+def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str]:
+    """Map exact local file arguments to conservative explicit-family groups."""
+    grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
+    for path_str in paths:
+        if "://" in path_str or "*" in path_str or "?" in path_str:
+            continue
+        path = Path(path_str)
+        if not path.is_file():
+            continue
+        try:
+            resolved_path = str(path.resolve(strict=True))
+        except (OSError, RuntimeError):
+            continue
+        shard_match = ShardedModelDetector.match_shard_filename(Path(resolved_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
+        ):
+            continue
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(resolved_path)))
+        grouped_paths.setdefault((pattern, expected_total), []).append(
+            (normalized_path, Path(resolved_path), shard_index)
+        )
+
+    groups: dict[str, str] = {}
+    for (_pattern, expected_total), records in grouped_paths.items():
+        targets_by_scope: dict[str, dict[int, list[str]]] = {}
+        scopes_by_source: dict[str, set[str]] = {}
+        for normalized_path, resolved_path_obj, shard_index in records:
+            source_scopes = scopes_by_source.setdefault(normalized_path, set())
+            for ancestor in (resolved_path_obj.parent, *resolved_path_obj.parent.parents):
+                normalized_scope = os.path.normcase(os.path.normpath(str(ancestor)))
+                source_scopes.add(normalized_scope)
+                targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
+
+        complete_scopes = {
+            scope
+            for scope, targets_by_index in targets_by_scope.items()
+            if len(targets_by_index) == expected_total
+            and all(len(targets) == 1 for targets in targets_by_index.values())
+        }
+        for normalized_path, _resolved_path, _shard_index in records:
+            matching_scopes = scopes_by_source[normalized_path] & complete_scopes
+            if matching_scopes:
+                family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
+                groups[normalized_path] = f"explicit-cli:{family_scope}"
+            else:
+                groups[normalized_path] = "explicit-cli:undiscriminated"
+    return groups
 
 
 def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
@@ -2308,11 +2373,12 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
+    explicit_family_group = path_state.explicit_shard_family_group_for(actual_path)
     pre_scan_shard_target = (
         _snapshot_validated_shard_target(
             actual_path,
-            family_group=path_state.explicit_shard_family_group,
-            family_group_policy="explicit" if path_state.explicit_shard_family_group else None,
+            family_group=explicit_family_group,
+            family_group_policy="explicit" if explicit_family_group else None,
         )
         if os.path.isfile(actual_path)
         else {}
@@ -3773,7 +3839,7 @@ def scan_command(
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
         collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
-        explicit_shard_family_group="explicit-cli-shard-family" if assume_shard_family else None,
+        explicit_shard_family_groups=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
     )
 
     # Scan each path with interrupt handling
