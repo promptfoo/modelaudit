@@ -140,6 +140,39 @@ def test_keras_zip_layer_counts_preserve_colliding_redacted_classes(tmp_path: Pa
     assert second_secret not in result.to_json()
 
 
+def test_keras_zip_non_string_model_class_preserves_nested_cve_detection(tmp_path: Path) -> None:
+    """Malformed root metadata must not suppress scanning of nested layers."""
+    raw_secret = "sk-proj-CAND061ZIPMODELCLASSSECRET000000000000"
+    encoded = base64.b64encode(b"lambda x: x * 2").decode()
+    model_path = create_configured_keras_zip(
+        tmp_path,
+        {
+            "class_name": {"api_key": raw_secret},
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "nested_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        },
+        keras_version="2.12.0",
+    )
+
+    result = KerasZipScanner().scan(str(model_path))
+
+    type_checks = [check for check in result.checks if check.name == "Model Class Type Validation"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+    assert len(type_checks) == 1
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.CRITICAL
+    assert result.metadata["model_class"] == "<invalid:dict>"
+    assert "keras_zip_model_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+    assert raw_secret not in result.to_json()
+
+
 def create_external_link_weights_h5(tmp_path: Path) -> Path:
     """Create a weights H5 file containing an ExternalLink to a local fixture."""
     if h5py is None:
@@ -4640,6 +4673,31 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
         assert determine_exit_code(audit_result) == 2
+
+    def test_wrapped_layer_validation_redacts_sensitive_layer_name(self, tmp_path: Path) -> None:
+        raw_secret = "sk-proj-CAND061ZIPWRAPPERSECRET000000000000"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "TimeDistributed",
+                            "name": f"wrapper_{raw_secret}",
+                            "config": {},
+                        }
+                    ]
+                },
+            },
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        wrapped_checks = [check for check in result.checks if check.name == "Wrapped Layer Config Validation"]
+
+        assert len(wrapped_checks) == 1
+        assert wrapped_checks[0].location and "wrapper_<redacted>" in wrapped_checks[0].location
+        assert raw_secret not in result.to_json()
 
     @pytest.mark.parametrize("layer_class", ["Dense", "myproject.TimeDistributed"])
     def test_nonwrapper_layer_config_scalar_nested_names_remain_quiet(self, tmp_path: Path, layer_class: str) -> None:

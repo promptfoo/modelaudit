@@ -1017,11 +1017,26 @@ class KerasZipScanner(BaseScanner):
 
         # Check model class name
         model_class = model_config.get("class_name", "")
-        redacted_model_class = redact_evidence_string(str(model_class))
+        model_class_is_string = isinstance(model_class, str)
+        redacted_model_class = (
+            redact_evidence_string(model_class) if model_class_is_string else f"<invalid:{type(model_class).__name__}>"
+        )
         result.metadata["model_class"] = redacted_model_class
 
         # Check for subclassed models (custom class names)
-        check_subclassed_model(model_class, result, self.current_file_path)
+        if model_class_is_string:
+            check_subclassed_model(model_class, result, self.current_file_path)
+        else:
+            self._mark_inconclusive_scan_result(result, "keras_zip_model_class_invalid_type")
+            result.add_check(
+                name="Model Class Type Validation",
+                passed=False,
+                message=f"Invalid model class type: expected str, got {type(model_class).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path}/config.json",
+                details={"actual_type": type(model_class).__name__, "expected_type": "str"},
+            )
 
         # Root configs can themselves be serialized callables rather than model containers.
         self._check_layer_module_references(
@@ -1033,7 +1048,7 @@ class KerasZipScanner(BaseScanner):
         )
 
         # Check for suspicious model types (Lambda, etc.)
-        if model_class in self.suspicious_layer_types:
+        if model_class_is_string and model_class in self.suspicious_layer_types:
             result.add_check(
                 name="Model Type Security Check",
                 passed=False,
@@ -1317,7 +1332,13 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
-            self._scan_wrapped_layer_config(layer_class, layer_config, result, layer_name, nested_layer_depth)
+            self._scan_wrapped_layer_config(
+                layer_class,
+                layer_config,
+                result,
+                redacted_layer_name,
+                nested_layer_depth,
+            )
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts

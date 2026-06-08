@@ -383,6 +383,34 @@ def test_keras_h5_non_string_layer_class_fails_closed_without_abort(tmp_path: Pa
     assert raw_secret not in result.to_json()
 
 
+def test_keras_h5_non_string_model_class_preserves_nested_cve_detection(tmp_path: Path) -> None:
+    """Malformed root metadata must not suppress scanning of nested layers."""
+    raw_secret = "sk-proj-CAND061H5MODELCLASSSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": {"api_key": raw_secret},
+            "config": {
+                "layers": [
+                    {"class_name": "Lambda", "config": {"function": "lambda x: x"}},
+                ]
+            },
+        },
+        keras_version="3.10.0",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    type_checks = [check for check in result.checks if check.name == "Model Class Type Validation"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+    assert len(type_checks) == 1
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.CRITICAL
+    assert result.metadata["model_class"] == "<invalid:dict>"
+    assert "keras_h5_model_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+    assert raw_secret not in result.to_json()
+
+
 @pytest.mark.parametrize(
     "fixture_factory",
     [create_h5_with_external_link, create_h5_with_external_storage],
