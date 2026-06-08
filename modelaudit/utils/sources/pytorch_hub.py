@@ -18,7 +18,7 @@ import requests
 
 from ..helpers.disk_space import check_disk_space
 
-_PYTORCH_HUB_PATTERN = r"^https?://pytorch\.org/hub/[\w\-_.]+/?$"
+_PYTORCH_HUB_PATTERN = r"^https://pytorch\.org/hub/[\w\-_.]+/?$"
 _PYTORCH_MODEL_URL_PATTERN = re.compile(
     r"https://download\.pytorch\.org/models/[^\s\"'<>]+",
     re.IGNORECASE,
@@ -374,6 +374,21 @@ class _GithubSourceLinkParser(HTMLParser):
 def is_pytorch_hub_url(url: str) -> bool:
     """Return True if the URL points to a PyTorch Hub model page."""
     return bool(re.match(_PYTORCH_HUB_PATTERN, url, re.IGNORECASE))
+
+
+def is_cleartext_pytorch_hub_url(url: str) -> bool:
+    """Return True for HTTP PyTorch Hub model-page URLs."""
+    try:
+        parsed = urlsplit(url)
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+
+    return (
+        parsed.scheme.casefold() == "http"
+        and hostname == "pytorch.org"
+        and re.fullmatch(r"/hub/[\w\-_.]+/?", parsed.path) is not None
+    )
 
 
 def _extract_weight_urls(
