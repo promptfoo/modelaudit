@@ -1,6 +1,8 @@
 """Tests for code validation utilities."""
 
 import tempfile
+from importlib.util import cache_from_source
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +11,10 @@ from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
+
+
+def _bytecode_artifacts_under(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*") if path.name == "__pycache__" or path.suffix == ".pyc")
 
 
 class TestValidatePythonSyntax:
@@ -78,6 +84,61 @@ class MyClass:
 
         assert is_valid is True
         assert error is None
+
+    def test_validates_model_source_filename_without_bytecode_artifacts(self, tmp_path: Path) -> None:
+        model_dir = tmp_path / "attacker_model"
+        model_dir.mkdir()
+        source_path = model_dir / "payload.py"
+
+        is_valid, error = validate_python_syntax(
+            "def transform(value):\n    return value + 1\n",
+            filename=str(source_path),
+        )
+
+        assert is_valid is True
+        assert error is None
+        assert _bytecode_artifacts_under(model_dir) == []
+
+    def test_invalid_model_source_filename_without_bytecode_artifacts(self, tmp_path: Path) -> None:
+        model_dir = tmp_path / "attacker_model"
+        model_dir.mkdir()
+        source_path = model_dir / "broken.py"
+
+        is_valid, error = validate_python_syntax("def broken(:\n    pass\n", filename=str(source_path))
+
+        assert is_valid is False
+        assert error is not None and "Syntax error" in error
+        assert _bytecode_artifacts_under(model_dir) == []
+
+    def test_model_source_filename_does_not_touch_bytecode_paths(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def reject_filesystem_access(*args: object, **kwargs: object) -> None:
+            raise AssertionError("in-memory syntax validation must not inspect or remove bytecode files")
+
+        monkeypatch.setattr(Path, "iterdir", reject_filesystem_access)
+        monkeypatch.setattr(Path, "unlink", reject_filesystem_access)
+
+        is_valid, error = validate_python_syntax("value = 1", filename="attacker_model/payload.py")
+
+        assert is_valid is True
+        assert error is None
+
+    def test_preserves_existing_bytecode_artifacts(self, tmp_path: Path) -> None:
+        source_path = tmp_path / "payload.py"
+        adjacent_artifact = source_path.with_suffix(".pyc")
+        cache_artifact = Path(cache_from_source(str(source_path)))
+        adjacent_artifact.write_bytes(b"adjacent")
+        cache_artifact.parent.mkdir()
+        cache_artifact.write_bytes(b"cache")
+
+        is_valid, error = validate_python_syntax("value = 1", filename=str(source_path))
+
+        assert is_valid is True
+        assert error is None
+        assert adjacent_artifact.read_bytes() == b"adjacent"
+        assert cache_artifact.read_bytes() == b"cache"
 
     @pytest.mark.parametrize(
         "invalid_code",
