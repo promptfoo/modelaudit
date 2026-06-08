@@ -473,6 +473,31 @@ def _shard_family_key_for_path(path: str) -> _ShardFamilyKey | None:
     return (str(path_obj.parent), pattern, expected_total)
 
 
+def _trusted_stream_shard_family_group(resolved_source: Path, family_group: str) -> str | None:
+    """Scope a trusted stream group to the artifact's logical staging parent."""
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        resolved_parent = resolved_source.parent
+        staging_root: Path | None = None
+        candidate = resolved_parent
+        while candidate != temp_root and candidate != candidate.parent:
+            if candidate.parent == temp_root and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES):
+                staging_root = candidate
+                break
+            candidate = candidate.parent
+        if staging_root is None:
+            return None
+        relative_parent = resolved_parent.relative_to(staging_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    scope = hashlib.sha256()
+    scope.update(family_group.encode("utf-8", errors="surrogatepass"))
+    scope.update(b"\0")
+    scope.update(os.path.normcase(relative_parent.as_posix()).encode("utf-8", errors="surrogatepass"))
+    return f"stream-staging:{scope.hexdigest()}"
+
+
 def _snapshot_validated_shard_target(
     source_path: str,
     *,
@@ -510,15 +535,11 @@ def _snapshot_validated_shard_target(
     if family_group_policy == "explicit" and family_group:
         target["family_group"] = family_group
     elif family_group_policy == "stream_staging":
-        try:
-            resolved_parent = source.absolute().parent.resolve(strict=True)
-            is_owned_stream_parent = resolved_parent.parent == Path(tempfile.gettempdir()).resolve(
-                strict=True
-            ) and resolved_parent.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
-        except (OSError, RuntimeError):
-            is_owned_stream_parent = False
-        if family_group and is_owned_stream_parent:
-            target["family_group"] = family_group
+        trusted_family_group = (
+            _trusted_stream_shard_family_group(resolved_source, family_group) if family_group else None
+        )
+        if trusted_family_group:
+            target["family_group"] = trusted_family_group
     return {str(source.absolute()): target}
 
 
@@ -659,6 +680,16 @@ def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, me
     record.message = message
 
 
+def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> bool:
+    """Return whether retained result evidence identifies an operational failure."""
+    if any(bool(metadata.get("operational_error")) for metadata in results.file_metadata.values()):
+        return True
+    if any(asset.type == "error" for asset in results.assets):
+        return True
+    records: list[Check | Issue] = [*results.checks, *results.issues]
+    return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
+
+
 def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
@@ -765,6 +796,7 @@ def _reconcile_cross_directory_shard_coverage(
         reconciled = True
 
     if reconciled:
+        results.has_errors = _results_have_explicit_operational_error(results)
         results.success = not _results_should_be_unsuccessful(results)
     return reconciled
 

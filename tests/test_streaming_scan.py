@@ -573,7 +573,9 @@ def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
     with ExitStack() as stack:
         shards: list[Path] = []
         for shard_index in range(1, 4):
-            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            staging_root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_dir = staging_root / "huggingface" / "models--org--repo" / "snapshots" / "revision"
+            shard_dir.mkdir(parents=True)
             shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
             shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
             shards.append(shard_path)
@@ -657,6 +659,46 @@ def test_scan_model_streaming_does_not_reconcile_distinct_remote_model_directori
         assert determine_exit_code(result) == 2
         assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
         assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
+def test_stream_staging_family_groups_are_scoped_to_nested_logical_parent() -> None:
+    """Nested trusted staging paths must not combine unrelated remote model directories."""
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
+        staging_root = Path(staging_directory)
+        snapshots = []
+        for shard_index, model_id in ((1, "model-a"), (2, "model-b")):
+            shard_dir = staging_root / "remote" / model_id
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            snapshots.append(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:remote-repo",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+    family_groups = [next(iter(snapshot.values())).get("family_group") for snapshot in snapshots]
+    assert all(isinstance(family_group, str) for family_group in family_groups)
+    assert family_groups[0] != family_groups[1]
+
+
+def test_stream_staging_family_group_rejects_nested_prefix_lookalike(tmp_path: Path) -> None:
+    """A prefixed directory outside the direct temp root must not gain trusted grouping."""
+    shard_dir = tmp_path / "modelaudit_stream_untrusted" / "remote" / "model-a"
+    shard_dir.mkdir(parents=True)
+    shard_path = shard_dir / "model-00001-of-00002.safetensors"
+    shard_path.write_bytes(b"shard")
+
+    snapshot = _snapshot_validated_shard_target(
+        str(shard_path),
+        family_group="attacker-controlled",
+        family_group_policy="stream_staging",
+    )
+
+    assert snapshot
+    assert "family_group" not in next(iter(snapshot.values()))
 
 
 def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() -> None:
@@ -820,6 +862,74 @@ def test_cross_directory_shard_reconciliation_clears_stale_outcome_message() -> 
             assert "scan_outcome_reason" not in metadata
             assert "scan_outcome_reasons" not in metadata
             assert "scan_outcome_message" not in metadata
+
+
+def test_cross_directory_shard_reconciliation_clears_stale_operational_error_state() -> None:
+    """A disproven missing-shard failure must not leave the aggregate at exit code 2."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+
+
+def test_cross_directory_shard_reconciliation_preserves_independent_operational_error() -> None:
+    """Clearing a shard gap must retain an unrelated explicit operational failure."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 3
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+        result.file_metadata["failed-download"] = FileMetadataModel(
+            operational_error=True,
+            operational_error_reason="download_failed",
+        )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_does_not_reconcile_duplicate_shard_targets(
