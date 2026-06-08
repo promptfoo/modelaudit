@@ -245,6 +245,35 @@ def test_flax_msgpack_byte_encoded_function_metadata_key_is_value_aware(tmp_path
     )
 
 
+def test_flax_msgpack_byte_encoded_function_metadata_value_is_checked(tmp_path: Path) -> None:
+    path = tmp_path / "byte_restore_fn_value.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"restore_fn": b"eval"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute value detected: restore_fn"
+        and issue.location == "root/restore_fn"
+        and issue.details["suspicious_key"] == "restore_fn"
+        and issue.details["value_sample"] == "eval"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_byte_encoded_benign_function_metadata_value_is_not_critical(tmp_path: Path) -> None:
+    path = tmp_path / "byte_benign_restore_fn_value.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"restore_fn": b"custom_deserialize"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert not [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL and "restore_fn" in issue.message
+    ]
+
+
 def test_flax_msgpack_byte_encoded_benign_near_match_key_is_not_critical(tmp_path: Path) -> None:
     path = tmp_path / "byte_benign_near_match_key.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"__reducer__": "custom_deserialize"})
