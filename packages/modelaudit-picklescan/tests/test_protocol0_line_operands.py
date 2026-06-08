@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import pickle
 from collections.abc import Mapping
 
@@ -8,6 +9,10 @@ import pytest
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
+
+
+def _nested_overlong_protocol0_line_operand() -> bytes:
+    return b"cos\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
 
 
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
@@ -36,7 +41,7 @@ def test_scan_bytes_fails_closed_for_overlong_protocol0_line_operand() -> None:
 def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
     as_unicode: bool,
 ) -> None:
-    nested_payload = b"cos\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
+    nested_payload = _nested_overlong_protocol0_line_operand()
     nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
     payload = pickle.dumps(nested_value, protocol=4)
 
@@ -70,6 +75,68 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
         and isinstance(notice.get("details"), Mapping)
         and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
         for notice in nested_notices
+    )
+
+
+def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_operand() -> None:
+    nested_payload = _nested_overlong_protocol0_line_operand()
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-nested-overlong-protocol0-string.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(encoded) + 16,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "expected_rule_code"),
+    [("raw", "S213"), ("base64", "S601")],
+)
+def test_scan_bytes_fails_closed_when_nested_overlong_protocol0_operand_hits_depth_limit(
+    encoding: str,
+    expected_rule_code: str,
+) -> None:
+    nested_payload = _nested_overlong_protocol0_line_operand()
+    if encoding == "raw":
+        outer_value: bytes | str = nested_payload
+    else:
+        outer_value = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(outer_value, protocol=4),
+        source=f"depth-limited-{encoding}-overlong-protocol0-string.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(outer_value) + 16,
+            max_nested_depth=0,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule_code
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("incomplete_reason") == "max_nested_depth"
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("max_nested_depth") == 0
+        and notice.details.get("incomplete_reason") == "max_nested_depth"
+        for notice in report.notices
     )
 
 

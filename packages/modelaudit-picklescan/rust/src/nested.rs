@@ -733,6 +733,13 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
     false
 }
 
+pub(crate) fn encoded_pickle_consumes_literal(value: &str) -> bool {
+    let stripped = value.trim();
+    let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(stripped);
+    let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(stripped);
+    encoded_prefix_consumes_literal(stripped, prefix_has_base64_pickle, prefix_has_hex_pickle)
+}
+
 fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
     encoded_pickle_kind_at(bytes, index).is_some()
 }
@@ -1136,6 +1143,15 @@ mod tests {
             let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
             assert!(windows.iter().any(|window| window.starts_with(&encoded)));
         }
+    }
+
+    #[test]
+    fn whole_encoded_pickle_detection_requires_full_literal_consumption() {
+        assert!(encoded_pickle_consumes_literal("gAR9Lg==\n"));
+        assert!(encoded_pickle_consumes_literal("80047d2e"));
+        assert!(encoded_pickle_consumes_literal(r"\x80\x04\x7d\x2e"));
+        assert!(!encoded_pickle_consumes_literal("prefix-gAR9Lg=="));
+        assert!(!encoded_pickle_consumes_literal("# gAR9Lg==\n# metadata"));
     }
 
     #[test]
