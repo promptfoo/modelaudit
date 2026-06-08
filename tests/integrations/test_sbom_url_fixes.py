@@ -192,22 +192,52 @@ class TestSBOMURLFixes:
 
         assert bom_ref("first-secret") == bom_ref("rotated-secret")
 
-    def test_credential_only_distinct_sources_keep_unique_non_secret_refs(self) -> None:
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_credential_only_distinct_sources_keep_unique_non_secret_refs(self, legacy_generator: bool) -> None:
         paths = [
             "https://storage.example/model.pkl?token=secret-one",
             "https://storage.example/model.pkl?token=secret-two",
         ]
+        scan_result = create_mock_scan_result(
+            files_scanned=2,
+            issues=[
+                Issue(
+                    message="Critical remote model",
+                    severity=IssueSeverity.CRITICAL,
+                    location=paths[0],
+                    timestamp=time.time(),
+                )
+            ],
+        )
 
-        sbom_json = generate_sbom_pydantic(paths, create_mock_scan_result(files_scanned=2))
-        components = json.loads(sbom_json)["components"]
+        def risk_by_ref(input_paths: Any) -> tuple[dict[str, str], str]:
+            if legacy_generator:
+                sbom_json = generate_sbom(input_paths, scan_result.model_dump(mode="python"))
+            else:
+                sbom_json = generate_sbom_pydantic(input_paths, scan_result)
+            components = json.loads(sbom_json)["components"]
+            return (
+                {
+                    component["bom-ref"]: next(
+                        prop["value"] for prop in component["properties"] if prop["name"] == "risk_score"
+                    )
+                    for component in components
+                },
+                sbom_json,
+            )
 
-        assert {component["bom-ref"] for component in components} == {
+        first_risks, first_sbom_json = risk_by_ref(paths)
+        second_risks, _ = risk_by_ref(reversed(paths))
+
+        assert first_risks == second_risks
+        assert set(first_risks) == {
             "https://storage.example/model.pkl",
             "https://storage.example/model.pkl#modelaudit-component-2",
         }
+        assert set(first_risks.values()) == {"0", "5"}
         for path in paths:
-            assert path not in sbom_json
-            assert hashlib.sha256(path.encode()).hexdigest() not in sbom_json
+            assert path not in first_sbom_json
+            assert hashlib.sha256(path.encode()).hexdigest() not in first_sbom_json
 
     def test_safe_fragment_provenance_keeps_components_distinct(self) -> None:
         paths = [
@@ -246,6 +276,63 @@ class TestSBOMURLFixes:
     @pytest.mark.parametrize("path", ["model?version=1.pkl", "model;version=1.pkl"])
     def test_nonexistent_local_provenance_filenames_are_preserved(self, path: str) -> None:
         assert redact_source_identifier(path) == path
+
+    @pytest.mark.parametrize(
+        "raw_path",
+        [
+            "token=source-secret?revision=v1",
+            "sessionToken=source-secret?revision=v1",
+            "bucket/token=path-secret/model.pkl?revision=v1",
+            "bucket/token%3Dpath-secret/model.pkl?revision=v1",
+            "Authorization: Bearer source-secret?revision=v1",
+            "dbPassword: source-secret#tag=v1",
+        ],
+    )
+    def test_safe_provenance_does_not_bypass_sensitive_prefix_redaction(self, raw_path: str) -> None:
+        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
+
+        assert "source-secret" not in sbom_json
+        assert "path-secret" not in sbom_json
+        assert json.loads(sbom_json)["components"][0]["bom-ref"].startswith("<source redacted>")
+
+    @pytest.mark.parametrize(
+        "raw_path",
+        [
+            "bucket/model.pkl;token%3Dscheme-less-secret",
+            "bucket/model.pkl?visible=yes&scheme-less-secret",
+        ],
+    )
+    def test_mixed_and_opaque_suffix_credentials_are_redacted(self, raw_path: str) -> None:
+        assert redact_source_identifier(raw_path) == "bucket/model.pkl"
+
+    @pytest.mark.parametrize(
+        "raw_url",
+        [
+            "https://example.com/sessionToken=path-secret/model.pkl",
+            "https://example.com/githubToken=path-secret/model.pkl",
+            "https://example.com/session%54oken=path-secret/model.pkl",
+        ],
+    )
+    def test_alias_url_path_credentials_are_redacted(self, raw_url: str) -> None:
+        sbom_json = generate_sbom_pydantic([raw_url], create_mock_scan_result())
+
+        assert "path-secret" not in sbom_json
+        assert "<redacted>" in json.loads(sbom_json)["components"][0]["bom-ref"]
+
+    @pytest.mark.parametrize(
+        "raw_url",
+        [
+            "//storage.example/model.pkl?token=query-secret",
+            "//bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef",
+            "//user:password@storage.example/model.pkl?token=query-secret",
+        ],
+    )
+    def test_protocol_relative_source_credentials_are_redacted(self, raw_url: str) -> None:
+        sbom_json = generate_sbom_pydantic([raw_url], create_mock_scan_result())
+
+        for secret in ("query-secret", "deadbeef", "user:password"):
+            assert secret not in sbom_json
+        assert json.loads(sbom_json)["components"][0]["bom-ref"].startswith("//")
 
     def test_sbom_with_huggingface_file_url_success(self, tmp_path):
         """Test SBOM generation after downloading HuggingFace file URL."""

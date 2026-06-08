@@ -1,3 +1,4 @@
+import os
 import json
 import time
 from pathlib import Path
@@ -5,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from modelaudit.integrations.sarif_formatter import format_sarif_output
-from modelaudit.integrations.source_redaction import redact_source_identifier, redact_source_value
+from modelaudit.integrations.source_redaction import (
+    redact_source_identifier,
+    redact_source_text,
+    redact_source_value,
+)
 from modelaudit.models import AssetModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 
@@ -129,6 +134,10 @@ def test_existing_local_assignment_paths_are_preserved(tmp_path: Path) -> None:
     assert redact_source_identifier(str(encoded_name_path)) == str(encoded_name_path)
     assert redact_source_identifier(str(query_name_path)) == str(query_name_path)
     assert redact_source_identifier(str(parameter_name_path)) == str(parameter_name_path)
+    if os.name != "nt":
+        double_slash_path = f"/{query_name_path}"
+        assert os.path.lexists(double_slash_path)
+        assert redact_source_identifier(double_slash_path) == double_slash_path
 
     def fingerprint(path: Path) -> str:
         result = create_initial_audit_result()
@@ -159,6 +168,19 @@ def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
     assert redact_source_identifier(local_path) == local_path
 
 
+@pytest.mark.parametrize(
+    ("local_path", "safe_path"),
+    [
+        (r"C:\models\model.pkl?token=windows-secret", r"C:\models\model.pkl"),
+        (r"\\server\share\model.pkl?token=unc-secret", r"\\server\share\model.pkl"),
+    ],
+)
+def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(
+    local_path: str, safe_path: str
+) -> None:
+    assert redact_source_identifier(local_path) == safe_path
+
+
 def test_unclassifiable_mapping_keys_fail_closed() -> None:
     result = create_initial_audit_result()
     result.issues = [
@@ -182,3 +204,80 @@ def test_recursive_export_values_fail_closed() -> None:
     recursive["nested"] = recursive
 
     assert redact_source_value(recursive) == {"nested": "<redacted recursive value>"}
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "token=scheme-less-secret?revision=v1",
+        "sessionToken=scheme-less-secret?revision=v1",
+        "session%54oken=scheme-less-secret?revision=v1",
+        "bucket/token=path-secret/model.pkl?revision=v1",
+        "bucket/token%3Dpath-secret/model.pkl?revision=v1",
+        "Authorization: Bearer source-secret?revision=v1",
+        "dbPassword: source-secret#tag=v1",
+    ],
+)
+def test_safe_provenance_does_not_restore_sensitive_prefixes(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+def test_export_alias_assignments_and_mapping_keys_are_redacted() -> None:
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message=(
+                "sessionToken=Bearer message-secret; dbPassword: password-secret; "
+                'refreshToken="abc,quoted-secret"; proxyAuthorization: "Bearer proxy-secret"; '
+                "refreshToken=<redacted>marker-bypass-secret; Cookie: session=abc; csrf=cookie-secret\n"
+                "sessionTokenCache=public-cache"
+            ),
+            severity=IssueSeverity.WARNING,
+            details={
+                "githubToken": "github-secret",
+                b"token": "bytes-key-secret",
+                "headers": {"Proxy-Authorization": "Bearer header-secret"},
+            },
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.pkl"])
+
+    for secret in (
+        "message-secret",
+        "password-secret",
+        "quoted-secret",
+        "proxy-secret",
+        "marker-bypass-secret",
+        "cookie-secret",
+        "github-secret",
+        "bytes-key-secret",
+        "header-secret",
+    ):
+        assert secret not in output
+    assert "public-cache" in output
+
+
+def test_escaped_quote_does_not_end_credential_redaction_early() -> None:
+    redacted = redact_source_text('refreshToken="abc\\"quoted-secret"; visible=yes')
+
+    assert "quoted-secret" not in redacted
+    assert "visible=yes" in redacted
+
+
+def test_redacted_url_path_assignment_preserves_safe_path_and_query() -> None:
+    raw_url = "https://example.com/token%253Dpath-secret/model.pkl?visible=yes"
+
+    assert redact_source_text(raw_url) == "https://example.com/token=<redacted>/model.pkl?visible=yes"
+
+
+def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.pkl?token=source-secret"
+    literal_path = tmp_path / "literal.pkl?token=filename-text"
+    literal_path.write_bytes(b"model")
+
+    assert redact_source_identifier(str(missing_path)) == str(tmp_path / "missing.pkl")
+    assert redact_source_identifier(str(literal_path)) == str(literal_path)
+    assert redact_source_identifier("./missing.pkl%3Ftoken%3Dsource-secret") == "./missing.pkl"

@@ -1,7 +1,7 @@
 import hashlib
 import os
 import stat
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from importlib.metadata import version as _pkg_version
 from typing import Any
 
@@ -476,6 +476,39 @@ def _calculate_risk_score(path: str, issues: list[Issue]) -> int:
     return min(score, 10)  # Cap at 10
 
 
+def _calculate_legacy_risk_score(path: str, issues: Iterable[dict[str, Any]]) -> int:
+    """Calculate the legacy dict-based risk score for a component."""
+    score = 0
+    for issue in issues:
+        if issue.get("location") != path:
+            continue
+        severity = issue.get("severity")
+        if severity == "critical":
+            score += 5
+        elif severity == "warning":
+            score += 2
+        elif severity == "info":
+            score += 1
+    return min(score, 10)
+
+
+def _stable_source_order(paths: Iterable[str], risk_score: Callable[[str], int]) -> list[str]:
+    """Order sources so colliding redacted refs keep deterministic risk attribution."""
+    grouped_paths: dict[str, list[str]] = {}
+    reference_order: list[str] = []
+    for path in paths:
+        reference = redact_source_reference(path)
+        if reference not in grouped_paths:
+            grouped_paths[reference] = []
+            reference_order.append(reference)
+        grouped_paths[reference].append(path)
+
+    ordered_paths: list[str] = []
+    for reference in reference_order:
+        ordered_paths.extend(sorted(grouped_paths[reference], key=lambda path: -risk_score(path)))
+    return ordered_paths
+
+
 def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExpression]:
     """Extract license expressions from file metadata."""
     license_expressions: list[LicenseExpression] = []
@@ -638,18 +671,7 @@ def _component_for_file(
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
-    score = 0
-    for issue in issues:
-        if issue.get("location") == path:
-            severity = issue.get("severity")
-            if severity == "critical":
-                score += 5
-            elif severity == "warning":
-                score += 2
-            elif severity == "info":
-                score += 1
-    if score > 10:
-        score = 10
+    score = _calculate_legacy_risk_score(path, issues)
     props.append(Property(name="risk_score", value=str(score)))
 
     # Enhanced license handling
@@ -762,7 +784,8 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     file_meta: dict[str, Any] = results.get("file_metadata", {})
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
 
-    for input_path in paths:
+    ordered_paths = _stable_source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts))
+    for input_path in ordered_paths:
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
@@ -847,7 +870,8 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets)
 
-    for input_path in paths:
+    ordered_paths = _stable_source_order(paths, lambda path: _calculate_risk_score(path, issues))
+    for input_path in ordered_paths:
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
             require_stable_root = _supports_descriptor_walk()
