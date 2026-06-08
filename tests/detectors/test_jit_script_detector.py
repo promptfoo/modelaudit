@@ -10,6 +10,8 @@ import pytest
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
 
+_PRIORITY_USAGE_STRESS_LINES = 10
+
 
 class TestJITScriptDetector:
     """Test the JITScriptDetector class."""
@@ -1616,9 +1618,7 @@ class TestJITScriptDetector:
         padding = padding_line * (
             jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
         )
-        comparisons = b"".join(
-            b"c == None\n" for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
-        )
+        comparisons = b"".join(b"c == None\n" for _index in range(_PRIORITY_USAGE_STRESS_LINES))
         source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + comparisons + b"c.cdll.msvcrt\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1640,7 +1640,7 @@ class TestJITScriptDetector:
         padding = padding_line * (
             jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
         )
-        filler = filler_line * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        filler = filler_line * _PRIORITY_USAGE_STRESS_LINES
         source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + filler + b"c.cdll.msvcrt\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1659,7 +1659,7 @@ class TestJITScriptDetector:
         padding = padding_line * (
             jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
         )
-        shadows = b"c = len\n" * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        shadows = b"c = len\n" * _PRIORITY_USAGE_STRESS_LINES
         source = (
             b"\x00\xff"
             + leading_blocks
@@ -1757,12 +1757,17 @@ class TestJITScriptDetector:
         )
         shadows = b"c = len\n" * 512
         shadow_candidate = shadows + b"import ctypes as c\nc.cdll.msvcrt\n"
-        usage_lines = jit_script_module._priority_alias_usage_lines(shadow_candidate, frozenset({b"c"}), 0)
+        usage_lines, proved_rule_codes = jit_script_module._priority_alias_usage_lines(
+            shadow_candidate,
+            frozenset({b"c"}),
+            0,
+        )
         source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + shadow_candidate
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert len(usage_lines) <= jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        assert usage_lines == []
+        assert proved_rule_codes == frozenset()
         assert any(
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
         )
@@ -1894,9 +1899,7 @@ class TestJITScriptDetector:
         padding = padding_line * (
             jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
         )
-        safe_shadow_calls = b"".join(
-            b"a = len; a([])\n" + padding for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
-        )
+        safe_shadow_calls = b"".join(b"a = len; a([])\n" + padding for _index in range(_PRIORITY_USAGE_STRESS_LINES))
         source = (
             b"\x00\xff"
             + leading_blocks
@@ -1925,7 +1928,7 @@ class TestJITScriptDetector:
             jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
         )
         safe_shadow_calls = b"".join(
-            b"    a = len; a([])\n" + padding for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
+            b"    a = len; a([])\n" + padding for _index in range(_PRIORITY_USAGE_STRESS_LINES)
         )
         source = (
             b"\x00\xff"
@@ -2857,15 +2860,15 @@ class TestJITScriptDetector:
             b"runner = True or rp.run_path\n(runner)('safe')\n",
             b"runner = print or rp.run_path\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif False:\n    if True:\n"
-            b"        runner = original\n(runner)('safe')\n",
+            + b"        runner = original\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif True:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif 1:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif False:\n    pass\nelif True:\n    pass\nelse:\n"
-            b"    runner = original\n(runner)('safe')\n",
+            + b"    runner = original\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif 'enabled':\n    pass\nelse:\n"
-            b"    runner = original\n(runner)('safe')\n",
+            + b"    runner = original\n(runner)('safe')\n",
             b"original = runner\nrunner = print\nif True:\n    pass\nelif False:\n    pass\nelse:\n"
-            b"    runner = original\n(runner)('safe')\n",
+            + b"    runner = original\n(runner)('safe')\n",
             b"if globals().get('enabled'):\n    runner = print\nelif True:\n    runner = print\n(runner)('safe')\n",
             b"getattr(object=rp, name='run_path')('safe')\n",
         ],
@@ -2885,16 +2888,18 @@ class TestJITScriptDetector:
         "late_state",
         [
             b"enabled = True\nrunner = rp.run_path if enabled else print\n"
-            b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
+            + b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
             b"from runpy import run_path as runner\nif globals().get('enabled'):\n    pass\n"
-            b"elif True:\n    runner = print\n(runner)('payload.py')\n",
-            b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
-            b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
-            b"else:\n    runner = print\n(runner)('payload.py')\n",
+            + b"elif True:\n    runner = print\n(runner)('payload.py')\n",
+            (
+                b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
+                + b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
+                + b"else:\n    runner = print\n(runner)('payload.py')\n"
+            ),
             b"from runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
-            b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+            + b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
             b"\x00\xfffrom runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
-            b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+            + b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
         ],
     )
     def test_scan_model_detects_late_alias_after_uncertain_safe_overwrite(self, late_state: bytes) -> None:
@@ -2913,13 +2918,13 @@ class TestJITScriptDetector:
         [
             b"import builtins\nbuiltins.print = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
             b"import builtins\nvars(builtins)['print'] = False\n"
-            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
             b"import builtins\nvars(builtins).update({'print': False})\n"
-            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
             b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
-            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
             b"import builtins\nvars(builtins).update(**{'print': False})\n"
-            b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+            + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
             b"from runpy import run_path as runner\nFalse and (runner := print)\n(runner)('payload.py')\n",
             (
                 b"from runpy import run_path as runner\nclass Broken:\n"
@@ -6162,9 +6167,9 @@ class TestJITScriptDetector:
         "shadow_state",
         [
             b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
-            b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
+            + b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
             b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
-            b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+            + b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
         ],
     )
     def test_scan_model_ignores_shadowed_dict_update_before_dangerous_runpy_call(self, shadow_state: bytes) -> None:
