@@ -188,7 +188,7 @@ def test_stream_analyze_file_detects_remote_growth_after_info(
     assert result.metadata["scan_outcome"] == "inconclusive"
 
 
-@pytest.mark.parametrize("reported_size", [-1, None, 0])
+@pytest.mark.parametrize("reported_size", [-1, None])
 def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
     reported_size: object,
@@ -217,6 +217,32 @@ def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
     assert result.metadata["scan_outcome"] == "inconclusive"
 
 
+def test_stream_analyze_file_treats_empty_remote_as_known_and_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=0,
+        payload=b"",
+        read_sizes=read_sizes,
+    )
+    scanner = RecordingStreamScanner()
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file("s3://bucket/empty.pkl", scanner)
+
+    assert read_sizes == [1]
+    assert scanner.seen_size == 0
+    assert analysis_complete is True
+    assert result is not None
+    assert result.bytes_scanned == 0
+    assert result.success is True
+    assert result.metadata["file_size_known"] is True
+    assert result.metadata["bytes_complete"] is True
+
+
 def test_stream_analyze_file_uses_scanner_read_cap_when_file_size_is_unlimited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -241,6 +267,31 @@ def test_stream_analyze_file_uses_scanner_read_cap_when_file_size_is_unlimited(
     assert result.bytes_scanned == 4
     assert result.metadata["max_bytes"] == 4
     assert result.metadata["bytes_analyzed"] == 4
+
+
+def test_stream_analyze_file_does_not_expand_default_cap_to_large_file_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=STREAMING_ANALYSIS_DEFAULT_MAX_BYTES + 4096,
+        payload=b"header",
+        read_sizes=read_sizes,
+    )
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/large.joblib",
+        HeaderOnlyScanner(config={"max_file_size": 50 * 1024 * 1024 * 1024}),
+    )
+
+    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.metadata["max_bytes"] == STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    assert result.metadata["bytes_complete"] is False
 
 
 def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
