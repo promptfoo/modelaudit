@@ -1375,7 +1375,7 @@ class ScanResultsCache:
             return getattr(file_stat, "st_ctime_ns", int(file_stat.st_ctime * 1_000_000_000))
 
         import ctypes
-        from ctypes import wintypes
+        import ctypes.wintypes as wintypes
 
         win_dll = ctypes.WinDLL  # type: ignore[attr-defined]
         get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]
@@ -1421,7 +1421,7 @@ class ScanResultsCache:
     @staticmethod
     def _get_windows_handle_change_token(handle: int) -> int:
         import ctypes
-        from ctypes import wintypes
+        import ctypes.wintypes as wintypes
 
         class FileBasicInfo(ctypes.Structure):
             _fields_ = [
