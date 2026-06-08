@@ -30,13 +30,13 @@ def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner") -> object:
     configured_stream_max = scanner.config.get("streaming_max_bytes")
     if configured_stream_max is not None:
         return configured_stream_max
-    configured_file_max = scanner.config.get("max_file_size")
-    if isinstance(configured_file_max, int) and not isinstance(configured_file_max, bool) and configured_file_max > 0:
-        return configured_file_max
-    configured_read_max = scanner.config.get("max_file_read_size")
-    if configured_read_max is not None:
-        return configured_read_max
-    return configured_file_max
+
+    resolved_max = STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+    for config_key in ("max_file_size", "max_file_read_size"):
+        configured_max = scanner.config.get(config_key)
+        if isinstance(configured_max, int) and not isinstance(configured_max, bool) and configured_max > 0:
+            resolved_max = min(resolved_max, configured_max)
+    return resolved_max
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
@@ -147,7 +147,7 @@ def stream_analyze_file(
             reported_file_size
             if isinstance(reported_file_size, int)
             and not isinstance(reported_file_size, bool)
-            and reported_file_size > 0
+            and reported_file_size >= 0
             else None
         )
 
