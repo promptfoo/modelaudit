@@ -61,7 +61,8 @@ def _append_mutable_refs(config_path: Path, uses_values: Iterator[str], mutable_
             else _PINNED_ACTION_RE.fullmatch(uses_value)
         )
         if not is_pinned:
-            mutable_refs.append(f"{config_path.relative_to(_REPO_ROOT)}: {uses_value}")
+            relative_path = config_path.relative_to(_REPO_ROOT).as_posix()
+            mutable_refs.append(f"{relative_path}: {uses_value}")
 
 
 def test_external_github_actions_are_pinned_to_commit_sha() -> None:
