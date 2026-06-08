@@ -34,6 +34,7 @@ from ..helpers.disk_space import check_disk_space
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+_CLEARTEXT_CLOUD_ERROR = "Cleartext cloud storage URL is not supported"
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _BARE_ASSIGNMENT_RE = re.compile(
@@ -131,18 +132,55 @@ def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> 
         return executor.submit(lambda: asyncio.run(coro_factory())).result()
 
 
+def _http_cloud_protocol(url: str) -> str | None:
+    """Return the provider protocol for a recognized HTTP(S) cloud URL."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.casefold() not in {"http", "https"}:
+            return None
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return None
+
+    if hostname.endswith(".s3.amazonaws.com"):
+        return "s3"
+    if hostname == "storage.googleapis.com":
+        return "gcs"
+    if hostname.endswith(".r2.cloudflarestorage.com"):
+        return "s3"
+    return None
+
+
+def is_cleartext_cloud_url(url: str) -> bool:
+    """Return True for HTTP URLs targeting a supported cloud provider."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.casefold() != "http":
+            return False
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+
+    return (
+        hostname.endswith(".s3.amazonaws.com")
+        or hostname == "storage.googleapis.com"
+        or hostname.endswith(".r2.cloudflarestorage.com")
+    )
+
+
 def is_cloud_url(url: str) -> bool:
     """Return True if the URL points to a supported cloud storage provider."""
-    patterns = [
-        r"^s3://.+",
-        r"^gs://.+",
-        r"^gcs://.+",
-        r"^r2://.+",
-        r"^https?://[^/]+\.s3\.amazonaws\.com/.+",
-        r"^https?://storage.googleapis.com/.+",
-        r"^https?://[^/]+\.r2\.cloudflarestorage\.com/.+",
-    ]
-    return any(re.match(p, url, re.IGNORECASE) for p in patterns)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    scheme = parsed.scheme.casefold()
+    if scheme in {"s3", "gs", "gcs", "r2"}:
+        return bool(parsed.netloc or parsed.path)
+    if scheme != "https" or _http_cloud_protocol(url) is None:
+        return False
+    return bool(parsed.path.lstrip("/"))
 
 
 def is_stream_url(url: str) -> bool:
@@ -482,19 +520,18 @@ def _cloud_url_without_query(url: str) -> str:
 
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
-    parsed = urlparse(url)
-    scheme = parsed.scheme
-    hostname = (parsed.hostname or "").casefold()
-
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}") from exc
+    scheme = parsed.scheme.casefold()
     if scheme in {"http", "https"}:
-        if hostname.endswith(".s3.amazonaws.com"):
-            return "s3"
-        elif hostname == "storage.googleapis.com":
-            return "gcs"
-        elif hostname.endswith(".r2.cloudflarestorage.com"):
-            return "s3"
-        else:
+        protocol = _http_cloud_protocol(url)
+        if protocol is None:
             raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+        if scheme == "http":
+            raise ValueError(f"{_CLEARTEXT_CLOUD_ERROR}: {redact_url_for_display(url)}")
+        return protocol
     elif scheme == "gcs" or scheme == "gs":
         return "gcs"
     elif scheme in {"s3", "r2"}:
