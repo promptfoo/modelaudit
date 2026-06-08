@@ -1561,12 +1561,33 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
     assert "collector.evil.example" in redacted
 
 
-def test_command_substitution_credential_redaction_has_bounded_runtime() -> None:
+@pytest.mark.parametrize(
+    ("pattern_name", "payload"),
+    [
+        (
+            "COMMAND_CERT_PASSWORD_QUOTED_RE",
+            '--cert "cert.pem:' + (r"\(" * 26),
+        ),
+        (
+            "COMMAND_QUOTED_USER_PASSWORD_RE",
+            '--user "alice:' + (r"\(" * 26),
+        ),
+        (
+            "COMMAND_SUBSTITUTION_USER_PASSWORD_RE",
+            "-u:$(" + (r"\(" * 26),
+        ),
+        (
+            "COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE",
+            'user = "alice:' + (r"\(" * 26),
+        ),
+    ],
+)
+def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
     code = (
         "from modelaudit.scanners._catboost_evidence_redaction import "
-        "COMMAND_SUBSTITUTION_USER_PASSWORD_RE\n"
-        "payload = '-u:$(' + r'\\(' * 26\n"
-        "COMMAND_SUBSTITUTION_USER_PASSWORD_RE.sub('<redacted>', payload)\n"
+        f"{pattern_name}\n"
+        f"payload = {payload!r}\n"
+        f"{pattern_name}.sub('<redacted>', payload)\n"
     )
 
     subprocess.run(

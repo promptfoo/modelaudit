@@ -262,10 +262,11 @@ CURL_ATTACHED_COOKIE_SERIALIZED_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<prefix>\$?)(?P<slashes>\\+)(?P<quote>[\"'])(?:(?!(?<!\\)(?P=slashes)(?P=quote)|,)[\s\S])*?"
     r"(?<!\\)(?P=slashes)(?P=quote)"
 )
+COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN: Final[str] = r"(?:\\.|(?!\\)(?!(?P=quote)).)"
 COMMAND_CERT_PASSWORD_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>((?<!\w)--(?:proxy-)?cert|(?<!\w)-E)(?:=|\s+))"
-    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<certificate>(?:\\.|(?!(?P=quote)).)*:)"
-    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+    rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<certificate>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}*:)"
+    rf"(?P<password>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}+)(?P=quote)"
 )
 COMMAND_CERT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?P<option>((?<!\w)--(?:proxy-)?cert|(?<!\w)-E)(?:=|\s+))"
@@ -277,8 +278,8 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>(?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)"
-    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>(?:\\.|(?!(?P=quote)).)*?:)"
-    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+    rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}*?:)"
+    rf"(?P<password>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}+)(?P=quote)"
 )
 COMMAND_SUBSTITUTION_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?P<option>(?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)"
@@ -286,8 +287,8 @@ COMMAND_SUBSTITUTION_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?<![?&/\w-])(?P<option>(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
-    r"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>(?:\\.|(?!(?P=quote)).)*?:)"
-    r"(?P<password>(?:\\.|(?!(?P=quote)).)+)(?P=quote)"
+    rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}*?:)"
+    rf"(?P<password>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}+)(?P=quote)"
 )
 COMMAND_CONFIG_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?<![?&/\w-])((?:proxy-)?user\s*(?:=|:|\s+)\s*)(\$?[\"']?)([^:\s\"';&|]*:)"
