@@ -4,7 +4,9 @@ import hashlib
 import itertools
 import logging
 import os
+import re
 import stat
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
@@ -344,6 +346,11 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
+_TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
+    "modelaudit_hf_",
+    "modelaudit_pth_stream_",
+    "modelaudit_stream_",
+)
 
 
 def _redacted_stream_url_for_reporting(stream_url: str) -> str:
@@ -465,6 +472,218 @@ def _shard_family_key_for_path(path: str) -> _ShardFamilyKey | None:
         expected_total = None
 
     return (str(path_obj.parent), pattern, expected_total)
+
+
+def _snapshot_validated_shard_target(
+    source_path: str,
+    *,
+    resolved_path: str | None = None,
+    family_group: str | None = None,
+) -> ValidatedShardTargets:
+    """Snapshot one selected shard path after resolving it to a regular file."""
+    source = Path(source_path)
+    shard_match = ShardedModelDetector.match_shard_filename(source.name)
+    if shard_match is None or not isinstance(shard_match.get("expected_total_shards"), int):
+        return {}
+
+    try:
+        resolved_source = source.resolve(strict=True)
+        resolved_target = Path(resolved_path).resolve(strict=True) if resolved_path is not None else resolved_source
+        if os.path.normcase(os.path.normpath(str(resolved_source))) != os.path.normcase(
+            os.path.normpath(str(resolved_target))
+        ):
+            return {}
+        target_stat = os.stat(resolved_target, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        return {}
+    if not stat.S_ISREG(target_stat.st_mode):
+        return {}
+
+    target: dict[str, int | str] = {
+        "resolved_path": str(resolved_target),
+        "device": target_stat.st_dev,
+        "inode": target_stat.st_ino,
+        "size": target_stat.st_size,
+        "mtime_ns": target_stat.st_mtime_ns,
+        "ctime_ns": target_stat.st_ctime_ns,
+    }
+    if family_group is not None:
+        target["family_scope_policy"] = "stream_logical_parent"
+        try:
+            resolved_parent = source.absolute().parent.resolve(strict=True)
+            temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved_parent = None
+            temp_root = None
+        if (
+            family_group
+            and resolved_parent is not None
+            and temp_root is not None
+            and resolved_parent.parent == temp_root
+            and resolved_parent.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
+        ):
+            target["family_group"] = family_group
+    return {str(source.absolute()): target}
+
+
+def _validated_shard_family_scopes(
+    source_path: str,
+    shard_index: int,
+    target: dict[str, int | str],
+) -> set[str]:
+    """Return conservative lexical scopes that may identify one shard family."""
+    parent = Path(source_path).absolute().parent
+    normalized_parent = os.path.normcase(os.path.normpath(str(parent)))
+    scopes = {f"directory:{normalized_parent}"}
+    family_group = target.get("family_group")
+    if isinstance(family_group, str) and family_group:
+        scopes.add(f"trusted-group:{family_group}")
+    if target.get("family_scope_policy") == "stream_logical_parent":
+        return scopes
+
+    matching_index_runs = [match for match in re.finditer(r"\d+", parent.name) if int(match.group(0)) == shard_index]
+    if len(matching_index_runs) != 1:
+        return scopes
+
+    index_run = matching_index_runs[0]
+    templated_name = f"{parent.name[: index_run.start()]}{{shard-index}}{parent.name[index_run.end() :]}"
+    templated_parent = parent.with_name(templated_name)
+    normalized_template = os.path.normcase(os.path.normpath(str(templated_parent)))
+    scopes.add(f"indexed-directory:{normalized_template}")
+    return scopes
+
+
+def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTargets) -> set[str]:
+    """Return source paths belonging to complete, uniquely targeted shard families."""
+    grouped_targets: dict[
+        tuple[str, int, str],
+        dict[int, list[tuple[str, dict[str, int | str]]]],
+    ] = {}
+    for source_path, target in validated_targets.items():
+        shard_match = ShardedModelDetector.match_shard_filename(Path(source_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
+        ):
+            continue
+        for family_scope in _validated_shard_family_scopes(source_path, shard_index, target):
+            grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
+                (source_path, target)
+            )
+
+    complete_sources: set[str] = set()
+    for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
+        # Indices are already bounded to [1, expected_total], so matching the
+        # expected cardinality proves the complete range without materializing
+        # an attacker-controlled range.
+        if len(targets_by_index) != expected_total:
+            continue
+        if any(len(records) != 1 for records in targets_by_index.values()):
+            continue
+        records = [records[0] for records in targets_by_index.values()]
+
+        target_identities: set[tuple[int | str, ...]] = set()
+        duplicate_target = False
+        for _source_path, target in records:
+            inode = target.get("inode")
+            device = target.get("device")
+            resolved_target = target.get("resolved_path")
+            if isinstance(inode, int) and inode and isinstance(device, int):
+                target_identity: tuple[int | str, ...] = ("inode", device, inode)
+            elif isinstance(resolved_target, str):
+                target_identity = (
+                    "path",
+                    os.path.normcase(os.path.normpath(resolved_target)),
+                )
+            else:
+                duplicate_target = True
+                break
+            if target_identity in target_identities:
+                duplicate_target = True
+                break
+            target_identities.add(target_identity)
+        if duplicate_target:
+            continue
+
+        complete_sources.update(
+            os.path.normcase(os.path.normpath(os.path.abspath(source_path))) for source_path, _target in records
+        )
+    return complete_sources
+
+
+def _reconcile_cross_directory_shard_coverage(
+    results: ModelAuditResultModel,
+    validated_targets: ValidatedShardTargets,
+) -> bool:
+    """Remove only missing-shard outcomes disproven by this scan's validated targets."""
+    complete_sources = _complete_validated_shard_family_sources(validated_targets)
+    if not complete_sources:
+        return False
+
+    def source_is_complete(path: str | None) -> bool:
+        if not isinstance(path, str):
+            return False
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return normalized_path in complete_sources
+
+    reconciled = False
+    retained_checks: list[Check] = []
+    for check in results.checks:
+        details = check.details if isinstance(check.details, dict) else {}
+        if (
+            check.name == "Sharded Model Coverage Check"
+            and details.get("scan_outcome_reason") == "missing_model_shards"
+            and source_is_complete(check.location)
+        ):
+            reconciled = True
+            continue
+        retained_checks.append(check)
+    results.checks = retained_checks
+
+    retained_issues: list[Issue] = []
+    for issue in results.issues:
+        details = issue.details if isinstance(issue.details, dict) else {}
+        if details.get("scan_outcome_reason") == "missing_model_shards" and source_is_complete(issue.location):
+            reconciled = True
+            continue
+        retained_issues.append(issue)
+    results.issues = retained_issues
+
+    from .models import FileMetadataModel
+
+    for source_path, metadata_model in list(results.file_metadata.items()):
+        if not source_is_complete(source_path):
+            continue
+        metadata = metadata_model.model_dump(mode="python")
+        reasons = metadata.get("scan_outcome_reasons")
+        if not isinstance(reasons, list) or "missing_model_shards" not in reasons:
+            continue
+        remaining_reasons = [reason for reason in reasons if reason != "missing_model_shards"]
+        if remaining_reasons:
+            metadata["scan_outcome_reasons"] = remaining_reasons
+            if metadata.get("scan_outcome_reason") == "missing_model_shards":
+                metadata["scan_outcome_reason"] = remaining_reasons[0]
+        else:
+            metadata.pop("scan_outcome_reasons", None)
+            if metadata.get("scan_outcome_reason") == "missing_model_shards":
+                metadata.pop("scan_outcome_reason", None)
+            if metadata.get("scan_outcome") == "inconclusive":
+                metadata.pop("scan_outcome", None)
+            metadata.pop("analysis_incomplete", None)
+        results.file_metadata[source_path] = FileMetadataModel(**metadata)
+        reconciled = True
+
+    if reconciled:
+        results.success = not _results_should_be_unsuccessful(results)
+    return reconciled
 
 
 def _build_shard_family_cache_fingerprint(
@@ -3564,6 +3783,7 @@ def scan_model_streaming(
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
     scan_root: FilePath | None = None,
+    shard_family_group: str | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
@@ -3578,6 +3798,7 @@ def scan_model_streaming(
         progress_callback: Optional callback for progress reporting
         delete_after_scan: Whether to delete files after scanning (default: True)
         scan_root: Optional root directory for local streaming traversal validation
+        shard_family_group: Trusted source group, admitted only for recognized ephemeral staging parents
         **kwargs: Additional arguments passed to scanners
 
     Returns:
@@ -3609,6 +3830,7 @@ def scan_model_streaming(
     )
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
+    validated_shard_targets: ValidatedShardTargets = {}
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
         if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
@@ -3691,6 +3913,11 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+                pre_scan_shard_target = _snapshot_validated_shard_target(
+                    str(source_path),
+                    resolved_path=str(scan_path),
+                    family_group=shard_family_group,
+                )
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -3734,6 +3961,17 @@ def scan_model_streaming(
                         metadata_dict.setdefault("source_path", report_path)
                         metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
+                    post_scan_shard_target = _snapshot_validated_shard_target(
+                        str(source_path),
+                        resolved_path=str(scan_path),
+                        family_group=shard_family_group,
+                    )
+                    if (
+                        not operational_scan_failure
+                        and pre_scan_shard_target
+                        and pre_scan_shard_target == post_scan_shard_target
+                    ):
+                        validated_shard_targets.update(post_scan_shard_target)
 
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
@@ -3792,6 +4030,8 @@ def scan_model_streaming(
             finally:
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
+
+        _reconcile_cross_directory_shard_coverage(results, validated_shard_targets)
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:

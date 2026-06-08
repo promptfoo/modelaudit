@@ -177,6 +177,11 @@ class ShardedModelDetector:
             if allowed_targets is not None
             else None
         )
+        validated_peer_paths = (
+            [Path(source_path) for source_path in allowed_targets if isinstance(source_path, str)]
+            if allowed_targets is not None
+            else []
+        )
         allowed_path_set: set[str] | None = None
         if allowed_paths is not None:
             allowed_path_set = {os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in allowed_paths}
@@ -203,8 +208,14 @@ class ShardedModelDetector:
                         requested_expected_total = int(match.group(2))
                         expected_totals.add(requested_expected_total)
 
-                # Find all related shards
-                for file in sorted(dir_path.glob("*")):
+                # Find local siblings plus any cross-directory peers that the
+                # caller already resolved and snapshotted for this scan.
+                candidate_paths: dict[str, Path] = {}
+                for candidate in (*dir_path.glob("*"), *validated_peer_paths):
+                    normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
+                    candidate_paths.setdefault(normalized_candidate, candidate)
+
+                for file in sorted(candidate_paths.values(), key=lambda candidate: str(candidate)):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
                         candidate_expected_total: int | None = None
@@ -242,6 +253,7 @@ class ShardedModelDetector:
                             continue
                         if (
                             allowed_path_set is None
+                            and normalized_allowed_targets is None
                             and not _is_resolved_path_within_directory(
                                 dir_path,
                                 resolved_file,
@@ -951,17 +963,24 @@ class ParallelShardHandler:
         pattern = self.shard_info["pattern"]
         expected_total = self.shard_info.get("expected_total_shards")
         members: set[str] = set()
-        for candidate in current_file.parent.glob("*"):
-            match = re.fullmatch(pattern, candidate.name)
-            if match is None:
-                continue
-            if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
-                try:
-                    if int(match.group(2)) != expected_total:
-                        continue
-                except (IndexError, ValueError):
+        family_directories = {current_file.parent}
+        shard_targets = self.shard_info.get("shard_targets")
+        if isinstance(shard_targets, dict):
+            family_directories.update(
+                Path(source_path).parent for source_path in shard_targets if isinstance(source_path, str)
+            )
+        for family_directory in family_directories:
+            for candidate in family_directory.glob("*"):
+                match = re.fullmatch(pattern, candidate.name)
+                if match is None:
                     continue
-            members.add(str(candidate.absolute()))
+                if isinstance(expected_total, int) and (match.lastindex or 0) >= 2:
+                    try:
+                        if int(match.group(2)) != expected_total:
+                            continue
+                    except (IndexError, ValueError):
+                        continue
+                members.add(str(candidate.absolute()))
         return members
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":
@@ -1242,6 +1261,7 @@ class AdvancedFileHandler:
                     passed=False,
                     message=(f"Missing {missing_count} expected model shard(s); scan coverage is incomplete."),
                     severity=IssueSeverity.INFO,
+                    location=self.file_path,
                     details={
                         "expected_total_shards": self.shard_info.get("expected_total_shards"),
                         "present_total_shards": self.shard_info.get("total_shards"),
@@ -1272,6 +1292,7 @@ class AdvancedFileHandler:
                         "scan coverage is incomplete."
                     ),
                     severity=IssueSeverity.INFO,
+                    location=self.file_path,
                     details={
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "out_of_scope_shard_count": out_of_scope_count,
@@ -1293,6 +1314,7 @@ class AdvancedFileHandler:
                     passed=False,
                     message=f"Unable to read {unreadable_count} model shard(s); scan coverage is incomplete.",
                     severity=IssueSeverity.INFO,
+                    location=self.file_path,
                     details={
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "unreadable_shard_count": unreadable_count,
@@ -1315,6 +1337,7 @@ class AdvancedFileHandler:
                         "scan coverage is incomplete."
                     ),
                     severity=IssueSeverity.INFO,
+                    location=self.file_path,
                     details={
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "unvalidated_shard_count": unvalidated_count,
@@ -1333,6 +1356,7 @@ class AdvancedFileHandler:
                         "scan coverage is incomplete."
                     ),
                     severity=IssueSeverity.INFO,
+                    location=self.file_path,
                     details={
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "duplicate_shard_count": duplicate_count,

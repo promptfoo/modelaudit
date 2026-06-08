@@ -120,6 +120,20 @@ class PatternMemoryMappedScanner:
 _SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
 
 
+def _validated_target(path: Path) -> dict[str, int | str]:
+    """Return the target identity fields used by grouped shard scans."""
+    resolved_path = path.resolve(strict=True)
+    path_stat = os.stat(resolved_path, follow_symlinks=False)
+    return {
+        "resolved_path": str(resolved_path),
+        "device": path_stat.st_dev,
+        "inode": path_stat.st_ino,
+        "size": path_stat.st_size,
+        "mtime_ns": path_stat.st_mtime_ns,
+        "ctime_ns": path_stat.st_ctime_ns,
+    }
+
+
 class ContextRecordingShardScanner:
     """Scanner that records worker context for propagation tests."""
 
@@ -237,6 +251,74 @@ class TestShardedModelDetector:
         assert shard_info is not None
         assert shard_info["shards"] == [str(shard_one)]
         assert shard_info["total_shards"] == 1
+
+    def test_detect_shards_includes_validated_cross_directory_peers(self, tmp_path: Path) -> None:
+        """Validated peers selected in separate directories should form one complete family."""
+        shards: list[Path] = []
+        for shard_index in range(1, 4):
+            shard_dir = tmp_path / f"part-{shard_index}"
+            shard_dir.mkdir()
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+            shard_path.write_bytes(f"shard-{shard_index}".encode())
+            shards.append(shard_path)
+        near_match = shards[1].parent / "model-00002-of-00003.safetensors.bak"
+        near_match.write_bytes(b"not-a-shard")
+        allowed_targets = {str(shard): _validated_target(shard) for shard in shards}
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shards[0]),
+            allowed_targets=allowed_targets,
+        )
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            allowed_shard_paths=[str(shard.resolve()) for shard in shards],
+            allowed_shard_targets=allowed_targets,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard) for shard in shards]
+        assert shard_info["total_shards"] == 3
+        assert "missing_shard_count" not in shard_info
+        assert result.success is True
+        assert result.bytes_scanned == sum(shard.stat().st_size for shard in shards)
+
+    def test_detect_shards_rejects_changed_cross_directory_peer(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A cross-directory peer cannot retarget after its identity is validated."""
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        targets_dir = tmp_path / "targets"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        targets_dir.mkdir()
+        shard_one = first_dir / "model-00001-of-00002.safetensors"
+        shard_two = second_dir / "model-00002-of-00002.safetensors"
+        original_target = targets_dir / "original"
+        replacement_target = targets_dir / "replacement"
+        shard_one.write_bytes(b"one")
+        original_target.write_bytes(b"two")
+        replacement_target.write_bytes(b"replacement")
+        shard_two.symlink_to(original_target)
+        allowed_targets = {
+            str(shard_one): _validated_target(shard_one),
+            str(shard_two): _validated_target(shard_two),
+        }
+        shard_two.unlink()
+        shard_two.symlink_to(replacement_target)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard_one),
+            allowed_targets=allowed_targets,
+        )
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["unvalidated_shards"] == [str(shard_two)]
 
     def test_detect_shards_rejects_direct_sibling_symlink_outside_scan_directory(
         self,

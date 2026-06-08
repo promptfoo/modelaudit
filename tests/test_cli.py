@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import types
@@ -600,6 +601,37 @@ def test_scan_multiple_paths(tmp_path):
         or "Size:" in result.output
         or "bytes_scanned" in result.output
         or "files_scanned" in result.output
+    )
+
+
+def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_path: Path) -> None:
+    """Explicit shard paths should be reconciled across their separate parent directories."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 4):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 3
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
     )
 
 
@@ -3229,6 +3261,7 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
     assert mock_download_streaming.call_args.kwargs["timeout"] > 0
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @pytest.mark.parametrize(
@@ -3321,6 +3354,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
     streaming_provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
     assert streaming_provenance.model_id == "test/streaming-model"
     assert streaming_provenance.model_source == "huggingface"
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
     # Verify content_hash is in JSON output
     try:
@@ -3820,6 +3854,7 @@ def test_scan_cloud_url_streaming_passes_scanner_selection_to_content_filter(
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
     assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset()
     assert mock_download_streaming.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @patch("os.remove")

@@ -37,6 +37,8 @@ from .config.local_config import find_local_config_for_paths
 from .core import (
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    _reconcile_cross_directory_shard_coverage,
+    _snapshot_validated_shard_target,
     determine_exit_code,
     scan_model_directory_or_file,
 )
@@ -66,6 +68,7 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
+from .utils.file.handlers import ValidatedShardTargets
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -1329,6 +1332,31 @@ class _ScanPathState:
     sbom_paths_resolved: bool = False
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
+    validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
+
+    def record_validated_shard_targets(
+        self,
+        scan_result: ModelAuditResultModel,
+        *,
+        pre_scan_target: ValidatedShardTargets | None = None,
+    ) -> None:
+        """Record stable regular-file identities for shard assets that were scanned."""
+        for asset in scan_result.assets:
+            if not asset.path or asset.type == "error":
+                continue
+            metadata = scan_result.file_metadata.get(asset.path)
+            if metadata is not None and metadata.get("operational_error") is True:
+                continue
+            post_scan_target = _snapshot_validated_shard_target(asset.path)
+            if not post_scan_target:
+                continue
+            if pre_scan_target:
+                common_sources = pre_scan_target.keys() & post_scan_target.keys()
+                if common_sources and any(
+                    pre_scan_target[source_path] != post_scan_target[source_path] for source_path in common_sources
+                ):
+                    continue
+            self.validated_shard_targets.update(post_scan_target)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -2275,6 +2303,7 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
+    pre_scan_shard_target = _snapshot_validated_shard_target(actual_path) if os.path.isfile(actual_path) else {}
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
@@ -2365,6 +2394,10 @@ def _scan_local_or_downloaded_path(
             skip_file_types=runtime.skip_non_model_files,
             use_hf_whitelist=runtime.use_hf_whitelist,
             **config_overrides,
+        )
+        path_state.record_validated_shard_targets(
+            scan_results,
+            pre_scan_target=pre_scan_shard_target,
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
         if is_dvc_pointer and has_prior_dvc_coverage:
@@ -2594,6 +2627,7 @@ def _resolve_scan_source_for_path(
 
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2707,6 +2741,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2846,6 +2881,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -3794,6 +3830,7 @@ def scan_command(
 
     _complete_progress_tracking(progress_tracker, verbose=verbose)
     _cleanup_progress_reporters(progress_reporters)
+    _reconcile_cross_directory_shard_coverage(audit_result, path_state.validated_shard_targets)
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
