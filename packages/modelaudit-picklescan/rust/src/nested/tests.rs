@@ -199,6 +199,7 @@ fn decoded_payloads_ignore_unstructured_protocol0_operand_limit_failures() {
         payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1,
         b'A',
     );
+    let operand_end = payload.len();
 
     assert!(decoded_pickle_payloads(&payload, payload.len() + 16).is_empty());
     let error = pickle_payload_extent_result(&payload, payload.len() + 16)
@@ -208,6 +209,18 @@ fn decoded_payloads_ignore_unstructured_protocol0_operand_limit_failures() {
     payload.extend_from_slice(b"\n.");
     let error = pickle_payload_extent_result(&payload, payload.len() + 16)
         .expect_err("benign suffix should not promote an overlong data operand");
+    assert!(!error.is_structured_protocol0_line_operand_limit());
+
+    payload.truncate(operand_end);
+    payload.extend_from_slice(b"'\nrandom benign footer\n");
+    let error = pickle_payload_extent_result(&payload, payload.len() + 16)
+        .expect_err("opcode-like letters in prose should not promote an overlong data operand");
+    assert!(!error.is_structured_protocol0_line_operand_limit());
+
+    payload.truncate(operand_end);
+    payload.extend_from_slice(b"'\ncfoo\nbar");
+    let error = pickle_payload_extent_result(&payload, payload.len() + 16)
+        .expect_err("an incomplete global suffix is not execution evidence");
     assert!(!error.is_structured_protocol0_line_operand_limit());
 }
 
@@ -243,6 +256,42 @@ fn protocol0_global_and_inst_name_limits_preserve_opcode_evidence() {
             .expect_err("overlong GLOBAL or INST name should preserve its parse failure");
         assert!(error.is_structured_protocol0_line_operand_limit());
     }
+}
+
+#[test]
+fn truncated_global_and_inst_names_preserve_opcode_evidence_before_operand_limit() {
+    for prefix in [b"cos\n".as_slice(), b"ios\n".as_slice()] {
+        let mut payload = prefix.to_vec();
+        payload.resize(TEST_MAX_NESTED_PICKLE_BYTES, b'A');
+        payload.extend_from_slice(b"\n.");
+
+        assert!(has_pickle_prefix(&payload));
+        assert!(truncated_pickle_prefix_requires_fail_closed(&payload));
+    }
+}
+
+#[test]
+fn truncated_global_name_prefix_requires_a_terminator_before_the_parser_cap() {
+    let mut benign = b"config\n".to_vec();
+    benign.resize(TEST_MAX_NESTED_PICKLE_BYTES + 1, b'A');
+
+    assert!(!has_pickle_prefix(&benign));
+    assert!(!truncated_pickle_prefix_requires_fail_closed(&benign));
+
+    benign.extend_from_slice(b"\nplain footer\n");
+    assert!(!has_pickle_prefix(&benign));
+    assert!(!truncated_pickle_prefix_requires_fail_closed(&benign));
+}
+
+#[test]
+fn structured_execution_setup_survives_a_truncated_protocol0_line() {
+    let mut payload = b"Vos\nVsystem\n\x93p0\n0(S'true'\ntp1\n0S'".to_vec();
+    payload.resize(TEST_MAX_NESTED_PICKLE_BYTES, b'A');
+
+    let error = pickle_payload_extent_result(&payload, payload.len())
+        .expect_err("structured execution before a clipped line should remain fail-closed");
+
+    assert!(error.is_structured_protocol0_line_operand_truncated());
 }
 
 #[test]
@@ -308,6 +357,8 @@ fn execution_opcode_detection_distinguishes_structural_nested_payloads() {
     assert!(!has_execution_opcode(
         b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
     ));
+    assert!(!has_structured_execution_prefix(b"dom benign footer\n"));
+    assert!(has_structured_execution_prefix(b"cos\nsystem\n)R."));
 }
 
 #[test]

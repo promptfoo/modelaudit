@@ -13,9 +13,10 @@ use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
-    has_binary_pickle_prefix, has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
-    nested_pickle_probe_offsets, pickle_payload_extent_result,
-    protocol0_global_or_inst_prefix_has_import_reference_lines,
+    has_binary_pickle_prefix, has_execution_opcode, has_pickle_prefix,
+    has_structured_execution_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
+    pickle_payload_extent_result, protocol0_global_or_inst_prefix_has_import_reference_lines,
+    protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line,
     truncated_pickle_prefix_requires_fail_closed, DecodedNestedPayload, NestedProbeOffsets,
     MAX_NESTED_PAYLOAD_PROBES,
 };
@@ -5798,6 +5799,8 @@ impl<'a> ScanState<'a> {
                 continue;
             }
             let remaining_len = value.len().saturating_sub(offset);
+            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
+            let full_candidate = &value[offset..];
             let end = value
                 .len()
                 .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
@@ -5823,15 +5826,23 @@ impl<'a> ScanState<'a> {
                     skip_offsets_before = offset.saturating_add(payload_len);
                     continue;
                 }
-                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                Err(error)
+                    if error.is_structured_protocol0_line_operand_limit()
+                        || (candidate_truncated
+                            && error.is_structured_protocol0_line_operand_truncated()) =>
+                {
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
+                    if candidate_truncated && error.is_structured_protocol0_line_operand_truncated()
+                    {
+                        self.record_raw_nested_payload_truncated(remaining_len, position + offset);
+                    }
                     return;
                 }
                 Ok(None) | Err(_) => {}
             }
             if has_pickle_prefix(probe)
                 && has_execution_opcode(probe)
-                && (allow_ambiguous_malformed_prefix
+                && (allow_ambiguous_malformed_prefix && has_structured_execution_prefix(probe)
                     || has_binary_pickle_prefix(probe)
                     || protocol0_global_or_inst_prefix_has_import_reference_lines(probe))
             {
@@ -5846,8 +5857,12 @@ impl<'a> ScanState<'a> {
                 }
                 return;
             }
-            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated && truncated_pickle_prefix_requires_fail_closed(probe) {
+            if candidate_truncated
+                && (truncated_pickle_prefix_requires_fail_closed(probe)
+                    || protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line(
+                        full_candidate,
+                    ))
+            {
                 self.add_nested_payload_finding(
                     raw_nested_payload_finding(remaining_len, position + offset, true, false),
                     true,
@@ -5870,6 +5885,7 @@ impl<'a> ScanState<'a> {
             for relative_offset in probe_offsets.offsets.iter().copied() {
                 let offset = search_start.saturating_add(relative_offset);
                 let remaining_len = value.len().saturating_sub(offset);
+                let full_candidate = &value[offset..];
                 let end = value
                     .len()
                     .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
@@ -5878,18 +5894,20 @@ impl<'a> ScanState<'a> {
                     pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
                 let complete_payload = last_stop_offset.is_some_and(|stop| offset < stop)
                     && matches!(&payload_extent, Ok(Some(_)));
-                let operand_limit_exceeded = payload_extent
-                    .as_ref()
-                    .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
+                let operand_failure = payload_extent.as_ref().is_err_and(|error| {
+                    error.is_structured_protocol0_line_operand_limit()
+                        || (remaining_len > self.options.max_nested_pickle_bytes
+                            && error.is_structured_protocol0_line_operand_truncated())
+                });
                 let malformed_payload = has_execution_opcode(probe)
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
                 let truncated_payload = remaining_len > self.options.max_nested_pickle_bytes
-                    && truncated_pickle_prefix_requires_fail_closed(probe);
-                if !complete_payload
-                    && !operand_limit_exceeded
-                    && !malformed_payload
-                    && !truncated_payload
+                    && (truncated_pickle_prefix_requires_fail_closed(probe)
+                        || protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line(
+                            full_candidate,
+                        ));
+                if !complete_payload && !operand_failure && !malformed_payload && !truncated_payload
                 {
                     continue;
                 }

@@ -105,6 +105,7 @@ pub(crate) struct ParseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseErrorKind {
     Generic,
+    Protocol0LineOperandTruncated,
     Protocol0LineOperandLimit,
 }
 
@@ -143,8 +144,21 @@ impl ParseError {
         }
     }
 
+    fn protocol0_line_operand_truncated(read_kind: &'static str, index: usize) -> Self {
+        Self {
+            message: format!("no newline found when trying to read {read_kind}"),
+            exception_type: "ValueError",
+            report_index: Some(index),
+            kind: ParseErrorKind::Protocol0LineOperandTruncated,
+        }
+    }
+
     pub(crate) fn is_protocol0_line_operand_limit(&self) -> bool {
         self.kind == ParseErrorKind::Protocol0LineOperandLimit
+    }
+
+    pub(crate) fn is_protocol0_line_operand_truncated(&self) -> bool {
+        self.kind == ParseErrorKind::Protocol0LineOperandTruncated
     }
 }
 pub(crate) fn parse_opcode(
@@ -596,10 +610,10 @@ fn read_line_bytes_kind(
 ) -> Result<Vec<u8>, ParseError> {
     let report_index = limit.min(payload.len());
     if *cursor >= limit {
-        return Err(
-            ParseError::new(format!("no newline found when trying to read {read_kind}"))
-                .at(report_index),
-        );
+        return Err(ParseError::protocol0_line_operand_truncated(
+            read_kind,
+            report_index,
+        ));
     }
     let payload_end = limit.min(payload.len());
     let search_end =
@@ -612,8 +626,7 @@ fn read_line_bytes_kind(
             if payload_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {
                 ParseError::protocol0_line_operand_limit(read_kind, search_end)
             } else {
-                ParseError::new(format!("no newline found when trying to read {read_kind}"))
-                    .at(report_index)
+                ParseError::protocol0_line_operand_truncated(read_kind, report_index)
             }
         })?;
     if line_end.saturating_sub(*cursor) > MAX_PROTOCOL0_LINE_OPERAND_BYTES {

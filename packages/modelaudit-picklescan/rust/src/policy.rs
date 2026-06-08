@@ -26,6 +26,14 @@ pub(crate) fn global_import_is_allowlisted(module: &str, name: &str) -> bool {
         || legacy_pickle_compat_reference_is_allowlisted(module, name)
 }
 
+pub(crate) fn global_module_has_dangerous_callables(module: &str) -> bool {
+    BUILTIN_MODULES.contains(&module)
+        || DANGEROUS_WILDCARD_MODULES.contains(&module)
+        || DANGEROUS_GLOBALS
+            .iter()
+            .any(|(dangerous_module, _)| *dangerous_module == module)
+}
+
 fn legacy_pickle_compat_reference_is_allowlisted(module: &str, name: &str) -> bool {
     (module == "copy_reg" && name == "_reconstructor")
         || (module == "exceptions" && LEGACY_BUILTIN_EXCEPTION_NAMES.contains(&name))

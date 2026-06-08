@@ -1,4 +1,5 @@
 use crate::opcode::{parse_opcode, ParseError, ParsedOpcode, MAX_PROTOCOL0_LINE_OPERAND_BYTES};
+use crate::policy::global_module_has_dangerous_callables;
 
 const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -32,6 +33,10 @@ pub(crate) struct PicklePayloadExtentError {
 impl PicklePayloadExtentError {
     pub(crate) fn is_structured_protocol0_line_operand_limit(&self) -> bool {
         self.structured_pickle_evidence && self.error.is_protocol0_line_operand_limit()
+    }
+
+    pub(crate) fn is_structured_protocol0_line_operand_truncated(&self) -> bool {
+        self.structured_pickle_evidence && self.error.is_protocol0_line_operand_truncated()
     }
 }
 
@@ -160,7 +165,10 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
         let bounded = take_bytes_str(stripped, max_base64_probe_chars);
         let padded = pad_base64(&bounded);
         if let Some(decoded) = decode_base64(&padded) {
-            if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
+            if decoded.len() > max_nested_pickle_bytes
+                && (has_pickle_prefix(&decoded)
+                    || protocol0_global_or_inst_prefix_has_truncated_name_line(&decoded))
+            {
                 detected.push(("base64", estimate_base64_decoded_size(stripped)));
             }
         }
@@ -179,7 +187,10 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
             && !is_repeated_single_char(&hex_candidate)
         {
             if let Some(decoded) = decode_hex(&hex_candidate) {
-                if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
+                if decoded.len() > max_nested_pickle_bytes
+                    && (has_pickle_prefix(&decoded)
+                        || protocol0_global_or_inst_prefix_has_truncated_name_line(&decoded))
+                {
                     detected.push((encoding, estimate_hex_decoded_size(stripped)));
                 }
             }
@@ -213,7 +224,7 @@ pub(crate) fn pickle_payload_extent_result(
     while index < value.len() {
         let parsed = parse_opcode(value, index, value.len()).map_err(|error| {
             let structured_suffix_evidence =
-                protocol0_line_operand_limit_has_structured_evidence(value, index, &error);
+                protocol0_line_operand_failure_has_structured_evidence(value, index, &error);
             PicklePayloadExtentError {
                 error,
                 structured_pickle_evidence: structured_pickle_evidence
@@ -252,6 +263,10 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
         }
     }
     false
+}
+
+pub(crate) fn has_structured_execution_prefix(value: &[u8]) -> bool {
+    has_execution_opcode(value) && pickle_prefix_has_structured_opcodes(value, true)
 }
 
 fn validate_pickle_stack_effect(
@@ -406,7 +421,7 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
     }
     has_binary_pickle_prefix(value)
         || protocol0_global_or_inst_prefix_has_complete_lines(value)
-        || protocol0_global_or_inst_prefix_has_oversized_name_line(value)
+        || protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line(value)
         || matches!(value[0], b'(' | b'd' | b'l' | b'I' | b'S' | b'V')
         || pickle_prefix_has_structured_opcodes(value, false)
 }
@@ -418,6 +433,7 @@ pub(crate) fn has_binary_pickle_prefix(value: &[u8]) -> bool {
 pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool {
     (has_binary_pickle_prefix(value) && pickle_prefix_has_structured_opcodes(value, true))
         || protocol0_global_or_inst_prefix_has_lines(value)
+        || protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line(value)
         || has_execution_opcode(value)
 }
 
@@ -444,6 +460,11 @@ fn pickle_prefix_has_structured_opcodes(value: &[u8], allow_truncated: bool) -> 
                 return saw_probe_anchor && parsed_count >= 2;
             }
         };
+        if matches!(parsed.name, "GLOBAL" | "INST")
+            && !protocol0_opcode_operands_are_plausible(&parsed, value)
+        {
+            return false;
+        }
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
             return false;
         }
@@ -554,7 +575,9 @@ fn is_pickle_prefix_start_byte(byte: u8) -> bool {
     )
 }
 
-fn protocol0_global_or_inst_prefix_has_oversized_name_line(value: &[u8]) -> bool {
+pub(crate) fn protocol0_global_or_inst_prefix_has_long_or_overlimit_name_line(
+    value: &[u8],
+) -> bool {
     let Some((module, name_start)) = protocol0_global_or_inst_prefix_module_line(value) else {
         return false;
     };
@@ -565,22 +588,69 @@ fn protocol0_global_or_inst_prefix_has_oversized_name_line(value: &[u8]) -> bool
     let bounded_name_end = value
         .len()
         .min(name_start.saturating_add(MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1));
-    if value[name_start..bounded_name_end].contains(&b'\n') || bounded_name_end == value.len() {
-        return false;
+    let name_probe = &value[name_start..bounded_name_end];
+    match name_probe.iter().position(|byte| *byte == b'\n') {
+        Some(name_end) => {
+            name_end > 256
+                && protocol0_global_or_inst_suffix_is_structured(
+                    &value[name_start + name_end + 1..],
+                )
+        }
+        None => {
+            name_probe.len() > MAX_PROTOCOL0_LINE_OPERAND_BYTES
+                && std::str::from_utf8(module)
+                    .ok()
+                    .is_some_and(global_module_has_dangerous_callables)
+        }
     }
-    value[bounded_name_end..].contains(&b'\n')
 }
 
-fn protocol0_line_operand_limit_has_structured_evidence(
+fn protocol0_global_or_inst_suffix_is_structured(value: &[u8]) -> bool {
+    let mut index = 0usize;
+    let mut stack_depth = 1usize;
+    let mut mark_depths = Vec::new();
+    let mut parsed_count = 0usize;
+    while index < value.len() && parsed_count < 64 {
+        let Ok(parsed) = parse_opcode(value, index, value.len()) else {
+            return false;
+        };
+        if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
+            return false;
+        }
+        parsed_count += 1;
+        index = parsed.next;
+        if parsed.name == "STOP" {
+            return stack_depth > 0;
+        }
+    }
+    false
+}
+
+fn protocol0_global_or_inst_prefix_has_truncated_name_line(value: &[u8]) -> bool {
+    let Some((module, name_start)) = protocol0_global_or_inst_prefix_module_line(value) else {
+        return false;
+    };
+    is_protocol0_import_reference(module)
+        && std::str::from_utf8(module)
+            .ok()
+            .is_some_and(global_module_has_dangerous_callables)
+        && value[name_start..].len() > 256
+        && !value[name_start..].contains(&b'\n')
+}
+
+fn protocol0_line_operand_failure_has_structured_evidence(
     value: &[u8],
     opcode_index: usize,
     error: &ParseError,
 ) -> bool {
-    if !error.is_protocol0_line_operand_limit() {
+    if !error.is_protocol0_line_operand_limit() && !error.is_protocol0_line_operand_truncated() {
         return false;
     }
     if matches!(value.get(opcode_index).copied(), Some(b'c' | b'i')) {
         return true;
+    }
+    if !error.is_protocol0_line_operand_limit() {
+        return false;
     }
     let search_start = error.report_index.unwrap_or(0).min(value.len());
     let Some(relative_newline) = value[search_start..].iter().position(|byte| *byte == b'\n')
@@ -590,7 +660,22 @@ fn protocol0_line_operand_limit_has_structured_evidence(
     let suffix_start = search_start
         .saturating_add(relative_newline)
         .saturating_add(1);
-    has_execution_opcode(&value[suffix_start..])
+    protocol0_suffix_has_structured_execution(&value[suffix_start..])
+}
+
+fn protocol0_suffix_has_structured_execution(value: &[u8]) -> bool {
+    let probe_offsets = nested_pickle_probe_offsets(value);
+    if probe_offsets.limit_exceeded {
+        return true;
+    }
+    probe_offsets.offsets.into_iter().any(|offset| {
+        let candidate = &value[offset..];
+        match pickle_payload_extent_result(candidate, candidate.len()) {
+            Ok(Some(payload_len)) => has_execution_opcode(&candidate[..payload_len]),
+            Err(error) => error.is_structured_protocol0_line_operand_limit(),
+            Ok(None) => false,
+        }
+    })
 }
 
 fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
