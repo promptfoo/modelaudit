@@ -12,11 +12,15 @@ MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
 SCAN_LIMIT_OVERHEAD_BYTES = 16
 
 
-def _nested_overlong_protocol0_line_operand() -> bytes:
+def _overlong_protocol0_operand_body() -> bytes:
     # Protocol 0 line operand length includes the surrounding single quotes.
     overlong_line_operand_bytes = MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1
     overlong_operand_body_bytes = overlong_line_operand_bytes - len(b"''")
-    return b"cos\nsystem\n(S'" + (b"A" * overlong_operand_body_bytes) + b"'\ntR."
+    return b"A" * overlong_operand_body_bytes
+
+
+def _nested_overlong_protocol0_line_operand() -> bytes:
+    return b"cos\nsystem\n(S'" + _overlong_protocol0_operand_body() + b"'\ntR."
 
 
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
@@ -148,7 +152,7 @@ def test_scan_bytes_fails_closed_when_nested_overlong_protocol0_operand_hits_dep
 def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_after_inst(
     as_unicode: bool,
 ) -> None:
-    nested_payload = b"(ios\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
+    nested_payload = b"(ios\nsystem\n(S'" + _overlong_protocol0_operand_body() + b"'\ntR."
     nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
     payload = pickle.dumps(nested_value, protocol=4)
 
@@ -156,8 +160,8 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_afte
         payload,
         source="nested-inst-overlong-protocol0-string.pkl",
         options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + 16,
-            max_string_literal_scan_chars=len(nested_payload) + 16,
+            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
         ),
     )
 
