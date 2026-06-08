@@ -204,6 +204,27 @@ def test_recursive_export_values_fail_closed() -> None:
     assert redact_source_value(recursive) == {"nested": "<redacted recursive value>"}
 
 
+def test_redact_source_value_preserves_colliding_mapping_entries() -> None:
+    first_url = "https://example.com/model.pkl?token=first-secret"
+    second_url = "https://example.com/model.pkl?token=second-secret"
+
+    redacted = redact_source_value(
+        {
+            first_url: {"finding": "first"},
+            second_url: {"finding": "second"},
+        }
+    )
+
+    assert isinstance(redacted, dict)
+    assert list(redacted.values()) == [{"finding": "first"}, {"finding": "second"}]
+    assert list(redacted) == [
+        "https://example.com/model.pkl",
+        "https://example.com/model.pkl#modelaudit-redacted-key-2",
+    ]
+    assert "first-secret" not in repr(redacted)
+    assert "second-secret" not in repr(redacted)
+
+
 @pytest.mark.parametrize(
     "raw_path",
     [

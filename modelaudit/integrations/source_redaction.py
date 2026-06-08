@@ -281,14 +281,15 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
             return "<redacted recursive value>"
         seen.add(id(value))
         try:
-            return {
-                _redact_mapping_key(key): (
+            redacted_mapping: dict[Any, Any] = {}
+            for key, item in value.items():
+                redacted_key = _unique_redacted_mapping_key(_redact_mapping_key(key), redacted_mapping)
+                redacted_mapping[redacted_key] = (
                     "<redacted>"
                     if _mapping_key_requires_redaction(key)
                     else _redact_source_value(item, seen=seen, depth=depth + 1)
                 )
-                for key, item in value.items()
-            }
+            return redacted_mapping
         finally:
             seen.remove(id(value))
     if isinstance(value, list):
@@ -447,6 +448,8 @@ def _redact_local_path_suffix(source: str) -> str:
 
 
 def _mapping_key_requires_redaction(key: Any) -> bool:
+    if isinstance(key, str) and redact_source_identifier(key) != key:
+        return False
     if _is_sensitive_export_key(key):
         return True
     if isinstance(key, bytes):
@@ -638,3 +641,16 @@ def _redact_mapping_key(value: Any) -> str | int | float | bool | None:
     if isinstance(redacted, (str, int, float, bool)) or redacted is None:
         return redacted
     return str(redacted)
+
+
+def _unique_redacted_mapping_key(key: Any, mapping: dict[Any, Any]) -> Any:
+    """Preserve entries whose credential-safe mapping keys collide."""
+    if key not in mapping:
+        return key
+    base_key = str(key)
+    occurrence = 2
+    candidate = f"{base_key}#modelaudit-redacted-key-{occurrence}"
+    while candidate in mapping:
+        occurrence += 1
+        candidate = f"{base_key}#modelaudit-redacted-key-{occurrence}"
+    return candidate
