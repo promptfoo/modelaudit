@@ -136,10 +136,14 @@ def stream_analyze_file(
     try:
         # Get file info first
         info = fs.info(url)
-        file_size = info.get("size", 0)
-
-        if file_size == 0:
-            return None, True
+        reported_file_size = info.get("size")
+        known_file_size = (
+            reported_file_size
+            if isinstance(reported_file_size, int)
+            and not isinstance(reported_file_size, bool)
+            and reported_file_size > 0
+            else None
+        )
 
         configured_max_bytes: object = max_bytes
         if configured_max_bytes is None:
@@ -147,13 +151,13 @@ def stream_analyze_file(
         resolved_max_bytes = resolve_streaming_max_bytes(configured_max_bytes)
 
         # Determine how much to request from the remote object.
-        bytes_to_read = min(file_size, resolved_max_bytes)
+        bytes_to_read = min(known_file_size, resolved_max_bytes) if known_file_size is not None else resolved_max_bytes
 
         # Read partial content
         with fs.open(url, "rb") as f:
             content = f.read(bytes_to_read)
         bytes_read = len(content)
-        bytes_complete = bytes_read >= file_size
+        bytes_complete = known_file_size is not None and bytes_read == known_file_size
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)
@@ -235,7 +239,7 @@ def stream_analyze_file(
                                 "pattern": pattern.decode("utf-8", errors="ignore"),
                                 "detection_method": "streaming_header_scan",
                                 "bytes_analyzed": bytes_read,
-                                "file_size": file_size,
+                                "file_size": reported_file_size,
                                 "analysis_complete": False,
                             },
                             type="streaming_security_check",
@@ -283,7 +287,8 @@ def stream_analyze_file(
             "bytes_analyzed": bytes_read,
             "bytes_complete": bytes_complete,
             "analysis_complete": analysis_complete,
-            "file_size": file_size,
+            "file_size": reported_file_size,
+            "file_size_known": known_file_size is not None,
             "max_bytes": resolved_max_bytes,
         }
         result.metadata.update(metadata)
