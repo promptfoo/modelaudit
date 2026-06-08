@@ -668,9 +668,10 @@ class TelemetryClient:
     @staticmethod
     def _sanitize_mlflow_reference(path: str) -> str:
         """Remove secret-shaped MLflow model identifiers before telemetry export."""
+        from .integrations.mlflow import _redact_mlflow_error_for_display
         from .scanners._evidence_redaction import redact_evidence_string
 
-        return redact_evidence_string(path, max_chars=512)
+        return redact_evidence_string(_redact_mlflow_error_for_display(path), max_chars=512)
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""

@@ -1163,10 +1163,35 @@ def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
     }
 
 
+def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() -> None:
+    model_uri = "models:/PublicModel/1?auth=QUERYSECRET123&session=SESSIONSECRET123"
+    boundary_error = "x" * 470 + " artifact_uri=///user:BUDGETPARTIALSECRET1234567890@host/model"
+    result = _mlflow_budget_failure_result(
+        model_uri,
+        "MLflow artifact download refused",
+        {
+            "model_uri": model_uri,
+            "nested": {"source": "models:/OtherModel/2?code=CODESECRET123&jwt=JWTSECRET123"},
+            "boundary_error": boundary_error,
+        },
+    )
+
+    serialized_result = result.model_dump_json()
+    for secret in ("QUERYSECRET123", "SESSIONSECRET123", "CODESECRET123", "JWTSECRET123"):
+        assert secret not in serialized_result
+    assert "BUDGETPARTIAL" not in serialized_result
+    assert result.checks[0].location == "models:/PublicModel/1?auth=<redacted>&session=<redacted>"
+    assert result.checks[0].details["nested"]["source"] == ("models:/OtherModel/2?code=<redacted>&jwt=<redacted>")
+
+
 @pytest.mark.parametrize(
     "source",
     [
         "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
+        "///user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
+        "\\\\user:RELATIVEPASS123@mlflow.example\\model?token=QUERYSECRET123",
+        "\\/\\/user:RELATIVEPASS123@mlflow.example\\/model?token=QUERYSECRET123",
+        "%2F%2F%2Fuser%3ARELATIVEPASS123%40mlflow.example%2Fmodel%3Ftoken%3DQUERYSECRET123",
         "%252F%252Fuser%253ARELATIVEPASS123%2540mlflow.example%252Fmodel%253Ftoken%253DQUERYSECRET123",
     ],
 )
@@ -1176,6 +1201,17 @@ def test_redact_mlflow_error_handles_protocol_relative_userinfo(source: str) -> 
     assert "mlflow.example/model" in redacted
     assert "RELATIVEPASS123" not in redacted
     assert "QUERYSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "///folder/user@mlflow.example/model",
+        "\\\\mlflow.example\\folder\\user@label",
+    ],
+)
+def test_redact_mlflow_error_preserves_non_authority_at_signs(source: str) -> None:
+    assert _redact_mlflow_error_for_display(f"artifact_uri={source}") == f"artifact_uri={source}"
 
 
 def test_redact_mlflow_error_handles_deeply_encoded_protocol_relative_userinfo() -> None:
@@ -1220,6 +1256,41 @@ def test_redact_mlflow_error_handles_credential_containers(details: str) -> None
 )
 def test_redact_mlflow_error_preserves_benign_auth_diagnostics(message: str) -> None:
     assert _redact_mlflow_error_for_display(message) == message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "headers[Authorization]=BRACKETSECRET123",
+        "request.headers[proxy-authorization]=Bearer SHORT",
+        "headers[proxy_authorization]=PROXYSECRET123",
+        "headers[X-Api-Key]=HEADERSECRET123",
+        "headers[Credentials]=CREDENTIALSECRET123",
+        "headers[auth]=AUTHSECRET123",
+        "headers[Cookie]=COOKIESECRET123",
+        "headers[session]=SESSIONSECRET123",
+        "headers[jwt]=JWTSECRET123",
+        "headers[key]=KEYSECRET123",
+        "params[api_key]='PARAMSECRET123'",
+        "params[client_secret]=CLIENTSECRET123",
+        "query[refresh_token]=REFRESHSECRET123",
+    ],
+)
+def test_redact_mlflow_error_handles_bracketed_sensitive_keys(message: str) -> None:
+    redacted = _redact_mlflow_error_for_display(message)
+
+    assert "<redacted>" in redacted
+    assert "SECRET" not in redacted
+    assert "Bearer SHORT" not in redacted
+
+
+def test_redact_mlflow_error_preserves_benign_bracketed_keys() -> None:
+    for message in (
+        "headers[Content-Type]=application/json",
+        "headers[X-Api-Version]=2026-06-08",
+        "params[region]=us-east-1",
+    ):
+        assert _redact_mlflow_error_for_display(message) == message
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
