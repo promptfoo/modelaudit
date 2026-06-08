@@ -1,4 +1,4 @@
-use crate::opcode::{parse_opcode, ParsedOpcode};
+use crate::opcode::{parse_opcode, ParseError, ParsedOpcode};
 
 const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -18,10 +18,27 @@ pub(crate) struct EncodedNestedProbeWindows {
     pub(crate) limit_exceeded_encoding: Option<&'static str>,
 }
 
+pub(crate) struct DecodedNestedPayload {
+    pub(crate) encoding: &'static str,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) analysis_incomplete: bool,
+}
+
+pub(crate) struct PicklePayloadExtentError {
+    error: ParseError,
+    structured_pickle_evidence: bool,
+}
+
+impl PicklePayloadExtentError {
+    pub(crate) fn is_structured_protocol0_line_operand_limit(&self) -> bool {
+        self.structured_pickle_evidence && self.error.is_protocol0_line_operand_limit()
+    }
+}
+
 pub(crate) fn decode_possible_encoded_pickle(
     value: &str,
     max_nested_pickle_bytes: usize,
-) -> Vec<(&'static str, Vec<u8>)> {
+) -> Vec<DecodedNestedPayload> {
     let stripped = value.trim();
     if stripped.len() < 16 || !encoded_literal_may_contain_pickle(stripped) {
         return Vec::new();
@@ -37,8 +54,14 @@ pub(crate) fn decode_possible_encoded_pickle(
             let bounded = take_bytes_str(&candidate, max_base64_nested_pickle_chars);
             let padded = pad_base64(&bounded);
             if let Some(decoded) = decode_base64(&padded) {
-                for payload in decoded_pickle_payloads(&decoded, max_nested_pickle_bytes) {
-                    decoded_values.push(("base64", payload));
+                for (payload, analysis_incomplete) in
+                    decoded_pickle_payloads(&decoded, max_nested_pickle_bytes)
+                {
+                    decoded_values.push(DecodedNestedPayload {
+                        encoding: "base64",
+                        payload,
+                        analysis_incomplete,
+                    });
                 }
             }
         }
@@ -57,8 +80,14 @@ pub(crate) fn decode_possible_encoded_pickle(
                 let bounded_hex_candidate =
                     take_bytes_str(&hex_candidate, max_hex_nested_pickle_chars);
                 if let Some(decoded) = decode_hex(&bounded_hex_candidate) {
-                    for payload in decoded_pickle_payloads(&decoded, max_nested_pickle_bytes) {
-                        decoded_values.push((encoding, payload));
+                    for (payload, analysis_incomplete) in
+                        decoded_pickle_payloads(&decoded, max_nested_pickle_bytes)
+                    {
+                        decoded_values.push(DecodedNestedPayload {
+                            encoding,
+                            payload,
+                            analysis_incomplete,
+                        });
                     }
                 }
             }
@@ -68,15 +97,22 @@ pub(crate) fn decode_possible_encoded_pickle(
     decoded_values
 }
 
-fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Vec<Vec<u8>> {
+fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Vec<(Vec<u8>, bool)> {
     let mut payloads = Vec::new();
     let mut search_start = 0usize;
-    if let Some(payload_len) = pickle_payload_extent(decoded, max_nested_pickle_bytes) {
-        payloads.push(decoded[..payload_len].to_vec());
-        search_start = payload_len;
-        if search_start >= decoded.len() {
+    match pickle_payload_extent_result(decoded, max_nested_pickle_bytes) {
+        Ok(Some(payload_len)) => {
+            payloads.push((decoded[..payload_len].to_vec(), false));
+            search_start = payload_len;
+            if search_start >= decoded.len() {
+                return payloads;
+            }
+        }
+        Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+            payloads.push((decoded.to_vec(), true));
             return payloads;
         }
+        Ok(None) | Err(_) => {}
     }
 
     let mut seen_spans = Vec::new();
@@ -86,15 +122,23 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
             .len()
             .min(offset.saturating_add(max_nested_pickle_bytes));
         let probe = &decoded[offset..end];
-        let Some(payload_len) = pickle_payload_extent(probe, max_nested_pickle_bytes) else {
-            continue;
-        };
+        let (payload_len, analysis_incomplete) =
+            match pickle_payload_extent_result(probe, max_nested_pickle_bytes) {
+                Ok(Some(payload_len)) => (payload_len, false),
+                Err(error) if error.is_structured_protocol0_line_operand_limit() => {
+                    (probe.len(), true)
+                }
+                Ok(None) | Err(_) => continue,
+            };
         let span = (offset, offset.saturating_add(payload_len));
         if seen_spans.contains(&span) {
             continue;
         }
         seen_spans.push(span);
-        payloads.push(decoded[span.0..span.1].to_vec());
+        payloads.push((decoded[span.0..span.1].to_vec(), analysis_incomplete));
+        if analysis_incomplete {
+            break;
+        }
     }
     payloads
 }
@@ -150,26 +194,38 @@ pub(crate) fn looks_like_pickle_payload(value: &[u8], max_bytes: usize) -> bool 
 }
 
 pub(crate) fn pickle_payload_extent(value: &[u8], max_bytes: usize) -> Option<usize> {
+    pickle_payload_extent_result(value, max_bytes)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn pickle_payload_extent_result(
+    value: &[u8],
+    max_bytes: usize,
+) -> Result<Option<usize>, PicklePayloadExtentError> {
     if value.len() < 2 || value.len() > max_bytes || !has_pickle_prefix(value) {
-        return None;
+        return Ok(None);
     }
     let mut index = 0usize;
     let mut stack_depth = 0usize;
     let mut mark_depths: Vec<usize> = Vec::new();
+    let mut structured_pickle_evidence = has_binary_pickle_prefix(value);
     while index < value.len() {
-        let parsed = match parse_opcode(value, index, value.len()) {
-            Ok(parsed) => parsed,
-            Err(_) => return None,
-        };
+        let parsed =
+            parse_opcode(value, index, value.len()).map_err(|error| PicklePayloadExtentError {
+                error,
+                structured_pickle_evidence,
+            })?;
         index = parsed.next;
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
-            return None;
+            return Ok(None);
         }
+        structured_pickle_evidence |= is_structured_nested_probe_anchor(parsed.name);
         if parsed.name == "STOP" {
-            return (stack_depth > 0).then_some(index);
+            return Ok((stack_depth > 0).then_some(index));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
@@ -1210,8 +1266,9 @@ mod tests {
         let decoded = decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES);
 
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0, "base64");
-        assert_eq!(decoded[0].1, b"cos\nsystem\n)R.");
+        assert_eq!(decoded[0].encoding, "base64");
+        assert_eq!(decoded[0].payload, b"cos\nsystem\n)R.");
+        assert!(!decoded[0].analysis_incomplete);
     }
 
     #[test]
@@ -1223,10 +1280,67 @@ mod tests {
 
         assert!(decoded
             .iter()
-            .any(|(encoding, payload)| *encoding == "base64" && payload == b"\x80\x04}."));
+            .any(|candidate| candidate.encoding == "base64" && candidate.payload == b"\x80\x04}."));
         assert!(decoded
             .iter()
-            .any(|(encoding, payload)| *encoding == "base64" && payload == b"cos\nsystem\n)R."));
+            .any(|candidate| candidate.encoding == "base64"
+                && candidate.payload == b"cos\nsystem\n)R."));
+    }
+
+    #[test]
+    fn decoded_payloads_preserve_protocol0_operand_limit_failures() {
+        let mut payload = b"cos\nsystem\n(S'".to_vec();
+        payload.resize(
+            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
+            b'A',
+        );
+        payload.extend_from_slice(b"'\ntR.");
+
+        let decoded = decoded_pickle_payloads(&payload, payload.len() + 16);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, payload);
+        assert!(decoded[0].1);
+    }
+
+    #[test]
+    fn decoded_payloads_ignore_unstructured_protocol0_operand_limit_failures() {
+        let mut payload = b"S'".to_vec();
+        payload.resize(
+            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1,
+            b'A',
+        );
+
+        assert!(decoded_pickle_payloads(&payload, payload.len() + 16).is_empty());
+        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
+            .expect_err("overlong protocol 0 string should preserve its parse error");
+        assert!(!error.is_structured_protocol0_line_operand_limit());
+    }
+
+    #[test]
+    fn protocol0_operand_limit_requires_prior_structured_opcode() {
+        let mut payload = b"cos\nsystem\n(S'".to_vec();
+        payload.resize(
+            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
+            b'A',
+        );
+
+        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
+            .expect_err("overlong nested operand should preserve its parse error");
+        assert!(error.is_structured_protocol0_line_operand_limit());
+    }
+
+    #[test]
+    fn protocol0_operand_limit_tracks_structured_evidence_beyond_prefix_probe() {
+        let mut payload = b"(NNNNcos\nsystem\n(S'".to_vec();
+        payload.resize(
+            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
+            b'A',
+        );
+
+        let error = pickle_payload_extent_result(&payload, payload.len() + 16)
+            .expect_err("structured evidence after setup opcodes should survive the operand cap");
+        assert!(error.is_structured_protocol0_line_operand_limit());
     }
 
     #[test]
