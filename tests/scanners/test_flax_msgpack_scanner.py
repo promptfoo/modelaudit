@@ -15,7 +15,6 @@ pytest.importorskip("msgpack")
 
 import msgpack
 
-import modelaudit.scanners.flax_msgpack_scanner as flax_msgpack_scanner
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import _create_results
@@ -25,6 +24,7 @@ from modelaudit.scanners.flax_msgpack_scanner import (
     _UNBOUNDED_GETATTR_PATTERN,
     FlaxMsgpackScanner,
     _matching_jax_transforms,
+    _pattern_has_stream_unsafe_repeat,
 )
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
@@ -798,7 +798,7 @@ def test_flax_msgpack_large_binary_preserves_cross_chunk_findings_without_re_par
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(flax_msgpack_scanner, "_get_regex_parser", lambda: None)
+    monkeypatch.setattr("modelaudit.scanners.flax_msgpack_scanner._get_regex_parser", lambda: None)
     path = tmp_path / "large_binary_pattern_without_re_parser.msgpack"
     stream_chunk_bytes = 64 * 1024
     prefix = b"x" * (stream_chunk_bytes - 3)
@@ -814,7 +814,7 @@ def test_flax_msgpack_large_binary_preserves_cross_chunk_findings_without_re_par
 
 
 def test_stream_repeat_fallback_without_re_parser(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(flax_msgpack_scanner, "_get_regex_parser", lambda: None)
+    monkeypatch.setattr("modelaudit.scanners.flax_msgpack_scanner._get_regex_parser", lambda: None)
 
     for pattern in (
         r"os\.system",
@@ -824,7 +824,7 @@ def test_stream_repeat_fallback_without_re_parser(monkeypatch: pytest.MonkeyPatc
         r"eval\s{1,}\(",
         r"[\s+]",
     ):
-        assert flax_msgpack_scanner._pattern_has_stream_unsafe_repeat(pattern) is False
+        assert _pattern_has_stream_unsafe_repeat(pattern) is False
 
     for pattern in (
         r"eval.*\(",
@@ -835,7 +835,7 @@ def test_stream_repeat_fallback_without_re_parser(monkeypatch: pytest.MonkeyPatc
         r"BEGIN.{5000}END",
         r"\\s+",
     ):
-        assert flax_msgpack_scanner._pattern_has_stream_unsafe_repeat(pattern) is True
+        assert _pattern_has_stream_unsafe_repeat(pattern) is True
 
 
 def test_flax_msgpack_large_binary_does_not_join_tokens_across_invalid_utf8(tmp_path: Path) -> None:
@@ -1714,6 +1714,19 @@ def test_flax_msgpack_redacts_openai_project_key_across_persisted_outputs(tmp_pa
         assert cache_stats["cache_hits"] == 1
     finally:
         reset_cache_manager()
+
+
+def test_flax_msgpack_unresolved_binary_pattern_aggregate_exits_with_error_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_unbounded_pattern.msgpack"
+    gap = b"x" * (64 * 1024 + 4096 + 100)
+    payload = b"getattr(object" + gap + b", '__custom_hook__')"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON,
+        tmp_path / "binary-pattern-cache",
+    )
 
 
 def test_flax_msgpack_stringifies_extension_metadata_keys(tmp_path: Path) -> None:
