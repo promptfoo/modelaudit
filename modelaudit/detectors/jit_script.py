@@ -11,6 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import builtins
+import codeop
 import json
 import re
 import textwrap
@@ -39,6 +40,7 @@ _FunctionAliasSummary = tuple[
     tuple[tuple[str, int], ...],
 ]
 _ContainerValue = TypeVar("_ContainerValue")
+_TypedMemberCallableValue = frozenset[tuple[str, str, bool]]
 
 
 def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
@@ -369,6 +371,23 @@ def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0
     return False
 
 
+def _embedded_python_source_start_budget_exceeded(data: bytes, *, start_offset: int = 0) -> bool:
+    """Return whether bounded candidate selection must omit source-like starts."""
+    if len(_priority_import_sites(data[start_offset:])) > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+        return True
+    source_start_probes = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data, start_offset):
+        cursor = match.start()
+        while cursor > 0 and data[cursor - 1] in b" \t\r":
+            cursor -= 1
+        if cursor > 0 and data[cursor - 1] != 0x0A and 0x20 <= data[cursor - 1] < 0x7F:
+            continue
+        source_start_probes += 1
+        if source_start_probes > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+            return True
+    return False
+
+
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
     """Return high-risk calls reached through shared static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
@@ -526,9 +545,18 @@ def _candidate_embedded_python_snippets(
         start_offsets.append(start)
     if len(start_offsets) > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
         selected_required_starts = sorted(priority_starts)
+        if len(selected_required_starts) > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+            leading_starts = _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES // 2
+            trailing_starts = _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES - leading_starts
+            selected_required_starts = [
+                *selected_required_starts[:leading_starts],
+                *selected_required_starts[-trailing_starts:],
+            ]
         block_budget = _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES - len(selected_required_starts)
         required_block_starts = sorted(priority_block_starts - priority_starts)
-        if len(required_block_starts) > block_budget:
+        if block_budget <= 0:
+            required_block_starts = []
+        elif len(required_block_starts) > block_budget:
             leading_blocks = block_budget // 2
             required_block_starts = [
                 *required_block_starts[:leading_blocks],
@@ -784,6 +812,679 @@ def _runpy_import_aliases(candidate: bytes) -> frozenset[str]:
     for statement in _compact_deterministically_executed_statements(tree.body):
         _update_compact_runpy_aliases(statement, aliases, for_suppression=True)
     return frozenset(aliases)
+
+
+def _has_late_alias_rebinding(candidate: bytes, alias: str) -> bool:
+    encoded_alias = re.escape(alias.encode("utf-8"))
+    return bool(
+        re.search(
+            rb"(?m)(?:^|[;(,\[])\s*"
+            + encoded_alias
+            + rb"(?:\s*:[^=\n]+)?\s*(?::=|=(?!=))"
+            + rb"|\b(?:as|class|def|del|case)\s+"
+            + encoded_alias
+            + rb"\b(?!\s*\.)"
+            + rb"|\bfor\s+"
+            + encoded_alias
+            + rb"(?=\s*(?:in\b|[,\])]))"
+            + rb"|[\[(][^\])\n]*\b"
+            + encoded_alias
+            + rb"\b[^\])\n]*[\])]\s*=(?!=)",
+            candidate,
+        )
+    )
+
+
+def _compact_tail_module_lines(tail: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
+    """Yield ordered module-scope lines and any parseable statements they contain."""
+
+    def parse_module_scope_statements(chunk: bytes) -> tuple[ast.stmt, ...] | None:
+        decoded_chunk = chunk.decode("utf-8", errors="ignore").lstrip("\x00\ufeff")
+        try:
+            tree = ast.parse(decoded_chunk)
+        except (RecursionError, SyntaxError, ValueError):
+            return None
+        parents, executed_statement_ids = _compact_module_scope_context(tree)
+        return tuple(
+            statement
+            for statement in _compact_deterministically_executed_statements(tree.body)
+            if _is_compact_module_scope_node(statement, parents, executed_statement_ids)
+        )
+
+    def chunk_is_incomplete(chunk: bytes) -> bool:
+        try:
+            compiled = codeop.compile_command(chunk.decode("utf-8", errors="ignore"), symbol="exec")
+        except (RecursionError, SyntaxError, ValueError):
+            return False
+        return compiled is None
+
+    def emit_chunk(chunk: bytes) -> tuple[bytes, tuple[ast.stmt, ...]] | None:
+        statements = parse_module_scope_statements(chunk)
+        if statements is not None:
+            return b"", statements
+        structural_chunk = b"\n".join(
+            line for raw_line in chunk.splitlines() if (line := _python_structural_line_bytes(raw_line).strip())
+        )
+        return (structural_chunk, ()) if structural_chunk else None
+
+    complete_tail = emit_chunk(tail)
+    if complete_tail is not None and complete_tail[1]:
+        yield complete_tail
+        return
+
+    chunk_lines: list[bytes] = []
+    for raw_line in tail.splitlines(keepends=True):
+        structural_line = _python_structural_line_bytes(raw_line).strip()
+        starts_top_level_statement = bool(structural_line) and not raw_line[:1].isspace()
+        if not chunk_lines:
+            if starts_top_level_statement:
+                chunk_lines.append(raw_line)
+            continue
+        if starts_top_level_statement:
+            current_chunk = b"".join(chunk_lines)
+            if not chunk_is_incomplete(current_chunk):
+                emitted = emit_chunk(current_chunk)
+                if emitted is not None:
+                    yield emitted
+                chunk_lines = [raw_line]
+                continue
+        chunk_lines.append(raw_line)
+    if chunk_lines:
+        emitted = emit_chunk(b"".join(chunk_lines))
+        if emitted is not None:
+            yield emitted
+
+
+def _compact_prefix_module_lines(candidate: bytes) -> Iterator[tuple[bytes, tuple[ast.stmt, ...]]]:
+    """Yield bounded prefix statements in source order without hoisting scoped bindings."""
+    prefix_end = min(len(candidate), _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
+    if prefix_end < len(candidate):
+        prefix_end = candidate.rfind(b"\n", 0, prefix_end) + 1
+    raw_prefix = candidate[:prefix_end]
+    prefix = raw_prefix.lstrip(b"\x00\xff")
+    prefix_offset = len(raw_prefix) - len(prefix)
+    prefix_source, prefix_byte_offsets = _decode_utf8_with_byte_offsets(prefix)
+    parsed_prefix_source = textwrap.dedent(prefix_source)
+    parsed_snippet = _parse_embedded_python_snippet(parsed_prefix_source)
+    tail_start = 0
+    if parsed_snippet is not None:
+        tree, parsed_chars = parsed_snippet
+        if isinstance(tree, ast.Module):
+            parents, executed_statement_ids = _compact_module_scope_context(tree)
+            for statement in _compact_deterministically_executed_statements(tree.body):
+                if _is_compact_module_scope_node(statement, parents, executed_statement_ids):
+                    yield b"", (statement,)
+        tail_start = (
+            prefix_end
+            if parsed_chars == len(parsed_prefix_source)
+            else (prefix_offset + prefix_byte_offsets[parsed_chars] if parsed_prefix_source == prefix_source else 0)
+        )
+    yield from _compact_tail_module_lines(candidate[tail_start:])
+
+
+def _builtins_import_alias_state(candidate: bytes) -> tuple[frozenset[str], frozenset[str]]:
+    aliases = {"builtins", "__builtins__"}
+    for line, statements in _compact_prefix_module_lines(candidate):
+        if not statements:
+            for alias in list(aliases):
+                if _has_late_alias_rebinding(line, alias):
+                    aliases.discard(alias)
+        for statement in statements:
+            _update_compact_builtins_aliases(statement, aliases)
+    canonical_aliases = {"builtins", "__builtins__"}
+    return frozenset(aliases - canonical_aliases), frozenset(canonical_aliases - aliases)
+
+
+def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
+    aliases, _shadowed_canonical_aliases = _builtins_import_alias_state(candidate)
+    return aliases
+
+
+def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str, str]) -> None:
+    aliases_before = dict(aliases)
+    if isinstance(statement, ast.Import):
+        for alias in statement.names:
+            local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            aliases.pop(local_name, None)
+            if alias.name in {"ctypes", "webbrowser"}:
+                aliases[local_name] = alias.name
+    elif isinstance(statement, ast.ImportFrom):
+        for alias in statement.names:
+            aliases.pop(alias.asname or alias.name, None)
+    elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        value = statement.value
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            for name in _assignment_target_names(target):
+                aliases.pop(name, None)
+                if isinstance(target, ast.Name) and isinstance(value, ast.Name) and value.id in aliases_before:
+                    aliases[name] = aliases_before[value.id]
+    elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+        for name in _assignment_target_names(statement.target):
+            aliases.pop(name, None)
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        for item in statement.items:
+            if item.optional_vars is not None:
+                for name in _assignment_target_names(item.optional_vars):
+                    aliases.pop(name, None)
+    elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        aliases.pop(statement.name, None)
+    elif isinstance(statement, ast.Delete):
+        for target in statement.targets:
+            for name in _assignment_target_names(target):
+                aliases.pop(name, None)
+    for expression in _deterministically_evaluated_statement_expressions(
+        statement,
+        evaluate_annotations=False,
+    ):
+        for node in _deterministically_executed_expression_nodes(expression):
+            if isinstance(node, ast.NamedExpr):
+                for name in _assignment_target_names(node.target):
+                    aliases.pop(name, None)
+
+
+def _typed_import_aliases(candidate: bytes) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for line, statements in _compact_prefix_module_lines(candidate):
+        if not statements:
+            for alias_name in list(aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    aliases.pop(alias_name, None)
+        for statement in statements:
+            _update_compact_typed_import_aliases(statement, aliases)
+    return aliases
+
+
+def _unsafe_typed_member_aliases(
+    candidate: bytes,
+    _inherited_typed_aliases: Mapping[str, str],
+) -> dict[str, _TypedMemberCallableValue]:
+    typed_aliases: dict[str, tuple[str, int]] = {}
+    cached_typed_identities: dict[str, tuple[str, int]] = {
+        "ctypes": ("ctypes", 0),
+        "webbrowser": ("webbrowser", 0),
+    }
+    next_typed_identity = 1
+    builtins_aliases = {"builtins", "__builtins__"}
+    safe_members: set[tuple[tuple[str, int], str]] = set()
+    unknown_members: set[tuple[tuple[str, int], str]] = set()
+    deleted_members: set[tuple[tuple[str, int], str]] = set()
+    member_callable_values: dict[tuple[tuple[str, int], str], _TypedMemberCallableValue] = {}
+    callable_aliases: dict[str, _TypedMemberCallableValue] = {}
+    sys_aliases: set[str] = set()
+    sys_modules_aliases: set[str] = set()
+    sys_modules_pop_aliases: set[str] = set()
+    sys_modules_clear_aliases: set[str] = set()
+    print_is_builtin = True
+    builtins_print_is_builtin = True
+    setattr_is_builtin = True
+
+    def current_typed_identity(module_name: str) -> tuple[str, int]:
+        nonlocal next_typed_identity
+        identity = cached_typed_identities.get(module_name)
+        if identity is None:
+            identity = (module_name, next_typed_identity)
+            cached_typed_identities[module_name] = identity
+            next_typed_identity += 1
+        return identity
+
+    def typed_member(node: ast.AST) -> tuple[tuple[str, int], str] | None:
+        if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+            return None
+        owner = typed_aliases.get(node.value.id)
+        if owner is None or _typed_member_high_risk_call(owner[0], node.attr) is None:
+            return None
+        return owner, node.attr
+
+    def typed_mapping_owner(node: ast.AST) -> tuple[str, int] | None:
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and isinstance(node.value, ast.Name):
+            return typed_aliases.get(node.value.id)
+        if (
+            isinstance(node, ast.Call)
+            and _simple_reference_name(node.func) in {"vars", "builtins.vars", "__builtins__.vars"}
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+        ):
+            return typed_aliases.get(node.args[0].id)
+        return None
+
+    def static_member_target(target: ast.AST) -> tuple[tuple[str, int], str] | None:
+        direct_member = typed_member(target)
+        if direct_member is not None:
+            return direct_member
+        if not isinstance(target, ast.Subscript):
+            return None
+        owner = typed_mapping_owner(target.value)
+        member_name = _static_getattr_member_name(target.slice)
+        if owner is None or member_name is None or _typed_member_high_risk_call(owner[0], member_name) is None:
+            return None
+        return owner, member_name
+
+    def expression_callable_value(value: ast.AST) -> _TypedMemberCallableValue | None:
+        reference = _simple_reference_name(value)
+        if reference is not None and reference in callable_aliases:
+            return callable_aliases[reference]
+        member = typed_member(value)
+        if member is None or member in safe_members or member in unknown_members:
+            return None
+        owner, member_name = member
+        return member_callable_values.get(member, frozenset({(owner[0], member_name, False)}))
+
+    def is_safe_print_reference(value: ast.AST) -> bool:
+        nonlocal print_is_builtin, builtins_print_is_builtin
+        if isinstance(value, ast.Name) and value.id == "print":
+            return print_is_builtin
+        return bool(
+            isinstance(value, ast.Attribute)
+            and value.attr == "print"
+            and isinstance(value.value, ast.Name)
+            and value.value.id in builtins_aliases
+            and builtins_print_is_builtin
+        )
+
+    def record_member_state(owner: tuple[str, int], member_name: str, value: ast.AST) -> None:
+        member = (owner, member_name)
+        deleted_members.discard(member)
+        if is_safe_print_reference(value):
+            safe_members.add(member)
+            unknown_members.discard(member)
+            member_callable_values.pop(member, None)
+            return
+        callable_value = expression_callable_value(value)
+        if callable_value is not None:
+            safe_members.discard(member)
+            unknown_members.discard(member)
+            member_callable_values[member] = callable_value
+            return
+        safe_members.discard(member)
+        unknown_members.add(member)
+        member_callable_values.pop(member, None)
+
+    def record_member_delete(owner: tuple[str, int], member_name: str) -> None:
+        member = (owner, member_name)
+        safe_members.discard(member)
+        unknown_members.discard(member)
+        member_callable_values.pop(member, None)
+        deleted_members.add(member)
+
+    def bind_name(target_name: str, value: ast.AST | None) -> None:
+        nonlocal print_is_builtin, setattr_is_builtin
+        callable_value = expression_callable_value(value) if value is not None else None
+        typed_value = typed_aliases.get(value.id) if isinstance(value, ast.Name) else None
+        callable_aliases.pop(target_name, None)
+        typed_aliases.pop(target_name, None)
+        if callable_value is not None:
+            callable_aliases[target_name] = callable_value
+        if typed_value is not None:
+            typed_aliases[target_name] = typed_value
+        if target_name == "print":
+            print_is_builtin = value is not None and is_safe_print_reference(value)
+        elif target_name == "setattr":
+            setattr_is_builtin = bool(
+                value is not None
+                and (
+                    _simple_reference_name(value) == "setattr"
+                    or (
+                        isinstance(value, ast.Attribute)
+                        and value.attr == "setattr"
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id in builtins_aliases
+                    )
+                )
+            )
+
+    def bind_target(target: ast.AST, value: ast.AST | None) -> None:
+        nonlocal builtins_print_is_builtin
+        member = static_member_target(target)
+        if member is not None and value is not None:
+            record_member_state(*member, value)
+            return
+        if (
+            isinstance(target, ast.Attribute)
+            and target.attr == "print"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_aliases
+        ):
+            builtins_print_is_builtin = value is not None and is_safe_print_reference(value)
+            return
+        if isinstance(target, ast.Name):
+            bind_name(target.id, value)
+        elif isinstance(target, ast.Starred):
+            bind_target(target.value, None)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            values = value.elts if isinstance(value, (ast.Tuple, ast.List)) else []
+            for index, element in enumerate(target.elts):
+                bind_target(element, values[index] if index < len(values) else None)
+
+    def delete_target(target: ast.AST) -> None:
+        member = static_member_target(target)
+        if member is not None:
+            record_member_delete(*member)
+            return
+        if isinstance(target, ast.Name):
+            bind_name(target.id, None)
+        elif isinstance(target, ast.Starred):
+            delete_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                delete_target(element)
+
+    def clear_module_helper_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            sys_aliases.discard(target.id)
+            sys_modules_aliases.discard(target.id)
+            sys_modules_pop_aliases.discard(target.id)
+            sys_modules_clear_aliases.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_module_helper_target(element)
+
+    def bind_module_helper_target(
+        target: ast.AST,
+        value: ast.AST,
+        sys_before: Collection[str],
+        modules_before: Collection[str],
+        pop_before: Collection[str],
+        clear_before: Collection[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            clear_module_helper_target(target)
+            if isinstance(value, ast.Name):
+                if value.id in sys_before:
+                    sys_aliases.add(target.id)
+                elif value.id in modules_before:
+                    sys_modules_aliases.add(target.id)
+                elif value.id in pop_before:
+                    sys_modules_pop_aliases.add(target.id)
+                elif value.id in clear_before:
+                    sys_modules_clear_aliases.add(target.id)
+            elif (
+                isinstance(value, ast.Attribute)
+                and value.attr == "modules"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in sys_before
+            ):
+                sys_modules_aliases.add(target.id)
+            elif isinstance(value, ast.Attribute) and value.attr in {"pop", "__delitem__", "clear"}:
+                is_modules_mapping = (isinstance(value.value, ast.Name) and value.value.id in modules_before) or (
+                    isinstance(value.value, ast.Attribute)
+                    and value.value.attr == "modules"
+                    and isinstance(value.value.value, ast.Name)
+                    and value.value.value.id in sys_before
+                )
+                if is_modules_mapping:
+                    if value.attr == "clear":
+                        sys_modules_clear_aliases.add(target.id)
+                    else:
+                        sys_modules_pop_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_module_helper_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_module_helper_target(
+                        target_item,
+                        value_item,
+                        sys_before,
+                        modules_before,
+                        pop_before,
+                        clear_before,
+                    )
+            else:
+                clear_module_helper_target(target)
+
+    def invalidate_cached_typed_identity(module_name: str | None) -> None:
+        if module_name == "*":
+            cached_typed_identities.clear()
+        elif module_name in {"ctypes", "webbrowser"}:
+            cached_typed_identities.pop(module_name, None)
+
+    def record_helper_call(call: ast.Call) -> None:
+        nonlocal builtins_print_is_builtin
+
+        def record_static_update(owner: tuple[str, int], update: ast.AST) -> None:
+            def record_item(key: ast.AST, value: ast.AST) -> None:
+                member_name = _static_getattr_member_name(key)
+                if member_name is not None and _typed_member_high_risk_call(owner[0], member_name) is not None:
+                    record_member_state(owner, member_name, value)
+
+            def invalidate_unknown() -> None:
+                for member_name in _TYPED_PROOF_MEMBER_NAMES:
+                    if _typed_member_high_risk_call(owner[0], member_name) is not None:
+                        member = (owner, member_name)
+                        safe_members.discard(member)
+                        unknown_members.add(member)
+                        deleted_members.discard(member)
+                        member_callable_values.pop(member, None)
+
+            _replay_static_update_items(update, record_item, invalidate_unknown)
+
+        reference = _simple_reference_name(call.func)
+        evicted_name = _static_sys_modules_eviction_name(
+            call,
+            set(sys_aliases),
+            set(sys_modules_aliases),
+            set(sys_modules_pop_aliases),
+            set(sys_modules_clear_aliases),
+        )
+        if evicted_name is not None:
+            invalidate_cached_typed_identity(evicted_name)
+            return
+        if reference in {"setattr", "builtins.setattr", "__builtins__.setattr"} and len(call.args) >= 3:
+            helper_is_builtin = reference != "setattr" or setattr_is_builtin
+            owner = call.args[0]
+            member_name = _static_getattr_member_name(call.args[1])
+            if helper_is_builtin and isinstance(owner, ast.Name) and member_name is not None:
+                typed_owner = typed_aliases.get(owner.id)
+                if typed_owner is not None and _typed_member_high_risk_call(typed_owner[0], member_name) is not None:
+                    record_member_state(typed_owner, member_name, call.args[2])
+                elif owner.id in builtins_aliases and member_name == "print":
+                    builtins_print_is_builtin = is_safe_print_reference(call.args[2])
+            return
+        if reference in {"delattr", "builtins.delattr", "__builtins__.delattr"} and len(call.args) >= 2:
+            owner = call.args[0]
+            member_name = _static_getattr_member_name(call.args[1])
+            if isinstance(owner, ast.Name) and member_name is not None:
+                typed_owner = typed_aliases.get(owner.id)
+                if typed_owner is not None and _typed_member_high_risk_call(typed_owner[0], member_name) is not None:
+                    record_member_delete(typed_owner, member_name)
+            return
+        if not isinstance(call.func, ast.Attribute):
+            return
+        if call.func.attr == "__setitem__" and len(call.args) >= 2:
+            module_name = typed_mapping_owner(call.func.value)
+            key_index = 0
+            value_index = 1
+            if (
+                module_name is None
+                and reference in {"dict.__setitem__", "builtins.dict.__setitem__", "__builtins__.dict.__setitem__"}
+                and len(call.args) >= 3
+            ):
+                module_name = typed_mapping_owner(call.args[0])
+                key_index = 1
+                value_index = 2
+            member_name = _static_getattr_member_name(call.args[key_index])
+            if module_name is not None and member_name is not None:
+                record_member_state(module_name, member_name, call.args[value_index])
+            return
+        if call.func.attr == "setdefault" and len(call.args) >= 2:
+            mapping_owner = typed_mapping_owner(call.func.value)
+            key_index = 0
+            value_index = 1
+            if (
+                mapping_owner is None
+                and reference in {"dict.setdefault", "builtins.dict.setdefault", "__builtins__.dict.setdefault"}
+                and len(call.args) >= 3
+            ):
+                mapping_owner = typed_mapping_owner(call.args[0])
+                key_index = 1
+                value_index = 2
+            member_name = _static_getattr_member_name(call.args[key_index])
+            if (
+                mapping_owner is not None
+                and member_name is not None
+                and (mapping_owner, member_name) in deleted_members
+            ):
+                record_member_state(mapping_owner, member_name, call.args[value_index])
+            return
+        if call.func.attr != "update":
+            return
+        mapping_node = call.func.value
+        keyword_values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+        if (module_name := typed_mapping_owner(mapping_node)) is not None:
+            for argument in call.args:
+                record_static_update(module_name, argument)
+            for member_name, value in keyword_values.items():
+                if _typed_member_high_risk_call(module_name[0], member_name) is not None:
+                    record_member_state(module_name, member_name, value)
+            return
+        if reference not in {"dict.update", "builtins.dict.update", "__builtins__.dict.update"} or not call.args:
+            return
+        if (module_name := typed_mapping_owner(call.args[0])) is not None:
+            for argument in call.args[1:]:
+                record_static_update(module_name, argument)
+            for member_name, value in keyword_values.items():
+                if _typed_member_high_risk_call(module_name[0], member_name) is not None:
+                    record_member_state(module_name, member_name, value)
+
+    def binding_snapshot() -> tuple[Any, ...]:
+        return (
+            dict(typed_aliases),
+            dict(callable_aliases),
+            set(builtins_aliases),
+            set(sys_aliases),
+            set(sys_modules_aliases),
+            set(sys_modules_pop_aliases),
+            set(sys_modules_clear_aliases),
+            print_is_builtin,
+            setattr_is_builtin,
+        )
+
+    def restore_bindings(snapshot: tuple[Any, ...]) -> None:
+        nonlocal print_is_builtin, setattr_is_builtin
+        typed_aliases.clear()
+        typed_aliases.update(snapshot[0])
+        callable_aliases.clear()
+        callable_aliases.update(snapshot[1])
+        builtins_aliases.clear()
+        builtins_aliases.update(snapshot[2])
+        sys_aliases.clear()
+        sys_aliases.update(snapshot[3])
+        sys_modules_aliases.clear()
+        sys_modules_aliases.update(snapshot[4])
+        sys_modules_pop_aliases.clear()
+        sys_modules_pop_aliases.update(snapshot[5])
+        sys_modules_clear_aliases.clear()
+        sys_modules_clear_aliases.update(snapshot[6])
+        print_is_builtin, setattr_is_builtin = snapshot[7:9]
+
+    def replay_statement(statement: ast.stmt) -> None:
+        sys_aliases_before = frozenset(sys_aliases)
+        sys_modules_aliases_before = frozenset(sys_modules_aliases)
+        sys_modules_pop_aliases_before = frozenset(sys_modules_pop_aliases)
+        sys_modules_clear_aliases_before = frozenset(sys_modules_clear_aliases)
+        for expression in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=False,
+        ):
+            for call in _deterministically_executed_expression_calls(expression):
+                record_helper_call(call)
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                bind_name(local_name, None)
+                clear_module_helper_target(ast.Name(id=local_name))
+                if alias.name in {"ctypes", "webbrowser"}:
+                    typed_aliases[local_name] = current_typed_identity(alias.name)
+                elif alias.name == "sys":
+                    sys_aliases.add(local_name)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                target_name = alias.asname or alias.name
+                bind_name(target_name, None)
+                clear_module_helper_target(ast.Name(id=target_name))
+                if (
+                    statement.module in {"ctypes", "webbrowser"}
+                    and _typed_member_high_risk_call(statement.module, alias.name) is not None
+                ):
+                    owner = current_typed_identity(statement.module)
+                    member = (owner, alias.name)
+                    if member not in safe_members and member not in unknown_members:
+                        callable_aliases[target_name] = member_callable_values.get(
+                            member, frozenset({(owner[0], alias.name, False)})
+                        )
+                elif statement.module == "sys" and alias.name == "modules":
+                    sys_modules_aliases.add(target_name)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind_target(target, statement.value)
+                bind_module_helper_target(
+                    target,
+                    statement.value,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                )
+        elif isinstance(statement, ast.AnnAssign):
+            bind_target(statement.target, statement.value)
+            if statement.value is not None:
+                bind_module_helper_target(
+                    statement.target,
+                    statement.value,
+                    sys_aliases_before,
+                    sys_modules_aliases_before,
+                    sys_modules_pop_aliases_before,
+                    sys_modules_clear_aliases_before,
+                )
+        elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+            bind_target(statement.target, None)
+            clear_module_helper_target(statement.target)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    bind_target(item.optional_vars, None)
+                    clear_module_helper_target(item.optional_vars)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind_name(statement.name, None)
+            clear_module_helper_target(ast.Name(id=statement.name))
+        elif isinstance(statement, ast.ClassDef):
+            bind_name(statement.name, None)
+            clear_module_helper_target(ast.Name(id=statement.name))
+            class_bindings = binding_snapshot()
+            for child in _compact_deterministically_executed_statements(statement.body):
+                replay_statement(child)
+            restore_bindings(class_bindings)
+        elif isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                if isinstance(target, ast.Subscript) and (
+                    (isinstance(target.value, ast.Name) and target.value.id in sys_modules_aliases)
+                    or (
+                        isinstance(target.value, ast.Attribute)
+                        and target.value.attr == "modules"
+                        and isinstance(target.value.value, ast.Name)
+                        and target.value.value.id in sys_aliases
+                    )
+                ):
+                    invalidate_cached_typed_identity(_static_getattr_member_name(target.slice))
+                delete_target(target)
+                clear_module_helper_target(target)
+        _update_compact_builtins_aliases(statement, builtins_aliases)
+
+    for line, statements in _compact_prefix_module_lines(candidate):
+        if not statements:
+            for alias_name in list(typed_aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    typed_aliases.pop(alias_name, None)
+            for alias_name in list(callable_aliases):
+                if _has_late_alias_rebinding(line, alias_name):
+                    callable_aliases.pop(alias_name, None)
+            continue
+        for statement in statements:
+            replay_statement(statement)
+    return callable_aliases
 
 
 def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
@@ -5195,13 +5896,18 @@ def _deterministically_executed_expression_nodes(
             for argument in current.args:
                 if not isinstance(argument, ast.GeneratorExp) or not argument.generators:
                     continue
-                outer = argument.generators[0]
-                pending.extend(reversed(outer.ifs))
-                if _static_late_iter_truth(outer.iter) is False or any(
-                    _static_late_truth_value(condition) is False for condition in outer.ifs
-                ):
-                    continue
-                pending.append(argument.elt)
+                eager_nodes: list[ast.AST] = []
+                for index, generator in enumerate(argument.generators):
+                    if index:
+                        eager_nodes.append(generator.iter)
+                    if _static_late_iter_truth(generator.iter) is False:
+                        break
+                    eager_nodes.extend(generator.ifs)
+                    if any(_static_late_truth_value(condition) is False for condition in generator.ifs):
+                        break
+                else:
+                    eager_nodes.append(argument.elt)
+                pending.extend(reversed(eager_nodes))
         if isinstance(current, (ast.ListComp, ast.SetComp, ast.DictComp)) and current.generators:
             generators = current.generators
             outer = generators[0]
@@ -8426,13 +9132,21 @@ def _static_call_argument(call: ast.Call, position: int, keyword: str | None = N
     return None
 
 
-def _deterministic_named_expressions(expression: ast.AST) -> list[ast.NamedExpr]:
+def _deterministic_named_expressions(
+    expression: ast.AST,
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
+) -> list[ast.NamedExpr]:
     return sorted(
         (
             node
             for node in _deterministically_executed_expression_nodes(
                 expression,
-                eager_generator_consumers=_canonical_eager_generator_consumer_aliases(),
+                eager_generator_consumers=(
+                    _canonical_eager_generator_consumer_aliases()
+                    if eager_generator_consumers is None
+                    else eager_generator_consumers
+                ),
             )
             if isinstance(node, ast.NamedExpr)
         ),
@@ -8440,11 +9154,19 @@ def _deterministic_named_expressions(expression: ast.AST) -> list[ast.NamedExpr]
     )
 
 
-def _prior_deterministic_named_expressions(expression: ast.AST, call: ast.Call) -> list[ast.NamedExpr]:
+def _prior_deterministic_named_expressions(
+    expression: ast.AST,
+    call: ast.Call,
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
+) -> list[ast.NamedExpr]:
     call_position = (getattr(call, "lineno", 0), getattr(call, "col_offset", 0))
     return [
         node
-        for node in _deterministic_named_expressions(expression)
+        for node in _deterministic_named_expressions(
+            expression,
+            eager_generator_consumers=eager_generator_consumers,
+        )
         if (
             getattr(node, "end_lineno", getattr(node, "lineno", 0)),
             getattr(node, "end_col_offset", getattr(node, "col_offset", 0)),
@@ -8458,9 +9180,15 @@ def _reload_aliases_before_call(
     call: ast.Call,
     aliases_before: frozenset[str],
     importlib_aliases: set[str],
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
 ) -> frozenset[str]:
     aliases = set(aliases_before)
-    for named_expression in _prior_deterministic_named_expressions(expression, call):
+    for named_expression in _prior_deterministic_named_expressions(
+        expression,
+        call,
+        eager_generator_consumers=eager_generator_consumers,
+    ):
         reference = _simple_reference_name(named_expression.value)
         aliases.discard(named_expression.target.id)
         if reference in aliases or (
@@ -8476,9 +9204,15 @@ def _name_aliases_before_call(
     expression: ast.AST,
     call: ast.Call,
     aliases_before: Mapping[str, _ContainerValue],
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
 ) -> dict[str, _ContainerValue]:
     aliases = dict(aliases_before)
-    for named_expression in _prior_deterministic_named_expressions(expression, call):
+    for named_expression in _prior_deterministic_named_expressions(
+        expression,
+        call,
+        eager_generator_consumers=eager_generator_consumers,
+    ):
         value = aliases.get(named_expression.value.id) if isinstance(named_expression.value, ast.Name) else None
         aliases.pop(named_expression.target.id, None)
         if value is not None:
@@ -8494,13 +9228,19 @@ def _module_helper_aliases_before_call(
     pop_before: frozenset[str],
     clear_before: frozenset[str],
     importlib_before: frozenset[str],
+    *,
+    eager_generator_consumers: dict[str, str] | None = None,
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
     sys_aliases = set(sys_before)
     modules_aliases = set(modules_before)
     pop_aliases = set(pop_before)
     clear_aliases = set(clear_before)
     importlib_aliases = set(importlib_before)
-    for named_expression in _prior_deterministic_named_expressions(expression, call):
+    for named_expression in _prior_deterministic_named_expressions(
+        expression,
+        call,
+        eager_generator_consumers=eager_generator_consumers,
+    ):
         target_name = named_expression.target.id
         sys_aliases.discard(target_name)
         modules_aliases.discard(target_name)
@@ -8836,6 +9576,9 @@ def _line_indent_width(line: bytes) -> int:
 
 def _compound_header_keyword(structural_line: bytes) -> bytes | None:
     stripped = structural_line.lstrip()
+    header_match = _COMPOUND_HEADER_MATCH_PATTERN.search(structural_line)
+    if header_match is not None and _is_embedded_top_level_prefix(structural_line[: header_match.start()]):
+        stripped = structural_line[header_match.start() :].lstrip()
     for keyword in (b"async def", b"elif", b"else", b"except", b"finally", b"if", b"for", b"while", b"try"):
         if stripped == keyword + b":" or stripped.startswith(keyword + b" ") or stripped.startswith(keyword + b":"):
             return keyword
@@ -8980,6 +9723,7 @@ def _previous_header_context_segments(
     before_line_start: int,
     indent: int,
     keywords: set[bytes],
+    continuation_keywords: set[bytes] | None = None,
 ) -> list[tuple[int, int]]:
     search_end = before_line_start
     while search_end > 0:
@@ -8996,6 +9740,10 @@ def _previous_header_context_segments(
         if previous_indent != indent:
             continue
         framed_header_start = _same_line_compound_header_start(structural_line, previous_line_start)
+        if framed_header_start is not None and not structural_line[: framed_header_start - previous_line_start].strip(
+            b" \t\r"
+        ):
+            framed_header_start = None
         header_line = (
             structural_line[framed_header_start - previous_line_start :]
             if framed_header_start is not None
@@ -9003,7 +9751,9 @@ def _previous_header_context_segments(
         )
         keyword = _compound_header_keyword(header_line)
         if keyword not in keywords or not header_line.endswith(b":"):
-            continue
+            if keyword in (continuation_keywords or set()) and header_line.endswith(b":"):
+                continue
+            return []
         header_start = framed_header_start or _compound_header_start(previous_line_start, structural_line)
         header_segment = (header_start, previous_line_start + len(previous_line))
         body_segment = _first_body_statement_segment(candidate, previous_line_start + len(previous_line), indent)
@@ -9015,7 +9765,13 @@ def _previous_header_context_segments(
 
 def _try_else_context_segments(candidate: bytes, clause_line_start: int, indent: int) -> list[tuple[int, int]]:
     except_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"except"})
-    try_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    try_context = _previous_header_context_segments(
+        candidate,
+        clause_line_start,
+        indent,
+        {b"try"},
+        {b"except"},
+    )
     if try_context and except_context:
         return [*try_context, *except_context]
     return []
@@ -9028,13 +9784,26 @@ def _matching_clause_context_segments(
     clause_keyword: bytes | None,
 ) -> list[tuple[int, int]]:
     if clause_keyword in {b"else", b"elif"}:
-        context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"if", b"for", b"while"})
+        context = _previous_header_context_segments(
+            candidate,
+            clause_line_start,
+            indent,
+            {b"if", b"for", b"while"},
+            {b"elif"},
+        )
         if context:
             return context
         if clause_keyword == b"else":
             return _try_else_context_segments(candidate, clause_line_start, indent)
     if clause_keyword in {b"except", b"finally"}:
-        return _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+        continuation_keywords = {b"except", b"else"} if clause_keyword == b"finally" else {b"except"}
+        return _previous_header_context_segments(
+            candidate,
+            clause_line_start,
+            indent,
+            {b"try"},
+            continuation_keywords,
+        )
     return []
 
 
@@ -10588,10 +11357,34 @@ def _compact_snippet_has_shadowed_print(code_str: str, tree: ast.AST | None = No
     ):
         return True
     parents, executed_statement_ids = _compact_module_scope_context(tree)
+    deterministic_named_expression_ids = {
+        id(named_expression)
+        for statement in _compact_deterministically_executed_statements(tree.body)
+        for expression in _deterministically_evaluated_statement_expressions(
+            statement,
+            evaluate_annotations=not _source_defers_annotations(code_str.encode("utf-8")),
+        )
+        for named_expression in _deterministic_named_expressions(expression)
+    }
     for node in ast.walk(tree):
         if not _is_compact_module_scope_node(node, parents, executed_statement_ids):
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "print":
+            parent = parents.get(node)
+            if isinstance(parent, ast.NamedExpr) and id(parent) not in deterministic_named_expression_ids:
+                ancestor: ast.AST = parent
+                enclosing_generator: ast.GeneratorExp | None = None
+                while ancestor in parents:
+                    ancestor = parents[ancestor]
+                    if isinstance(ancestor, ast.GeneratorExp):
+                        enclosing_generator = ancestor
+                        break
+                if enclosing_generator is None or any(
+                    _static_late_iter_truth(generator.iter) is False
+                    or any(_static_late_truth_value(condition) is False for condition in generator.ifs)
+                    for generator in enclosing_generator.generators
+                ):
+                    continue
             return True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "print":
             return True
@@ -10662,6 +11455,56 @@ def _compact_statement_print_shadow_transition(
                 continue
             return statement.module not in builtins_aliases
     return None
+
+
+def _update_compact_builtins_aliases(statement: ast.stmt, builtins_aliases: set[str]) -> None:
+    """Update definite module-scope aliases for the builtins module."""
+    aliases_before = set(builtins_aliases)
+
+    def bind_target(target: ast.AST, value: ast.AST | None = None) -> None:
+        if isinstance(target, ast.Name):
+            builtins_aliases.discard(target.id)
+            if isinstance(value, ast.Name) and value.id in aliases_before:
+                builtins_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            bind_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            values = value.elts if isinstance(value, (ast.Tuple, ast.List)) else []
+            for index, item in enumerate(target.elts):
+                bind_target(item, values[index] if index < len(values) else None)
+
+    if isinstance(statement, ast.Import):
+        for alias in statement.names:
+            local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            builtins_aliases.discard(local_name)
+            if alias.name == "builtins":
+                builtins_aliases.add(local_name)
+    elif isinstance(statement, ast.ImportFrom):
+        for alias in statement.names:
+            builtins_aliases.discard(alias.asname or alias.name)
+    elif isinstance(statement, ast.Assign):
+        for target in statement.targets:
+            bind_target(target, statement.value)
+    elif isinstance(statement, ast.AnnAssign):
+        bind_target(statement.target, statement.value)
+    elif isinstance(statement, (ast.AugAssign, ast.For, ast.AsyncFor)):
+        bind_target(statement.target)
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        for item in statement.items:
+            if item.optional_vars is not None:
+                bind_target(item.optional_vars)
+    elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        builtins_aliases.discard(statement.name)
+    elif isinstance(statement, ast.Delete):
+        for target in statement.targets:
+            bind_target(target)
+    for expression in _deterministically_evaluated_statement_expressions(
+        statement,
+        evaluate_annotations=False,
+    ):
+        for node in _deterministically_executed_expression_nodes(expression):
+            if isinstance(node, ast.NamedExpr):
+                bind_target(node.target)
 
 
 def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
@@ -12360,9 +13203,12 @@ def _compact_snippet_replay_proven_rule_codes(code_str: str) -> frozenset[str]:
 
 def _compact_snippet_typed_print_overwrite_replay(
     code_str: str,
+    inherited_builtins_aliases: frozenset[str] = frozenset(),
+    inherited_typed_member_aliases: Mapping[str, _TypedMemberCallableValue] | None = None,
+    inherited_shadowed_builtins_aliases: frozenset[str] = frozenset(),
 ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     source = textwrap.dedent(code_str)
-    if "print" not in source:
+    if "print" not in source and not inherited_typed_member_aliases:
         return set(), set()
     try:
         tree = ast.parse(source)
@@ -12375,7 +13221,12 @@ def _compact_snippet_typed_print_overwrite_replay(
         "ctypes": ("ctypes", 0),
     }
     next_typed_generation = {"webbrowser": 1, "ctypes": 1}
-    builtins_aliases = {"builtins", "__builtins__"}
+    inherited_active_builtins_aliases = {
+        "builtins",
+        "__builtins__",
+        *inherited_builtins_aliases,
+    } - set(inherited_shadowed_builtins_aliases)
+    builtins_aliases = set(inherited_active_builtins_aliases)
     executed_statements = _compact_deterministically_executed_statements(tree.body)
     for statement in executed_statements:
         if isinstance(statement, ast.Import):
@@ -12407,12 +13258,21 @@ def _compact_snippet_typed_print_overwrite_replay(
     dict_helper_aliases: set[str] = set()
     dict_update_aliases: set[str] = set()
     dict_setitem_aliases: set[str] = set()
-    builtins_mapping_aliases: set[str] = set()
+    dict_setdefault_aliases: set[str] = set()
+    dict_delete_aliases: set[str] = set()
+    safe_print_aliases: set[str] = set()
+    builtins_mapping_aliases: set[str] = {"__builtins__"}
     builtins_mapping_update_aliases: set[str] = set()
     builtins_mapping_setitem_aliases: set[str] = set()
+    builtins_mapping_delete_aliases: set[str] = set()
     mapping_aliases: dict[str, tuple[str, int]] = {}
+    typed_member_callable_aliases: dict[str, _TypedMemberCallableValue] = {}
+    if inherited_typed_member_aliases is not None:
+        typed_member_callable_aliases.update(inherited_typed_member_aliases)
     safe_members: set[tuple[tuple[str, int], str]] = set()
     deleted_members: set[tuple[tuple[str, int], str]] = set()
+    deleted_builtins_members: set[str] = set()
+    definitely_deleted_builtins_members: set[str] = set()
     safe_called_members: set[tuple[str, str]] = set()
     unsafe_called_members: set[tuple[str, str]] = set()
     importlib_aliases: set[str] = set()
@@ -12423,13 +13283,141 @@ def _compact_snippet_typed_print_overwrite_replay(
     sys_modules_clear_aliases: set[str] = set()
     class_mutated_owners: set[tuple[str, int]] = set()
     current_print_is_shadowed = False
+    builtins_print_is_shadowed = False
+    dynamic_print_shadow_state: bool | None = None
+    dynamic_builtins_print_shadow_state: bool | None = None
+    dynamic_safe_members: set[tuple[tuple[str, int], str]] | None = None
+    dynamic_safe_print_aliases: set[str] | None = None
+    class_scope_depth = 0
+    active_print_builtins_aliases = set(inherited_active_builtins_aliases)
+    eager_builtins_aliases = set(inherited_active_builtins_aliases)
     local_setattr_shadowed = False
     builtins_setattr_shadowed = False
     local_vars_shadowed = False
     builtins_vars_shadowed = False
     local_dict_shadowed = False
     builtins_dict_shadowed = False
+    uncertain_helper_shadows: set[str] = set()
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def helper_shadowed(helper: str) -> bool:
+        return {
+            "local_setattr": local_setattr_shadowed,
+            "builtins_setattr": builtins_setattr_shadowed,
+            "local_vars": local_vars_shadowed,
+            "builtins_vars": builtins_vars_shadowed,
+            "local_dict": local_dict_shadowed,
+            "builtins_dict": builtins_dict_shadowed,
+        }[helper]
+
+    def set_helper_shadowed(helper: str, shadowed: bool, *, conditional: bool = False) -> None:
+        nonlocal local_setattr_shadowed, builtins_setattr_shadowed
+        nonlocal local_vars_shadowed, builtins_vars_shadowed
+        nonlocal local_dict_shadowed, builtins_dict_shadowed
+        current_definite = helper_shadowed(helper)
+        current_possible = current_definite or helper in uncertain_helper_shadows
+        if conditional:
+            definite = current_definite and shadowed
+            possible = current_possible or shadowed
+        else:
+            definite = shadowed
+            possible = shadowed
+        if helper == "local_setattr":
+            local_setattr_shadowed = definite
+        elif helper == "builtins_setattr":
+            builtins_setattr_shadowed = definite
+        elif helper == "local_vars":
+            local_vars_shadowed = definite
+        elif helper == "builtins_vars":
+            builtins_vars_shadowed = definite
+        elif helper == "local_dict":
+            local_dict_shadowed = definite
+        else:
+            builtins_dict_shadowed = definite
+        uncertain_helper_shadows.discard(helper)
+        if possible and not definite:
+            uncertain_helper_shadows.add(helper)
+
+    def active_eager_generator_consumer_aliases(
+        aliases: Collection[str] | None = None,
+    ) -> dict[str, str]:
+        active_aliases = active_print_builtins_aliases | eager_builtins_aliases if aliases is None else aliases
+        return {
+            **{consumer: consumer for consumer in _EAGER_LATE_GENERATOR_CONSUMERS},
+            **{
+                f"{alias}.{consumer}": consumer
+                for alias in active_aliases
+                for consumer in _EAGER_LATE_GENERATOR_CONSUMERS
+            },
+        }
+
+    def expression_eager_generator_consumer_aliases(expression: ast.AST) -> dict[str, str]:
+        consumers = active_eager_generator_consumer_aliases()
+        aliases_before = dict.fromkeys(active_print_builtins_aliases | eager_builtins_aliases, True)
+        for node in ast.walk(expression):
+            if not isinstance(node, ast.Call):
+                continue
+            active_aliases = _name_aliases_before_call(
+                expression,
+                node,
+                aliases_before,
+                eager_generator_consumers=consumers,
+            )
+            consumers.update(active_eager_generator_consumer_aliases(active_aliases))
+        return consumers
+
+    def is_conditionally_evaluated_typed_call(node: ast.AST) -> bool:
+        def generator_reaches_node_unconditionally(generator_expression: ast.GeneratorExp) -> bool:
+            def contains(candidate: ast.AST, target: ast.AST) -> bool:
+                return any(descendant is target for descendant in ast.walk(candidate))
+
+            for generator in generator_expression.generators:
+                if contains(generator.iter, node):
+                    return True
+                if _static_late_iter_truth(generator.iter) is not True:
+                    return False
+                for condition in generator.ifs:
+                    if contains(condition, node):
+                        return True
+                    if _static_late_truth_value(condition) is not True:
+                        return False
+            return contains(generator_expression.elt, node)
+
+        if not _is_conditionally_evaluated_expression(node, parents):
+            return False
+        current = node
+        while current in parents:
+            current = parents[current]
+            if not isinstance(current, ast.GeneratorExp):
+                continue
+            outer_call = parents.get(current)
+            if isinstance(outer_call, ast.Call):
+                expression: ast.AST = outer_call
+                while expression in parents and not isinstance(parents[expression], ast.stmt):
+                    expression = parents[expression]
+                active_builtins_aliases: Collection[str] = _name_aliases_before_call(
+                    expression,
+                    outer_call,
+                    dict.fromkeys(active_print_builtins_aliases, True),
+                    eager_generator_consumers=expression_eager_generator_consumer_aliases(expression),
+                ).keys()
+            else:
+                active_builtins_aliases = ()
+            eager_consumer = (
+                _eager_generator_consumer_name(
+                    outer_call.func,
+                    active_eager_generator_consumer_aliases(active_builtins_aliases),
+                )
+                if isinstance(outer_call, ast.Call) and current in outer_call.args
+                else None
+            )
+            if (
+                eager_consumer is not None
+                and eager_consumer not in mutated_truthy_builtins
+                and generator_reaches_node_unconditionally(current)
+            ):
+                return False
+        return True
 
     def class_scope_path(node: ast.AST) -> tuple[ast.ClassDef, ...]:
         path: list[ast.ClassDef] = []
@@ -12440,6 +13428,14 @@ def _compact_snippet_typed_print_overwrite_replay(
                 path.append(current)
         path.reverse()
         return tuple(path)
+
+    def current_typed_identity(module_name: str) -> tuple[str, int]:
+        identity = cached_typed_identities.get(module_name)
+        if identity is None:
+            identity = (module_name, next_typed_generation[module_name])
+            next_typed_generation[module_name] += 1
+            cached_typed_identities[module_name] = identity
+        return identity
 
     def clear_reload_target(target: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -12559,6 +13555,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             and not builtins_setattr_shadowed
         )
 
+    def uncertain_setattr_reference(reference: str | None) -> bool:
+        if reference in setattr_helper_aliases:
+            return False
+        if reference == "setattr":
+            return bool({"local_setattr", "builtins_setattr"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.setattr":
+            return "builtins_setattr" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".setattr")
+            and reference.removesuffix(".setattr") in builtins_aliases
+            and "builtins_setattr" in uncertain_helper_shadows
+        )
+
     def active_vars_reference(reference: str | None) -> bool:
         if reference in vars_helper_aliases:
             return True
@@ -12571,6 +13581,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             and reference.endswith(".vars")
             and reference.removesuffix(".vars") in builtins_aliases
             and not builtins_vars_shadowed
+        )
+
+    def uncertain_vars_reference(reference: str | None) -> bool:
+        if reference in vars_helper_aliases:
+            return False
+        if reference == "vars":
+            return bool({"local_vars", "builtins_vars"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.vars":
+            return "builtins_vars" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".vars")
+            and reference.removesuffix(".vars") in builtins_aliases
+            and "builtins_vars" in uncertain_helper_shadows
         )
 
     def active_getattr_reference(reference: str | None) -> bool:
@@ -12598,12 +13622,37 @@ def _compact_snippet_typed_print_overwrite_replay(
             and not builtins_dict_shadowed
         )
 
+    def uncertain_dict_reference(reference: str | None) -> bool:
+        if reference in dict_helper_aliases:
+            return False
+        if reference == "dict":
+            return bool({"local_dict", "builtins_dict"}.intersection(uncertain_helper_shadows))
+        if reference == "builtins.dict":
+            return "builtins_dict" in uncertain_helper_shadows
+        return bool(
+            reference is not None
+            and reference.endswith(".dict")
+            and reference.removesuffix(".dict") in builtins_aliases
+            and "builtins_dict" in uncertain_helper_shadows
+        )
+
+    def uncertain_dict_mutator_reference(reference: str | None) -> bool:
+        if reference is None:
+            return False
+        for suffix in (".update", ".__ior__", ".__setitem__", ".setdefault", ".pop", ".__delitem__"):
+            if reference.endswith(suffix):
+                return uncertain_dict_reference(reference.removesuffix(suffix))
+        return False
+
     def active_dict_update_reference(reference: str | None) -> bool:
         if reference in dict_update_aliases:
             return True
-        if reference is None or not reference.endswith(".update"):
+        if reference is None:
             return False
-        return active_dict_reference(reference.removesuffix(".update"))
+        for suffix in (".update", ".__ior__"):
+            if reference.endswith(suffix):
+                return active_dict_reference(reference.removesuffix(suffix))
+        return False
 
     def active_dict_setitem_reference(reference: str | None) -> bool:
         if reference in dict_setitem_aliases:
@@ -12613,9 +13662,21 @@ def _compact_snippet_typed_print_overwrite_replay(
         return active_dict_reference(reference.removesuffix(".__setitem__"))
 
     def active_dict_setdefault_reference(reference: str | None) -> bool:
+        if reference in dict_setdefault_aliases:
+            return True
         if reference is None or not reference.endswith(".setdefault"):
             return False
         return active_dict_reference(reference.removesuffix(".setdefault"))
+
+    def active_dict_delete_reference(reference: str | None) -> bool:
+        if reference in dict_delete_aliases:
+            return True
+        if reference is None:
+            return False
+        for suffix in (".pop", ".__delitem__"):
+            if reference.endswith(suffix):
+                return active_dict_reference(reference.removesuffix(suffix))
+        return False
 
     def owner_name(
         node: ast.AST,
@@ -12654,16 +13715,20 @@ def _compact_snippet_typed_print_overwrite_replay(
             return current_typed_ids[node.args[0].id]
         return None
 
-    def is_builtins_mapping(node: ast.AST) -> bool:
+    def is_builtins_mapping_with_aliases(
+        node: ast.AST,
+        module_aliases: Collection[str],
+        mapping_names: Collection[str],
+    ) -> bool:
         if isinstance(node, ast.NamedExpr):
-            return is_builtins_mapping(node.value)
+            return is_builtins_mapping_with_aliases(node.value, module_aliases, mapping_names)
         if isinstance(node, ast.Name):
-            return node.id == "__builtins__" or node.id in builtins_mapping_aliases
+            return node.id in mapping_names
         if (
             isinstance(node, ast.Attribute)
             and node.attr == "__dict__"
             and isinstance(node.value, ast.Name)
-            and node.value.id in builtins_aliases
+            and node.value.id in module_aliases
         ):
             return True
         if not isinstance(node, ast.Call):
@@ -12672,7 +13737,52 @@ def _compact_snippet_typed_print_overwrite_replay(
             active_vars_reference(_simple_reference_name(node.func))
             and len(node.args) == 1
             and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in builtins_aliases
+            and node.args[0].id in module_aliases
+        )
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return is_builtins_mapping_with_aliases(
+            node,
+            active_print_builtins_aliases,
+            builtins_mapping_aliases,
+        )
+
+    def mapping_expression_is_uncertain(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return mapping_expression_is_uncertain(node.value)
+        return bool(
+            isinstance(node, ast.Call)
+            and uncertain_vars_reference(_simple_reference_name(node.func))
+            and len(node.args) == 1
+        )
+
+    def is_builtins_object(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return is_builtins_object(node.value)
+        return isinstance(node, ast.Name) and node.id in active_print_builtins_aliases
+
+    def is_safe_print_value(value: ast.AST) -> bool:
+        value_reference = _simple_reference_name(value)
+        active_safe_print_aliases = (
+            safe_print_aliases if dynamic_safe_print_aliases is None else dynamic_safe_print_aliases
+        )
+        if value_reference in active_safe_print_aliases:
+            return True
+        active_builtins_print_is_shadowed = (
+            builtins_print_is_shadowed
+            if dynamic_builtins_print_shadow_state is None
+            else dynamic_builtins_print_shadow_state
+        )
+        active_print_is_shadowed = (
+            current_print_is_shadowed if dynamic_print_shadow_state is None else dynamic_print_shadow_state
+        )
+        return not active_builtins_print_is_shadowed and (
+            (value_reference == "print" and not active_print_is_shadowed)
+            or (
+                value_reference is not None
+                and value_reference.endswith(".print")
+                and value_reference.removesuffix(".print") in active_print_builtins_aliases
+            )
         )
 
     def record_member(
@@ -12686,8 +13796,8 @@ def _compact_snippet_typed_print_overwrite_replay(
             return
         member_key = (owner, member_name)
         deleted_members.discard(member_key)
-        if isinstance(value, ast.Name) and value.id == "print":
-            if not conditional and not current_print_is_shadowed and owner not in class_mutated_owners:
+        if is_safe_print_value(value):
+            if not conditional and owner not in class_mutated_owners:
                 safe_members.add(member_key)
         elif (
             isinstance(value, ast.Attribute)
@@ -12750,8 +13860,50 @@ def _compact_snippet_typed_print_overwrite_replay(
         value: ast.AST,
         aliases_before: Mapping[str, tuple[str, int]],
         mapping_aliases_before: Mapping[str, tuple[str, int]],
+        target_builtins_aliases: set[str] | None = None,
+        target_builtins_mapping_aliases: set[str] | None = None,
+        value_builtins_aliases: frozenset[str] | None = None,
+        value_builtins_mapping_aliases: frozenset[str] | None = None,
     ) -> None:
-        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+        if target_builtins_aliases is None:
+            target_builtins_aliases = set(active_print_builtins_aliases)
+        if target_builtins_mapping_aliases is None:
+            target_builtins_mapping_aliases = set(builtins_mapping_aliases)
+        if value_builtins_aliases is None:
+            value_builtins_aliases = frozenset(active_print_builtins_aliases)
+        if value_builtins_mapping_aliases is None:
+            value_builtins_mapping_aliases = frozenset(builtins_mapping_aliases)
+
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in target_builtins_aliases
+        ):
+            record_builtins_helper_assignment(target.attr, value)
+        elif isinstance(target, ast.Subscript) and is_builtins_mapping_with_aliases(
+            target.value,
+            target_builtins_aliases,
+            target_builtins_mapping_aliases,
+        ):
+            record_builtins_helper_assignment(
+                _static_getattr_member_name(target.slice),
+                value,
+                conditional=mapping_expression_is_uncertain(target.value),
+            )
+        elif isinstance(target, ast.Name):
+            aliases_builtins_object = isinstance(value, ast.Name) and value.id in value_builtins_aliases
+            aliases_builtins_mapping = is_builtins_mapping_with_aliases(
+                value,
+                value_builtins_aliases,
+                value_builtins_mapping_aliases,
+            )
+            target_builtins_aliases.discard(target.id)
+            target_builtins_mapping_aliases.discard(target.id)
+            if aliases_builtins_object:
+                target_builtins_aliases.add(target.id)
+            if aliases_builtins_mapping:
+                target_builtins_mapping_aliases.add(target.id)
+        elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
             record_attribute(aliases_before.get(target.value.id), target.attr, value)
         elif isinstance(target, ast.Subscript):
             owner = owner_name(target.value, mapping_aliases_before, aliases_before)
@@ -12760,18 +13912,36 @@ def _compact_snippet_typed_print_overwrite_replay(
                 safe_members.difference_update({member for member in safe_members if member[0] == owner})
                 deleted_members.difference_update({member for member in deleted_members if member[0] == owner})
             else:
-                record_member(owner, member_name, value)
+                record_member(
+                    owner,
+                    member_name,
+                    value,
+                    conditional=mapping_expression_is_uncertain(target.value),
+                )
         elif isinstance(target, ast.Starred):
             record_assignment_target(
                 target.value,
                 ast.Constant(value=None),
                 aliases_before,
                 mapping_aliases_before,
+                target_builtins_aliases,
+                target_builtins_mapping_aliases,
+                value_builtins_aliases,
+                value_builtins_mapping_aliases,
             )
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 for target_item, value_item in zip(target.elts, value.elts, strict=True):
-                    record_assignment_target(target_item, value_item, aliases_before, mapping_aliases_before)
+                    record_assignment_target(
+                        target_item,
+                        value_item,
+                        aliases_before,
+                        mapping_aliases_before,
+                        target_builtins_aliases,
+                        target_builtins_mapping_aliases,
+                        value_builtins_aliases,
+                        value_builtins_mapping_aliases,
+                    )
             else:
                 for target_item in target.elts:
                     record_assignment_target(
@@ -12779,6 +13949,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                         ast.Constant(value=None),
                         aliases_before,
                         mapping_aliases_before,
+                        target_builtins_aliases,
+                        target_builtins_mapping_aliases,
+                        value_builtins_aliases,
+                        value_builtins_mapping_aliases,
                     )
 
     def invalidate_owner_state(owner: tuple[str, int]) -> None:
@@ -12890,36 +14064,153 @@ def _compact_snippet_typed_print_overwrite_replay(
         active_aliases: Mapping[str, tuple[str, int]],
     ) -> None:
         payload = ast.Tuple(elts=[*call.args, *(keyword.value for keyword in call.keywords)])
-        for nested_call in _deterministically_executed_expression_calls(payload):
-            aliases_before_call = _name_aliases_before_call(payload, nested_call, active_aliases)
+        eager_generator_consumers = active_eager_generator_consumer_aliases()
+        for nested_call in _deterministically_executed_expression_calls(
+            payload,
+            eager_generator_consumers=eager_generator_consumers,
+        ):
+            aliases_before_call = _name_aliases_before_call(
+                payload,
+                nested_call,
+                active_aliases,
+                eager_generator_consumers=eager_generator_consumers,
+            )
             record_typed_call(nested_call, aliases_before_call)
 
-    def record_builtins_helper_assignment(member_name: str | None, value: ast.AST) -> None:
-        nonlocal builtins_dict_shadowed, builtins_setattr_shadowed, builtins_vars_shadowed
+    def record_builtins_helper_assignment(
+        member_name: str | None,
+        value: ast.AST,
+        *,
+        conditional: bool = False,
+    ) -> None:
+        nonlocal builtins_print_is_shadowed
+        nonlocal dynamic_builtins_print_shadow_state
+        if member_name is None:
+            deleted_builtins_members.clear()
+            definitely_deleted_builtins_members.clear()
+            set_helper_shadowed("builtins_dict", True, conditional=conditional)
+            if dynamic_builtins_print_shadow_state is None:
+                builtins_print_is_shadowed = True
+            else:
+                dynamic_builtins_print_shadow_state = True
+            set_helper_shadowed("builtins_setattr", True, conditional=conditional)
+            set_helper_shadowed("builtins_vars", True, conditional=conditional)
+            return
+        if not conditional:
+            deleted_builtins_members.discard(member_name)
+        definitely_deleted_builtins_members.discard(member_name)
         value_reference = _simple_reference_name(value)
-        if member_name == "setattr":
-            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+        if member_name == "print":
+            print_is_shadowed = not is_safe_print_value(value)
+            if dynamic_builtins_print_shadow_state is None:
+                builtins_print_is_shadowed = (
+                    builtins_print_is_shadowed or print_is_shadowed if conditional else print_is_shadowed
+                )
+            else:
+                dynamic_builtins_print_shadow_state = (
+                    dynamic_builtins_print_shadow_state or print_is_shadowed if conditional else print_is_shadowed
+                )
+        elif member_name == "setattr":
+            set_helper_shadowed(
+                "builtins_setattr",
+                not active_setattr_reference(value_reference),
+                conditional=conditional,
+            )
         elif member_name == "vars":
-            builtins_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_vars",
+                not active_vars_reference(value_reference),
+                conditional=conditional,
+            )
         elif member_name == "dict":
-            builtins_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed(
+                "builtins_dict",
+                not active_dict_reference(value_reference),
+                conditional=conditional,
+            )
 
-    def record_builtins_update(call: ast.Call) -> None:
+    def record_builtins_helper_delete(member_name: str | None) -> None:
+        if member_name is None:
+            deleted_builtins_members.clear()
+            definitely_deleted_builtins_members.clear()
+            invalidate_builtins_mapping_helpers()
+            return
+        deleted_builtins_members.add(member_name)
+        definitely_deleted_builtins_members.add(member_name)
+        record_builtins_helper_assignment(member_name, ast.Constant(value=None))
+        deleted_builtins_members.add(member_name)
+        definitely_deleted_builtins_members.add(member_name)
+
+    def record_builtins_setdefault(member_name: str | None, value: ast.AST) -> None:
+        nonlocal builtins_print_is_shadowed, dynamic_builtins_print_shadow_state
+        if member_name is None or member_name not in deleted_builtins_members:
+            return
+        if member_name in definitely_deleted_builtins_members:
+            record_builtins_helper_assignment(member_name, value)
+            return
+
+        deleted_builtins_members.discard(member_name)
+        definitely_deleted_builtins_members.discard(member_name)
+        value_reference = _simple_reference_name(value)
+        if member_name == "print":
+            current_shadowed = (
+                builtins_print_is_shadowed
+                if dynamic_builtins_print_shadow_state is None
+                else dynamic_builtins_print_shadow_state
+            )
+            joined_shadowed = current_shadowed or not is_safe_print_value(value)
+            if dynamic_builtins_print_shadow_state is None:
+                builtins_print_is_shadowed = joined_shadowed
+            else:
+                dynamic_builtins_print_shadow_state = joined_shadowed
+        elif member_name == "setattr":
+            set_helper_shadowed(
+                "builtins_setattr",
+                not active_setattr_reference(value_reference),
+                conditional=True,
+            )
+        elif member_name == "vars":
+            set_helper_shadowed(
+                "builtins_vars",
+                not active_vars_reference(value_reference),
+                conditional=True,
+            )
+        elif member_name == "dict":
+            set_helper_shadowed(
+                "builtins_dict",
+                not active_dict_reference(value_reference),
+                conditional=True,
+            )
+
+    def record_builtins_update(call: ast.Call, *, conditional: bool = False) -> None:
+        def record_item(key_node: ast.AST, value_node: ast.AST) -> None:
+            record_builtins_helper_assignment(
+                _static_getattr_member_name(key_node),
+                value_node,
+                conditional=conditional,
+            )
+
         for argument in call.args:
-            for key_node, value_node in _runpy_static_update_items(argument) or []:
-                record_builtins_helper_assignment(_static_getattr_member_name(key_node), value_node)
+            _replay_static_update_items(
+                argument,
+                record_item,
+                lambda: invalidate_builtins_mapping_helpers(conditional=conditional),
+            )
         for keyword in call.keywords:
             if keyword.arg is not None:
-                record_builtins_helper_assignment(keyword.arg, keyword.value)
-            elif keyword.arg is None and isinstance(keyword.value, ast.Dict):
-                for dict_key_node, dict_value_node in zip(keyword.value.keys, keyword.value.values, strict=True):
-                    if dict_key_node is not None:
-                        record_builtins_helper_assignment(_static_getattr_member_name(dict_key_node), dict_value_node)
+                record_builtins_helper_assignment(keyword.arg, keyword.value, conditional=conditional)
+            else:
+                _replay_static_update_items(
+                    keyword.value,
+                    record_item,
+                    lambda: invalidate_builtins_mapping_helpers(conditional=conditional),
+                )
 
-    def invalidate_builtins_mapping_helpers() -> None:
-        record_builtins_helper_assignment("dict", ast.Constant(value=None))
-        record_builtins_helper_assignment("setattr", ast.Constant(value=None))
-        record_builtins_helper_assignment("vars", ast.Constant(value=None))
+    def invalidate_builtins_mapping_helpers(*, conditional: bool = False) -> None:
+        record_builtins_helper_assignment("dict", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("print", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("setattr", ast.Constant(value=None), conditional=conditional)
+        record_builtins_helper_assignment("vars", ast.Constant(value=None), conditional=conditional)
 
     def bind_mapping_alias(
         target: ast.AST,
@@ -12945,6 +14236,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         builtins_mapping_aliases.discard(name)
         builtins_mapping_update_aliases.discard(name)
         builtins_mapping_setitem_aliases.discard(name)
+        builtins_mapping_delete_aliases.discard(name)
 
     def bind_builtins_mapping_alias(name: str, value: ast.AST) -> None:
         kind: str | None = None
@@ -12955,6 +14247,8 @@ def _compact_snippet_typed_print_overwrite_replay(
                 kind = "update"
             elif value.attr == "__setitem__":
                 kind = "setitem"
+            elif value.attr in {"pop", "__delitem__"}:
+                kind = "delete"
         elif isinstance(value, ast.Name):
             if value.id in builtins_mapping_aliases:
                 kind = "mapping"
@@ -12962,15 +14256,20 @@ def _compact_snippet_typed_print_overwrite_replay(
                 kind = "update"
             elif value.id in builtins_mapping_setitem_aliases:
                 kind = "setitem"
+            elif value.id in builtins_mapping_delete_aliases:
+                kind = "delete"
         builtins_mapping_aliases.discard(name)
         builtins_mapping_update_aliases.discard(name)
         builtins_mapping_setitem_aliases.discard(name)
+        builtins_mapping_delete_aliases.discard(name)
         if kind == "mapping":
             builtins_mapping_aliases.add(name)
         elif kind == "update":
             builtins_mapping_update_aliases.add(name)
         elif kind == "setitem":
             builtins_mapping_setitem_aliases.add(name)
+        elif kind == "delete":
+            builtins_mapping_delete_aliases.add(name)
 
     def bind_local_helper_alias(name: str, value: ast.AST) -> None:
         value_reference = _simple_reference_name(value)
@@ -12980,12 +14279,43 @@ def _compact_snippet_typed_print_overwrite_replay(
             (dict_helper_aliases, active_dict_reference),
             (dict_update_aliases, active_dict_update_reference),
             (dict_setitem_aliases, active_dict_setitem_reference),
+            (dict_setdefault_aliases, active_dict_setdefault_reference),
+            (dict_delete_aliases, active_dict_delete_reference),
         )
         for aliases, is_active in helper_bindings:
             if is_active(value_reference):
                 aliases.add(name)
             else:
                 aliases.discard(name)
+
+    def bind_safe_print_alias(target: ast.AST, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            is_safe_alias = is_safe_print_value(value)
+            safe_print_aliases.discard(target.id)
+            if is_safe_alias:
+                safe_print_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            bind_safe_print_alias(target.value, ast.Constant(value=None))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_safe_print_alias(target_item, value_item)
+            else:
+                for target_item in target.elts:
+                    bind_safe_print_alias(target_item, ast.Constant(value=None))
+
+    def clear_local_helper_alias(name: str) -> None:
+        vars_helper_aliases.discard(name)
+        setattr_helper_aliases.discard(name)
+        dict_helper_aliases.discard(name)
+        dict_update_aliases.discard(name)
+        dict_setitem_aliases.discard(name)
+        dict_setdefault_aliases.discard(name)
+        dict_delete_aliases.discard(name)
+        if dynamic_safe_print_aliases is None:
+            safe_print_aliases.discard(name)
+        else:
+            dynamic_safe_print_aliases.discard(name)
 
     def bind_typed_alias(
         target: ast.AST,
@@ -13008,60 +14338,234 @@ def _compact_snippet_typed_print_overwrite_replay(
                 for target_item in target.elts:
                     bind_typed_alias(target_item, ast.Constant(value=None), current_aliases)
 
+    def typed_member_callable_value(
+        value: ast.AST,
+        member_aliases: Mapping[str, _TypedMemberCallableValue],
+        module_aliases: Mapping[str, tuple[str, int]],
+    ) -> _TypedMemberCallableValue:
+        if isinstance(value, ast.Name):
+            return member_aliases.get(value.id, frozenset())
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            owner = module_aliases.get(value.value.id)
+            if owner is not None and _typed_member_high_risk_call(owner[0], value.attr) is not None:
+                active_safe_members = safe_members if dynamic_safe_members is None else dynamic_safe_members
+                return frozenset({(owner[0], value.attr, (owner, value.attr) in active_safe_members)})
+        return frozenset()
+
+    def merge_typed_member_callable_values(
+        *values: _TypedMemberCallableValue,
+    ) -> _TypedMemberCallableValue:
+        merged: dict[tuple[str, str], bool] = {}
+        for owner_name_value, member_name, is_safe in (item for value in values for item in value):
+            member = (owner_name_value, member_name)
+            merged[member] = merged.get(member, True) and is_safe
+        return frozenset((*member, is_safe) for member, is_safe in merged.items())
+
+    def bind_typed_member_callable_alias(
+        target: ast.AST,
+        value: ast.AST,
+        member_aliases_before: Mapping[str, _TypedMemberCallableValue] | None = None,
+        module_aliases_before: Mapping[str, tuple[str, int]] | None = None,
+    ) -> None:
+        current_member_aliases = (
+            typed_member_callable_aliases if member_aliases_before is None else member_aliases_before
+        )
+        current_module_aliases = typed_aliases if module_aliases_before is None else module_aliases_before
+        if isinstance(target, ast.Name):
+            member = typed_member_callable_value(value, current_member_aliases, current_module_aliases)
+            typed_member_callable_aliases.pop(target.id, None)
+            if member:
+                typed_member_callable_aliases[target.id] = member
+        elif isinstance(target, ast.Starred):
+            bind_typed_member_callable_alias(
+                target.value,
+                ast.Constant(value=None),
+                current_member_aliases,
+                current_module_aliases,
+            )
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_typed_member_callable_alias(
+                        target_item,
+                        value_item,
+                        current_member_aliases,
+                        current_module_aliases,
+                    )
+            else:
+                for target_item in target.elts:
+                    bind_typed_member_callable_alias(
+                        target_item,
+                        ast.Constant(value=None),
+                        current_member_aliases,
+                        current_module_aliases,
+                    )
+
+    def merge_uncertain_typed_member_callable_alias(
+        target: ast.AST,
+        value: ast.AST,
+        *,
+        safe_print_candidate: bool | None = None,
+    ) -> None:
+        nonlocal current_print_is_shadowed, dynamic_print_shadow_state
+        candidate_is_safe_print = is_safe_print_value(value) if safe_print_candidate is None else safe_print_candidate
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in active_print_builtins_aliases
+        ):
+            record_builtins_helper_assignment(target.attr, value)
+            return
+        if isinstance(target, ast.Subscript) and is_builtins_mapping(target.value):
+            record_builtins_helper_assignment(_static_getattr_member_name(target.slice), value)
+            return
+        if isinstance(target, ast.Name):
+            if class_scope_depth:
+                return
+            previous = typed_member_callable_aliases.get(target.id)
+            candidate = typed_member_callable_value(value, typed_member_callable_aliases, typed_aliases)
+            active_safe_print_aliases = (
+                safe_print_aliases if dynamic_safe_print_aliases is None else dynamic_safe_print_aliases
+            )
+            previous_safe_print_alias = target.id in active_safe_print_aliases
+            previous_print_is_safe = target.id == "print" and not current_print_is_shadowed
+            preserves_builtins_alias = (
+                target.id in active_print_builtins_aliases
+                and isinstance(value, ast.Name)
+                and value.id in active_print_builtins_aliases
+            )
+            preserves_eager_builtins_alias = (
+                target.id in eager_builtins_aliases
+                and isinstance(value, ast.Name)
+                and value.id in eager_builtins_aliases
+            )
+            invalidate_rebound_target(target)
+            if preserves_builtins_alias:
+                active_print_builtins_aliases.add(target.id)
+            if preserves_eager_builtins_alias:
+                eager_builtins_aliases.add(target.id)
+            if dynamic_safe_print_aliases is None:
+                if previous_safe_print_alias and candidate_is_safe_print:
+                    safe_print_aliases.add(target.id)
+            elif candidate_is_safe_print:
+                dynamic_safe_print_aliases.add(target.id)
+            if target.id == "print":
+                if dynamic_print_shadow_state is None:
+                    current_print_is_shadowed = not (previous_print_is_safe and candidate_is_safe_print)
+                else:
+                    dynamic_print_shadow_state = not candidate_is_safe_print
+            if previous is None:
+                if candidate:
+                    typed_member_callable_aliases[target.id] = candidate
+                return
+            if not candidate:
+                typed_member_callable_aliases.pop(target.id, None)
+                return
+            typed_member_callable_aliases[target.id] = merge_typed_member_callable_values(previous, candidate)
+        elif isinstance(target, ast.Starred):
+            merge_uncertain_typed_member_callable_alias(
+                target.value,
+                ast.Constant(value=None),
+                safe_print_candidate=False,
+            )
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                candidates = [is_safe_print_value(value_item) for value_item in value.elts]
+                for target_item, value_item, candidate_is_safe in zip(
+                    target.elts,
+                    value.elts,
+                    candidates,
+                    strict=True,
+                ):
+                    merge_uncertain_typed_member_callable_alias(
+                        target_item,
+                        value_item,
+                        safe_print_candidate=candidate_is_safe,
+                    )
+            else:
+                for target_item in target.elts:
+                    merge_uncertain_typed_member_callable_alias(
+                        target_item,
+                        ast.Constant(value=None),
+                        safe_print_candidate=False,
+                    )
+        else:
+            member_key: tuple[tuple[str, int], str] | None = None
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                owner = typed_aliases.get(target.value.id)
+                if owner is not None:
+                    member_key = (owner, target.attr)
+            elif isinstance(target, ast.Subscript):
+                owner = owner_name(target.value)
+                member_name = _static_getattr_member_name(target.slice)
+                if owner is not None and member_name is not None:
+                    member_key = (owner, member_name)
+            if dynamic_safe_members is not None and member_key is not None:
+                if candidate_is_safe_print and member_key[0] not in class_mutated_owners:
+                    dynamic_safe_members.add(member_key)
+                elif not (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == member_key[1]
+                    and isinstance(value.value, ast.Name)
+                    and typed_aliases.get(value.value.id) == member_key[0]
+                ):
+                    dynamic_safe_members.discard(member_key)
+                return
+            preserves_safe_member = member_key is not None and member_key in safe_members and candidate_is_safe_print
+            invalidate_rebound_target(target)
+            if preserves_safe_member and member_key is not None:
+                safe_members.add(member_key)
+
     def record_setattr_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_setattr_shadowed, builtins_setattr_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_setattr_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "setattr":
-            local_setattr_shadowed = not active_setattr_reference(value_reference)
+            set_helper_shadowed("local_setattr", not active_setattr_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "setattr"
             and isinstance(target.value, ast.Name)
-            and target.value.id in builtins_aliases
+            and target.value.id in active_print_builtins_aliases
         ):
-            builtins_setattr_shadowed = not active_setattr_reference(value_reference)
+            set_helper_shadowed("builtins_setattr", not active_setattr_reference(value_reference))
 
     def record_vars_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_vars_shadowed, builtins_vars_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_vars_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "vars":
-            local_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed("local_vars", not active_vars_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "vars"
             and isinstance(target.value, ast.Name)
-            and target.value.id in builtins_aliases
+            and target.value.id in active_print_builtins_aliases
         ):
-            builtins_vars_shadowed = not active_vars_reference(value_reference)
+            set_helper_shadowed("builtins_vars", not active_vars_reference(value_reference))
 
     def record_dict_shadow(target: ast.AST, value: ast.AST) -> None:
-        nonlocal local_dict_shadowed, builtins_dict_shadowed
         if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             for target_item, value_item in zip(target.elts, value.elts, strict=False):
                 record_dict_shadow(target_item, value_item)
             return
         value_reference = _simple_reference_name(value)
         if isinstance(target, ast.Name) and target.id == "dict":
-            local_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed("local_dict", not active_dict_reference(value_reference))
         elif (
             isinstance(target, ast.Attribute)
             and target.attr == "dict"
             and isinstance(target.value, ast.Name)
-            and target.value.id in builtins_aliases
+            and target.value.id in active_print_builtins_aliases
         ):
-            builtins_dict_shadowed = not active_dict_reference(value_reference)
+            set_helper_shadowed("builtins_dict", not active_dict_reference(value_reference))
 
     def invalidate_rebound_target(target: ast.AST) -> None:
-        nonlocal local_setattr_shadowed, builtins_setattr_shadowed, local_vars_shadowed, builtins_vars_shadowed
-        nonlocal local_dict_shadowed, builtins_dict_shadowed
+        nonlocal builtins_print_is_shadowed
         if isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 invalidate_rebound_target(element)
@@ -13070,33 +14574,36 @@ def _compact_snippet_typed_print_overwrite_replay(
             invalidate_rebound_target(target.value)
             return
         if isinstance(target, ast.Name):
+            if class_scope_depth:
+                return
             typed_aliases.pop(target.id, None)
+            typed_member_callable_aliases.pop(target.id, None)
+            active_print_builtins_aliases.discard(target.id)
+            eager_builtins_aliases.discard(target.id)
             clear_local_mapping_alias(target.id)
             clear_module_helper_target(target)
             reload_aliases.discard(target.id)
-            vars_helper_aliases.discard(target.id)
-            setattr_helper_aliases.discard(target.id)
-            dict_helper_aliases.discard(target.id)
-            dict_update_aliases.discard(target.id)
-            dict_setitem_aliases.discard(target.id)
+            clear_local_helper_alias(target.id)
             if target.id == "vars":
-                local_vars_shadowed = True
+                set_helper_shadowed("local_vars", True)
             elif target.id == "setattr":
-                local_setattr_shadowed = True
+                set_helper_shadowed("local_setattr", True)
             elif target.id == "dict":
-                local_dict_shadowed = True
+                set_helper_shadowed("local_dict", True)
         elif isinstance(target, ast.Attribute):
             if isinstance(target.value, ast.Name):
                 owner = typed_aliases.get(target.value.id)
                 if owner is not None:
                     safe_members.discard((owner, target.attr))
-                if target.value.id in builtins_aliases:
-                    if target.attr == "vars":
-                        builtins_vars_shadowed = True
+                if target.value.id in active_print_builtins_aliases:
+                    if target.attr == "print":
+                        builtins_print_is_shadowed = True
+                    elif target.attr == "vars":
+                        set_helper_shadowed("builtins_vars", True)
                     elif target.attr == "setattr":
-                        builtins_setattr_shadowed = True
+                        set_helper_shadowed("builtins_setattr", True)
                     elif target.attr == "dict":
-                        builtins_dict_shadowed = True
+                        set_helper_shadowed("builtins_dict", True)
         elif isinstance(target, ast.Subscript):
             owner = owner_name(target.value)
             member_name = _static_getattr_member_name(target.slice)
@@ -13112,16 +14619,86 @@ def _compact_snippet_typed_print_overwrite_replay(
 
     def invalidate_dynamic_bindings(statement: ast.stmt) -> None:
         class BindingVisitor(ast.NodeVisitor):
+            def visit_If(self, node: ast.If) -> None:
+                nonlocal current_print_is_shadowed, builtins_print_is_shadowed
+                nonlocal dynamic_print_shadow_state, dynamic_builtins_print_shadow_state, dynamic_safe_members
+                nonlocal dynamic_safe_print_aliases
+                self.visit(node.test)
+                parent_print_state = dynamic_print_shadow_state
+                parent_builtins_print_state = dynamic_builtins_print_shadow_state
+                parent_safe_members = dynamic_safe_members
+                parent_safe_print_aliases = dynamic_safe_print_aliases
+                base_print_state = current_print_is_shadowed if parent_print_state is None else parent_print_state
+                base_builtins_print_state = (
+                    builtins_print_is_shadowed if parent_builtins_print_state is None else parent_builtins_print_state
+                )
+                base_safe_members = set(safe_members if parent_safe_members is None else parent_safe_members)
+                base_safe_print_aliases = set(
+                    safe_print_aliases if parent_safe_print_aliases is None else parent_safe_print_aliases
+                )
+                base_lexical_scope = lexical_scope_snapshot()
+
+                dynamic_print_shadow_state = base_print_state
+                dynamic_builtins_print_shadow_state = base_builtins_print_state
+                dynamic_safe_members = set(base_safe_members)
+                dynamic_safe_print_aliases = set(base_safe_print_aliases)
+                for child in node.body:
+                    self.visit(child)
+                body_print_state = dynamic_print_shadow_state
+                body_builtins_print_state = dynamic_builtins_print_shadow_state
+                body_safe_members = set(dynamic_safe_members)
+                body_safe_print_aliases = set(dynamic_safe_print_aliases)
+                body_lexical_scope = lexical_scope_snapshot()
+
+                restore_lexical_scope(base_lexical_scope)
+                dynamic_print_shadow_state = base_print_state
+                dynamic_builtins_print_shadow_state = base_builtins_print_state
+                dynamic_safe_members = set(base_safe_members)
+                dynamic_safe_print_aliases = set(base_safe_print_aliases)
+                for child in node.orelse:
+                    self.visit(child)
+                else_lexical_scope = lexical_scope_snapshot()
+                merged_print_state = bool(body_print_state or dynamic_print_shadow_state)
+                merged_builtins_print_state = bool(body_builtins_print_state or dynamic_builtins_print_shadow_state)
+                merged_safe_members = body_safe_members.intersection(dynamic_safe_members)
+                merged_safe_print_aliases = body_safe_print_aliases.intersection(dynamic_safe_print_aliases)
+                restore_lexical_scope(merge_lexical_branch_scopes(body_lexical_scope, else_lexical_scope))
+
+                if parent_print_state is None:
+                    current_print_is_shadowed = merged_print_state
+                    dynamic_print_shadow_state = None
+                else:
+                    dynamic_print_shadow_state = merged_print_state
+                if parent_builtins_print_state is None:
+                    builtins_print_is_shadowed = merged_builtins_print_state
+                    dynamic_builtins_print_shadow_state = None
+                else:
+                    dynamic_builtins_print_shadow_state = merged_builtins_print_state
+                if parent_safe_members is None:
+                    safe_members.clear()
+                    safe_members.update(merged_safe_members)
+                    dynamic_safe_members = None
+                else:
+                    dynamic_safe_members = merged_safe_members
+                if parent_safe_print_aliases is None:
+                    safe_print_aliases.clear()
+                    safe_print_aliases.update(merged_safe_print_aliases)
+                    dynamic_safe_print_aliases = None
+                else:
+                    dynamic_safe_print_aliases = merged_safe_print_aliases
+
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
                 for target in node.targets:
-                    invalidate_rebound_target(target)
+                    merge_uncertain_typed_member_callable_alias(target, node.value)
 
             def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
                 self.visit(node.annotation)
                 if node.value is not None:
                     self.visit(node.value)
-                invalidate_rebound_target(node.target)
+                    merge_uncertain_typed_member_callable_alias(node.target, node.value)
+                else:
+                    invalidate_rebound_target(node.target)
 
             def visit_AugAssign(self, node: ast.AugAssign) -> None:
                 self.visit(node.value)
@@ -13129,11 +14706,20 @@ def _compact_snippet_typed_print_overwrite_replay(
 
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
-                invalidate_rebound_target(node.target)
+                merge_uncertain_typed_member_callable_alias(node.target, node.value)
 
             def visit_Delete(self, node: ast.Delete) -> None:
                 for target in node.targets:
-                    invalidate_rebound_target(target)
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in active_print_builtins_aliases
+                    ):
+                        record_builtins_helper_delete(target.attr)
+                    elif isinstance(target, ast.Subscript) and is_builtins_mapping(target.value):
+                        record_builtins_helper_delete(_static_getattr_member_name(target.slice))
+                    else:
+                        invalidate_rebound_target(target)
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
@@ -13142,17 +14728,121 @@ def _compact_snippet_typed_print_overwrite_replay(
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                 for alias in node.names:
-                    invalidate_rebound_target(ast.Name(id=alias.asname or alias.name, ctx=ast.Store()))
+                    local_name = alias.asname or alias.name
+                    previous = typed_member_callable_aliases.get(local_name)
+                    candidate: _TypedMemberCallableValue | None = None
+                    if (
+                        node.module in {"webbrowser", "ctypes"}
+                        and _typed_member_high_risk_call(node.module, alias.name) is not None
+                    ):
+                        identity = current_typed_identity(node.module)
+                        active_safe_members = safe_members if dynamic_safe_members is None else dynamic_safe_members
+                        candidate = frozenset(
+                            {(node.module, alias.name, (identity, alias.name) in active_safe_members)}
+                        )
+                    invalidate_rebound_target(ast.Name(id=local_name, ctx=ast.Store()))
+                    if previous is not None and candidate is not None:
+                        typed_member_callable_aliases[local_name] = merge_typed_member_callable_values(
+                            previous,
+                            candidate,
+                        )
+                    elif previous is not None:
+                        typed_member_callable_aliases[local_name] = previous
+                    elif candidate is not None:
+                        typed_member_callable_aliases[local_name] = candidate
+
+            def visit_Call(self, node: ast.Call) -> None:
+                self.generic_visit(node)
+                reference = _simple_reference_name(node.func)
+                if isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_update_aliases:
+                    record_builtins_update(node)
+                elif (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in builtins_mapping_setitem_aliases
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                elif isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_delete_aliases and node.args:
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
+                elif active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
+                    record_builtins_update(
+                        node,
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
+                elif (
+                    active_dict_setitem_reference(reference)
+                    and len(node.args) >= 3
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
+                elif (
+                    active_dict_delete_reference(reference)
+                    and len(node.args) >= 2
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[1]))
+                elif (
+                    active_dict_setdefault_reference(reference)
+                    and len(node.args) >= 3
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_setdefault(_static_getattr_member_name(node.args[1]), node.args[2])
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"update", "__ior__"}
+                    and is_builtins_mapping(node.func.value)
+                ):
+                    record_builtins_update(node)
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setitem__"
+                    and is_builtins_mapping(node.func.value)
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"pop", "__delitem__"}
+                    and is_builtins_mapping(node.func.value)
+                    and node.args
+                ):
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "setdefault"
+                    and is_builtins_mapping(node.func.value)
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_setdefault(_static_getattr_member_name(node.args[0]), node.args[1])
+                elif active_setattr_reference(reference) and len(node.args) >= 3 and is_builtins_object(node.args[0]):
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_setattr_reference(reference),
+                    )
+                elif (
+                    reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
+                    and reference not in shadowed_delattr_references_by_statement.get(id(statement), set())
+                    and len(node.args) >= 2
+                    and is_builtins_object(node.args[0])
+                ):
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[1]))
 
             def visit_For(self, node: ast.For) -> None:
                 self.visit(node.iter)
-                invalidate_rebound_target(node.target)
+                if _static_late_iter_truth(node.iter) is not False:
+                    invalidate_rebound_target(node.target)
                 for child in [*node.body, *node.orelse]:
                     self.visit(child)
 
             def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
                 self.visit(node.iter)
-                invalidate_rebound_target(node.target)
+                if _static_late_iter_truth(node.iter) is not False:
+                    invalidate_rebound_target(node.target)
                 for child in [*node.body, *node.orelse]:
                     self.visit(child)
 
@@ -13206,11 +14896,18 @@ def _compact_snippet_typed_print_overwrite_replay(
                         self.visit(default)
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                nonlocal class_scope_depth
                 invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
                 for expression in [*node.decorator_list, *node.bases]:
                     self.visit(expression)
                 for keyword in node.keywords:
                     self.visit(keyword.value)
+                class_scope_depth += 1
+                try:
+                    for child in node.body:
+                        self.visit(child)
+                finally:
+                    class_scope_depth -= 1
 
             def visit_Lambda(self, node: ast.Lambda) -> None:
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
@@ -13223,36 +14920,51 @@ def _compact_snippet_typed_print_overwrite_replay(
         return (
             dict(typed_aliases),
             set(builtins_aliases),
+            set(active_print_builtins_aliases),
             set(vars_helper_aliases),
             set(setattr_helper_aliases),
             set(dict_helper_aliases),
             set(dict_update_aliases),
             set(dict_setitem_aliases),
+            set(dict_setdefault_aliases),
             set(builtins_mapping_aliases),
             set(builtins_mapping_update_aliases),
             set(builtins_mapping_setitem_aliases),
             dict(mapping_aliases),
+            dict(typed_member_callable_aliases),
             set(importlib_aliases),
             set(reload_aliases),
             set(sys_aliases),
             set(sys_modules_aliases),
             set(sys_modules_pop_aliases),
             set(sys_modules_clear_aliases),
+            set(safe_print_aliases),
             local_setattr_shadowed,
             local_vars_shadowed,
             local_dict_shadowed,
+            builtins_setattr_shadowed,
+            builtins_vars_shadowed,
+            builtins_dict_shadowed,
+            set(deleted_builtins_members),
+            set(dict_delete_aliases),
+            set(builtins_mapping_delete_aliases),
+            set(definitely_deleted_builtins_members),
+            set(eager_builtins_aliases),
+            set(uncertain_helper_shadows),
         )
 
     def restore_lexical_scope(snapshot: tuple[Any, ...]) -> None:
         nonlocal local_setattr_shadowed, local_vars_shadowed, local_dict_shadowed
-        mappings = (typed_aliases, mapping_aliases)
+        nonlocal builtins_setattr_shadowed, builtins_vars_shadowed, builtins_dict_shadowed
         sets = (
             builtins_aliases,
+            active_print_builtins_aliases,
             vars_helper_aliases,
             setattr_helper_aliases,
             dict_helper_aliases,
             dict_update_aliases,
             dict_setitem_aliases,
+            dict_setdefault_aliases,
             builtins_mapping_aliases,
             builtins_mapping_update_aliases,
             builtins_mapping_setitem_aliases,
@@ -13262,14 +14974,70 @@ def _compact_snippet_typed_print_overwrite_replay(
             sys_modules_aliases,
             sys_modules_pop_aliases,
             sys_modules_clear_aliases,
+            safe_print_aliases,
         )
-        for mapping, saved in zip(mappings, (snapshot[0], snapshot[10]), strict=True):
+        for mapping, saved in (
+            (typed_aliases, snapshot[0]),
+            (mapping_aliases, snapshot[12]),
+            (typed_member_callable_aliases, snapshot[13]),
+        ):
             mapping.clear()
             mapping.update(saved)
-        for current, saved in zip(sets, (*snapshot[1:10], *snapshot[11:17]), strict=True):
+        for current, saved in zip(sets, (*snapshot[1:12], *snapshot[14:21]), strict=True):
             current.clear()
             current.update(saved)
-        local_setattr_shadowed, local_vars_shadowed, local_dict_shadowed = snapshot[17:20]
+        local_setattr_shadowed, local_vars_shadowed, local_dict_shadowed = snapshot[21:24]
+        builtins_setattr_shadowed, builtins_vars_shadowed, builtins_dict_shadowed = snapshot[24:27]
+        deleted_builtins_members.clear()
+        deleted_builtins_members.update(snapshot[27])
+        dict_delete_aliases.clear()
+        dict_delete_aliases.update(snapshot[28])
+        builtins_mapping_delete_aliases.clear()
+        builtins_mapping_delete_aliases.update(snapshot[29])
+        definitely_deleted_builtins_members.clear()
+        definitely_deleted_builtins_members.update(snapshot[30])
+        eager_builtins_aliases.clear()
+        eager_builtins_aliases.update(snapshot[31])
+        uncertain_helper_shadows.clear()
+        uncertain_helper_shadows.update(snapshot[32])
+
+    def merge_lexical_branch_scopes(body: tuple[Any, ...], otherwise: tuple[Any, ...]) -> tuple[Any, ...]:
+        merged_typed_aliases = {name: value for name, value in body[0].items() if otherwise[0].get(name) == value}
+
+        merged_mapping_aliases = {name: value for name, value in body[12].items() if otherwise[12].get(name) == value}
+        merged_member_aliases: dict[str, _TypedMemberCallableValue] = {}
+        for name in body[13].keys() | otherwise[13].keys():
+            values = [scope[name] for scope in (body[13], otherwise[13]) if name in scope]
+            merged_member_aliases[name] = merge_typed_member_callable_values(*values)
+
+        union_set_indexes = {1, *range(3, 12), *range(14, 20), 27, 28, 29}
+        intersection_set_indexes = {2, 20, 30, 31}
+        merged: list[Any] = [None] * 33
+        merged[0] = merged_typed_aliases
+        merged[12] = merged_mapping_aliases
+        merged[13] = merged_member_aliases
+        for index in union_set_indexes:
+            merged[index] = set(body[index]).union(otherwise[index])
+        for index in intersection_set_indexes:
+            merged[index] = set(body[index]).intersection(otherwise[index])
+        helper_names = (
+            "local_setattr",
+            "local_vars",
+            "local_dict",
+            "builtins_setattr",
+            "builtins_vars",
+            "builtins_dict",
+        )
+        merged_uncertain_helpers: set[str] = set()
+        for index, helper_name in zip(range(21, 27), helper_names, strict=True):
+            merged[index] = bool(body[index] and otherwise[index])
+            helper_is_possible = bool(
+                body[index] or otherwise[index] or helper_name in body[32] or helper_name in otherwise[32]
+            )
+            if helper_is_possible and not merged[index]:
+                merged_uncertain_helpers.add(helper_name)
+        merged[32] = merged_uncertain_helpers
+        return tuple(merged)
 
     executed_statement_ids = {id(statement) for statement in executed_statements}
     shadowed_print_statement_ids = _compact_snippet_shadowed_print_statement_ids(executed_statements)
@@ -13296,6 +15064,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         for scope in statement_scope[common_scope_length:]:
             class_scope_stack.append((scope, lexical_scope_snapshot()))
         typed_aliases_before = dict(typed_aliases)
+        typed_member_callable_aliases_before = dict(typed_member_callable_aliases)
         mapping_aliases_before = dict(mapping_aliases)
         reload_aliases_before = frozenset(reload_aliases)
         importlib_aliases_before = frozenset(importlib_aliases)
@@ -13322,22 +15091,14 @@ def _compact_snippet_typed_print_overwrite_replay(
                 local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                 clear_local_mapping_alias(local_name)
                 typed_aliases.pop(local_name, None)
+                typed_member_callable_aliases.pop(local_name, None)
                 reload_aliases.discard(local_name)
+                clear_local_helper_alias(local_name)
                 clear_module_helper_target(ast.Name(id=local_name))
                 if alias.name == "webbrowser":
-                    identity = cached_typed_identities.get("webbrowser")
-                    if identity is None:
-                        identity = ("webbrowser", next_typed_generation["webbrowser"])
-                        next_typed_generation["webbrowser"] += 1
-                        cached_typed_identities["webbrowser"] = identity
-                    typed_aliases[local_name] = identity
+                    typed_aliases[local_name] = current_typed_identity("webbrowser")
                 elif alias.name == "ctypes":
-                    identity = cached_typed_identities.get("ctypes")
-                    if identity is None:
-                        identity = ("ctypes", next_typed_generation["ctypes"])
-                        next_typed_generation["ctypes"] += 1
-                        cached_typed_identities["ctypes"] = identity
-                    typed_aliases[local_name] = identity
+                    typed_aliases[local_name] = current_typed_identity("ctypes")
                 elif alias.name == "builtins":
                     builtins_aliases.add(local_name)
                 elif alias.name == "importlib":
@@ -13348,21 +15109,43 @@ def _compact_snippet_typed_print_overwrite_replay(
             for alias in statement.names:
                 local_name = alias.asname or alias.name
                 typed_aliases.pop(local_name, None)
+                typed_member_callable_aliases.pop(local_name, None)
                 clear_local_mapping_alias(local_name)
                 clear_module_helper_target(ast.Name(id=local_name))
                 reload_aliases.discard(local_name)
-                if statement.module == "importlib" and alias.name == "reload":
+                clear_local_helper_alias(local_name)
+                if (
+                    statement.module in {"webbrowser", "ctypes"}
+                    and _typed_member_high_risk_call(statement.module, alias.name) is not None
+                ):
+                    identity = current_typed_identity(statement.module)
+                    typed_member_callable_aliases[local_name] = frozenset(
+                        {(statement.module, alias.name, (identity, alias.name) in safe_members)}
+                    )
+                elif statement.module == "importlib" and alias.name == "reload":
                     reload_aliases.add(local_name)
                 elif statement.module == "sys" and alias.name == "modules":
                     sys_modules_aliases.add(local_name)
         elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             typed_aliases.pop(statement.name, None)
+            typed_member_callable_aliases.pop(statement.name, None)
             clear_local_mapping_alias(statement.name)
             clear_module_helper_target(ast.Name(id=statement.name))
             reload_aliases.discard(statement.name)
+            clear_local_helper_alias(statement.name)
         elif isinstance(statement, ast.Assign):
+            target_builtins_aliases = set(active_print_builtins_aliases)
+            target_builtins_mapping_aliases = set(builtins_mapping_aliases)
+            value_builtins_aliases = frozenset(active_print_builtins_aliases)
+            value_builtins_mapping_aliases = frozenset(builtins_mapping_aliases)
             for target in statement.targets:
                 bind_typed_alias(target, statement.value, typed_aliases_before)
+                bind_typed_member_callable_alias(
+                    target,
+                    statement.value,
+                    typed_member_callable_aliases_before,
+                    typed_aliases_before,
+                )
                 record_setattr_shadow(target, statement.value)
                 record_vars_shadow(target, statement.value)
                 record_dict_shadow(target, statement.value)
@@ -13371,7 +15154,12 @@ def _compact_snippet_typed_print_overwrite_replay(
                     statement.value,
                     typed_aliases_before,
                     mapping_aliases_before,
+                    target_builtins_aliases,
+                    target_builtins_mapping_aliases,
+                    value_builtins_aliases,
+                    value_builtins_mapping_aliases,
                 )
+                bind_safe_print_alias(target, statement.value)
                 invalidate_sys_modules_assignment(target, sys_aliases_before, sys_modules_aliases_before)
                 if isinstance(target, ast.Name):
                     bind_local_helper_alias(target.id, statement.value)
@@ -13389,6 +15177,12 @@ def _compact_snippet_typed_print_overwrite_replay(
                 bind_mapping_alias(target, statement.value, mapping_aliases_before)
         elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
             bind_typed_alias(statement.target, statement.value, typed_aliases_before)
+            bind_typed_member_callable_alias(
+                statement.target,
+                statement.value,
+                typed_member_callable_aliases_before,
+                typed_aliases_before,
+            )
             record_setattr_shadow(statement.target, statement.value)
             record_vars_shadow(statement.target, statement.value)
             record_dict_shadow(statement.target, statement.value)
@@ -13398,6 +15192,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 typed_aliases_before,
                 mapping_aliases_before,
             )
+            bind_safe_print_alias(statement.target, statement.value)
             invalidate_sys_modules_assignment(
                 statement.target,
                 sys_aliases_before,
@@ -13424,7 +15219,15 @@ def _compact_snippet_typed_print_overwrite_replay(
             bind_mapping_alias(statement.target, statement.value)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in active_print_builtins_aliases
+                ):
+                    record_builtins_helper_delete(target.attr)
+                elif isinstance(target, ast.Subscript) and is_builtins_mapping(target.value):
+                    record_builtins_helper_delete(_static_getattr_member_name(target.slice))
+                elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
                     record_member_delete(typed_aliases.get(target.value.id), target.attr)
                 elif isinstance(target, ast.Subscript):
                     record_member_delete(
@@ -13433,9 +15236,11 @@ def _compact_snippet_typed_print_overwrite_replay(
                     )
                 for target_name in _assignment_target_names(target):
                     typed_aliases.pop(target_name, None)
+                    typed_member_callable_aliases.pop(target_name, None)
                     clear_local_mapping_alias(target_name)
                     clear_module_helper_target(ast.Name(id=target_name))
                     reload_aliases.discard(target_name)
+                    clear_local_helper_alias(target_name)
                 if (
                     isinstance(target, ast.Subscript)
                     and (
@@ -13477,7 +15282,8 @@ def _compact_snippet_typed_print_overwrite_replay(
                     invalidate_target_owner,
                 )
         elif isinstance(statement, (ast.For, ast.AsyncFor)):
-            invalidate_rebound_target(statement.target)
+            if _static_late_iter_truth(statement.iter) is not False:
+                invalidate_rebound_target(statement.target)
         elif isinstance(statement, (ast.With, ast.AsyncWith)):
             for item in statement.items:
                 if item.optional_vars is not None:
@@ -13492,13 +15298,38 @@ def _compact_snippet_typed_print_overwrite_replay(
             expression_typed_aliases = (
                 typed_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else typed_aliases
             )
+            expression_typed_member_callable_aliases = (
+                typed_member_callable_aliases_before
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                else typed_member_callable_aliases
+            )
             expression_mapping_aliases = (
                 mapping_aliases_before if isinstance(statement, (ast.Assign, ast.AnnAssign)) else mapping_aliases
             )
-            for node in _deterministically_executed_expression_calls(value):
+            eager_generator_consumers = expression_eager_generator_consumer_aliases(value)
+            for node in _deterministically_executed_expression_calls(
+                value,
+                eager_generator_consumers=eager_generator_consumers,
+            ):
                 reference = _simple_reference_name(node.func)
-                active_typed_aliases = _name_aliases_before_call(value, node, expression_typed_aliases)
-                active_mapping_aliases = _name_aliases_before_call(value, node, expression_mapping_aliases)
+                active_typed_aliases = _name_aliases_before_call(
+                    value,
+                    node,
+                    expression_typed_aliases,
+                    eager_generator_consumers=eager_generator_consumers,
+                )
+                active_typed_member_callable_aliases = _name_aliases_before_call(
+                    value,
+                    node,
+                    expression_typed_member_callable_aliases,
+                    eager_generator_consumers=eager_generator_consumers,
+                )
+                active_mapping_aliases = _name_aliases_before_call(
+                    value,
+                    node,
+                    expression_mapping_aliases,
+                    eager_generator_consumers=eager_generator_consumers,
+                )
                 (
                     active_sys_aliases,
                     active_sys_modules_aliases,
@@ -13513,14 +15344,24 @@ def _compact_snippet_typed_print_overwrite_replay(
                     sys_modules_pop_aliases_before,
                     sys_modules_clear_aliases_before,
                     importlib_aliases_before,
+                    eager_generator_consumers=eager_generator_consumers,
                 )
                 active_reload_aliases = _reload_aliases_before_call(
                     value,
                     node,
                     reload_aliases_before,
                     set(active_importlib_aliases),
+                    eager_generator_consumers=eager_generator_consumers,
                 )
                 record_typed_call(node, active_typed_aliases)
+                if isinstance(node.func, ast.Name) and node.func.id in active_typed_member_callable_aliases:
+                    for owner_name_value, imported_member_name, imported_safe in active_typed_member_callable_aliases[
+                        node.func.id
+                    ]:
+                        if imported_safe:
+                            safe_called_members.add((owner_name_value, imported_member_name))
+                        else:
+                            unsafe_called_members.add((owner_name_value, imported_member_name))
                 if invalidate_sys_modules_update(node, active_sys_aliases, active_sys_modules_aliases):
                     continue
                 if (
@@ -13564,15 +15405,39 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ):
                     record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
                     continue
+                if isinstance(node.func, ast.Name) and node.func.id in builtins_mapping_delete_aliases and node.args:
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
+                    continue
                 if active_dict_update_reference(reference) and node.args and is_builtins_mapping(node.args[0]):
-                    record_builtins_update(node)
+                    record_builtins_update(
+                        node,
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
                     continue
                 if (
                     active_dict_setitem_reference(reference)
                     and len(node.args) >= 3
                     and is_builtins_mapping(node.args[0])
                 ):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_dict_mutator_reference(reference),
+                    )
+                    continue
+                if (
+                    active_dict_delete_reference(reference)
+                    and len(node.args) >= 2
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[1]))
+                    continue
+                if (
+                    active_dict_setdefault_reference(reference)
+                    and len(node.args) >= 3
+                    and is_builtins_mapping(node.args[0])
+                ):
+                    record_builtins_setdefault(_static_getattr_member_name(node.args[1]), node.args[2])
                     continue
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -13590,12 +15455,35 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_builtins_helper_assignment(_static_getattr_member_name(node.args[0]), node.args[1])
                     continue
                 if (
-                    active_setattr_reference(reference)
-                    and len(node.args) >= 3
-                    and isinstance(node.args[0], ast.Name)
-                    and node.args[0].id in builtins_aliases
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"pop", "__delitem__"}
+                    and is_builtins_mapping(node.func.value)
+                    and node.args
                 ):
-                    record_builtins_helper_assignment(_static_getattr_member_name(node.args[1]), node.args[2])
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[0]))
+                    continue
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "setdefault"
+                    and is_builtins_mapping(node.func.value)
+                    and len(node.args) >= 2
+                ):
+                    record_builtins_setdefault(_static_getattr_member_name(node.args[0]), node.args[1])
+                    continue
+                if active_setattr_reference(reference) and len(node.args) >= 3 and is_builtins_object(node.args[0]):
+                    record_builtins_helper_assignment(
+                        _static_getattr_member_name(node.args[1]),
+                        node.args[2],
+                        conditional=uncertain_setattr_reference(reference),
+                    )
+                    continue
+                if (
+                    reference in {"delattr", "builtins.delattr", "__builtins__.delattr"}
+                    and reference not in shadowed_delattr_references_by_statement.get(id(statement), set())
+                    and len(node.args) >= 2
+                    and is_builtins_object(node.args[0])
+                ):
+                    record_builtins_helper_delete(_static_getattr_member_name(node.args[1]))
                     continue
                 if (
                     active_setattr_reference(reference)
@@ -13607,7 +15495,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_setattr_reference(reference)
+                        ),
                     )
                     continue
                 if (
@@ -13621,7 +15511,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.func.value.id],
                         _static_getattr_member_name(node.args[0]),
                         node.args[1],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13634,7 +15524,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13647,7 +15537,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13660,7 +15550,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.func.value.id],
                         _static_getattr_member_name(node.args[0]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13672,7 +15562,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_member_delete_call(
                         active_typed_aliases[node.args[0].id],
                         _static_getattr_member_name(node.args[1]),
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13691,7 +15581,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_update(
                         update_owner,
                         node,
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_dict_mutator_reference(reference)
+                        ),
                     )
                     continue
                 if active_dict_setitem_reference(reference) and len(node.args) >= 3:
@@ -13715,7 +15607,10 @@ def _compact_snippet_typed_print_overwrite_replay(
                                 setitem_owner,
                                 member_name,
                                 node.args[2],
-                                conditional=_is_conditionally_evaluated_expression(node, parents),
+                                conditional=(
+                                    is_conditionally_evaluated_typed_call(node)
+                                    or uncertain_dict_mutator_reference(reference)
+                                ),
                             )
                     continue
                 if active_dict_setdefault_reference(reference) and len(node.args) >= 3:
@@ -13723,7 +15618,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                         owner_name(node.args[0], active_mapping_aliases, active_typed_aliases),
                         _static_getattr_member_name(node.args[1]),
                         node.args[2],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=(
+                            is_conditionally_evaluated_typed_call(node) or uncertain_dict_mutator_reference(reference)
+                        ),
                     )
                     continue
                 if (
@@ -13756,7 +15653,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     record_update(
                         update_owner,
                         node,
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13785,7 +15682,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                             setitem_owner,
                             member_name,
                             node.args[1],
-                            conditional=_is_conditionally_evaluated_expression(node, parents),
+                            conditional=is_conditionally_evaluated_typed_call(node),
                         )
                     continue
                 if (
@@ -13805,7 +15702,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                         setdefault_owner,
                         _static_getattr_member_name(node.args[0]),
                         node.args[1],
-                        conditional=_is_conditionally_evaluated_expression(node, parents),
+                        conditional=is_conditionally_evaluated_typed_call(node),
                     )
                     continue
                 if (
@@ -13820,17 +15717,34 @@ def _compact_snippet_typed_print_overwrite_replay(
                     )
                     is not None
                     and node.args
-                    and not _is_conditionally_evaluated_expression(node, parents)
+                    and not is_conditionally_evaluated_typed_call(node)
                 ):
                     record_member_delete(delete_owner, _static_getattr_member_name(node.args[0]))
                     continue
-            for named_expression in _deterministic_named_expressions(value):
+            for named_expression in _deterministic_named_expressions(
+                value,
+                eager_generator_consumers=eager_generator_consumers,
+            ):
                 target_name = named_expression.target.id
                 canonical_module = expression_typed_aliases.get(_simple_reference_name(named_expression.value) or "")
                 if canonical_module is None:
                     typed_aliases.pop(target_name, None)
                 else:
                     typed_aliases[target_name] = canonical_module
+                bind_typed_member_callable_alias(
+                    named_expression.target,
+                    named_expression.value,
+                    expression_typed_member_callable_aliases,
+                    expression_typed_aliases,
+                )
+                bind_safe_print_alias(named_expression.target, named_expression.value)
+                aliases_active_builtins = (
+                    isinstance(named_expression.value, ast.Name)
+                    and named_expression.value.id in active_print_builtins_aliases
+                )
+                active_print_builtins_aliases.discard(target_name)
+                if aliases_active_builtins:
+                    active_print_builtins_aliases.add(target_name)
                 record_setattr_shadow(named_expression.target, named_expression.value)
                 record_vars_shadow(named_expression.target, named_expression.value)
                 record_dict_shadow(named_expression.target, named_expression.value)
@@ -13852,7 +15766,9 @@ def _compact_snippet_typed_print_overwrite_replay(
                     reload_aliases_before,
                     importlib_aliases_before,
                 )
-        print_shadow_transition = _compact_statement_print_shadow_transition(statement, builtins_aliases)
+        _update_compact_builtins_aliases(statement, active_print_builtins_aliases)
+        _update_compact_builtins_aliases(statement, eager_builtins_aliases)
+        print_shadow_transition = _compact_statement_print_shadow_transition(statement, active_print_builtins_aliases)
         if print_shadow_transition is not None:
             current_print_is_shadowed = print_shadow_transition
         elif statement_index == first_print_shadow_index:
@@ -20537,9 +22453,11 @@ class JITScriptDetector:
                 matches, bounded=bounded
             )
         else:
+            matches = prioritized_snippets
             prioritized_matches = prioritized_snippets
             omitted_budgeted_spans = []
         has_bounded_source = _has_source_like_embedded_python_start(bounded)
+        source_start_budget_exceeded = _embedded_python_source_start_budget_exceeded(bounded)
         has_source_beyond_bound = (
             not include_full_source
             and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
@@ -20751,8 +22669,20 @@ class JITScriptDetector:
                     parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     ast_high_risk_calls = set(parsed_high_risk_calls or set())
+                    (
+                        builtins_aliases_before_snippet,
+                        shadowed_builtins_aliases_before_snippet,
+                    ) = _builtins_import_alias_state(bounded[: span[0]])
+                    typed_aliases_before_snippet = _typed_import_aliases(bounded[: span[0]])
+                    typed_member_aliases_before_snippet = _unsafe_typed_member_aliases(
+                        bounded[: span[0]],
+                        typed_aliases_before_snippet,
+                    )
                     typed_suppressed_calls, typed_high_risk_calls = _compact_snippet_typed_print_overwrite_replay(
-                        code_str
+                        code_str,
+                        builtins_aliases_before_snippet,
+                        typed_member_aliases_before_snippet,
+                        shadowed_builtins_aliases_before_snippet,
                     )
                     inactive_restore_high_risk_calls: set[tuple[str, str]] = set()
                     inactive_restore_high_risk_calls.update(typed_high_risk_calls)
@@ -20858,7 +22788,18 @@ class JITScriptDetector:
         uncovered_omitted_spans = [
             span for span in omitted_budgeted_spans if not _is_span_inside_parsed_spans(span, parsed_snippet_spans)
         ]
-        if uncovered_omitted_spans:
+        if source_start_budget_exceeded and bounded_high_risk_calls is None:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: source-start probe budget was exceeded"),
+                    omitted_snippets=1,
+                    candidates_count=len(matches) + 1,
+                )
+            )
+        elif uncovered_omitted_spans:
             findings.append(
                 _embedded_python_analysis_incomplete_finding(
                     framework=framework,

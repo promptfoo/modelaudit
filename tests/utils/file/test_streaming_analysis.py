@@ -188,6 +188,36 @@ def test_stream_analyze_file_detects_remote_growth_after_info(
     assert result.metadata["scan_outcome"] == "inconclusive"
 
 
+def test_stream_analyze_file_fails_closed_when_reported_size_equals_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"safe" + b"os\nsystem"
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=4,
+        payload=payload,
+        read_sizes=read_sizes,
+    )
+    scanner = RecordingStreamScanner()
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/changing.pkl",
+        scanner,
+        max_bytes=4,
+    )
+
+    assert read_sizes == [4]
+    assert scanner.seen_size == 4
+    assert analysis_complete is False
+    assert result is not None
+    assert result.success is False
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+
+
 @pytest.mark.parametrize("reported_size", [-1, None])
 def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
@@ -341,6 +371,51 @@ def test_stream_analyze_file_prefers_streaming_specific_config_cap(
     assert result is not None
     assert result.bytes_scanned == 3
     assert result.metadata["max_bytes"] == 3
+
+
+@pytest.mark.parametrize("invalid_streaming_max", [0, -1, True, "3"])
+def test_stream_analyze_file_ignores_invalid_streaming_specific_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_streaming_max: object,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/large.joblib",
+        HeaderOnlyScanner(config={"max_file_read_size": 4, "streaming_max_bytes": invalid_streaming_max}),
+    )
+
+    assert read_sizes == [4]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.metadata["max_bytes"] == 4
+
+
+@pytest.mark.parametrize("invalid_max_bytes", [0, -1, True])
+def test_stream_analyze_file_ignores_invalid_explicit_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_max_bytes: int,
+) -> None:
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"abcdef", read_sizes=read_sizes)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/large.joblib",
+        HeaderOnlyScanner(config={"max_file_read_size": 4}),
+        max_bytes=invalid_max_bytes,
+    )
+
+    assert read_sizes == [4]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.metadata["max_bytes"] == 4
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

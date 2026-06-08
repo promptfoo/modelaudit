@@ -28,7 +28,11 @@ def resolve_streaming_max_bytes(max_bytes: object = None) -> int:
 
 def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner") -> object:
     configured_stream_max = scanner.config.get("streaming_max_bytes")
-    if configured_stream_max is not None:
+    if (
+        isinstance(configured_stream_max, int)
+        and not isinstance(configured_stream_max, bool)
+        and configured_stream_max > 0
+    ):
         return configured_stream_max
 
     resolved_max = STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
@@ -152,7 +156,11 @@ def stream_analyze_file(
         )
 
         configured_max_bytes: object = max_bytes
-        if configured_max_bytes is None:
+        if (
+            not isinstance(configured_max_bytes, int)
+            or isinstance(configured_max_bytes, bool)
+            or configured_max_bytes <= 0
+        ):
             configured_max_bytes = _streaming_max_bytes_from_scanner_config(scanner)
         resolved_max_bytes = resolve_streaming_max_bytes(configured_max_bytes)
 
@@ -169,7 +177,9 @@ def stream_analyze_file(
         with fs.open(url, "rb") as f:
             content = f.read(bytes_to_read)
         bytes_read = len(content)
-        bytes_complete = known_file_size is not None and bytes_read == known_file_size
+        bytes_complete = (
+            known_file_size is not None and known_file_size < resolved_max_bytes and bytes_read == known_file_size
+        )
 
         # Create a temporary in-memory file for scanning
         temp_file = io.BytesIO(content)
