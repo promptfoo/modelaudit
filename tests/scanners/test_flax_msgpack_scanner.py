@@ -1,5 +1,9 @@
 import json
 import os
+import struct
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -374,6 +378,30 @@ def test_flax_msgpack_trailing_objects_do_not_dilute_primary_scan_budget(tmp_pat
     )
 
 
+def test_flax_msgpack_trailing_objects_share_an_aggregate_node_budget(tmp_path: Path) -> None:
+    path = tmp_path / "bounded_trailing_stream.msgpack"
+    payload = msgpack.packb({"params": [1]}, use_bin_type=True)
+    payload += b"".join(msgpack.packb(["a", "b", "c", "d"], use_bin_type=True) for _ in range(12))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_msgpack_stream_objects": 32,
+            "max_msgpack_structure_nodes": 5,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.STRUCTURE_BUDGET_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["msgpack_object_count"] == 13
+    assert result.metadata["msgpack_stream_analyzed_nodes"] <= 10
+    assert result.metadata["msgpack_stream_node_budget"] == 10
+    budget_checks = [check for check in result.checks if check.name == "Flax MessagePack Structure Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["max_allowed"] == 5
+
+
 def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
     """Valid trailing dict objects should be scanned without warning-level stream noise."""
     path = tmp_path / "benign_two_objects.msgpack"
@@ -469,6 +497,193 @@ def test_flax_msgpack_streaming_decode_does_not_call_unpackb(
 
     assert result.success is True
     assert result.metadata.get("top_level_type") == "dict"
+
+
+def test_flax_msgpack_event_walker_scans_nested_and_trailing_content(tmp_path: Path) -> None:
+    """Nested and trailing content should be inspected one scalar at a time."""
+    path = tmp_path / "event_walk.msgpack"
+    payload = msgpack.packb(
+        {"params": {"notes": "evaluate(safely)", "weights": [1, 2, 3]}},
+        use_bin_type=True,
+    )
+    payload += msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["msgpack_object_count"] == 2
+    assert any(
+        issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root[msgpack_object_1]/__reduce__"
+        for issue in result.issues
+    )
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_flax_msgpack_complex_map_keys_consume_node_budget(tmp_path: Path) -> None:
+    path = tmp_path / "complex_key.msgpack"
+    key_item_count = 1000
+    payload = b"\x81\xdc" + struct.pack(">H", key_item_count) + (b"\x01" * key_item_count) + b"\x00"
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2000,
+            "max_msgpack_structure_nodes": 2,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    budget_checks = [check for check in result.checks if check.name == "Flax MessagePack Structure Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["max_allowed"] == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="resource peak RSS is unavailable on Windows")
+def test_flax_msgpack_large_container_peak_memory_is_bounded(tmp_path: Path) -> None:
+    """A large scalar array must not expand into a retained Python object graph."""
+    path = tmp_path / "large_array.msgpack"
+    item_count = 750_000
+    with path.open("wb") as output:
+        output.write(b"\xdd" + struct.pack(">I", item_count))
+        for start in range(0, item_count, 50_000):
+            payload = bytearray()
+            for value in range(start, min(start + 50_000, item_count)):
+                payload.append(0xCE)
+                payload.extend(struct.pack(">I", value))
+            output.write(payload)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script = textwrap.dedent(
+        """
+        import json
+        import resource
+        import sys
+
+        from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
+
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        result = FlaxMsgpackScanner(
+            config={
+                "max_file_read_size": 0,
+                "max_items_per_container": 800_000,
+                "max_msgpack_structure_nodes": 800_010,
+            }
+        ).scan(sys.argv[1])
+        after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        scale = 1 if sys.platform == "darwin" else 1024
+        print(
+            json.dumps(
+                {
+                    "peak_delta_mb": (after - before) * scale / (1024 * 1024),
+                    "top_level_type": result.metadata.get("top_level_type"),
+                    "scan_outcome": result.metadata.get("scan_outcome"),
+                }
+            )
+        )
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+    )
+    metrics = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert metrics["top_level_type"] == "list"
+    assert metrics["scan_outcome"] is None
+    assert metrics["peak_delta_mb"] < 20
+
+
+def test_flax_msgpack_large_binary_preserves_cross_chunk_findings(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_pattern.msgpack"
+    stream_chunk_bytes = 64 * 1024
+    prefix = b"x" * (stream_chunk_bytes - 3)
+    create_msgpack_file(path, {"params": {"blob": prefix + b"os.system('id')"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: os\.system"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_large_binary_preserves_long_whitespace_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_whitespace_pattern.msgpack"
+    stream_chunk_bytes = 64 * 1024
+    prefix = b"x" * (stream_chunk_bytes - 5004)
+    payload = prefix + b"eval" + (b" " * 6000) + b"("
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_preserves_long_whitespace_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_whitespace_near_match.msgpack"
+    stream_chunk_bytes = 64 * 1024
+    prefix = b"x" * (stream_chunk_bytes - 5010)
+    payload = prefix + b"evaluation" + (b" " * 6000) + b"("
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert all(check.name != "Code Pattern Security Check" for check in result.checks)
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_fails_closed_for_unresolved_unbounded_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_unbounded_pattern.msgpack"
+    gap = b"x" * (64 * 1024 + 4096 + 100)
+    payload = b"getattr(object" + gap + b", '__custom_hook__')"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["analysis_incomplete"] is True
+    assert coverage_check.details["stream_overlap_chars"] == 4096
+
+
+def test_flax_msgpack_streams_shape_validation_beyond_evidence_limit(tmp_path: Path) -> None:
+    malicious_path = tmp_path / "long_malicious_shape.msgpack"
+    benign_path = tmp_path / "long_benign_shape.msgpack"
+    create_msgpack_file(malicious_path, {"params": {"shape": [1] * 64 + [-1]}})
+    create_msgpack_file(benign_path, {"params": {"shape": [1] * 65}})
+
+    malicious_result = FlaxMsgpackScanner().scan(str(malicious_path))
+    benign_result = FlaxMsgpackScanner().scan(str(benign_path))
+
+    shape_check = next(check for check in malicious_result.checks if check.name == "Tensor Shape Validation")
+    assert shape_check.details["dimension_index"] == 64
+    assert shape_check.details["dimension"] == -1
+    assert shape_check.details["shape_item_count"] == 65
+    assert shape_check.details["shape_evidence_truncated"] is True
+    assert all(check.name != "Tensor Shape Validation" for check in benign_result.checks)
+
+
+def test_flax_msgpack_file_size_cap_is_opt_in() -> None:
+    assert FlaxMsgpackScanner().max_file_read_size == 0
+    assert FlaxMsgpackScanner(config={"max_file_read_size": 1024}).max_file_read_size == 1024
 
 
 def test_flax_msgpack_small_decode_buffer_accepts_stream_of_small_objects(tmp_path: Path) -> None:
@@ -665,6 +880,24 @@ def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
         FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON,
         tmp_path / "benign-recursion-cache",
     )
+
+
+def test_flax_msgpack_depth_limit_reporting_is_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "wide_beyond_depth.msgpack"
+    create_msgpack_file(path, [0] * 1000)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2000,
+            "max_msgpack_structure_nodes": 5000,
+            "max_recursion_depth": 0,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert sum(check.name == "Flax MessagePack Preanalysis Depth Limit" for check in result.checks) == 1
+    assert sum(check.name == "Recursion Depth Check" for check in result.checks) == 1
 
 
 def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclusive(tmp_path: Path) -> None:
@@ -1359,10 +1592,10 @@ def test_flax_msgpack_redacts_parse_error_evidence(
     secret = "PARSEERRORSECRET123456789"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}})
 
-    def raise_parse_error(*_args: Any, **_kwargs: Any) -> bool:
+    def raise_parse_error(*_args: Any, **_kwargs: Any) -> object:
         raise ValueError(f"token={secret}")
 
-    monkeypatch.setattr(FlaxMsgpackScanner, "_drain_msgpack_unpacker", raise_parse_error)
+    monkeypatch.setattr(FlaxMsgpackScanner, "_read_stream_value", raise_parse_error)
 
     result = FlaxMsgpackScanner().scan(str(path))
     parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
@@ -1639,3 +1872,17 @@ def test_flax_msgpack_custom_suspicious_patterns_still_match(tmp_path: Path) -> 
     result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"custom_threat"]}).scan(str(path))
 
     assert any(issue.details.get("pattern") == r"custom_threat" for issue in result.issues)
+
+
+def test_flax_msgpack_custom_long_suspicious_key_still_matches(tmp_path: Path) -> None:
+    path = tmp_path / "custom_long_key.msgpack"
+    suspicious_key = "dangerous_" + ("x" * 80)
+    create_msgpack_file(path, {suspicious_key: "safe"})
+
+    result = FlaxMsgpackScanner(config={"suspicious_keys": {suspicious_key}}).scan(str(path))
+
+    assert any(
+        check.name == "Object Attribute Security Check"
+        and check.message == f"Suspicious object attribute detected: {suspicious_key}"
+        for check in result.checks
+    )
