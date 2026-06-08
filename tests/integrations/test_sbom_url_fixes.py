@@ -4,6 +4,7 @@ This module tests the fix for FileNotFoundError when generating SBOMs for conten
 downloaded from URLs (HuggingFace, cloud storage, etc.).
 """
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -191,6 +192,23 @@ class TestSBOMURLFixes:
 
         assert bom_ref("first-secret") == bom_ref("rotated-secret")
 
+    def test_credential_only_distinct_sources_keep_unique_non_secret_refs(self) -> None:
+        paths = [
+            "https://storage.example/model.pkl?token=secret-one",
+            "https://storage.example/model.pkl?token=secret-two",
+        ]
+
+        sbom_json = generate_sbom_pydantic(paths, create_mock_scan_result(files_scanned=2))
+        components = json.loads(sbom_json)["components"]
+
+        assert {component["bom-ref"] for component in components} == {
+            "https://storage.example/model.pkl",
+            "https://storage.example/model.pkl#modelaudit-component-2",
+        }
+        for path in paths:
+            assert path not in sbom_json
+            assert hashlib.sha256(path.encode()).hexdigest() not in sbom_json
+
     def test_safe_fragment_provenance_keeps_components_distinct(self) -> None:
         paths = [
             "https://storage.example/model.pkl?token=secret#revision=first",
@@ -224,6 +242,10 @@ class TestSBOMURLFixes:
             str(first_path),
             str(second_path),
         }
+
+    @pytest.mark.parametrize("path", ["model?version=1.pkl", "model;version=1.pkl"])
+    def test_nonexistent_local_provenance_filenames_are_preserved(self, path: str) -> None:
+        assert redact_source_identifier(path) == path
 
     def test_sbom_with_huggingface_file_url_success(self, tmp_path):
         """Test SBOM generation after downloading HuggingFace file URL."""

@@ -420,16 +420,27 @@ def _is_non_filesystem_identifier(path: str) -> bool:
     return "://" in path
 
 
-def _redacted_component_identity(path: str, sha256: str = "") -> tuple[str, str]:
+def _redacted_component_identity(
+    path: str,
+    sha256: str = "",
+    bom_ref_counts: dict[str, int] | None = None,
+) -> tuple[str, str]:
     """Return credential-safe component name and bom-ref values for exported SBOMs."""
     safe_identifier = redact_source_identifier(path)
     component_name = os.path.basename(safe_identifier) or safe_identifier
     if safe_identifier == path:
-        return component_name, safe_identifier
-    safe_reference = redact_source_reference(path)
-    if sha256:
-        safe_reference = f"{safe_reference}#modelaudit-content-sha256-{sha256}"
-    return component_name, safe_reference
+        base_reference = safe_identifier
+    else:
+        base_reference = redact_source_reference(path)
+        if sha256:
+            base_reference = f"{base_reference}#modelaudit-content-sha256-{sha256}"
+
+    if bom_ref_counts is None:
+        return component_name, base_reference
+    occurrence = bom_ref_counts.get(base_reference, 0) + 1
+    bom_ref_counts[base_reference] = occurrence
+    bom_ref = base_reference if occurrence == 1 else f"{base_reference}#modelaudit-component-{occurrence}"
+    return component_name, bom_ref
 
 
 def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
@@ -557,6 +568,7 @@ def _component_for_file_pydantic(
     scan_root_fd: int | None = None,
     relative_path: str | None = None,
     require_stable_root: bool = False,
+    bom_ref_counts: dict[str, int] | None = None,
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
     size, sha256 = _resolve_component_size_and_sha256(
@@ -584,7 +596,7 @@ def _component_for_file_pydantic(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256)
+    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_counts)
 
     # Create the component
     component = Component(
@@ -612,6 +624,7 @@ def _component_for_file(
     scan_root_fd: int | None = None,
     relative_path: str | None = None,
     require_stable_root: bool = False,
+    bom_ref_counts: dict[str, int] | None = None,
 ) -> Component:
     size, sha256 = _resolve_component_size_and_sha256(
         path,
@@ -717,7 +730,7 @@ def _component_for_file(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256)
+    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_counts)
 
     component = Component(
         name=component_name,
@@ -736,6 +749,7 @@ def _component_for_file(
 
 def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     bom = Bom()
+    bom_ref_counts: dict[str, int] = {}
     issues = results.get("issues", [])
     # Convert issues to dicts if they are Pydantic models
     issues_dicts = []
@@ -776,6 +790,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                         scan_root_fd=scan_root_fd,
                         relative_path=relative_path,
                         require_stable_root=require_stable_root,
+                        bom_ref_counts=bom_ref_counts,
                     )
                     bom.components.add(component)
             finally:
@@ -806,6 +821,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                     scan_root_fd=scan_root_fd,
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
+                    bom_ref_counts=bom_ref_counts,
                 )
                 bom.components.add(component)
             finally:
@@ -824,6 +840,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     without any dict conversions, providing full type safety.
     """
     bom = Bom()
+    bom_ref_counts: dict[str, int] = {}
 
     # Use Pydantic models directly
     issues: list[Issue] = results.issues or []
@@ -853,6 +870,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                         scan_root_fd=scan_root_fd,
                         relative_path=relative_path,
                         require_stable_root=require_stable_root,
+                        bom_ref_counts=bom_ref_counts,
                     )
                     bom.components.add(component)
             finally:
@@ -878,6 +896,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                     scan_root_fd=scan_root_fd,
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
+                    bom_ref_counts=bom_ref_counts,
                 )
                 bom.components.add(component)
             finally:

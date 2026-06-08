@@ -88,6 +88,8 @@ def redact_source_identifier(source: str) -> str:
         return redacted_userinfo
     if _is_local_path_identifier(source):
         return source
+    if _has_safe_schemeless_provenance_suffix(source):
+        return source
 
     comparison_source = _normalize_percent_encoded_url_delimiters_for_display(normalized_source)
     path_prefix = re.split(r"[?#;&]", comparison_source, maxsplit=1)[0]
@@ -157,6 +159,31 @@ def redact_source_reference(source: str) -> str:
     if not safe_params:
         return safe_identifier
     return f"{safe_identifier}?{urlencode(sorted(safe_params))}"
+
+
+def _has_safe_schemeless_provenance_suffix(source: str) -> bool:
+    """Preserve bounded, explicitly non-sensitive assignments in local-looking names."""
+    suffix_indexes = [index for delimiter in "?#;" if (index := source.find(delimiter)) >= 0]
+    if not suffix_indexes:
+        return False
+    suffix = source[min(suffix_indexes) + 1 :]
+    if not suffix or len(suffix) > _MAX_PROVENANCE_QUERY_CHARS:
+        return False
+
+    assignments = re.split(r"[&#;]", suffix)
+    if len(assignments) > _MAX_PROVENANCE_PARAMS:
+        return False
+    for assignment in assignments:
+        key, separator, value = assignment.partition("=")
+        normalized_key = key.casefold()
+        if (
+            not separator
+            or normalized_key not in _SAFE_PROVENANCE_QUERY_KEYS
+            or is_sensitive_credential_key(normalized_key)
+            or _SAFE_PROVENANCE_VALUE_RE.fullmatch(value) is None
+        ):
+            return False
+    return True
 
 
 def redact_source_value(value: Any) -> Any:
