@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound Joblib decompression output to the configured scanner read budget
+- redact credential-bearing source identifiers in exported SARIF and SBOM reports
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources
 - preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis

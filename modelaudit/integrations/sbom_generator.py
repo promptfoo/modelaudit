@@ -13,6 +13,7 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
+from .source_redaction import redact_source_identifier, redact_source_reference
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 _MAX_SYMLINK_HOPS = 40
@@ -419,6 +420,18 @@ def _is_non_filesystem_identifier(path: str) -> bool:
     return "://" in path
 
 
+def _redacted_component_identity(path: str, sha256: str = "") -> tuple[str, str]:
+    """Return credential-safe component name and bom-ref values for exported SBOMs."""
+    safe_identifier = redact_source_identifier(path)
+    component_name = os.path.basename(safe_identifier) or safe_identifier
+    if safe_identifier == path:
+        return component_name, safe_identifier
+    safe_reference = redact_source_reference(path)
+    if sha256:
+        safe_reference = f"{safe_reference}#modelaudit-content-sha256-{sha256}"
+    return component_name, safe_reference
+
+
 def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
     """Collect ephemeral streamed assets whose scan-time metadata is authoritative."""
     trusted_paths: set[str] = set()
@@ -571,11 +584,12 @@ def _component_for_file_pydantic(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
+    component_name, bom_ref = _redacted_component_identity(path, sha256)
 
     # Create the component
     component = Component(
-        name=os.path.basename(path),
-        bom_ref=path,
+        name=component_name,
+        bom_ref=bom_ref,
         type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,
@@ -703,10 +717,11 @@ def _component_for_file(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+    component_name, bom_ref = _redacted_component_identity(path, sha256)
 
     component = Component(
-        name=os.path.basename(path),
-        bom_ref=path,
+        name=component_name,
+        bom_ref=bom_ref,
         type=component_type,
         hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,
