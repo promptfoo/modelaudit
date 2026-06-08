@@ -9,10 +9,13 @@ import pytest
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
+SCAN_LIMIT_OVERHEAD_BYTES = 16
 
 
 def _nested_overlong_protocol0_line_operand() -> bytes:
-    return b"cos\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
+    # Protocol 0 line operand length includes the surrounding single quotes.
+    overlong_operand_body_bytes = MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1
+    return b"cos\nsystem\n(S'" + (b"A" * overlong_operand_body_bytes) + b"'\ntR."
 
 
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
@@ -49,8 +52,8 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
         payload,
         source="nested-overlong-protocol0-string.pkl",
         options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + 16,
-            max_string_literal_scan_chars=len(nested_payload) + 16,
+            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
         ),
     )
 
@@ -86,8 +89,8 @@ def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_opera
         pickle.dumps(encoded, protocol=4),
         source="base64-nested-overlong-protocol0-string.pkl",
         options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + 16,
-            max_string_literal_scan_chars=len(encoded) + 16,
+            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(encoded) + SCAN_LIMIT_OVERHEAD_BYTES,
         ),
     )
 
@@ -118,8 +121,8 @@ def test_scan_bytes_fails_closed_when_nested_overlong_protocol0_operand_hits_dep
         pickle.dumps(outer_value, protocol=4),
         source=f"depth-limited-{encoding}-overlong-protocol0-string.pkl",
         options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_payload) + 16,
-            max_string_literal_scan_chars=len(outer_value) + 16,
+            max_nested_pickle_bytes=len(nested_payload) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(outer_value) + SCAN_LIMIT_OVERHEAD_BYTES,
             max_nested_depth=0,
         ),
     )
@@ -152,8 +155,8 @@ def test_scan_bytes_ignores_unstructured_nested_overlong_protocol0_near_match(
         payload,
         source="nested-overlong-protocol0-near-match.pkl",
         options=ScanOptions(
-            max_nested_pickle_bytes=len(nested_value_bytes) + 16,
-            max_string_literal_scan_chars=len(nested_value) + 16,
+            max_nested_pickle_bytes=len(nested_value_bytes) + SCAN_LIMIT_OVERHEAD_BYTES,
+            max_string_literal_scan_chars=len(nested_value) + SCAN_LIMIT_OVERHEAD_BYTES,
         ),
     )
 
