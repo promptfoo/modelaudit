@@ -79,7 +79,9 @@ _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
     }
 )
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
+_MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
+_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
@@ -300,6 +302,9 @@ class PickleScanner:
 
             reports: list[PickleReport] = []
             skipped_notices: list[Notice] = list(discovery_notices)
+            scanned_pickle_member_count = 0
+            scanned_pickle_member_bytes = 0
+            budget_skipped_entries: list[zipfile.ZipInfo] = []
             for entry in pickle_entries:
                 member_name = entry.filename
                 member_source = f"{source}:{member_name}"
@@ -321,6 +326,14 @@ class PickleScanner:
                         )
                     )
                     continue
+                if (
+                    scanned_pickle_member_count >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
+                    or scanned_pickle_member_bytes + entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES
+                ):
+                    budget_skipped_entries.append(entry)
+                    continue
+                scanned_pickle_member_count += 1
+                scanned_pickle_member_bytes += entry.file_size
                 try:
                     with archive.open(entry, "r") as member_stream:
                         reports.append(
@@ -342,6 +355,18 @@ class PickleScanner:
                             bytes_total=entry.file_size,
                         )
                     )
+
+            if budget_skipped_entries:
+                skipped_notices.append(
+                    _pytorch_zip_pickle_member_budget_notice(
+                        source=source,
+                        pickle_member_count=len(pickle_entries),
+                        scanned_pickle_member_count=scanned_pickle_member_count,
+                        total_pickle_member_bytes=sum(entry.file_size for entry in pickle_entries),
+                        scanned_pickle_member_bytes=scanned_pickle_member_bytes,
+                        skipped_entries=budget_skipped_entries,
+                    )
+                )
 
             return _combine_pytorch_zip_reports(
                 source=source,
@@ -706,6 +731,37 @@ def _pytorch_zip_entry_limit_report(*, source: str, size: int, entry_count: int)
     )
 
 
+def _pytorch_zip_pickle_member_budget_notice(
+    *,
+    source: str,
+    pickle_member_count: int,
+    scanned_pickle_member_count: int,
+    total_pickle_member_bytes: int,
+    scanned_pickle_member_bytes: int,
+    skipped_entries: list[zipfile.ZipInfo],
+) -> Notice:
+    return Notice(
+        message=(
+            "PyTorch ZIP analysis stopped scanning pickle members because the archive exceeds the standalone "
+            "aggregate pickle-member budget"
+        ),
+        severity=Severity.INFO,
+        location=source,
+        code="pytorch_zip_pickle_member_budget",
+        details={
+            "pickle_member_count": pickle_member_count,
+            "scanned_pickle_member_count": scanned_pickle_member_count,
+            "skipped_pickle_member_count": len(skipped_entries),
+            "max_pickle_members": _MAX_PYTORCH_ZIP_PICKLE_MEMBERS,
+            "total_pickle_member_bytes": total_pickle_member_bytes,
+            "scanned_pickle_member_bytes": scanned_pickle_member_bytes,
+            "max_total_pickle_member_bytes": _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES,
+            "skipped_pickle_members": [entry.filename for entry in skipped_entries[:10]],
+            "analysis_incomplete": True,
+        },
+    )
+
+
 def _combine_pytorch_zip_reports(
     *,
     source: str,
@@ -751,6 +807,8 @@ def _combine_pytorch_zip_reports(
     ):
         if any(report.metadata.get(metadata_key) is True for report in member_reports):
             metadata[metadata_key] = True
+    if any(notice.details.get("analysis_incomplete") is True for notice in extra_notices):
+        metadata["analysis_incomplete"] = True
     return PickleReport(
         source=source,
         status=status,
@@ -1347,14 +1405,22 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
+    invocation_classification: (
+        tuple[
+            frozenset[int],
+            frozenset[int],
+            frozenset[tuple[str, str]],
+        ]
+        | None
+    )
     try:
-        invoked_global_positions = _invoked_global_positions(callable_invocations)
-        trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
-        trusted_reconstruction_references = _trusted_reconstruction_references(callable_invocations)
+        invocation_classification = (
+            _invoked_global_positions(callable_invocations),
+            _trusted_reconstruction_global_positions(callable_invocations),
+            _trusted_reconstruction_references(callable_invocations),
+        )
     except Exception as error:
-        invoked_global_positions = frozenset()
-        trusted_reconstruction_global_positions = frozenset()
-        trusted_reconstruction_references = frozenset()
+        invocation_classification = None
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
@@ -1418,8 +1484,14 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         source_snapshot_stable
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
+        and invocation_classification is not None
         and (inert_initialization_modules or trusted_import_references)
     ):
+        (
+            invoked_global_positions,
+            trusted_reconstruction_global_positions,
+            trusted_reconstruction_references,
+        ) = invocation_classification
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,
