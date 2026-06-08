@@ -15,6 +15,7 @@ from modelaudit_picklescan import PickleScanner, SafetyVerdict, ScanStatus, scan
 
 class MaliciousPayload:
     def __reduce__(self) -> tuple[object, tuple[str]]:
+        # Deliberately unsafe reducer used to verify malicious pickle handling.
         return (os.system, ("echo pwned",))
 
 
@@ -172,11 +173,11 @@ def test_scan_file_keeps_plain_descriptor_after_path_replacement(
     replacement_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
     original_is_zipfile = package_api.zipfile.is_zipfile
 
-    def replace_after_open(candidate: Any) -> bool:
+    def replace_and_check_zipfile(candidate: Any) -> bool:
         replacement_path.replace(payload_path)
         return original_is_zipfile(candidate)
 
-    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_after_open)
+    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
 
     report = scan_file(payload_path)
 
@@ -200,11 +201,11 @@ def test_scan_file_keeps_zip_descriptor_after_path_replacement(
     replacement_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
     original_is_zipfile = package_api.zipfile.is_zipfile
 
-    def replace_after_open(candidate: Any) -> bool:
+    def replace_and_check_zipfile(candidate: Any) -> bool:
         replacement_path.replace(archive_path)
         return original_is_zipfile(candidate)
 
-    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_after_open)
+    monkeypatch.setattr(package_api.zipfile, "is_zipfile", replace_and_check_zipfile)
 
     report = scan_file(archive_path)
 
