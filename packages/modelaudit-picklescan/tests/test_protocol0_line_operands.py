@@ -74,6 +74,47 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
 
 
 @pytest.mark.parametrize("as_unicode", [False, True])
+def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand_after_inst(
+    as_unicode: bool,
+) -> None:
+    nested_payload = b"(ios\nsystem\n(S'" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES - 1)) + b"'\ntR."
+    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
+    payload = pickle.dumps(nested_value, protocol=4)
+
+    report = scan_bytes(
+        payload,
+        source="nested-inst-overlong-protocol0-string.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(nested_payload) + 16,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "INST"
+        and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    incomplete_notice = next(notice for notice in report.notices if notice.code == "nested_pickle_incomplete")
+    nested_notices = incomplete_notice.details.get("nested_notices")
+    assert isinstance(nested_notices, (list, tuple))
+    assert any(
+        isinstance(notice, Mapping)
+        and notice.get("code") == "parse_incomplete"
+        and isinstance(notice.get("details"), Mapping)
+        and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
+        for notice in nested_notices
+    )
+
+
+@pytest.mark.parametrize("as_unicode", [False, True])
 def test_scan_bytes_ignores_unstructured_nested_overlong_protocol0_near_match(
     as_unicode: bool,
 ) -> None:

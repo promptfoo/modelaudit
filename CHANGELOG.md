@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
 - stream Flax MessagePack containers without materializing decoded object graphs and remove the default whole-file size cutoff
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
