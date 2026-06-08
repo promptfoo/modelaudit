@@ -75,6 +75,7 @@ from .utils.helpers.auto_defaults import (
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.sources.cloud_storage import (
     download_from_cloud,
+    is_cleartext_cloud_url,
     is_cloud_url,
     is_sensitive_credential_key,
     is_stream_url,
@@ -98,7 +99,11 @@ from .utils.sources.jfrog import (
     redact_jfrog_error_for_display,
     redact_jfrog_url_for_display,
 )
-from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
+from .utils.sources.pytorch_hub import (
+    download_pytorch_hub_model,
+    is_cleartext_pytorch_hub_url,
+    is_pytorch_hub_url,
+)
 
 logger = logging.getLogger("modelaudit")
 
@@ -107,7 +112,7 @@ def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
-    if is_cloud_url(path):
+    if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path):
         return redact_url_for_display(path)
     if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
@@ -123,7 +128,11 @@ def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
     if is_stream_url(path):
         return redact_stream_error_for_display(error, path[9:])
-    return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
+    return (
+        redact_cloud_error_for_display(error, path)
+        if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path)
+        else str(error)
+    )
 
 
 def _redact_source_text_for_persisted_output(text: str, source_path: str) -> str:
@@ -2505,6 +2514,16 @@ def _resolve_scan_source_for_path(
     dry_run: bool,
 ) -> _SourceDispatchResult | None:
     """Resolve one source path and execute source-native scans when they should bypass local scanning."""
+    if is_cleartext_cloud_url(path):
+        click.echo(f"Error: Cleartext cloud storage URL is not supported: {redact_url_for_display(path)}", err=True)
+        audit_result.has_errors = True
+        return None
+
+    if is_cleartext_pytorch_hub_url(path):
+        click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {redact_url_for_display(path)}", err=True)
+        audit_result.has_errors = True
+        return None
+
     if is_huggingface_file_url(path):
         display_path = redact_huggingface_url_for_display(path)
         download_spinner = None
