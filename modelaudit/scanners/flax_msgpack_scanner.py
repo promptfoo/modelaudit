@@ -68,12 +68,12 @@ def _join_evidence_path(path: str, key: Any) -> str:
     return f"{path}/{key_str}" if path else key_str
 
 
-def _text_key_for_security_matching(key: Any) -> str | None:
-    if isinstance(key, str):
-        return key
-    if isinstance(key, bytes | bytearray):
+def _text_for_security_matching(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes | bytearray):
         with suppress(UnicodeDecodeError):
-            return bytes(key).decode("utf-8")
+            return bytes(value).decode("utf-8")
     return None
 
 
@@ -573,9 +573,10 @@ class FlaxMsgpackScanner(BaseScanner):
 
     def _value_names_dangerous_callable(self, value: Any) -> bool:
         """Return whether a metadata value directly names a dangerous callable."""
-        if not isinstance(value, str):
+        value_text = _text_for_security_matching(value)
+        if value_text is None:
             return False
-        normalized = value.strip().lower()
+        normalized = value_text.strip().lower()
         return normalized in self.dangerous_callable_names
 
     def _add_incomplete_check(
@@ -849,7 +850,8 @@ class FlaxMsgpackScanner(BaseScanner):
             for index, (k, v) in enumerate(value.items()):
                 if index >= self.max_items_per_container:
                     break
-                key_str = _text_key_for_security_matching(k) or _stringify_evidence_fragment(k)
+                key_text = _text_for_security_matching(k)
+                key_str = key_text if key_text is not None else _stringify_evidence_fragment(k)
                 safe_key_str = _stringify_safe_evidence_fragment(k)
                 key_location = _join_evidence_path(location, k)
                 self._check_jax_transform(
@@ -1237,7 +1239,7 @@ class FlaxMsgpackScanner(BaseScanner):
         suspicious_top_level = {
             key_text
             for key in found_keys
-            if (key_text := _text_key_for_security_matching(key)) is not None and key_text in dangerous_keys
+            if (key_text := _text_for_security_matching(key)) is not None and key_text in dangerous_keys
         }
         if suspicious_top_level:
             result.add_check(
