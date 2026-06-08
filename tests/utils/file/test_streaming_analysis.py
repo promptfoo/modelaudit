@@ -52,12 +52,12 @@ class _FakeLargeRemoteFile:
 
 
 class _FakeLargeRemoteFileSystem:
-    def __init__(self, *, size: int, payload: bytes, read_sizes: list[int]) -> None:
+    def __init__(self, *, size: object, payload: bytes, read_sizes: list[int]) -> None:
         self._size = size
         self._payload = payload
         self._read_sizes = read_sizes
 
-    def info(self, path: str) -> dict[str, int]:
+    def info(self, path: str) -> dict[str, object]:
         del path
         return {"size": self._size}
 
@@ -160,6 +160,35 @@ def test_stream_analyze_file_passes_actual_short_read_size_to_scanner(
     assert result is not None
     assert result.bytes_scanned == len(payload)
     assert result.metadata["bytes_analyzed"] == len(payload)
+
+
+@pytest.mark.parametrize("reported_size", [-1, None, 0])
+def test_stream_analyze_file_bounds_reads_when_remote_size_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_size: object,
+) -> None:
+    payload = b"short-read"
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(
+        size=reported_size,
+        payload=payload,
+        read_sizes=read_sizes,
+    )
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file("s3://bucket/unknown-size.joblib", HeaderOnlyScanner())
+
+    assert read_sizes == [STREAMING_ANALYSIS_DEFAULT_MAX_BYTES]
+    assert analysis_complete is False
+    assert result is not None
+    assert result.bytes_scanned == len(payload)
+    assert result.success is False
+    assert result.metadata["file_size"] == reported_size
+    assert result.metadata["file_size_known"] is False
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
 
 
 def test_stream_analyze_file_uses_scanner_config_cap_for_large_remote(
