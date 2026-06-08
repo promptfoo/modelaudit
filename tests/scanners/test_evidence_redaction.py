@@ -1380,6 +1380,45 @@ def test_redacts_secret_bearing_structured_keys() -> None:
     )
 
 
+def test_preserves_values_when_redacted_mapping_keys_collide() -> None:
+    """Redaction must not silently overwrite distinct mapping entries."""
+    secret = "sk-proj-REDACTEDKEYCOLLISION1234567890"
+
+    redacted_value = redact_evidence_value(
+        {
+            f"node_{secret}": "secret-derived-key",
+            f"node_{REDACTED_EVIDENCE_VALUE}": "literal-redacted-key",
+            1: "first-non-string-key",
+            2: "second-non-string-key",
+        },
+        max_string_chars=500,
+    )
+
+    assert redacted_value == {
+        f"node_{REDACTED_EVIDENCE_VALUE}": "secret-derived-key",
+        f"node_{REDACTED_EVIDENCE_VALUE}[2]": "literal-redacted-key",
+        "<int-key>": "first-non-string-key",
+        "<int-key>[2]": "second-non-string-key",
+    }
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_case_variant_name_keys_cannot_bypass_value_redaction() -> None:
+    """Every name/key alias must contribute to name-value sensitivity."""
+    secret = "context-only-sensitive-value"
+
+    redacted_value = redact_evidence_value(
+        {
+            "name": "API_KEY",
+            "Name": "public_label",
+            "value": secret,
+        }
+    )
+
+    assert redacted_value["value"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
 def test_redacts_camel_case_structured_credential_keys() -> None:
     """SDK-style camelCase credential keys should redact values by key context."""
     aws_secret = "AWS_SECRET_ACCESS_KEY_VALUE"

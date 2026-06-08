@@ -115,6 +115,31 @@ def _assert_inconclusive_keras_zip_scan_not_cached(model_path: Path, reason: str
         reset_cache_manager()
 
 
+def test_keras_zip_layer_counts_preserve_colliding_redacted_classes(tmp_path: Path) -> None:
+    """Distinct model-controlled class names must not collapse into one count."""
+    first_secret = "sk-proj-" + "A" * 24
+    second_secret = "sk-proj-" + "B" * 24
+    model_path = create_configured_keras_zip(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": f"token={first_secret}", "config": {}},
+                    {"class_name": f"token={second_secret}", "config": {}},
+                    {"class_name": f"token={first_secret}", "config": {}},
+                ]
+            },
+        },
+    )
+
+    result = KerasZipScanner().scan(str(model_path))
+
+    assert result.metadata["layer_counts"] == {"token=<redacted>": 2, "token=<redacted>[2]": 1}
+    assert first_secret not in result.to_json()
+    assert second_secret not in result.to_json()
+
+
 def create_external_link_weights_h5(tmp_path: Path) -> Path:
     """Create a weights H5 file containing an ExternalLink to a local fixture."""
     if h5py is None:
@@ -242,6 +267,26 @@ class TestKerasZipScanner:
         assert scanner is not None
         assert scanner.name == "keras_zip"
 
+    def test_archive_member_details_redact_model_controlled_values(self, tmp_path: Path) -> None:
+        """Archive member names should remain useful without serializing embedded secrets."""
+        raw_secret = "sk-proj-CAND061ZIPDETAILSECRET000000000000"
+        keras_path = tmp_path / "missing_config.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("assets/public/readme.txt", "benign")
+            zf.writestr(f"assets/{raw_secret}/payload.py", "print('review')")
+
+        result = KerasZipScanner().scan(str(keras_path))
+        format_checks = [check for check in result.checks if check.name == "Keras ZIP Format Check"]
+        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
+
+        assert format_checks
+        assert python_checks
+        serialized_result = result.to_json()
+        assert raw_secret not in serialized_result
+        assert "assets/public/readme.txt" in format_checks[0].details["files"]
+        assert any("<redacted>" in filename for filename in format_checks[0].details["files"])
+        assert "<redacted>" in python_checks[0].details["filename"]
+
     def test_detects_cve_2026_1669_in_embedded_weights(self, tmp_path: Path) -> None:
         """Vulnerable .keras archives should warn on embedded HDF5 ExternalLink weights."""
         scanner = KerasZipScanner()
@@ -266,6 +311,24 @@ class TestKerasZipScanner:
                 "path": "/payload",
             },
         ]
+
+    def test_redacted_local_version_still_triggers_cve_2026_1669(self, tmp_path: Path) -> None:
+        """Embedded HDF5 attribution must classify the unredacted local version."""
+        raw_secret = "sk-proj-CAND061ZIPH5VERSIONSECRET000000000000"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=f"3.12.0+{raw_secret}",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "3.12.0+<redacted>"
+        assert raw_secret not in result.to_json()
 
     @pytest.mark.parametrize(
         "weights_factory",
@@ -3557,6 +3620,35 @@ __import__('pickle').loads(data)
         assert cve_checks[0].severity == IssueSeverity.WARNING
         assert cve_checks[0].details["layer_name"] == "string_lookup"
         assert cve_checks[0].details["cwe"] == "CWE-502, CWE-918"
+
+    def test_redacted_local_version_still_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
+        """StringLookup attribution must classify the unredacted local version."""
+        raw_secret = "sk-proj-CAND061ZIPLOOKUPVERSIONSECRET000000000000"
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": str(tmp_path / "vocab.txt")},
+                    },
+                ],
+            },
+        }
+        model_path = create_configured_keras_zip(
+            tmp_path,
+            config,
+            keras_version=f"3.11.3+{raw_secret}",
+        )
+
+        result = KerasZipScanner().scan(str(model_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].details["keras_version"] == "3.11.3+<redacted>"
+        assert raw_secret not in result.to_json()
 
     def test_stringlookup_remote_vocabulary_url_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Remote StringLookup vocabulary URLs should also be attributed to CVE-2025-12058."""
@@ -7475,6 +7567,31 @@ class TestCVE20243660LambdaAttribution:
         assert cve_issues[0].details["description"]
         assert cve_issues[0].details["remediation"]
         assert cve_issues[0].details["layer_name"] == "my_lambda"
+
+    def test_redacted_local_version_still_triggers_cve_2024_3660(self, tmp_path: Path) -> None:
+        """Display redaction must not downgrade a valid vulnerable local version."""
+        raw_secret = "sk-proj-CAND061ZIPVERSIONSECRET000000000000"
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "redacted_version_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(self._make_keras_zip(config, tmp_path, keras_version=f"2.12.0+{raw_secret}"))
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == "2.12.0+<redacted>"
+        assert raw_secret not in result.to_json()
 
     @pytest.mark.parametrize(
         "layer_class",

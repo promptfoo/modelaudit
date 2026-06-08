@@ -192,6 +192,40 @@ def create_h5_with_external_storage(
     return model_path
 
 
+def create_h5_with_sensitive_external_references(tmp_path: Path, raw_secret: str) -> Path:
+    """Create a Keras H5 file whose external-reference metadata contains sensitive evidence."""
+    raw_storage = tmp_path / f"{raw_secret}.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version=f"3.13.1+{raw_secret}",
+        file_name="sensitive_external_refs.h5",
+    )
+
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group[f"linked_{raw_secret}"] = h5py.ExternalLink(
+            f"https://user:very-secret-password@example.com/private/model.h5?token={raw_secret}",
+            f"/payload/{raw_secret}",
+        )
+        weights_group.create_dataset(
+            f"external_{raw_secret}_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return model_path
+
+
 def test_keras_h5_scanner_safe_model(tmp_path):
     """Test scanning a safe Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path)
@@ -245,6 +279,108 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
             "segments": [{"filename": "weights.raw", "offset": 0, "size": 8}],
         },
     ]
+
+
+def test_keras_h5_external_reference_details_redact_model_controlled_values(tmp_path: Path) -> None:
+    """HDF5 external-reference details should not serialize secrets, URL creds, or private path tokens."""
+    raw_secret = "sk-proj-CAND061H5DETAILSECRET000000000000"
+    model_path = create_h5_with_sensitive_external_references(tmp_path, raw_secret)
+
+    result = KerasH5Scanner().scan(str(model_path))
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+
+    assert len(cve_issues) == 1
+    serialized_result = result.to_json()
+    assert raw_secret not in serialized_result
+    assert "very-secret-password" not in serialized_result
+    details_json = json.dumps(cve_issues[0].details, sort_keys=True)
+    assert "model_weights" in details_json
+    assert "https://" in details_json
+    assert "<redacted>" in details_json
+
+
+def test_keras_h5_custom_layer_config_details_redact_model_controlled_values(tmp_path: Path) -> None:
+    """Custom layer details should keep benign config keys while redacting sensitive model-controlled values."""
+    raw_secret = "sk-proj-CAND061H5CONFIGSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "CustomAuditLayer",
+                        "config": {
+                            "api_key": raw_secret,
+                            "callback": f"https://callback.example/hook?token={raw_secret}",
+                            "safe_label": "public_label",
+                        },
+                    }
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+    custom_issues = [check for check in result.checks if check.name == "Custom Layer Class Detection"]
+
+    assert custom_issues
+    layer_config = custom_issues[0].details["layer_config"]
+    assert layer_config["api_key"] == "<redacted>"
+    assert layer_config["safe_label"] == "public_label"
+    assert raw_secret not in result.to_json()
+
+
+def test_keras_h5_layer_counts_preserve_colliding_redacted_classes(tmp_path: Path) -> None:
+    """Distinct model-controlled class names must not collapse into one count."""
+    first_secret = "sk-proj-" + "A" * 24
+    second_secret = "sk-proj-" + "B" * 24
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": f"token={first_secret}", "config": {}},
+                    {"class_name": f"token={second_secret}", "config": {}},
+                    {"class_name": f"token={first_secret}", "config": {}},
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.metadata["layer_counts"] == {"token=<redacted>": 2, "token=<redacted>[2]": 1}
+    assert first_secret not in result.to_json()
+    assert second_secret not in result.to_json()
+
+
+def test_keras_h5_non_string_layer_class_fails_closed_without_abort(tmp_path: Path) -> None:
+    """Malformed structured class names should remain explicit and serializable."""
+    raw_secret = "sk-proj-CAND061H5CLASSSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": {"api_key": raw_secret}, "config": {}},
+                    {"class_name": "Dense", "config": {"units": 2}},
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    type_checks = [check for check in result.checks if check.name == "Layer Class Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].severity == IssueSeverity.WARNING
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_layer_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["layer_counts"]["<invalid:dict>"] == 1
+    assert raw_secret not in result.to_json()
 
 
 @pytest.mark.parametrize(
@@ -4600,6 +4736,34 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_redacted_local_version_still_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+        """Display redaction must not downgrade a valid vulnerable local version."""
+        raw_secret = "sk-proj-CAND061H5VERSIONSECRET000000000000"
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: x"},
+                        }
+                    ]
+                },
+            },
+            keras_version=f"3.10.0+{raw_secret}",
+            file_name="redacted_local_version.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == "3.10.0+<redacted>"
+        assert raw_secret not in result.to_json()
 
     @pytest.mark.parametrize(
         "layer_class",

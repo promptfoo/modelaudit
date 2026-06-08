@@ -26,7 +26,12 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ._evidence_redaction import REDACTED_URL_CREDENTIALS, redact_evidence_string
+from ._evidence_redaction import (
+    REDACTED_URL_CREDENTIALS,
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+)
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
@@ -300,6 +305,26 @@ def _safe_decoded_preview(text: str, limit: int) -> str:
     if len(text) <= limit and len(redacted) <= limit:
         return redacted
     return f"{redacted[:limit]}..."
+
+
+def _redact_savedmodel_detail_string(value: Any, max_chars: int = 200) -> str:
+    return redact_evidence_string(str(value), max_chars=max_chars)
+
+
+def _redact_savedmodel_detail_value(value: Any, max_string_chars: int = 200) -> Any:
+    return redact_evidence_value(value, max_string_chars=max_string_chars)
+
+
+def _redact_savedmodel_relative_path(file_path: Path, model_root: Path) -> str:
+    try:
+        relative_path = file_path.relative_to(model_root)
+    except ValueError:
+        relative_path = Path(file_path.name)
+    return str(Path(*(_redact_savedmodel_detail_string(part) for part in relative_path.parts)))
+
+
+def _redact_savedmodel_file_location(file_path: Path, model_root: Path) -> str:
+    return str(model_root / _redact_savedmodel_relative_path(file_path, model_root))
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -777,13 +802,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
         except OSError as e:
             return self._finish_read_failure(result, path, e)
         except Exception as e:
+            redacted_error = _redact_savedmodel_detail_string(e, max_chars=500)
             result.add_check(
                 name="SavedModel Parsing",
                 passed=False,
-                message=f"Error scanning TF SavedModel file: {e!s}",
+                message=f"Error scanning TF SavedModel file: {redacted_error}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={"exception": redacted_error, "exception_type": type(e).__name__},
             )
             result.finish(success=False)
             return result
@@ -831,6 +857,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
         for root, _dirs, files in os.walk(dir_path):
             for file in files:
                 file_path = Path(root) / file
+                redacted_file = _redact_savedmodel_detail_string(file)
+                redacted_location = _redact_savedmodel_file_location(file_path, model_root)
+                redacted_directory = str(Path(redacted_location).parent)
                 if (
                     any(
                         file_path.is_relative_to(model_root / asset_dir_name)
@@ -844,11 +873,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     result.add_check(
                         name="Python File Detection",
                         passed=False,
-                        message=f"Python file found in SavedModel: {file}",
+                        message=f"Python file found in SavedModel: {redacted_file}",
                         severity=IssueSeverity.INFO,
-                        location=str(file_path),
+                        location=redacted_location,
                         rule_code="S902",
-                        details={"file": file, "directory": root},
+                        details={"file": redacted_file, "directory": redacted_directory},
                     )
 
                 # Check for blacklist patterns in text files
@@ -877,23 +906,24 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         result.add_check(
                                             name="Blacklist Pattern Check",
                                             passed=False,
-                                            message=f"Blacklisted pattern '{pattern}' found in file {file}",
+                                            message=f"Blacklisted pattern '{pattern}' found in file {redacted_file}",
                                             severity=IssueSeverity.CRITICAL,
-                                            location=str(file_path),
+                                            location=redacted_location,
                                             rule_code="S902",
-                                            details={"pattern": pattern, "file": file},
+                                            details={"pattern": pattern, "file": redacted_file},
                                         )
                     except Exception as e:
+                        redacted_error = _redact_savedmodel_detail_string(e, max_chars=500)
                         result.add_check(
                             name="File Read Check",
                             passed=False,
-                            message=f"Error reading file {file}: {e!s}",
+                            message=f"Error reading file {redacted_file}: {redacted_error}",
                             severity=IssueSeverity.DEBUG,
-                            location=str(file_path),
+                            location=redacted_location,
                             rule_code="S902",
                             details={
-                                "file": file,
-                                "exception": str(e),
+                                "file": redacted_file,
+                                "exception": redacted_error,
                                 "exception_type": type(e).__name__,
                             },
                         )
@@ -953,23 +983,27 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 retained_dirs: list[str] = []
                 for dir_name in dir_names:
                     child_dir = Path(root) / dir_name
+                    redacted_dir_name = _redact_savedmodel_detail_string(dir_name)
+                    redacted_relative_dir = _redact_savedmodel_relative_path(child_dir, model_root)
+                    redacted_dir_location = _redact_savedmodel_file_location(child_dir, model_root)
                     try:
                         child_stat = child_dir.lstat()
                     except OSError as exc:
+                        redacted_error = _redact_savedmodel_detail_string(exc, max_chars=500)
                         result.add_check(
                             name="SavedModel Assets Security Check",
                             passed=False,
                             message=(
                                 "Cannot inspect nested asset directory for security analysis: "
-                                f"{child_dir.relative_to(model_root)}: {exc}"
+                                f"{redacted_relative_dir}: {redacted_error}"
                             ),
                             severity=IssueSeverity.WARNING,
-                            location=str(child_dir),
+                            location=redacted_dir_location,
                             details={
-                                "file_name": dir_name,
+                                "file_name": redacted_dir_name,
                                 "detected_content_type": "unscannable_asset_dir",
                                 "asset_kind": "stat_error",
-                                "exception": str(exc),
+                                "exception": redacted_error,
                                 "exception_type": type(exc).__name__,
                             },
                             rule_code="S902",
@@ -982,12 +1016,12 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             passed=False,
                             message=(
                                 "Symlinked nested asset directory is not traversed during security analysis: "
-                                f"{child_dir.relative_to(model_root)}"
+                                f"{redacted_relative_dir}"
                             ),
                             severity=IssueSeverity.WARNING,
-                            location=str(child_dir),
+                            location=redacted_dir_location,
                             details={
-                                "file_name": dir_name,
+                                "file_name": redacted_dir_name,
                                 "detected_content_type": "unscannable_asset_dir",
                                 "asset_kind": "symlink_directory",
                             },
@@ -1002,22 +1036,24 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 for file_name in files:
                     file_path = Path(root) / file_name
-                    detected_types = self._detect_suspicious_asset_content(file_path, result)
+                    detected_types = self._detect_suspicious_asset_content(file_path, result, model_root=model_root)
                     if not detected_types:
                         continue
 
                     file_size = self.get_file_size(str(file_path))
+                    redacted_file_name = _redact_savedmodel_detail_string(file_name)
+                    redacted_relative_path = _redact_savedmodel_relative_path(file_path, model_root)
                     result.add_check(
                         name="SavedModel Assets Security Check",
                         passed=False,
                         message=(
                             "Suspicious executable-like content detected in SavedModel assets: "
-                            f"{file_path.relative_to(model_root)}"
+                            f"{redacted_relative_path}"
                         ),
                         severity=IssueSeverity.WARNING,
-                        location=str(file_path),
+                        location=_redact_savedmodel_file_location(file_path, model_root),
                         details={
-                            "file_name": file_name,
+                            "file_name": redacted_file_name,
                             "detected_content_type": ", ".join(detected_types),
                             "size": file_size,
                         },
@@ -1027,20 +1063,23 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_root_siblings(self, model_root: Path, result: ScanResult) -> None:
         """Scan non-canonical root entries that can accompany a SavedModel."""
         for child_path in model_root.iterdir():
+            redacted_child_name = _redact_savedmodel_detail_string(child_path.name)
+            redacted_child_location = _redact_savedmodel_file_location(child_path, model_root)
             try:
                 child_stat = child_path.lstat()
             except OSError as exc:
+                redacted_error = _redact_savedmodel_detail_string(exc, max_chars=500)
                 result.add_check(
                     name="SavedModel Supplemental Directory Security Check",
                     passed=False,
-                    message=f"Cannot inspect SavedModel supplemental entry: {child_path.name}: {exc}",
+                    message=f"Cannot inspect SavedModel supplemental entry: {redacted_child_name}: {redacted_error}",
                     severity=IssueSeverity.WARNING,
-                    location=str(child_path),
+                    location=redacted_child_location,
                     details={
-                        "file_name": child_path.name,
+                        "file_name": redacted_child_name,
                         "detected_content_type": "unscannable_supplemental_entry",
                         "entry_kind": "stat_error",
-                        "exception": str(exc),
+                        "exception": redacted_error,
                         "exception_type": type(exc).__name__,
                     },
                     rule_code="S902",
@@ -1059,7 +1098,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 self._scan_saved_model_supplemental_directory(model_root, child_path, result)
                 continue
 
-            self._scan_saved_model_supplemental_file(child_path, result)
+            self._scan_saved_model_supplemental_file(model_root, child_path, result)
 
     def _scan_saved_model_supplemental_directory(
         self,
@@ -1072,23 +1111,27 @@ class TensorFlowSavedModelScanner(BaseScanner):
             retained_dirs: list[str] = []
             for dir_name in dir_names:
                 child_dir = Path(root) / dir_name
+                redacted_dir_name = _redact_savedmodel_detail_string(dir_name)
+                redacted_relative_dir = _redact_savedmodel_relative_path(child_dir, model_root)
+                redacted_dir_location = _redact_savedmodel_file_location(child_dir, model_root)
                 try:
                     child_stat = child_dir.lstat()
                 except OSError as exc:
+                    redacted_error = _redact_savedmodel_detail_string(exc, max_chars=500)
                     result.add_check(
                         name="SavedModel Supplemental Directory Security Check",
                         passed=False,
                         message=(
                             "Cannot inspect nested SavedModel supplemental directory: "
-                            f"{child_dir.relative_to(model_root)}: {exc}"
+                            f"{redacted_relative_dir}: {redacted_error}"
                         ),
                         severity=IssueSeverity.WARNING,
-                        location=str(child_dir),
+                        location=redacted_dir_location,
                         details={
-                            "file_name": dir_name,
+                            "file_name": redacted_dir_name,
                             "detected_content_type": "unscannable_supplemental_dir",
                             "entry_kind": "stat_error",
-                            "exception": str(exc),
+                            "exception": redacted_error,
                             "exception_type": type(exc).__name__,
                         },
                         rule_code="S902",
@@ -1101,12 +1144,12 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         passed=False,
                         message=(
                             "Symlinked SavedModel supplemental directory is not traversed during security analysis: "
-                            f"{child_dir.relative_to(model_root)}"
+                            f"{redacted_relative_dir}"
                         ),
                         severity=IssueSeverity.WARNING,
-                        location=str(child_dir),
+                        location=redacted_dir_location,
                         details={
-                            "file_name": dir_name,
+                            "file_name": redacted_dir_name,
                             "detected_content_type": "unscannable_supplemental_dir",
                             "entry_kind": "symlink_directory",
                         },
@@ -1120,13 +1163,19 @@ class TensorFlowSavedModelScanner(BaseScanner):
             dir_names[:] = retained_dirs
 
             for file_name in files:
-                self._scan_saved_model_supplemental_file(Path(root) / file_name, result)
+                self._scan_saved_model_supplemental_file(model_root, Path(root) / file_name, result)
 
-    def _scan_saved_model_supplemental_file(self, file_path: Path, result: ScanResult) -> None:
+    def _scan_saved_model_supplemental_file(
+        self,
+        model_root: Path,
+        file_path: Path,
+        result: ScanResult,
+    ) -> None:
         """Scan one supplemental SavedModel file-like entry."""
         detected_types = self._detect_suspicious_asset_content(
             file_path,
             result,
+            model_root=model_root,
             check_name="SavedModel Supplemental File Security Check",
             file_label="supplemental file",
         )
@@ -1134,14 +1183,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return
 
         file_size = self.get_file_size(str(file_path))
+        redacted_file_name = _redact_savedmodel_detail_string(file_path.name)
         result.add_check(
             name="SavedModel Supplemental File Security Check",
             passed=False,
-            message=f"Suspicious executable-like content detected in SavedModel supplemental file: {file_path.name}",
+            message=(
+                f"Suspicious executable-like content detected in SavedModel supplemental file: {redacted_file_name}"
+            ),
             severity=IssueSeverity.WARNING,
-            location=str(file_path),
+            location=_redact_savedmodel_file_location(file_path, model_root),
             details={
-                "file_name": file_path.name,
+                "file_name": redacted_file_name,
                 "detected_content_type": ", ".join(detected_types),
                 "size": file_size,
             },
@@ -1153,24 +1205,28 @@ class TensorFlowSavedModelScanner(BaseScanner):
         file_path: Path,
         result: ScanResult,
         *,
+        model_root: Path,
         check_name: str = "SavedModel Assets Security Check",
         file_label: str = "asset file",
     ) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""
+        redacted_file_name = _redact_savedmodel_detail_string(file_path.name)
+        redacted_location = _redact_savedmodel_file_location(file_path, model_root)
         try:
             file_stat = file_path.lstat()
         except OSError as exc:
+            redacted_error = _redact_savedmodel_detail_string(exc, max_chars=500)
             result.add_check(
                 name=check_name,
                 passed=False,
-                message=f"Cannot inspect {file_label} for security analysis: {file_path.name}: {exc}",
+                message=f"Cannot inspect {file_label} for security analysis: {redacted_file_name}: {redacted_error}",
                 severity=IssueSeverity.WARNING,
-                location=str(file_path),
+                location=redacted_location,
                 details={
-                    "file_name": file_path.name,
+                    "file_name": redacted_file_name,
                     "detected_content_type": "unscannable_asset",
                     "asset_kind": "stat_error",
-                    "exception": str(exc),
+                    "exception": redacted_error,
                     "exception_type": type(exc).__name__,
                 },
                 rule_code="S902",
@@ -1180,11 +1236,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.add_check(
                 name=check_name,
                 passed=False,
-                message=f"Symlink {file_label} is not followed during security analysis: {file_path.name}",
+                message=f"Symlink {file_label} is not followed during security analysis: {redacted_file_name}",
                 severity=IssueSeverity.WARNING,
-                location=str(file_path),
+                location=redacted_location,
                 details={
-                    "file_name": file_path.name,
+                    "file_name": redacted_file_name,
                     "detected_content_type": "unscannable_asset",
                     "asset_kind": "symlink",
                     "size": file_stat.st_size,
@@ -1196,11 +1252,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.add_check(
                 name=check_name,
                 passed=False,
-                message=f"Non-regular {file_label} is not scanned during security analysis: {file_path.name}",
+                message=f"Non-regular {file_label} is not scanned during security analysis: {redacted_file_name}",
                 severity=IssueSeverity.WARNING,
-                location=str(file_path),
+                location=redacted_location,
                 details={
-                    "file_name": file_path.name,
+                    "file_name": redacted_file_name,
                     "detected_content_type": "unscannable_asset",
                     "asset_kind": "non_regular",
                     "size": file_stat.st_size,
@@ -1213,18 +1269,19 @@ class TensorFlowSavedModelScanner(BaseScanner):
             with file_path.open("rb") as file_obj:
                 content_head = file_obj.read(_ASSET_PROBE_BYTES)
         except OSError as exc:
+            redacted_error = _redact_savedmodel_detail_string(exc, max_chars=500)
             result.add_check(
                 name=check_name,
                 passed=False,
-                message=f"Cannot read {file_label} for security analysis: {file_path.name}: {exc}",
+                message=f"Cannot read {file_label} for security analysis: {redacted_file_name}: {redacted_error}",
                 severity=IssueSeverity.WARNING,
-                location=str(file_path),
+                location=redacted_location,
                 details={
-                    "file_name": file_path.name,
+                    "file_name": redacted_file_name,
                     "detected_content_type": "unscannable_asset",
                     "asset_kind": "unreadable",
                     "size": file_stat.st_size,
-                    "exception": str(exc),
+                    "exception": redacted_error,
                     "exception_type": type(exc).__name__,
                 },
                 rule_code="S902",
@@ -1270,11 +1327,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.add_check(
                 name="SavedModel Asset Probe Limit",
                 passed=False,
-                message=f"Asset exceeds bounded security probe window: {file_path.name}",
+                message=f"Asset exceeds bounded security probe window: {redacted_file_name}",
                 severity=IssueSeverity.INFO,
-                location=str(file_path),
+                location=redacted_location,
                 details={
-                    "file_name": file_path.name,
+                    "file_name": redacted_file_name,
                     "asset_size": file_stat.st_size,
                     "probe_bytes": _ASSET_PROBE_BYTES,
                     "analysis_incomplete": True,
@@ -1322,8 +1379,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan MetaGraph collection payloads embedded in SavedModel files."""
         for meta_graph in saved_model.meta_graphs:
             meta_graph_tag = self._get_meta_graph_tag(meta_graph)
+            redacted_meta_graph_tag = _redact_savedmodel_detail_string(meta_graph_tag)
             for key, collection in meta_graph.collection_def.items():
                 key_lower = key.lower()
+                redacted_key = _redact_savedmodel_detail_string(key)
                 if not hasattr(collection, "bytes_list"):
                     continue
 
@@ -1336,11 +1395,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
                             details={
-                                "collection_key": key,
+                                "collection_key": redacted_key,
                                 "index": index,
                                 "entry_size": len(value),
                                 "max_expected": _MAX_COLLECTION_VALUE_BYTES,
-                                "meta_graph": meta_graph_tag,
+                                "meta_graph": redacted_meta_graph_tag,
                             },
                         )
 
@@ -1356,10 +1415,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
                             details={
-                                "collection_key": key,
+                                "collection_key": redacted_key,
                                 "index": index,
                                 "value_preview": _safe_decoded_preview(decoded, 200),
-                                "meta_graph": meta_graph_tag,
+                                "meta_graph": redacted_meta_graph_tag,
                             },
                         )
 
@@ -1372,10 +1431,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Format a finding location for a graph node."""
         location_parts = []
         if node_context.function_name:
-            location_parts.append(f"function: {node_context.function_name}")
-        location_parts.append(f"node: {node_context.node.name}")
+            location_parts.append(f"function: {_redact_savedmodel_detail_string(node_context.function_name)}")
+        location_parts.append(f"node: {_redact_savedmodel_detail_string(node_context.node.name)}")
         if attr_name:
-            location_parts.append(f"attr: {attr_name}")
+            location_parts.append(f"attr: {_redact_savedmodel_detail_string(attr_name)}")
         return f"{self.current_file_path} ({', '.join(location_parts)})"
 
     def _build_node_details(
@@ -1385,14 +1444,16 @@ class TensorFlowSavedModelScanner(BaseScanner):
     ) -> dict[str, Any]:
         """Build consistent finding details for a graph node."""
         details: dict[str, Any] = {
-            "node_name": node_context.node.name,
-            "meta_graph": node_context.meta_graph_tag,
+            "node_name": _redact_savedmodel_detail_string(node_context.node.name),
+            "meta_graph": _redact_savedmodel_detail_string(node_context.meta_graph_tag),
             "node_scope": node_context.node_scope,
         }
         if node_context.function_name:
-            details["function_name"] = node_context.function_name
+            details["function_name"] = _redact_savedmodel_detail_string(node_context.function_name)
         if extra_details:
-            details.update(extra_details)
+            redacted_extra_details = _redact_savedmodel_detail_value(extra_details)
+            if isinstance(redacted_extra_details, dict):
+                details.update(redacted_extra_details)
         return details
 
     def _scan_tf_operations(self, saved_model: Any) -> list[dict[str, Any]]:
@@ -1424,6 +1485,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Analyze the saved model for suspicious operations"""
         suspicious_op_found = False
         op_counts: dict[str, int] = {}
+        op_count_display_keys: dict[str, str] = {}
 
         # Regex to detect Lambda-layer node names in the graph.
         # Matches node names that start with "lambda" (case-insensitive)
@@ -1441,7 +1503,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             node = node_context.node
 
             # Count all operation types
-            op_counts[node.op] = op_counts.get(node.op, 0) + 1
+            redacted_op = op_count_display_keys.get(node.op)
+            if redacted_op is None:
+                redacted_op = redact_evidence_mapping_key(node.op, op_counts)
+                op_count_display_keys[node.op] = redacted_op
+            op_counts[redacted_op] = op_counts.get(redacted_op, 0) + 1
 
             if node.op in self.suspicious_ops:
                 suspicious_op_found = True
@@ -1453,7 +1519,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     result.add_check(
                         name="TensorFlow Operation Security Check",
                         passed=False,
-                        message=f"Suspicious TensorFlow operation: {node.op}",
+                        message=f"Suspicious TensorFlow operation: {redacted_op}",
                         severity=IssueSeverity.CRITICAL,
                         location=self._build_node_location(node_context),
                         rule_code="S703",
@@ -1483,10 +1549,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     # _scan_keras_metadata.
                     matched_pattern = self._match_suspicious_function_name(func_name)
                     if matched_pattern is not None:
+                        redacted_func_name = _redact_savedmodel_detail_string(func_name)
                         result.add_check(
                             name="StatefulPartitionedCall Security Check",
                             passed=False,
-                            message=f"StatefulPartitionedCall with suspicious function: {func_name}",
+                            message=f"StatefulPartitionedCall with suspicious function: {redacted_func_name}",
                             severity=IssueSeverity.WARNING,
                             location=self._build_node_location(node_context),
                             details=self._build_node_details(
@@ -1602,10 +1669,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             func_name = attr.s.decode("utf-8", errors="ignore")
                             matched_reference = self._match_pyfunc_reference_token(func_name)
                             if matched_reference is not None:
+                                redacted_func_name = _redact_savedmodel_detail_string(func_name)
                                 result.add_check(
                                     name="PyFunc Function Reference Check",
                                     passed=False,
-                                    message=f"{node.op} operation references dangerous function: {func_name}",
+                                    message=f"{node.op} operation references dangerous function: {redacted_func_name}",
                                     severity=IssueSeverity.CRITICAL,
                                     location=self._build_node_location(node_context),
                                     rule_code="S902",
@@ -2052,7 +2120,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             "node_name_length": len(node.name),
                             "name_threshold": 2048,
                             "attack_type": "protobuf_buffer_overflow",
-                            "node_name_preview": node.name[:200],  # First 200 chars
+                            "node_name_preview": _redact_savedmodel_detail_string(node.name[:200]),
                         },
                     ),
                 )
@@ -2063,7 +2131,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     result.add_check(
                         name="Protobuf Input Name Length Check",
                         passed=False,
-                        message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
+                        message=(
+                            f"Abnormally long input name (length: {len(input_name)}) in node "
+                            f"{_redact_savedmodel_detail_string(node.name)}"
+                        ),
                         severity=IssueSeverity.WARNING,
                         location=self._build_node_location(node_context),
                         details=self._build_node_details(
@@ -2203,19 +2274,24 @@ class TensorFlowSavedModelScanner(BaseScanner):
             with contextlib.suppress(PackageNotFoundError, Exception):
                 metadata["tensorflow_version"] = version("tensorflow")
 
+            redacted_signature_details = _redact_savedmodel_detail_value(signature_details)
             metadata.update(
                 {
                     "meta_graph_count": len(saved_model.meta_graphs),
                     "saved_model_pb_size": len(content),
-                    "signatures": sorted(signature_details.keys()),
-                    "signature_details": signature_details,
+                    "signatures": (
+                        sorted(redacted_signature_details.keys())
+                        if isinstance(redacted_signature_details, dict)
+                        else []
+                    ),
+                    "signature_details": redacted_signature_details,
                     "trackable_objects": trackable_objects,
                 }
             )
             if tag_sets:
-                metadata["tag_sets"] = tag_sets
+                metadata["tag_sets"] = _redact_savedmodel_detail_value(tag_sets)
 
         except Exception as e:
-            metadata["extraction_error"] = str(e)
+            metadata["extraction_error"] = _redact_savedmodel_detail_string(e, max_chars=500)
 
         return metadata
