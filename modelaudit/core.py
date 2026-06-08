@@ -708,6 +708,8 @@ def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) ->
 def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
+    *,
+    preserve_has_errors: bool = False,
 ) -> bool:
     """Remove only missing-shard outcomes disproven by this scan's validated targets."""
     complete_sources = _complete_validated_shard_family_sources(validated_targets)
@@ -813,7 +815,7 @@ def _reconcile_cross_directory_shard_coverage(
     if reconciled:
         had_errors = results.has_errors
         results.has_errors = _results_have_explicit_operational_error(results) or (
-            had_errors and _results_have_retained_incomplete_outcome(results)
+            had_errors and (preserve_has_errors or _results_have_retained_incomplete_outcome(results))
         )
         results.success = not _results_should_be_unsuccessful(results)
     return reconciled
@@ -3964,6 +3966,7 @@ def scan_model_streaming(
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
     validated_shard_targets: ValidatedShardTargets = {}
+    preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
         if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
@@ -3995,6 +3998,7 @@ def scan_model_streaming(
             # Check timeout
             if time.time() - start_time > timeout:
                 results.has_errors = True
+                preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
                 logger.error(f"Streaming scan timeout after {timeout}s")
                 delete_streamed_source(source_path, "after streaming timeout")
@@ -4015,6 +4019,7 @@ def scan_model_streaming(
                     )
                     if entry_unavailable:
                         results.has_errors = True
+                        preserve_shard_reconciliation_errors = True
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
@@ -4095,6 +4100,8 @@ def scan_model_streaming(
                         metadata_dict.setdefault("source_path", report_path)
                         metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
+                    if operational_scan_failure:
+                        preserve_shard_reconciliation_errors = True
                     post_scan_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
                         resolved_path=str(scan_path),
@@ -4155,18 +4162,24 @@ def scan_model_streaming(
                         details={"max_total_size": max_total_size, "analysis_incomplete": True},
                     )
                     results.has_errors = True
+                    preserve_shard_reconciliation_errors = True
                     break
 
             except Exception as e:
                 logger.error(f"Error processing {source_path}: {e}", exc_info=True)
                 results.has_errors = True
+                preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
 
             finally:
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
 
-        _reconcile_cross_directory_shard_coverage(results, validated_shard_targets)
+        _reconcile_cross_directory_shard_coverage(
+            results,
+            validated_shard_targets,
+            preserve_has_errors=preserve_shard_reconciliation_errors,
+        )
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:

@@ -925,6 +925,84 @@ def test_cross_directory_shard_reconciliation_clears_stale_operational_error_sta
         assert determine_exit_code(result) == 0
 
 
+def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failure() -> None:
+    """A retained incomplete-analysis issue must keep the aggregate at exit code 2."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+        result.issues.append(
+            Issue(
+                message="Total scan size limit exceeded",
+                severity=IssueSeverity.INFO,
+                details={"max_total_size": 1, "analysis_incomplete": True},
+            )
+        )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
+def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_failure() -> None:
+    """Caller provenance must preserve a runtime failure without durable result evidence."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                preserve_has_errors=True,
+            )
+            is True
+        )
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
 def test_cross_directory_shard_reconciliation_preserves_independent_operational_error() -> None:
     """Clearing a shard gap must retain an unrelated explicit operational failure."""
     with ExitStack() as stack:
