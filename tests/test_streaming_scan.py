@@ -603,6 +603,35 @@ def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
         )
 
 
+def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_reconciliation() -> None:
+    """Completing a shard family must not erase an independent aggregate size failure."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        max_total_size = sum(shard.stat().st_size for shard in shards) - 1
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            max_total_size=max_total_size,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+        )
+
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+        assert any(issue.details.get("max_total_size") == max_total_size for issue in result.issues)
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings() -> None:
     """Coverage reconciliation must not suppress a malicious finding from a complete family."""
     safe_header = b'{"__metadata__":{"format":"pt"}}'

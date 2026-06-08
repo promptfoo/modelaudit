@@ -690,6 +690,21 @@ def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> 
     return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
 
 
+def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) -> bool:
+    """Return whether retained evidence still identifies incomplete analysis."""
+    if any(
+        bool(metadata.get("analysis_incomplete")) or metadata.get("scan_outcome") == "inconclusive"
+        for metadata in results.file_metadata.values()
+    ):
+        return True
+    records: list[Check | Issue] = [*results.checks, *results.issues]
+    return any(
+        isinstance(record.details, dict)
+        and (bool(record.details.get("analysis_incomplete")) or record.details.get("scan_outcome") == "inconclusive")
+        for record in records
+    )
+
+
 def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
@@ -796,7 +811,10 @@ def _reconcile_cross_directory_shard_coverage(
         reconciled = True
 
     if reconciled:
-        results.has_errors = _results_have_explicit_operational_error(results)
+        had_errors = results.has_errors
+        results.has_errors = _results_have_explicit_operational_error(results) or (
+            had_errors and _results_have_retained_incomplete_outcome(results)
+        )
         results.success = not _results_should_be_unsuccessful(results)
     return reconciled
 
