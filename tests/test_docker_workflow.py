@@ -12,6 +12,7 @@ _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 _ACTION_DIR = _REPO_ROOT / ".github" / "actions"
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
 _PINNED_ACTION_RE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
+_PINNED_DOCKER_ACTION_RE = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
 
 
 def _load_docker_workflow() -> dict[str, Any]:
@@ -96,9 +97,14 @@ def _iter_action_uses(action: Any) -> Iterator[str]:
 
 def _append_mutable_refs(config_path: Path, uses_values: Iterator[str], mutable_refs: list[str]) -> None:
     for uses_value in uses_values:
-        if uses_value.startswith(("./", "docker://")):
+        if uses_value.startswith("./"):
             continue
-        if not _PINNED_ACTION_RE.fullmatch(uses_value):
+        is_pinned = (
+            _PINNED_DOCKER_ACTION_RE.fullmatch(uses_value)
+            if uses_value.startswith("docker://")
+            else _PINNED_ACTION_RE.fullmatch(uses_value)
+        )
+        if not is_pinned:
             mutable_refs.append(f"{config_path.relative_to(_REPO_ROOT)}: {uses_value}")
 
 
@@ -148,6 +154,30 @@ def test_action_reference_discovery_covers_yaml_and_ignores_input_names(tmp_path
 
     assert list(_iter_workflow_uses(workflow)) == ["owner/workflow@main", "owner/action@main"]
     assert list(_iter_action_uses(action)) == ["owner/composite-step@main"]
+
+
+def test_action_pin_validation_rejects_mutable_docker_images() -> None:
+    config_path = _WORKFLOW_DIR / "example.yml"
+    mutable_refs: list[str] = []
+
+    _append_mutable_refs(
+        config_path,
+        iter(
+            (
+                "./local-action",
+                f"owner/action@{'a' * 40}",
+                f"docker://ghcr.io/owner/action@sha256:{'b' * 64}",
+                "owner/action@v1",
+                "docker://ghcr.io/owner/action:latest",
+            )
+        ),
+        mutable_refs,
+    )
+
+    assert mutable_refs == [
+        ".github/workflows/example.yml: owner/action@v1",
+        ".github/workflows/example.yml: docker://ghcr.io/owner/action:latest",
+    ]
 
 
 def test_dockerfiles_pin_python_base_images_by_digest() -> None:
