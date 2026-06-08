@@ -34,7 +34,6 @@ _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
-_STREAM_SAFE_WHITESPACE_REPEAT_PATTERN = re.compile(r"\\s(?:[+*]|\{[01],\})")
 _JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
 
 
@@ -137,17 +136,87 @@ def _contains_suspicious_getattr(value: str) -> bool:
     return False
 
 
+def _get_regex_parser() -> Any:
+    return vars(re).get("_parser")
+
+
+def _strip_stream_safe_whitespace_repeats(pattern: str) -> str:
+    remaining: list[str] = []
+    in_character_class = False
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "[":
+            in_character_class = True
+            remaining.append(char)
+            index += 1
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            remaining.append(char)
+            index += 1
+            continue
+        if char != "\\" or index + 1 >= len(pattern):
+            remaining.append(char)
+            index += 1
+            continue
+
+        escaped_char = pattern[index + 1]
+        if not in_character_class and escaped_char == "s":
+            suffix = pattern[index + 2 :]
+            if suffix.startswith(("*", "+")):
+                index += 3
+                continue
+            if suffix.startswith(("{0,}", "{1,}")):
+                index += 6
+                continue
+
+        remaining.extend((char, escaped_char))
+        index += 2
+
+    return "".join(remaining)
+
+
 def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
     """Return whether bounded overlap cannot guarantee coverage for this regex."""
-    remaining = _STREAM_SAFE_WHITESPACE_REPEAT_PATTERN.sub("", pattern)
-    try:
-        parser = vars(re).get("_parser")
-        if parser is None:
+    remaining = _strip_stream_safe_whitespace_repeats(pattern)
+    parser = _get_regex_parser()
+    if parser is not None:
+        try:
+            _, max_width = parser.parse(remaining, re.IGNORECASE).getwidth()
+        except Exception:
             return True
-        _, max_width = parser.parse(remaining, re.IGNORECASE).getwidth()
-    except Exception:
-        return True
-    return max_width > _STREAM_TEXT_OVERLAP_CHARS
+        return max_width > _STREAM_TEXT_OVERLAP_CHARS
+
+    escaped = False
+    in_character_class = False
+    for index, char in enumerate(remaining):
+        if escaped:
+            if char.isdigit() and char != "0":
+                return True
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "[":
+            in_character_class = True
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            continue
+        if in_character_class:
+            continue
+        if char in {"*", "+"}:
+            return True
+        if char == "?" and (index == 0 or remaining[index - 1] != "("):
+            return True
+        if char == "{" and re.match(r"(?:\d+(?:,\d*)?|,\d+)\}", remaining[index + 1 :]):
+            return True
+        if remaining.startswith("(?P=", index):
+            return True
+
+    return len(remaining) > _STREAM_TEXT_OVERLAP_CHARS
 
 
 def _pattern_literal_anchors(pattern: str) -> tuple[str, ...] | None:

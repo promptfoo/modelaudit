@@ -15,6 +15,7 @@ pytest.importorskip("msgpack")
 
 import msgpack
 
+import modelaudit.scanners.flax_msgpack_scanner as flax_msgpack_scanner
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import _create_results
@@ -793,6 +794,50 @@ def test_flax_msgpack_large_binary_preserves_cross_chunk_findings(tmp_path: Path
     )
 
 
+def test_flax_msgpack_large_binary_preserves_cross_chunk_findings_without_re_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(flax_msgpack_scanner, "_get_regex_parser", lambda: None)
+    path = tmp_path / "large_binary_pattern_without_re_parser.msgpack"
+    stream_chunk_bytes = 64 * 1024
+    prefix = b"x" * (stream_chunk_bytes - 3)
+    create_msgpack_file(path, {"params": {"blob": prefix + b"os.system('id')"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: os\.system"
+        for issue in result.issues
+    )
+
+
+def test_stream_repeat_fallback_without_re_parser(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flax_msgpack_scanner, "_get_regex_parser", lambda: None)
+
+    for pattern in (
+        r"os\.system",
+        r"eval\s*\(",
+        r"import\s+os",
+        r"eval\s{0,}\(",
+        r"eval\s{1,}\(",
+        r"[\s+]",
+    ):
+        assert flax_msgpack_scanner._pattern_has_stream_unsafe_repeat(pattern) is False
+
+    for pattern in (
+        r"eval.*\(",
+        r"eval\s{2,}\(",
+        r"(foo)?bar",
+        r"(foo)\1",
+        r"(?P<name>foo)(?P=name)",
+        r"BEGIN.{5000}END",
+        r"\\s+",
+    ):
+        assert flax_msgpack_scanner._pattern_has_stream_unsafe_repeat(pattern) is True
+
+
 def test_flax_msgpack_large_binary_does_not_join_tokens_across_invalid_utf8(tmp_path: Path) -> None:
     path = tmp_path / "large_binary_invalid_utf8.msgpack"
     payload = (b"x" * (64 * 1024 + 100)) + b"ev\xffal("
@@ -864,9 +909,13 @@ def test_flax_msgpack_large_binary_benign_getattr_prose_is_not_inconclusive(tmp_
 @pytest.mark.parametrize(
     ("pattern", "payload"),
     [
-        (r"(?:eval|harmless_long_anchor).*\(", b"eval" + (b"x" * 70000) + b"("),
-        (r"eval\s{2,}\(", b"eval" + (b" " * 70000) + b"("),
-        (r"BEGIN.{5000}END", b"BEGIN" + (b"x" * 5000) + b"END"),
+        pytest.param(
+            r"(?:eval|harmless_long_anchor).*\(",
+            b"eval" + (b"x" * 70000) + b"(",
+            id="unbounded-alternation",
+        ),
+        pytest.param(r"eval\s{2,}\(", b"eval" + (b" " * 70000) + b"(", id="unbounded-whitespace"),
+        pytest.param(r"BEGIN.{5000}END", b"BEGIN" + (b"x" * 5000) + b"END", id="wide-bounded-repeat"),
     ],
 )
 def test_flax_msgpack_large_binary_fails_closed_for_stream_unsafe_custom_patterns(
