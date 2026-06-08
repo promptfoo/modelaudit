@@ -1333,6 +1333,7 @@ class _ScanPathState:
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
     validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
+    explicit_shard_family_group: str | None = None
 
     def record_validated_shard_targets(
         self,
@@ -1347,7 +1348,11 @@ class _ScanPathState:
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and metadata.get("operational_error") is True:
                 continue
-            post_scan_target = _snapshot_validated_shard_target(asset.path)
+            post_scan_target = _snapshot_validated_shard_target(
+                asset.path,
+                family_group=self.explicit_shard_family_group,
+                family_group_policy="explicit" if self.explicit_shard_family_group else None,
+            )
             if not post_scan_target:
                 continue
             if pre_scan_target:
@@ -2303,7 +2308,15 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
-    pre_scan_shard_target = _snapshot_validated_shard_target(actual_path) if os.path.isfile(actual_path) else {}
+    pre_scan_shard_target = (
+        _snapshot_validated_shard_target(
+            actual_path,
+            family_group=path_state.explicit_shard_family_group,
+            family_group_policy="explicit" if path_state.explicit_shard_family_group else None,
+        )
+        if os.path.isfile(actual_path)
+        else {}
+    )
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
@@ -3605,6 +3618,11 @@ def delegate_info() -> None:
     is_flag=True,
     help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
 )
+@click.option(
+    "--assume-shard-family",
+    is_flag=True,
+    help="Treat explicitly provided cross-directory shard paths as one model family",
+)
 def scan_command(
     paths: tuple[str, ...],
     format: str | None,
@@ -3627,6 +3645,7 @@ def scan_command(
     no_cache: bool,
     cache_dir: str | None,
     stream: bool,
+    assume_shard_family: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -3694,6 +3713,7 @@ def scan_command(
         "strict": strict,
         "no_whitelist": no_whitelist,
         "dry_run": dry_run,
+        "assume_shard_family": assume_shard_family,
         "has_scanner_selection": bool(scanners or exclude_scanners),
         "num_paths": len(paths),
     }
@@ -3752,7 +3772,8 @@ def scan_command(
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
-        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths)
+        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
+        explicit_shard_family_group="explicit-cli-shard-family" if assume_shard_family else None,
     )
 
     # Scan each path with interrupt handling

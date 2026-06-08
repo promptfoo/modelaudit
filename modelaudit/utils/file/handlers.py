@@ -215,7 +215,7 @@ class ShardedModelDetector:
                     normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
                     candidate_paths.setdefault(normalized_candidate, candidate)
 
-                for file in sorted(candidate_paths.values(), key=lambda candidate: str(candidate)):
+                for file in sorted(candidate_paths.values(), key=str):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
                         candidate_expected_total: int | None = None

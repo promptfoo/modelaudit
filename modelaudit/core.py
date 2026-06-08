@@ -4,7 +4,6 @@ import hashlib
 import itertools
 import logging
 import os
-import re
 import stat
 import tempfile
 import time
@@ -479,6 +478,7 @@ def _snapshot_validated_shard_target(
     *,
     resolved_path: str | None = None,
     family_group: str | None = None,
+    family_group_policy: str | None = None,
 ) -> ValidatedShardTargets:
     """Snapshot one selected shard path after resolving it to a regular file."""
     source = Path(source_path)
@@ -507,49 +507,32 @@ def _snapshot_validated_shard_target(
         "mtime_ns": target_stat.st_mtime_ns,
         "ctime_ns": target_stat.st_ctime_ns,
     }
-    if family_group is not None:
-        target["family_scope_policy"] = "stream_logical_parent"
+    if family_group_policy == "explicit" and family_group:
+        target["family_group"] = family_group
+    elif family_group_policy == "stream_staging":
         try:
             resolved_parent = source.absolute().parent.resolve(strict=True)
-            temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+            is_owned_stream_parent = resolved_parent.parent == Path(tempfile.gettempdir()).resolve(
+                strict=True
+            ) and resolved_parent.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
         except (OSError, RuntimeError):
-            resolved_parent = None
-            temp_root = None
-        if (
-            family_group
-            and resolved_parent is not None
-            and temp_root is not None
-            and resolved_parent.parent == temp_root
-            and resolved_parent.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
-        ):
+            is_owned_stream_parent = False
+        if family_group and is_owned_stream_parent:
             target["family_group"] = family_group
     return {str(source.absolute()): target}
 
 
 def _validated_shard_family_scopes(
     source_path: str,
-    shard_index: int,
     target: dict[str, int | str],
 ) -> set[str]:
-    """Return conservative lexical scopes that may identify one shard family."""
+    """Return validated scopes that may identify one shard family."""
     parent = Path(source_path).absolute().parent
     normalized_parent = os.path.normcase(os.path.normpath(str(parent)))
     scopes = {f"directory:{normalized_parent}"}
     family_group = target.get("family_group")
     if isinstance(family_group, str) and family_group:
         scopes.add(f"trusted-group:{family_group}")
-    if target.get("family_scope_policy") == "stream_logical_parent":
-        return scopes
-
-    matching_index_runs = [match for match in re.finditer(r"\d+", parent.name) if int(match.group(0)) == shard_index]
-    if len(matching_index_runs) != 1:
-        return scopes
-
-    index_run = matching_index_runs[0]
-    templated_name = f"{parent.name[: index_run.start()]}{{shard-index}}{parent.name[index_run.end() :]}"
-    templated_parent = parent.with_name(templated_name)
-    normalized_template = os.path.normcase(os.path.normpath(str(templated_parent)))
-    scopes.add(f"indexed-directory:{normalized_template}")
     return scopes
 
 
@@ -574,7 +557,7 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
             or not 1 <= shard_index <= expected_total
         ):
             continue
-        for family_scope in _validated_shard_family_scopes(source_path, shard_index, target):
+        for family_scope in _validated_shard_family_scopes(source_path, target):
             grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
                 (source_path, target)
             )
@@ -3917,6 +3900,7 @@ def scan_model_streaming(
                     str(source_path),
                     resolved_path=str(scan_path),
                     family_group=shard_family_group,
+                    family_group_policy="stream_staging",
                 )
 
                 file_hash: str | None = None
@@ -3965,6 +3949,7 @@ def scan_model_streaming(
                         str(source_path),
                         resolved_path=str(scan_path),
                         family_group=shard_family_group,
+                        family_group_policy="stream_staging",
                     )
                     if (
                         not operational_scan_failure

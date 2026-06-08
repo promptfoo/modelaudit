@@ -692,6 +692,7 @@ def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> N
                 _snapshot_validated_shard_target(
                     str(shard_path),
                     family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
                 )
             )
 

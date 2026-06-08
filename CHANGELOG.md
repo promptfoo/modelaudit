@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound Joblib decompression output to the configured scanner read budget
-- reconcile complete sharded models scanned across separate directories without hiding malicious findings or changed targets
+- reconcile validated streamed shard families across staging directories and add an explicit opt-in for local cross-directory shards
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources
 - preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis

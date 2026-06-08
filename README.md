@@ -191,6 +191,7 @@ Common scan options:
 --strict                     Fail on warnings, scan all file types, strict license validation
 --sbom FILE                  Generate CycloneDX SBOM
 --stream                     Process files one-by-one; remote downloads are deleted after scanning
+--assume-shard-family        Treat explicitly listed cross-directory shards as one model family
 --max-size SIZE              Size limit (e.g., 10GB)
 --timeout SECONDS            Override scan timeout
 --dry-run                    Preview what would be scanned
