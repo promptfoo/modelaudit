@@ -202,10 +202,6 @@ _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
-_ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
-    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.lz|tar\.lz4|tar\.lzma)(?:[?#]|$)",
-    re.IGNORECASE,
-)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
@@ -222,6 +218,21 @@ def _has_get_file_reference(values: list[str]) -> bool:
         if stripped_value_lower.endswith(".get_file") or "keras.utils.get_file" in stripped_value_lower:
             return True
 
+    return False
+
+
+def _archive_format_may_extract_tar(value: Any) -> bool:
+    """Mirror Keras archive-format dispatch closely enough to identify tar extraction."""
+    if value == "auto" or value == "tar":
+        return True
+    if isinstance(value, str):
+        return False
+    if isinstance(value, (list, tuple, dict)):
+        for archive_type in value:
+            if archive_type == "tar":
+                return True
+            if archive_type != "zip":
+                return False
     return False
 
 
@@ -379,6 +390,7 @@ class _ConfigTraversalState:
     items_seen: int = 0
     string_literals_seen: int = 0
     string_chars_seen: int = 0
+    halted: bool = False
 
 
 class KerasZipScanner(BaseScanner):
@@ -999,6 +1011,7 @@ class KerasZipScanner(BaseScanner):
             return False
 
         if state.items_seen >= state.max_items:
+            state.halted = True
             self._mark_config_traversal_limit_exceeded(
                 result,
                 _CONFIG_TRAVERSAL_ITEM_LIMIT_EXCEEDED_REASON,
@@ -1024,6 +1037,7 @@ class KerasZipScanner(BaseScanner):
         context: str,
     ) -> str | None:
         if state.string_literals_seen >= state.max_string_literals:
+            state.halted = True
             self._mark_config_traversal_limit_exceeded(
                 result,
                 _CONFIG_STRING_LITERAL_LIMIT_EXCEEDED_REASON,
@@ -1040,6 +1054,7 @@ class KerasZipScanner(BaseScanner):
         state.string_literals_seen += 1
         next_string_chars_seen = state.string_chars_seen + len(value)
         if next_string_chars_seen > state.max_string_chars:
+            state.halted = True
             remaining_chars = max(state.max_string_chars - state.string_chars_seen, 0)
             state.string_chars_seen = state.max_string_chars
             self._mark_config_traversal_limit_exceeded(
@@ -1063,7 +1078,7 @@ class KerasZipScanner(BaseScanner):
         """Walk config.json once to fail closed on budget-exhausted coverage."""
         state = self._new_config_traversal_state()
         pending: deque[tuple[Any, int, str]] = deque([(model_config, 0, "root")])
-        while pending:
+        while pending and not state.halted:
             node, depth, context = pending.popleft()
             if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
                 continue
@@ -2138,19 +2153,22 @@ class KerasZipScanner(BaseScanner):
         as a gadget to download and execute arbitrary files even with safe_mode=True.
         Detected when a single config object references get_file and includes URL arguments.
         """
-        state = self._new_config_traversal_state()
-        for context, node in self._iter_dict_nodes(model_config, result, state=state):
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
             direct_string_values: list[str] = []
             url_candidate_values: list[str] = []
             for key, value in node.items():
+                if literal_state.halted:
+                    break
                 value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
                 direct_string_values.extend(
                     self._extract_string_literals(
                         value,
                         result=result,
-                        state=state,
+                        state=literal_state,
                         context=value_context,
                     )
                 )
@@ -2161,7 +2179,7 @@ class KerasZipScanner(BaseScanner):
                             value,
                             include_dict_values=True,
                             result=result,
-                            state=state,
+                            state=literal_state,
                             context=value_context,
                         )
                     )
@@ -2196,60 +2214,48 @@ class KerasZipScanner(BaseScanner):
 
     def _check_get_file_archive_extraction(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-12060: get_file(extract=True) tar traversal risk."""
-        state = self._new_config_traversal_state()
-        for context, node in self._iter_dict_nodes(model_config, result, state=state):
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
 
             direct_string_values: list[str] = []
-            url_candidate_values: list[str] = []
             for key, value in node.items():
+                if literal_state.halted:
+                    break
                 value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
                 direct_string_values.extend(
                     self._extract_string_literals(
                         value,
                         result=result,
-                        state=state,
+                        state=literal_state,
                         context=value_context,
                     )
                 )
-                key_lower = str(key).lower()
-                if key_lower in {"url", "origin", "args", "kwargs"}:
-                    url_candidate_values.extend(
-                        self._extract_string_literals(
-                            value,
-                            include_dict_values=True,
-                            result=result,
-                            state=state,
-                            context=value_context,
-                        )
-                    )
 
             has_get_file = _has_get_file_reference(direct_string_values)
-            if not has_get_file or not self._node_has_get_file_extract_true(node):
-                continue
-
-            archive_urls = [
-                value
-                for value in url_candidate_values
-                if _URL_PATTERN.search(value) is not None and _ARCHIVE_EXTRACT_URL_PATTERN.search(value) is not None
-            ]
-            if not archive_urls:
+            origin = self._node_get_file_origin(node)
+            if (
+                not has_get_file
+                or not self._node_has_get_file_tar_extraction_semantics(node)
+                or origin is None
+                or _URL_PATTERN.match(origin.strip()) is None
+            ):
                 continue
 
             result.add_check(
                 name="CVE-2025-12060: get_file Archive Extraction Traversal",
                 passed=False,
                 message=(
-                    "CVE-2025-12060: config.json contains keras.utils.get_file with extract=True "
-                    "and a remote tar archive URL"
+                    "CVE-2025-12060: config.json contains keras.utils.get_file with remote tar extraction enabled"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-12060",
                     "context": context,
-                    "urls": [_redact_url_for_display(url) for url in archive_urls[:5]],
+                    "urls": [_redact_url_for_display(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (
@@ -2266,21 +2272,52 @@ class KerasZipScanner(BaseScanner):
             return
 
     @staticmethod
-    def _node_has_get_file_extract_true(node: dict[str, Any]) -> bool:
-        """Return True only for direct get_file extract=True argument positions."""
-        if node.get("extract") is True:
-            return True
+    def _node_get_file_argument(node: dict[str, Any], name: str, position: int, default: Any) -> Any:
+        """Resolve one get_file argument from flattened, kwargs, or positional config forms."""
+        if name in node:
+            return node[name]
 
         kwargs = node.get("kwargs")
-        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
-            return True
+        if isinstance(kwargs, dict) and name in kwargs:
+            return kwargs[name]
 
         args = node.get("args")
-        if isinstance(args, list | tuple):
-            # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
-            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+        if isinstance(args, (list, tuple)) and len(args) > position:
+            return args[position]
 
-        return False
+        return default
+
+    @staticmethod
+    def _node_get_file_origin(node: dict[str, Any]) -> str | None:
+        """Return only the actual get_file origin argument, excluding other URL-valued fields."""
+        for container in (node, node.get("kwargs")):
+            if not isinstance(container, dict):
+                continue
+            for key in ("origin", "url"):
+                if key in container:
+                    value = container[key]
+                    return value if isinstance(value, str) else None
+
+        args = node.get("args")
+        if isinstance(args, (list, tuple)) and len(args) > 1:
+            value = args[1]
+            return value if isinstance(value, str) else None
+
+        return None
+
+    @staticmethod
+    def _node_has_get_file_tar_extraction_semantics(node: dict[str, Any]) -> bool:
+        """Return True when effective get_file arguments can extract a tar archive."""
+        untar = KerasZipScanner._node_get_file_argument(node, "untar", 2, False)
+        if bool(untar):
+            return True
+
+        extract = KerasZipScanner._node_get_file_argument(node, "extract", 7, False)
+        if not bool(extract):
+            return False
+
+        archive_format = KerasZipScanner._node_get_file_argument(node, "archive_format", 8, "auto")
+        return _archive_format_may_extract_tar(archive_format)
 
     def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
@@ -3267,7 +3304,7 @@ class KerasZipScanner(BaseScanner):
         """Extract string literals from simple container values."""
         literals: list[str] = []
         pending: deque[tuple[Any, int, str]] = deque([(value, 0, context)])
-        while pending:
+        while pending and not state.halted:
             node, depth, node_context = pending.popleft()
             if not self._reserve_config_traversal_item(state, result, context=node_context, depth=depth):
                 continue
@@ -3445,7 +3482,7 @@ class KerasZipScanner(BaseScanner):
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield all dict nodes with their traversal path."""
         pending: deque[tuple[Any, str, int]] = deque([(obj, path, 0)])
-        while pending:
+        while pending and not state.halted:
             node, node_path, depth = pending.popleft()
             if not self._reserve_config_traversal_item(state, result, context=node_path, depth=depth):
                 continue
