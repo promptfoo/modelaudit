@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
