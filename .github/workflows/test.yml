@@ -33,8 +33,8 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
         id: filter
         with:
           filters: |
@@ -111,7 +111,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true')
+    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -902,7 +902,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: |
             ~/.cargo/registry
