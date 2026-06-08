@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound manifest embedded-Jinja template collection so deeply nested configs fail closed without hiding recovered template findings
 - bound Joblib decompression output to the configured scanner read budget
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources

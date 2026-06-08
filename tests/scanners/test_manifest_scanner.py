@@ -764,6 +764,168 @@ def test_manifest_scanner_nested_chat_template_collection_enforces_timeout(monke
         scanner._collect_jinja_template_fields({"chat_template": {"default": "{{ harmless }}"}})
 
 
+def test_manifest_scanner_deep_jinja_collection_budget_fails_closed(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    nested_config: dict[str, Any] = {"leaf": "plain metadata"}
+    for index in range(5):
+        nested_config = {"nested": nested_config, "level": index}
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "metadata": nested_config,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {"jinja_template_collection_max_depth": 3}
+
+    result = ManifestScanner(config=config).scan(str(config_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "manifest_jinja_template_collection_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    budget_checks = [check for check in result.checks if check.name == "Embedded Jinja Collection Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert "parsed manifest traversal exceeded" in budget_checks[0].message
+    assert budget_checks[0].details["limit_type"] == "depth"
+    assert budget_checks[0].details["max_depth"] == 3
+    assert budget_checks[0].details["scan_outcome_reason"] == "manifest_jinja_template_collection_budget_exceeded"
+
+
+def test_manifest_scanner_jinja_collection_budget_preserves_malicious_template_detection(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    nested_config: dict[str, Any] = {"leaf": "plain metadata"}
+    for index in range(5):
+        nested_config = {"nested": nested_config, "level": index}
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "metadata": nested_config,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"jinja_template_collection_max_depth": 3}).scan(str(config_path))
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "manifest_jinja_template_collection_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Embedded Jinja Collection Budget"
+        and check.status == CheckStatus.FAILED
+        and check.details["templates_collected"] == 1
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_wide_jinja_collection_item_budget_fails_closed(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "metadata": [{"name": f"layer-{index}"} for index in range(8)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"jinja_template_collection_max_items": 4}).scan(str(config_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "manifest_jinja_template_collection_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Embedded Jinja Collection Budget"
+        and check.status == CheckStatus.FAILED
+        and check.details["limit_type"] == "items"
+        and check.details["max_items"] == 4
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_jinja_collection_budget_redacts_path_evidence(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    secret = "MANIFEST_COLLECTION_SECRET"
+    config_path.write_text(
+        json.dumps({f"api_key={secret}": {"nested": {"value": "plain metadata"}}}),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"jinja_template_collection_max_depth": 1}).scan(str(config_path))
+
+    budget_checks = [check for check in result.checks if check.name == "Embedded Jinja Collection Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["path"] == "api_key=<redacted>"
+    assert secret not in json.dumps(budget_checks[0].details)
+
+
+def test_manifest_scanner_nested_near_match_jinja_template_still_scanned(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template_metadata": {"description": "near-match container name"},
+                "generation": {
+                    "variants": [
+                        {"chat_template": ("{% for message in messages %}{{ message['content'] }}{% endfor %}")}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(
+        config={
+            "jinja_template_collection_max_depth": 8,
+            "jinja_template_collection_max_items": 64,
+        }
+    ).scan(str(config_path))
+
+    assert "manifest_jinja_template_collection_budget_exceeded" not in result.metadata.get(
+        "scan_outcome_reasons",
+        [],
+    )
+    assert not any(check.name == "Embedded Jinja Collection Budget" for check in result.checks)
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_ignores_plain_nested_template_metadata() -> None:
+    scanner = ManifestScanner()
+    payload = "{{ message['content'] }}"
+
+    assert scanner._collect_jinja_template_fields({"chat_template": "plain template text"}) == {
+        "chat_template": "plain template text"
+    }
+
+    templates = scanner._collect_jinja_template_fields(
+        {
+            "chat_template": {
+                "default": payload,
+                "metadata": {"template": "Documentation example: requests.get(url)"},
+            }
+        }
+    )
+
+    assert templates == {"chat_template.default": payload}
+
+
 def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     payload = "{{ message['content'] }}" + (" safe" * 32)
@@ -925,6 +1087,28 @@ def test_manifest_scanner_honors_excluded_embedded_jinja_selection(tmp_path: Pat
 
     assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_manifest_scanner_skips_jinja_collection_budget_when_excluded(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"model_type": "llama", "metadata": {"nested": {"value": "benign"}}}),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(
+        config={
+            "scanners": ["manifest"],
+            "jinja_template_collection_max_depth": 1,
+        }
+    ).scan(str(config_path))
+
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert "manifest_jinja_template_collection_budget_exceeded" not in result.metadata.get(
+        "scan_outcome_reasons",
+        [],
+    )
+    assert not any(check.name == "Embedded Jinja Collection Budget" for check in result.checks)
 
 
 def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
