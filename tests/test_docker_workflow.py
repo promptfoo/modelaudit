@@ -8,6 +8,7 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _load_docker_workflow() -> dict[str, Any]:
@@ -22,12 +23,16 @@ def _dockerfile_lines(path: str) -> list[str]:
 
 
 def _python_image_from_arg(path: str) -> str:
+    return _dockerfile_arg(path, "PYTHON_IMAGE")
+
+
+def _dockerfile_arg(path: str, name: str) -> str:
     lines = _dockerfile_lines(path)
-    prefix = "ARG PYTHON_IMAGE="
+    prefix = f"ARG {name}="
     for line in lines:
         if line.startswith(prefix):
             return line.removeprefix(prefix)
-    raise AssertionError(f"{path} does not define PYTHON_IMAGE")
+    raise AssertionError(f"{path} does not define {name}")
 
 
 def _assert_pinned_python_image(image: str, expected_version: str) -> None:
@@ -71,6 +76,31 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
 
     tensorflow_from = _dockerfile_lines("Dockerfile.tensorflow")[0].removeprefix("FROM ")
     _assert_pinned_python_image(tensorflow_from, "3.12-slim")
+
+
+def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> None:
+    expected_rustup_version = _dockerfile_arg("Dockerfile", "RUSTUP_VERSION")
+    expected_amd64_sha256 = _dockerfile_arg("Dockerfile", "RUSTUP_INIT_X86_64_UNKNOWN_LINUX_GNU_SHA256")
+    expected_arm64_sha256 = _dockerfile_arg("Dockerfile", "RUSTUP_INIT_AARCH64_UNKNOWN_LINUX_GNU_SHA256")
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", expected_rustup_version)
+    assert _SHA256_RE.fullmatch(expected_amd64_sha256)
+    assert _SHA256_RE.fullmatch(expected_arm64_sha256)
+
+    for path in ("Dockerfile", "Dockerfile.full"):
+        content = (_REPO_ROOT / path).read_text(encoding="utf-8")
+        assert "https://sh.rustup.rs" not in content
+        assert "| sh" not in content
+        assert "sh -s --" not in content
+        assert _dockerfile_arg(path, "RUSTUP_VERSION") == expected_rustup_version
+        assert _dockerfile_arg(path, "RUSTUP_INIT_X86_64_UNKNOWN_LINUX_GNU_SHA256") == expected_amd64_sha256
+        assert _dockerfile_arg(path, "RUSTUP_INIT_AARCH64_UNKNOWN_LINUX_GNU_SHA256") == expected_arm64_sha256
+        assert "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rustup_target}/rustup-init" in content
+        assert "printf '%s  %s\\n' \"${rustup_sha256}\" /tmp/rustup-init > /tmp/rustup-init.sha256" in content
+        assert "sha256sum -c /tmp/rustup-init.sha256" in content
+        assert content.index("sha256sum -c /tmp/rustup-init.sha256") < content.index(
+            "/tmp/rustup-init -y --profile minimal --default-toolchain"
+        )
 
 
 def test_docker_success_job_waits_for_all_image_results() -> None:

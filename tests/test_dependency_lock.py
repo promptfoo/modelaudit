@@ -3,9 +3,16 @@
 import re
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib  # type: ignore[no-redef]
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCKFILE = ROOT_DIR / "uv.lock"
+PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
+PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 
 
 def _lock_package_block(name: str) -> str:
@@ -52,3 +59,12 @@ def test_mlflow_skinny_transitive_gitpython_dependency_is_guarded() -> None:
     mlflow_skinny_block = _lock_package_block("mlflow-skinny")
 
     assert "gitpython" in _dependency_names(mlflow_skinny_block)
+
+
+def test_picklescan_build_backend_is_exactly_pinned() -> None:
+    package_config = tomllib.loads(PICKLESCAN_PYPROJECT.read_text(encoding="utf-8"))
+    build_system = package_config["build-system"]
+
+    assert build_system["build-backend"] == "maturin"
+    # PEP 440 `==1.13.3` also accepts local versions such as `1.13.3+local`.
+    assert build_system["requires"] == [PINNED_MATURIN_BACKEND]
