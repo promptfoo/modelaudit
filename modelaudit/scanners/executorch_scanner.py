@@ -10,7 +10,6 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
-    PROTO0_1_MAX_PROBE_BYTES,
     PROTO0_1_START_BYTES,
     _is_executorch_binary_signature,
     _is_valid_executorch_binary,
@@ -31,9 +30,20 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x04",
     b"\x80\x05",
 )
+_PICKLE_PROTOCOLLESS_BINARY_START_BYTES = frozenset(
+    ord(opcode.code) for opcode in pickletools.opcodes if opcode.proto >= 1 and opcode.name != "PROTO"
+)
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
-_PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
+_PICKLE_DISCOVERY_MAX_ENTRIES = 10_000
+_PICKLE_DISCOVERY_MAX_PROBE_BYTES = 4 * 1024 * 1024
+_PICKLE_DISCOVERY_MAX_FAILURE_SAMPLES = 20
+_PICKLE_DISCOVERY_MAX_DIAGNOSTIC_CHARS = 512
 _PICKLE_DISCOVERY_INCOMPLETE_REASON = "executorch_pickle_discovery_incomplete"
+_PICKLE_MEMBER_SCAN_INCOMPLETE_REASON = "executorch_pickle_member_scan_incomplete"
+
+
+class _PickleDiscoveryBudgetExceeded(ValueError):
+    """Raised when hidden-pickle discovery cannot inspect another candidate safely."""
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -46,6 +56,14 @@ class ExecuTorchScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         self.pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
+        self.max_pickle_discovery_entries = self._normalize_positive_int_config(
+            self.config.get("max_executorch_pickle_discovery_entries"),
+            _PICKLE_DISCOVERY_MAX_ENTRIES,
+        )
+        self.max_pickle_discovery_probe_bytes = self._normalize_positive_int_config(
+            self.config.get("max_executorch_pickle_discovery_probe_bytes"),
+            _PICKLE_DISCOVERY_MAX_PROBE_BYTES,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -70,26 +88,38 @@ class ExecuTorchScanner(BaseScanner):
             return f.read(length)
 
     @staticmethod
-    def _read_member_prefix(zip_file: zipfile.ZipFile, entry: zipfile.ZipInfo, length: int) -> bytes:
-        with zip_file.open(entry, "r") as member_file:
-            return member_file.read(min(length, entry.file_size))
+    def _bounded_discovery_text(value: object) -> str:
+        text = str(value)
+        if len(text) <= _PICKLE_DISCOVERY_MAX_DIAGNOSTIC_CHARS:
+            return text
+        return f"{text[: _PICKLE_DISCOVERY_MAX_DIAGNOSTIC_CHARS - 3]}..."
 
     @staticmethod
-    def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
-        if not any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+    def _looks_like_binary_pickle_prefix(
+        sample: bytes,
+        *,
+        sample_is_prefix: bool,
+        allow_protocolless: bool = False,
+    ) -> bool:
+        has_protocol = any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES)
+        if not has_protocol and not (
+            allow_protocolless and sample and sample[0] in _PICKLE_PROTOCOLLESS_BINARY_START_BYTES
+        ):
             return False
 
         op_count = 0
         try:
             for opcode, _arg, _pos in pickletools.genops(sample):
                 op_count += 1
-                if opcode.name == "STOP" or op_count >= 4:
+                if opcode.name == "STOP":
+                    return True
+                if sample_is_prefix and op_count >= 4:
                     return True
         except ValueError as exc:
             message = str(exc).lower()
             return (
                 sample_is_prefix
-                and op_count >= 2
+                and op_count >= 1
                 and ("exhausted before seeing stop" in message or "not enough data" in message or "expected" in message)
             )
 
@@ -99,22 +129,60 @@ class ExecuTorchScanner(BaseScanner):
         self,
         zip_file: zipfile.ZipFile,
         entry: zipfile.ZipInfo,
+        probe_bytes_remaining: list[int],
     ) -> bool:
-        data_start = self._read_member_prefix(zip_file, entry, _PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
-        if not data_start:
+        if entry.file_size <= 0:
             return False
+        if probe_bytes_remaining[0] <= 0:
+            raise _PickleDiscoveryBudgetExceeded("aggregate hidden-pickle probe byte budget exhausted")
 
-        if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
-            sample = self._read_member_prefix(zip_file, entry, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
-            return self._looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+        with zip_file.open(entry, "r") as member_file:
+            initial_read_size = min(
+                entry.file_size,
+                _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+                probe_bytes_remaining[0],
+            )
+            data_start = member_file.read(initial_read_size)
+            probe_bytes_remaining[0] -= len(data_start)
 
-        if data_start[0] not in PROTO0_1_START_BYTES:
-            return False
+            if not data_start:
+                return False
 
-        sample = data_start
-        if entry.file_size > len(data_start):
-            sample = self._read_member_prefix(zip_file, entry, PROTO0_1_MAX_PROBE_BYTES)
-        return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+            incomplete_protocol_prefix = data_start == b"\x80" and entry.file_size > len(data_start)
+            has_binary_protocol = any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES)
+            has_protocolless_binary_start = data_start[0] in _PICKLE_PROTOCOLLESS_BINARY_START_BYTES
+            has_proto0_or_1_start = data_start[0] in PROTO0_1_START_BYTES
+            if not (
+                incomplete_protocol_prefix
+                or has_binary_protocol
+                or has_protocolless_binary_start
+                or has_proto0_or_1_start
+            ):
+                return False
+
+            remaining_entry_bytes = entry.file_size - len(data_start)
+            extra_read_size = min(remaining_entry_bytes, probe_bytes_remaining[0])
+            sample = data_start + member_file.read(extra_read_size)
+            probe_bytes_remaining[0] -= len(sample) - len(data_start)
+
+        sample_is_prefix = entry.file_size > len(sample)
+        if incomplete_protocol_prefix:
+            raise _PickleDiscoveryBudgetExceeded("hidden-pickle protocol prefix exceeds aggregate probe byte budget")
+
+        if has_binary_protocol or has_protocolless_binary_start:
+            is_pickle = self._looks_like_binary_pickle_prefix(
+                sample,
+                sample_is_prefix=sample_is_prefix,
+                allow_protocolless=has_protocolless_binary_start,
+            )
+        else:
+            is_pickle = _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=sample_is_prefix)
+
+        if is_pickle:
+            return True
+        if sample_is_prefix and probe_bytes_remaining[0] <= 0:
+            raise _PickleDiscoveryBudgetExceeded("hidden-pickle structure exceeds aggregate probe byte budget")
+        return False
 
     def _discover_pickle_entries(
         self,
@@ -136,26 +204,40 @@ class ExecuTorchScanner(BaseScanner):
             if entry.filename.casefold().endswith(".pkl"):
                 add_entry(entry)
 
+        candidates = [entry for entry in safe_entries if id(entry) not in seen_entries and not entry.is_dir()]
+        entries_to_probe = candidates[: self.max_pickle_discovery_entries]
+        failed_count = len(candidates) - len(entries_to_probe)
         probe_failures: list[dict[str, Any]] = []
-        for entry in safe_entries:
-            if id(entry) in seen_entries or entry.is_dir():
-                continue
+        if failed_count:
+            probe_failures.append(
+                {
+                    "exception": "hidden-pickle candidate entry limit exceeded",
+                    "exception_type": _PickleDiscoveryBudgetExceeded.__name__,
+                    "location": self.current_file_path,
+                }
+            )
+
+        probe_bytes_remaining = [self.max_pickle_discovery_probe_bytes]
+        for entry in entries_to_probe:
             try:
-                if self._entry_looks_like_pickle(zip_file, entry):
+                if self._entry_looks_like_pickle(zip_file, entry, probe_bytes_remaining):
                     add_entry(entry)
             except Exception as exc:
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                failed_count += 1
+                if len(probe_failures) < _PICKLE_DISCOVERY_MAX_FAILURE_SAMPLES:
+                    safe_name = self._bounded_discovery_text(entry.filename)
+                    probe_failures.append(
+                        {
+                            "zip_entry": safe_name,
+                            "exception": self._bounded_discovery_text(exc),
+                            "exception_type": type(exc).__name__,
+                            "location": self._bounded_discovery_text(f"{self.current_file_path}:{safe_name}"),
+                        }
+                    )
 
-        if probe_failures:
+        if failed_count:
             mark_inconclusive_scan_result(result, _PICKLE_DISCOVERY_INCOMPLETE_REASON)
-            count = len(probe_failures)
+            count = failed_count
             noun = "member" if count == 1 else "members"
             result.add_check(
                 name="Pickle Discovery",
@@ -164,9 +246,10 @@ class ExecuTorchScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=self.current_file_path,
                 details={
-                    "zip_entries": [failure["zip_entry"] for failure in probe_failures],
+                    "zip_entries": [failure["zip_entry"] for failure in probe_failures if "zip_entry" in failure],
                     "entries": probe_failures,
                     "failed_count": count,
+                    "reported_failure_count": len(probe_failures),
                     "analysis_incomplete": True,
                     "scan_outcome_reason": _PICKLE_DISCOVERY_INCOMPLETE_REASON,
                 },
@@ -274,6 +357,8 @@ class ExecuTorchScanner(BaseScanner):
                 pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
                 bytes_scanned = 0
+                pickle_member_failure_count = 0
+                pickle_member_failures: list[dict[str, Any]] = []
 
                 for member_info in pickle_entries:
                     name = member_info.filename
@@ -288,14 +373,46 @@ class ExecuTorchScanner(BaseScanner):
                         )
                         continue
 
-                    with z.open(member_info, "r") as file_like:
-                        sub_result = self.pickle_scanner.scan_stream(
-                            cast(BinaryIO, file_like),
-                            member_info.file_size,
-                            source=f"{path}:{name}",
-                        )
+                    try:
+                        with z.open(member_info, "r") as file_like:
+                            sub_result = self.pickle_scanner.scan_stream(
+                                cast(BinaryIO, file_like),
+                                member_info.file_size,
+                                source=f"{path}:{name}",
+                            )
+                    except Exception as exc:
+                        pickle_member_failure_count += 1
+                        if len(pickle_member_failures) < _PICKLE_DISCOVERY_MAX_FAILURE_SAMPLES:
+                            safe_name = self._bounded_discovery_text(name)
+                            pickle_member_failures.append(
+                                {
+                                    "zip_entry": safe_name,
+                                    "exception": self._bounded_discovery_text(exc),
+                                    "exception_type": type(exc).__name__,
+                                    "location": self._bounded_discovery_text(f"{path}:{safe_name}"),
+                                }
+                            )
+                        continue
                     apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
                     result.merge(sub_result)
+
+                if pickle_member_failure_count:
+                    mark_inconclusive_scan_result(result, _PICKLE_MEMBER_SCAN_INCOMPLETE_REASON)
+                    noun = "member" if pickle_member_failure_count == 1 else "members"
+                    result.add_check(
+                        name="Embedded Pickle Scan",
+                        passed=False,
+                        message=(f"Unable to scan {pickle_member_failure_count} embedded ExecuTorch pickle {noun}"),
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "entries": pickle_member_failures,
+                            "failed_count": pickle_member_failure_count,
+                            "reported_failure_count": len(pickle_member_failures),
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": _PICKLE_MEMBER_SCAN_INCOMPLETE_REASON,
+                        },
+                    )
 
                 for entry in safe_entries:
                     name = entry.filename

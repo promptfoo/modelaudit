@@ -916,7 +916,7 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
-PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
+PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNPSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
     "pickle exhausted before seeing STOP",
