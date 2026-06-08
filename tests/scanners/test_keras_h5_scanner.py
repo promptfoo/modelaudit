@@ -4866,6 +4866,62 @@ class TestCVE20251550H5ModuleReferences:
 
         assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
 
+    def test_dangerous_lambda_config_fn_module_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_lambda_dangerous_fn_module",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "keras.layers",
+                            "config": {
+                                "name": "lambda_evil_fn_module",
+                                "function": "relu",
+                                "fn_module": "subprocess",
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["key"] == "fn_module"
+        assert cve_issues[0].details["module"] == "subprocess"
+
+    def test_safe_keras_lambda_config_fn_module_is_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_lambda_safe_fn_module",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "keras.layers",
+                            "config": {
+                                "name": "lambda_safe_fn_module",
+                                "function": "relu",
+                                "fn_module": "keras.activations",
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
+
     def test_dangerous_lambda_inbound_callable_is_critical(self, tmp_path: Path) -> None:
         model_path = create_custom_h5_file(
             tmp_path,

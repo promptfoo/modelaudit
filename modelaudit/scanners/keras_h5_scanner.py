@@ -947,7 +947,7 @@ class KerasH5Scanner(BaseScanner):
             model_config,
             result,
             "model_config",
-            check_config_fields=False,
+            config_fields=(),
             check_nested=False,
         )
 
@@ -1064,7 +1064,7 @@ class KerasH5Scanner(BaseScanner):
                 layer,
                 result,
                 layer_reference_name,
-                check_config_fields=not is_lambda_layer,
+                config_fields=("fn_module",) if is_lambda_layer else ("module", "fn_module"),
             )
 
             # Update layer count
@@ -1452,7 +1452,7 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
         layer_name: str,
         *,
-        check_config_fields: bool = True,
+        config_fields: tuple[str, ...] = ("module", "fn_module"),
         check_nested: bool = True,
     ) -> None:
         """Check H5 layer config for CVE-2025-1550 module references."""
@@ -1476,18 +1476,17 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layer_config, dict):
             return
 
-        if check_config_fields:
-            for key in ("module", "fn_module"):
-                config_value = layer_config.get(key)
-                if isinstance(config_value, str) and config_value.strip():
-                    self._check_config_module_reference(
-                        layer_config,
-                        key,
-                        config_value.strip(),
-                        layer_class,
-                        result,
-                        layer_name,
-                    )
+        for key in config_fields:
+            config_value = layer_config.get(key)
+            if isinstance(config_value, str) and config_value.strip():
+                self._check_config_module_reference(
+                    layer_config,
+                    key,
+                    config_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
+                )
 
         if layer_class == "FlaxLayer":
             self._check_nested_serialized_module_references(
