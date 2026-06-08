@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import pickle
 from collections.abc import Mapping
 
@@ -71,6 +72,64 @@ def test_scan_bytes_fails_closed_for_nested_overlong_protocol0_line_operand(
         and "protocol 0 line operand exceeds" in str(notice["details"].get("exception"))
         for notice in nested_notices
     )
+
+
+@pytest.mark.parametrize("as_unicode", [False, True])
+@pytest.mark.parametrize(
+    ("payload_kind", "prefix"),
+    [
+        ("dangerous_suffix", b"S'"),
+        ("first_global", b"cos\n"),
+        ("first_inst", b"ios\n"),
+    ],
+)
+def test_scan_bytes_fails_closed_when_structure_follows_overlong_protocol0_operand(
+    as_unicode: bool, payload_kind: str, prefix: bytes
+) -> None:
+    suffix = b"'\n0cos\nsystem\n)R." if payload_kind == "dangerous_suffix" else b"\n."
+    nested_payload = prefix + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1)) + suffix
+    nested_value = nested_payload.decode("ascii") if as_unicode else nested_payload
+    payload = pickle.dumps(nested_value, protocol=4)
+
+    report = scan_bytes(
+        payload,
+        source=f"nested-overlong-{payload_kind}.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(nested_value) + 16,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+def test_scan_bytes_fails_closed_for_base64_overlong_first_global_operand() -> None:
+    nested_payload = b"cos\n" + (b"A" * (MAX_PROTOCOL0_LINE_OPERAND_BYTES + 1)) + b"\n."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    payload = pickle.dumps(encoded, protocol=4)
+
+    report = scan_bytes(
+        payload,
+        source="nested-overlong-first-global-base64.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload) + 16,
+            max_string_literal_scan_chars=len(encoded) + 16,
+        ),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
 
 @pytest.mark.parametrize("as_unicode", [False, True])
