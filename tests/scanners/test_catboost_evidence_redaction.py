@@ -3,6 +3,7 @@
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -1568,7 +1569,12 @@ def test_command_substitution_credential_redaction_has_bounded_runtime() -> None
         "COMMAND_SUBSTITUTION_USER_PASSWORD_RE.sub('<redacted>', payload)\n"
     )
 
-    subprocess.run([sys.executable, "-c", code], check=True, timeout=3)
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=Path(__file__).resolve().parents[2],
+        timeout=3,
+    )
 
 
 def test_standalone_command_context_redacts_credential_arguments() -> None:
