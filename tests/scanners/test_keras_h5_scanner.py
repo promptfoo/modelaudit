@@ -4802,9 +4802,8 @@ class TestCVE20251550H5ModuleReferences:
                     "layers": [
                         {
                             "class_name": "Dense",
-                            "name": "dense_evil",
                             "module": "os",
-                            "config": {"units": 1},
+                            "config": {"name": "dense_evil", "units": 1},
                         }
                     ],
                 },
@@ -4818,6 +4817,128 @@ class TestCVE20251550H5ModuleReferences:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["layer_name"] == "dense_evil"
         assert cve_issues[0].details["module"] == "os"
+
+    def test_dangerous_lambda_layer_module_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_lambda_dangerous_module",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "os",
+                            "config": {"name": "lambda_evil", "function": "relu"},
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_name"] == "lambda_1"
+        assert cve_issues[0].details["module"] == "os"
+
+    def test_safe_keras_lambda_layer_module_is_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_lambda_safe_module",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "keras.layers",
+                            "config": {"name": "lambda_safe", "function": "relu"},
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
+
+    def test_dangerous_lambda_inbound_callable_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Functional",
+                "config": {
+                    "name": "h5_lambda_inbound_callable",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "keras.layers",
+                            "config": {"name": "lambda_inbound", "function": "relu"},
+                            "inbound_nodes": [
+                                {
+                                    "args": [
+                                        {
+                                            "class_name": "function",
+                                            "module": "posix",
+                                            "config": "system",
+                                            "registered_name": "system",
+                                        }
+                                    ],
+                                    "kwargs": {},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_name"] == "lambda_1"
+        assert cve_issues[0].details["module"] == "posix"
+
+    def test_dangerous_lambda_nested_callable_is_critical(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "h5_lambda_nested_callable",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "module": "keras.layers",
+                            "config": {
+                                "name": "lambda_nested",
+                                "function": "relu",
+                                "activation": {
+                                    "class_name": "function",
+                                    "module": "posix",
+                                    "config": "system",
+                                    "registered_name": "system",
+                                },
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_name"] == "lambda_1"
+        assert cve_issues[0].details["module"] == "posix"
 
     def test_nested_non_lambda_serialized_function_is_critical(self, tmp_path: Path) -> None:
         model_path = create_custom_h5_file(

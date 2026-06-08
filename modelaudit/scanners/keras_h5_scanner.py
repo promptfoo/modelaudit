@@ -1034,12 +1034,6 @@ class KerasH5Scanner(BaseScanner):
             layer_config = layer.get("config", {})
             is_lambda_layer = self._is_lambda_layer_class(layer_class)
             layer_count_key = "Lambda" if is_lambda_layer else layer_class
-            serialized_layer_name = layer.get("name")
-            layer_reference_name = (
-                str(serialized_layer_name)
-                if isinstance(serialized_layer_name, str) and serialized_layer_name.strip()
-                else f"layer_{index}"
-            )
             if not isinstance(layer_config, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
                 result.add_check(
@@ -1053,8 +1047,25 @@ class KerasH5Scanner(BaseScanner):
                 )
                 layer_config = {}
 
-            if not is_lambda_layer:
-                self._check_layer_module_references(layer, result, layer_reference_name)
+            if is_lambda_layer:
+                layer_reference_name = f"lambda_{lambda_layer_count + 1}"
+            else:
+                serialized_layer_name = layer.get("name")
+                config_layer_name = layer_config.get("name")
+                layer_reference_name = next(
+                    (
+                        name.strip()
+                        for name in (serialized_layer_name, config_layer_name)
+                        if isinstance(name, str) and name.strip()
+                    ),
+                    f"layer_{index}",
+                )
+            self._check_layer_module_references(
+                layer,
+                result,
+                layer_reference_name,
+                check_config_fields=not is_lambda_layer,
+            )
 
             # Update layer count
             if layer_count_key in layer_counts:
@@ -1321,7 +1332,7 @@ class KerasH5Scanner(BaseScanner):
             return
         self._checked_config_module_references.add(reference_key)
 
-        redacted_module_value = redact_evidence_string(module_value)
+        redacted_module_value = redact_evidence_string(module_value.split(".", 1)[0])
         redacted_object_class = redact_evidence_string(object_class)
         redacted_layer_name = redact_evidence_string(layer_name)
         top_module = module_value.split(".")[0]
@@ -1444,7 +1455,7 @@ class KerasH5Scanner(BaseScanner):
         check_config_fields: bool = True,
         check_nested: bool = True,
     ) -> None:
-        """Check H5 layer config for CVE-2025-1550 module references beyond Lambda layers."""
+        """Check H5 layer config for CVE-2025-1550 module references."""
         layer_class = layer.get("class_name")
         if not isinstance(layer_class, str) or "config" not in layer:
             return
