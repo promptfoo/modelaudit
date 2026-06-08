@@ -132,15 +132,30 @@ class JoblibScanner(BaseScanner):
         self.pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
+        has_explicit_read_budget = "max_file_read_size" in self.config
+        configured_file_size = self.config.get("max_file_size")
+        public_file_size_budget = (
+            configured_file_size
+            if not isinstance(configured_file_size, bool)
+            and isinstance(configured_file_size, int)
+            and configured_file_size > 0
+            else None
+        )
         decompressed_read_budget = (
             self.max_file_read_size if self.max_file_read_size > 0 else self.default_max_file_read_size
         )
+        if not has_explicit_read_budget and public_file_size_budget is not None:
+            decompressed_read_budget = public_file_size_budget
         configured_decompressed_size = self._normalize_positive_int_config(
             self.config.get("max_decompressed_size", decompressed_read_budget),
             decompressed_read_budget,
         )
         self.max_decompressed_size = configured_decompressed_size
-        if self.max_file_read_size > 0:
+        if has_explicit_read_budget and self.max_file_read_size > 0:
+            self.max_decompressed_size = min(self.max_decompressed_size, self.max_file_read_size)
+        elif not has_explicit_read_budget and public_file_size_budget is not None:
+            self.max_decompressed_size = min(self.max_decompressed_size, public_file_size_budget)
+        elif configured_file_size != 0 and self.max_file_read_size > 0:
             self.max_decompressed_size = min(self.max_decompressed_size, self.max_file_read_size)
         self.chunk_size = self.config.get("chunk_size", 8192)  # 8KB chunks
 
