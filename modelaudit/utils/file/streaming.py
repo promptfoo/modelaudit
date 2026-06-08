@@ -30,7 +30,13 @@ def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner") -> object:
     configured_stream_max = scanner.config.get("streaming_max_bytes")
     if configured_stream_max is not None:
         return configured_stream_max
-    return scanner.config.get("max_file_size")
+    configured_file_max = scanner.config.get("max_file_size")
+    if isinstance(configured_file_max, int) and not isinstance(configured_file_max, bool) and configured_file_max > 0:
+        return configured_file_max
+    configured_read_max = scanner.config.get("max_file_read_size")
+    if configured_read_max is not None:
+        return configured_read_max
+    return configured_file_max
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
@@ -150,8 +156,14 @@ def stream_analyze_file(
             configured_max_bytes = _streaming_max_bytes_from_scanner_config(scanner)
         resolved_max_bytes = resolve_streaming_max_bytes(configured_max_bytes)
 
-        # Determine how much to request from the remote object.
-        bytes_to_read = min(known_file_size, resolved_max_bytes) if known_file_size is not None else resolved_max_bytes
+        # Use one spare byte of the budget to detect an object that grew after
+        # the metadata lookup without exceeding the configured read cap.
+        if known_file_size is None:
+            bytes_to_read = resolved_max_bytes
+        elif known_file_size < resolved_max_bytes:
+            bytes_to_read = known_file_size + 1
+        else:
+            bytes_to_read = resolved_max_bytes
 
         # Read partial content
         with fs.open(url, "rb") as f:
