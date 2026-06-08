@@ -32,6 +32,7 @@ from modelaudit.utils.sources.cloud_storage import (
     filter_scannable_files,
     get_cloud_object_size,
     get_fs_protocol,
+    is_cleartext_cloud_url,
     is_cloud_url,
     is_sensitive_credential_key,
     redact_cloud_error_for_display,
@@ -182,6 +183,78 @@ class TestCloudURLDetection:
     )
     def test_resolves_mixed_case_https_provider_hosts(self, url: str, expected_protocol: str) -> None:
         assert get_fs_protocol(url) == expected_protocol
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://bucket.s3.amazonaws.com/model.bin",
+        "HTTP://bucket.s3.amazonaws.com:80/model.bin?X-Amz-Signature=secret",
+        "http://storage.googleapis.com/bucket/model.bin",
+        "http://account.r2.cloudflarestorage.com/bucket/model.bin",
+    ],
+)
+def test_rejects_cleartext_cloud_provider_urls(url: str) -> None:
+    assert not is_cloud_url(url)
+    assert is_cleartext_cloud_url(url)
+
+    with pytest.raises(ValueError, match="Cleartext cloud storage URL is not supported") as exc_info:
+        get_fs_protocol(url)
+
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://bucket.s3.amazonaws.com./model.bin",
+        "http://storage.googleapis.com.:80/bucket/model.bin",
+        "http://account.r2.cloudflarestorage.com./bucket/model.bin",
+    ],
+)
+def test_rejects_cleartext_cloud_provider_urls_with_absolute_hostnames(url: str) -> None:
+    assert is_cleartext_cloud_url(url)
+    with pytest.raises(ValueError, match="Cleartext cloud storage URL is not supported"):
+        get_fs_protocol(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://storage.googleapis.com.evil.example/bucket/model.bin",
+        "http://storage.googleapis.com@evil.example/bucket/model.bin",
+        "http://pytorch.org/hub/pytorch_vision_resnet/",
+    ],
+)
+def test_cleartext_cloud_provider_detection_rejects_hostname_near_matches(url: str) -> None:
+    assert not is_cleartext_cloud_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_protocol"),
+    [
+        ("https://bucket.s3.amazonaws.com:443/model.bin", "s3"),
+        ("https://storage.googleapis.com:443/bucket/model.bin", "gcs"),
+        ("https://account.r2.cloudflarestorage.com:443/bucket/model.bin", "s3"),
+    ],
+)
+def test_routes_secure_cloud_provider_urls_with_ports(url: str, expected_protocol: str) -> None:
+    assert is_cloud_url(url)
+    assert get_fs_protocol(url) == expected_protocol
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://bucket.s3.amazonaws.com.evil.example/model.bin",
+        "https://storage.googleapis.com.evil.example/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com.evil.example/model.bin",
+    ],
+)
+def test_rejects_cloud_provider_hostname_near_matches(url: str) -> None:
+    assert not is_cloud_url(url)
+    with pytest.raises(ValueError, match="Unsupported cloud storage URL"):
+        get_fs_protocol(url)
 
 
 class TestCloudURLRedaction:

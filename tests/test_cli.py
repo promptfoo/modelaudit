@@ -3966,6 +3966,32 @@ def test_display_path_redacts_mixed_case_signed_urls() -> None:
     assert _display_path(cloud_url) == "https://bucket.s3.amazonaws.com/model.bin"
 
 
+@patch("modelaudit.cli.download_from_cloud")
+def test_scan_rejects_cleartext_cloud_url_without_leaking_credentials(mock_download: MagicMock) -> None:
+    url = "HTTP://BUCKET.S3.AMAZONAWS.COM:80/model.bin?X-Amz-Signature=cloud-secret"
+
+    result = CliRunner().invoke(cli, ["scan", url])
+
+    assert result.exit_code == 2
+    assert "Cleartext cloud storage URL is not supported" in result.output
+    assert "http://bucket.s3.amazonaws.com:80/model.bin" in result.output.lower()
+    assert "cloud-secret" not in result.output
+    mock_download.assert_not_called()
+
+
+@patch("modelaudit.cli.download_pytorch_hub_model")
+def test_scan_rejects_cleartext_pytorch_hub_url_without_downloading(mock_download: MagicMock) -> None:
+    url = "HTTP://PYTORCH.ORG:80/hub/pytorch_vision_resnet/?token=hub-secret"
+
+    result = CliRunner().invoke(cli, ["scan", url])
+
+    assert result.exit_code == 2
+    assert "Cleartext PyTorch Hub URL is not supported" in result.output
+    assert "http://pytorch.org:80/hub/pytorch_vision_resnet/" in result.output.lower()
+    assert "hub-secret" not in result.output
+    mock_download.assert_not_called()
+
+
 def test_progress_initial_status_redacts_signed_stream_url() -> None:
     """Initial progress status should not expose signed stream URLs."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
