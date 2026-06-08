@@ -1872,6 +1872,105 @@ def test_scan_file_marks_oversized_pytorch_zip_member_inconclusive(
     assert any(notice.code == "pytorch_zip_member_size_limit" for notice in report.notices)
 
 
+def test_scan_file_marks_pytorch_zip_pickle_member_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 2)
+    archive_path = tmp_path / "member-budget.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/skipped-malicious.pkl", malicious_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not report.is_clean
+    assert report.coverage.raw_scan_complete is False
+    assert report.coverage.opcode_scan_complete is False
+    assert report.metadata["analysis_incomplete"] is True
+    assert list(report.metadata["pickle_files"]) == [
+        "archive/data.pkl",
+        "archive/near-limit.pkl",
+        "archive/skipped-malicious.pkl",
+    ]
+    assert len(report.metadata["member_reports"]) == 2
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_member_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["analysis_incomplete"] is True
+    assert budget_notices[0].details["pickle_member_count"] == 3
+    assert budget_notices[0].details["scanned_pickle_member_count"] == 2
+    assert budget_notices[0].details["skipped_pickle_member_count"] == 1
+    assert budget_notices[0].details["max_pickle_members"] == 2
+    assert list(budget_notices[0].details["skipped_pickle_members"]) == ["archive/skipped-malicious.pkl"]
+
+
+def test_scan_file_marks_pytorch_zip_pickle_member_total_bytes_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "member-byte-budget.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 10)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES", len(safe_payload) * 2)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/skipped-malicious.pkl", malicious_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["analysis_incomplete"] is True
+    assert len(report.metadata["member_reports"]) == 2
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_member_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["pickle_member_count"] == 3
+    assert budget_notices[0].details["scanned_pickle_member_count"] == 2
+    assert budget_notices[0].details["max_pickle_members"] == 10
+    assert budget_notices[0].details["total_pickle_member_bytes"] == len(safe_payload) * 2 + len(malicious_payload)
+    assert budget_notices[0].details["scanned_pickle_member_bytes"] == len(safe_payload) * 2
+    assert budget_notices[0].details["max_total_pickle_member_bytes"] == len(safe_payload) * 2
+    assert list(budget_notices[0].details["skipped_pickle_members"]) == ["archive/skipped-malicious.pkl"]
+
+
+def test_scan_file_scans_pytorch_zip_pickle_member_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "member-budget-boundary.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 2)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES", len(safe_payload) * 2)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    assert "analysis_incomplete" not in report.metadata
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/near-limit.pkl"]
+    assert len(report.metadata["member_reports"]) == 2
+    assert all(notice.code != "pytorch_zip_pickle_member_budget" for notice in report.notices)
+
+
 def test_scan_file_enforces_pytorch_zip_entry_cap_before_opening_archive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
