@@ -111,7 +111,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true')
+    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
