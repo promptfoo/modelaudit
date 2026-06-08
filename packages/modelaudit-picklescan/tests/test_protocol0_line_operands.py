@@ -110,6 +110,78 @@ def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_opera
 
 @pytest.mark.parametrize(
     ("encoding", "expected_rule_code"),
+    [("base64", "S601"), ("hex", "S602")],
+)
+def test_scan_bytes_detects_inline_encoded_protocol0_pickle_before_suffix(
+    encoding: str,
+    expected_rule_code: str,
+) -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    encoded = base64.b64encode(nested_payload).decode("ascii") if encoding == "base64" else nested_payload.hex()
+
+    report = scan_bytes(
+        pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
+        source=f"inline-{encoding}-nested-protocol0.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule_code
+        and finding.details.get("encoding") == encoding
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("encoding", "expected_rule_code"),
+    [("base64", "S601"), ("hex", "S602")],
+)
+def test_scan_bytes_fails_closed_for_oversized_inline_encoded_protocol0_pickle(
+    encoding: str,
+    expected_rule_code: str,
+) -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    encoded = base64.b64encode(nested_payload).decode("ascii") if encoding == "base64" else nested_payload.hex()
+
+    report = scan_bytes(
+        pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
+        source=f"oversized-inline-{encoding}-nested-protocol0.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=4),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule_code
+        and finding.details.get("encoding") == encoding
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_scan_bytes_ignores_malformed_inline_encoded_protocol0_near_match(
+    encoding: str,
+) -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    encoded = (
+        f"{base64.b64encode(nested_payload).decode('ascii')}==" if encoding == "base64" else f"{nested_payload.hex()}f"
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
+        source=f"malformed-inline-{encoding}-nested-protocol0.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=4),
+    )
+
+    assert not any(finding.rule_code in {"S601", "S602"} for finding in report.findings)
+    assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "expected_rule_code"),
     [("raw", "S213"), ("base64", "S601")],
 )
 def test_scan_bytes_fails_closed_when_nested_overlong_protocol0_operand_hits_depth_limit(

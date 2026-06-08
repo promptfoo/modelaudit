@@ -50,8 +50,10 @@ pub(crate) fn decode_possible_encoded_pickle(
     let max_escaped_hex_nested_pickle_chars = max_nested_pickle_bytes * 4;
 
     for candidate in encoded_literal_candidates(stripped) {
-        let bounded_base64 = take_base64_literal_prefix(&candidate, max_base64_nested_pickle_chars);
-        if base64_prefix_has_pickle_prefix(&candidate) && is_base64_candidate(bounded_base64) {
+        let base64_token = take_base64_literal_prefix(&candidate, candidate.len());
+        if base64_prefix_has_pickle_prefix(&candidate) && is_base64_candidate(base64_token) {
+            let bounded_base64 =
+                take_base64_literal_prefix(base64_token, max_base64_nested_pickle_chars);
             let padded = pad_base64(bounded_base64);
             if let Some(decoded) = decode_base64(&padded) {
                 for (payload, analysis_incomplete) in
@@ -67,9 +69,10 @@ pub(crate) fn decode_possible_encoded_pickle(
         }
 
         if hex_prefix_has_pickle_prefix(&candidate) {
-            let encoding = hex_encoding_label(&candidate);
+            let hex_token = take_hex_literal_prefix(&candidate, candidate.len());
+            let encoding = hex_encoding_label(hex_token);
             let bounded_hex =
-                take_hex_literal_prefix(&candidate, max_escaped_hex_nested_pickle_chars);
+                take_hex_literal_prefix(hex_token, max_escaped_hex_nested_pickle_chars);
             let hex_candidate = strip_escaped_hex_markers(bounded_hex);
             if hex_candidate.len() >= 16
                 && hex_candidate.len() % 2 == 0
@@ -157,7 +160,7 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     let base64_token = take_base64_literal_prefix(stripped, stripped.len());
     if base64_prefix_has_pickle_prefix(stripped) && is_base64_candidate(base64_token) {
         let max_base64_probe_chars = (probe_decoded_bytes.div_ceil(3) * 4).max(16);
-        let bounded = take_base64_literal_prefix(stripped, max_base64_probe_chars);
+        let bounded = take_base64_literal_prefix(base64_token, max_base64_probe_chars);
         let padded = pad_base64(bounded);
         if let Some(decoded) = decode_base64(&padded) {
             if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
@@ -170,18 +173,18 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
         let hex_token = take_hex_literal_prefix(stripped, stripped.len());
         let encoding = hex_encoding_label(hex_token);
         let max_hex_probe_chars = (probe_decoded_bytes * 4).max(16);
-        let bounded_hex = take_hex_literal_prefix(stripped, max_hex_probe_chars);
-        let mut hex_candidate = strip_escaped_hex_markers(bounded_hex);
-        if hex_candidate.len() % 2 == 1 {
-            hex_candidate.pop();
-        }
-        if hex_candidate.len() >= 16
-            && is_hex_candidate(&hex_candidate)
-            && !is_repeated_single_char(&hex_candidate)
-        {
-            if let Some(decoded) = decode_hex(&hex_candidate) {
-                if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
-                    detected.push((encoding, estimate_hex_decoded_size(hex_token)));
+        let normalized_hex_literal = strip_escaped_hex_markers(hex_token);
+        if normalized_hex_literal.len() % 2 == 0 {
+            let bounded_hex = take_hex_literal_prefix(hex_token, max_hex_probe_chars);
+            let hex_candidate = strip_escaped_hex_markers(bounded_hex);
+            if hex_candidate.len() >= 16
+                && is_hex_candidate(&hex_candidate)
+                && !is_repeated_single_char(&hex_candidate)
+            {
+                if let Some(decoded) = decode_hex(&hex_candidate) {
+                    if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
+                        detected.push((encoding, estimate_hex_decoded_size(hex_token)));
+                    }
                 }
             }
         }
@@ -848,15 +851,16 @@ pub(crate) fn encoded_nested_window_char_limit(
     let max_escaped_hex_chars = max_nested_pickle_bytes * 4;
     let probe = encoded_literal_probe(value);
     if contains_escaped_hex_marker(&probe) {
-        return 16.max(max_escaped_hex_chars);
+        return (ENCODED_LITERAL_PROBE_CHARS * 4).max(max_escaped_hex_chars);
     }
     if chars_are_in_alphabet(probe.as_bytes(), HEX_LITERAL_CHARS) {
-        return 16.max(max_plain_hex_chars);
+        return ENCODED_LITERAL_PROBE_CHARS.max(max_plain_hex_chars);
     }
     if chars_are_in_alphabet(probe.as_bytes(), BASE64_LITERAL_CHARS) {
-        return 16.max(max_base64_chars);
+        return ENCODED_LITERAL_PROBE_CHARS.max(max_base64_chars);
     }
-    16.max(max_base64_chars)
+    ENCODED_LITERAL_PROBE_CHARS
+        .max(max_base64_chars)
         .max(max_plain_hex_chars)
         .max(max_escaped_hex_chars)
 }
@@ -964,11 +968,8 @@ fn take_base64_literal_prefix(value: &str, max_chars: usize) -> &str {
     {
         end += 1;
     }
-    if end < limit && bytes[end] == b'=' {
+    while end < limit && bytes[end] == b'=' {
         end += 1;
-        if end < limit && bytes[end] == b'=' {
-            end += 1;
-        }
     }
     &value[..end]
 }
@@ -1327,6 +1328,32 @@ mod tests {
         assert_eq!(decoded[0].encoding, "base64");
         assert_eq!(decoded[0].payload, b"cos\nsystem\n)R.");
         assert!(!decoded[0].analysis_incomplete);
+    }
+
+    #[test]
+    fn inline_encoded_pickle_candidates_stop_before_suffixes() {
+        let payload = b"cos\nsystem\n)R.";
+        for (value, encoding) in [
+            ("Y29zCnN5c3RlbQopUi4=-suffix", "base64"),
+            ("636f730a73797374656d0a29522e-suffix", "hex"),
+        ] {
+            let decoded = decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES);
+
+            assert!(decoded
+                .iter()
+                .any(|candidate| candidate.encoding == encoding && candidate.payload == payload));
+        }
+    }
+
+    #[test]
+    fn inline_encoded_pickle_candidates_reject_malformed_tokens() {
+        for value in [
+            "Y29zCnN5c3RlbQopUi4===-suffix",
+            "636f730a73797374656d0a29522ef-suffix",
+        ] {
+            assert!(decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES).is_empty());
+            assert!(detect_oversized_encoded_pickle_prefixes(value, 4).is_empty());
+        }
     }
 
     #[test]
