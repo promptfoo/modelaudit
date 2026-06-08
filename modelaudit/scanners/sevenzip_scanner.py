@@ -389,11 +389,6 @@ class SevenZipScanner(BaseScanner):
         except Exception:
             return False
 
-    @staticmethod
-    def _is_unconfigured_mock(value: Any) -> bool:
-        """Return True for MagicMock placeholder attributes on mocked archives."""
-        return type(value).__module__.startswith("unittest.mock")
-
     @classmethod
     def _archive_member_name(cls, member_info: Any) -> str:
         if isinstance(member_info, str):
@@ -403,24 +398,27 @@ class SevenZipScanner(BaseScanner):
             raise ValueError("7z member metadata did not include a filename")
         return member_name
 
-    def _archive_member_name_source(self, archive: Any) -> Any | None:
-        files = getattr(archive, "files", None)
-        if files is not None and not self._is_unconfigured_mock(files):
-            return files
-
-        list_members = getattr(archive, "list", None)
-        if callable(list_members) and not self._is_unconfigured_mock(list_members):
-            listed_members = list_members()
-            if listed_members is not None and not self._is_unconfigured_mock(listed_members):
-                return listed_members
-        return None
+    @staticmethod
+    def _archive_member_name_source(archive: Any) -> Any | None:
+        archive_state = getattr(archive, "__dict__", None)
+        return archive_state.get("files") if isinstance(archive_state, dict) else None
 
     def _bounded_archive_file_names(self, archive: Any) -> tuple[list[str], int, bool]:
         """Return archive member names without building a second unbounded name table when possible."""
         member_source = self._archive_member_name_source(archive)
         if member_source is None:
+            if type(archive).__module__.startswith("py7zr"):
+                raise ValueError("7z archive metadata did not expose a bounded member source")
             fallback_file_names = list(archive.getnames())
             return fallback_file_names, len(fallback_file_names), len(fallback_file_names) > self.max_entries
+
+        try:
+            observed_entry_count = len(member_source)
+        except TypeError:
+            observed_entry_count = 0
+        else:
+            if observed_entry_count > self.max_entries:
+                return [], observed_entry_count, True
 
         file_names: list[str] = []
         for member_info in member_source:
