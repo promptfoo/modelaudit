@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import time
 from pathlib import Path
 
@@ -175,9 +175,7 @@ def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
         (r"\\server\share\model.pkl?token=unc-secret", r"\\server\share\model.pkl"),
     ],
 )
-def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(
-    local_path: str, safe_path: str
-) -> None:
+def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path: str, safe_path: str) -> None:
     assert redact_source_identifier(local_path) == safe_path
 
 

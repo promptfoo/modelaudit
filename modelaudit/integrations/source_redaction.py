@@ -192,7 +192,21 @@ def redact_source_text(text: str) -> str:
         lambda match: _redact_encoded_suffix_token(match.group("identifier")),
         redacted_text,
     )
-    return _redact_export_alias_assignments(_redact_cloud_error_for_display(redacted_text))
+    return _redact_assignments_outside_url_tokens(redacted_text)
+
+
+def _redact_assignments_outside_url_tokens(text: str) -> str:
+    """Redact free-text assignments without reprocessing sanitized URLs."""
+    redacted_parts: list[str] = []
+    previous_end = 0
+    for match in _URL_TOKEN_RE.finditer(text):
+        redacted_parts.append(
+            _redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end : match.start()]))
+        )
+        redacted_parts.append(match.group(0))
+        previous_end = match.end()
+    redacted_parts.append(_redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end:])))
+    return "".join(redacted_parts)
 
 
 def redact_source_reference(source: str) -> str:
@@ -585,6 +599,7 @@ def _redact_url_token(url: str) -> str:
     """Preserve benign query context while removing credentials from evidence URLs."""
     if is_stream_url(url):
         return redact_source_identifier(url)
+    url = _normalize_percent_encoded_url_delimiters_for_display(url)
     encoded_safe_url = _strip_encoded_opaque_suffix(url)
     if encoded_safe_url != url:
         return _redact_url_path_assignments(encoded_safe_url)
@@ -596,9 +611,7 @@ def _redact_url_token(url: str) -> str:
         if safe_base in {"<source redacted>", "<cloud URL redacted>"}:
             return safe_base
         safe_parts = urlsplit(safe_base)
-        component_probe = urlunsplit(
-            ("https", "redaction.invalid", "/", original_parts.query, original_parts.fragment)
-        )
+        component_probe = urlunsplit(("https", "redaction.invalid", "/", original_parts.query, original_parts.fragment))
         redacted_parts = urlsplit(_redact_cloud_error_for_display(component_probe))
     except Exception:
         return "<cloud URL redacted>"
