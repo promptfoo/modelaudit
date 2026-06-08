@@ -624,6 +624,8 @@ def mock_cli_scan_command():
         mock_model.files_scanned = mock_result_dict["files_scanned"]
         mock_model.bytes_scanned = mock_result_dict["bytes_scanned"]
         mock_model.has_errors = mock_result_dict["has_errors"]
+        mock_model.assets = mock_result_dict["assets"]
+        mock_model.file_metadata = mock_result_dict["file_metadata"]
 
         mock_scan.return_value = mock_model
         yield mock_scan
