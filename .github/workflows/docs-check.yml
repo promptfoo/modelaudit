@@ -2,21 +2,9 @@ name: Documentation Check
 
 on:
   pull_request:
-    paths:
-      - "**.md"
-      - "**.txt"
-      - "**.rst"
-      - "LICENSE*"
-      - ".github/workflows/docs-check.yml"
   push:
     branches:
       - main
-    paths:
-      - "**.md"
-      - "**.txt"
-      - "**.rst"
-      - "LICENSE*"
-      - ".github/workflows/docs-check.yml"
 
 permissions:
   contents: read
@@ -29,22 +17,91 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
         with:
-          files: |
-            **.md
-            **.yaml
-            **.yml
-            **.json
+          fetch-depth: 0
 
       - name: Setup Node.js
-        if: steps.changed-files.outputs.any_changed == 'true'
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: "24"
+
+      - name: Collect changed documentation files
+        id: changed-files
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          CHANGED_FILES_JSON_PATH: ${{ runner.temp }}/modelaudit-doc-files.json
+        run: |
+          node <<'NODE'
+          const { appendFileSync, writeFileSync } = require("node:fs");
+          const { extname } = require("node:path");
+          const { spawnSync } = require("node:child_process");
+
+          const baseSha = process.env.BASE_SHA || "";
+          const headSha = process.env.HEAD_SHA || "";
+          const shaPattern = /^[0-9a-f]{40,64}$/i;
+          if (!shaPattern.test(baseSha) || !shaPattern.test(headSha)) {
+            throw new Error("Invalid workflow diff boundary");
+          }
+
+          let effectiveBaseSha = baseSha;
+          if (/^0+$/.test(baseSha)) {
+            const emptyTree = spawnSync("git", ["hash-object", "-t", "tree", "--stdin"], {
+              input: Buffer.alloc(0),
+              encoding: "utf8",
+            });
+            if (emptyTree.error) {
+              throw emptyTree.error;
+            }
+            if (emptyTree.status !== 0) {
+              process.stderr.write(emptyTree.stderr);
+              process.exit(emptyTree.status ?? 1);
+            }
+            effectiveBaseSha = emptyTree.stdout.trim();
+            if (!shaPattern.test(effectiveBaseSha)) {
+              throw new Error("Git returned an invalid empty-tree hash");
+            }
+          }
+          const result = spawnSync(
+            "git",
+            ["diff", "--name-only", "-z", "--diff-filter=ACMRTUX", effectiveBaseSha, headSha],
+            { encoding: "buffer", maxBuffer: 16 * 1024 * 1024 },
+          );
+          if (result.error) {
+            throw result.error;
+          }
+          if (result.status !== 0) {
+            process.stderr.write(result.stderr);
+            process.exit(result.status ?? 1);
+          }
+
+          const extensions = new Set([".md", ".yaml", ".yml", ".json"]);
+          const changedFiles = [];
+          let start = 0;
+          for (let index = 0; index < result.stdout.length; index += 1) {
+            if (result.stdout[index] !== 0) {
+              continue;
+            }
+            const rawFile = result.stdout.subarray(start, index);
+            const file = rawFile.toString("utf8");
+            if (!Buffer.from(file, "utf8").equals(rawFile)) {
+              throw new Error("Changed filename is not valid UTF-8");
+            }
+            if (extensions.has(extname(file).toLowerCase())) {
+              changedFiles.push(file);
+            }
+            start = index + 1;
+          }
+          if (start !== result.stdout.length) {
+            throw new Error("Git returned a non-terminated filename list");
+          }
+
+          writeFileSync(process.env.CHANGED_FILES_JSON_PATH, JSON.stringify(changedFiles), {
+            encoding: "utf8",
+            mode: 0o600,
+          });
+          appendFileSync(process.env.GITHUB_OUTPUT, `any_changed=${changedFiles.length > 0}\n`);
+          NODE
 
       - name: Install Node dependencies
         if: steps.changed-files.outputs.any_changed == 'true'
@@ -52,14 +109,35 @@ jobs:
 
       - name: Check markdown formatting with prettier
         if: steps.changed-files.outputs.any_changed == 'true'
+        env:
+          CHANGED_FILES_JSON_PATH: ${{ runner.temp }}/modelaudit-doc-files.json
         run: |
-          echo "Checking formatting for changed files:"
-          echo "${{ steps.changed-files.outputs.all_changed_files }}"
-          npx prettier --check ${{ steps.changed-files.outputs.all_changed_files }} || (
-            echo "Documentation is not properly formatted. Run:"
-            echo "npm ci --ignore-scripts && npx prettier --write '**/*.{md,yaml,yml,json}'"
-            exit 1
-          )
+          node <<'NODE'
+          const { spawnSync } = require("node:child_process");
+          const { readFileSync } = require("node:fs");
+
+          const changedFiles = JSON.parse(readFileSync(process.env.CHANGED_FILES_JSON_PATH, "utf8"));
+          if (!Array.isArray(changedFiles) || changedFiles.some((file) => typeof file !== "string")) {
+            throw new Error("changed-files returned an invalid filename list");
+          }
+
+          console.log("Checking formatting for changed files:");
+          for (const file of changedFiles) {
+            console.log(JSON.stringify(file));
+          }
+
+          const result = spawnSync("npx", ["prettier", "--check", "--", ...changedFiles], {
+            stdio: "inherit",
+          });
+          if (result.error) {
+            throw result.error;
+          }
+          if (result.status !== 0) {
+            console.error("Documentation is not properly formatted. Run:");
+            console.error("npm ci --ignore-scripts && npx prettier --write '**/*.{md,yaml,yml,json}'");
+            process.exit(result.status ?? 1);
+          }
+          NODE
 
       - name: Skip if no relevant files changed
         if: steps.changed-files.outputs.any_changed == 'false'
