@@ -4903,6 +4903,98 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
     [
         (b"import operator, os\noperator.attrgetter('system')(os)('id')\n", "S101", "os.system"),
         (
+            b"import operator, os\noperator.attrgetter('system.__call__')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter('system')(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('getcwd', 'system')(os)[1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('getcwd', 'system')(os)[-1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nrun, _ = operator.attrgetter('system', 'getcwd')(os)\nrun('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter('run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(-1)([print, os.system])('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(True)({1: os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(1.0)({1: os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\noperator.methodcaller('get', 'run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nif flag:\n    payload = {'run': print}\nelse:\n    payload = {}\n"
+            b"operator.methodcaller('get', 'run', os.system)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nif flag:\n    payload = {'run': os.system}\nelse:\n    payload = {}\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('__getitem__', 'run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('get', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('pop', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('setdefault', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('__dict__')(os)['system']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
             b"import operator, os\noperator.methodcaller('__getattribute__', 'system')(os)('id')\n",
             "S101",
             "os.system",
@@ -4928,6 +5020,19 @@ def test_high_risk_python_calls_resolves_operator_accessor_execution(
         b"import operator, os\noperator.attrgetter('getcwd')(os)()\n",
         b"import operator\noperator.methodcaller('lower')('SAFE')\n",
         b"import operator, subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+        b"import operator, os\noperator.methodcaller('system.__call__', 'id')(os)\n",
+        b"import operator, os\noperator.methodcaller('__getattr__', 'system')(os)\n",
+        b"import operator, os\noperator.attrgetter('system', 'getcwd')(os)\n",
+        b"import operator, os\noperator.attrgetter('system', 'getcwd')(os)[1]()\n",
+        b"import operator, os\noperator.methodcaller('get', 'safe', os.system)({'safe': lambda: None})()\n",
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload['run'] = print\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload.update({'run': print})\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
     ],
 )
 def test_high_risk_python_calls_ignores_benign_operator_accessor_names(source: bytes) -> None:
@@ -4941,6 +5046,41 @@ def test_high_risk_python_calls_ignores_benign_operator_accessor_names(source: b
     [
         (
             "import operator\nimport os\noperator.attrgetter('system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('system.__call__')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.itemgetter('system')(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('getcwd', 'system')(os)[1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.itemgetter('run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\npayload = {'run': os.system}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.methodcaller('get', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('__dict__')(os)['system']('id')\n",
             "S101",
             "os.system",
         ),
@@ -4998,6 +5138,10 @@ def test_scan_zip_python_member_detects_operator_accessor_execution(
         "import operator\noperator.methodcaller('lower')('SAFE')\n",
         "from operator import methodcaller\nimport os\nmethodcaller('getcwd')(os)\n",
         "import operator\nimport subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+        "import operator\nimport os\noperator.methodcaller('system.__call__', 'id')(os)\n",
+        "import operator\nimport os\noperator.methodcaller('__getattr__', 'system')(os)\n",
+        "import operator\nimport os\noperator.attrgetter('system', 'getcwd')(os)\n",
+        ("import operator\nimport os\noperator.methodcaller('get', 'safe', os.system)({'safe': lambda: None})()\n"),
     ],
 )
 def test_scan_zip_python_member_ignores_benign_operator_accessor_names(tmp_path: Path, source: str) -> None:
