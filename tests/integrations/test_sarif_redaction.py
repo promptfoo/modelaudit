@@ -283,7 +283,13 @@ def test_unclassifiable_mapping_keys_fail_closed() -> None:
         Issue(
             message="Unsafe metadata",
             severity=IssueSeverity.WARNING,
-            details={"nested": {b"token\xff": "RAW-SECRET", ("token",): "TUPLE-SECRET"}},
+            details={
+                "nested": {
+                    b"token\xff": "RAW-SECRET",
+                    ("token",): "TUPLE-SECRET",
+                    Path("bucket/model.pkl?token=PATH-KEY-SECRET"): "PATH-VALUE-SECRET",
+                }
+            },
             timestamp=time.time(),
         )
     ]
@@ -293,6 +299,9 @@ def test_unclassifiable_mapping_keys_fail_closed() -> None:
 
     assert "RAW-SECRET" not in output
     assert "TUPLE-SECRET" not in output
+    assert "PATH-KEY-SECRET" not in output
+    assert "PATH-VALUE-SECRET" not in output
+    assert "bucket/model.pkl" in output
 
 
 def test_recursive_export_values_fail_closed() -> None:
@@ -321,6 +330,35 @@ def test_redact_source_value_preserves_colliding_mapping_entries() -> None:
     ]
     assert "first-secret" not in repr(redacted)
     assert "second-secret" not in repr(redacted)
+
+
+def test_redact_source_value_scales_for_many_colliding_mapping_keys() -> None:
+    values = {f"https://example.com/model.pkl?token=secret-{index}": index for index in range(1000)}
+
+    redacted = redact_source_value(values)
+
+    assert isinstance(redacted, dict)
+    assert len(redacted) == 1000
+    assert redacted["https://example.com/model.pkl"] == 0
+    assert redacted["https://example.com/model.pkl#modelaudit-redacted-key-1000"] == 999
+
+
+def test_direct_sensitive_assignment_mapping_keys_redact_associated_values() -> None:
+    source_key = "https://example.com/model.pkl?token=source-secret"
+
+    redacted = redact_source_value(
+        {
+            "token=attacker-label": "RAW-SECRET",
+            "Authorization%253A%2520Bearer%2520label": "HEADER-SECRET",
+            source_key: {"finding": "preserved"},
+        }
+    )
+
+    assert isinstance(redacted, dict)
+    assert list(redacted.values()) == ["<redacted>", "<redacted>", {"finding": "preserved"}]
+    assert source_key not in redacted
+    assert "RAW-SECRET" not in repr(redacted)
+    assert "HEADER-SECRET" not in repr(redacted)
 
 
 @pytest.mark.parametrize(
@@ -377,6 +415,45 @@ def test_export_alias_assignments_and_mapping_keys_are_redacted() -> None:
     assert "public-cache" in output
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://host/model,Authorization: Bearer URL-ADJACENT-SECRET",
+        "https://host/model;password: URL-ADJACENT-SECRET",
+        "metadata token%3DENCODED-SECRET visible=yes",
+        "metadata token%253DDOUBLE-ENCODED-SECRET",
+        "Authorization%3A%20Bearer%20ENCODED-HEADER-SECRET",
+        r"password\u003aESCAPED-SECRET",
+        '{"token":"QUOTED-SECRET"}',
+        '{"Authorization":"Bearer QUOTED-HEADER-SECRET"}',
+        "token%3DCHAINED-SECRET%26visible%3Dyes",
+        "token%253DDOUBLE-CHAINED-SECRET%2526visible%253Dyes",
+        "Authorization%3A%20Bearer%20HEADER-SECRET%3Btoken%3DSECOND-SECRET",
+    ],
+)
+def test_encoded_quoted_and_url_adjacent_assignments_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "SECRET" not in redacted
+    assert "<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token_count=128",
+        "signature_algorithm=RSA",
+        "auth_method=oauth",
+        "session_duration=10",
+        "password_length=12",
+        "version%3D1",
+        "tokenizer%3Dpublic",
+    ],
+)
+def test_benign_metric_and_encoded_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
 def test_escaped_quote_does_not_end_credential_redaction_early() -> None:
     redacted = redact_source_text('refreshToken="abc\\"quoted-secret"; visible=yes')
 
@@ -388,6 +465,39 @@ def test_redacted_url_path_assignment_preserves_safe_path_and_query() -> None:
     raw_url = "https://example.com/token%253Dpath-secret/model.pkl?visible=yes"
 
     assert redact_source_text(raw_url) == "https://example.com/token=<redacted>/model.pkl?visible=yes"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "https://example.com/token:URL-SECRET/model.pkl",
+            "https://example.com/token=<redacted>/model.pkl",
+        ),
+        (
+            "https://example.com/sessionToken%253AURL-SECRET/model.pkl",
+            "https://example.com/sessionToken=<redacted>/model.pkl",
+        ),
+        ("bucket/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        ("/tmp/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        (r"C:\models\token:PATH-SECRET\model.pkl", "<source redacted>"),
+    ],
+)
+def test_colon_path_credentials_are_redacted(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://example.com/version:1/model.pkl",
+        "bucket/version:1/model.pkl",
+        "/tmp/version:1/model.pkl",
+        r"C:\models\version:1\model.pkl",
+    ],
+)
+def test_benign_colon_path_segments_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
 
 
 def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(tmp_path: Path) -> None:
@@ -410,6 +520,18 @@ def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(
 )
 def test_nonexistent_posix_local_credential_prefixes_fail_closed(raw_path: str) -> None:
     assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "/tmp/build@2026/model.pkl",
+        "./artifacts/user@example.com/model.pkl",
+    ],
+)
+def test_nonexistent_posix_at_paths_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+    assert redact_source_text(f"source {local_path}") == f"source {local_path}"
 
 
 @pytest.mark.parametrize(

@@ -505,7 +505,7 @@ def _stable_source_order(paths: Iterable[str], risk_score: Callable[[str], int])
 
     ordered_paths: list[str] = []
     for reference in reference_order:
-        ordered_paths.extend(sorted(grouped_paths[reference], key=lambda path: -risk_score(path)))
+        ordered_paths.extend(sorted(grouped_paths[reference], key=lambda path: (-risk_score(path), path)))
     return ordered_paths
 
 

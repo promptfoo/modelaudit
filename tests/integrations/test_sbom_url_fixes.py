@@ -17,6 +17,7 @@ from click.testing import CliRunner
 from modelaudit.cli import cli
 from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
 from modelaudit.integrations.source_redaction import redact_source_identifier
+from modelaudit.models import FileMetadataModel
 from modelaudit.scanners.base import Issue, IssueSeverity
 
 
@@ -292,6 +293,53 @@ class TestSBOMURLFixes:
         assert {component["bom-ref"] for component in sbom["components"]} == {
             "https://storage.example/model.pkl?fragment-revision=first",
             "https://storage.example/model.pkl?fragment-revision=second",
+        }
+
+    @pytest.mark.parametrize(
+        "credential_value",
+        [
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "sk-abcdefghijklmnop",
+            "AKIAABCDEFGHIJKLMNOP",
+            "eyJabcdefghijk.abcdefghijkl.mnopqrstuv",
+        ],
+    )
+    def test_credential_shaped_safe_provenance_values_are_dropped(self, credential_value: str) -> None:
+        raw_path = f"https://storage.example/model.pkl?revision={credential_value}&token=secret"
+
+        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
+
+        assert credential_value not in sbom_json
+        assert json.loads(sbom_json)["components"][0]["bom-ref"] == "https://storage.example/model.pkl"
+        assert redact_source_identifier(f"model?revision={credential_value}") == "model"
+
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_equal_risk_collisions_have_deterministic_metadata_attribution(self, legacy_generator: bool) -> None:
+        first_path = "https://storage.example/model.pkl?token=z-secret"
+        second_path = "https://storage.example/model.pkl?token=a-secret"
+        paths = [first_path, second_path]
+        scan_result = create_mock_scan_result(files_scanned=2)
+        scan_result.file_metadata = {
+            first_path: FileMetadataModel(file_size=111),
+            second_path: FileMetadataModel(file_size=222),
+        }
+
+        def sizes_by_ref(input_paths: Any) -> dict[str, str]:
+            if legacy_generator:
+                sbom_json = generate_sbom(input_paths, scan_result.model_dump(mode="python"))
+            else:
+                sbom_json = generate_sbom_pydantic(input_paths, scan_result)
+            return {
+                component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == "size")
+                for component in json.loads(sbom_json)["components"]
+            }
+
+        expected = sizes_by_ref(paths)
+
+        assert sizes_by_ref(reversed(paths)) == expected
+        assert expected == {
+            "https://storage.example/model.pkl": "222",
+            "https://storage.example/model.pkl#modelaudit-component-2": "111",
         }
 
     def test_existing_local_assignment_paths_remain_distinct(self, tmp_path: Path) -> None:

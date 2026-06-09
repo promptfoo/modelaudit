@@ -77,7 +77,7 @@ _EMAIL_SUFFIX_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[a-z]:[\\/]", re.IGNORECASE)
-_ENCODED_ASSIGNMENT_SEPARATOR_RE = re.compile(r"%(?:25)*3d", re.IGNORECASE)
+_ENCODED_ASSIGNMENT_SEPARATOR_RE = re.compile(r"%(?:25)*(?:3a|3d)", re.IGNORECASE)
 _ENCODED_MAJOR_SUFFIX_RE = re.compile(r"%(?:25)*(?:3f|23)", re.IGNORECASE)
 _ENCODED_FILENAME_SUFFIX_RE = re.compile(r"^[0-9A-Za-z._~-]+\.[0-9A-Za-z]{1,16}$")
 _MAX_REDACTION_DEPTH = 32
@@ -90,7 +90,12 @@ _EXPORT_EQUALS_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPORT_HEADER_KEY_RE = re.compile(
-    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)\s*:",
+    r"(?<![0-9A-Za-z_%.-])(?P<quote>[\"']?)(?P<key>[0-9A-Za-z_%.-]+)(?P=quote)(?P<separator>\s*:\s*)",
+    re.IGNORECASE,
+)
+_EXPORT_ENCODED_SEPARATOR_RE = re.compile(
+    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+?)"
+    r"(?P<separator>%(?:25)*(?P<separator_code>3a|3d)(?:%(?:25)*20)*)",
     re.IGNORECASE,
 )
 _MAX_CREDENTIAL_KEY_DECODE_PASSES = 4
@@ -136,6 +141,19 @@ _EXPORT_CREDENTIAL_KEY_NEAR_MATCHES = frozenset(
         "sessiontokencache",
         "tokenizer",
     }
+)
+_EXPORT_SAFE_METADATA_KEY_SUFFIXES = (
+    "authmethod",
+    "authenticationmethod",
+    "authorizationmethod",
+    "passwordlength",
+    "sessionduration",
+    "signaturealgorithm",
+    "tokencount",
+)
+_CREDENTIAL_SHAPED_PROVENANCE_VALUE_RE = re.compile(
+    r"(?:gh[pousr]_[0-9A-Za-z_]{20,}|sk-[0-9A-Za-z_-]{12,}|AKIA[0-9A-Z]{16}|"
+    r"eyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,})"
 )
 
 
@@ -206,10 +224,10 @@ def redact_source_identifier(source: str) -> str:
 def redact_source_text(text: str) -> str:
     """Redact signed URL tokens embedded in exported text fields."""
     normalized_text = _normalize_escaped_url_delimiters_for_display(text)
+    normalized_text = _redact_url_adjacent_assignments(normalized_text)
     redacted_text = _URL_TOKEN_RE.sub(lambda match: _redact_url_token(match.group(0)), normalized_text)
     redacted_text = _USERINFO_TOKEN_RE.sub(
-        lambda match: redact_source_identifier(match.group("identifier")),
-        redacted_text,
+        lambda match: _redact_userinfo_text_token(redacted_text, match), redacted_text
     )
     redacted_text = _SCHEMELESS_SUFFIX_TOKEN_RE.sub(
         lambda match: _redact_schemeless_suffix_token(match.group("identifier")),
@@ -261,13 +279,33 @@ def _redact_assignments_outside_url_tokens(text: str) -> str:
             merged_spans.append((start, end))
 
     for start, end in merged_spans:
-        redacted_parts.append(
-            _redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end:start]))
-        )
-        redacted_parts.append(text[start:end])
+        redacted_parts.append(_redact_export_alias_assignments(text[previous_end:start]))
+        redacted_parts.append(_redact_export_alias_assignments(text[start:end]))
         previous_end = end
-    redacted_parts.append(_redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end:])))
+    redacted_parts.append(_redact_export_alias_assignments(text[previous_end:]))
     return "".join(redacted_parts)
+
+
+def _redact_url_adjacent_assignments(text: str) -> str:
+    """Redact credential fields swallowed by a permissive URL token match."""
+    url_spans = [(match.start(), match.end()) for match in _URL_TOKEN_RE.finditer(text)]
+    if not url_spans:
+        return text
+
+    assignment_starts: list[int] = []
+    for pattern in (_EXPORT_EQUALS_KEY_RE, _EXPORT_HEADER_KEY_RE, _EXPORT_ENCODED_SEPARATOR_RE):
+        for match in pattern.finditer(text):
+            if not _is_sensitive_export_key(match.group("key")):
+                continue
+            preceding = text[: match.start()].rstrip()
+            if not preceding or preceding[-1] not in ",;":
+                continue
+            if any(start <= match.start() < end for start, end in url_spans):
+                assignment_starts.append(match.start())
+    if not assignment_starts:
+        return text
+    first_assignment = min(assignment_starts)
+    return f"{text[:first_assignment]}{_redact_export_alias_assignments(text[first_assignment:])}"
 
 
 def redact_source_reference(source: str) -> str:
@@ -288,6 +326,7 @@ def redact_source_reference(source: str) -> str:
                 normalized_key in _SAFE_PROVENANCE_QUERY_KEYS
                 and not _is_sensitive_export_key(normalized_key)
                 and _SAFE_PROVENANCE_VALUE_RE.fullmatch(value)
+                and not _looks_like_credential_value(value)
             ):
                 safe_params.append((f"{key_prefix}{normalized_key}", value))
     if not safe_params:
@@ -318,6 +357,7 @@ def _has_safe_schemeless_provenance_suffix(source: str) -> bool:
             or normalized_key not in _SAFE_PROVENANCE_QUERY_KEYS
             or _is_sensitive_export_key(normalized_key)
             or _SAFE_PROVENANCE_VALUE_RE.fullmatch(value) is None
+            or _looks_like_credential_value(value)
         ):
             return False
     return True
@@ -348,8 +388,13 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
         seen.add(id(value))
         try:
             redacted_mapping: dict[Any, Any] = {}
+            next_key_occurrence: dict[str, int] = {}
             for key, item in value.items():
-                redacted_key = _unique_redacted_mapping_key(_redact_mapping_key(key), redacted_mapping)
+                redacted_key = _unique_redacted_mapping_key(
+                    _redact_mapping_key(key),
+                    redacted_mapping,
+                    next_key_occurrence,
+                )
                 redacted_mapping[redacted_key] = (
                     "<redacted>"
                     if _mapping_key_requires_redaction(key)
@@ -416,6 +461,17 @@ def _redact_userinfo_identifier(source: str) -> str | None:
     return f"//{safe_identifier}" if prefix == "//" else safe_identifier
 
 
+def _redact_userinfo_text_token(text: str, match: re.Match[str]) -> str:
+    identifier = match.group("identifier")
+    if match.start() > 0 and text[match.start() - 1] in "/\\":
+        authority = re.split(r"[\\/]", identifier, maxsplit=1)[0]
+        decoded_authority, _ = _bounded_unquote(authority)
+        userinfo = decoded_authority.rsplit("@", 1)[0]
+        if ":" not in userinfo:
+            return identifier
+    return redact_source_identifier(identifier)
+
+
 def _redact_schemeless_suffix_token(source: str) -> str:
     if _URL_LIKE_PREFIX_RE.match(source):
         return source
@@ -462,13 +518,13 @@ def _redact_url_path_assignments(source: str) -> str:
 
 
 def _redact_path_segment_assignment(segment: str) -> str:
-    if "=" in segment:
-        key = segment.split("=", 1)[0]
-    else:
-        encoded_separator = _ENCODED_ASSIGNMENT_SEPARATOR_RE.search(segment)
-        if encoded_separator is None:
-            return segment
-        key = segment[: encoded_separator.start()]
+    separator_indexes = [index for delimiter in "=:" if (index := segment.find(delimiter)) >= 0]
+    encoded_separator = _ENCODED_ASSIGNMENT_SEPARATOR_RE.search(segment)
+    if encoded_separator is not None:
+        separator_indexes.append(encoded_separator.start())
+    if not separator_indexes:
+        return segment
+    key = segment[: min(separator_indexes)]
     if _is_sensitive_export_key(key):
         return f"{key}=<redacted>"
     return segment
@@ -548,14 +604,17 @@ def _redact_local_path_identifier(source: str) -> str:
         return "<source redacted>"
     if _is_windows_or_unc_path(source):
         return source
-    if _USERINFO_TOKEN_RE.search(path_prefix):
+    if _has_local_userinfo_credentials(path_prefix):
         return "<source redacted>"
     return source
 
 
 def _mapping_key_requires_redaction(key: Any) -> bool:
-    if isinstance(key, str) and redact_source_identifier(key) != key:
-        return False
+    if isinstance(key, str):
+        if _mapping_key_is_direct_sensitive_assignment(key):
+            return True
+        if redact_source_identifier(key) != key:
+            return False
     if _is_sensitive_export_key(key):
         return True
     if isinstance(key, bytes):
@@ -565,6 +624,28 @@ def _mapping_key_requires_redaction(key: Any) -> bool:
             return True
         return False
     return not (isinstance(key, (str, int, float, bool)) or key is None)
+
+
+def _mapping_key_is_direct_sensitive_assignment(key: str) -> bool:
+    normalized_key = _normalize_escaped_url_delimiters_for_display(key)
+    decoded_key, _ = _bounded_unquote(normalized_key)
+    stripped_key = decoded_key.lstrip()
+    for pattern in (_EXPORT_EQUALS_KEY_RE, _EXPORT_HEADER_KEY_RE, _EXPORT_ENCODED_SEPARATOR_RE):
+        match = pattern.match(stripped_key)
+        if match is not None and _is_sensitive_export_key(match.group("key")):
+            return True
+    return False
+
+
+def _has_local_userinfo_credentials(path: str) -> bool:
+    for segment in re.split(r"[\\/]", path):
+        decoded_segment, decode_incomplete = _bounded_unquote(segment)
+        if decode_incomplete or "@" not in decoded_segment:
+            continue
+        userinfo, _ = decoded_segment.rsplit("@", 1)
+        if ":" in userinfo and userinfo.split(":", 1)[1]:
+            return True
+    return False
 
 
 def _contains_sensitive_assignment(value: str) -> bool:
@@ -619,6 +700,8 @@ def _is_sensitive_export_key(key: object) -> bool:
     if normalized_key in _EXPORT_CREDENTIAL_KEY_NEAR_MATCHES:
         return False
     key_tokens = {token for token in re.split(r"[^a-z0-9]+", separated_key.casefold()) if token}
+    if normalized_key.endswith(_EXPORT_SAFE_METADATA_KEY_SUFFIXES):
+        return False
     return (
         is_sensitive_credential_key(decoded_key)
         or normalized_key in _EXPORT_CREDENTIAL_KEY_ALIASES
@@ -627,7 +710,7 @@ def _is_sensitive_export_key(key: object) -> bool:
 
 
 def _redact_export_alias_assignments(value: str) -> str:
-    redacted = value
+    redacted = _normalize_encoded_sensitive_assignment_separators(value)
     sensitive_assignments = [
         match
         for match in _EXPORT_EQUALS_KEY_RE.finditer(redacted)
@@ -648,8 +731,28 @@ def _redact_export_alias_assignments(value: str) -> str:
     ]
     for match in reversed(sensitive_headers):
         value_end = _assignment_value_end(redacted, match.end(), key=match.group("key"))
-        redacted = f"{redacted[: match.start()]}{match.group('key')}: <redacted>{redacted[value_end:]}"
+        redacted = (
+            f"{redacted[: match.start()]}{match.group('quote')}{match.group('key')}{match.group('quote')}"
+            f"{match.group('separator')}<redacted>{redacted[value_end:]}"
+        )
     return redacted
+
+
+def _normalize_encoded_sensitive_assignment_separators(value: str) -> str:
+    normalized = value
+    sensitive_separators = [
+        match
+        for match in _EXPORT_ENCODED_SEPARATOR_RE.finditer(normalized)
+        if _is_sensitive_export_key(match.group("key"))
+    ]
+    for match in reversed(sensitive_separators):
+        separator = ":" if match.group("separator_code").casefold() == "3a" else "="
+        normalized = f"{normalized[: match.start('separator')]}{separator}{normalized[match.end('separator') :]}"
+    return normalized
+
+
+def _looks_like_credential_value(value: str) -> bool:
+    return _CREDENTIAL_SHAPED_PROVENANCE_VALUE_RE.search(value) is not None
 
 
 def _assignment_value_end(value: str, start: int, *, key: str) -> int:
@@ -694,7 +797,7 @@ def _assignment_value_is_already_redacted(value: str, start: int) -> bool:
     for marker in ("<redacted>", "<credentials-redacted>"):
         if not remainder.startswith(marker):
             continue
-        if len(remainder) == len(marker) or remainder[len(marker)].isspace() or remainder[len(marker)] in "&#;,)}]":
+        if len(remainder) == len(marker) or remainder[len(marker)].isspace() or remainder[len(marker)] in "/?&#;,)}]":
             return True
     return False
 
@@ -746,17 +849,23 @@ def _redact_mapping_key(value: Any) -> str | int | float | bool | None:
     redacted = redact_source_value(value)
     if isinstance(redacted, (str, int, float, bool)) or redacted is None:
         return redacted
-    return str(redacted)
+    return redact_source_text(str(redacted))
 
 
-def _unique_redacted_mapping_key(key: Any, mapping: dict[Any, Any]) -> Any:
+def _unique_redacted_mapping_key(
+    key: Any,
+    mapping: dict[Any, Any],
+    next_occurrence: dict[str, int],
+) -> Any:
     """Preserve entries whose credential-safe mapping keys collide."""
     if key not in mapping:
+        next_occurrence.setdefault(str(key), 2)
         return key
     base_key = str(key)
-    occurrence = 2
+    occurrence = next_occurrence.get(base_key, 2)
     candidate = f"{base_key}#modelaudit-redacted-key-{occurrence}"
     while candidate in mapping:
         occurrence += 1
         candidate = f"{base_key}#modelaudit-redacted-key-{occurrence}"
+    next_occurrence[base_key] = occurrence + 1
     return candidate

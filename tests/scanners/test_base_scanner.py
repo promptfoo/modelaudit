@@ -511,7 +511,7 @@ def test_whitelist_downgrade_warning_to_info():
 
 
 def test_whitelist_downgrade_critical_to_info():
-    """Test that whitelisted models have critical issues downgraded to INFO."""
+    """Policy-grade critical findings remain eligible for trusted HF downgrades."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     # Get a model from the whitelist
@@ -531,11 +531,301 @@ def test_whitelist_downgrade_critical_to_info():
     result = scanner._create_result()
     result._add_issue("Test critical", severity=IssueSeverity.CRITICAL)
 
-    # Should be downgraded to INFO
     assert len(result.issues) == 1
     assert result.issues[0].severity == IssueSeverity.INFO
     assert result.issues[0].details.get("whitelist_downgrade") is True
     assert result.issues[0].details.get("original_severity") == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    ],
+)
+def test_whitelist_does_not_downgrade_critical_command_network_correlation(check_name: str) -> None:
+    """Neutral command/network criticals must still fail whitelisted HF scans."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Correlated command and process/network indicators detected",
+        severity=IssueSeverity.CRITICAL,
+        details={"same_fragment_correlation": True},
+    )
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert len(result.checks) == 1
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    ],
+)
+def test_whitelist_downgrades_unconfirmed_command_network_correlation(check_name: str) -> None:
+    """Display names alone must not turn unrelated model text into an active finding."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Command and network indicators occur in unrelated model text",
+        severity=IssueSeverity.CRITICAL,
+        details={"same_fragment_correlation": False},
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "CoreML Custom Layer Check",
+        "CoreML Custom Model Class Check",
+        "Embedded PE Detection",
+        "External Library Reference Check",
+        "Protobuf String Injection Check",
+        "Python Operator Detection",
+        "Serialized Expression Payload Detection",
+        "Suspicious Layer Type Detection",
+        "TorchServe Handler Static Analysis",
+        "Torch7 Lua Execution Primitive Analysis",
+    ],
+)
+def test_whitelist_does_not_downgrade_active_critical_checks(check_name: str) -> None:
+    """Concrete active-payload criticals must still fail whitelisted HF scans."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Concrete active execution or runtime-extension evidence detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "Protobuf String Injection Check",
+        "Serialized Expression Payload Detection",
+        "Torch7 Lua Execution Primitive Analysis",
+    ],
+)
+def test_whitelist_still_downgrades_warning_variants_of_active_check_names(check_name: str) -> None:
+    """Documentation, operational, or uncorrelated warning variants stay whitelist eligible."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Uncorrelated or documentation-context indicator detected",
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
+
+
+def test_whitelist_still_downgrades_rknn_command_only_near_match() -> None:
+    """The RKNN correlation exemption must not cover command-only indicators."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.rknn"),
+        file_size=100,
+        file_type=".rknn",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="RKNN Command Indicator Detection",
+        passed=False,
+        message="Command execution indicators detected in RKNN metadata text",
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
+
+
+def test_whitelist_still_downgrades_policy_grade_high_severity_url() -> None:
+    """Trusted HF provenance may still suppress policy-grade URL findings."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    scanner.add_network_communication_findings(
+        [
+            {
+                "type": "url",
+                "message": "Suspicious URL detected: https://example.com/model",
+                "severity": "HIGH",
+            }
+        ],
+        result,
+    )
+
+    assert result.issues[0].rule_code == "S309"
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("original_severity") == "CRITICAL"
+
+
+def test_whitelist_annotations_do_not_leak_through_reused_details() -> None:
+    """Internal whitelist markers must not mutate caller-owned evidence."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+    shared_details = {"source": "shared detector evidence"}
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Policy Finding",
+        passed=False,
+        message="Policy-grade anomaly detected",
+        severity=IssueSeverity.WARNING,
+        details=shared_details,
+    )
+    result.add_check(
+        name="Command/Network Correlation Check",
+        passed=False,
+        message="Correlated command and process/network indicators detected",
+        severity=IssueSeverity.CRITICAL,
+        details=shared_details | {"same_fragment_correlation": True},
+    )
+
+    assert shared_details == {"source": "shared detector evidence"}
+    result.metadata["analysis_incomplete"] = True
+    result.finish(success=False)
+
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[1].severity == IssueSeverity.CRITICAL
+    assert result.checks[1].severity == IssueSeverity.CRITICAL
+    assert result.issues[1].details.get("whitelist_downgrade_restored") is None
+
+
+def test_relayed_whitelist_downgrade_can_be_restored_by_parent_metadata() -> None:
+    """Composition must retain the provenance needed for fail-closed restoration."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    child = scanner._create_result()
+    child.add_check(
+        name="Policy Finding",
+        passed=False,
+        message="Policy-grade anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert child.issues[0].severity == IssueSeverity.INFO
+
+    parent = scanner._create_result()
+    child_issue = child.issues[0]
+    parent.add_check(
+        name=child_issue.type or "Relayed Security Finding",
+        passed=False,
+        message=child_issue.message,
+        severity=child_issue.severity,
+        location=child_issue.location,
+        details=child_issue.details,
+        why=child_issue.why,
+    )
+
+    assert parent.issues[0].details.get("whitelist_downgrade") is True
+    assert parent.issues[0].details.get("original_severity") == "CRITICAL"
+
+    parent.metadata["analysis_incomplete"] = True
+    parent.finish(success=False)
+
+    assert parent.checks[0].severity == IssueSeverity.CRITICAL
+    assert parent.issues[0].severity == IssueSeverity.CRITICAL
+    assert parent.issues[0].details.get("whitelist_downgrade_restored") is True
 
 
 def test_whitelist_no_downgrade_info():
@@ -920,8 +1210,8 @@ def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_check_critical() -> None:
-    """Test that whitelisted models have critical checks downgraded to INFO."""
+def test_whitelist_downgrade_critical_check() -> None:
+    """Policy-grade critical checks remain eligible for trusted HF downgrades."""
     from modelaudit.whitelists import POPULAR_MODELS
 
     # Get a model from the whitelist
@@ -946,13 +1236,11 @@ def test_whitelist_downgrade_check_critical() -> None:
         severity=IssueSeverity.CRITICAL,
     )
 
-    # Verify the Issue was downgraded
     assert len(result.issues) == 1
     assert result.issues[0].severity == IssueSeverity.INFO
     assert result.issues[0].details.get("whitelist_downgrade") is True
     assert result.issues[0].details.get("original_severity") == "CRITICAL"
 
-    # Verify the Check exists and severity is also downgraded
     assert len(result.checks) == 1
     assert result.checks[0].name == "Test Security Check"
     assert result.checks[0].status == CheckStatus.FAILED
@@ -1357,13 +1645,49 @@ def test_whitelist_apply_downgrade_helper_none_details():
         model_source="huggingface",
     )
 
-    # Test with None details
-    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.CRITICAL, None)
+    new_severity, new_details = scanner._apply_whitelist_downgrade(IssueSeverity.WARNING, None)
 
     assert new_severity == IssueSeverity.INFO
     assert new_details is not None
     assert new_details.get("whitelist_downgrade") is True
-    assert new_details.get("original_severity") == "CRITICAL"
+    assert new_details.get("original_severity") == "WARNING"
+
+
+def test_whitelist_apply_downgrade_helper_keeps_exempt_critical_none_details() -> None:
+    """Explicitly active critical checks must not be downgrade eligible."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    new_severity, new_details = scanner._apply_whitelist_downgrade(
+        IssueSeverity.CRITICAL,
+        {"same_fragment_correlation": True},
+        check_name="Command/Network Correlation Check",
+    )
+
+    assert new_severity == IssueSeverity.CRITICAL
+    assert new_details == {"same_fragment_correlation": True}
+
+
+def test_whitelist_helper_preserves_detector_original_severity_evidence() -> None:
+    """Generic detector evidence must not be treated as internal whitelist state."""
+    scanner = MockScanner()
+    original_details = {"original_severity": "upstream-high", "source": "nested scanner"}
+
+    new_severity, new_details = scanner._apply_whitelist_downgrade(
+        IssueSeverity.WARNING,
+        original_details,
+    )
+
+    assert new_severity == IssueSeverity.WARNING
+    assert new_details == original_details
 
 
 def test_whitelist_apply_downgrade_helper_existing_details():
@@ -1390,3 +1714,4 @@ def test_whitelist_apply_downgrade_helper_existing_details():
     assert new_details.get("whitelist_downgrade") is True
     assert new_details.get("original_severity") == "WARNING"
     assert new_details.get("custom_field") == "value"  # Original details preserved
+    assert existing_details == {"custom_field": "value"}
