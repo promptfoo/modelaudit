@@ -1223,7 +1223,13 @@ def _parameterized_authorization_value_end(
             return index
         elif char in "\r\n":
             if stop_at_newline:
-                return index
+                continuation_index = index + 1
+                if char == "\r" and continuation_index < len(text) and text[continuation_index] == "\n":
+                    continuation_index += 1
+                if continuation_index >= len(text) or text[continuation_index] not in " \t":
+                    return index
+                index = continuation_index
+                continue
         elif char == ";":
             if SHELL_OPERATOR_COMMAND_RE.match(text, index) is not None:
                 return index
@@ -1274,10 +1280,20 @@ def _redact_authorization_literal(literal: str | bytes) -> str | bytes:
     if isinstance(literal, bytes):
         decoded = literal.decode("latin-1")
         redacted = _redact_parameterized_authorization_values(decoded, stop_at_newline=False)
+        redacted = _redact_parameterized_authorization_values(
+            redacted,
+            prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+            stop_at_newline=False,
+        )
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
         return redacted.encode("latin-1")
 
     redacted = _redact_parameterized_authorization_values(literal, stop_at_newline=False)
+    redacted = _redact_parameterized_authorization_values(
+        redacted,
+        prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+        stop_at_newline=False,
+    )
     return AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
 
 
@@ -1305,6 +1321,12 @@ def _redact_authorization_in_python_strings(text: str) -> str:
                 continue
             body = source[string_match.end() : -len(quote)]
             redacted_body = _redact_parameterized_authorization_values(body, fstring=True, stop_at_newline=False)
+            redacted_body = _redact_parameterized_authorization_values(
+                redacted_body,
+                fstring=True,
+                prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+                stop_at_newline=False,
+            )
             if redacted_body != body:
                 redacted_source = f"{source[: string_match.end()]}{redacted_body}{quote}"
                 _append_ast_node_replacement(text, offsets, node, replacements, redacted_source)
@@ -3279,6 +3301,8 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     dedented = textwrap.dedent(text) if python_evidence else text
     python_indent = _common_dedent_prefix(text, dedented) if python_evidence else ""
     redacted = dedented
+    if parseable_python_evidence:
+        redacted = _redact_authorization_in_python_strings(redacted)
     if r_evidence:
         redacted = _redact_r_raw_assignments(redacted)
         redacted = _redact_leftward_assignment_expressions(redacted)
@@ -3343,9 +3367,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
-    if parseable_python_evidence:
-        redacted = _redact_authorization_in_python_strings(redacted)
-    else:
+    if not parseable_python_evidence:
         redacted = _redact_parameterized_authorization_values(redacted)
         redacted = _redact_parameterized_authorization_values(
             redacted,
