@@ -253,14 +253,46 @@ def _strip_stream_safe_whitespace_repeats(pattern: str) -> str:
 
 
 def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
-    """Return whether bounded overlap cannot guarantee coverage for this regex."""
+    """Return whether bounded streaming search cannot safely execute this regex."""
     remaining = _strip_stream_safe_whitespace_repeats(pattern)
     parser = _get_regex_parser()
     if parser is not None:
         try:
-            _, max_width = parser.parse(remaining, re.IGNORECASE).getwidth()
+            parsed_pattern = parser.parse(pattern, re.IGNORECASE)
+            parsed_remaining = parser.parse(remaining, re.IGNORECASE)
         except Exception:
             return True
+        repeat_ops = {op for name in ("MAX_REPEAT", "MIN_REPEAT") if (op := getattr(parser, name, None)) is not None}
+        branch_op = getattr(parser, "BRANCH", None)
+        subpattern_op = getattr(parser, "SUBPATTERN", None)
+        assertion_ops = {
+            op for name in ("ASSERT", "ASSERT_NOT", "ATOMIC_GROUP") if (op := getattr(parser, name, None)) is not None
+        }
+
+        def has_ambiguous_repeat(subpattern: Any, *, inside_repeat: bool = False) -> bool:
+            for op, argument in subpattern.data:
+                if op in repeat_ops:
+                    repeated = argument[-1]
+                    if inside_repeat or has_ambiguous_repeat(repeated, inside_repeat=True):
+                        return True
+                    continue
+                if branch_op is not None and op is branch_op:
+                    if inside_repeat:
+                        return True
+                    if any(has_ambiguous_repeat(branch, inside_repeat=inside_repeat) for branch in argument[1]):
+                        return True
+                    continue
+                if subpattern_op is not None and op is subpattern_op:
+                    if has_ambiguous_repeat(argument[-1], inside_repeat=inside_repeat):
+                        return True
+                    continue
+                if op in assertion_ops and has_ambiguous_repeat(argument[-1], inside_repeat=inside_repeat):
+                    return True
+            return False
+
+        if has_ambiguous_repeat(parsed_pattern):
+            return True
+        _, max_width = parsed_remaining.getwidth()
         return max_width > _STREAM_TEXT_OVERLAP_CHARS
 
     escaped = False
@@ -290,6 +322,11 @@ def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
             return True
         if remaining.startswith("(?P=", index):
             return True
+
+    if re.search(r"\((?:[^()\\]|\\.)*[|](?:[^()\\]|\\.)*\)\s*(?:[*+?]|\{)", remaining):
+        return True
+    if re.search(r"\((?:[^()\\]|\\.)*(?:[*+?]|\{[^}]+\})(?:[^()\\]|\\.)*\)\s*(?:[*+?]|\{)", remaining):
+        return True
 
     return len(remaining) > _STREAM_TEXT_OVERLAP_CHARS
 
@@ -493,7 +530,7 @@ class FlaxMsgpackScanner(BaseScanner):
         )
 
         # Enhanced suspicious patterns for JAX/Flax specific threats
-        self.suspicious_patterns = self.config.get(
+        configured_patterns = self.config.get(
             "suspicious_patterns",
             [
                 # Standard serialization attacks
@@ -523,12 +560,12 @@ class FlaxMsgpackScanner(BaseScanner):
                 # Dynamic code execution
                 _UNBOUNDED_GETATTR_PATTERN,
                 # Dangerous imports in serialized functions
-                r"import\s+subprocess",
                 r"from\s+subprocess\s+import",
                 r"import\s+sys",
                 r"from\s+os\s+import\s+system",
             ],
         )
+        self.suspicious_patterns = list(dict.fromkeys(configured_patterns))
         self._compiled_suspicious_patterns = tuple(
             (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
         )
@@ -536,6 +573,14 @@ class FlaxMsgpackScanner(BaseScanner):
             pattern: _pattern_literal_anchors(pattern)
             for pattern in self.suspicious_patterns
             if _pattern_has_stream_unsafe_repeat(pattern)
+        }
+        self._stream_unsafe_anchor_matchers = {
+            pattern: (
+                None
+                if anchors is None
+                else tuple((anchor, re.compile(re.escape(anchor), re.IGNORECASE)) for anchor in anchors)
+            )
+            for pattern, anchors in self._stream_unsafe_pattern_anchors.items()
         }
 
         self.suspicious_keys = self.config.get(
@@ -970,17 +1015,16 @@ class FlaxMsgpackScanner(BaseScanner):
         evidence_value: Any | None = None,
     ) -> None:
         """Check string values for suspicious patterns that might indicate code injection."""
-        sample_value = value if evidence_value is None else evidence_value
-        for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
-            if compiled_pattern.search(value):
-                self._add_suspicious_string_check(
-                    pattern,
-                    lowered_pattern,
-                    sample_value,
-                    len(value),
-                    location,
-                    result,
-                )
+        self._analyze_streamed_text_chunks(
+            (value,),
+            location,
+            result,
+            full_length=len(value),
+            finding_location=location,
+            coverage_details={"text_length": len(value)},
+            check_jax_transform=False,
+            evidence_sample=evidence_value,
+        )
 
     @staticmethod
     def _suspicious_pattern_rule_code(lowered_pattern: str) -> str:
@@ -1026,14 +1070,15 @@ class FlaxMsgpackScanner(BaseScanner):
         if key in self.suspicious_keys:
             # Determine appropriate rule code based on key
             rule_code = "S201" if key.lower() == "__reduce__" else "S999"
+            safe_key = _redact_evidence_location(key)
 
             result.add_check(
                 name="Object Attribute Security Check",
                 passed=False,
-                message=f"Suspicious object attribute detected: {key}",
+                message=f"Suspicious object attribute detected: {safe_key}",
                 severity=IssueSeverity.CRITICAL,
                 location=_redact_evidence_location(location),
-                details={"suspicious_key": key},
+                details={"suspicious_key": safe_key},
                 rule_code=rule_code,
             )
             return
@@ -1878,6 +1923,7 @@ class FlaxMsgpackScanner(BaseScanner):
         coverage_details: dict[str, Any],
         check_jax_transform: bool,
         jax_location: str | None = None,
+        evidence_sample: Any | None = None,
     ) -> None:
         """Analyze decoded text with bounded regex windows and conservative coverage checks."""
         raw_tail = ""
@@ -1891,7 +1937,6 @@ class FlaxMsgpackScanner(BaseScanner):
 
         def inspect_windows(raw_window: str, normalized_window: str) -> None:
             raw_window_lower = raw_window.lower()
-            normalized_window_lower = normalized_window.lower()
             if check_jax_transform:
                 for transform in _DANGEROUS_JAX_TRANSFORMS:
                     if transform not in matched_transforms and transform in raw_window_lower:
@@ -1899,14 +1944,20 @@ class FlaxMsgpackScanner(BaseScanner):
             for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
                 if pattern in self._stream_unsafe_pattern_anchors:
                     anchors = self._stream_unsafe_pattern_anchors[pattern]
-                    window_has_all_anchors = anchors is None or all(
-                        anchor in normalized_window_lower for anchor in anchors
-                    )
+                    anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
                     if anchors is None:
                         unresolved_pattern_candidates.add(pattern)
+                        window_has_all_anchors = True
                     else:
                         seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
-                        seen_anchors.update(anchor for anchor in anchors if anchor in normalized_window_lower)
+                        assert anchor_matchers is not None
+                        window_anchors = {
+                            anchor
+                            for anchor, matcher in anchor_matchers
+                            if matcher.search(normalized_window) is not None
+                        }
+                        seen_anchors.update(window_anchors)
+                        window_has_all_anchors = len(window_anchors) == len(anchors)
                         if len(seen_anchors) == len(anchors):
                             unresolved_pattern_candidates.add(pattern)
 
@@ -1954,7 +2005,7 @@ class FlaxMsgpackScanner(BaseScanner):
             self._add_suspicious_string_check(
                 pattern,
                 lowered_pattern,
-                sample,
+                sample if evidence_sample is None else evidence_sample,
                 decoded_chars,
                 finding_location,
                 result,
