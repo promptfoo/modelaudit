@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- use credential-free, cross-platform cloud routing filenames without changing native object-key suffix semantics
+- encode native cloud object keys into collision-resistant, prefix-safe Windows paths and reject out-of-target listings
 - fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
 - discover extensionless pickle payloads inside ExecuTorch ZIP archives with bounded structural probing, including repeated protocol-0 comment-token evasions
 - report TAR external link escapes with the dedicated symlink rule code, resolve link targets from their correct archive bases, and avoid retaining passing checks for benign link floods
@@ -53,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
 - detect interpolated Hydra helper configs, legacy Hydra global-state aliases, and unsafe local or remote NeMo model-loader paths.
 - bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
+- keep bounded ExecuTorch ZIP snapshots seekable on Python 3.10 so benign and malicious pickle members remain analyzable
 
 ## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
 
