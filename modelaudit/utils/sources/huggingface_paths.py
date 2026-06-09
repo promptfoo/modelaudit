@@ -45,6 +45,21 @@ def _decode_huggingface_repo_component(raw_component: str, field_name: str) -> s
     return _validate_huggingface_repo_component(decoded, field_name)
 
 
+def _decode_huggingface_file_path_component(raw_component: str, field_name: str) -> str:
+    decoded = unquote(raw_component)
+    if not decoded or decoded in {".", ".."} or "/" in decoded or "\\" in decoded:
+        raise ValueError(f"Invalid HuggingFace {field_name} path component: {decoded!r}")
+    return decoded
+
+
+def _decode_huggingface_revision(raw_component: str) -> str:
+    decoded = unquote(raw_component)
+    revision_parts = decoded.split("/")
+    if "\\" in decoded or any(not part or part in {".", ".."} for part in revision_parts):
+        raise ValueError(f"Invalid HuggingFace revision path component: {decoded!r}")
+    return decoded
+
+
 def _split_huggingface_repo_path(raw_path: str) -> tuple[str, str, list[str]]:
     stripped = raw_path.strip("/")
     if not stripped:
@@ -118,15 +133,29 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
     if parsed.hostname not in ["huggingface.co", "hf.co"]:
         raise ValueError(f"Not a HuggingFace URL: {redact_huggingface_url_for_display(url)}")
 
-    path_parts = parsed.path.strip("/").split("/")
-    if len(path_parts) < 5 or path_parts[2] != "resolve":
+    raw_path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+    if not raw_path or raw_path.startswith("/") or raw_path.endswith("/") or "//" in raw_path:
         raise ValueError(f"Invalid HuggingFace file URL format: {redact_huggingface_url_for_display(url)}")
 
-    namespace = _decode_huggingface_repo_component(path_parts[0], "namespace")
-    repo_name = _decode_huggingface_repo_component(path_parts[1], "repository")
-    repo_id = f"{namespace}/{repo_name}"
-    branch = unquote(path_parts[3])
-    filename = "/".join(unquote(part) for part in path_parts[4:])
+    path_parts = raw_path.split("/")
+    if len(path_parts) >= 5 and path_parts[2] == "resolve":
+        resolve_index = 2
+    elif len(path_parts) >= 4 and path_parts[1] == "resolve":
+        resolve_index = 1
+    else:
+        raise ValueError(f"Invalid HuggingFace file URL format: {redact_huggingface_url_for_display(url)}")
+
+    if resolve_index == 2:
+        namespace = _decode_huggingface_repo_component(path_parts[0], "namespace")
+        repo_name = _decode_huggingface_repo_component(path_parts[1], "repository")
+        repo_id = f"{namespace}/{repo_name}"
+    else:
+        repo_id = _decode_huggingface_repo_component(path_parts[0], "repository")
+
+    branch = _decode_huggingface_revision(path_parts[resolve_index + 1])
+    filename = "/".join(
+        _decode_huggingface_file_path_component(part, "filename") for part in path_parts[resolve_index + 2 :]
+    )
 
     return repo_id, branch, filename
 
@@ -174,7 +203,13 @@ def is_huggingface_cache_path(path: str | Path) -> bool:
 
 def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
     """Extract HuggingFace model ID and source from a local path or URL."""
-    if is_huggingface_url(path) or is_huggingface_file_url(path):
+    if is_huggingface_file_url(path):
+        try:
+            repo_id, _, _ = parse_huggingface_file_url(path)
+            return repo_id, "huggingface"
+        except ValueError:
+            pass
+    if is_huggingface_url(path):
         try:
             namespace, repo_name = parse_huggingface_url(path)
             model_id = f"{namespace}/{repo_name}" if repo_name else namespace

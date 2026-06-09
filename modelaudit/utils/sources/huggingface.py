@@ -1927,6 +1927,9 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
         ValueError: If max_size is set and file size is unknown or exceeds it
         Exception: If download fails
     """
+    repo_id, branch, filename = parse_huggingface_file_url(url)
+    display_url = redact_huggingface_url_for_display(url)
+
     try:
         from huggingface_hub import HfApi, hf_hub_download
     except ImportError as e:
@@ -1934,9 +1937,6 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
             "huggingface-hub package is required for HuggingFace URL support. "
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
-
-    repo_id, branch, filename = parse_huggingface_file_url(url)
-    display_url = redact_huggingface_url_for_display(url)
 
     try:
         if max_size is not None and max_size < 0:
