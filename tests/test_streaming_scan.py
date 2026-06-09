@@ -904,7 +904,11 @@ def test_cross_directory_shard_reconciliation_distinguishes_reused_inode_generat
         },
     }
 
-    assert _complete_validated_shard_family_sources(targets) == {shard_one, shard_two}
+    expected_sources = {
+        os.path.normcase(os.path.normpath(os.path.abspath(shard_one))),
+        os.path.normcase(os.path.normpath(os.path.abspath(shard_two))),
+    }
+    assert _complete_validated_shard_family_sources(targets) == expected_sources
 
 
 def test_cross_directory_shard_reconciliation_rejects_sequential_hardlinks() -> None:
