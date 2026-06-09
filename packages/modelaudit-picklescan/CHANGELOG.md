@@ -84,6 +84,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed before copying protocol 0 line operands larger than 8 MiB,
   including nested payload probes
 - fail closed when nested protocol 0 operand analysis reaches the recursion depth limit
+- detect nested pickles accepted by permissive base64 and hex decoders, and fail
+  closed when decoded prefixes leave over-budget encoded tails
 - Invalidate cached call-graph analysis when Python sources, import hooks, loaded module origins, or parent package markers change.
 - fail closed when PyTorch ZIP archives exceed the standalone pickle-member scan budget
 - detect dangerous call-like strings split across newline-separated statements

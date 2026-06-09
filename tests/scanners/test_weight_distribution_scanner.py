@@ -547,14 +547,14 @@ class TestWeightDistributionScanner:
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
-    def test_pytorch_model_scan(self, tmp_path: Path) -> None:
+    def test_pytorch_model_scan(self):
         """Test scanning a PyTorch model with anomalous weights"""
         if not has_torch():
             pytest.skip("PyTorch not installed")
 
         import torch
 
-        scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
+        scanner = WeightDistributionScanner()
 
         # Create a simple model with anomalous weights
         class SimpleModel(torch.nn.Module):
@@ -570,23 +570,29 @@ class TestWeightDistributionScanner:
 
         model = SimpleModel()
 
-        model_path = tmp_path / "model.pt"
-        torch.save(model.state_dict(), model_path)
+        # Save model
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            torch.save(model.state_dict(), f.name)
+            temp_path = f.name
 
-        result = scanner.scan(str(model_path))
-        assert result.success
+        try:
+            result = scanner.scan(temp_path)
+            assert result.success
 
-        # If no issues found, it might be because the scanner couldn't extract weights
-        # This test is more about integration than specific anomaly detection
-        # So we'll make it more lenient
-        if len(result.issues) == 0:
-            # Check if any layers were analyzed
-            assert result.metadata.get("layers_analyzed", 0) >= 0
-        else:
-            # Check that anomaly was detected - could be either type
-            has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
-            has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
-            assert has_magnitude or has_extreme
+            # If no issues found, it might be because the scanner couldn't extract weights
+            # This test is more about integration than specific anomaly detection
+            # So we'll make it more lenient
+            if len(result.issues) == 0:
+                # Check if any layers were analyzed
+                assert result.metadata.get("layers_analyzed", 0) >= 0
+            else:
+                # Check that anomaly was detected - could be either type
+                has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
+                has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
+                assert has_magnitude or has_extreme
+
+        finally:
+            os.unlink(temp_path)
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_keras_model_scan(self):

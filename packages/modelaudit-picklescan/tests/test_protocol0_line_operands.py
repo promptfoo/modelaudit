@@ -161,23 +161,200 @@ def test_scan_bytes_fails_closed_for_oversized_inline_encoded_protocol0_pickle(
     )
 
 
-@pytest.mark.parametrize("encoding", ["base64", "hex"])
-def test_scan_bytes_ignores_malformed_inline_encoded_protocol0_near_match(
+@pytest.mark.parametrize(
+    ("case_name", "encoded", "encoding", "expected_rule_code"),
+    [
+        (
+            "base64-extra-padding",
+            "Y29zCnN5c3RlbQopUi4===",
+            "base64",
+            "S601",
+        ),
+        (
+            "base64-ignored-separator",
+            "Y29z!CnN5c3RlbQopUi4=",
+            "base64",
+            "S601",
+        ),
+        (
+            "base64-second-symbol-gap",
+            f"Y{'!' * 64}29zCnN5c3RlbQopUi4=",
+            "base64",
+            "S601",
+        ),
+        (
+            "base64-prefix-gap",
+            f"Y29z{'!' * 256}CnN5c3RlbQopUi4=",
+            "base64",
+            "S601",
+        ),
+        (
+            "base64-internal-padding",
+            "Y29z==CnN5c3RlbQopUi4=",
+            "base64",
+            "S601",
+        ),
+        (
+            "hex-dangling-nibble",
+            "636f730a73797374656d0a29522ef",
+            "hex",
+            "S602",
+        ),
+        (
+            "hex-whitespace",
+            "63 6f 73 0a 73 79 73 74 65 6d 0a 29 52 2e",
+            "hex",
+            "S602",
+        ),
+        (
+            "hex-whitespace-gap",
+            f"63{' ' * 247}6f730a73797374656d0a29522e",
+            "hex",
+            "S602",
+        ),
+    ],
+)
+def test_scan_bytes_detects_leniently_decodable_inline_protocol0_pickle(
+    case_name: str,
+    encoded: str,
     encoding: str,
+    expected_rule_code: str,
 ) -> None:
-    nested_payload = b"cos\nsystem\n)R."
-    encoded = (
-        f"{base64.b64encode(nested_payload).decode('ascii')}==" if encoding == "base64" else f"{nested_payload.hex()}f"
+    report = scan_bytes(
+        pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
+        source=f"lenient-inline-{case_name}-nested-protocol0.pkl",
     )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule_code
+        and finding.details.get("encoding") == encoding
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_for_base64_pickle_across_probe_cap_gap() -> None:
+    encoded = f"Y{'!' * (1024 * 1024 - 2)}29zCnN5c3RlbQopUi4="
 
     report = scan_bytes(
         pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
-        source=f"malformed-inline-{encoding}-nested-protocol0.pkl",
+        source="base64-probe-cap-gap-nested-protocol0.pkl",
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 
-    assert not any(finding.rule_code in {"S601", "S602"} for finding in report.findings)
-    assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_detects_base64_pickle_beyond_probe_cap() -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    base64_payload = base64.b64encode(nested_payload).decode("ascii")
+    encoded = f"{base64_payload[0]}{'!' * (1024 * 1024 + 65)}{base64_payload[1:]}"
+    assert base64.b64decode(encoded) == nested_payload
+
+    report = scan_bytes(
+        pickle.dumps({"outer": f"prefix-{encoded}-suffix"}, protocol=4),
+        source="base64-beyond-probe-cap-nested-protocol0.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_scan_bytes_keeps_benign_encoded_pickle_beyond_probe_cap_clean(encoding: str) -> None:
+    nested_payload = b"\x80\x04N."
+    if encoding == "base64":
+        encoded_payload = base64.b64encode(nested_payload).decode("ascii")
+        value = f"{encoded_payload[0]}{'!' * (1024 * 1024 + 65)}{encoded_payload[1:]}"
+        assert base64.b64decode(value) == nested_payload
+    else:
+        encoded_payload = nested_payload.hex()
+        value = f"{encoded_payload[:2]}{' ' * (1024 * 1024 + 65)}{encoded_payload[2:]}"
+        assert bytes.fromhex(value) == nested_payload
+
+    report = scan_bytes(
+        pickle.dumps(value, protocol=4),
+        source=f"benign-{encoding}-beyond-probe-cap.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_ignores_incomplete_base64_near_match_beyond_probe_cap() -> None:
+    value = f"S{'!' * (1024 * 1024 + 65)}Q"
+
+    report = scan_bytes(
+        pickle.dumps(value, protocol=4),
+        source="incomplete-base64-beyond-probe-cap.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_ignores_repeated_protocol0_scalar_prefix_near_matches() -> None:
+    report = scan_bytes(
+        pickle.dumps("S!" * 128, protocol=4),
+        source="repeated-protocol0-scalar-prefix-near-match.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert not any(notice.code == "nested_probe_limit" for notice in report.notices)
+
+
+def test_scan_bytes_keeps_raw_scan_for_lenient_whole_base64_near_match() -> None:
+    value = "gAROLg!cos\nsystem\n)R."
+
+    report = scan_bytes(
+        pickle.dumps(value, protocol=4),
+        source="lenient-base64-with-raw-nested-protocol0.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_fails_closed_when_encoded_prefix_hides_later_pickle_beyond_budget() -> None:
+    nested_payloads = b"\x80\x04N." + b"cos\nsystem\n)R."
+    encoded = base64.b64encode(nested_payloads).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="encoded-benign-prefix-before-budgeted-payload.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=4),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
 
 
 @pytest.mark.parametrize(

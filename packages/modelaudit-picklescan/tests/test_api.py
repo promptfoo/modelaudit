@@ -1003,7 +1003,7 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
 
 RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
 RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
-UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode()
 BINARY_STACK_GLOBAL_NESTED_PICKLE = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93)R."
 
 
@@ -1098,7 +1098,7 @@ def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_pa
 
 def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() -> None:
     report = scan_bytes(
-        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode("utf-8")) + b".",
+        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode()) + b".",
         source="mixed-unicode-raw-nested.pkl",
     )
 

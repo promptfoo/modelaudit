@@ -4,8 +4,11 @@ const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const HEX_LITERAL_CHARS: &[u8] = b"0123456789abcdefABCDEF";
 const ENCODED_LITERAL_PROBE_CHARS: usize = 64;
+const PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES: usize = 256;
 pub(crate) const MAX_NESTED_PAYLOAD_PROBES: usize = 64;
 const MAX_ENCODED_LITERAL_MID_SCAN_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES: usize =
+    MAX_ENCODED_LITERAL_MID_SCAN_BYTES + ENCODED_LITERAL_PROBE_CHARS;
 
 pub(crate) struct NestedProbeOffsets {
     pub(crate) offsets: Vec<usize>,
@@ -44,26 +47,38 @@ pub(crate) fn decode_possible_encoded_pickle(
         return Vec::new();
     }
 
-    let mut decoded_values = Vec::new();
+    let mut decoded_values: Vec<DecodedNestedPayload> = Vec::new();
     let max_base64_nested_pickle_chars = max_nested_pickle_bytes.div_ceil(3) * 4;
     let max_hex_nested_pickle_chars = max_nested_pickle_bytes * 2;
     let max_escaped_hex_nested_pickle_chars = max_nested_pickle_bytes * 4;
 
     for candidate in encoded_literal_candidates(stripped) {
-        let base64_token = take_base64_literal_prefix(&candidate, candidate.len());
-        if base64_prefix_has_pickle_prefix(&candidate) && is_base64_candidate(base64_token) {
-            let bounded_base64 =
-                take_base64_literal_prefix(base64_token, max_base64_nested_pickle_chars);
-            let padded = pad_base64(bounded_base64);
-            if let Some(decoded) = decode_base64(&padded) {
-                for (payload, analysis_incomplete) in
-                    decoded_pickle_payloads(&decoded, max_nested_pickle_bytes)
+        if base64_prefix_has_pickle_prefix(&candidate) {
+            for bounded_base64 in base64_literal_candidates(
+                &candidate,
+                max_base64_nested_pickle_chars,
+                candidate.len(),
+            ) {
+                if let Some(decoded) = canonical_base64_candidate(&bounded_base64)
+                    .as_deref()
+                    .and_then(decode_base64)
                 {
-                    decoded_values.push(DecodedNestedPayload {
-                        encoding: "base64",
-                        payload,
-                        analysis_incomplete,
-                    });
+                    for (payload, analysis_incomplete) in
+                        decoded_pickle_payloads(&decoded, max_nested_pickle_bytes)
+                    {
+                        if decoded_values.iter().any(|existing| {
+                            existing.encoding == "base64"
+                                && existing.payload == payload
+                                && existing.analysis_incomplete == analysis_incomplete
+                        }) {
+                            continue;
+                        }
+                        decoded_values.push(DecodedNestedPayload {
+                            encoding: "base64",
+                            payload,
+                            analysis_incomplete,
+                        });
+                    }
                 }
             }
         }
@@ -73,9 +88,9 @@ pub(crate) fn decode_possible_encoded_pickle(
             let encoding = hex_encoding_label(hex_token);
             let bounded_hex =
                 take_hex_literal_prefix(hex_token, max_escaped_hex_nested_pickle_chars);
-            let hex_candidate = strip_escaped_hex_markers(bounded_hex);
+            let mut hex_candidate = strip_escaped_hex_markers(bounded_hex);
+            hex_candidate.truncate(hex_candidate.len() - (hex_candidate.len() % 2));
             if hex_candidate.len() >= 16
-                && hex_candidate.len() % 2 == 0
                 && is_hex_candidate(&hex_candidate)
                 && !is_repeated_single_char(&hex_candidate)
             {
@@ -157,14 +172,25 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     let mut detected = Vec::new();
     let probe_decoded_bytes = (max_nested_pickle_bytes + 1).max(2);
 
-    let base64_token = take_base64_literal_prefix(stripped, stripped.len());
-    if base64_prefix_has_pickle_prefix(stripped) && is_base64_candidate(base64_token) {
+    if base64_prefix_has_pickle_prefix(stripped) {
         let max_base64_probe_chars = (probe_decoded_bytes.div_ceil(3) * 4).max(16);
-        let bounded = take_base64_literal_prefix(base64_token, max_base64_probe_chars);
-        let padded = pad_base64(bounded);
-        if let Some(decoded) = decode_base64(&padded) {
-            if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
-                detected.push(("base64", estimate_base64_decoded_size(base64_token)));
+        let oversized_prefix_found =
+            base64_literal_candidates(stripped, max_base64_probe_chars, stripped.len())
+                .into_iter()
+                .any(|bounded| {
+                    canonical_base64_candidate(&bounded)
+                        .as_deref()
+                        .and_then(decode_base64)
+                        .is_some_and(|decoded| {
+                            decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded)
+                        })
+                });
+        if oversized_prefix_found {
+            let strict_token = take_base64_literal_prefix(stripped, stripped.len());
+            let payload_size = estimate_base64_decoded_size(strict_token)
+                .max(estimate_lenient_base64_decoded_size(stripped));
+            if payload_size > max_nested_pickle_bytes {
+                detected.push(("base64", payload_size));
             }
         }
     }
@@ -172,19 +198,17 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     if hex_prefix_has_pickle_prefix(stripped) {
         let hex_token = take_hex_literal_prefix(stripped, stripped.len());
         let encoding = hex_encoding_label(hex_token);
-        let max_hex_probe_chars = (probe_decoded_bytes * 4).max(16);
-        let normalized_hex_literal = strip_escaped_hex_markers(hex_token);
-        if normalized_hex_literal.len() % 2 == 0 {
-            let bounded_hex = take_hex_literal_prefix(hex_token, max_hex_probe_chars);
-            let hex_candidate = strip_escaped_hex_markers(bounded_hex);
-            if hex_candidate.len() >= 16
-                && is_hex_candidate(&hex_candidate)
-                && !is_repeated_single_char(&hex_candidate)
-            {
-                if let Some(decoded) = decode_hex(&hex_candidate) {
-                    if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
-                        detected.push((encoding, estimate_hex_decoded_size(hex_token)));
-                    }
+        let max_hex_probe_chars = (probe_decoded_bytes * 4).max(ENCODED_LITERAL_PROBE_CHARS);
+        let bounded_hex = take_hex_literal_prefix(hex_token, max_hex_probe_chars);
+        let mut hex_candidate = strip_escaped_hex_markers(bounded_hex);
+        hex_candidate.truncate(hex_candidate.len() - (hex_candidate.len() % 2));
+        if hex_candidate.len() >= 16
+            && is_hex_candidate(&hex_candidate)
+            && !is_repeated_single_char(&hex_candidate)
+        {
+            if let Some(decoded) = decode_hex(&hex_candidate) {
+                if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
+                    detected.push((encoding, estimate_hex_decoded_size(hex_token)));
                 }
             }
         }
@@ -410,6 +434,25 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
         || pickle_prefix_has_structured_opcodes(value, false)
 }
 
+fn has_nested_probe_prefix(value: &[u8]) -> bool {
+    has_pickle_prefix(value)
+        && (!value
+            .first()
+            .is_some_and(|byte| matches!(*byte, b'I' | b'S' | b'V'))
+            || protocol0_scalar_prefix_has_bounded_line(value))
+}
+
+fn protocol0_scalar_prefix_has_bounded_line(value: &[u8]) -> bool {
+    value
+        .first()
+        .is_some_and(|byte| matches!(*byte, b'I' | b'S' | b'V'))
+        && value
+            .iter()
+            .skip(1)
+            .take(PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES)
+            .any(|byte| *byte == b'\n')
+}
+
 pub(crate) fn has_binary_pickle_prefix(value: &[u8]) -> bool {
     value.len() >= 2 && value[0] == 0x80 && matches!(value[1], 1..=5)
 }
@@ -629,7 +672,7 @@ fn nested_pickle_probe_offsets_with_limit(
 ) -> NestedProbeOffsets {
     let mut offsets = Vec::new();
     for index in 0..value.len().saturating_sub(1) {
-        if has_pickle_prefix(&value[index..]) {
+        if has_nested_probe_prefix(&value[index..]) {
             if limit.is_some_and(|max_offsets| offsets.len() >= max_offsets) {
                 return NestedProbeOffsets {
                     offsets,
@@ -657,6 +700,7 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
     value: &str,
     max_window_chars: usize,
 ) -> EncodedNestedProbeWindows {
+    let value = value.trim();
     let mut windows = Vec::new();
     let mut limit_exceeded = false;
     let mut limit_exceeded_encoding = None;
@@ -664,7 +708,11 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
     let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(value);
     if prefix_has_base64_pickle || prefix_has_hex_pickle {
         push_unique_window(&mut windows, take_chars(value, max_window_chars));
-        if encoded_prefix_consumes_literal(value, prefix_has_base64_pickle, prefix_has_hex_pickle) {
+        if encoded_probe_prefix_consumes_literal(
+            value,
+            prefix_has_base64_pickle,
+            prefix_has_hex_pickle,
+        ) {
             return EncodedNestedProbeWindows {
                 windows,
                 limit_exceeded,
@@ -677,15 +725,24 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
         push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
     }
 
-    let bytes = value.as_bytes();
-    let mid_scan_len = bytes.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
+    let mid_scan_len = value.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
     for index in 0..mid_scan_len {
-        let Some(candidate_encoding) = encoded_pickle_kind_at(bytes, index) else {
-            continue;
-        };
         if !value.is_char_boundary(index) {
             continue;
         }
+        if let Some(encoding) = encoded_pickle_prefix_probe_limit_kind_at(value, index) {
+            let suffix = &value[index..];
+            let normalized = if encoding == "base64" {
+                normalize_base64_literal(suffix, max_window_chars, suffix.len())
+            } else {
+                normalize_hex_literal(suffix, max_window_chars, suffix.len())
+            };
+            push_unique_window(&mut windows, normalized);
+            break;
+        }
+        let Some(candidate_encoding) = encoded_pickle_kind_at(value, index) else {
+            continue;
+        };
         if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
             limit_exceeded = true;
             limit_exceeded_encoding = Some(candidate_encoding);
@@ -710,9 +767,15 @@ pub(crate) fn encoded_nested_literal_probe_coverage_incomplete(value: &str) -> b
     }
 
     let stripped = value.trim();
-    let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(stripped);
-    let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(stripped);
-    !encoded_prefix_consumes_literal(stripped, prefix_has_base64_pickle, prefix_has_hex_pickle)
+    let prefix_has_base64_pickle =
+        base64_prefix_has_pickle_prefix_with_limit(stripped, stripped.len());
+    let prefix_has_hex_pickle = !prefix_has_base64_pickle
+        && hex_prefix_has_pickle_prefix_with_limit(stripped, stripped.len());
+    !encoded_probe_prefix_consumes_literal(
+        stripped,
+        prefix_has_base64_pickle,
+        prefix_has_hex_pickle,
+    )
 }
 
 pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
@@ -729,9 +792,11 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
         return true;
     }
 
-    let bytes = stripped.as_bytes();
-    for index in 0..bytes.len() {
-        if starts_encoded_pickle_at(bytes, index) && stripped.is_char_boundary(index) {
+    for index in 0..stripped.len() {
+        if stripped.is_char_boundary(index)
+            && (starts_encoded_pickle_at(stripped, index)
+                || encoded_pickle_prefix_probe_limit_kind_at(stripped, index).is_some())
+        {
             return true;
         }
     }
@@ -745,28 +810,59 @@ pub(crate) fn encoded_pickle_consumes_literal(value: &str) -> bool {
     encoded_prefix_consumes_literal(stripped, prefix_has_base64_pickle, prefix_has_hex_pickle)
 }
 
-fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
-    encoded_pickle_kind_at(bytes, index).is_some()
+fn starts_encoded_pickle_at(value: &str, index: usize) -> bool {
+    encoded_pickle_kind_at(value, index).is_some()
 }
 
-fn encoded_pickle_kind_at(bytes: &[u8], index: usize) -> Option<&'static str> {
-    let suffix = &bytes[index..];
+fn encoded_pickle_kind_at(value: &str, index: usize) -> Option<&'static str> {
+    let suffix = &value[index..];
+    let suffix_bytes = suffix.as_bytes();
     let starts_base64_pickle =
-        encoded_base64_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
-    let starts_hex_pickle = encoded_hex_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
+        encoded_base64_first_byte(suffix_bytes).is_some_and(is_pickle_prefix_start_byte);
+    let starts_hex_pickle =
+        encoded_hex_first_byte(suffix_bytes).is_some_and(is_pickle_prefix_start_byte);
     if !starts_base64_pickle && !starts_hex_pickle {
         return None;
     }
 
-    let probe_len = suffix.len().min(ENCODED_LITERAL_PROBE_CHARS * 4);
-    let Ok(probe) = std::str::from_utf8(&suffix[..probe_len]) else {
-        return None;
-    };
+    let probe = take_bytes_str_slice(suffix, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES);
     if starts_base64_pickle && base64_prefix_has_pickle_prefix(probe) {
         return Some("base64");
     }
     if starts_hex_pickle && hex_prefix_has_pickle_prefix(probe) {
         return Some("hex");
+    }
+    None
+}
+
+fn encoded_pickle_prefix_probe_limit_kind_at(value: &str, index: usize) -> Option<&'static str> {
+    let suffix = &value[index..];
+    if suffix.len() <= MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES {
+        return None;
+    }
+
+    let suffix_bytes = suffix.as_bytes();
+    let base64_first_byte = encoded_base64_first_byte_unbounded(suffix_bytes);
+    let starts_base64_pickle = base64_first_byte.is_some_and(is_pickle_prefix_start_byte);
+    let starts_hex_pickle =
+        encoded_hex_first_byte(suffix_bytes).is_some_and(is_pickle_prefix_start_byte);
+    if !starts_base64_pickle && !starts_hex_pickle {
+        return None;
+    }
+
+    let probe = take_bytes_str_slice(suffix, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES);
+    if starts_base64_pickle
+        && !base64_prefix_has_pickle_prefix(probe)
+        && base64_prefix_has_pickle_prefix_with_limit(suffix, suffix.len())
+    {
+        return Some("base64");
+    }
+
+    if starts_hex_pickle
+        && !hex_prefix_has_pickle_prefix(probe)
+        && hex_prefix_has_pickle_prefix_with_limit(suffix, suffix.len())
+    {
+        return Some(hex_encoding_label(suffix));
     }
     None
 }
@@ -782,7 +878,17 @@ fn encoded_prefix_consumes_literal(
 ) -> bool {
     (prefix_has_base64_pickle
         && take_base64_literal_prefix(value, value.len()).len() == value.len()
-        && is_base64_candidate(value))
+        && base64_candidate_unpadded(value).is_some())
+        || (prefix_has_hex_pickle
+            && take_hex_literal_prefix(value, value.len()).len() == value.len())
+}
+
+fn encoded_probe_prefix_consumes_literal(
+    value: &str,
+    prefix_has_base64_pickle: bool,
+    prefix_has_hex_pickle: bool,
+) -> bool {
+    (prefix_has_base64_pickle && is_lenient_base64_candidate(value))
         || (prefix_has_hex_pickle
             && take_hex_literal_prefix(value, value.len()).len() == value.len())
 }
@@ -849,20 +955,25 @@ pub(crate) fn encoded_nested_window_char_limit(
     let max_base64_chars = max_nested_pickle_bytes.div_ceil(3) * 4;
     let max_plain_hex_chars = max_nested_pickle_bytes * 2;
     let max_escaped_hex_chars = max_nested_pickle_bytes * 4;
+    let base64_window_chars = MAX_ENCODED_LITERAL_MID_SCAN_BYTES
+        .saturating_add(max_base64_chars.max(ENCODED_LITERAL_PROBE_CHARS));
+    let plain_hex_window_chars = MAX_ENCODED_LITERAL_MID_SCAN_BYTES
+        .saturating_add(max_plain_hex_chars.max(ENCODED_LITERAL_PROBE_CHARS));
+    let escaped_hex_window_chars = MAX_ENCODED_LITERAL_MID_SCAN_BYTES
+        .saturating_add(max_escaped_hex_chars.max(ENCODED_LITERAL_PROBE_CHARS));
     let probe = encoded_literal_probe(value);
     if contains_escaped_hex_marker(&probe) {
-        return (ENCODED_LITERAL_PROBE_CHARS * 4).max(max_escaped_hex_chars);
+        return escaped_hex_window_chars;
     }
     if chars_are_in_alphabet(probe.as_bytes(), HEX_LITERAL_CHARS) {
-        return ENCODED_LITERAL_PROBE_CHARS.max(max_plain_hex_chars);
+        return plain_hex_window_chars;
     }
     if chars_are_in_alphabet(probe.as_bytes(), BASE64_LITERAL_CHARS) {
-        return ENCODED_LITERAL_PROBE_CHARS.max(max_base64_chars);
+        return base64_window_chars;
     }
-    ENCODED_LITERAL_PROBE_CHARS
-        .max(max_base64_chars)
-        .max(max_plain_hex_chars)
-        .max(max_escaped_hex_chars)
+    base64_window_chars
+        .max(plain_hex_window_chars)
+        .max(escaped_hex_window_chars)
 }
 
 fn encoded_literal_probe(value: &str) -> String {
@@ -893,24 +1004,38 @@ fn chars_are_in_alphabet(value: &[u8], alphabet: &[u8]) -> bool {
     !value.is_empty() && value.iter().all(|byte| alphabet.contains(byte))
 }
 
-fn is_base64_candidate(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
+fn is_lenient_base64_candidate(value: &str) -> bool {
+    let mut unpadded_chars = 0usize;
     let mut padding_seen = false;
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !padding_seen => {}
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !padding_seen => {
+                unpadded_chars = unpadded_chars.saturating_add(1);
+            }
+            b'=' if unpadded_chars % 4 == 0 => {}
             b'=' => padding_seen = true,
-            _ => return false,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => return false,
+            _ => {}
         }
     }
-    value
-        .as_bytes()
-        .iter()
-        .filter(|byte| **byte == b'=')
-        .count()
-        <= 2
+    unpadded_chars > 0 && unpadded_chars % 4 != 1
+}
+
+fn canonical_base64_candidate(value: &str) -> Option<String> {
+    base64_candidate_unpadded(value).map(pad_base64)
+}
+
+fn base64_candidate_unpadded(value: &str) -> Option<&str> {
+    let unpadded = value.trim_end_matches('=');
+    if unpadded.is_empty()
+        || unpadded.len() % 4 == 1
+        || !unpadded
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'))
+    {
+        return None;
+    }
+    Some(unpadded)
 }
 
 fn is_hex_candidate(value: &str) -> bool {
@@ -939,16 +1064,27 @@ fn pad_base64(value: &str) -> String {
 }
 
 fn base64_prefix_has_pickle_prefix(value: &str) -> bool {
-    let prefix = take_base64_literal_prefix(value, ENCODED_LITERAL_PROBE_CHARS);
-    let padded = pad_base64(prefix);
-    decode_base64(&padded)
-        .map(|decoded| has_pickle_prefix(&decoded))
-        .unwrap_or(false)
+    base64_prefix_has_pickle_prefix_with_limit(value, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES)
+}
+
+fn base64_prefix_has_pickle_prefix_with_limit(value: &str, max_input_bytes: usize) -> bool {
+    base64_literal_candidates(value, ENCODED_LITERAL_PROBE_CHARS, max_input_bytes)
+        .into_iter()
+        .any(|prefix| {
+            canonical_base64_candidate(&prefix)
+                .as_deref()
+                .and_then(decode_base64)
+                .is_some_and(|decoded| has_nested_probe_prefix(&decoded))
+        })
 }
 
 fn hex_prefix_has_pickle_prefix(value: &str) -> bool {
-    let candidate = take_hex_literal_prefix(value, ENCODED_LITERAL_PROBE_CHARS * 4);
-    let mut hex_candidate = strip_escaped_hex_markers(candidate);
+    hex_prefix_has_pickle_prefix_with_limit(value, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES)
+}
+
+fn hex_prefix_has_pickle_prefix_with_limit(value: &str, max_input_bytes: usize) -> bool {
+    let mut hex_candidate =
+        normalize_hex_literal(value, ENCODED_LITERAL_PROBE_CHARS * 4, max_input_bytes);
     if hex_candidate.len() % 2 == 1 {
         hex_candidate.pop();
     }
@@ -956,7 +1092,7 @@ fn hex_prefix_has_pickle_prefix(value: &str) -> bool {
         return false;
     }
     decode_hex(&hex_candidate)
-        .map(|decoded| has_pickle_prefix(&decoded))
+        .map(|decoded| has_nested_probe_prefix(&decoded))
         .unwrap_or(false)
 }
 
@@ -974,11 +1110,68 @@ fn take_base64_literal_prefix(value: &str, max_chars: usize) -> &str {
     &value[..end]
 }
 
+fn normalize_base64_literal(
+    value: &str,
+    max_encoded_chars: usize,
+    max_input_bytes: usize,
+) -> String {
+    if value
+        .as_bytes()
+        .first()
+        .is_none_or(|byte| base64_value(*byte).is_none())
+    {
+        return String::new();
+    }
+    let mut normalized = String::with_capacity(value.len().min(max_encoded_chars));
+    let mut padding_seen = false;
+    let mut unpadded_chars = 0usize;
+    for byte in value.bytes().take(max_input_bytes) {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !padding_seen => {
+                normalized.push(char::from(byte));
+                unpadded_chars = unpadded_chars.saturating_add(1);
+            }
+            b'=' if unpadded_chars % 4 == 0 => {}
+            b'=' => {
+                padding_seen = true;
+                normalized.push('=');
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => break,
+            _ => {}
+        }
+        if normalized.len() >= max_encoded_chars {
+            break;
+        }
+    }
+    normalized
+}
+
+fn base64_literal_candidates(
+    value: &str,
+    max_encoded_chars: usize,
+    max_input_bytes: usize,
+) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    let strict = take_base64_literal_prefix(value, max_encoded_chars).to_string();
+    if !strict.is_empty() {
+        candidates.push(strict);
+    }
+    let lenient = normalize_base64_literal(value, max_encoded_chars, max_input_bytes);
+    if !lenient.is_empty() && !candidates.iter().any(|candidate| candidate == &lenient) {
+        candidates.push(lenient);
+    }
+    candidates
+}
+
 fn take_hex_literal_prefix(value: &str, max_chars: usize) -> &str {
     let bytes = value.as_bytes();
     let limit = bytes.len().min(max_chars);
     let mut index = 0usize;
     while index < limit {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
         if bytes[index] == b'\\' && matches!(bytes.get(index + 1), Some(b'x' | b'X')) {
             if index + 4 <= limit
                 && bytes.get(index + 2).is_some_and(|byte| is_hex_byte(*byte))
@@ -998,12 +1191,53 @@ fn take_hex_literal_prefix(value: &str, max_chars: usize) -> &str {
     &value[..index]
 }
 
-fn encoded_base64_first_byte(value: &[u8]) -> Option<u8> {
-    if value.len() < 2 {
-        return None;
+fn normalize_hex_literal(value: &str, max_hex_digits: usize, max_input_bytes: usize) -> String {
+    let bytes = value.as_bytes();
+    let limit = bytes.len().min(max_input_bytes);
+    let mut normalized = String::with_capacity(max_hex_digits.min(limit));
+    let mut index = 0usize;
+    while index < limit && normalized.len() < max_hex_digits {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'\\' && matches!(bytes.get(index + 1), Some(b'x' | b'X')) {
+            if index + 4 <= limit
+                && bytes.get(index + 2).is_some_and(|byte| is_hex_byte(*byte))
+                && bytes.get(index + 3).is_some_and(|byte| is_hex_byte(*byte))
+            {
+                normalized.push(char::from(bytes[index + 2]));
+                if normalized.len() < max_hex_digits {
+                    normalized.push(char::from(bytes[index + 3]));
+                }
+                index += 4;
+                continue;
+            }
+            break;
+        }
+        if is_hex_byte(bytes[index]) {
+            normalized.push(char::from(bytes[index]));
+            index += 1;
+            continue;
+        }
+        break;
     }
-    let first = base64_value(value[0])?;
-    let second = base64_value(value[1])?;
+    normalized
+}
+
+fn encoded_base64_first_byte(value: &[u8]) -> Option<u8> {
+    let first = base64_value(*value.first()?)?;
+    let second = value
+        .iter()
+        .skip(1)
+        .take(MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES)
+        .find_map(|byte| base64_value(*byte))?;
+    Some((first << 2) | (second >> 4))
+}
+
+fn encoded_base64_first_byte_unbounded(value: &[u8]) -> Option<u8> {
+    let first = base64_value(*value.first()?)?;
+    let second = value.iter().skip(1).find_map(|byte| base64_value(*byte))?;
     Some((first << 2) | (second >> 4))
 }
 
@@ -1080,8 +1314,24 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn estimate_base64_decoded_size(value: &str) -> usize {
-    let padding_chars = value.len() - value.trim_end_matches('=').len();
-    ((value.len() * 3) / 4).saturating_sub(padding_chars)
+    value.trim_end_matches('=').len().saturating_mul(3) / 4
+}
+
+fn estimate_lenient_base64_decoded_size(value: &str) -> usize {
+    let mut unpadded_chars = 0usize;
+    let mut padding_seen = false;
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !padding_seen => {
+                unpadded_chars = unpadded_chars.saturating_add(1);
+            }
+            b'=' if unpadded_chars % 4 == 0 => {}
+            b'=' => padding_seen = true,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => break,
+            _ => {}
+        }
+    }
+    unpadded_chars.saturating_mul(3) / 4
 }
 
 fn estimate_hex_decoded_size(value: &str) -> usize {
@@ -1089,7 +1339,12 @@ fn estimate_hex_decoded_size(value: &str) -> usize {
 }
 
 fn strip_escaped_hex_markers(value: &str) -> String {
-    value.replace("\\x", "").replace("\\X", "")
+    value
+        .replace("\\x", "")
+        .replace("\\X", "")
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect()
 }
 
 fn contains_escaped_hex_marker(value: &str) -> bool {
@@ -1123,6 +1378,17 @@ fn take_bytes_str(value: &str, count: usize) -> String {
     value[..end].to_string()
 }
 
+fn take_bytes_str_slice(value: &str, count: usize) -> &str {
+    if count >= value.len() {
+        return value;
+    }
+    let mut end = count;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1400,28 @@ mod tests {
         assert!(base64_prefix_has_pickle_prefix("gAR9Lg=="));
         assert!(hex_prefix_has_pickle_prefix("80047d2e"));
         assert!(hex_prefix_has_pickle_prefix(r"\x80\x04\x7d\x2e"));
+    }
+
+    #[test]
+    fn encoded_mid_scan_uses_resolved_base64_first_bytes() {
+        let benign = "YA".repeat((MAX_ENCODED_LITERAL_MID_SCAN_BYTES / 2) + 65);
+
+        assert!(!encoded_literal_may_contain_pickle(&benign));
+        assert!(encoded_nested_literal_probe_windows(&benign, 64).is_empty());
+    }
+
+    #[test]
+    fn encoded_windows_include_probe_allowance_and_payload_budget() {
+        let max_nested_pickle_bytes = 4;
+        let window_chars = encoded_nested_window_char_limit("Y!...", max_nested_pickle_bytes);
+
+        assert!(
+            window_chars
+                >= MAX_ENCODED_LITERAL_MID_SCAN_BYTES
+                    + max_nested_pickle_bytes
+                        .saturating_mul(4)
+                        .max(ENCODED_LITERAL_PROBE_CHARS)
+        );
     }
 
     #[test]
@@ -1150,6 +1438,14 @@ mod tests {
             take_hex_literal_prefix("636f730a73797374656d0a29522e-suffix", usize::MAX),
             "636f730a73797374656d0a29522e"
         );
+        assert_eq!(
+            normalize_base64_literal("Y29z!CnN5c3RlbQopUi4=", usize::MAX, usize::MAX),
+            "Y29zCnN5c3RlbQopUi4="
+        );
+        assert_eq!(
+            strip_escaped_hex_markers("63 6f 73 0a 73 79 73 74 65 6d 0a 29 52 2e"),
+            "636f730a73797374656d0a29522e"
+        );
     }
 
     #[test]
@@ -1159,7 +1455,7 @@ mod tests {
                 "gASVCgAAAAAAAAB9lIwBYZRLAXMu-trailing-suffix",
                 4
             ),
-            vec![("base64", 21)]
+            vec![("base64", 31)]
         );
         assert_eq!(
             detect_oversized_encoded_pickle_prefixes(
@@ -1195,6 +1491,7 @@ mod tests {
         assert!(encoded_pickle_consumes_literal(r"\x80\x04\x7d\x2e"));
         assert!(!encoded_pickle_consumes_literal("prefix-gAR9Lg=="));
         assert!(!encoded_pickle_consumes_literal("# gAR9Lg==\n# metadata"));
+        assert!(!encoded_pickle_consumes_literal("gAROLg!cos\nsystem\n)R."));
     }
 
     #[test]
@@ -1210,6 +1507,18 @@ mod tests {
             pickle_payload_extent(payload, TEST_MAX_NESTED_PICKLE_BYTES),
             Some(payload.len())
         );
+    }
+
+    #[test]
+    fn protocol0_scalar_prefixes_require_bounded_line_operands() {
+        assert!(has_nested_probe_prefix(b"I1\n."));
+        assert!(has_nested_probe_prefix(b"S'x'\n."));
+        assert!(has_nested_probe_prefix(b"Vtext\n."));
+        assert!(has_pickle_prefix(b"I$$$$$$$$"));
+        assert!(!has_nested_probe_prefix(b"I$$$$$$$$"));
+        assert!(!has_nested_probe_prefix(
+            format!("S{}", "A".repeat(PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES + 1)).as_bytes()
+        ));
     }
 
     #[test]
@@ -1266,11 +1575,40 @@ mod tests {
     }
 
     #[test]
+    fn encoded_probe_windows_normalize_candidates_beyond_prefix_probe() {
+        let gap = "!".repeat(MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES + 1);
+        for (value, expected_prefix) in [
+            (format!("Y{gap}29zCnN5c3RlbQopUi4="), "Y29zCnN5c3RlbQopUi4="),
+            (format!("g{gap}AROLg=="), "gAROLg=="),
+            (
+                format!(
+                    "80{}044e2e",
+                    " ".repeat(MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES + 1)
+                ),
+                "80044e2e",
+            ),
+        ] {
+            assert!(encoded_literal_may_contain_pickle(&value));
+            let probed = encoded_nested_literal_probe_windows_with_limit(&value, 64);
+            assert!(probed
+                .windows
+                .iter()
+                .any(|window| window.starts_with(expected_prefix)));
+        }
+    }
+
+    #[test]
     fn encoded_probe_windows_skip_mid_scan_for_whole_encoded_literals() {
-        for value in ["gAR9Lg==", "80047d2e", r"\x80\x04\x7d\x2e"] {
+        for value in [
+            "gAR9Lg==",
+            "gAR9Lg==\n",
+            "80047d2e",
+            "80047d2e\n",
+            r"\x80\x04\x7d\x2e",
+        ] {
             let windows = encoded_nested_literal_probe_windows(value, 64);
 
-            assert_eq!(windows, vec![value.to_string()]);
+            assert_eq!(windows, vec![value.trim().to_string()]);
         }
     }
 
@@ -1335,6 +1673,7 @@ mod tests {
         let payload = b"cos\nsystem\n)R.";
         for (value, encoding) in [
             ("Y29zCnN5c3RlbQopUi4=-suffix", "base64"),
+            ("Y29zCnN5c3RlbQopUi4-suffix", "base64"),
             ("636f730a73797374656d0a29522e-suffix", "hex"),
         ] {
             let decoded = decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES);
@@ -1346,13 +1685,22 @@ mod tests {
     }
 
     #[test]
-    fn inline_encoded_pickle_candidates_reject_malformed_tokens() {
-        for value in [
-            "Y29zCnN5c3RlbQopUi4===-suffix",
-            "636f730a73797374656d0a29522ef-suffix",
+    fn inline_encoded_pickle_candidates_model_lenient_decoder_tails() {
+        let payload = b"cos\nsystem\n)R.";
+        for (value, encoding) in [
+            ("Y29zCnN5c3RlbQopUi4===-suffix", "base64"),
+            ("Y29z!CnN5c3RlbQopUi4=-suffix", "base64"),
+            ("636f730a73797374656d0a29522ef-suffix", "hex"),
+            ("63 6f 73 0a 73 79 73 74 65 6d 0a 29 52 2e-suffix", "hex"),
         ] {
-            assert!(decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES).is_empty());
-            assert!(detect_oversized_encoded_pickle_prefixes(value, 4).is_empty());
+            let decoded = decode_possible_encoded_pickle(value, TEST_MAX_NESTED_PICKLE_BYTES);
+            assert!(decoded
+                .iter()
+                .any(|candidate| candidate.encoding == encoding && candidate.payload == payload));
+            assert_eq!(
+                detect_oversized_encoded_pickle_prefixes(value, 4),
+                vec![(encoding, payload.len())]
+            );
         }
     }
 

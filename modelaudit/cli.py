@@ -3647,7 +3647,7 @@ def scan_command(
     telemetry_options = {
         "format": format,
         "timeout": timeout,
-        "max_file_size": max_size,
+        "has_max_file_size": bool(max_size),
         "has_blacklist": bool(blacklist),
         "num_blacklist_patterns": len(blacklist) if blacklist else 0,
         "progress": progress,

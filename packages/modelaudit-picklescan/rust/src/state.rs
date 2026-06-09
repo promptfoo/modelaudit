@@ -6093,10 +6093,6 @@ impl<'a> ScanState<'a> {
                 surface_outcome.promote_complete_payload(nested_has_execution_opcode),
             );
         }
-        if decoded_payload_found {
-            return true;
-        }
-
         let mut oversized_prefix_found = false;
         for (encoding, payload_size) in
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
@@ -6108,7 +6104,7 @@ impl<'a> ScanState<'a> {
             );
             self.record_encoded_nested_payload_truncated(encoding, payload_size, position);
         }
-        oversized_prefix_found
+        decoded_payload_found || oversized_prefix_found
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
