@@ -78,7 +78,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- scan encoded nested pickles in byte and bytearray literals without treating complete encoded payloads as raw pickle fragments
+- scan encoded nested pickles in bounded byte and bytearray literals without treating benign execution-like text or complete encoded payloads as raw pickle fragments
 - continue probing encoded protocol 0 payloads after long line operands, lenient base64 separators, and wrapper alignment shifts while failing closed beyond bounded mid-scan coverage
 - reject nested-pickle analysis budgets below two bytes, recognize explicit protocol 0 headers, and use bounded structural probes to avoid prose false positives without missing valid suffixes
 - preserve fail-closed nested protocol 0 analysis after `INST` opcodes
@@ -110,6 +110,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve reviewed safe callable references in dependency-minimal environments and
   recognize active-environment package overlays without trusting project-local shadows
 - avoid custom meta-path finder calls during pickle call-graph source probing
+- avoid hookable builtin/frozen finders, mutable import-runtime dependencies, forged
+  loaded specs, and in-place trusted-reference mutations during pickle call-graph module
+  resolution
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`

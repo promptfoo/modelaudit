@@ -1304,64 +1304,8 @@ impl<'a> ScanState<'a> {
             "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
                 if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
                     let bytes = &self.payload[start..end];
-                    let encoded_nested_pickle_outcome = match std::str::from_utf8(bytes) {
-                        Ok(value) => {
-                            if self.is_large_uninteresting_repeated_literal(value) {
-                                (false, false)
-                            } else {
-                                self.scan_encoded_nested_pickle_literal_outcome(value, position)
-                            }
-                        }
-                        Err(_) => {
-                            let sanitize = |slice: &[u8]| {
-                                slice
-                                    .iter()
-                                    .map(|byte| {
-                                        if byte.is_ascii() {
-                                            char::from(*byte)
-                                        } else {
-                                            '!'
-                                        }
-                                    })
-                                    .collect::<String>()
-                            };
-                            let scan_limit =
-                                bytes.len().min(self.options.max_string_literal_scan_chars);
-                            if scan_limit == bytes.len() {
-                                let value = sanitize(bytes);
-                                if self.is_large_uninteresting_repeated_literal(&value) {
-                                    (false, false)
-                                } else {
-                                    self.scan_encoded_nested_pickle_literal_outcome(
-                                        &value, position,
-                                    )
-                                }
-                            } else {
-                                let mut found_candidate = false;
-                                if scan_limit > 0 {
-                                    for slice in
-                                        [&bytes[..scan_limit], &bytes[bytes.len() - scan_limit..]]
-                                    {
-                                        let value = sanitize(slice);
-                                        if !self.is_large_uninteresting_repeated_literal(&value) {
-                                            found_candidate |= self
-                                                .scan_encoded_nested_pickle_literal_outcome(
-                                                    &value, position,
-                                                )
-                                                .0;
-                                        }
-                                    }
-                                }
-                                self.record_literal_scan_truncated(
-                                    "bytes",
-                                    bytes.len(),
-                                    "encoded_nested_pickle",
-                                    position,
-                                );
-                                (found_candidate, false)
-                            }
-                        }
-                    };
+                    let encoded_nested_pickle_outcome =
+                        self.scan_encoded_nested_pickle_bytes_literal(bytes, position);
                     let strict_base64_literal = is_strict_base64_literal(bytes);
                     // Complete raw pickles require STOP ('.'), which is outside the
                     // base64 alphabet. After a decoded candidate is confirmed, raw
@@ -6064,6 +6008,64 @@ impl<'a> ScanState<'a> {
         value.len() >= 1024
             && value.len() <= self.options.max_string_literal_scan_chars
             && is_repeated_single_byte(value.as_bytes())
+    }
+
+    fn scan_encoded_nested_pickle_bytes_literal(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        let scan_limit = value.len().min(self.options.max_string_literal_scan_chars);
+        if scan_limit == value.len() {
+            return self.scan_encoded_nested_pickle_bytes_slice(value, position);
+        }
+
+        let mut found_candidate = false;
+        if scan_limit > 0 {
+            for slice in [
+                &value[..scan_limit],
+                &value[value.len().saturating_sub(scan_limit)..],
+            ] {
+                found_candidate |= self
+                    .scan_encoded_nested_pickle_bytes_slice(slice, position)
+                    .0;
+            }
+        }
+        self.record_literal_scan_truncated("bytes", value.len(), "encoded_nested_pickle", position);
+        (found_candidate, false)
+    }
+
+    fn scan_encoded_nested_pickle_bytes_slice(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        match std::str::from_utf8(value) {
+            Ok(value) => {
+                if self.is_large_uninteresting_repeated_literal(value) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(value, position)
+                }
+            }
+            Err(_) => {
+                let sanitized = value
+                    .iter()
+                    .map(|byte| {
+                        if byte.is_ascii() {
+                            char::from(*byte)
+                        } else {
+                            '!'
+                        }
+                    })
+                    .collect::<String>();
+                if self.is_large_uninteresting_repeated_literal(&sanitized) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(&sanitized, position)
+                }
+            }
+        }
     }
 
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) -> bool {

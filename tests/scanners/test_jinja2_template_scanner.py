@@ -1057,6 +1057,30 @@ class TestJinja2TemplateScannerEdgeCases:
         assert budget_checks[0].details["budget_type"] == "budget_exceeded"
         assert budget_checks[0].details["detail"] == "output"
 
+    def test_json_chat_template_output_budget_is_inconclusive_without_security_finding(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(json.dumps({"chat_template": "{{ 'A' * 1000000 }}"}), encoding="utf-8")
+
+        result = Jinja2TemplateScanner(
+            {
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            }
+        ).scan(str(tokenizer_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "budget_exceeded"
+        assert budget_checks[0].details["detail"] == "output"
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
     def test_sandbox_probe_preflights_static_range_list_before_starting_worker(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1380,6 +1404,262 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
 
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{% set r = range %}{{ r(1000)|list }}",
+            "{% set ns = namespace(r=range) %}{{ ns.r(1000)|join }}",
+            "{% set r = range %}{% for item in r(1000) %}{{ item }}{% endfor %}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_uses_configured_budget_for_range_aliases(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "configured-range-alias.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(100001)|min }}",
+            "{{ range(100001)|max }}",
+            "{{ range(100001)|sum }}",
+            "{{ range(100001)|select('odd')|sum }}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_fails_closed_for_cpu_heavy_scalar_range_filters(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "range-scalar-filter.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(100001)|default([])|min }}",
+            "{{ range(100001)|d([])|max }}",
+            "{% set values = range(100001) %}{{ values|sum }}",
+            "{% set r = range %}{{ r(100001)|sum }}",
+            "{% set r = range %}{% set s = r %}{{ s(100001)|min }}",
+            "{% set r = range %}{{ r(100001)|min }}{% set r = small %}",
+            "{% set r, n = range, 100001 %}{{ r(n)|max }}",
+            "{% set (r,) = [range] %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set range, r = small, range %}{{ r(100001)|min }}",
+            "{% set n = 100000 %}{{ range(n + 1)|min }}",
+            "{% set n = 100001 %}{{ range(n)|min }}{% set n = 1 %}",
+            "{% if true %}{% set r = range %}{{ r(100001)|sum }}{% endif %}",
+            "{% if 1 + 1 %}{% set r = range %}{% endif %}{{ r(100001)|min }}",
+            "{% if false %}{% set r = small %}{% elif true %}{% set r = range %}"
+            + "{% else %}{% set r = small %}{% endif %}{{ r(100001)|min }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(range) }}",
+            "{% set r = range %}{% macro m(fn) %}{{ fn(100001)|min }}{% endmacro %}{{ m(r) }}",
+            "{% macro m(r=range) %}{{ r(100001)|min }}{% endmacro %}{{ m() }}",
+            "{% macro m(r, n) %}{{ r(n)|min }}{% endmacro %}{{ m(range, 100001) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set alias = m %}{{ alias(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set alias, _ = m, 0 %}{{ alias(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set (alias,) = [m] %}{{ alias(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}" + "{% set ns = namespace(m=m) %}{{ ns.m(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}"
+            + "{% set ns = namespace() %}{% set ns.m = m %}{{ ns.m(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}"
+            + "{% set ns = namespace(m=m) %}{% set other = ns %}{{ other.m(range) }}",
+            "{% macro m() %}{{ kwargs.r(100001)|min }}{% endmacro %}{{ m(r=range) }}",
+            "{% for r in [range] %}{{ r(100001)|min }}{% endfor %}",
+            "{% set ns = namespace() %}{% for _ in [0] %}{% set ns.r = range %}{% endfor %}{{ ns.r(100001)|min }}",
+            "{% set ns = namespace(r=range) %}{{ ns.r(100001)|min }}",
+            "{% set ns = namespace() %}{% set ns.r = range %}{{ ns.r(100001)|min }}",
+            "{% set ns = namespace(r=range) %}{% set other = ns %}{{ other.r(100001)|min }}",
+            "{% set ns = namespace(xs=range(100001)) %}{{ ns.xs|max }}",
+            "{{ range(100001)|min }}{% set range = 1 %}",
+            "{{ range(100001)|min }}{% macro range(n) %}1{% endmacro %}",
+            "{{ range(10 ** 101, 10 ** 101 + 100001)|min }}",
+            "{% set n = 10 ** 101 %}{% set m = 100001 %}{{ range(n, n + m)|min }}",
+            "{{ range(((-1) ** 100001) * -100001)|min }}",
+            "{% set exponent = 100001 %}{{ range(((-1) ** exponent) * -100001)|sum }}",
+            "{{ range((1 // -(10 ** 1000)) * -100001)|min }}",
+            "{% set denominator = -(10 ** 1000) %}{{ range((1 // denominator) * -100001)|sum }}",
+            "{% set denominator = -(10 ** 1000) %}{{ range((1 % denominator) * -1)|sum }}",
+            "{% set huge = 10 ** 1000 %}{{ range((-huge + -huge) * -1)|sum }}",
+            "{% set huge = 10 ** 1000 %}{{ range((-huge - huge) * -1)|sum }}",
+            "{{ range(10 ** 1000 + -(10 ** 999))|min }}",
+            "{% macro m(xs=range(100001)) %}{{ xs|min }}{% endmacro %}{{ m() }}",
+            "{% set r = range %}{{ r(10)|list }}",
+            "{% set r = range %}{{ r(15)|join }}",
+            "{{ [range(100001)]|map('min')|first }}",
+            "{{ range(100001)|batch(100001)|first|min }}",
+            "{{ range(*[100001])|min }}",
+            "{% for n in [1, 100001] %}{{ range(n)|min }}{% endfor %}",
+            "{% if condition %}{% macro m() %}{{ range(100001)|min }}{% endmacro %}{% endif %}{{ m() }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% macro good() %}ok{% endmacro %}"
+            + "{% if condition %}{% set f=bad %}{% else %}{% set f=good %}{% endif %}{{ f() }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(*[range]) }}",
+            "{% macro m() %}{{ kwargs['r'](100001)|min }}{% endmacro %}{{ m(**{'r': range}) }}",
+            "{% macro m() %}{{ varargs[0](100001)|min }}{% endmacro %}{{ m(range) }}",
+            "{% set r = range if condition else range %}{{ r(100001)|min }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ (m if condition else m)(range) }}",
+            "{% macro w() %}{{ caller(range) }}{% endmacro %}" + "{% call(r) w() %}{{ r(100001)|min }}{% endcall %}",
+            "{% set ns=namespace() %}{% set other=ns %}{% set other.r=range %}{{ ns.r(100001)|min }}",
+            "{% set ns=namespace() %}{% macro bind(x) %}{% set x.r=range %}{% endmacro %}"
+            + "{{ bind(ns) }}{{ ns.r(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}"
+            + "{% macro bind(x) %}{% set x.m=bad %}{% endmacro %}{{ bind(ns) }}{{ ns.m() }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}{% set other=ns %}"
+            + "{% macro bind(x) %}{% set x.m=bad %}{% endmacro %}{{ bind(other) }}{{ ns.m() }}",
+            "{{ [range][0](100001)|min }}",
+            "{{ (range,)[0](100001)|min }}",
+            "{{ (range, range)[-1](100001)|min }}",
+            "{{ ([range] + [range])[0](100001)|min }}",
+            "{{ {'r': range}['r'](100001)|min }}",
+            "{{ {'r': range}.get('r')(100001)|min }}",
+            "{% set xs=[range] %}{{ xs[0](100001)|min }}",
+            "{% set funcs={'r': range} %}{{ funcs['r'](100001)|min }}",
+            "{% set funcs={'r': range} %}{{ funcs.get('r')(100001)|min }}",
+            "{% set funcs=[[range]] %}{{ funcs[0][0](100001)|min }}",
+            "{% set funcs={'outer': {'r': range}} %}{{ funcs.outer.r(100001)|min }}",
+            "{% set funcs={'outer': {'items': range}} %}{{ funcs['outer']['items'](100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% set funcs={'outer': {'items': bad}} %}{{ funcs['outer']['items']() }}",
+            "{% macro small(_count) %}12{% endmacro %}" + "{% set funcs=[small, range] %}{{ funcs[-1](100001)|min }}",
+            "{% set funcs={true: range} %}{{ funcs[true](100001)|min }}",
+            "{% set values=[100001] %}{{ range(values[0])|min }}",
+            "{% set values={'n': 100001} %}{{ range(values.n)|min }}",
+            "{% set values=[[100001]] %}{{ range(values[0][0])|min }}",
+            "{% set n='100001' %}{{ range(n|int)|min }}",
+            "{% set n=100001.9 %}{{ range(n|int)|min }}",
+            "{% set n='100001' %}{% set m=n|int %}{{ range(m)|min }}",
+            "{{ range(('100000' ~ '1')|int)|min }}",
+            "{{ (range|default)(100001)|min }}",
+            "{% set r=range|d %}{{ r(100001)|min }}",
+            "{{ (missing|default(range))(100001)|min }}",
+            "{% set value=missing %}{{ (value|default(range))(100001)|min }}",
+            "{% set value=value|default(range) %}{{ value(100001)|min }}",
+            "{{ (false|default(range, true))(100001)|min }}",
+            "{% set value=0 %}{{ (value|default(range, true))(100001)|min }}",
+            "{% macro m() %}{{ (kwargs|default(range, true))(100001)|min }}{% endmacro %}{{ m() }}",
+            "{% if unknown %}{% set n='1' %}{% endif %}{{ range((n|default('100001'))|int)|min }}",
+            "{% macro small() %}ok{% endmacro %}{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% if unknown %}{% set f=small %}{% endif %}{{ (f|default(bad))() }}",
+            "{% macro small() %}ok{% endmacro %}"
+            + "{% if unknown %}{% set d={'x':small} %}{% else %}{% set d={} %}{% endif %}"
+            + "{{ d.get('x', range)(100001)|min }}",
+            "{% if unknown %}{% set d={'x':1} %}{% else %}{% set d={} %}{% endif %}"
+            + "{{ range(d.get('x', 100001))|min }}",
+            "{% set funcs={} %}{{ funcs.get('r', range)(100001)|min }}",
+            "{% set values={} %}{{ range(values.get('n', 100001))|min }}",
+            "{% macro m(n) %}{{ range(n|int)|min }}{% endmacro %}{{ m('100001') }}",
+            "{% macro m(value) %}{{ (value|default(range))(100001)|min }}{% endmacro %}{{ m(missing) }}",
+            "{% macro m() %}{{ range(kwargs.n)|min }}{% endmacro %}{{ m(n=100001) }}",
+            "{% macro m() %}{{ range(varargs[0])|min }}{% endmacro %}{{ m(100001) }}",
+            "{% set n=100001 %}{{ range(('' ~ n)|int)|min }}",
+            "{% set values=[100001] %}{{ range(('' ~ values[0])|int)|min }}",
+            "{{ {-1:range}[-1](100001)|min }}",
+            "{{ {-1:range}.get(-1)(100001)|min }}",
+            "{{ range({-1:100001}[-1])|min }}",
+            "{{ {none:range}[none](100001)|min }}",
+            "{% set funcs={none:range} %}{{ funcs[none](100001)|min }}",
+            "{{ {(1,2):range}[(1,2)](100001)|min }}",
+            "{% set funcs={(1,2):range} %}{{ funcs[(1,2)](100001)|min }}",
+            "{% set kw={} %}{% macro m() %}{{ range(100001)|min }}{% endmacro %}{{ m(**kw) }}",
+            "{% set kw={'x': none} %}{% macro m() %}{{ kwargs }}{{ range(100001)|min }}{% endmacro %}{{ m(**kw) }}",
+            "{{ ([range]|first)(100001)|min }}",
+            "{{ ([range]|last)(100001)|min }}",
+            "{{ ([small, range]|reverse|first)(100001)|min }}",
+            "{% for key, r in {'x': range}.items() %}{{ r(100001)|min }}{% endfor %}",
+            "{% for r in [range]|reverse %}{{ r(100001)|min }}{% endfor %}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{{ [bad][0]() }}",
+            "{% set args=[range] %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(*args) }}",
+            "{% set kw={'r': range} %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(**kw) }}",
+            "{% set args=[100001] %}{{ range(*args)|min }}",
+            "{% macro small(_count) %}0{% endmacro %}"
+            + "{% macro recurse(n, f) %}{% if n %}{{ recurse(0, range) }}"
+            + "{% else %}{{ f(100001)|min }}{% endif %}{% endmacro %}{{ recurse(1, small) }}",
+            "{% if condition %}{% set n=100001 %}{% else %}{% set n=1 %}{% endif %}{{ range(n)|min }}",
+            "{% if condition %}{% set n=1 %}{% else %}{% set n=200001 %}{% endif %}" + "{{ range(0, 200001, n)|min }}",
+            "{% if condition %}{% set n=-1 %}{% else %}{% set n=-200001 %}{% endif %}"
+            + "{{ range(200001, 0, n)|min }}",
+            "{% if condition %}{% set n=-200001 %}{% else %}{% set n=100001 %}{% endif %}{{ range(n)|min }}",
+            "{% if condition %}{% set n=0 %}{% else %}{% set n=200000 %}{% endif %}"
+            + "{% set step=n + 1 %}{{ range(0, 200001, step)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set r=range %}"
+            + "{% block b %}{% set r=small %}{% endblock %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set r=range %}"
+            + "{% filter string %}{% set r=small %}{% endfilter %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set r=range %}"
+            + "{% set x %}{% set r=small %}{% endset %}{{ r(100001)|min }}",
+            "{% set ns=namespace() %}{% block b %}{% set ns.r=range %}{% endblock %}" + "{{ ns.r(100001)|min }}",
+            "{% set ns=namespace() %}{% filter upper %}{% set ns.r=range %}{% endfilter %}" + "{{ ns.r(100001)|min }}",
+            "{% set ns=namespace() %}{% set x %}{% set ns.r=range %}{% endset %}" + "{{ ns.r(100001)|min }}",
+            "{% set ns=namespace() %}{% with %}{% set ns.r=range %}{% endwith %}" + "{{ ns.r(100001)|min }}",
+            "{{ range((10 ** 1000 + 1) - 10 ** 999)|min }}",
+            "{{ range(3 ** 1000 - 2 ** 1000)|min }}",
+            "{{ range((-(10 ** 1000)) ** 3, 0)|min }}",
+            "{{ range((-2) ** (10 ** 101))|list }}",
+            "{{ range((2 ** 400) % 999983)|list }}",
+            "{{ range(3 ** 300 - (2 ** 400 + 1))|min }}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_fails_closed_for_wrapped_scalar_range_filters(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "wrapped-range-scalar-filter.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
     def test_unavailable_sandbox_worker_keeps_direct_range_repr_clean(
         self,
         tmp_path: Path,
@@ -1387,7 +1667,7 @@ class TestJinja2TemplateScannerEdgeCases:
     ) -> None:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "direct-range-expression.jinja"
-        template_file.write_text("{{ range(1000) }}", encoding="utf-8")
+        template_file.write_text("{{ range(100000) }}", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
         monkeypatch.setattr(
@@ -1404,9 +1684,151 @@ class TestJinja2TemplateScannerEdgeCases:
     @pytest.mark.parametrize(
         "template_content",
         [
-            "{{ range(1000)|min }}",
-            "{{ range(1000)|max }}",
-            "{{ range(1000)|sum }}",
+            "{% set range = 1 %}{{ range(100001)|min }}",
+            "{% set n = 1 %}{{ range(n)|min }}{% set n = 100001 %}",
+            "{% macro small(_count) %}12{% endmacro %}",
+            "{% set ns = namespace(r=range) %}{% set ns.r = small %}{{ ns.r(100001)|min }}",
+            "{% set range %}not callable{% endset %}{{ range(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% with range = small %}{{ range(100001)|min }}{% endwith %}",
+            "{% macro small(_count) %}12{% endmacro %}{% for range in [small] %}{{ range(100001)|min }}{% endfor %}",
+            "{{ range(10 ** 101, 10 ** 101 + 100000)|min }}",
+            "{% set n = 10 ** 101 %}{% set m = 100000 %}{{ range(n, n + m)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(small) }}",
+            "{% macro small(_count) %}12{% endmacro %}{% macro m(r=small) %}{{ r(100001)|min }}{% endmacro %}{{ m() }}",
+            "{% set r = range %}{% if condition %}{% set r = small %}"
+            + "{% else %}{% set r = small %}{% endif %}{{ r(100001)|min }}",
+            "{{ range((10 ** 1000) // (10 ** 999))|sum }}",
+            "{{ range((10 ** 1000) % (10 ** 999))|sum }}",
+            "{{ range(10 ** 1000 + -(10 ** 1000))|sum }}",
+            "{% set a = 10 ** 1000 %}{% set b = a %}{{ range(a - b)|min }}",
+            "{% set a = 10 ** 1000 %}{% set b = a %}{{ range(a // b)|min }}",
+            "{% set a = 10 ** 1000 %}{% set b = a %}{{ range(a % b)|min }}",
+            "{{ range(0, 10 ** 1000, 10 ** 1000)|min }}",
+            "{% macro m() %}{{ range(100001)|min }}{% endmacro %}",
+            "{% for _ in range(0) %}{{ range(100001)|min }}{% endfor %}",
+            "{{ range(100001)|min if false else 0 }}",
+            "{% set r, x = (range,) %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}"
+            + "{{ m(small, r=range) }}",
+            "{% macro m() %}{{ range(100001)|min }}{% endmacro %}{{ m(foo=1) }}",
+            "{% macro m() %}{{ range(100001)|min }}{% endmacro %}" + "{% set ns = namespace(m=m) %}{{ ns.m(foo=1) }}",
+            "{% set ns = 1 %}{% set ns.r = range %}{{ ns.r(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% set ns = 1 %}{% set ns.m = bad %}{{ ns.m() }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}"
+            + "{% macro bind(x) %}{% set x=namespace(m=bad) %}{% endmacro %}{{ bind(ns) }}{{ ns.m() }}",
+            "{{ [range][0](100000)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}"
+            + "{% set funcs={1: small, '1': range} %}{{ funcs[1](100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}"
+            + "{% set funcs={1: range, '1': small} %}{{ funcs['1'](100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}"
+            + "{% set funcs={'r': range, 'r': small} %}{{ funcs.r(100001)|min }}",
+            "{% set funcs={'r': range} %}{{ (funcs|attr('r'))(100001)|min }}",
+            "{% set kwargs={'n':100001} %}{% macro m() %}{{ range(kwargs.n)|min }}{% endmacro %}{{ m() }}",
+            "{% set varargs=[100001] %}{% macro m() %}{{ range(varargs[0])|min }}{% endmacro %}{{ m() }}",
+            "{% set funcs={'items': range} %}{{ funcs.items(100001)|min }}",
+            "{% set funcs={'outer': {'items': range}} %}{{ funcs.outer.items(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% set funcs={'outer': {'items': bad}} %}{{ funcs.outer.items() }}",
+            "{% set values={'items': 100001} %}{{ range(values.items)|min }}",
+            "{% for n in [0] if n %}{{ range(100001)|min }}{% endfor %}",
+            "{% for n in [1] if not n %}{{ range(100001)|min }}{% endfor %}",
+            "{% for n in [1,2] if n < 0 %}{{ range(100001)|min }}{% endfor %}",
+            "{% for n in [1,2] if n == 0 %}{{ range(100001)|min }}{% endfor %}",
+            "{% for n in [1,1] if n != 1 %}{{ range(100001)|min }}{% endfor %}",
+            "{% for n in {'x':0}.values() if n %}{{ range(100001)|min }}{% endfor %}",
+            "{% set value=1 %}{{ (value|default(range))(100001)|min }}",
+            "{% set value='ok' %}{{ (value|d(range))(100001)|min }}",
+            "{% macro m(value) %}{{ (value|default(range))(100001)|min }}{% endmacro %}{{ m(1) }}",
+            "{% macro small(_count) %}12{% endmacro %}{{ (small|default(range))(100001)|min }}",
+            "{% set d={'x':'ok'} %}{{ (d.x|default(range))(100001)|min }}",
+            "{% set d={'x':{'y':'ok'}} %}{{ (d['x']['y']|default(range))(100001)|min }}",
+            "{% set ns=namespace(x='ok') %}{{ (ns.x|default(range))(100001)|min }}",
+            "{% set ns=namespace() %}{% set ns.x='ok' %}{{ (ns.x|default(range))(100001)|min }}",
+            "{% set value %}ok{% endset %}{{ (value|default(range))(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% macro wrapper(value) %}{{ (value|default(bad))() }}{% endmacro %}{{ wrapper(1) }}",
+            "{% set kwargs=range %}{% macro m() %}{{ kwargs(100001)|min }}{% endmacro %}{{ m() }}",
+            "{% set varargs=range %}{% macro m() %}{{ varargs(100001)|min }}{% endmacro %}{{ m() }}",
+            "{% macro m() %}{{ (kwargs|default(range))(100001)|min }}{% endmacro %}{{ m() }}",
+            "{{ range((-(10 ** 1000)) ** 2, 0)|min }}",
+            "{% set r = range %}{{ r(4)|list }}",
+            "{% set r = range %}{{ r(10)|join }}",
+            "{% for n in [100001] if false %}{{ range(n)|min }}{% else %}ok{% endfor %}",
+            "{% macro noop(caller=None) %}ok{% endmacro %}" + "{% call noop() %}{{ range(100001)|min }}{% endcall %}",
+            "{% macro small(_count) %}12{% endmacro %}{% set ns=namespace(r=range) %}"
+            + "{% set other=ns %}{% set other.r=small %}{{ ns.r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set r=small %}"
+            + "{% block b %}{% set r=range %}{% endblock %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set r=small %}"
+            + "{% filter string %}{% set r=range %}{% endfilter %}{{ r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set ns=namespace(r=range) %}"
+            + "{% block b %}{% set ns.r=small %}{% endblock %}{{ ns.r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set ns=namespace(r=range) %}"
+            + "{% filter upper %}{% set ns.r=small %}{% endfilter %}{{ ns.r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set ns=namespace(r=range) %}"
+            + "{% set x %}{% set ns.r=small %}{% endset %}{{ ns.r(100001)|min }}",
+            "{% macro small(_count) %}12{% endmacro %}{% set ns=namespace(r=range) %}"
+            + "{% with %}{% set ns.r=small %}{% endwith %}{{ ns.r(100001)|min }}",
+            "{% if 1 - 1 %}{{ range(100001)|min }}{% endif %}",
+            "{{ range(0, 10 ** 1000, 2 * 10 ** 1000)|min }}",
+            "{% if condition %}{% set n=100001 %}{% else %}{% set n=200001 %}{% endif %}"
+            + "{{ range(0, 200001, n)|min }}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_keeps_ordered_range_boundaries_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "ordered-range-boundary.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_keeps_small_symbolic_range_delta_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "small-symbolic-range-delta.jinja"
+        template_file.write_text(
+            "{{ range(10 ** 1000, (10 ** 1000 + 2) - 1) }}",
+            encoding="utf-8",
+        )
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 65536})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(100000)|min }}",
+            "{{ range(100000)|max }}",
+            "{{ range(100000)|sum }}",
             "{{ range(1000)|slice(10) }}",
         ],
     )
@@ -1420,7 +1842,313 @@ class TestJinja2TemplateScannerEdgeCases:
         template_file = tmp_path / "bounded-range-filter.jinja"
         template_file.write_text(template_content, encoding="utf-8")
 
-        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 64})
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_respects_shadowed_range_macro(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "shadowed-range-macro.jinja"
+        template_file.write_text(
+            "{% macro range(_count) %}12{% endmacro %}{{ range(100001)|min }}",
+            encoding="utf-8",
+        )
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{% macro range(_count) %}12{% endmacro %}{{ range(100001)|list }}",
+            "{% macro range(_count) %}12{% endmacro %}{{ range(100001)|join }}",
+            "{% macro range(_count) %}12{% endmacro %}{% for item in range(100001) %}{{ item }}{% endfor %}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_respects_shadowed_range_in_eager_contexts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "shadowed-range-eager.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_static_range_analysis_fails_closed_when_macro_expansion_budget_is_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RENDER_ANALYSIS_STEPS", 32)
+        definitions: list[str] = []
+        assignments: list[str] = []
+        for index in range(6):
+            next_call = f"f{index + 1}()" if index + 1 < 6 else "0"
+            definitions.extend(
+                [
+                    f"{{% macro a{index}() %}}{{{{ {next_call} }}}}{{% endmacro %}}",
+                    f"{{% macro b{index}() %}}{{{{ {next_call} }}}}{{% endmacro %}}",
+                ]
+            )
+            assignments.append(
+                f"{{% if condition{index} %}}{{% set f{index}=a{index} %}}"
+                f"{{% else %}}{{% set f{index}=b{index} %}}{{% endif %}}"
+            )
+        template_content = "".join([*definitions, *assignments, "{{ f0() }}"])
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_fails_closed_when_projection_budget_is_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RANGE_PROJECTION_ITEMS", 15_000)
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1_000_000})
+
+        assert scanner._template_has_static_render_budget_risk("{{ range(10000)|list }}" * 2) is True
+
+    def test_static_range_analysis_fails_closed_when_candidate_values_are_truncated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        values = [1, 2, 3, 4, 6, 7, 8, 9, 5]
+        branches = [
+            f"{{% {'if' if index == 0 else 'elif'} condition{index} %}}{{% set n={value} %}}"
+            for index, value in enumerate(values[:-1])
+        ]
+        template_content = (
+            "".join(branches) + "{% else %}{% set n=5 %}{% endif %}" + "{{ range(0,100001,((n-5)|abs)+1)|min }}"
+        )
+        template_file = tmp_path / "candidate-truncation.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "test"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+
+    def test_static_range_analysis_bounds_candidate_variant_projection(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+
+        def binding(name: str, scale: int, binding_index: int) -> str:
+            values = [item * scale for item in range(8)]
+            branches = [
+                f"{{% {'if' if index == 0 else 'elif'} condition{binding_index}_{index} %}}{{% set {name}={value} %}}"
+                for index, value in enumerate(values[:-1])
+            ]
+            return "".join(branches) + f"{{% else %}}{{% set {name}={values[-1]} %}}{{% endif %}}"
+
+        template_content = (
+            "".join(
+                binding(name, scale, index)
+                for index, (name, scale) in enumerate(zip("abcd", [1, 8, 64, 512], strict=True))
+            )
+            + "{{ range(10000+a+b+c+d)|list }}"
+        )
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 65_536})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_charges_empty_macro_candidates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RENDER_ANALYSIS_STEPS", 64)
+        candidate_count = 16
+        macro_definitions = "".join(
+            f"{{% macro candidate{index}() %}}{{% endmacro %}}" for index in range(candidate_count)
+        )
+        conditional_bindings = "".join(
+            f"{{% if condition{index} %}}{{% set selected=candidate{index} %}}{{% endif %}}"
+            for index in range(candidate_count)
+        )
+        template_content = macro_definitions + conditional_bindings + "{{ selected() }}" * candidate_count
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_bounds_wide_destructuring_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RENDER_ANALYSIS_STEPS", 128)
+        binding_count = 16
+        prefix = "".join(f"{{% set source{index}={index} %}}" for index in range(binding_count))
+        targets = ",".join(f"target{index}" for index in range(binding_count))
+        values = ",".join("1" for _ in range(binding_count))
+        template_content = prefix + f"{{% set {targets}=[{values}] %}}"
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_bounds_nested_container_paths(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_CONTAINER_PATHS", 32)
+        nested_value = "1"
+        for _ in range(6):
+            nested_value = f"[{nested_value}]"
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(f"{{% set value={nested_value} %}}") is True
+
+    @pytest.mark.parametrize("unpack_kind", ["args", "kwargs"])
+    def test_static_range_analysis_bounds_repeated_macro_argument_projection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        unpack_kind: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RENDER_ANALYSIS_STEPS", 2_048)
+        if unpack_kind == "args":
+            packed_value = "[" + ",".join(str(index) for index in range(16)) + "]"
+            macro = "{% macro m() %}{% if varargs %}ok{% endif %}{% endmacro %}"
+            call = "{{ m(*packed) }}"
+        else:
+            packed_value = "{" + ",".join(f"'k{index}':{index}" for index in range(16)) + "}"
+            macro = "{% macro m() %}{% if kwargs %}ok{% endif %}{% endmacro %}"
+            call = "{{ m(**packed) }}"
+        template_content = f"{{% set packed={packed_value} %}}" + macro + call * 4
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    @pytest.mark.parametrize("unpack_kind", ["args", "kwargs"])
+    def test_static_range_analysis_allows_bounded_macro_argument_projection(
+        self,
+        unpack_kind: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        if unpack_kind == "args":
+            packed_value = "[" + ",".join(str(index) for index in range(16)) + "]"
+            macro = "{% macro m() %}{% if varargs %}ok{% endif %}{% endmacro %}"
+            call = "{{ m(*packed) }}"
+        else:
+            packed_value = "{" + ",".join(f"'k{index}':{index}" for index in range(16)) + "}"
+            macro = "{% macro m() %}{% if kwargs %}ok{% endif %}{% endmacro %}"
+            call = "{{ m(**packed) }}"
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert (
+            scanner._template_has_static_preflight_render_budget_risk(
+                f"{{% set packed={packed_value} %}}" + macro + call
+            )
+            is False
+        )
+
+    def test_static_range_analysis_bounds_wide_repeated_macro_unpacking(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        packed_value = "[" + ",".join(str(index) for index in range(2_000)) + "]"
+        macro = "{% macro m() %}{% if varargs %}ok{% endif %}{% endmacro %}"
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert (
+            scanner._template_has_static_preflight_render_budget_risk(
+                f"{{% set packed={packed_value} %}}" + macro + "{{ m(*packed) }}" * 5
+            )
+            is True
+        )
+
+    def test_static_range_analysis_bounds_wide_formal_macro_binding(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        argument_names = ",".join(f"value{index}" for index in range(2_000))
+        argument_values = ",".join(str(index) for index in range(2_000))
+        template_content = (
+            f"{{% set packed=[{argument_values}] %}}"
+            f"{{% macro m({argument_names}) %}}ok{{% endmacro %}}"
+            "{{ m(*packed) }}"
+        )
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_bounds_wide_omitted_formal_cleanup(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        argument_names = ",".join(f"value{index}" for index in range(2_000))
+        argument_values = ",".join("0" for _ in range(2_000))
+        template_content = (
+            f"{{% set packed=[{argument_values}] %}}{{% macro m({argument_names}) %}}ok{{% endmacro %}}{{{{ m() }}}}"
+        )
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_preflight_render_budget_risk(template_content) is True
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ (namespace(r=range)|attr('r'))(100001)|min }}",
+            "{% set ns=namespace(r=range) %}{{ (ns|attr('r'))(100001)|min }}",
+        ],
+    )
+    def test_static_range_analysis_resolves_namespace_attr_filter(self, template_content: str) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_render_budget_risk(template_content) is True
+
+    def test_unavailable_sandbox_worker_respects_overwritten_range_function_alias(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "overwritten-range-function.jinja"
+        template_file.write_text(
+            "{% macro small(_count) %}12{% endmacro %}"
+            "{% set reducer = range %}{% set reducer = small %}{{ reducer(100001)|min }}",
+            encoding="utf-8",
+        )
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
         monkeypatch.setattr(
             scanner,
             "_test_template_safety_with_budget",
@@ -1590,6 +2318,8 @@ class TestJinja2TemplateScannerEdgeCases:
             "{{ range(10 ** 1000 - 10 ** 1000)|list }}",
             "{{ range((10 ** 1000) // (10 ** 1000))|list }}",
             "{{ range((10 ** 1000) % (10 ** 1000))|list }}",
+            "{{ range((10 ** 101) // 10 - 10 ** 100)|list }}",
+            "{{ range(0, (10 ** 100) % (-(10 ** 100 + 1)), -1)|list }}",
             "{{ range(-(10 ** 1000))|list }}",
             "{{ range(10 ** 1000, 0)|list }}",
         ],
@@ -1603,6 +2333,50 @@ class TestJinja2TemplateScannerEdgeCases:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "invalid-range.jinja"
         template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_keeps_exact_saturated_power_quotient_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "exact-power-quotient.jinja"
+        template_file.write_text("{{ range((10 ** 101) // (10 ** 100))|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1000})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    @pytest.mark.parametrize("numeric_text", ["x" * 4097, "0" * 4097])
+    def test_unavailable_sandbox_worker_keeps_long_non_amplifying_int_filters_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        numeric_text: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "long-int-filter.jinja"
+        template_file.write_text(f'{{{{ range("{numeric_text}"|int)|list }}}}', encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
         monkeypatch.setattr(

@@ -150,7 +150,7 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
     if search_start > 0
         && remaining.len() <= max_nested_pickle_bytes
         && !remaining_is_complete
-        && has_execution_opcode(remaining)
+        && has_structurally_valid_execution_prefix(remaining)
     {
         let payload_len = remaining.len().min(max_nested_pickle_bytes);
         payloads.push((remaining[..payload_len].to_vec(), true));
@@ -170,7 +170,7 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
                 Err(error) if error.is_structured_protocol0_line_operand_limit() => {
                     (probe.len(), true)
                 }
-                Ok(None) | Err(_) if has_execution_opcode(probe) => {
+                Ok(None) | Err(_) if has_structurally_valid_execution_prefix(probe) => {
                     (probe.len().min(max_nested_pickle_bytes), true)
                 }
                 Ok(None) | Err(_) => continue,
@@ -332,6 +332,41 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
                 return true;
             }
             _ => {}
+        }
+        index = parsed.next;
+        if parsed.name == "STOP" {
+            return false;
+        }
+    }
+    false
+}
+
+fn has_structurally_valid_execution_prefix(value: &[u8]) -> bool {
+    if !has_pickle_prefix(value) {
+        return false;
+    }
+
+    let mut index = 0usize;
+    let mut stack_depth = 0usize;
+    let mut mark_depths = Vec::new();
+    while index < value.len() {
+        let parsed = match parse_opcode(value, index, value.len()) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        if matches!(parsed.name, "GLOBAL" | "INST")
+            && !protocol0_opcode_operands_are_import_references(&parsed, value)
+        {
+            return false;
+        }
+        if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
+            return false;
+        }
+        if matches!(
+            parsed.name,
+            "INST" | "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID"
+        ) {
+            return true;
         }
         index = parsed.next;
         if parsed.name == "STOP" {
@@ -2698,6 +2733,14 @@ mod tests {
                 *analysis_incomplete && candidate.starts_with(b"Pevil\n")
             }));
         }
+    }
+
+    #[test]
+    fn decoded_payloads_ignore_execution_like_benign_text_and_suffixes() {
+        let payloads = decoded_pickle_payloads(b"\x80\x04N.README", 64);
+        assert_eq!(payloads, vec![(b"\x80\x04N.".to_vec(), false)]);
+
+        assert!(decoded_pickle_payloads(b"(README benign text", 64).is_empty());
     }
 
     #[test]

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
+- bound Jinja static render analysis and fail closed on CPU-heavy aliased, recursive, container-wrapped, and arithmetic range probes when sandbox workers are unavailable
+- restrict auth bearer-token validation to trusted Promptfoo API hosts unless custom hosts are explicitly configured
 - escape terminal and Unicode formatting controls in human-readable CLI output
 - disable unsafe Joblib and NumPy object metadata deserialization
 - keep concrete active execution, runtime-extension, and blacklist findings from being downgraded by Hugging Face whitelists
@@ -44,10 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
+- redact credential-bearing source identifiers in exported SARIF and SBOM reports
 - reconcile validated streamed shard families across staging directories and add an explicit opt-in for local cross-directory shards
 - stream Flax MessagePack containers with bounded traversal, object, and metadata-key handling instead of a whole-file size cutoff
 - bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
+- detect `BINUNICODE8` literals and bounded concatenated-stream abuse in pickle CVE-2026-24747 SETITEM analysis without treating byte literals as `STACK_GLOBAL` names
 - reject MLflow downloads that replace or escape private staging, hide behind directory links, expose special files, or retain external hardlinks, and report safety refusals without success telemetry
 - scan raw payload indicators inside signature-valid ExecuTorch binaries and launcher-prefixed archives before reporting them clean
 - detect Keras get_file tar extraction from effective call arguments without relying on URL suffixes

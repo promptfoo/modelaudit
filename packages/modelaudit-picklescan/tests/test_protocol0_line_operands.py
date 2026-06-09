@@ -355,6 +355,26 @@ def test_scan_bytes_keeps_benign_base64_byte_literals_with_invalid_utf8_clean(
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+@pytest.mark.parametrize("decoded", [b"\x80\x04N.README", b"(README benign text"])
+def test_scan_bytes_keeps_execution_like_encoded_byte_literal_text_clean(
+    container: type[bytes] | type[bytearray],
+    encoding: str,
+    decoded: bytes,
+) -> None:
+    encoded = base64.b64encode(decoded) if encoding == "base64" else decoded.hex().encode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(container(encoded), protocol=5),
+        source=f"benign-{encoding}-execution-like-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
 @pytest.mark.parametrize("encoded_first", [False, True])
 def test_scan_bytes_keeps_raw_nested_scan_for_mixed_encoded_byte_literals(
     container: type[bytes] | type[bytearray],
@@ -458,6 +478,23 @@ def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> Non
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+
+
+def test_scan_bytes_bounds_valid_utf8_encoded_byte_literal_prefilter() -> None:
+    literal = b"gA" * (512 * 1024)
+
+    started = time.monotonic()
+    report = scan_bytes(
+        pickle.dumps(literal, protocol=5),
+        source="bounded-valid-utf8-byte-literal.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=64, timeout_s=0.05),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 @pytest.mark.parametrize("opcode", [b"g", b"p"])

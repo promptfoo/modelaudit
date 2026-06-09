@@ -18,6 +18,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
 
 import click
+from pydantic import TypeAdapter
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
@@ -46,6 +47,7 @@ from .core import (
 )
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
+from .integrations.source_redaction import redact_source_value
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import IssueSeverity
@@ -110,6 +112,7 @@ from .utils.sources.pytorch_hub import (
 )
 
 logger = logging.getLogger("modelaudit")
+_JSON_VALUE_ADAPTER = TypeAdapter(Any)
 
 
 def _display_path(path: str) -> str:
@@ -2221,12 +2224,14 @@ def _format_scan_output(
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
             audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
-        return audit_result.model_dump_json(indent=2, exclude_none=True)
+        redacted_result = redact_source_value(audit_result.model_dump(mode="python", exclude_none=True))
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(redacted_result, mode="json"), indent=2)
 
     if output_format == "sarif":
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
-    return format_text_output(audit_result.model_dump(), verbose)
+    redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
+    return format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
 
 
 def _emit_scan_output(
@@ -3345,7 +3350,10 @@ def auth() -> None:
 @click.option(
     "-h",
     "--host",
-    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+    help=(
+        "The API URL of the Promptfoo instance. Custom domains must also be configured through "
+        "MODELAUDIT_API_ALLOWED_HOSTS (a comma-separated hostname or URL list), MODELAUDIT_API_HOST, or API_HOST."
+    ),
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
@@ -3355,7 +3363,7 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     start_time = time.time()
     try:
         token = None
-        api_host = host or cloud_config.get_api_host()
+        api_host = host or config.get_api_host()
 
         # Record telemetry (stub for now)
         # telemetry.record('command_used', {'name': 'auth login'})
