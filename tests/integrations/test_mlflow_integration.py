@@ -1866,6 +1866,79 @@ def test_scan_mlflow_model_rejects_download_return_outside_staging(
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_staging_root_symlink_swap(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A backend must not replace the private staging root with an outside link."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_model = outside_dir / "model.pkl"
+    outside_model.write_bytes(b"model")
+    mock_mkdtemp.return_value = str(download_dir)
+
+    def replace_staging_root(*, artifact_uri: str, dst_path: str) -> str:
+        assert artifact_uri == "models:/TestModel/1"
+        assert dst_path == str(download_dir)
+        download_dir.rmdir()
+        download_dir.symlink_to(outside_dir, target_is_directory=True)
+        return str(download_dir / outside_model.name)
+
+    mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_root_changed"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_staging_root_directory_swap(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A new directory at the same path is not the private staging root ModelAudit created."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+
+    def replace_staging_root(*, artifact_uri: str, dst_path: str) -> str:
+        assert artifact_uri == "models:/TestModel/1"
+        assert dst_path == str(download_dir)
+        download_dir.rmdir()
+        download_dir.mkdir()
+        replacement_model = download_dir / "model.pkl"
+        replacement_model.write_bytes(b"replacement")
+        return str(replacement_model)
+
+    mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_root_changed"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_rejects_staged_symlink_to_outside_file(
     mock_scan: MagicMock,
     mock_mkdtemp: MagicMock,
@@ -2233,14 +2306,19 @@ def test_scan_mlflow_model_bounds_staging_tree_validation(
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-def test_scan_mlflow_model_download_error(mock_mkdtemp: MagicMock, mock_rmtree: MagicMock) -> None:
+def test_scan_mlflow_model_download_error(
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test error handling when MLflow download fails."""
     # Mock MLflow with download error
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.side_effect = Exception("Download failed")
 
-    temp_dir = "/tmp/modelaudit_mlflow_test"
-    mock_mkdtemp.return_value = temp_dir
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
@@ -2249,7 +2327,7 @@ def test_scan_mlflow_model_download_error(mock_mkdtemp: MagicMock, mock_rmtree: 
         scan_mlflow_model("models:/TestModel/1")
 
     # Verify cleanup still happens
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(str(temp_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
@@ -2258,11 +2336,14 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     model_uri = "models:/PrivateModel/access_token=DEBUGSECRET123"
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.side_effect = RuntimeError("Download failed")
-    mock_mkdtemp.return_value = "/tmp/modelaudit_mlflow_test"
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
 
     with (
         caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.mlflow"),
@@ -2273,7 +2354,7 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
 
     assert "models:/PrivateModel/access_token=<redacted>" in caplog.text
     assert "DEBUGSECRET123" not in caplog.text
-    mock_rmtree.assert_called_once_with("/tmp/modelaudit_mlflow_test", ignore_errors=True)
+    mock_rmtree.assert_called_once_with(str(temp_dir), ignore_errors=True)
 
 
 def test_scan_mlflow_model_no_registry_uri(tmp_path: Path) -> None:

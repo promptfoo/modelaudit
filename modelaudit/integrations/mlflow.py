@@ -94,6 +94,14 @@ class _MlflowDownloadPlan:
     local_sources: tuple[_MlflowLocalSource, ...] = ()
 
 
+@dataclass(frozen=True)
+class _MlflowDownloadRoot:
+    path: Path
+    stat: os.stat_result
+    file_descriptor: int | None
+    creation_time_ns: int | None
+
+
 class _MlflowArtifactSizeChangedError(Exception):
     def __init__(self, actual_size: int, *, artifact_path: str | None = None, expected_size: int | None = None) -> None:
         super().__init__(f"artifact size changed to {actual_size} bytes")
@@ -1437,6 +1445,66 @@ def _mlflow_entry_is_reparse_point(path: Path, path_stat: os.stat_result) -> boo
     return bool(reparse_flag and file_attributes & reparse_flag)
 
 
+def _capture_mlflow_download_root(
+    model_uri: str,
+    download_dir: str,
+) -> _MlflowDownloadRoot | ModelAuditResultModel:
+    """Capture the private staging directory identity before backend code runs."""
+    root_file_descriptor: int | None = None
+    try:
+        download_dir_path = Path(download_dir).expanduser()
+        download_dir_stat = download_dir_path.stat(follow_symlinks=False)
+        download_root = download_dir_path.resolve(strict=True)
+        download_root_stat = download_root.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to establish the MLflow staging directory",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    if (
+        not stat.S_ISDIR(download_dir_stat.st_mode)
+        or not stat.S_ISDIR(download_root_stat.st_mode)
+        or _mlflow_entry_is_reparse_point(download_dir_path, download_dir_stat)
+        or _mlflow_entry_is_reparse_point(download_root, download_root_stat)
+        or not os.path.samestat(download_dir_stat, download_root_stat)
+    ):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow staging directory is not a stable private directory",
+            {"reason": "artifact_download_root_unsupported"},
+        )
+
+    try:
+        if os.name != "nt":
+            open_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+            root_file_descriptor = os.open(download_root, open_flags)
+            held_root_stat = os.fstat(root_file_descriptor)
+            if not stat.S_ISDIR(held_root_stat.st_mode) or not os.path.samestat(held_root_stat, download_root_stat):
+                raise OSError("MLflow staging directory changed while its identity was captured")
+            download_root_stat = held_root_stat
+    except OSError as exc:
+        if root_file_descriptor is not None:
+            os.close(root_file_descriptor)
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to hold the MLflow staging directory open",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    creation_time_ns = getattr(download_root_stat, "st_birthtime_ns", None)
+    if creation_time_ns is None and os.name == "nt":
+        creation_time_ns = download_root_stat.st_ctime_ns
+    return _MlflowDownloadRoot(download_root, download_root_stat, root_file_descriptor, creation_time_ns)
+
+
 def _validate_mlflow_download_tree(
     model_uri: str,
     download_root: Path,
@@ -1573,9 +1641,13 @@ def _resolve_mlflow_download_path(
     local_path: str,
     download_dir: str,
     max_artifact_entries: int,
+    expected_download_root: _MlflowDownloadRoot,
 ) -> str | ModelAuditResultModel:
     try:
-        download_root = Path(download_dir).expanduser().resolve(strict=True)
+        download_dir_path = Path(download_dir).expanduser()
+        current_download_dir_stat = download_dir_path.stat(follow_symlinks=False)
+        download_root = download_dir_path.resolve(strict=True)
+        current_download_root_stat = download_root.stat(follow_symlinks=False)
         returned_path = Path(local_path).expanduser().resolve(strict=True)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return _mlflow_download_safety_failure_result(
@@ -1585,6 +1657,45 @@ def _resolve_mlflow_download_path(
                 "reason": "artifact_download_path_unavailable",
                 "error": _redact_mlflow_error_for_display(exc),
             },
+        )
+
+    try:
+        held_download_root_stat = (
+            os.fstat(expected_download_root.file_descriptor)
+            if expected_download_root.file_descriptor is not None
+            else expected_download_root.stat
+        )
+    except OSError as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to verify the MLflow staging directory identity",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    current_creation_time_ns = getattr(current_download_root_stat, "st_birthtime_ns", None)
+    if current_creation_time_ns is None and os.name == "nt":
+        current_creation_time_ns = current_download_root_stat.st_ctime_ns
+
+    if (
+        download_root != expected_download_root.path
+        or not stat.S_ISDIR(current_download_dir_stat.st_mode)
+        or not stat.S_ISDIR(current_download_root_stat.st_mode)
+        or _mlflow_entry_is_reparse_point(download_dir_path, current_download_dir_stat)
+        or _mlflow_entry_is_reparse_point(download_root, current_download_root_stat)
+        or not os.path.samestat(current_download_dir_stat, held_download_root_stat)
+        or not os.path.samestat(current_download_root_stat, held_download_root_stat)
+        or (
+            expected_download_root.file_descriptor is None
+            and current_creation_time_ns != expected_download_root.creation_time_ns
+        )
+    ):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow staging directory changed during artifact download",
+            {"reason": "artifact_download_root_changed"},
         )
 
     if not returned_path.is_relative_to(download_root):
@@ -1698,8 +1809,14 @@ def scan_mlflow_model(
         return download_plan
 
     download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
+    download_root_identity: _MlflowDownloadRoot | None = None
 
     try:
+        captured_download_root = _capture_mlflow_download_root(model_uri, download_dir)
+        if isinstance(captured_download_root, ModelAuditResultModel):
+            return captured_download_root
+        download_root_identity = captured_download_root
+
         logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(
@@ -1719,6 +1836,7 @@ def scan_mlflow_model(
             local_path,
             download_dir,
             max_artifact_entries,
+            download_root_identity,
         )
         if isinstance(download_path, ModelAuditResultModel):
             return download_path
@@ -1737,5 +1855,7 @@ def scan_mlflow_model(
             **scan_kwargs,
         )
     finally:
+        if download_root_identity is not None and download_root_identity.file_descriptor is not None:
+            os.close(download_root_identity.file_descriptor)
         if cleanup_download_dir:
             shutil.rmtree(download_dir, ignore_errors=True)

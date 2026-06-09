@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound Joblib decompression output to the configured scanner read budget
 - bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
-- reject MLflow download trees that escape staging, hide behind directory links, expose special files, or retain external hardlinks
+- reject MLflow downloads that replace or escape private staging, hide behind directory links, expose special files, or retain external hardlinks, and report safety refusals without success telemetry
 - scan raw payload indicators inside signature-valid ExecuTorch binaries and launcher-prefixed archives before reporting them clean
 - detect Keras get_file tar extraction from effective call arguments without relying on URL suffixes
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources
