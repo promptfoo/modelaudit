@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
+- fail closed on PMML XML parsing when defusedxml is unavailable instead of using the stdlib parser
+- reject ambiguous, lossy, SDK-invalid, or traversal-bearing Hugging Face direct file URLs, redact rejected URL secrets, and preserve platform-valid filenames
+- scan safe OCI layer links with model-looking member names instead of treating link metadata as complete coverage
+- preserve scanner read caps when core max_file_size is unlimited
+- reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
 - restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names

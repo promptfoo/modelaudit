@@ -233,6 +233,17 @@ class TestHuggingFaceURLParsing:
 class TestExtractModelIdFromPath:
     """Test HuggingFace model ID extraction from local paths."""
 
+    @pytest.mark.parametrize(
+        ("url", "model_id"),
+        [
+            ("https://huggingface.co/gpt2/resolve/main/config.json", "gpt2"),
+            ("https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/model.bin", "user/repo"),
+        ],
+    )
+    def test_extract_model_id_from_direct_file_url(self, url: str, model_id: str) -> None:
+        """Direct file URLs should retain their repository provenance."""
+        assert extract_model_id_from_path(url) == (model_id, "huggingface")
+
     def test_extract_model_id_from_local_config(self, tmp_path: Path) -> None:
         """Local config metadata should still be extracted as local provenance."""
         model_dir = tmp_path / "model"
@@ -3146,19 +3157,61 @@ class TestHuggingFaceFileURLs:
         assert "hf_secret" not in redacted
         assert "#frag" not in redacted
 
-    def test_valid_file_urls(self):
+    def test_invalid_host_error_redacts_credentials_and_query(self) -> None:
+        """Rejected lookalike hosts must not echo secrets in validation errors."""
+        url = "https://alice:password@evil.example/org/repo/resolve/main/model.bin?token=secret#frag"
+
+        with pytest.raises(ValueError) as exc_info:
+            parse_huggingface_file_url(url)
+
+        message = str(exc_info.value)
+        assert "evil.example/org/repo/resolve/main/model.bin" in message
+        assert "alice" not in message
+        assert "password" not in message
+        assert "token=" not in message
+        assert "secret" not in message
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://alice:password@huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+            "https:huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+            "https:alice:password@huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+            "javascript:huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+            "huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+            "https://alice:password@huggingface.co\uff0fevil/org/repo/resolve/main/model.bin?token=secret#frag",
+            "https://alice:password\uff20huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
+        ],
+    )
+    def test_invalid_url_error_redacts_credentials_and_query(self, url: str) -> None:
+        """Rejected schemes, authorities, and netlocs must not echo embedded secrets."""
+
+        with pytest.raises(ValueError) as exc_info:
+            parse_huggingface_file_url(url)
+
+        message = str(exc_info.value)
+        assert "alice" not in message
+        assert "password" not in message
+        assert "token=" not in message
+        assert "secret" not in message
+
+    def test_valid_file_urls(self) -> None:
         """Test that valid HuggingFace file URLs are detected."""
         valid_urls = [
+            "https://huggingface.co/gpt2/resolve/main/config.json",
             "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
             "https://huggingface.co/facebook/bart-large/resolve/main/config.json",
             "https://hf.co/microsoft/DialoGPT/resolve/main/model.safetensors",
-            "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",  # Percent-encoded revision
+            "https://hf.co/facebook/bart-large/resolve/main/subfolder/model.safetensors",
+            "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",
+            "https://huggingface.co/user/repo/resolve/feature%2Ffoo/file.bin",
+            "https://huggingface.co/user/repo/resolve/v1.0/model%20file.bin",
             "https://user:pass@huggingface.co/private/repo/resolve/main/model.bin?token=hf_secret",
         ]
         for url in valid_urls:
             assert is_huggingface_file_url(url), f"Failed to detect valid file URL: {url}"
 
-    def test_invalid_file_urls(self):
+    def test_invalid_file_urls(self) -> None:
         """Test that invalid URLs are not detected as HuggingFace file URLs."""
         invalid_urls = [
             "https://huggingface.co/bert-base-uncased",  # Model URL, not file URL
@@ -3169,9 +3222,17 @@ class TestHuggingFaceFileURLs:
         for url in invalid_urls:
             assert not is_huggingface_file_url(url), f"Incorrectly detected invalid file URL: {url}"
 
-    def test_parse_file_urls(self):
+    def test_parse_file_urls(self) -> None:
         """Test parsing HuggingFace file URLs."""
         test_cases = [
+            (
+                "https://huggingface.co/gpt2/resolve/main/config.json",
+                ("gpt2", "main", "config.json"),
+            ),
+            (
+                f"https://huggingface.co/{'a' * 47}/{'b' * 48}/resolve/main/model.bin",
+                (f"{'a' * 47}/{'b' * 48}", "main", "model.bin"),
+            ),
             (
                 "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
                 ("bert-base/uncased", "main", "pytorch_model.bin"),
@@ -3186,7 +3247,15 @@ class TestHuggingFaceFileURLs:
             ),
             (
                 "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",
-                ("user/repo", "refs/pr/1", "file.bin"),  # Percent-decoded revision
+                ("user/repo", "refs/pr/1", "file.bin"),
+            ),
+            (
+                "https://huggingface.co/user/repo/resolve/feature%2Ffoo/file.bin",
+                ("user/repo", "feature/foo", "file.bin"),
+            ),
+            (
+                "https://huggingface.co/user/repo/resolve/v1.0/model%20file.bin",
+                ("user/repo", "v1.0", "model file.bin"),
             ),
             (
                 "https://user:pass@huggingface.co/private/repo/resolve/main/model.bin?token=hf_secret",
@@ -3197,7 +3266,7 @@ class TestHuggingFaceFileURLs:
             repo_id, branch, filename = parse_huggingface_file_url(url)
             assert (repo_id, branch, filename) == expected, f"Failed to parse file URL: {url}"
 
-    def test_parse_invalid_file_urls(self):
+    def test_parse_invalid_file_urls(self) -> None:
         """Test that invalid file URLs raise ValueError."""
         invalid_urls = [
             "https://github.com/user/repo/blob/main/file.bin",
@@ -3223,8 +3292,228 @@ class TestHuggingFaceFileURLs:
 
         assert is_huggingface_file_url(url) is False
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://huggingface.co/test/model/resolve/%2e%2e/model.bin",
+            "https://huggingface.co/test/model/resolve/%2e%2e%2Fmain/model.bin",
+            "https://huggingface.co/test/model/resolve/refs%2F..%2Fmain/model.bin",
+            "https://huggingface.co/test/model/resolve/%2Fmain/model.bin",
+            "https://huggingface.co/test/model/resolve/main%2F/model.bin",
+            "https://huggingface.co/test/model/resolve/refs%2F%2Fmain/model.bin",
+            "https://huggingface.co/test/model/resolve/refs%5Cmain/model.bin",
+            "https://huggingface.co/test/model/resolve/main/%2e%2e%2Fsecrets.bin",
+            "https://huggingface.co/test/model/resolve/main/subdir%2Fmodel.bin",
+            "https://huggingface.co/test/model/resolve/main/%2Fetc%2Fpasswd",
+            "https://huggingface.co/test/model/resolve/main/../model.bin",
+            "https://huggingface.co/test/model/resolve/main//model.bin",
+            "https://huggingface.co/test/model/resolve/main/model.bin/",
+        ],
+    )
+    def test_parse_file_url_rejects_unsafe_revision_or_filename_components(self, url: str) -> None:
+        """Direct file URLs must not smuggle traversal or separators into SDK paths."""
+        with pytest.raises(ValueError):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://huggingface.co/test/model/resolve/main/model.bin",
+            "//huggingface.co/test/model/resolve/main/model.bin",
+            "https://huggingface.co:invalid/test/model/resolve/main/model.bin",
+            "https://huggingface.co:444/test/model/resolve/main/model.bin",
+            "https://huggingface.co/foo/resolve/resolve/main/file.bin",
+            f"https://huggingface.co/{'a' * 48}/{'b' * 48}/resolve/main/model.bin",
+            "https://huggingface.co/test%FF/model/resolve/main/model.bin",
+            "https://huggingface.co/test/model/resolve/rev%FF/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%FF.bin",
+            "https://huggingface.co/test/model/resolve/main/model%00.bin",
+            "https://huggingface.co/test/model/resolve/rev%/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%ZZ.bin",
+            "https://huggingface.co/test/model/resolve/%C2%85/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%C2%85.bin",
+            "https://huggingface.co/test/model/resolve/main/model\ud800.bin",
+            "\x00https://huggingface.co/test/model/resolve/main/model.bin",
+            " https://huggingface.co/test/model/resolve/main/model.bin",
+            "https://huggingface.co/te\nst/model/resolve/main/model.bin",
+            "https://huggingface.co/test/model/resolve/ma\tin/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model\r.bin",
+        ],
+    )
+    def test_parse_file_url_rejects_ambiguous_or_sdk_invalid_components(self, url: str) -> None:
+        """Validation should reject lossy decoding and repo IDs the SDK cannot accept."""
+        with pytest.raises(ValueError):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "..%20",
+            "C%3A",
+            "CON",
+            "CONIN%24",
+            "conout%24.log",
+            "COM%C2%B9",
+            "LPT%C2%B2.log",
+            "nul.txt",
+            "model.bin.",
+            "model.bin%20",
+            "model.bin%3Astream",
+            "model%3F.bin",
+            "subdir%5Cmodel.bin",
+        ],
+    )
+    def test_parse_file_url_rejects_windows_unsafe_filename_components(
+        self,
+        filename: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows device, drive, alias, and alternate-stream names must fail closed."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+        url = f"https://huggingface.co/test/model/resolve/main/{filename}"
+
+        with pytest.raises(ValueError, match="on Windows"):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    def test_parse_file_url_preserves_posix_colon_filename(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows-only path restrictions should not reject a valid POSIX filename."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", False)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/main/model.bin%3Astream") == (
+            "test/model",
+            "main",
+            "model.bin:stream",
+        )
+
+    def test_parse_file_url_preserves_posix_backslash_filename(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A backslash is a literal POSIX filename character, not a path separator."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", False)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/main/dir%5Cweights.bin") == (
+            "test/model",
+            "main",
+            "dir\\weights.bin",
+        )
+
+    def test_parse_file_url_preserves_posix_colon_revision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows-only cache path restrictions should not reject a POSIX revision."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", False)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/release%3A1/model.bin") == (
+            "test/model",
+            "release:1",
+            "model.bin",
+        )
+
+    @pytest.mark.parametrize(
+        "revision",
+        [
+            "C%3A",
+            "NUL",
+            "refs%2FNUL%2F1",
+            "refs%2FCOM%C2%B3%2F1",
+            "branch.",
+            "branch%20",
+            "branch%3Fname",
+        ],
+    )
+    def test_parse_file_url_rejects_windows_unsafe_revision_components(
+        self,
+        revision: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revisions become SDK cache paths and must be Windows-safe component by component."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+        url = f"https://huggingface.co/test/model/resolve/{revision}/model.bin"
+
+        with pytest.raises(ValueError, match="on Windows"):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    def test_parse_file_url_allows_windows_safe_slash_revision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Valid PR refs remain supported when each cache-path component is safe."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/refs%2Fpr%2F1/model.bin") == (
+            "test/model",
+            "refs/pr/1",
+            "model.bin",
+        )
+
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_file_success(self, mock_hf_hub_download):
+    def test_download_file_rejects_windows_unsafe_revision_before_sdk(
+        self,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unsafe revision cache paths must fail before any SDK download."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+
+        with pytest.raises(ValueError, match="revision path component on Windows"):
+            download_file_from_hf("https://huggingface.co/test/model/resolve/C%3A/model.bin")
+
+        mock_hf_hub_download.assert_not_called()
+
+    def test_parse_file_url_accepts_default_https_port(self) -> None:
+        """An explicit default transport port should preserve the same repository locator."""
+        assert parse_huggingface_file_url("https://huggingface.co:443/test/model/resolve/main/model.bin") == (
+            "test/model",
+            "main",
+            "model.bin",
+        )
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_rejects_unsafe_direct_url_before_sdk_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+    ) -> None:
+        """Unsafe decoded filename components should fail before the SDK download path."""
+        with pytest.raises(ValueError, match="Invalid HuggingFace filename path component"):
+            download_file_from_hf("https://huggingface.co/test/model/resolve/main/%2e%2e%2Fsecrets.bin")
+
+        mock_hf_hub_download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://huggingface.co/{'a' * 48}/{'b' * 48}/resolve/main/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%FF.bin",
+            "https://huggingface.co/test/model/resolve/main/model\n.bin",
+        ],
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_rejects_sdk_invalid_direct_url_before_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+        url: str,
+    ) -> None:
+        """Repository, encoding, and raw URL validation must complete before the SDK call."""
+        with pytest.raises(ValueError):
+            download_file_from_hf(url)
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_success(self, mock_hf_hub_download: MagicMock) -> None:
         """Test successful file download from HuggingFace."""
         mock_path = "/tmp/downloaded_file.bin"
         mock_hf_hub_download.return_value = mock_path
@@ -3242,7 +3531,24 @@ class TestHuggingFaceFileURLs:
         assert result == Path(mock_path)
 
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_file_with_cache_dir(self, mock_hf_hub_download, tmp_path):
+    def test_download_file_allows_encoded_slash_revision(self, mock_hf_hub_download: MagicMock) -> None:
+        """Legitimate PR refs should reach the SDK as decoded slash-containing revisions."""
+        mock_hf_hub_download.return_value = "/tmp/downloaded_file.bin"
+
+        result = download_file_from_hf(
+            "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/model.bin",
+        )
+
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="user/repo",
+            filename="model.bin",
+            revision="refs/pr/1",
+            cache_dir=None,
+        )
+        assert result == Path("/tmp/downloaded_file.bin")
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_cache_dir(self, mock_hf_hub_download: MagicMock, tmp_path: Path) -> None:
         """Test file download with custom cache directory."""
         mock_path = str(tmp_path / "downloaded_file.bin")
         mock_hf_hub_download.return_value = mock_path
