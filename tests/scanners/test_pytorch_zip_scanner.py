@@ -2334,10 +2334,10 @@ def test_pytorch_zip_detects_compound_late_runpy_alias_restore(tmp_path: Path, r
         b"original = runner\nrunner = print\nif True:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
         b"original = runner\nrunner = print\nif 1:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
         b"original = runner\nrunner = print\nif False:\n    pass\nelif True:\n    pass\nelse:\n"
-        b"    runner = original\n(runner)('safe')\n",
+        + b"    runner = original\n(runner)('safe')\n",
         b"original = runner\nrunner = print\nif 'enabled':\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
         b"original = runner\nrunner = print\nif True:\n    pass\nelif False:\n    pass\nelse:\n"
-        b"    runner = original\n(runner)('safe')\n",
+        + b"    runner = original\n(runner)('safe')\n",
         b"if globals().get('enabled'):\n    runner = print\nelif True:\n    runner = print\n(runner)('safe')\n",
         b"getattr(object=rp, name='run_path')('safe')\n",
     ],
@@ -2366,16 +2366,18 @@ def test_pytorch_zip_preserves_definitely_safe_late_conditional_alias_state(tmp_
     "late_state",
     [
         b"enabled = True\nrunner = rp.run_path if enabled else print\n"
-        b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
+        + b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
         b"from runpy import run_path as runner\nif globals().get('enabled'):\n    pass\n"
-        b"elif True:\n    runner = print\n(runner)('payload.py')\n",
-        b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
-        b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
-        b"else:\n    runner = print\n(runner)('payload.py')\n",
+        + b"elif True:\n    runner = print\n(runner)('payload.py')\n",
+        (
+            b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
+            + b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
+            + b"else:\n    runner = print\n(runner)('payload.py')\n"
+        ),
         b"from runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
-        b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+        + b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
         b"\x00\xfffrom runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
-        b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+        + b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
     ],
 )
 def test_pytorch_zip_detects_late_alias_after_uncertain_safe_overwrite(tmp_path: Path, late_state: bytes) -> None:
@@ -2404,11 +2406,11 @@ def test_pytorch_zip_detects_late_alias_after_uncertain_safe_overwrite(tmp_path:
         b"import builtins\nbuiltins.print = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
         b"import builtins\nvars(builtins)['print'] = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
         b"import builtins\nvars(builtins).update({'print': False})\n"
-        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
         b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
-        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
         b"import builtins\nvars(builtins).update(**{'print': False})\n"
-        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        + b"runner = print or rp.run_path\n(runner)('payload.py')\n",
         b"from runpy import run_path as runner\nFalse and (runner := print)\n(runner)('payload.py')\n",
         (
             b"from runpy import run_path as runner\nclass Broken:\n"
@@ -5620,9 +5622,9 @@ def test_pytorch_zip_detects_late_runpy_call_after_unreachable_member_overwrite(
     "shadow_state",
     [
         b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
-        b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
+        + b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
         b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
-        b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+        + b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
     ],
 )
 def test_pytorch_zip_ignores_shadowed_dict_update_before_dangerous_runpy_call(
