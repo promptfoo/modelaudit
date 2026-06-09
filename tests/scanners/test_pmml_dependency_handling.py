@@ -13,8 +13,9 @@ import pytest
     [
         'raise RuntimeError("broken defusedxml installation")\n',
         "ElementTree = None\n",
+        "class ElementTree:\n    fromstring = None\n",
     ],
-    ids=["import-error", "missing-element-tree"],
+    ids=["import-error", "missing-element-tree", "non-callable-parser"],
 )
 def test_pmml_scanner_broken_defusedxml_fails_closed(
     tmp_path: Path,

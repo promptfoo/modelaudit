@@ -118,6 +118,44 @@ def test_pmml_scanner_missing_defusedxml_fails_closed_without_unsafe_parse(
     )
 
 
+def test_pmml_cache_invalidates_when_safe_parser_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.pmml"
+    path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert determine_exit_code(first) == 0
+
+        monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+        monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(path)]
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert metadata["scan_outcome_reasons"] == [PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON]
+        assert determine_exit_code(second) == 2
+    finally:
+        reset_cache_manager()
+
+
 def test_pmml_scanner_missing_defusedxml_preserves_xxe_preparse_detection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
