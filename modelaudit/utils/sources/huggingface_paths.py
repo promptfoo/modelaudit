@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlparse, urlunparse
 
@@ -21,6 +22,7 @@ _SENSITIVE_URL_QUERY_PARAM_PATTERN = re.compile(
 )
 _URL_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _HF_REPO_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_MALFORMED_PERCENT_ESCAPE_PATTERN = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _HF_REPO_ID_MAX_LENGTH = 96
 _IS_WINDOWS = os.name == "nt"
 _WINDOWS_RESERVED_FILE_STEMS = {
@@ -37,11 +39,13 @@ _WINDOWS_RESERVED_FILE_STEMS = {
 
 def _decode_huggingface_url_component(raw_component: str, field_name: str) -> str:
     """Decode one URL component without silently replacing malformed UTF-8."""
+    if _MALFORMED_PERCENT_ESCAPE_PATTERN.search(raw_component):
+        raise ValueError(f"Invalid HuggingFace {field_name} encoding")
     try:
         decoded = unquote(raw_component, errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError(f"Invalid HuggingFace {field_name} encoding") from exc
-    if any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+    if any(unicodedata.category(character) in {"Cc", "Cs"} for character in decoded):
         raise ValueError(f"Invalid HuggingFace {field_name} control character")
     return decoded
 
@@ -69,18 +73,22 @@ def _decode_huggingface_repo_component(raw_component: str, field_name: str) -> s
     return _validate_huggingface_repo_component(decoded, field_name)
 
 
+def _validate_huggingface_windows_path_component(component: str, field_name: str) -> None:
+    if _IS_WINDOWS:
+        reserved_stem = component.split(".", 1)[0].rstrip(" .").upper()
+        if (
+            component[-1] in {" ", "."}
+            or any(character in '<>:"|?*' for character in component)
+            or reserved_stem in _WINDOWS_RESERVED_FILE_STEMS
+        ):
+            raise ValueError(f"Invalid HuggingFace {field_name} path component on Windows: {component!r}")
+
+
 def _decode_huggingface_file_path_component(raw_component: str, field_name: str) -> str:
     decoded = _decode_huggingface_url_component(raw_component, field_name)
     if not decoded or decoded in {".", ".."} or "/" in decoded or "\\" in decoded:
         raise ValueError(f"Invalid HuggingFace {field_name} path component: {decoded!r}")
-    if _IS_WINDOWS:
-        reserved_stem = decoded.split(".", 1)[0].rstrip(" .").upper()
-        if (
-            decoded[-1] in {" ", "."}
-            or any(character in '<>:"|?*' for character in decoded)
-            or reserved_stem in _WINDOWS_RESERVED_FILE_STEMS
-        ):
-            raise ValueError(f"Invalid HuggingFace {field_name} path component on Windows: {decoded!r}")
+    _validate_huggingface_windows_path_component(decoded, field_name)
     return decoded
 
 
@@ -89,6 +97,8 @@ def _decode_huggingface_revision(raw_component: str) -> str:
     revision_parts = decoded.split("/")
     if "\\" in decoded or any(not part or part in {".", ".."} for part in revision_parts):
         raise ValueError(f"Invalid HuggingFace revision path component: {decoded!r}")
+    for revision_part in revision_parts:
+        _validate_huggingface_windows_path_component(revision_part, "revision")
     return decoded
 
 
@@ -126,11 +136,15 @@ def is_huggingface_url(url: str) -> bool:
 
 def redact_huggingface_url_for_display(url: str) -> str:
     """Remove credentials, query strings, and fragments from HuggingFace URLs for display."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
+        return redacted.split("#", 1)[0].split("?", 1)[0]
     if parsed.scheme == "hf":
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
-    if parsed.hostname not in {"huggingface.co", "hf.co"}:
+    if parsed.scheme not in {"http", "https"}:
         return url
 
     netloc = parsed.netloc
@@ -177,6 +191,8 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
         raise ValueError(f"Invalid HuggingFace file URL format: {redact_huggingface_url_for_display(url)}")
 
     path_parts = raw_path.split("/")
+    if len(path_parts) >= 5 and path_parts[1:3] == ["resolve", "resolve"]:
+        raise ValueError(f"Ambiguous HuggingFace file URL format: {redact_huggingface_url_for_display(url)}")
     if len(path_parts) >= 5 and path_parts[2] == "resolve":
         resolve_index = 2
     elif len(path_parts) >= 4 and path_parts[1] == "resolve":

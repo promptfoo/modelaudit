@@ -1428,7 +1428,7 @@ class TestModelDownload:
             "test/model",
         )
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("requests.get")
     def test_huggingface_prefix_rechecks_deadline_between_chunks(
         self,
@@ -1438,7 +1438,13 @@ class TestModelDownload:
         """A slow streaming response must not run past the acquisition deadline."""
         response = MagicMock()
         response.__enter__.return_value = response
-        response.iter_content.return_value = iter([b"first", b"second"])
+
+        def iter_content(*_args: object, **_kwargs: object) -> Iterator[bytes]:
+            yield b"first"
+            _mock_monotonic.return_value = 102.0
+            yield b"second"
+
+        response.iter_content.side_effect = iter_content
         mock_requests_get.return_value = response
         budget = _HuggingFaceProbeBudget(remaining_bytes=1024, deadline=101.0)
 
@@ -2102,7 +2108,7 @@ class TestModelDownloadStreaming:
         assert all(call.kwargs["revision"] == _HF_TEST_REVISION for call in mock_hf_hub_download.call_args_list)
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2119,6 +2125,16 @@ class TestModelDownloadStreaming:
         _mock_monotonic: MagicMock,
     ) -> None:
         """The scan deadline should stop acquisition before a late remote probe begins."""
+
+        def finish_listing_after_deadline(
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[list[str], str, None]:
+            _mock_monotonic.return_value = 102.0
+            return ["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None
+
+        _mock_list_repo_files.side_effect = finish_listing_after_deadline
+
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
@@ -3141,6 +3157,20 @@ class TestHuggingFaceFileURLs:
         assert "hf_secret" not in redacted
         assert "#frag" not in redacted
 
+    def test_invalid_host_error_redacts_credentials_and_query(self) -> None:
+        """Rejected lookalike hosts must not echo secrets in validation errors."""
+        url = "https://alice:password@evil.example/org/repo/resolve/main/model.bin?token=secret#frag"
+
+        with pytest.raises(ValueError) as exc_info:
+            parse_huggingface_file_url(url)
+
+        message = str(exc_info.value)
+        assert "evil.example/org/repo/resolve/main/model.bin" in message
+        assert "alice" not in message
+        assert "password" not in message
+        assert "token=" not in message
+        assert "secret" not in message
+
     def test_valid_file_urls(self) -> None:
         """Test that valid HuggingFace file URLs are detected."""
         valid_urls = [
@@ -3271,11 +3301,17 @@ class TestHuggingFaceFileURLs:
             "//huggingface.co/test/model/resolve/main/model.bin",
             "https://huggingface.co:invalid/test/model/resolve/main/model.bin",
             "https://huggingface.co:444/test/model/resolve/main/model.bin",
+            "https://huggingface.co/foo/resolve/resolve/main/file.bin",
             f"https://huggingface.co/{'a' * 48}/{'b' * 48}/resolve/main/model.bin",
             "https://huggingface.co/test%FF/model/resolve/main/model.bin",
             "https://huggingface.co/test/model/resolve/rev%FF/model.bin",
             "https://huggingface.co/test/model/resolve/main/model%FF.bin",
             "https://huggingface.co/test/model/resolve/main/model%00.bin",
+            "https://huggingface.co/test/model/resolve/rev%/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%ZZ.bin",
+            "https://huggingface.co/test/model/resolve/%C2%85/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%C2%85.bin",
+            "https://huggingface.co/test/model/resolve/main/model\ud800.bin",
         ],
     )
     def test_parse_file_url_rejects_ambiguous_or_sdk_invalid_components(self, url: str) -> None:
@@ -3326,6 +3362,71 @@ class TestHuggingFaceFileURLs:
             "main",
             "model.bin:stream",
         )
+
+    def test_parse_file_url_preserves_posix_colon_revision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows-only cache path restrictions should not reject a POSIX revision."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", False)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/release%3A1/model.bin") == (
+            "test/model",
+            "release:1",
+            "model.bin",
+        )
+
+    @pytest.mark.parametrize(
+        "revision",
+        [
+            "C%3A",
+            "NUL",
+            "refs%2FNUL%2F1",
+            "branch.",
+            "branch%20",
+            "branch%3Fname",
+        ],
+    )
+    def test_parse_file_url_rejects_windows_unsafe_revision_components(
+        self,
+        revision: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revisions become SDK cache paths and must be Windows-safe component by component."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+        url = f"https://huggingface.co/test/model/resolve/{revision}/model.bin"
+
+        with pytest.raises(ValueError, match="on Windows"):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    def test_parse_file_url_allows_windows_safe_slash_revision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Valid PR refs remain supported when each cache-path component is safe."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/refs%2Fpr%2F1/model.bin") == (
+            "test/model",
+            "refs/pr/1",
+            "model.bin",
+        )
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_rejects_windows_unsafe_revision_before_sdk(
+        self,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unsafe revision cache paths must fail before any SDK download."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+
+        with pytest.raises(ValueError, match="revision path component on Windows"):
+            download_file_from_hf("https://huggingface.co/test/model/resolve/C%3A/model.bin")
+
+        mock_hf_hub_download.assert_not_called()
 
     def test_parse_file_url_accepts_default_https_port(self) -> None:
         """An explicit default transport port should preserve the same repository locator."""
