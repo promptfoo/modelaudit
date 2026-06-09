@@ -24,7 +24,7 @@ from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner, _looks_like_pickle
+from .pickle_scanner import PickleScanner
 
 _MAX_JOBLIB_DTYPE_SPEC_CHARS = 256
 _MAX_JOBLIB_DTYPE_DEPTH = 16
@@ -48,6 +48,76 @@ _JOBLIB_NUMPY_ARRAY_SUBCLASSES = {
     _JoblibPickleGlobal("numpy", "matrix"),
     _JoblibPickleGlobal("numpy", "memmap"),
 }
+_TRUNCATED_RAW_PICKLE_SIGNAL_OPCODES = frozenset(
+    {
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "PERSID",
+        "BINPERSID",
+        "STACK_GLOBAL",
+    }
+)
+_PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
+_PICKLE_TWO_LINE_ARGUMENT_OPCODES = frozenset({"GLOBAL", "INST"})
+_PICKLE_LENGTH_PREFIX_BYTES = {-2: 1, -3: 2, -4: 4, -5: 8}
+
+
+def _next_pickle_opcode_offset(data: bytes, offset: int, opcode: Any) -> int | None:
+    argument = opcode.arg
+    if argument is None:
+        return offset + 1
+
+    argument_size = argument.n
+    if argument_size >= 0:
+        next_offset = offset + 1 + argument_size
+        return next_offset if next_offset <= len(data) else None
+    if argument_size == -1:
+        next_offset = offset + 1
+        line_count = 2 if opcode.name in _PICKLE_TWO_LINE_ARGUMENT_OPCODES else 1
+        for _ in range(line_count):
+            newline = data.find(b"\n", next_offset)
+            if newline < 0:
+                return None
+            next_offset = newline + 1
+        return next_offset
+
+    prefix_size = _PICKLE_LENGTH_PREFIX_BYTES.get(argument_size)
+    if prefix_size is None:
+        return None
+    prefix_start = offset + 1
+    payload_start = prefix_start + prefix_size
+    if payload_start > len(data):
+        return None
+    payload_size = int.from_bytes(data[prefix_start:payload_start], "little")
+    if payload_size > len(data) - payload_start:
+        return None
+    return payload_start + payload_size
+
+
+def _apply_pickle_stack_effect(stack: list[bool], opcode: Any) -> bool:
+    before = [item.name for item in opcode.stack_before]
+    if "stackslice" in before:
+        required_before_mark = before.index("mark")
+        try:
+            mark_index = len(stack) - 1 - stack[::-1].index(True)
+        except ValueError:
+            return False
+        if mark_index < required_before_mark:
+            return False
+        del stack[mark_index - required_before_mark :]
+    else:
+        required = len(before)
+        if required > len(stack):
+            return False
+        if required:
+            del stack[-required:]
+    stack.extend(item.name == "mark" for item in opcode.stack_after)
+    return True
 
 
 @dataclass
@@ -715,21 +785,29 @@ class JoblibScanner(BaseScanner):
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""
-        if _looks_like_pickle(data):
-            return True
+        if len(data) >= 2 and data[0] == 0x80:
+            return data[1] <= 5
 
-        if len(data) >= 2 and data[0] == 0x80 and data[1] <= 5:
-            return True
-
-        try:
-            probe = io.BytesIO(data[:4096])
-            for _opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(probe), 1):
-                if opcode.name == "STOP":
-                    return True
-                if _opcode_count >= 16:
-                    break
-        except Exception:
-            return False
+        parsed_security_opcode = False
+        stack: list[bool] = []
+        offset = 0
+        for opcode_count in range(1, 17):
+            if offset >= len(data):
+                return parsed_security_opcode
+            opcode = _PICKLE_OPCODE_BY_BYTE.get(data[offset])
+            if opcode is None:
+                return parsed_security_opcode
+            next_offset = _next_pickle_opcode_offset(data, offset, opcode)
+            if next_offset is None:
+                return parsed_security_opcode
+            if opcode.name == "STOP":
+                return opcode_count > 1 and bool(stack) and not stack[-1]
+            if not _apply_pickle_stack_effect(stack, opcode):
+                return parsed_security_opcode
+            parsed_security_opcode = parsed_security_opcode or (opcode.name in _TRUNCATED_RAW_PICKLE_SIGNAL_OPCODES)
+            if opcode_count >= 16:
+                return True
+            offset = next_offset
 
         return False
 

@@ -863,6 +863,57 @@ def test_manifest_scanner_recursive_jinja_alias_preserves_sibling_template() -> 
     assert collection.templates == {"chat_template": malicious}
 
 
+def test_manifest_scanner_recursive_yaml_alias_reaches_jinja_analysis(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+1: &recursive
+  self: *recursive
+  chat_template: "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+
+def test_manifest_scanner_benign_recursive_yaml_alias_terminates(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+metadata: &recursive
+  self: *recursive
+  description: benign metadata
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_manifest_scanner_bounds_jinja_collection_paths_before_concatenation() -> None:
+    scanner = ManifestScanner(config={"jinja_template_collection_max_depth": 8})
+    long_key = "metadata-" + ("x" * 4096)
+    nested: dict[str, Any] = {"leaf": "benign"}
+    for _ in range(9):
+        nested = {long_key: nested}
+
+    collection = scanner._collect_jinja_template_fields_with_budget(nested)
+
+    assert collection.budget_exceeded is True
+    assert collection.limit_type == "depth"
+    assert len(collection.path) <= 240
+
+
 def test_manifest_scanner_alias_identity_is_scoped_to_collection_mode() -> None:
     scanner = ManifestScanner()
     malicious = "{{ ''.__class__.__mro__[1].__subclasses__() }}"

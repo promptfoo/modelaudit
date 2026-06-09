@@ -47,6 +47,8 @@ _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS = 8192
+_MAX_CVE_PICKLE_STREAMS = 64
+_CVE_PICKLE_STREAM_PADDING = frozenset(b"\x00\t\n\x0b\x0c\r ")
 _BASE64_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
     b"ZXZhbCg",  # eval(
     b"ZXhlYyg",  # exec(
@@ -266,6 +268,7 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
         "BYTEARRAY8",
     }
 )
+_PICKLE_OPCODE_PREFIX_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"compile",
@@ -334,6 +337,25 @@ class _RootStreamPayloadRead:
     payload: bytes
     truncated: bool
     read_limit: int
+
+
+@dataclass(frozen=True)
+class _PickleCveStream:
+    payload: bytes
+    offset: int
+    parse_incomplete: bool
+
+
+@dataclass(frozen=True)
+class _PickleSetitemAnalysis:
+    saw_setitem: bool
+    confirmed_dangerous_target: bool
+    suspicious_entry_on_unknown_target: bool
+    parse_incomplete: bool
+
+    @property
+    def has_abuse(self) -> bool:
+        return self.confirmed_dangerous_target or (self.parse_incomplete and self.suspicious_entry_on_unknown_target)
 
 
 _BUILTIN_MODULES = frozenset({"builtins", "__builtin__", "__builtins__"})
@@ -415,11 +437,87 @@ def _looks_like_pickle(data: bytes) -> bool:
 
     first = data[0]
     if first == 0x80:
-        return data[1] in {1, 2, 3, 4, 5}
+        return data[1] in {0, 1, 2, 3, 4, 5}
 
-    # Protocol 0 pickles often start directly with GLOBAL/INST/list/dict/tuple
-    # structural opcodes. This is intentionally a sniff, not validation.
-    return first in {ord("("), ord("]"), ord("}"), ord("c"), ord("i"), ord("l"), ord("d"), ord("t")}
+    # Pickles without an explicit PROTO may start with a scalar, string, global,
+    # or container constructor. This is intentionally a sniff, not validation.
+    return first in {
+        ord("("),
+        ord(")"),
+        ord("B"),
+        ord("C"),
+        ord("F"),
+        ord("G"),
+        ord("I"),
+        ord("J"),
+        ord("K"),
+        ord("L"),
+        ord("M"),
+        ord("N"),
+        ord("S"),
+        ord("T"),
+        ord("U"),
+        ord("V"),
+        ord("X"),
+        ord("]"),
+        ord("c"),
+        ord("d"),
+        ord("i"),
+        ord("l"),
+        ord("t"),
+        ord("}"),
+        0x88,  # NEWTRUE
+        0x89,  # NEWFALSE
+        0x8A,  # LONG1
+        0x8B,  # LONG4
+        0x8C,  # SHORT_BINUNICODE
+        0x8D,  # BINUNICODE8
+        0x8E,  # BINBYTES8
+        0x8F,  # EMPTY_SET
+        0x91,  # FROZENSET
+        0x96,  # BYTEARRAY8
+    }
+
+
+def _probe_pickle_stream(stream: io.BytesIO, offset: int = 0) -> tuple[int | None, int]:
+    stream.seek(offset)
+    try:
+        for opcode, _arg, position in pickletools.genops(stream):
+            if opcode.name == "STOP":
+                extent = None if position is None else position + 1 - offset
+                return extent, max(1, stream.tell() - offset)
+    except Exception:
+        pass
+    return None, max(1, stream.tell() - offset)
+
+
+def _pickle_cve_streams(data: bytes) -> tuple[tuple[_PickleCveStream, ...], bool]:
+    streams: list[_PickleCveStream] = []
+    probe = io.BytesIO(data)
+    offset = 0
+    while offset < len(data):
+        while offset < len(data) and (
+            data[offset] in _CVE_PICKLE_STREAM_PADDING or data[offset] not in _PICKLE_OPCODE_PREFIX_BYTES
+        ):
+            offset += 1
+        if offset >= len(data):
+            break
+
+        extent, consumed = _probe_pickle_stream(probe, offset)
+        if len(streams) >= _MAX_CVE_PICKLE_STREAMS:
+            return tuple(streams), True
+        if extent is None:
+            end = min(len(data), offset + consumed)
+            streams.append(_PickleCveStream(data[offset:end], offset, True))
+            offset = end
+            continue
+
+        streams.append(_PickleCveStream(data[offset : offset + extent], offset, False))
+        offset += extent
+
+    if not streams and data:
+        streams.append(_PickleCveStream(data, 0, True))
+    return tuple(streams), False
 
 
 def _is_primarily_documentation(data: bytes) -> bool:
@@ -808,14 +906,7 @@ def _result_has_rebuild_tensor_global(result: ScanResult) -> bool:
 def _pickle_has_parsed_rebuild_tensor_literal(data: bytes) -> bool:
     try:
         for opcode, arg, _position in pickletools.genops(data):
-            if opcode.name in {
-                "STRING",
-                "UNICODE",
-                "BINSTRING",
-                "SHORT_BINSTRING",
-                "BINUNICODE",
-                "SHORT_BINUNICODE",
-            } and (
+            if opcode.name in _PICKLE_LITERAL_OPCODE_NAMES and (
                 isinstance(arg, str)
                 and "_rebuild_tensor" in arg
                 and not _is_primarily_documentation(arg.encode("utf-8", errors="ignore"))
@@ -826,15 +917,19 @@ def _pickle_has_parsed_rebuild_tensor_literal(data: bytes) -> bool:
     return False
 
 
-def _pickle_has_setitem_abuse_for_entries(
+def _analyze_pickle_setitem_entries(
     data: bytes,
     *,
     global_needles: tuple[str, ...],
     literal_needles: tuple[str, ...] = (),
-) -> bool:
+) -> _PickleSetitemAnalysis:
     stack: list[tuple[str, str | None]] = []
     memo: dict[int, tuple[str, str | None]] = {}
     mark = ("mark", None)
+    saw_setitem = False
+    confirmed_dangerous_target = False
+    suspicious_entry_on_unknown_target = False
+    parse_incomplete = False
 
     def pop() -> tuple[str, str | None]:
         return stack.pop() if stack else ("unknown", None)
@@ -854,12 +949,19 @@ def _pickle_has_setitem_abuse_for_entries(
         if kind == "interesting_result":
             return True
         if kind == "global" and isinstance(text, str):
-            return any(needle in text for needle in global_needles)
+            global_name = text.rsplit(".", 1)[-1]
+            return any(
+                text == needle or (needle == "_rebuild_tensor" and global_name.startswith(needle))
+                for needle in global_needles
+            )
         if kind == "string" and isinstance(text, str):
             return any(needle in text for needle in literal_needles) and not _is_primarily_documentation(
                 text.encode("utf-8", errors="ignore")
             )
         return False
+
+    def is_confirmed_dangerous_target(value: tuple[str, str | None]) -> bool:
+        return value[0] == "interesting_result"
 
     def entry_for_global(arg: object) -> tuple[str, str | None]:
         parts = _global_parts(arg)
@@ -884,14 +986,7 @@ def _pickle_has_setitem_abuse_for_entries(
                     stack.append(("global", f"{module[1]}.{global_name[1]}"))
                 else:
                     stack.append(("global", None))
-            elif name in {
-                "STRING",
-                "UNICODE",
-                "BINSTRING",
-                "SHORT_BINSTRING",
-                "BINUNICODE",
-                "SHORT_BINUNICODE",
-            }:
+            elif name in _PICKLE_LITERAL_OPCODE_NAMES:
                 stack.append(("string", arg if isinstance(arg, str) else None))
             elif name == "EMPTY_DICT":
                 stack.append(("dict", None))
@@ -919,36 +1014,42 @@ def _pickle_has_setitem_abuse_for_entries(
                 pop()
                 pop()
                 stack.append(collapse_callable_result(pop()))
+            elif name == "BUILD":
+                pop()
+            elif name == "INST":
+                pop_to_mark()
+                stack.append(collapse_callable_result(entry_for_global(arg)))
+            elif name == "OBJ":
+                values = pop_to_mark()
+                callable_value = values[0] if values else ("unknown", None)
+                stack.append(collapse_callable_result(callable_value))
             elif name == "SETITEM":
+                saw_setitem = True
                 value = pop()
                 key = pop()
                 target = stack[-1] if stack else ("unknown", None)
-                if is_interesting_entry(target) or is_interesting_entry(key):
-                    return True
-                if is_interesting_entry(value) and (target[0] not in {"dict", "unknown"} or value[0] == "global"):
-                    return True
+                if is_confirmed_dangerous_target(target):
+                    confirmed_dangerous_target = True
+                if target[0] == "unknown" and (is_interesting_entry(key) or is_interesting_entry(value)):
+                    suspicious_entry_on_unknown_target = True
             elif name == "SETITEMS":
+                saw_setitem = True
                 values = pop_to_mark()
                 target = stack[-1] if stack else ("unknown", None)
-                if is_interesting_entry(target):
-                    return True
-                for index in range(0, len(values), 2):
-                    if is_interesting_entry(values[index]):
-                        return True
-                    if (
-                        index + 1 < len(values)
-                        and values[index + 1][0] == "global"
-                        and is_interesting_entry(values[index + 1])
-                    ):
-                        return True
+                if is_confirmed_dangerous_target(target):
+                    confirmed_dangerous_target = True
+                if target[0] == "unknown" and any(is_interesting_entry(value) for value in values):
+                    suspicious_entry_on_unknown_target = True
             elif name in {"APPEND", "APPENDS", "ADDITEMS"}:
                 if name == "APPEND":
                     pop()
                 else:
                     pop_to_mark()
-            elif name in {"POP", "DUP"}:
+            elif name in {"POP", "POP_MARK", "DUP"}:
                 if name == "POP":
                     pop()
+                elif name == "POP_MARK":
+                    pop_to_mark()
                 elif stack:
                     stack.append(stack[-1])
             elif name in {"PUT", "BINPUT", "LONG_BINPUT"}:
@@ -973,11 +1074,36 @@ def _pickle_has_setitem_abuse_for_entries(
                 "LONG",
                 "LONG1",
                 "LONG4",
+                "FLOAT",
+                "BINFLOAT",
             }:
                 stack.append(("scalar", None))
+            elif name in {"EXT1", "EXT2", "EXT4", "NEXT_BUFFER", "PERSID"}:
+                stack.append(("object", None))
+            elif name == "BINPERSID":
+                pop()
+                stack.append(("object", None))
     except Exception:
-        return False
-    return False
+        parse_incomplete = True
+    return _PickleSetitemAnalysis(
+        saw_setitem=saw_setitem,
+        confirmed_dangerous_target=confirmed_dangerous_target,
+        suspicious_entry_on_unknown_target=suspicious_entry_on_unknown_target,
+        parse_incomplete=parse_incomplete,
+    )
+
+
+def _pickle_has_setitem_abuse_for_entries(
+    data: bytes,
+    *,
+    global_needles: tuple[str, ...],
+    literal_needles: tuple[str, ...] = (),
+) -> bool:
+    return _analyze_pickle_setitem_entries(
+        data,
+        global_needles=global_needles,
+        literal_needles=literal_needles,
+    ).has_abuse
 
 
 def _pickle_has_rebuild_tensor_setitem_abuse(data: bytes) -> bool:
@@ -1117,6 +1243,7 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
     dangerous_globals: list[str] = []
     protocol: int | None = None
     total_opcodes = 0
+    parse_error: str | None = None
 
     def _memo_index(value: object) -> int | None:
         if isinstance(value, int):
@@ -1138,8 +1265,8 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
             opcode_counts[name] = opcode_counts.get(name, 0) + 1
             if name == "PROTO" and isinstance(arg, int):
                 protocol = arg
-            if name in {"STRING", "UNICODE", "BINSTRING", "SHORT_BINSTRING", "BINUNICODE", "SHORT_BINUNICODE"}:
-                stack.append(str(arg))
+            if name in _PICKLE_LITERAL_OPCODE_NAMES:
+                stack.append(arg if isinstance(arg, str) else None)
                 continue
             if name == "MEMOIZE":
                 if stack:
@@ -1196,10 +1323,10 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
             }:
                 stack.append(None)
     except Exception as error:
-        return {"parse_error": str(error)}
+        parse_error = str(error)
 
     observed_dangerous_opcodes = sorted(opcode for opcode in dangerous_opcodes if opcode_counts.get(opcode, 0) > 0)
-    return {
+    summary = {
         "dangerous_opcodes": observed_dangerous_opcodes,
         "has_dangerous_opcodes": bool(observed_dangerous_opcodes),
         "opcode_counts": opcode_counts,
@@ -1207,6 +1334,9 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
         "pickle_protocol": protocol,
         "dangerous_globals": sorted(set(dangerous_globals)),
     }
+    if parse_error is not None:
+        summary["parse_error"] = parse_error
+    return summary
 
 
 def _rebuild_tensor_indicators_are_documentation_literals(data: bytes) -> bool:
@@ -1228,14 +1358,7 @@ def _rebuild_tensor_indicators_are_documentation_literals(data: bytes) -> bool:
                     if "_rebuild_tensor" in f"{module}.{global_name}":
                         return False
                 continue
-            if opcode.name not in {
-                "STRING",
-                "UNICODE",
-                "BINSTRING",
-                "SHORT_BINSTRING",
-                "BINUNICODE",
-                "SHORT_BINUNICODE",
-            }:
+            if opcode.name not in _PICKLE_LITERAL_OPCODE_NAMES:
                 continue
             if isinstance(arg, str):
                 stack.append(arg)
@@ -2273,6 +2396,28 @@ class PickleScanner(BaseScanner):
         present_bytes: frozenset[int] | None = None,
     ) -> None:
         """Add CVE attribution checks from a bounded raw pickle scan window."""
+        streams, stream_limit_exceeded = _pickle_cve_streams(data)
+        result.metadata["pickle_cve_streams_analyzed"] = len(streams)
+        if stream_limit_exceeded:
+            reason = "pickle_cve_stream_limit_exceeded"
+            mark_inconclusive_scan_result(result, reason)
+            result.metadata[reason] = True
+            result.add_check(
+                name="Pickle CVE Stream Coverage",
+                passed=False,
+                message=f"Pickle CVE analysis stopped after {_MAX_CVE_PICKLE_STREAMS} streams",
+                severity=IssueSeverity.INFO,
+                location=source or self.current_file_path,
+                details={
+                    "streams_analyzed": len(streams),
+                    "max_streams": _MAX_CVE_PICKLE_STREAMS,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
+                rule_code="S902",
+            )
+            result.finish(success=False)
+
         opcode_counts = _result_opcode_counts(result)
         has_setitem_opcode = opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
         import_references = _result_import_references(result)
@@ -2283,44 +2428,90 @@ class PickleScanner(BaseScanner):
         lower = data.lower() if lower_data is None else lower_data
         if present_bytes is None:
             present_bytes = frozenset(lower)
-        if not _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS, present_bytes) and not (
-            has_setitem_opcode and has_dangerous_system_global
+        has_raw_cve_seed = _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS, present_bytes)
+        # Encoded STACK_GLOBAL operands are not contiguous raw-text seeds. Use
+        # a cheap candidate gate before running the Python stack model twice.
+        has_raw_setitem_opcode = ord("s") in present_bytes or ord("u") in present_bytes
+        if (
+            not has_raw_cve_seed
+            and not (has_setitem_opcode and has_dangerous_system_global)
+            and not has_raw_setitem_opcode
+        ):
+            result.metadata["pickle_cve_raw_detector_skipped"] = True
+            return
+
+        stream_setitem_analyses = [
+            (
+                _analyze_pickle_setitem_entries(
+                    stream.payload,
+                    global_needles=("_rebuild_tensor",),
+                    literal_needles=("_rebuild_tensor",),
+                ),
+                _analyze_pickle_setitem_entries(
+                    stream.payload,
+                    global_needles=("os.system", "posix.system", "nt.system"),
+                ),
+            )
+            for stream in streams
+        ]
+        has_stream_setitem_evidence = any(
+            rebuild_analysis.has_abuse or dangerous_system_analysis.has_abuse
+            for rebuild_analysis, dangerous_system_analysis in stream_setitem_analyses
+        )
+        if (
+            not has_raw_cve_seed
+            and not (has_setitem_opcode and has_dangerous_system_global)
+            and not (has_stream_setitem_evidence)
         ):
             result.metadata["pickle_cve_raw_detector_skipped"] = True
             return
 
         try:
-            from modelaudit.detectors.cve_patterns import analyze_cve_patterns
+            from modelaudit.detectors.cve_patterns import CVEAttribution, analyze_cve_patterns
         except ImportError:
             return
 
-        text = lower.decode("utf-8", errors="ignore")
         try:
-            attributions = analyze_cve_patterns(text, data)
+            attributions = analyze_cve_patterns(lower.decode("utf-8", errors="ignore"), data)
         except Exception as error:
             logger.warning("Error checking pickle CVE patterns: %s", error)
             return
 
-        has_rebuild_tensor_setitem_abuse = (
-            _pickle_has_rebuild_tensor_setitem_abuse(data) if has_setitem_opcode else False
-        )
-        has_rebuild_tensor_literal = _pickle_has_parsed_rebuild_tensor_literal(data) if has_setitem_opcode else False
-        has_cve_2026_setitem_evidence = has_rebuild_tensor_setitem_abuse or has_rebuild_tensor_literal
-        has_dangerous_system_setitem_abuse = (
-            _pickle_has_dangerous_system_setitem_abuse(data)
-            if has_setitem_opcode and has_dangerous_system_global
-            else False
-        )
+        # Other CVEs intentionally retain whole-window matching. CVE-2026-24747
+        # remains fail-closed for wholly unparseable inputs, but once a complete
+        # stream exists its target-sensitive SETITEM evidence is stream-scoped.
+        has_complete_stream = any(not stream.parse_incomplete for stream in streams)
+        all_attributions = [
+            attribution
+            for attribution in attributions
+            if attribution.cve_id != "CVE-2026-24747" or not has_complete_stream
+        ]
+        attribution_context: dict[tuple[str, str], tuple[int, int, bool]] = {}
+        dangerous_system_context: tuple[int, int, bool] | None = None
+        for stream_index, (stream, setitem_analyses) in enumerate(zip(streams, stream_setitem_analyses, strict=True)):
+            try:
+                stream_attributions = analyze_cve_patterns(
+                    stream.payload.decode("utf-8", errors="ignore"),
+                    stream.payload,
+                )
+            except Exception as error:
+                logger.warning("Error checking pickle stream CVE patterns: %s", error)
+                stream_attributions = []
+            for attribution in stream_attributions:
+                if attribution.cve_id != "CVE-2026-24747" or any(
+                    "setitem" in pattern.lower() for pattern in attribution.patterns_matched
+                ):
+                    continue
+                all_attributions.append(attribution)
+                rule_code = self._rule_code_for_cve_attribution(attribution.patterns_matched)
+                attribution_context.setdefault(
+                    (attribution.cve_id, rule_code),
+                    (stream_index, stream.offset, stream.parse_incomplete),
+                )
 
-        if (
-            has_cve_2026_setitem_evidence
-            and has_setitem_opcode
-            and not any(attribution.cve_id == "CVE-2026-24747" for attribution in attributions)
-        ):
-            from modelaudit.detectors.cve_patterns import CVEAttribution
-
-            attributions.append(
-                CVEAttribution(
+            rebuild_analysis, dangerous_system_analysis = setitem_analyses
+            if rebuild_analysis.has_abuse:
+                attribution = CVEAttribution(
                     cve_id="CVE-2026-24747",
                     description="PyTorch weights_only restricted unpickler SETITEM abuse pattern",
                     severity="CRITICAL",
@@ -2330,29 +2521,23 @@ class PickleScanner(BaseScanner):
                     remediation="Upgrade PyTorch and avoid loading untrusted pickle checkpoints",
                     patterns_matched=["_rebuild_tensor", "SETITEM opcode"],
                 )
-            )
-
-        pickle_parse_failed = _result_parse_was_incomplete(result)
-        attributions = self._dedupe_cve_attributions(
-            [
-                attribution
-                for attribution in attributions
-                if not (
-                    attribution.cve_id == "CVE-2026-24747"
-                    and (
-                        (not has_setitem_opcode and not pickle_parse_failed)
-                        or (not has_cve_2026_setitem_evidence and not pickle_parse_failed)
-                        or (
-                            not has_cve_2026_setitem_evidence
-                            and _rebuild_tensor_indicators_are_documentation_literals(data)
-                        )
-                    )
+                all_attributions.append(attribution)
+                rule_code = self._rule_code_for_cve_attribution(attribution.patterns_matched)
+                attribution_context.setdefault(
+                    (attribution.cve_id, rule_code),
+                    (stream_index, stream.offset, stream.parse_incomplete or rebuild_analysis.parse_incomplete),
                 )
-            ]
-        )
+            if dangerous_system_analysis.has_abuse and dangerous_system_context is None:
+                dangerous_system_context = (
+                    stream_index,
+                    stream.offset,
+                    stream.parse_incomplete or dangerous_system_analysis.parse_incomplete,
+                )
 
+        attributions = self._dedupe_cve_attributions(all_attributions)
         emitted_cve_rule_keys: set[tuple[str, str]] = set()
-        if has_setitem_opcode and has_dangerous_system_setitem_abuse:
+        if dangerous_system_context is not None:
+            stream_index, stream_offset, stream_parse_incomplete = dangerous_system_context
             emitted_cve_rule_keys.add(("CVE-2026-24747", "S209"))
             result.add_check(
                 name="CVE-2026-24747 SETITEM Abuse Detection",
@@ -2370,6 +2555,9 @@ class PickleScanner(BaseScanner):
                     "pattern_type": "setitem_near_dangerous_global",
                     "associated_global": "os.system",
                     "analysis": "bounded_raw_pickle_window",
+                    "pickle_stream_index": stream_index,
+                    "pickle_stream_offset": stream_offset,
+                    "pickle_stream_parse_incomplete": stream_parse_incomplete,
                 },
                 rule_code="S209",
             )
@@ -2392,13 +2580,24 @@ class PickleScanner(BaseScanner):
                 if attribution.severity.upper() in {"CRITICAL", "HIGH"}
                 else IssueSeverity.WARNING
             )
+            details = {**attribution.to_dict(), "cve_risk_score": attribution.cvss}
+            stream_context = attribution_context.get(cve_rule_key)
+            if stream_context is not None:
+                stream_index, stream_offset, stream_parse_incomplete = stream_context
+                details.update(
+                    {
+                        "pickle_stream_index": stream_index,
+                        "pickle_stream_offset": stream_offset,
+                        "pickle_stream_parse_incomplete": stream_parse_incomplete,
+                    }
+                )
             result.add_check(
                 name=f"{attribution.cve_id} Pattern Detection",
                 passed=False,
                 message=f"{attribution.cve_id}: {attribution.description}",
                 severity=severity,
                 location=source or self.current_file_path,
-                details={**attribution.to_dict(), "cve_risk_score": attribution.cvss},
+                details=details,
                 rule_code=rule_code,
             )
 

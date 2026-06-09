@@ -186,6 +186,7 @@ JINJA_TEMPLATE_COLLECTION_MAX_DEPTH_CONFIG_KEY: Final[str] = "jinja_template_col
 JINJA_TEMPLATE_COLLECTION_MAX_ITEMS_CONFIG_KEY: Final[str] = "jinja_template_collection_max_items"
 DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_DEPTH: Final[int] = 64
 DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_ITEMS: Final[int] = 50_000
+JINJA_TEMPLATE_LOCATION_MAX_CHARS: Final[int] = 240
 _JINJA_COLLECTION_MODE_FIELDS: Final[str] = "fields"
 _JINJA_COLLECTION_MODE_CONTAINER: Final[str] = "container"
 
@@ -1181,9 +1182,22 @@ class ManifestScanner(BaseScanner):
 
     @staticmethod
     def _jinja_collection_child_path(path: str, key: Any, parent_is_list: bool) -> str:
+        key_text = str(key)
         if parent_is_list:
-            return f"{path}[{key}]" if path else f"[{key}]"
-        return f"{path}.{key}" if path else str(key)
+            candidate = f"{path}[{key_text}]" if path else f"[{key_text}]"
+        else:
+            safe_key = redact_evidence_string(key_text, max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS)
+            candidate = f"{path}.{safe_key}" if path else safe_key
+
+        preserve_chat_template_context = "chat_template" in path.casefold() or "chat_template" in key_text.casefold()
+        context_suffix = ".chat_template" if preserve_chat_template_context else ""
+        safe_path = redact_evidence_string(
+            candidate,
+            max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS - len(context_suffix),
+        )
+        if context_suffix and "chat_template" not in safe_path.casefold():
+            safe_path = f"{safe_path}{context_suffix}"
+        return safe_path
 
     def _record_jinja_collection_budget_exceeded(
         self,
@@ -1206,7 +1220,7 @@ class ManifestScanner(BaseScanner):
                 "scan_outcome_reason": JINJA_TEMPLATE_COLLECTION_BUDGET_REASON,
                 "analysis_incomplete": True,
                 "limit_type": collection.limit_type,
-                "path": redact_evidence_string(collection.path, max_chars=240),
+                "path": redact_evidence_string(collection.path, max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS),
                 "items_visited": collection.items_visited,
                 "max_depth": collection.max_depth,
                 "max_items": collection.max_items,
@@ -1224,7 +1238,10 @@ class ManifestScanner(BaseScanner):
         safe_templates: dict[str, str] = {}
         for path, value in templates.items():
             context_suffix = ".chat_template" if "chat_template" in path.casefold() else ""
-            safe_path = redact_evidence_string(path, max_chars=240 - len(context_suffix))
+            safe_path = redact_evidence_string(
+                path,
+                max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS - len(context_suffix),
+            )
             if context_suffix and "chat_template" not in safe_path.casefold():
                 safe_path = f"{safe_path}{context_suffix}"
             cls._record_jinja_template(safe_templates, safe_path, value)
@@ -1312,14 +1329,22 @@ class ManifestScanner(BaseScanner):
 
     def _check_model_name_policies(self, content: Any, result: ScanResult) -> None:
         """Check for blacklisted model names in config values"""
+        visited_containers: set[int] = set()
 
         def check_value(value: Any, prefix: str = "") -> None:
             self._check_timeout()
 
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, dict):
                 for key, nested_value in value.items():
-                    key_lower = key.lower()
-                    full_key = f"{prefix}.{key}" if prefix else key
+                    key_text = str(key)
+                    key_lower = key_text.lower()
+                    full_key = f"{prefix}.{key_text}" if prefix else key_text
 
                     # Check if this key might contain a model name
                     if key_lower in MODEL_NAME_KEYS_LOWER:
@@ -1454,6 +1479,7 @@ class ManifestScanner(BaseScanner):
         detection by registering new domains.
         """
         seen_urls: set[str] = set()
+        visited_containers: set[int] = set()
 
         def is_trusted_domain(url: str) -> bool:
             """Check if URL host is in the trusted domain allowlist."""
@@ -1462,6 +1488,12 @@ class ManifestScanner(BaseScanner):
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
             self._check_timeout()
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, str):
                 urls = URL_PATTERN.findall(value)
                 for url in urls:
@@ -1492,7 +1524,8 @@ class ManifestScanner(BaseScanner):
 
             elif isinstance(value, dict):
                 for k, v in value.items():
-                    new_path = f"{key_path}.{k}" if key_path else k
+                    key_text = str(k)
+                    new_path = f"{key_path}.{key_text}" if key_path else key_text
                     extract_urls_from_value(v, new_path)
             elif isinstance(value, list):
                 for i, item in enumerate(value):
@@ -1576,13 +1609,22 @@ class ManifestScanner(BaseScanner):
                     },
                 )
 
+        visited_containers: set[int] = set()
+
         def traverse_for_hashes(value: Any, prefix: str = "", parent_key: str = "") -> None:
             """Recursively check parsed manifest content for weak hashes."""
             self._check_timeout()
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, dict):
                 for key, nested_value in value.items():
-                    full_key = f"{prefix}.{key}" if prefix else key
-                    traverse_for_hashes(nested_value, full_key, key)
+                    key_text = str(key)
+                    full_key = f"{prefix}.{key_text}" if prefix else key_text
+                    traverse_for_hashes(nested_value, full_key, key_text)
             elif isinstance(value, list):
                 for i, item in enumerate(value):
                     item_path = f"{prefix}[{i}]"

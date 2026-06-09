@@ -7,6 +7,7 @@ import gzip
 import io
 import lzma
 import pickle
+import pickletools
 import struct
 import zlib
 from importlib.metadata import PackageNotFoundError
@@ -294,6 +295,48 @@ def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
     assert _has_system_reduce_failure(result)
 
 
+def test_scan_detects_truncated_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
+    payload = pickle.dumps(_Payload(), protocol=0)[:-1]
+
+    result = _scan_payload(tmp_path, payload, "truncated_raw_protocol0.joblib")
+
+    assert result.success is False
+    assert _has_system_reduce_failure(result)
+    assert _compression_failures(result) == []
+
+
+@pytest.mark.parametrize("payload", [b"Pattacker-controlled-id\n", b"Vattacker-controlled-id\nQ"])
+def test_scan_detects_truncated_raw_persistent_id_joblib(tmp_path: Path, payload: bytes) -> None:
+    result = _scan_payload(tmp_path, payload, "truncated_persistent_id.joblib")
+
+    assert result.success is False
+    assert any(issue.rule_code == "S212" for issue in result.issues)
+    assert _compression_failures(result) == []
+
+
+def test_scan_detects_raw_protocol0_pickle_after_large_literal(tmp_path: Path) -> None:
+    payload = pickle.dumps(["A" * 5000, _Payload()], protocol=0)
+
+    result = _scan_payload(tmp_path, payload, "large_prefix_raw_protocol0.joblib")
+
+    assert result.success is False
+    assert _has_system_reduce_failure(result)
+    assert _compression_failures(result) == []
+
+
+def test_raw_pickle_classifier_skips_large_unicode_operands_without_genops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"V" + (b"A" * (1024 * 1024)) + b"\n0cos\nsystem\n."
+
+    def fail_genops(_payload: object) -> object:
+        raise AssertionError("raw pickle classification must not decode opcode operands")
+
+    monkeypatch.setattr(pickletools, "genops", fail_genops)
+
+    assert JoblibScanner()._looks_like_raw_pickle_payload(payload) is True
+
+
 def test_scan_accepts_raw_protocol4_primitive_pickle_joblib(tmp_path: Path) -> None:
     payload = pickle.dumps(7, protocol=4)
 
@@ -312,6 +355,31 @@ def test_scan_accepts_raw_protocol0_int_pickle_joblib(tmp_path: Path) -> None:
     assert result.success is True
     assert _compression_failures(result) == []
     assert not _has_system_reduce_failure(result)
+
+
+@pytest.mark.parametrize("value", [None, True, 7, 3.5, "safe", b"safe", [1, 2], {"key": "value"}])
+def test_raw_protocol0_scalar_and_container_pickles_are_recognized(value: object) -> None:
+    payload = pickle.dumps(value, protocol=0)
+
+    assert JoblibScanner()._looks_like_raw_pickle_payload(payload) is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"Bogus BINBYTES-like text",
+        b"Invalid INT-like text",
+        b"Not a pickle",
+        b"Routine plain text",
+        b"This is not compressed data at all!",
+        b"Xylophone BINUNICODE-like text",
+        b".not a pickle",
+        b"]not a pickle",
+        b"}not a pickle",
+    ],
+)
+def test_opcode_looking_text_is_not_recognized_as_raw_pickle(payload: bytes) -> None:
+    assert JoblibScanner()._looks_like_raw_pickle_payload(payload) is False
 
 
 def test_scan_reports_unavailable_joblib_read_as_inconclusive_not_security_finding(
@@ -700,7 +768,7 @@ def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path
 
 
 def test_scan_reports_plain_text_joblib_without_critical_pickle_noise(tmp_path: Path) -> None:
-    result = _scan_payload(tmp_path, b"not a pickle", "plain_text.joblib")
+    result = _scan_payload(tmp_path, b"This is not compressed data at all!", "plain_text.joblib")
 
     compression_failures = _compression_failures(result)
     assert result.success is False

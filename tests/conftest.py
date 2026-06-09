@@ -94,6 +94,7 @@ def pytest_runtest_setup(item):
         allowed_test_files = [
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
+            "test_pickle_binunicode8_setitem.py",
             "test_picklescan_adapter.py",
             "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
@@ -107,6 +108,7 @@ def pytest_runtest_setup(item):
             "test_core.py",
             "test_cli.py",
             "test_sarif_formatter.py",  # SARIF output and credential-redaction regressions
+            "test_sarif_redaction.py",  # SARIF exported source credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_bug1_confidence_exploit.py",  # Security bug test
@@ -222,6 +224,7 @@ def pytest_runtest_setup(item):
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
+            "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]
         allowed_test_nodeids = [
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
