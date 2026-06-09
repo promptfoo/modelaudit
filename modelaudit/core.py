@@ -498,6 +498,22 @@ def _trusted_stream_shard_family_group(
     trusted_root_marker: object | None = None,
 ) -> str | None:
     """Scope a trusted stream group to the artifact's logical staging parent."""
+
+    def trusted_root_is_private(path: Path) -> bool:
+        try:
+            root_stat = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return False
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if callable(get_effective_uid) and root_stat.st_uid != get_effective_uid():
+                return False
+            if stat.S_IMODE(root_stat.st_mode) & 0o022:
+                return False
+        return True
+
     try:
         logical_parent = source.absolute().parent.resolve(strict=True)
         trusted_root: Path | None = None
@@ -506,14 +522,18 @@ def _trusted_stream_shard_family_group(
             and trusted_root_marker.token is _TRUSTED_STREAM_SHARD_ROOT_TOKEN
         ):
             candidate_root = trusted_root_marker.path.resolve(strict=True)
-            if candidate_root.is_dir():
+            if trusted_root_is_private(candidate_root):
                 trusted_root = candidate_root
 
         if trusted_root is None:
             temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
             candidate = logical_parent
             while candidate != temp_root and candidate != candidate.parent:
-                if candidate.parent == temp_root and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES):
+                if (
+                    candidate.parent == temp_root
+                    and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
+                    and trusted_root_is_private(candidate)
+                ):
                     trusted_root = candidate
                     break
                 candidate = candidate.parent
@@ -568,6 +588,7 @@ def _snapshot_validated_shard_target(
         "size": target_stat.st_size,
         "mtime_ns": target_stat.st_mtime_ns,
         "ctime_ns": target_stat.st_ctime_ns,
+        "nlink": target_stat.st_nlink,
     }
     if family_group_policy == "explicit" and family_group:
         target["family_group"] = family_group
@@ -638,26 +659,51 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
             continue
         records = [records[0] for records in targets_by_index.values()]
 
-        target_identities: set[tuple[int | str, ...]] = set()
+        inode_targets: dict[tuple[int, int], list[dict[str, int | str]]] = {}
+        path_identities: set[str] = set()
         duplicate_target = False
         for _source_path, target in records:
             inode = target.get("inode")
             device = target.get("device")
             resolved_target = target.get("resolved_path")
             if isinstance(inode, int) and inode and isinstance(device, int):
-                target_identity: tuple[int | str, ...] = ("inode", device, inode)
+                inode_key = (device, inode)
+                for existing_target in inode_targets.get(inode_key, []):
+                    existing_path = existing_target.get("resolved_path")
+                    same_resolved_path = (
+                        isinstance(existing_path, str)
+                        and isinstance(resolved_target, str)
+                        and os.path.normcase(os.path.normpath(existing_path))
+                        == os.path.normcase(os.path.normpath(resolved_target))
+                    )
+                    hardlink_observed = any(
+                        isinstance((link_count := candidate.get("nlink")), int) and link_count > 1
+                        for candidate in (existing_target, target)
+                    )
+                    generation_fields = ("size", "mtime_ns", "ctime_ns")
+                    generations_available = all(
+                        isinstance(candidate.get(field), int)
+                        for candidate in (existing_target, target)
+                        for field in generation_fields
+                    )
+                    same_generation = generations_available and all(
+                        existing_target[field] == target[field] for field in generation_fields
+                    )
+                    if same_resolved_path or hardlink_observed or same_generation or not generations_available:
+                        duplicate_target = True
+                        break
+                if duplicate_target:
+                    break
+                inode_targets.setdefault(inode_key, []).append(target)
             elif isinstance(resolved_target, str):
-                target_identity = (
-                    "path",
-                    os.path.normcase(os.path.normpath(resolved_target)),
-                )
+                path_identity = os.path.normcase(os.path.normpath(resolved_target))
+                if path_identity in path_identities:
+                    duplicate_target = True
+                    break
+                path_identities.add(path_identity)
             else:
                 duplicate_target = True
                 break
-            if target_identity in target_identities:
-                duplicate_target = True
-                break
-            target_identities.add(target_identity)
         if duplicate_target:
             continue
 
@@ -4033,6 +4079,7 @@ def scan_model_streaming(
             source_path = Path(file_path)
             scan_path = source_path
             report_path = str(source_path)
+            pinned_scan_directory: tempfile.TemporaryDirectory[str] | None = None
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4097,13 +4144,50 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
-                pre_scan_shard_target = _snapshot_validated_shard_target(
+                initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),
                     family_group=shard_family_group,
                     family_group_policy="stream_staging",
                     trusted_root_marker=_trusted_shard_family_root,
                 )
+                selected_resolved_path = str(scan_path)
+                pre_scan_shard_target: ValidatedShardTargets = {}
+                if initial_shard_target:
+                    initial_target = next(iter(initial_shard_target.values()))
+                    resolved_target = initial_target.get("resolved_path")
+                    if isinstance(resolved_target, str):
+                        selected_resolved_path = resolved_target
+                        try:
+                            pinned_scan_directory = tempfile.TemporaryDirectory(
+                                prefix=".modelaudit_scan_",
+                                dir=str(Path(resolved_target).parent),
+                            )
+                            pinned_path = Path(pinned_scan_directory.name) / source_path.name
+                            os.link(resolved_target, pinned_path, follow_symlinks=False)
+                            pre_scan_shard_target = _snapshot_validated_shard_target(
+                                str(source_path),
+                                resolved_path=resolved_target,
+                                family_group=shard_family_group,
+                                family_group_policy="stream_staging",
+                                trusted_root_marker=_trusted_shard_family_root,
+                            )
+                            pinned_stat = os.stat(pinned_path, follow_symlinks=False)
+                            pinned_target = next(iter(pre_scan_shard_target.values()), {})
+                            if (
+                                pinned_target.get("device") != pinned_stat.st_dev
+                                or pinned_target.get("inode") != pinned_stat.st_ino
+                                or pinned_target.get("size") != pinned_stat.st_size
+                                or pinned_target.get("mtime_ns") != pinned_stat.st_mtime_ns
+                                or pinned_target.get("ctime_ns") != pinned_stat.st_ctime_ns
+                            ):
+                                raise OSError("Shard target changed while pinning it for scanning")
+                            scan_path = pinned_path
+                        except OSError:
+                            if pinned_scan_directory is not None:
+                                pinned_scan_directory.cleanup()
+                                pinned_scan_directory = None
+                            pre_scan_shard_target = {}
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -4145,23 +4229,48 @@ def scan_model_streaming(
                     metadata_dict.setdefault("file_size", scan_path.stat().st_size)
                     if report_path != resolved_report_path:
                         metadata_dict.setdefault("source_path", report_path)
-                        metadata_dict.setdefault("resolved_path", resolved_report_path)
+                        metadata_dict.setdefault("resolved_path", selected_resolved_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
                     if operational_scan_failure:
                         preserve_shard_reconciliation_errors = True
                     post_scan_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
-                        resolved_path=str(scan_path),
+                        resolved_path=selected_resolved_path,
                         family_group=shard_family_group,
                         family_group_policy="stream_staging",
                         trusted_root_marker=_trusted_shard_family_root,
                     )
-                    if (
-                        not operational_scan_failure
-                        and pre_scan_shard_target
-                        and pre_scan_shard_target == post_scan_shard_target
-                    ):
-                        validated_shard_targets.update(post_scan_shard_target)
+                    stable_while_scanning = bool(
+                        pre_scan_shard_target and pre_scan_shard_target == post_scan_shard_target
+                    )
+                    if pinned_scan_directory is not None:
+                        pinned_scan_directory.cleanup()
+                        pinned_scan_directory = None
+                    final_shard_target = _snapshot_validated_shard_target(
+                        str(source_path),
+                        resolved_path=selected_resolved_path,
+                        family_group=shard_family_group,
+                        family_group_policy="stream_staging",
+                        trusted_root_marker=_trusted_shard_family_root,
+                    )
+                    stable_after_unpinning = False
+                    if initial_shard_target and final_shard_target:
+                        initial_target = next(iter(initial_shard_target.values()))
+                        final_target = next(iter(final_shard_target.values()))
+                        stable_after_unpinning = all(
+                            initial_target.get(field) == final_target.get(field)
+                            for field in (
+                                "resolved_path",
+                                "device",
+                                "inode",
+                                "size",
+                                "mtime_ns",
+                                "nlink",
+                                "family_group",
+                            )
+                        )
+                    if not operational_scan_failure and stable_while_scanning and stable_after_unpinning:
+                        validated_shard_targets.update(final_shard_target)
 
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
@@ -4220,6 +4329,8 @@ def scan_model_streaming(
                 aggregate_hash_complete = False
 
             finally:
+                if pinned_scan_directory is not None:
+                    pinned_scan_directory.cleanup()
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
 

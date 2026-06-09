@@ -1612,8 +1612,17 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
             continue
         try:
             resolved_path = str(path.resolve(strict=True))
+            parent_stat = os.stat(Path(resolved_path).parent, follow_symlinks=False)
         except (OSError, RuntimeError):
             continue
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            continue
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if callable(get_effective_uid) and parent_stat.st_uid != get_effective_uid():
+                continue
+            if stat.S_IMODE(parent_stat.st_mode) & 0o022:
+                continue
         shard_match = ShardedModelDetector.match_shard_filename(Path(resolved_path).name)
         if shard_match is None:
             continue
@@ -1655,8 +1664,6 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
             if matching_scopes:
                 family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
                 groups[normalized_path] = f"explicit-cli:{family_scope}"
-            else:
-                groups[normalized_path] = "explicit-cli:undiscriminated"
     return groups
 
 
