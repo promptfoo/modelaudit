@@ -1670,6 +1670,22 @@ def test_executorch_scans_hidden_protocol0_pickle_with_global_comment_token(tmp_
     )
 
 
+def test_executorch_scans_hidden_protocol0_pickle_with_repeated_global_comment_tokens(tmp_path: Path) -> None:
+    model_path = tmp_path / "hidden-protocol0-repeated-comment-tokens.ptl"
+    payload = b"cposix\nsystem\n#\n#\nN0cbuiltins\neval\n#\n(S'echo pwned'\ntR."
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("payload", payload)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["payload"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
+        for issue in result.issues
+    )
+
+
 def test_executorch_protocol0_global_comment_near_match_remains_unselected(tmp_path: Path) -> None:
     model_path = tmp_path / "protocol0-comment-near-match.ptl"
     with zipfile.ZipFile(model_path, "w") as zipf:
@@ -1680,6 +1696,34 @@ def test_executorch_protocol0_global_comment_near_match_remains_unselected(tmp_p
 
     assert result.success is True
     assert result.metadata["pickle_files"] == []
+
+
+def test_executorch_protocol0_repeated_global_comment_near_match_remains_unselected(tmp_path: Path) -> None:
+    model_path = tmp_path / "protocol0-repeated-comment-near-match.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("payload", b"cmetadata\nlabel\n#\n#\nplain text")
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == []
+
+
+def test_executorch_protocol0_global_comment_token_limit_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "protocol0-comment-token-limit.ptl"
+    payload = b"cposix\nsystem\n" + (b"#\n" * 65) + b"(S'echo pwned'\ntR."
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("payload", payload)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    assert discovery_check.details["failed_count"] == 1
+    assert discovery_check.details["entries"][0]["exception_type"] == "_PickleDiscoveryBudgetExceeded"
 
 
 def test_executorch_scans_hidden_pickle_with_boundary_spanning_first_operand(tmp_path: Path) -> None:

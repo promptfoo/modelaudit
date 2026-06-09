@@ -35,6 +35,7 @@ _PICKLE_DISCOVERY_MAX_ENTRIES = 10_000
 _PICKLE_DISCOVERY_MAX_PROBE_BYTES = 4 * 1024 * 1024
 _PICKLE_DISCOVERY_MAX_FAILURE_SAMPLES = 20
 _PICKLE_DISCOVERY_MAX_DIAGNOSTIC_CHARS = 512
+_PICKLE_DISCOVERY_MAX_GLOBAL_COMMENT_TOKENS = 64
 _PICKLE_DISCOVERY_INCOMPLETE_REASON = "executorch_pickle_discovery_incomplete"
 
 
@@ -593,24 +594,33 @@ class ExecuTorchScanner(BaseScanner):
         return sample_is_prefix and op_count >= 2
 
     @staticmethod
-    def _without_single_global_comment_token(sample: bytes) -> bytes | None:
-        token_index = sample.find(b"#\n")
-        if token_index <= 0 or sample.find(b"#\n", token_index + 2) >= 0:
-            return None
+    def _without_global_comment_tokens(sample: bytes) -> bytes | None:
+        candidate = sample
+        removed_token_count = 0
 
-        last_opcode_name: str | None = None
-        try:
-            for opcode, _arg, _pos in pickletools.genops(sample[:token_index]):
-                last_opcode_name = opcode.name
-        except ValueError as exc:
-            if not str(exc).startswith("pickle exhausted before seeing STOP"):
+        while (token_index := candidate.find(b"#\n")) > 0:
+            last_opcode_name: str | None = None
+            try:
+                for opcode, _arg, _pos in pickletools.genops(candidate[:token_index]):
+                    last_opcode_name = opcode.name
+            except ValueError as exc:
+                if not str(exc).startswith("pickle exhausted before seeing STOP"):
+                    return None
+            except Exception:
                 return None
-        except Exception:
-            return None
 
-        if last_opcode_name != "GLOBAL":
-            return None
-        return sample[:token_index] + sample[token_index + 2 :]
+            if last_opcode_name != "GLOBAL":
+                return None
+
+            token_end = token_index
+            while candidate.startswith(b"#\n", token_end):
+                removed_token_count += 1
+                if removed_token_count > _PICKLE_DISCOVERY_MAX_GLOBAL_COMMENT_TOKENS:
+                    raise _PickleDiscoveryBudgetExceeded("too many GLOBAL-adjacent pickle comment tokens")
+                token_end += 2
+            candidate = candidate[:token_index] + candidate[token_end:]
+
+        return candidate if removed_token_count else None
 
     def _entry_looks_like_pickle(
         self,
@@ -665,7 +675,7 @@ class ExecuTorchScanner(BaseScanner):
         else:
             is_pickle = _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=sample_is_prefix)
             if not is_pickle:
-                uncommented_sample = self._without_single_global_comment_token(sample)
+                uncommented_sample = self._without_global_comment_tokens(sample)
                 if uncommented_sample is not None:
                     is_pickle = _looks_like_proto0_or_1_pickle(
                         uncommented_sample,
