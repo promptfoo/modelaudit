@@ -2264,6 +2264,31 @@ def test_scan_file_selected_numpy_preserves_within_limit_npz_selection(tmp_path:
     assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
 
 
+def test_scan_file_selected_numpy_honors_selection_before_plain_zip_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "not-numpy.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("unselected plain ZIP routes must not be preflighted")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.ZipScanner.requires_preflight_result", fail_zip_preflight)
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "scanner_selection"
+    assert result.success is True
+    assert result.metadata["skipped_scanner_id"] == "zip"
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+
+
 def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

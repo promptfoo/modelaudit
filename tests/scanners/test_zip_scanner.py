@@ -9706,6 +9706,22 @@ class TestZipScanner:
         assert result.success is True
         assert opened_with_handle is True
 
+    def test_owned_archive_handle_closes_when_consumer_raises(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "owned_handle.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        opened_handle: Any = None
+        with (
+            pytest.raises(RuntimeError, match="stop scan"),
+            ZipScanner._open_archive_handle(str(archive_path), None) as handle,
+        ):
+            opened_handle = handle
+            raise RuntimeError("stop scan")
+
+        assert opened_handle is not None
+        assert opened_handle.closed is True
+
     def test_max_entries_limit_zip64_preflight_rejects_before_zipfile_open(
         self,
         tmp_path: Path,

@@ -701,7 +701,7 @@ def _select_non_hdf5_preferred_scanner_id(
         return "zip"
 
     if header_format == "zip":
-        if config is not None and not allows_zip_structure_analysis(policy_from_config(config)):
+        if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
             return "joblib" if ext == ".joblib" else "zip"
         if is_torchserve_mar_archive(path, config):
             return "torchserve_mar"
@@ -3075,7 +3075,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
-    if allows_zip_structure_analysis(scanner_selection) and ZipScanner.requires_preflight_result(
+    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
         path,
         max_zip_entries,
         max_zip_directory_size,

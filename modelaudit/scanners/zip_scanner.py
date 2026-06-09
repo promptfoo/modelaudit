@@ -1399,6 +1399,20 @@ class ZipScanner(BaseScanner):
                 else entry_name
             )
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _open_archive_handle(path: str, archive: zipfile.ZipFile | None) -> Iterator[BinaryIO]:
+        """Yield an owned path handle or borrow the handle from an existing archive."""
+        if archive is None:
+            with open(path, "rb") as handle:
+                yield handle
+            return
+
+        archive_fp = archive.fp
+        if archive_fp is None:
+            raise zipfile.BadZipFile("ZIP archive is already closed")
+        yield cast(BinaryIO, archive_fp)
+
     def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
         """Dispatch a nested archive member through an injected callback or registry fallback."""
         nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
@@ -1554,15 +1568,7 @@ class ZipScanner(BaseScanner):
                 details={"depth": depth, "max_depth": self.max_depth},
             )
 
-        with contextlib.ExitStack() as archive_stack:
-            opened_archive_handle: BinaryIO
-            if archive is None:
-                opened_archive_handle = archive_stack.enter_context(open(path, "rb"))
-            else:
-                archive_fp = archive.fp
-                if archive_fp is None:
-                    raise zipfile.BadZipFile("ZIP archive is already closed")
-                opened_archive_handle = cast(BinaryIO, archive_fp)
+        with self._open_archive_handle(path, archive) as opened_archive_handle, contextlib.ExitStack() as archive_stack:
             try:
                 archive_file_size = os.fstat(opened_archive_handle.fileno()).st_size
             except (AttributeError, OSError):
