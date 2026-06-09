@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
 - bound Jinja static render analysis and fail closed on CPU-heavy aliased, recursive, container-wrapped, and arithmetic range probes when sandbox workers are unavailable
 - restrict auth bearer-token validation to trusted Promptfoo API hosts unless custom hosts are explicitly configured
