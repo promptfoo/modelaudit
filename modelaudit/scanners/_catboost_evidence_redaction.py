@@ -26,6 +26,8 @@ REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
+CURL_COMMAND_SCAN_CHARS: Final[int] = EVIDENCE_URL_LOOKAHEAD_CHARS
+MAX_CURL_EXECUTABLE_CANDIDATES: Final[int] = 64
 MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
 MAX_NESTED_URL_QUERY_DEPTH: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
@@ -239,7 +241,8 @@ CURL_COMMAND_TRANSITION_PATTERN: Final[str] = (
     r"(?=\s+-)"
 )
 CURL_ATTACHED_COOKIE_OPTION_PREFIX_PATTERN: Final[str] = (
-    rf"\b{CURL_EXECUTABLE_NAME_PATTERN}\b(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,2048}}?"
+    rf"\b{CURL_EXECUTABLE_NAME_PATTERN}\b"
+    rf"(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,{CURL_COMMAND_SCAN_CHARS}}}?"
     r"(?<=[\s\"'])-[A-Za-z]*?b"
 )
 CURL_ATTACHED_COOKIE_OPTION_RE: Final[re.Pattern[str]] = re.compile(
@@ -304,6 +307,14 @@ COMMAND_SUBSTITUTION_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<option>(?:{COMMAND_USER_OPTION_PATTERN})(?:=|\s+)?)"
     r"(?P<username>[^:\s\"';&|]*:)(?P<password>\$\((?:\\.|[^\\)])*\))"
 )
+COMMAND_USER_SHELL_WORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>(?:{COMMAND_USER_OPTION_PATTERN})(?:=|\s+)?)"
+    r"(?P<argument>(?:\\[\s\S]|[^\s;&|)])+)"
+)
+COMMAND_CERT_SHELL_WORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>{COMMAND_CERT_OPTION_PATTERN})"
+    r"(?P<argument>(?:\\[\s\S]|[^\s;&|)])+)"
+)
 COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(?<![?&/\w-])(?P<option>(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
     rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>{COMMAND_QUOTED_CREDENTIAL_NAME_CHAR_PATTERN}*:)"
@@ -314,7 +325,8 @@ COMMAND_CONFIG_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"([^\"'\r\n]+)([\"']?)"
 )
 CURL_INLINE_CONFIG_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b{CURL_EXECUTABLE_NAME_PATTERN}\b(?:(?![;&|\n]).){{0,2048}}?"
+    rf"(?is)\b{CURL_EXECUTABLE_NAME_PATTERN}\b"
+    rf"(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,{CURL_COMMAND_SCAN_CHARS}}}?"
     rf"(?P<option>(?<!\w)(?:(?P<config>--config)(?:=|\s+)|"
     rf"(?P<short_config>{CURL_CONFIG_SHORT_OPTION_PATTERN})\s*|"
     r"(?P<netrc>--netrc-file)(?:=|\s+)))"
@@ -402,7 +414,8 @@ SSHPASS_FILE_DESCRIPTOR_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_INLINE_SECRET_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?:(?<!\w){COMMAND_SECRET_LONG_OPTION_PATTERN}(?:=|\s+)|"
-    rf"\b{CURL_EXECUTABLE_NAME_PATTERN}\b(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,2048}}?"
+    rf"\b{CURL_EXECUTABLE_NAME_PATTERN}\b"
+    rf"(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,{CURL_COMMAND_SCAN_CHARS}}}?"
     r"(?<!\w)-[A-Za-z]*b(?![A-Za-z])(?:=|\s+))\s*<\("
 )
 SHELL_HERE_STRING_VALUE_RE: Final[re.Pattern[str]] = re.compile(
@@ -2704,6 +2717,13 @@ def _shell_wrapper_prefix_allows_command(prefix: str) -> bool:
     except ValueError:
         return False
 
+    if tokens and tokens[0].replace("\\", "/").rsplit("/", 1)[-1] == "find":
+        exec_indexes = [index for index, token in enumerate(tokens) if token in {"-exec", "-execdir"}]
+        if not exec_indexes:
+            return False
+        nested_prefix = tokens[exec_indexes[-1] + 1 :]
+        return not nested_prefix or _shell_wrapper_prefix_allows_command(shlex.join(nested_prefix))
+
     index = 0
     while index < len(tokens) and tokens[index] in {"!", "do", "elif", "if", "then", "until", "while"}:
         index += 1
@@ -2789,6 +2809,37 @@ def _shell_wrapper_prefix_allows_command(prefix: str) -> bool:
                         return False
                     index += 1
             continue
+        if wrapper == "timeout":
+            options_with_values = {"-k", "-s", "--kill-after", "--signal"}
+            while index < len(tokens) and tokens[index].startswith("-"):
+                token = tokens[index]
+                if token == "--":
+                    index += 1
+                    break
+                option = token.split("=", 1)[0]
+                index += 1
+                if option in options_with_values and "=" not in token:
+                    if index >= len(tokens):
+                        return False
+                    index += 1
+            if index >= len(tokens):
+                return False
+            index += 1
+            continue
+        if wrapper == "stdbuf":
+            options_with_values = {"-e", "-i", "-o", "--error", "--input", "--output"}
+            while index < len(tokens) and tokens[index].startswith("-"):
+                token = tokens[index]
+                if token == "--":
+                    index += 1
+                    break
+                option = token.split("=", 1)[0]
+                index += 1
+                if option in options_with_values and "=" not in token:
+                    if index >= len(tokens):
+                        return False
+                    index += 1
+            continue
         return False
     return True
 
@@ -2863,12 +2914,21 @@ def _curl_command_ranges(text: str) -> list[tuple[int, int]]:
                 segment_end = index
                 break
             index += 1
-        ranges.append((executable_start, min(segment_end, executable_start + 2048)))
+        ranges.append((executable_start, min(segment_end, executable_start + CURL_COMMAND_SCAN_CHARS)))
         covered_until = segment_end
     return ranges
 
 
+def _curl_candidate_limit_exceeded(text: str) -> bool:
+    for index, _ in enumerate(CURL_EXECUTABLE_RE.finditer(text), start=1):
+        if index > MAX_CURL_EXECUTABLE_CANDIDATES:
+            return True
+    return False
+
+
 def _redact_curl_credentials(text: str) -> str:
+    if _curl_candidate_limit_exceeded(text):
+        return REDACTED_EVIDENCE_VALUE
     for start, end in reversed(_curl_command_ranges(text)):
         fragment = text[start:end]
         fragment = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, fragment)
@@ -2876,6 +2936,8 @@ def _redact_curl_credentials(text: str) -> str:
         fragment = COMMAND_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
         fragment = COMMAND_SUBSTITUTION_USER_PASSWORD_RE.sub(_redact_substitution_command_user_password, fragment)
         fragment = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, fragment)
+        fragment = COMMAND_CERT_SHELL_WORD_RE.sub(_redact_shell_word_credential, fragment)
+        fragment = COMMAND_USER_SHELL_WORD_RE.sub(_redact_shell_word_credential, fragment)
         text = f"{text[:start]}{fragment}{text[end:]}"
     return text
 
@@ -2981,6 +3043,24 @@ def _redact_certificate_password(match: re.Match[str]) -> str:
     return f"{match.group('option')}{match.group('certificate')}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _redact_shell_word_credential(match: re.Match[str]) -> str:
+    argument = match.group("argument")
+    preceding_backslashes = 0
+    colon_index = -1
+    for index, char in enumerate(argument):
+        if char == ":" and preceding_backslashes % 2 == 0:
+            colon_index = index
+            break
+        preceding_backslashes = preceding_backslashes + 1 if char == "\\" else 0
+    if colon_index < 0 or colon_index + 1 >= len(argument):
+        return match.group(0)
+
+    password = argument[colon_index + 1 :]
+    if REDACTED_EVIDENCE_VALUE in password:
+        return match.group(0)
+    return f"{match.group('option')}{argument[: colon_index + 1]}{_redact_positional_secret_value(password)}"
+
+
 def _find_function_argument_end(text: str, start: int) -> int:
     quote: str | None = None
     quote_slashes = 0
@@ -3074,7 +3154,31 @@ def _argv_pair_is_for_curl(text: str, pair_start: int) -> bool:
     if collection_start < 0:
         return False
     collection_prefix = text[collection_start + 1 : pair_start]
-    return PYTHON_CURL_ARGV_START_RE.match(collection_prefix) is not None
+    if PYTHON_CURL_ARGV_START_RE.match(collection_prefix) is not None:
+        return True
+    try:
+        prefix_values = _safe_eval_string_expr(ast.parse(f"[{collection_prefix}]", mode="eval"))
+    except SyntaxError:
+        return False
+    if not isinstance(prefix_values, list) or not prefix_values:
+        return False
+
+    return _curl_argv_executable_index(prefix_values) is not None
+
+
+def _curl_argv_executable_index(arguments: list[str]) -> int | None:
+    """Return the curl executable position after supported command wrappers."""
+    if not arguments:
+        return None
+
+    for index, value in enumerate(arguments):
+        executable = value.replace("\\", "/").rsplit("/", 1)[-1]
+        if re.fullmatch(CURL_EXECUTABLE_NAME_PATTERN, executable, re.IGNORECASE) is None:
+            continue
+        if index == 0 or _shell_wrapper_prefix_allows_command(shlex.join(arguments[:index])):
+            return index
+        return None
+    return None
 
 
 def _redact_curl_argv_credential_value(option: str, value: str) -> str | None:
@@ -3125,7 +3229,11 @@ def _curl_config_arguments_use_stdin(arguments: list[str]) -> bool:
     for index, argument in enumerate(arguments):
         if argument.casefold() == "--config=-":
             return True
+        if argument.casefold() == "--netrc-file=-":
+            return True
         if argument.casefold() == "--config" and index + 1 < len(arguments) and arguments[index + 1] == "-":
+            return True
+        if argument.casefold() == "--netrc-file" and index + 1 < len(arguments) and arguments[index + 1] == "-":
             return True
         if re.fullmatch(rf"{CURL_CONFIG_SHORT_OPTION_PATTERN}-", argument) is not None:
             return True
@@ -3158,8 +3266,9 @@ def _is_curl_config_subprocess_command(raw_argument: str) -> bool:
         return False
     if not isinstance(command, (list, tuple)) or not command:
         return False
-    executable = command[0].replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".exe")
-    return executable == "curl" and _curl_config_arguments_use_stdin(list(command[1:]))
+    command_arguments = list(command)
+    executable_index = _curl_argv_executable_index(command_arguments)
+    return executable_index is not None and _curl_config_arguments_use_stdin(command_arguments[executable_index + 1 :])
 
 
 def _safe_eval_bytes_expr(node: ast.AST) -> bytes | None:
@@ -3201,7 +3310,7 @@ def _safe_eval_curl_config_input(node: ast.AST) -> str | bytes | None:
 
 
 def _redact_static_curl_config_input(raw_value: str) -> str | None:
-    raw_redacted = _redact_curl_config_fragment(raw_value)
+    raw_redacted = COMMAND_NETRC_PASSWORD_RE.sub(_redact_netrc_password, _redact_curl_config_fragment(raw_value))
     if raw_redacted != raw_value:
         return raw_redacted
     try:
@@ -3210,12 +3319,12 @@ def _redact_static_curl_config_input(raw_value: str) -> str | None:
         return None
     value = _safe_eval_curl_config_input(node)
     if isinstance(value, str):
-        redacted = _redact_curl_config_fragment(value)
+        redacted = COMMAND_NETRC_PASSWORD_RE.sub(_redact_netrc_password, _redact_curl_config_fragment(value))
         return repr(redacted) if redacted != value else None
     if not isinstance(value, bytes):
         return None
     decoded = value.decode("utf-8", errors="replace")
-    redacted = _redact_curl_config_fragment(decoded)
+    redacted = COMMAND_NETRC_PASSWORD_RE.sub(_redact_netrc_password, _redact_curl_config_fragment(decoded))
     if redacted == decoded:
         return None
     redacted_bytes = redacted.encode()
@@ -3692,6 +3801,8 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
+    if _curl_candidate_limit_exceeded(text):
+        return REDACTED_EVIDENCE_VALUE
     redacted = _redact_inline_curl_config_passwords(text)
     redacted = _redact_inline_password_sources(redacted)
     redacted = _redact_subprocess_curl_config_inputs(redacted)
@@ -3771,6 +3882,8 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_serialized_url_slashes(redacted)
     redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
+    if _curl_candidate_limit_exceeded(redacted):
+        return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
     redacted = _normalize_serialized_assignment_separators(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
     redacted = _normalize_embedded_control_sensitive_keys(redacted)
