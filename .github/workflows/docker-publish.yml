@@ -8,6 +8,7 @@ on:
       tag:
         description: "Image tag (e.g., 0.2.26)"
         required: true
+        type: string
 
 permissions:
   contents: read
@@ -18,13 +19,99 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  validate-manual-publish:
+    name: Validate Manual Publish
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image_tag: ${{ steps.validate.outputs.image_tag }}
+      source_ref: ${{ steps.validate.outputs.source_ref }}
+      source_sha: ${{ steps.validate.outputs.source_sha }}
+    environment:
+      name: ghcr-manual-publish
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Validate manual image tag
+        id: validate
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+        run: |
+          SOURCE_TAG="$(python scripts/validate_docker_publish_tag.py "$IMAGE_TAG")"
+          SOURCE_REF="refs/tags/v${SOURCE_TAG}"
+          git fetch --no-tags --depth=1 origin "$SOURCE_REF"
+          SOURCE_SHA="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "image_tag=$SOURCE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  validate-release-publish:
+    name: Validate Release Publish
+    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image_tag: ${{ steps.validate.outputs.image_tag }}
+      source_ref: ${{ steps.validate.outputs.source_ref }}
+      source_sha: ${{ steps.validate.outputs.source_sha }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Validate release image tag
+        id: validate
+        env:
+          IMAGE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          SOURCE_TAG="$(python scripts/validate_docker_publish_tag.py "$IMAGE_TAG")"
+          if [[ "$IMAGE_TAG" != "v${SOURCE_TAG}" ]]; then
+            echo "Docker images are published only for root vX.Y.Z releases" >&2
+            exit 1
+          fi
+          SOURCE_REF="refs/tags/v${SOURCE_TAG}"
+          git fetch --no-tags --depth=1 origin "$SOURCE_REF"
+          SOURCE_SHA="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "image_tag=$SOURCE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Build and Push Docker Image
+    needs: [validate-manual-publish, validate-release-publish]
+    if: >-
+      ${{ always() && (
+        (github.event_name == 'workflow_dispatch' && needs.validate-manual-publish.result == 'success') ||
+        (github.event_name == 'release' && needs.validate-release-publish.result == 'success')
+      ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.validate-manual-publish.outputs.source_ref || needs.validate-release-publish.outputs.source_ref }}
+
+      - name: Resolve source commit
+        id: source
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && needs.validate-manual-publish.outputs.source_sha || needs.validate-release-publish.outputs.source_sha }}
+        run: |
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          if [[ -n "$EXPECTED_SOURCE_SHA" && "$SOURCE_SHA" != "$EXPECTED_SOURCE_SHA" ]]; then
+            echo "Validated source commit changed before publish" >&2
+            exit 1
+          fi
+          echo "short_sha=${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
@@ -43,13 +130,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
+          context: git
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
             type=sha
-            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=raw,value=${{ needs.validate-manual-publish.outputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push lightweight image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
@@ -66,5 +155,5 @@ jobs:
       - name: Verify published image
         run: |
           # Pull and verify the image works
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7} --version
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.source.outputs.short_sha }}
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.source.outputs.short_sha }} --version
