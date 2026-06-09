@@ -297,9 +297,9 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
     ),
     RuleCatalogEntry(
         code="S406",
-        name="Symlink to external location",
+        name="Archive link to external location",
         severity="HIGH",
-        description="Symbolic link pointing outside scope",
+        description="Symbolic or hard archive link pointing outside scope",
         patterns=(r"symlink.*external", r"link.*outside", r"symlink"),
     ),
     RuleCatalogEntry(

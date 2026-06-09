@@ -88,11 +88,10 @@ class ScanOptions:
         if (
             isinstance(max_nested_pickle_bytes, bool)
             or not isinstance(max_nested_pickle_bytes, int)
-            or max_nested_pickle_bytes < 0
+            or max_nested_pickle_bytes < 2
         ):
             raise ValueError(
-                "max_nested_pickle_bytes must be greater than or equal to 0 and an integer, "
-                f"got {max_nested_pickle_bytes!r}",
+                f"max_nested_pickle_bytes must be at least 2 and an integer, got {max_nested_pickle_bytes!r}",
             )
 
         max_nested_depth: object = self.max_nested_depth

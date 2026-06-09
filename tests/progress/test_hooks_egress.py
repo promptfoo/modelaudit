@@ -124,21 +124,32 @@ def test_custom_host_header_cannot_override_validated_destination(monkeypatch: p
     assert "host" not in mock_post.call_args.kwargs["headers"]
 
 
-def test_unicode_url_matches_punycode_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("unicode_host", "punycode_host"),
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.de", "xn--fa-hia.de"),
+    ],
+)
+def test_unicode_url_matches_punycode_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+    unicode_host: str,
+    punycode_host: str,
+) -> None:
     resolver = MagicMock(return_value=_address_info())
     monkeypatch.setattr("socket.getaddrinfo", resolver)
     with patch("modelaudit.progress.hooks._post_to_pinned_address", return_value=200) as mock_post:
         hook = WebhookProgressHook(
             name="idn",
-            webhook_url="https://bücher.example/modelaudit",
+            webhook_url=f"https://{unicode_host}/modelaudit",
             retry_attempts=1,
-            allowed_hosts={"xn--bcher-kva.example"},
+            allowed_hosts={punycode_host},
         )
         assert hook._send_webhook({"event_type": "progress"}) is True
 
-    resolver.assert_called_once_with("xn--bcher-kva.example", 443, type=socket.SOCK_STREAM)
-    assert mock_post.call_args.kwargs["hostname"] == "xn--bcher-kva.example"
-    assert mock_post.call_args.kwargs["headers"]["Host"] == "xn--bcher-kva.example"
+    resolver.assert_called_once_with(punycode_host, 443, type=socket.SOCK_STREAM)
+    assert mock_post.call_args.kwargs["hostname"] == punycode_host
+    assert mock_post.call_args.kwargs["headers"]["Host"] == punycode_host
 
 
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.5", "192.168.1.10"])
@@ -232,9 +243,8 @@ def test_webhook_accepts_iana_global_exceptions_when_ipaddress_is_stale(
     assert hook.webhook_url == f"https://{rendered_hostname}/progress"
 
 
-def test_webhook_accepts_public_ipv4_embedded_in_nat64_destination() -> None:
-    hostname = "64:ff9b::5db8:d822"
-
+@pytest.mark.parametrize("hostname", ["64:ff9b::5db8:d822", "::ffff:0:5db8:d822"])
+def test_webhook_accepts_public_ipv4_embedded_destination(hostname: str) -> None:
     hook = WebhookProgressHook(
         name="public-nat64",
         webhook_url=f"https://[{hostname}]/progress",
@@ -572,6 +582,29 @@ def test_email_allowed_host_uses_pinned_address_and_preserves_payload(monkeypatc
     smtp_server.quit.assert_called_once()
 
 
+def test_email_unicode_host_uses_idna2008_destination(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODELAUDIT_PROGRESS_SMTP_ALLOWED_HOSTS", "xn--fa-hia.de")
+    resolver = MagicMock(return_value=_address_info(port=587))
+    monkeypatch.setattr("socket.getaddrinfo", resolver)
+    smtp_server = MagicMock()
+
+    with patch("modelaudit.progress.hooks._connect_pinned_smtp", return_value=smtp_server) as mock_connect:
+        hook = EmailProgressHook(
+            name="smtp-idn",
+            smtp_host="faß.de",
+            smtp_port=587,
+            username="user",
+            password="pass",
+            from_email="scanner@example.com",
+            to_emails=["security@example.com"],
+        )
+        assert hook._send_email("ModelAudit Scan", "body") is True
+
+    assert hook.smtp_host == "xn--fa-hia.de"
+    resolver.assert_called_once_with("xn--fa-hia.de", 587, type=socket.SOCK_STREAM)
+    assert mock_connect.call_args.args[:2] == ("xn--fa-hia.de", 587)
+
+
 def test_email_rejects_private_dns_resolution_before_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODELAUDIT_PROGRESS_SMTP_ALLOWED_HOSTS", "smtp.example.com")
     monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: _address_info("192.168.1.10", 587))
@@ -644,6 +677,7 @@ def test_email_falls_back_and_closes_failed_server(monkeypatch: pytest.MonkeyPat
         "64:ff9b::7f00:1",
         "2001:4860::5efe:7f00:1",
         "::ffff:127.0.0.1",
+        "::ffff:0:127.0.0.1",
         "::7f00:1",
         "::0a00:5",
     ],

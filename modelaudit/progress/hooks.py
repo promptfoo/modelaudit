@@ -14,6 +14,8 @@ from collections.abc import Callable, Collection
 from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
+import idna
+
 from .base import ProgressPhase, ProgressStats
 
 logger = logging.getLogger("modelaudit.progress.hooks")
@@ -27,6 +29,7 @@ _NAT64_NETWORKS = (
     ipaddress.ip_network("64:ff9b::/96"),
     ipaddress.ip_network("64:ff9b:1::/48"),
 )
+_IPV4_TRANSLATED_NETWORK = ipaddress.ip_network("::ffff:0:0:0/96")
 _ISATAP_MARKERS = frozenset({b"\x00\x00\x5e\xfe", b"\x02\x00\x5e\xfe"})
 _IANA_GLOBAL_IP_NETWORKS = (
     ipaddress.ip_network("192.0.0.9/32"),
@@ -131,8 +134,8 @@ def _canonical_destination_host(hostname: str) -> str:
     if parsed_ip is not None:
         return parsed_ip.compressed
     try:
-        return normalized.encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
+        return idna.encode(normalized, uts46=True).decode("ascii").lower()
+    except idna.IDNAError as exc:
         raise ValueError(f"Invalid internationalized destination host '{hostname}'") from exc
 
 
@@ -147,6 +150,8 @@ def _embedded_ipv4_addresses(address: ipaddress.IPv6Address) -> tuple[ipaddress.
     if int(address) >> 32 == 0:
         embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
     if any(address in network for network in _NAT64_NETWORKS):
+        embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
+    if address in _IPV4_TRANSLATED_NETWORK:
         embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
     if address.packed[8:12] in _ISATAP_MARKERS:
         embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
