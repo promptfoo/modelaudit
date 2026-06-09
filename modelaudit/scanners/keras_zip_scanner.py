@@ -1923,7 +1923,7 @@ class KerasZipScanner(BaseScanner):
             return
 
     def _check_get_file_archive_extraction(self, model_config: Any, result: ScanResult) -> None:
-        """Check for CVE-2025-12060: get_file(extract=True) tar traversal risk."""
+        """Check for CVE-2025-12060: truthy get_file tar extraction arguments."""
         for context, node in self._iter_dict_nodes(model_config):
             if self._is_primarily_documentation(context, node):
                 continue
@@ -1957,8 +1957,9 @@ class KerasZipScanner(BaseScanner):
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (
-                        "keras.utils.get_file(extract=True) can extract attacker-controlled tar archives "
-                        "with traversal or symlink entries outside the intended destination."
+                        "Truthy keras.utils.get_file untar arguments, or extract arguments with a "
+                        "tar-capable archive format, can extract attacker-controlled archives with "
+                        "traversal or symlink entries outside the intended destination."
                     ),
                     "affected_versions": "Keras < 3.12.0",
                     "remediation": (
