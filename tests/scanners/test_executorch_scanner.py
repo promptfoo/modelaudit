@@ -467,6 +467,57 @@ def test_executorch_scanner_scans_stubbed_zip_payload(tmp_path: Path) -> None:
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
+@pytest.mark.parametrize("dispatch", ["direct", "core"])
+def test_executorch_scanner_analyzes_raw_payload_in_executable_prefixed_zip(
+    tmp_path: Path,
+    dispatch: str,
+) -> None:
+    file_path = create_executorch_archive(tmp_path)
+    file_path.write_bytes(
+        _valid_elf64_header() + b"\x00" * 64 + b"os.system('id')" + b"\x00" * 64 + file_path.read_bytes()
+    )
+
+    if dispatch == "direct":
+        result = ExecuTorchScanner().scan(str(file_path))
+    else:
+        result = core.scan_file(str(file_path), config={"cache_scan_results": False})
+
+    assert "pytorch_binary" in result.metadata["supplemental_scanners"]
+    assert any(
+        check.name == "Embedded Code Pattern Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+    assert any(
+        issue.rule_code == "S501" and "Linux executable" in issue.message and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    assert result.success is False
+
+
+@pytest.mark.parametrize("dispatch", ["direct", "core"])
+def test_executorch_scanner_raw_payload_ignores_benign_prefixed_zip_near_match(
+    tmp_path: Path,
+    dispatch: str,
+) -> None:
+    file_path = create_executorch_archive(tmp_path)
+    file_path.write_bytes(b"launcher=acos.systematic_normalization\x00" + b"\x00" * 128 + file_path.read_bytes())
+
+    if dispatch == "direct":
+        result = ExecuTorchScanner().scan(str(file_path))
+    else:
+        result = core.scan_file(str(file_path), config={"cache_scan_results": False})
+
+    assert "pytorch_binary" in result.metadata["supplemental_scanners"]
+    assert result.success is True
+    assert not any(
+        check.name == "Embedded Code Pattern Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.rule_code == "S501" for issue in result.issues)
+
+
 def test_executorch_scanner_preserves_legacy_pickle_rule_codes_for_embedded_members(tmp_path: Path) -> None:
     fixture_path = _ASSETS_DIR / "samples" / "pickles" / "decode_exec_chain.pkl"
     model_path = tmp_path / "decode_exec_chain.ptl"

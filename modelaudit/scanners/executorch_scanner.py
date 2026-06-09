@@ -268,7 +268,7 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        if valid_binary_program:
+        if valid_binary_program or not header.startswith(b"PK"):
             self._merge_raw_binary_analysis(path, result, file_size)
         result.finish(success=True)
         return result
