@@ -10,6 +10,7 @@ import pickletools
 import zlib
 from collections.abc import Callable
 from contextlib import suppress
+from importlib.metadata import version as distribution_version
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
@@ -576,85 +577,12 @@ class JoblibScanner(BaseScanner):
         """Extract joblib metadata."""
         metadata = super().extract_metadata(file_path)
 
-        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+        with suppress(Exception):
+            metadata["joblib_version"] = distribution_version("joblib")
 
-        if not allow_deserialization:
-            metadata["deserialization_skipped"] = True
-            metadata["reason"] = "Deserialization disabled for metadata extraction"
-            return metadata
-
-        try:
-            import joblib
-
-            # Try to load the joblib file
-            obj = joblib.load(file_path)
-
-            metadata.update(
-                {
-                    "joblib_version": joblib.__version__,
-                    "object_type": type(obj).__name__,
-                    "object_module": getattr(type(obj), "__module__", "unknown"),
-                }
-            )
-
-            # Analyze sklearn models specifically
-            if hasattr(obj, "_sklearn_version"):
-                metadata["sklearn_version"] = str(obj._sklearn_version)
-
-            if hasattr(obj, "get_params"):
-                try:
-                    try:
-                        params = obj.get_params(deep=False)
-                    except TypeError:
-                        params = obj.get_params()
-                    metadata.update(
-                        {
-                            "model_parameters": len(params),
-                            "key_parameters": list(params.keys())[:10],  # First 10 parameters
-                        }
-                    )
-                except Exception:
-                    metadata["model_parameters_unavailable"] = True
-
-            # Check for common sklearn model attributes
-            if hasattr(obj, "n_features_in_"):
-                metadata["n_features_in"] = obj.n_features_in_
-
-            if hasattr(obj, "classes_"):
-                metadata.update(
-                    {
-                        "n_classes": len(obj.classes_),
-                        "classes": list(obj.classes_)[:10]
-                        if len(obj.classes_) <= 10
-                        else f"{len(obj.classes_)} classes",
-                    }
-                )
-
-            if hasattr(obj, "feature_importances_"):
-                metadata["has_feature_importances"] = True
-                with suppress(Exception):
-                    importances = obj.feature_importances_
-                    metadata["feature_importance_stats"] = {
-                        "min": float(min(importances)),
-                        "max": float(max(importances)),
-                        "mean": float(sum(importances) / len(importances)),
-                    }
-            else:
-                metadata["has_feature_importances"] = False
-
-            # Check for ensemble models
-            if hasattr(obj, "estimators_"):
-                metadata.update(
-                    {
-                        "is_ensemble": True,
-                        "n_estimators": len(obj.estimators_),
-                    }
-                )
-            else:
-                metadata["is_ensemble"] = False
-
-        except Exception as e:
-            metadata["extraction_error"] = str(e)
-            metadata["extraction_error_type"] = type(e).__name__
+        metadata["deserialization_skipped"] = True
+        metadata["reason"] = "Unsafe in-process joblib deserialization is disabled for metadata extraction"
+        if self.config.get("allow_metadata_deserialization"):
+            metadata["allow_metadata_deserialization_ignored"] = True
 
         return metadata

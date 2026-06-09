@@ -223,6 +223,7 @@ def pytest_runtest_setup(item):
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_patched_version_suffixes",
+            "tests/test_security_enhancements.py::TestNumPyScannerSecurity::test_negative_dimension_rejection",
         ]
 
         # Check if this is an allowed test file
