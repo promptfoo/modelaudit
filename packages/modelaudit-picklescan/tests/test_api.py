@@ -7572,6 +7572,25 @@ def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
     )
 
 
+def test_scan_bytes_zero_nested_depth_still_flags_nested_pickle() -> None:
+    nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="zero-depth-nested-malicious.pkl",
+        options=ScanOptions(max_nested_depth=0),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("incomplete_reason") == "max_nested_depth"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_surfaces_deep_nested_pickle_findings_without_parse_incomplete() -> None:
     deepest_payload = pickle.dumps(MaliciousPayload(), protocol=4)
     nested_payload = pickle.dumps({"middle": deepest_payload}, protocol=4)

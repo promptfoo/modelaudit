@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _CLEARTEXT_CLOUD_ERROR = "Cleartext cloud storage URL is not supported"
+_CACHE_ENTRY_NAMESPACE = ".entries-v2"
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _BARE_ASSIGNMENT_RE = re.compile(
@@ -552,7 +553,12 @@ def _cloud_url_local_basename(url: str) -> str:
             return ""
     except Exception:
         logger.debug("Unable to parse cloud URL for local basename; using fallback path handling")
-    return _cloud_url_basename(url).replace("\\", "/").rsplit("/", 1)[-1]
+    return _normalize_cloud_local_separators(_cloud_url_basename(url)).rsplit("/", 1)[-1]
+
+
+def _normalize_cloud_local_separators(path: str) -> str:
+    """Interpret backslashes as separators only on filesystems that do so."""
+    return path.replace("\\", "/") if _uses_windows_filename_rules() else path
 
 
 def _remove_path(path: Path) -> None:
@@ -566,7 +572,7 @@ def _remove_path(path: Path) -> None:
 def _prepare_cache_subdirectory(cache_dir: Path, cache_key: str) -> Path:
     """Create a cache-key directory without following replaced path components."""
     cache_subdir = cache_dir
-    for component in (cache_key[:2], cache_key[2:4]):
+    for component in (_CACHE_ENTRY_NAMESPACE, cache_key[:2], cache_key[2:4], cache_key):
         cache_subdir /= component
         if cache_subdir.is_symlink() or (cache_subdir.exists() and not cache_subdir.is_dir()):
             cache_subdir.unlink()
@@ -756,7 +762,7 @@ def _is_resolved_path_within_base(base_path: Path, target_path: Path) -> bool:
 
 def _resolve_cloud_path(entry_name: str, base_dir: Path) -> tuple[Path, bool]:
     """Resolve a cloud object relative path and return whether it is safe."""
-    entry = entry_name.replace("\\", "/")
+    entry = _normalize_cloud_local_separators(entry_name)
     if entry.startswith("/") or (os.name == "nt" and len(entry) > 1 and entry[1] == ":"):
         return (base_dir / entry.lstrip("/")).resolve(), False
 
@@ -1140,8 +1146,12 @@ class GCSCache:
             for cache_key, entry in self.metadata.items()
             if isinstance(entry, dict)
         }
-        temp_file = self.metadata_file.with_name(f"{self.metadata_file.name}.tmp")
-        fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.metadata_file.name}.",
+            suffix=".tmp",
+            dir=self.cache_dir,
+        )
+        temp_file = Path(temp_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.metadata, f, indent=2)
@@ -2076,7 +2086,7 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
     else:
         relative_path = _protocol_less_cloud_relative_path(normalized_base, file_url)
 
-    relative_path = relative_path.replace("\\", "/")
+    relative_path = _normalize_cloud_local_separators(relative_path)
     _validate_cloud_local_path(relative_path, file_url)
 
     resolved_path, is_safe = _resolve_cloud_path(relative_path, download_path)
@@ -2097,26 +2107,32 @@ def _protocol_less_cloud_relative_path(base_url: str, file_url: str) -> str:
         parsed_file = urlsplit(file_url)
         # Provider listings commonly return bare object keys. In that form,
         # URL delimiters are literal key text rather than query/fragment syntax.
-        file_path = parsed_file.path if parsed_file.scheme or parsed_file.netloc else file_url
-        file_path = file_path.replace("\\", "/").lstrip("/")
+        file_scheme = parsed_file.scheme.casefold()
+        structured_file_url = file_scheme in {"s3", "gs", "gcs", "r2"} or (
+            file_scheme in {"http", "https"} and _http_cloud_protocol(file_url) is not None
+        )
+        file_path = parsed_file.path if structured_file_url else file_url
+        file_path = _normalize_cloud_local_separators(file_path).lstrip("/")
     except Exception:
         return _cloud_url_local_basename(file_url)
 
-    hostname = (base.hostname or "").casefold().rstrip(".")
-    base_path = base.path.strip("/")
-    if base.scheme.casefold() in {"http", "https"} and hostname.endswith(".s3.amazonaws.com"):
-        bucket = hostname[: -len(".s3.amazonaws.com")]
-        provider_prefix = "/".join(part for part in (bucket, base_path) if part)
-    elif base.scheme.casefold() in {"http", "https"} and (
-        hostname == "storage.googleapis.com" or hostname.endswith(".r2.cloudflarestorage.com")
-    ):
-        provider_prefix = base_path
+    if base.scheme.casefold() in {"http", "https"}:
+        try:
+            _protocol, canonical_url, _fs_args = get_cloud_filesystem_config(base_url)
+            canonical = urlsplit(canonical_url)
+            provider_prefix = "/".join(
+                part.strip("/") for part in (canonical.netloc, canonical.path) if part.strip("/")
+            )
+        except ValueError:
+            provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
     else:
         provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
     if provider_prefix and file_path.startswith(f"{provider_prefix}/"):
         return file_path[len(provider_prefix) + 1 :]
     if provider_prefix and file_path == provider_prefix:
         return _cloud_url_local_basename(file_url)
+    if not structured_file_url:
+        return file_path
     return _cloud_url_local_basename(file_url)
 
 
@@ -2134,7 +2150,6 @@ def _validate_cloud_local_path(relative_path: str, file_url: str) -> None:
         or not leaf
         or leaf in {".", ".."}
         or "/" in leaf
-        or "\\" in leaf
         or (
             _uses_windows_filename_rules()
             and any(_is_unsafe_windows_cloud_filename(component) for component in components if component)
@@ -2229,8 +2244,16 @@ def _local_destination_key(
     if not unicode_normalization_sensitive:
         normalized = unicodedata.normalize("NFC", normalized)
     if not case_sensitive:
-        normalized = normalized.casefold()
+        normalized = normalized.lower()
     return normalized
+
+
+def _local_destination_ancestor_keys(destination_key: str) -> Iterator[str]:
+    """Yield canonical parent keys up to the filesystem root."""
+    parent = os.path.dirname(destination_key)
+    while parent and parent != destination_key:
+        yield parent
+        destination_key, parent = parent, os.path.dirname(parent)
 
 
 def _build_cloud_download_plan(
@@ -2241,6 +2264,7 @@ def _build_cloud_download_plan(
     """Resolve all cloud objects to local paths and fail on destination aliases."""
     planned: list[tuple[dict[str, Any], str, Path]] = []
     destinations: dict[str, str] = {}
+    descendant_destinations: dict[str, str] = {}
     case_sensitive = _is_case_sensitive_directory(download_path)
     unicode_normalization_sensitive = _is_unicode_normalization_sensitive_directory(download_path)
     for file_info in files:
@@ -2251,14 +2275,22 @@ def _build_cloud_download_plan(
             case_sensitive=case_sensitive,
             unicode_normalization_sensitive=unicode_normalization_sensitive,
         )
-        previous_url = destinations.get(destination_key)
+        previous_url = destinations.get(destination_key) or descendant_destinations.get(destination_key)
+        ancestor_keys = tuple(_local_destination_ancestor_keys(destination_key))
+        if previous_url is None:
+            previous_url = next(
+                (destinations[ancestor_key] for ancestor_key in ancestor_keys if ancestor_key in destinations),
+                None,
+            )
         if previous_url is not None:
             raise ValueError(
                 "Cloud object path alias collision: "
                 f"{_redact_cloud_path_for_display(previous_url)} and "
-                f"{_redact_cloud_path_for_display(file_url)} both resolve to {local_path.name}"
+                f"{_redact_cloud_path_for_display(file_url)} overlap at {local_path.name}"
             )
         destinations[destination_key] = file_url
+        for ancestor_key in ancestor_keys:
+            descendant_destinations.setdefault(ancestor_key, file_url)
         planned.append((file_info, file_url, local_path))
     return planned
 

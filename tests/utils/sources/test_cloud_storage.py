@@ -2771,6 +2771,32 @@ def test_build_safe_local_path_preserves_protocol_less_literal_delimiters(
     assert local_path == tmp_path / expected_name
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Colon-bearing object keys are not valid Win32 filenames")
+def test_build_safe_local_path_preserves_protocol_less_scheme_like_key(tmp_path: Path) -> None:
+    local_path = _build_safe_local_path("s3://bucket/models", "a:model.pkl", tmp_path)
+
+    assert local_path == tmp_path / "a:model.pkl"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Backslashes are path separators on Windows")
+def test_build_safe_local_path_preserves_posix_backslash_key(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, rf"{base_url}/folder\model.pkl", tmp_path)
+
+    assert local_path == tmp_path / r"folder\model.pkl"
+
+
+def test_build_safe_local_path_rejects_windows_backslash_traversal(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    with (
+        patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=True),
+        pytest.raises(ValueError, match=r"Path traversal attempt detected|Invalid cloud object basename"),
+    ):
+        _build_safe_local_path(base_url, rf"{base_url}/..\outside.pkl", tmp_path)
+
+
 @pytest.mark.parametrize(
     "file_url",
     [
@@ -3626,8 +3652,13 @@ class TestCloudPathSecurity:
         "base_url",
         [
             "https://bucket.s3.amazonaws.com/models",
+            "https://bucket.s3.us-west-2.amazonaws.com/models",
+            "https://s3.us-west-2.amazonaws.com/bucket/models",
+            "https://bucket.s3-accelerate.amazonaws.com/models",
             "https://storage.googleapis.com/bucket/models",
+            "https://bucket.storage.googleapis.com/models",
             "https://account.r2.cloudflarestorage.com/bucket/models",
+            "https://bucket.account.r2.cloudflarestorage.com/models",
         ],
     )
     def test_download_plan_preserves_https_provider_nested_object_paths(
@@ -3651,8 +3682,13 @@ class TestCloudPathSecurity:
         "base_url",
         [
             "https://bucket.s3.amazonaws.com/models",
+            "https://bucket.s3.us-west-2.amazonaws.com/models",
+            "https://s3.us-west-2.amazonaws.com/bucket/models",
+            "https://bucket.s3-accelerate.amazonaws.com/models",
             "https://storage.googleapis.com/bucket/models",
+            "https://bucket.storage.googleapis.com/models",
             "https://account.r2.cloudflarestorage.com/bucket/models",
+            "https://bucket.account.r2.cloudflarestorage.com/models",
         ],
     )
     def test_download_plan_rejects_https_provider_path_traversal(
@@ -3709,6 +3745,42 @@ class TestCloudPathSecurity:
             plan = _build_cloud_download_plan(base_url, files, tmp_path)
 
         assert [local_path.name for _, _, local_path in plan] == ["Model.pkl", "model.pkl"]
+
+    def test_download_plan_preserves_sharp_s_names_on_case_insensitive_filesystem(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/stra\u00dfe.pkl"},
+            {"path": f"{base_url}/strasse.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=False),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=True,
+            ),
+        ):
+            plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["stra\u00dfe.pkl", "strasse.pkl"]
+
+    @pytest.mark.parametrize(
+        "paths",
+        [
+            ("artifact", "artifact/model.pkl"),
+            ("artifact/model.pkl", "artifact"),
+        ],
+    )
+    def test_download_plan_rejects_file_directory_prefix_aliases(
+        self,
+        tmp_path: Path,
+        paths: tuple[str, str],
+    ) -> None:
+        base_url = "s3://bucket/models"
+        files = [{"path": f"{base_url}/{path}"} for path in paths]
+
+        with pytest.raises(ValueError, match="alias collision"):
+            _build_cloud_download_plan(base_url, files, tmp_path)
 
     def test_download_plan_rejects_unicode_alias_on_normalization_insensitive_filesystem(
         self,
@@ -4021,7 +4093,67 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_refresh_replaces_nested_cached_symlink_without_touching_target(
+    def test_download_rejects_prefix_alias_before_clearing_stale_cache(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/models"
+        cache_dir = tmp_path / "cache"
+        metadata = {
+            "type": "directory",
+            "etag": "etag-v2",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": f"{url}/artifact", "name": "artifact", "size": 4, "human_size": "4 B"},
+                {
+                    "path": f"{url}/artifact/model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+        cache_scope = _cloud_directory_cache_scope(
+            metadata,
+            selective=False,
+            scannable_extensions=None,
+            scannable_filenames=None,
+            scanner_selection=None,
+        )
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
+        cached_path = cache.cache_dir / cache_key[:2] / cache_key[2:4]
+        cached_path.mkdir(parents=True)
+        (cached_path / "old-model.pkl").write_bytes(b"old")
+        cache.cache_file(url, cached_path, etag="etag-v1", cache_scope=cache_scope)
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 8}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = metadata
+
+        with pytest.raises(ValueError, match="alias collision"):
+            download_from_cloud(
+                url,
+                cache_dir=cache_dir,
+                selective=False,
+                show_progress=False,
+            )
+
+        assert (cached_path / "old-model.pkl").read_bytes() == b"old"
+        assert (
+            GCSCache(cache_dir=cache_dir).get_cached_path(url, etag="etag-v1", cache_scope=cache_scope) == cached_path
+        )
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_refresh_migrates_legacy_cache_with_nested_symlink_without_touching_target(
         self,
         mock_fs_class: MagicMock,
         mock_analyze: AsyncMock,
@@ -4077,7 +4209,8 @@ class TestCloudPathSecurity:
             show_progress=False,
         )
 
-        assert result == cached_path
+        assert result == cache.cache_dir / ".entries-v2" / cache_key[:2] / cache_key[2:4] / cache_key
+        assert (cached_path / "subdir").is_symlink()
         assert not (result / "subdir").is_symlink()
         assert (result / "subdir" / "model.pkl").read_bytes() == b"new"
         assert outside_marker.read_text(encoding="utf-8") == "keep"
@@ -4715,6 +4848,84 @@ class TestCloudCacheSafety:
         cache.cache_file(url, source_file, etag="etag-v1")
 
         assert cache.get_cached_path(url, etag="etag-v2") is None
+
+    def test_cache_paths_use_full_key_after_sharding(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        first_url = "s3://bucket-28/model.pkl"
+        second_url = "s3://bucket-145/model.pkl"
+        first_key = cache.get_cache_key(first_url)
+        second_key = cache.get_cache_key(second_url)
+        assert first_key[:4] == second_key[:4]
+        assert first_key != second_key
+
+        first_source = tmp_path / "first" / "model.pkl"
+        second_source = tmp_path / "second" / "model.pkl"
+        first_source.parent.mkdir()
+        second_source.parent.mkdir()
+        first_source.write_bytes(b"first")
+        second_source.write_bytes(b"second")
+
+        cache.cache_file(first_url, first_source, etag="etag-first")
+        cache.cache_file(second_url, second_source, etag="etag-second")
+
+        first_cached = cache.get_cached_path(first_url, etag="etag-first")
+        second_cached = cache.get_cached_path(second_url, etag="etag-second")
+        assert first_cached is not None
+        assert second_cached is not None
+        assert first_cached != second_cached
+        assert first_cached.read_bytes() == b"first"
+        assert second_cached.read_bytes() == b"second"
+        assert ".entries-v2" in first_cached.parts
+        assert ".entries-v2" in second_cached.parts
+        assert first_key in first_cached.parts
+        assert second_key in second_cached.parts
+
+    def test_new_cache_namespace_does_not_overlap_legacy_shard_content(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        legacy_url = "s3://bucket-28/model.pkl"
+        new_url = "s3://bucket-145/model.pkl"
+        legacy_key = cache.get_cache_key(legacy_url)
+        new_key = cache.get_cache_key(new_url)
+        assert legacy_key[:4] == new_key[:4]
+
+        legacy_path = cache.cache_dir / legacy_key[:2] / legacy_key[2:4]
+        legacy_path.mkdir(parents=True)
+        legacy_model = legacy_path / "legacy.pkl"
+        legacy_model.write_bytes(b"legacy")
+        cache.cache_file(legacy_url, legacy_path, etag="etag-legacy")
+        cache.metadata[legacy_key]["last_accessed"] = "2000-01-01T00:00:00"
+        cache._save_metadata()
+
+        new_source = tmp_path / "new.pkl"
+        new_source.write_bytes(b"new")
+        cache.cache_file(new_url, new_source, etag="etag-new")
+
+        new_cached = cache.get_cached_path(new_url, etag="etag-new")
+        assert new_cached is not None
+        assert new_cached.read_bytes() == b"new"
+        assert new_cached.is_relative_to(cache.cache_dir / ".entries-v2")
+        assert list(legacy_path.iterdir()) == [legacy_model]
+
+        cache.clean_old_cache(max_age_days=1)
+
+        assert not legacy_path.exists()
+        assert new_cached.read_bytes() == b"new"
+        assert cache.get_cached_path(new_url, etag="etag-new") == new_cached
+
+    @pytest.mark.skipif(os.name == "nt", reason="Creating symlinks may require elevated Windows privileges")
+    def test_cache_metadata_ignores_preplanted_fixed_temp_symlink(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        legacy_temp_file = cache.metadata_file.with_name(f"{cache.metadata_file.name}.tmp")
+        legacy_temp_file.symlink_to(victim)
+        cache.metadata["test"] = {"path": str(cache.cache_dir), "etag": "etag"}
+
+        cache._save_metadata()
+
+        assert victim.read_text(encoding="utf-8") == "keep"
+        assert legacy_temp_file.is_symlink()
+        assert json.loads(cache.metadata_file.read_text(encoding="utf-8"))["test"]["etag"] == "etag"
 
     def test_legacy_cache_without_etag_is_stale_miss_and_migrates_metadata(self, tmp_path: Path) -> None:
         cache_dir = tmp_path / "cache"
