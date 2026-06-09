@@ -38,6 +38,9 @@ from .config.local_config import find_local_config_for_paths
 from .core import (
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    _make_trusted_stream_shard_root,
+    _reconcile_cross_directory_shard_coverage,
+    _snapshot_validated_shard_target,
     determine_exit_code,
     scan_model_directory_or_file,
 )
@@ -67,6 +70,7 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
+from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -1352,6 +1356,53 @@ class _ScanPathState:
     sbom_paths_resolved: bool = False
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
+    validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
+    explicit_shard_family_groups: dict[str, str] = field(default_factory=dict)
+    has_errors_outside_reconciled_shards: bool = False
+
+    def mark_non_shard_error(self, audit_result: ModelAuditResultModel) -> None:
+        """Record an aggregate error that shard reconciliation does not own."""
+        self.has_errors_outside_reconciled_shards = True
+        audit_result.has_errors = True
+
+    def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
+        """Preserve errors from results that cannot join final CLI shard reconciliation."""
+        if scan_result.has_errors:
+            self.has_errors_outside_reconciled_shards = True
+
+    def explicit_shard_family_group_for(self, path: str) -> str | None:
+        """Return the opt-in family group only for an exact explicit file argument."""
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return self.explicit_shard_family_groups.get(normalized_path)
+
+    def record_validated_shard_targets(
+        self,
+        scan_result: ModelAuditResultModel,
+        *,
+        pre_scan_target: ValidatedShardTargets | None = None,
+    ) -> None:
+        """Record stable regular-file identities for shard assets that were scanned."""
+        for asset in scan_result.assets:
+            if not asset.path or asset.type == "error":
+                continue
+            metadata = scan_result.file_metadata.get(asset.path)
+            if metadata is not None and metadata.get("operational_error") is True:
+                continue
+            explicit_family_group = self.explicit_shard_family_group_for(asset.path)
+            post_scan_target = _snapshot_validated_shard_target(
+                asset.path,
+                family_group=explicit_family_group,
+                family_group_policy="explicit" if explicit_family_group else None,
+            )
+            if not post_scan_target:
+                continue
+            if pre_scan_target:
+                common_sources = pre_scan_target.keys() & post_scan_target.keys()
+                if common_sources and any(
+                    pre_scan_target[source_path] != post_scan_target[source_path] for source_path in common_sources
+                ):
+                    continue
+            self.validated_shard_targets.update(post_scan_target)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -1594,6 +1645,76 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
     return expanded, missing_globs
+
+
+def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str]:
+    """Map exact local file arguments to conservative explicit-family groups."""
+    grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
+    seen_paths: set[str] = set()
+    for path_str in paths:
+        if "://" in path_str or "*" in path_str or "?" in path_str:
+            continue
+        path = Path(path_str)
+        if not path.is_file():
+            continue
+        try:
+            resolved_path = str(path.resolve(strict=True))
+            parent_stat = os.stat(Path(resolved_path).parent, follow_symlinks=False)
+        except (OSError, RuntimeError):
+            continue
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            continue
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if callable(get_effective_uid) and parent_stat.st_uid != get_effective_uid():
+                continue
+            if stat.S_IMODE(parent_stat.st_mode) & 0o022:
+                continue
+        shard_match = ShardedModelDetector.match_shard_filename(Path(resolved_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
+        ):
+            continue
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(resolved_path)))
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        grouped_paths.setdefault((pattern, expected_total), []).append(
+            (normalized_path, Path(resolved_path), shard_index)
+        )
+
+    groups: dict[str, str] = {}
+    for (_pattern, expected_total), records in grouped_paths.items():
+        targets_by_scope: dict[str, dict[int, list[str]]] = {}
+        scopes_by_source: dict[str, set[str]] = {}
+        for normalized_path, resolved_path_obj, shard_index in records:
+            source_scopes = scopes_by_source.setdefault(normalized_path, set())
+            for ancestor in (resolved_path_obj.parent, *resolved_path_obj.parent.parents):
+                normalized_scope = os.path.normcase(os.path.normpath(str(ancestor)))
+                source_scopes.add(normalized_scope)
+                targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
+
+        complete_scopes = {
+            scope
+            for scope, targets_by_index in targets_by_scope.items()
+            if len(targets_by_index) == expected_total
+            and all(len(targets) == 1 for targets in targets_by_index.values())
+        }
+        for normalized_path, _resolved_path, _shard_index in records:
+            matching_scopes = scopes_by_source[normalized_path] & complete_scopes
+            if matching_scopes:
+                family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
+                groups[normalized_path] = f"explicit-cli:{family_scope}"
+    return groups
 
 
 def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
@@ -2325,6 +2446,16 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
+    explicit_family_group = path_state.explicit_shard_family_group_for(actual_path)
+    pre_scan_shard_target = (
+        _snapshot_validated_shard_target(
+            actual_path,
+            family_group=explicit_family_group,
+            family_group_policy="explicit" if explicit_family_group else None,
+        )
+        if os.path.isfile(actual_path)
+        else {}
+    )
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
@@ -2369,6 +2500,7 @@ def _scan_local_or_downloaded_path(
                 cache_dir=runtime.cache_dir,
                 **_scanner_selection_overrides(runtime),
             )
+            path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
             path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
@@ -2415,6 +2547,10 @@ def _scan_local_or_downloaded_path(
             skip_file_types=runtime.skip_non_model_files,
             use_hf_whitelist=runtime.use_hf_whitelist,
             **config_overrides,
+        )
+        path_state.record_validated_shard_targets(
+            scan_results,
+            pre_scan_target=pre_scan_shard_target,
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
         if is_dvc_pointer and has_prior_dvc_coverage:
@@ -2470,7 +2606,7 @@ def _scan_local_or_downloaded_path(
 
         logger.error(f"Error during scan of {display_path}: {display_error}")
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         path_state.scanned_paths.append(_display_scan_path(actual_path))
 
         if progress_tracker:
@@ -2490,12 +2626,12 @@ def _resolve_scan_source_for_path(
     """Resolve one source path and execute source-native scans when they should bypass local scanning."""
     if is_cleartext_cloud_url(path):
         click.echo(f"Error: Cleartext cloud storage URL is not supported: {_display_path(path)}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     if is_cleartext_pytorch_hub_url(path):
         click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {_display_path(path)}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     if is_huggingface_file_url(path):
@@ -2551,7 +2687,7 @@ def _resolve_scan_source_for_path(
             error_msg = _display_error(exc, path)
             logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2647,6 +2783,12 @@ def _resolve_scan_source_for_path(
 
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
+                    _trusted_shard_family_root=(
+                        _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
+                        if runtime.cache_enabled and trusted_source_provenance is not None
+                        else None
+                    ),
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2659,6 +2801,7 @@ def _resolve_scan_source_for_path(
                     cache_dir=runtime.cache_dir,
                     **streaming_kwargs,
                 )
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
@@ -2729,7 +2872,7 @@ def _resolve_scan_source_for_path(
                 logger.error(f"Failed to process model from {display_path}: {error_msg}")
                 click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2761,6 +2904,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2774,6 +2918,7 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 record_download_completed("pytorch_hub", time.time() - download_start, 0, path)
 
@@ -2831,7 +2976,7 @@ def _resolve_scan_source_for_path(
                 logger.error(f"Failed to download model from {display_path}: {error_msg}")
                 click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_cloud_url(path):
@@ -2868,7 +3013,7 @@ def _resolve_scan_source_for_path(
             except Exception as exc:
                 error_msg = _display_error(exc, path)
                 click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
-                audit_result.has_errors = True
+                path_state.mark_non_shard_error(audit_result)
                 return None
 
         download_spinner = None
@@ -2901,6 +3046,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2914,6 +3060,7 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 record_download_completed("cloud_storage", time.time() - download_start, 0, path)
 
@@ -2985,7 +3132,7 @@ def _resolve_scan_source_for_path(
                 logger.error(f"Failed to download from {display_path}: {error_msg}")
                 click.echo(f"Error downloading from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_mlflow_uri(path):
@@ -3017,13 +3164,27 @@ def _resolve_scan_source_for_path(
                 **_scanner_selection_overrides(runtime),
             )
 
+            path_state.record_non_shard_result_errors(results)
             audit_result.aggregate_scan_result(results.model_dump())
-            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
-            if download_refused:
+            download_refusal_type = next(
+                (
+                    issue_type
+                    for issue in results.issues
+                    if isinstance((issue_type := getattr(issue, "type", None)), str)
+                    and issue_type.startswith("mlflow_download_")
+                ),
+                None,
+            )
+            if download_refusal_type is not None:
                 if download_spinner:
                     download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
                 elif runtime.show_styled_output:
-                    click.echo("Download refused by configured size budget")
+                    refusal_reason = (
+                        "configured size budget"
+                        if download_refusal_type == "mlflow_download_budget"
+                        else "MLflow staging safety checks"
+                    )
+                    click.echo(f"Download refused by {refusal_reason}")
             else:
                 record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
                 if download_spinner:
@@ -3037,10 +3198,10 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            display_error = _display_error(exc, path)
-            logger.error(f"Failed to download model from {display_path}: {display_error}")
-            click.echo(f"Error downloading model from {display_path}: {display_error}", err=True)
-            audit_result.has_errors = True
+            error_msg = _display_error(exc, path)
+            logger.error(f"Failed to download model from {display_path}: {error_msg}")
+            click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_jfrog_url(path):
@@ -3090,6 +3251,7 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Downloaded and scanned successfully")
 
+            path_state.record_non_shard_result_errors(jfrog_results)
             audit_result.aggregate_scan_result(jfrog_results.model_dump())
             record_download_completed("jfrog", time.time() - download_start, jfrog_results.bytes_scanned, path)
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
@@ -3102,12 +3264,12 @@ def _resolve_scan_source_for_path(
             error_msg = _display_error(exc, path)
             logger.error(f"Failed to download/scan model from {display_path}: {error_msg}")
             click.echo(f"Error downloading/scanning model from {display_path}: {error_msg}", err=True)
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if not os.path.exists(path):
         click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     return _SourceDispatchResult(actual_path=path)
@@ -3626,6 +3788,11 @@ def delegate_info() -> None:
     is_flag=True,
     help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
 )
+@click.option(
+    "--assume-shard-family",
+    is_flag=True,
+    help="Treat explicitly provided cross-directory shard paths as one model family",
+)
 def scan_command(
     paths: tuple[str, ...],
     format: str | None,
@@ -3648,6 +3815,7 @@ def scan_command(
     no_cache: bool,
     cache_dir: str | None,
     stream: bool,
+    assume_shard_family: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -3715,6 +3883,7 @@ def scan_command(
         "strict": strict,
         "no_whitelist": no_whitelist,
         "dry_run": dry_run,
+        "assume_shard_family": assume_shard_family,
         "has_scanner_selection": bool(scanners or exclude_scanners),
         "num_paths": len(paths),
     }
@@ -3773,7 +3942,8 @@ def scan_command(
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
-        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths)
+        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
+        explicit_shard_family_groups=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
     )
 
     # Scan each path with interrupt handling
@@ -3814,7 +3984,7 @@ def scan_command(
                 logger.error(f"Unexpected error processing {display_path}: {display_error}")
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
                 path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
-                audit_result.has_errors = True
+                path_state.mark_non_shard_error(audit_result)
 
                 if progress_tracker:
                     progress_tracker.report_error(Exception(display_error))
@@ -3848,6 +4018,11 @@ def scan_command(
 
     _complete_progress_tracking(progress_tracker, verbose=verbose)
     _cleanup_progress_reporters(progress_reporters)
+    _reconcile_cross_directory_shard_coverage(
+        audit_result,
+        path_state.validated_shard_targets,
+        missing_shard_errors_only=not path_state.has_errors_outside_reconciled_shards,
+    )
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 

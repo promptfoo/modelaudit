@@ -1,3 +1,4 @@
+import io
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -11,7 +12,7 @@ from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.numpy_scanner import NumPyScanner
+from modelaudit.scanners.numpy_scanner import NUMPY_HEADER_MAX_SIZE, NumPyScanner, _read_numpy_array_header
 
 
 def test_numpy_scanner_valid(tmp_path):
@@ -268,6 +269,18 @@ class _ExecPayload:
         return (exec, ("print('owned')",))
 
 
+def _write_metadata_marker(path: str) -> None:
+    Path(path).write_text("executed", encoding="utf-8")
+
+
+class _MetadataExecPayload:
+    def __init__(self, marker_path: Path) -> None:
+        self.marker_path = str(marker_path)
+
+    def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        return (_write_metadata_marker, (self.marker_path,))
+
+
 class _SSLPayload:
     def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
         import ssl
@@ -294,6 +307,239 @@ def _assert_no_trailing_pickle_parse_noise(result: ScanResult) -> None:
     assert not any(term in issue_text for term in parse_noise_terms)
     assert isinstance(reasons, list)
     assert "parse_incomplete" not in reasons
+
+
+def test_numpy_metadata_extraction_preserves_numeric_header_and_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "numeric.npy"
+    np.save(path, np.array([1.0, 2.0, 3.0], dtype=np.float32), allow_pickle=False)
+
+    def fail_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("metadata extraction must not reopen the path with numpy.load")
+
+    monkeypatch.setattr(np, "load", fail_load)
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert metadata["array_shape"] == [3]
+    assert metadata["array_dtype"] == "float32"
+    assert metadata["array_size"] == 3
+    assert metadata["contains_objects"] is False
+    assert metadata["min_value"] == 1.0
+    assert metadata["max_value"] == 3.0
+
+
+def test_numpy_metadata_extraction_preserves_v3_unicode_field_names(tmp_path: Path) -> None:
+    path = tmp_path / "unicode-fields.npy"
+    array = np.zeros(1, dtype=[("\u03bc", np.int64)])
+    with path.open("wb") as handle:
+        np.lib.format.write_array(handle, array, version=(3, 0), allow_pickle=False)
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert metadata["array_dtype"] == "[('\u03bc', '<i8')]"
+    assert metadata["contains_objects"] is False
+    assert "extraction_error" not in metadata
+
+
+@pytest.mark.parametrize(
+    (("version", "length_size", "header_length")),
+    [
+        ((1, 0), 2, NUMPY_HEADER_MAX_SIZE + 1),
+        ((2, 0), 4, NUMPY_HEADER_MAX_SIZE + 1),
+        ((3, 0), 4, (NUMPY_HEADER_MAX_SIZE * 4) + 1),
+    ],
+)
+def test_numpy_metadata_extraction_bounds_header_reads(
+    tmp_path: Path,
+    version: tuple[int, int],
+    length_size: int,
+    header_length: int,
+) -> None:
+    path = tmp_path / f"oversized-v{version[0]}-header.npy"
+    path.write_bytes(
+        b"\x93NUMPY" + bytes(version) + header_length.to_bytes(length_size, "little"),
+    )
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert "NumPy header is too large" in metadata["extraction_error"]
+
+
+def test_numpy_metadata_extraction_bounds_v3_decoded_header_characters(tmp_path: Path) -> None:
+    path = tmp_path / "oversized-v3-decoded-header.npy"
+    header = b" " * (NUMPY_HEADER_MAX_SIZE + 1)
+    path.write_bytes(b"\x93NUMPY\x03\x00" + len(header).to_bytes(4, "little") + header)
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert "NumPy header is too large" in metadata["extraction_error"]
+    assert "characters" in metadata["extraction_error"]
+
+
+def test_numpy_v3_unicode_header_uses_decoded_character_limit(tmp_path: Path) -> None:
+    path = tmp_path / "long-unicode-header.npy"
+    field_name = "\u03bc" * 5_000
+    array = np.zeros(1, dtype=[(field_name, np.int8)])
+    with path.open("wb") as handle:
+        np.lib.format.write_array(handle, array, version=(3, 0), allow_pickle=False)
+
+    with path.open("rb") as handle:
+        assert np.lib.format.read_magic(handle) == (3, 0)
+        header_length = int.from_bytes(handle.read(4), "little")
+        header_bytes = handle.read(header_length)
+    assert len(header_bytes) > NUMPY_HEADER_MAX_SIZE
+    assert len(header_bytes.decode("utf-8")) <= NUMPY_HEADER_MAX_SIZE
+
+    result = NumPyScanner().scan(str(path))
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert result.success is True
+    assert metadata["array_dtype"] == f"[('{field_name}', 'i1')]"
+    assert "extraction_error" not in metadata
+
+
+@pytest.mark.parametrize((("version", "length_size")), [((1, 0), 2), ((2, 0), 4), ((3, 0), 4)])
+def test_numpy_scan_rejects_boolean_shape_dimensions(
+    tmp_path: Path,
+    version: tuple[int, int],
+    length_size: int,
+) -> None:
+    path = tmp_path / f"boolean-shape-v{version[0]}.npy"
+    header = repr({"descr": "<i8", "fortran_order": False, "shape": (False,)}).encode("ascii")
+    path.write_bytes(b"\x93NUMPY" + bytes(version) + len(header).to_bytes(length_size, "little") + header)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "NumPy Header Read" and "Boolean NumPy shape dimensions are invalid" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize((("version", "length_size")), [((1, 0), 2), ((2, 0), 4), ((3, 0), 4)])
+def test_numpy_metadata_extraction_rejects_negative_shape_dimensions(
+    tmp_path: Path,
+    version: tuple[int, int],
+    length_size: int,
+) -> None:
+    path = tmp_path / f"negative-shape-v{version[0]}.npy"
+    header = repr({"descr": "<i8", "fortran_order": False, "shape": (-1,)}).encode("ascii")
+    path.write_bytes(
+        b"\x93NUMPY" + bytes(version) + len(header).to_bytes(length_size, "little") + header + (b"A" * 1024),
+    )
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert metadata["extraction_error"] == "Negative NumPy shape dimensions are invalid"
+
+
+def test_numpy_scan_accepts_empty_integer_dimension(tmp_path: Path) -> None:
+    path = tmp_path / "empty.npy"
+    np.save(path, np.empty((0,), dtype=np.int64), allow_pickle=False)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["shape"] == (0,)
+
+
+def test_numpy_header_parser_does_not_rewind_the_untrusted_stream() -> None:
+    class NoRewindBytesIO(io.BytesIO):
+        def seek(self, offset: int, whence: int = 0) -> int:
+            raise AssertionError(f"unexpected rewind: {offset}, {whence}")
+
+    encoded_header = io.BytesIO()
+    np.lib.format.write_array_header_2_0(
+        encoded_header,
+        {"descr": "<i8", "fortran_order": False, "shape": (1,)},
+    )
+    stream = NoRewindBytesIO(encoded_header.getvalue())
+    assert np.lib.format.read_magic(stream) == (2, 0)
+
+    shape, fortran_order, dtype = _read_numpy_array_header(stream, (2, 0))
+
+    assert shape == (1,)
+    assert fortran_order is False
+    assert dtype == np.dtype("<i8")
+
+
+def test_numpy_metadata_extraction_does_not_flag_fixed_width_strings_as_objects(tmp_path: Path) -> None:
+    path = tmp_path / "strings.npy"
+    np.save(path, np.array(["abc"], dtype="U3"), allow_pickle=False)
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert metadata["contains_objects"] is False
+    assert metadata["contains_strings"] is True
+    assert "security_note" not in metadata
+
+
+def test_numpy_metadata_extraction_never_deserializes_object_arrays(tmp_path: Path) -> None:
+    marker_path = tmp_path / "metadata-executed"
+    path = tmp_path / "object.npy"
+    np.save(path, np.array([_MetadataExecPayload(marker_path)], dtype=object), allow_pickle=True)
+
+    metadata = NumPyScanner({"allow_metadata_deserialization": True}).extract_metadata(str(path))
+
+    assert marker_path.exists() is False
+    assert metadata["array_shape"] == [1]
+    assert metadata["array_dtype"] == "object"
+    assert metadata["contains_objects"] is True
+    assert metadata["deserialization_skipped"] is True
+    assert metadata["allow_metadata_deserialization_ignored"] is True
+    assert "unsafe pickle deserialization" in metadata["reason"]
+    assert "extraction_error" not in metadata
+
+
+def test_numpy_metadata_extraction_never_deserializes_structured_object_fields(tmp_path: Path) -> None:
+    marker_path = tmp_path / "structured-metadata-executed"
+    path = tmp_path / "structured-object.npy"
+    array = np.empty(1, dtype=[("value", np.int64), ("payload", object)])
+    array["value"] = 1
+    array["payload"][0] = _MetadataExecPayload(marker_path)
+    np.save(path, array, allow_pickle=True)
+
+    metadata = NumPyScanner({"allow_metadata_deserialization": True}).extract_metadata(str(path))
+
+    assert marker_path.exists() is False
+    assert metadata["array_shape"] == [1]
+    assert metadata["contains_objects"] is True
+    assert metadata["deserialization_skipped"] is True
+    assert metadata["allow_metadata_deserialization_ignored"] is True
+    assert "unsafe pickle deserialization" in metadata["reason"]
+    assert "extraction_error" not in metadata
+
+
+@pytest.mark.parametrize(
+    (("dtype", "shape")),
+    [
+        (np.dtype("<i8"), (1,)),
+        (np.dtype("S8"), (1,)),
+        (np.dtype("<i8"), ((10 * 1024 * 1024 // 8) + 1,)),
+    ],
+)
+def test_numpy_metadata_extraction_reports_truncated_fixed_width_payloads(
+    tmp_path: Path,
+    dtype: np.dtype[Any],
+    shape: tuple[int, ...],
+) -> None:
+    path = tmp_path / "truncated.npy"
+    with path.open("wb") as handle:
+        np.lib.format.write_array_header_2_0(
+            handle,
+            {"descr": np.lib.format.dtype_to_descr(dtype), "fortran_order": False, "shape": shape},
+        )
+
+    metadata = NumPyScanner().extract_metadata(str(path))
+
+    assert metadata["array_shape"] == list(shape)
+    assert metadata["array_dtype"] == str(dtype)
+    assert metadata["extraction_error"].startswith("NumPy array data is truncated:")
+    assert "found 0" in metadata["extraction_error"]
 
 
 def _inject_comment_token_into_npy_payload(path: Path) -> None:

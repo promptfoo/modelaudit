@@ -3,10 +3,18 @@
 from pathlib import Path
 
 from modelaudit.cache.optimized_config import (
+    CACHE_SCHEMA_VERSION,
     CacheConfiguration,
     ConfigurationExtractor,
+    build_cache_version_context,
     get_config_extractor,
 )
+
+
+def test_cache_schema_invalidates_pre_whitelist_policy_entries() -> None:
+    """Security-policy changes must not reuse cached pre-fix severities."""
+    assert CACHE_SCHEMA_VERSION == "2.2"
+    assert build_cache_version_context()["cache_schema_version"] == "2.2"
 
 
 class TestCacheConfiguration:
