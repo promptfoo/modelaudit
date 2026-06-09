@@ -1608,6 +1608,7 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
 def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str]:
     """Map exact local file arguments to conservative explicit-family groups."""
     grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
+    seen_paths: set[str] = set()
     for path_str in paths:
         if "://" in path_str or "*" in path_str or "?" in path_str:
             continue
@@ -1642,6 +1643,9 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
         ):
             continue
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(resolved_path)))
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
         grouped_paths.setdefault((pattern, expected_total), []).append(
             (normalized_path, Path(resolved_path), shard_index)
         )
@@ -3113,12 +3117,25 @@ def _resolve_scan_source_for_path(
 
             path_state.record_non_shard_result_errors(results)
             audit_result.aggregate_scan_result(results.model_dump())
-            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
-            if download_refused:
+            download_refusal_type = next(
+                (
+                    issue_type
+                    for issue in results.issues
+                    if isinstance((issue_type := getattr(issue, "type", None)), str)
+                    and issue_type.startswith("mlflow_download_")
+                ),
+                None,
+            )
+            if download_refusal_type is not None:
                 if download_spinner:
                     download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
                 elif runtime.show_styled_output:
-                    click.echo("Download refused by configured size budget")
+                    refusal_reason = (
+                        "configured size budget"
+                        if download_refusal_type == "mlflow_download_budget"
+                        else "MLflow staging safety checks"
+                    )
+                    click.echo(f"Download refused by {refusal_reason}")
             else:
                 record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
                 if download_spinner:

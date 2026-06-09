@@ -137,6 +137,7 @@ def pytest_runtest_setup(item):
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
+            "test_pmml_dependency_handling.py",  # PMML safe-parser fail-closed regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
             "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
@@ -171,6 +172,7 @@ def pytest_runtest_setup(item):
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
             "test_evidence_redaction.py",  # Shared scanner evidence redaction tests
+            "test_evidence_redaction_authorization_continuation.py",  # Folded auth-header redaction regressions
             "test_catboost_evidence_redaction.py",  # CatBoost command evidence redaction tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
@@ -186,6 +188,7 @@ def pytest_runtest_setup(item):
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
+            "test_jfrog_redirect_security.py",  # JFrog redirect SSRF regression tests
             "test_mlflow_integration.py",  # MLflow integration tests
             "test_streaming_analysis.py",  # signed stream routing and fallback regressions
             "test_tar_scanner.py",  # TAR archive scanner tests

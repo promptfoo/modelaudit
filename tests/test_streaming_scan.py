@@ -113,6 +113,21 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
     assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_or_file_streaming_path_enforces_max_file_size() -> None:
+    """The configured file limit must cap the actual remote stream read."""
+    stream_url = "s3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, False)) as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()) as mock_scanner,
+    ):
+        scan_model_directory_or_file(f"stream://{stream_url}", max_file_size=4096)
+
+    mock_stream.assert_called_once_with(stream_url, mock_scanner.return_value, max_bytes=4096)
+
+
 def test_scan_model_directory_or_file_encoded_signed_query_preserves_routing() -> None:
     """Encoded signed queries must not hide the model suffix from scanner routing."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret-token"
@@ -714,6 +729,107 @@ def test_streaming_shard_alias_aba_cannot_hide_malicious_content() -> None:
         assert all(shard.resolve().name == "malicious.safetensors" for shard in shards)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert determine_exit_code(result) == 1
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir() and not Path("/dev/fd").is_dir(),
+    reason="descriptor-relative scan paths are unavailable",
+)
+def test_streaming_shard_staging_directory_aba_cannot_hide_malicious_content() -> None:
+    """Replacing the staging pathname cannot redirect a descriptor-bound shard scan."""
+    safe_header = b'{"__metadata__":{"format":"pt"}}'
+    malicious_header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    )
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard = root / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header + b"\0")
+            shards.append(shard)
+
+        real_scan_file = scan_file
+
+        def exchange_staging_directory(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            scan_path = Path(path)
+            if not path.startswith(("/proc/self/fd/", "/dev/fd/")):
+                return real_scan_file(path, config=config)
+            staging_directory = Path(os.readlink(scan_path.parent))
+            preserved_directory = staging_directory.with_name(f"{staging_directory.name}.preserved")
+            staging_directory.rename(preserved_directory)
+            staging_directory.mkdir(mode=0o700)
+            benign_path = staging_directory / scan_path.name
+            benign_path.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
+            try:
+                return real_scan_file(path, config=config)
+            finally:
+                shutil.rmtree(staging_directory)
+                preserved_directory.rename(staging_directory)
+
+        with patch("modelaudit.core.scan_file", side_effect=exchange_staging_directory):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert all(b"SECRET_METADATA_TOKEN" in shard.read_bytes() for shard in shards)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor pinning does not require hard links")
+def test_streaming_shard_scan_does_not_require_hard_link_support() -> None:
+    """Descriptor-bound shard scans must work on filesystems without hard links."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard)
+
+        with patch("modelaudit.utils.file.handlers.os.link", side_effect=OSError("hard links unavailable")):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 0
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses open-handle hard-link pinning")
+def test_streaming_shard_pin_failure_is_explicit_operational_error() -> None:
+    """Platforms without descriptor paths must report the pin failure explicitly."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as shard_directory:
+        shard = Path(shard_directory) / "model-00001-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+
+        with patch("modelaudit.utils.file.handlers._descriptor_path_for_open_file", return_value=None):
+            result = scan_model_streaming(
+                file_generator=iter([(shard, True)]),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        assert any(check.details.get("scan_outcome_reason") == "shard_pin_unavailable" for check in result.checks)
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
 
 
 def test_scan_model_streaming_does_not_reconcile_distinct_remote_model_directories() -> None:

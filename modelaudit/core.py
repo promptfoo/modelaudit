@@ -97,8 +97,12 @@ from modelaudit.utils.file.detection import (
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
+    _SHARD_ALREADY_PINNED_CONFIG_KEY,
+    MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
+    _pinned_shard_scan_path,
+    _ShardPinUnavailableError,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -715,6 +719,62 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
     return complete_sources
 
 
+def _ensure_streamed_shard_coverage_placeholder(scan_result: ScanResult, source_path: Path) -> None:
+    """Record the per-file shard gap that trusted cross-file reconciliation may later disprove."""
+    for record in itertools.chain(scan_result.checks, scan_result.issues):
+        details = getattr(record, "details", None)
+        if isinstance(details, dict) and details.get("scan_outcome_reason") == "missing_model_shards":
+            return
+
+    shard_match = ShardedModelDetector.match_shard_filename(source_path.name)
+    if shard_match is None:
+        return
+    shard_index = shard_match.get("current_shard_index")
+    expected_total = shard_match.get("expected_total_shards")
+    if (
+        not isinstance(shard_index, int)
+        or not isinstance(expected_total, int)
+        or expected_total <= 1
+        or not 1 <= shard_index <= expected_total
+    ):
+        return
+
+    missing_count = expected_total - 1
+    missing_indices = list(
+        itertools.islice(
+            (index for index in range(1, expected_total + 1) if index != shard_index),
+            MAX_RECORDED_MISSING_SHARD_INDICES,
+        )
+    )
+    _mark_inconclusive_scan_outcome(scan_result, "missing_model_shards")
+    scan_result.add_check(
+        name="Sharded Model Coverage Check",
+        passed=False,
+        message=f"Missing {missing_count} expected model shard(s); scan coverage is incomplete.",
+        severity=IssueSeverity.INFO,
+        location=str(source_path),
+        details={
+            "expected_total_shards": expected_total,
+            "present_total_shards": 1,
+            "missing_shard_count": missing_count,
+            "missing_shard_indices": missing_indices,
+            "missing_shard_indices_truncated": missing_count > len(missing_indices),
+            "unreadable_shard_count": 0,
+            "unreadable_shards": [],
+            "out_of_scope_shard_count": 0,
+            "out_of_scope_shards": [],
+            "unvalidated_shard_count": 0,
+            "unvalidated_shards": [],
+            "duplicate_shard_count": 0,
+            "duplicate_shards": [],
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "missing_model_shards",
+        },
+    )
+    scan_result.finish(success=False)
+
+
 def _remaining_shard_coverage_outcome(details: dict[str, Any]) -> tuple[str, str] | None:
     """Return the next visible incomplete-coverage reason after missing peers are disproven."""
     out_of_scope_count = details.get("out_of_scope_shard_count")
@@ -1230,10 +1290,15 @@ def _merge_pytorch_binary_supplemental_analysis(
     supplemental_scanner_id: str | None,
 ) -> None:
     """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    supplemental_config = dict(config)
+    if supplemental_scanner_id == "executorch":
+        from .scanners.executorch_scanner import PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY
+
+        supplemental_config[PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY] = True
     _merge_supplemental_scanner_analysis(
         path,
         result,
-        config,
+        supplemental_config,
         scanner_selection,
         supplemental_scanner_id,
         context="supplemental .bin content analysis",
@@ -1993,7 +2058,14 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
-                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
+                if max_file_size > 0:
+                    scan_result, analysis_complete = stream_analyze_file(
+                        stream_url,
+                        scanner,
+                        max_bytes=max_file_size,
+                    )
+                else:
+                    scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:
@@ -4096,6 +4168,43 @@ def scan_model_streaming(
             logger.warning(f"Failed to delete {source_path} {context}: {e}")
             pending_delete_failures[source_path] = e
 
+    def record_shard_pin_failure(source_path: Path, error: _ShardPinUnavailableError) -> None:
+        """Record a durable operational failure when a streamed shard cannot be pinned."""
+        failure = ScanResult(scanner_name="shard_pin")
+        _mark_inconclusive_scan_outcome(failure, "shard_pin_unavailable")
+        _mark_operational_scan_error(failure, "shard_pin_unavailable")
+        failure.add_check(
+            name="Shard Scan Pinning",
+            passed=False,
+            message=f"Unable to bind shard to a stable scan path: {source_path.name}",
+            severity=IssueSeverity.INFO,
+            location=str(source_path),
+            details={
+                "error": "descriptor-bound shard pinning unavailable",
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_pin_unavailable",
+            },
+        )
+        failure.finish(success=False)
+        results.aggregate_scan_result(
+            {
+                "bytes_scanned": 0,
+                "files_scanned": 1,
+                "has_errors": True,
+                "success": False,
+                "issues": [],
+                "checks": _serialize_streamed_records(
+                    list(failure.checks),
+                    str(source_path),
+                    str(source_path),
+                ),
+                "scanners": [failure.scanner_name],
+                "file_metadata": {str(source_path): dict(failure.metadata)},
+            }
+        )
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
@@ -4105,7 +4214,7 @@ def scan_model_streaming(
             source_path = Path(file_path)
             scan_path = source_path
             report_path = str(source_path)
-            pinned_scan_directory: tempfile.TemporaryDirectory[str] | None = None
+            pinned_scan_context: Any | None = None
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4185,12 +4294,8 @@ def scan_model_streaming(
                     if isinstance(resolved_target, str):
                         selected_resolved_path = resolved_target
                         try:
-                            pinned_scan_directory = tempfile.TemporaryDirectory(
-                                prefix=".modelaudit_scan_",
-                                dir=str(Path(resolved_target).parent),
-                            )
-                            pinned_path = Path(pinned_scan_directory.name) / source_path.name
-                            os.link(resolved_target, pinned_path, follow_symlinks=False)
+                            pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
+                            scan_path = Path(pinned_scan_context.__enter__().path)
                             pre_scan_shard_target = _snapshot_validated_shard_target(
                                 str(source_path),
                                 resolved_path=resolved_target,
@@ -4198,22 +4303,15 @@ def scan_model_streaming(
                                 family_group_policy="stream_staging",
                                 trusted_root_marker=_trusted_shard_family_root,
                             )
-                            pinned_stat = os.stat(pinned_path, follow_symlinks=False)
-                            pinned_target = next(iter(pre_scan_shard_target.values()), {})
-                            if (
-                                pinned_target.get("device") != pinned_stat.st_dev
-                                or pinned_target.get("inode") != pinned_stat.st_ino
-                                or pinned_target.get("size") != pinned_stat.st_size
-                                or pinned_target.get("mtime_ns") != pinned_stat.st_mtime_ns
-                                or pinned_target.get("ctime_ns") != pinned_stat.st_ctime_ns
-                            ):
-                                raise OSError("Shard target changed while pinning it for scanning")
-                            scan_path = pinned_path
-                        except OSError:
-                            if pinned_scan_directory is not None:
-                                pinned_scan_directory.cleanup()
-                                pinned_scan_directory = None
-                            pre_scan_shard_target = {}
+                            scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
+                        except _ShardPinUnavailableError as error:
+                            if pinned_scan_context is not None:
+                                pinned_scan_context = None
+                            record_shard_pin_failure(source_path, error)
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
+                            files_processed += 1
+                            continue
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -4246,6 +4344,8 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                if pre_scan_shard_target:
+                    _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
                 # Merge results
                 if scan_result:
@@ -4269,9 +4369,9 @@ def scan_model_streaming(
                     stable_while_scanning = bool(
                         pre_scan_shard_target and pre_scan_shard_target == post_scan_shard_target
                     )
-                    if pinned_scan_directory is not None:
-                        pinned_scan_directory.cleanup()
-                        pinned_scan_directory = None
+                    if pinned_scan_context is not None:
+                        pinned_scan_context.__exit__(None, None, None)
+                        pinned_scan_context = None
                     final_shard_target = _snapshot_validated_shard_target(
                         str(source_path),
                         resolved_path=selected_resolved_path,
@@ -4355,8 +4455,8 @@ def scan_model_streaming(
                 aggregate_hash_complete = False
 
             finally:
-                if pinned_scan_directory is not None:
-                    pinned_scan_directory.cleanup()
+                if pinned_scan_context is not None:
+                    pinned_scan_context.__exit__(None, None, None)
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
 

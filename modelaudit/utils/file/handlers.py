@@ -9,11 +9,13 @@ import logging
 import os
 import re
 import stat
+import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from contextvars import copy_context
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -42,8 +44,220 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
+_SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
+
+
+class _ShardPinUnavailableError(OSError):
+    """Raised when a validated shard cannot be bound to a stable scan path."""
+
+
+@dataclass
+class _PinnedShardScan:
+    """Descriptor-bound scan path plus post-scan inode stability state."""
+
+    path: str
+    changed_during_scan: bool = False
+
+
+def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str, int | str]) -> bool:
+    """Return whether an opened shard still matches its validated target snapshot."""
+    expected_values = (
+        ("device", opened_stat.st_dev),
+        ("inode", opened_stat.st_ino),
+        ("size", opened_stat.st_size),
+        ("mtime_ns", opened_stat.st_mtime_ns),
+        ("ctime_ns", opened_stat.st_ctime_ns),
+    )
+    return stat.S_ISREG(opened_stat.st_mode) and all(
+        not isinstance(target.get(key), int) or target[key] == current_value for key, current_value in expected_values
+    )
+
+
+def _descriptor_relative_scan_path(directory_fd: int, filename: str) -> str | None:
+    """Return a filename-preserving path rooted at an already-open directory."""
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        candidate = descriptor_root / str(directory_fd) / filename
+        try:
+            if stat.S_ISREG(os.stat(candidate).st_mode):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _descriptor_path_for_open_file(file_fd: int) -> str | None:
+    """Return a stable path to an opened regular file descriptor."""
+    opened_stat = os.fstat(file_fd)
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        candidate = descriptor_root / str(file_fd)
+        try:
+            if os.path.samestat(opened_stat, os.stat(candidate)):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+@contextmanager
+def _pinned_windows_shard_scan_path(
+    resolved_path: str,
+    target: dict[str, int | str],
+) -> Iterator[_PinnedShardScan]:
+    """Pin a Windows shard with open handles that prevent rename/delete replacement."""
+    source_path = Path(resolved_path)
+    source_fd: int | None = None
+    pinned_fd: int | None = None
+    staging_directory: tempfile.TemporaryDirectory[str] | None = None
+    pinned_scan: _PinnedShardScan | None = None
+    pinned_stat: os.stat_result | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+        source_fd = os.open(source_path, flags)
+        source_stat = os.fstat(source_fd)
+        if not _validated_stat_matches_target(source_stat, target):
+            raise _ShardPinUnavailableError("validated shard target changed before pinning")
+
+        staging_directory = tempfile.TemporaryDirectory(
+            prefix=".modelaudit_scan_",
+            dir=str(source_path.parent),
+        )
+        pinned_path = Path(staging_directory.name) / source_path.name
+        os.link(source_path, pinned_path, follow_symlinks=False)
+        pinned_fd = os.open(pinned_path, flags)
+        pinned_stat = os.fstat(pinned_fd)
+        if not os.path.samestat(source_stat, pinned_stat):
+            raise _ShardPinUnavailableError("validated shard target changed while pinning")
+
+        pinned_scan = _PinnedShardScan(path=str(pinned_path))
+        yield pinned_scan
+    except _ShardPinUnavailableError:
+        raise
+    except OSError as error:
+        raise _ShardPinUnavailableError(str(error)) from error
+    finally:
+        if pinned_scan is not None and pinned_stat is not None and pinned_fd is not None:
+            try:
+                final_stat = os.fstat(pinned_fd)
+            except OSError:
+                pinned_scan.changed_during_scan = True
+            else:
+                identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+                pinned_scan.changed_during_scan = any(
+                    getattr(pinned_stat, field) != getattr(final_stat, field) for field in identity_fields
+                )
+        if pinned_fd is not None:
+            os.close(pinned_fd)
+        if staging_directory is not None:
+            with suppress(OSError):
+                staging_directory.cleanup()
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+@contextmanager
+def _pinned_shard_scan_path(
+    resolved_path: str,
+    target: dict[str, int | str],
+) -> Iterator[_PinnedShardScan]:
+    """Expose a validated shard through a directory descriptor immune to pathname ABA swaps."""
+    if os.name == "nt":
+        with _pinned_windows_shard_scan_path(resolved_path, target) as windows_pinned_scan:
+            yield windows_pinned_scan
+        return
+
+    source_path = Path(resolved_path)
+    parent_fd: int | None = None
+    source_fd: int | None = None
+    staging_fd: int | None = None
+    staging_path: Path | None = None
+    pinned_name = source_path.name
+    pinned_created = False
+    pinned_scan: _PinnedShardScan | None = None
+    pinned_stat: os.stat_result | None = None
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        required_dir_fd_functions = (os.open, os.stat, os.symlink, os.unlink)
+        if (
+            not nofollow
+            or not directory
+            or any(function not in os.supports_dir_fd for function in required_dir_fd_functions)
+        ):
+            raise _ShardPinUnavailableError("descriptor-bound shard scans are unsupported on this platform")
+
+        directory_flags = os.O_RDONLY | directory | nofollow | cloexec
+        parent_fd = os.open(source_path.parent, directory_flags)
+        source_fd = os.open(
+            pinned_name,
+            os.O_RDONLY | nofollow | nonblock | cloexec,
+            dir_fd=parent_fd,
+        )
+        source_stat = os.fstat(source_fd)
+        if not _validated_stat_matches_target(source_stat, target):
+            raise _ShardPinUnavailableError("validated shard target changed before pinning")
+
+        source_descriptor_path = _descriptor_path_for_open_file(source_fd)
+        if source_descriptor_path is None:
+            raise _ShardPinUnavailableError("platform cannot expose the opened shard descriptor")
+
+        staging_path = Path(tempfile.mkdtemp(prefix=".modelaudit_scan_"))
+        initial_staging_stat = os.stat(staging_path, follow_symlinks=False)
+        staging_fd = os.open(staging_path, directory_flags)
+        staging_stat = os.fstat(staging_fd)
+        effective_uid = getattr(os, "geteuid", lambda: staging_stat.st_uid)()
+        if (
+            not stat.S_ISDIR(staging_stat.st_mode)
+            or staging_stat.st_uid != effective_uid
+            or stat.S_IMODE(staging_stat.st_mode) & 0o077
+            or not os.path.samestat(staging_stat, initial_staging_stat)
+        ):
+            raise _ShardPinUnavailableError("private shard staging directory changed while opening")
+
+        os.symlink(source_descriptor_path, pinned_name, dir_fd=staging_fd)
+        pinned_created = True
+        pinned_stat = os.stat(pinned_name, dir_fd=staging_fd)
+        if not os.path.samestat(source_stat, pinned_stat):
+            raise _ShardPinUnavailableError("validated shard target changed while pinning")
+
+        scan_path = _descriptor_relative_scan_path(staging_fd, pinned_name)
+        if scan_path is None:
+            raise _ShardPinUnavailableError("platform cannot expose the pinned shard directory")
+        opened_scan_stat = os.stat(scan_path)
+        if not os.path.samestat(source_stat, opened_scan_stat):
+            raise _ShardPinUnavailableError("pinned shard scan path resolved to a different file")
+        pinned_scan = _PinnedShardScan(path=scan_path)
+        yield pinned_scan
+    except _ShardPinUnavailableError:
+        raise
+    except OSError as error:
+        raise _ShardPinUnavailableError(str(error)) from error
+    finally:
+        if pinned_scan is not None and pinned_stat is not None and source_fd is not None:
+            try:
+                final_stat = os.fstat(source_fd)
+            except OSError:
+                pinned_scan.changed_during_scan = True
+            else:
+                identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+                pinned_scan.changed_during_scan = any(
+                    getattr(pinned_stat, field) != getattr(final_stat, field) for field in identity_fields
+                )
+        if pinned_created and staging_fd is not None:
+            with suppress(OSError):
+                os.unlink(pinned_name, dir_fd=staging_fd)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if staging_path is not None:
+            with suppress(OSError):
+                staging_path.rmdir()
+        if source_fd is not None:
+            os.close(source_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _supports_reliable_shard_cache_identity() -> bool:
@@ -68,6 +282,138 @@ def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> 
         except ValueError:
             return False
     return target_path.is_relative_to(base_path)
+
+
+def _build_advanced_shard_family_cache_fingerprint(
+    shard_info: dict[str, Any] | None,
+    hasher: Any,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return a content-bound shard-family fingerprint, or mark cache unsafe."""
+    if shard_info is None:
+        return None, True
+    if not shard_info:
+        return None, False
+
+    pattern = shard_info.get("pattern")
+    raw_shards = shard_info.get("shards")
+    total_shards = shard_info.get("total_shards")
+    expected_total_shards = shard_info.get("expected_total_shards")
+    if (
+        type(pattern) is not str
+        or not pattern
+        or not isinstance(raw_shards, list)
+        or not raw_shards
+        or any(type(shard_path) is not str or not shard_path for shard_path in raw_shards)
+        or type(total_shards) is not int
+        or total_shards != len(raw_shards)
+        or (
+            expected_total_shards is not None
+            and (type(expected_total_shards) is not int or expected_total_shards != len(raw_shards))
+        )
+    ):
+        return None, False
+
+    for count_key in (
+        "duplicate_shard_count",
+        "missing_shard_count",
+        "out_of_scope_shard_count",
+        "unreadable_shard_count",
+        "unvalidated_shard_count",
+    ):
+        count = shard_info.get(count_key)
+        if count is not None and (type(count) is not int or count != 0):
+            return None, False
+
+    for members_key in (
+        "duplicate_shards",
+        "missing_shard_indices",
+        "out_of_scope_shards",
+        "unreadable_shards",
+        "unvalidated_shards",
+    ):
+        suspect_members = shard_info.get(members_key)
+        if suspect_members is not None and (not isinstance(suspect_members, list) or suspect_members):
+            return None, False
+
+    missing_indices_truncated = shard_info.get("missing_shard_indices_truncated")
+    if missing_indices_truncated is not None and (
+        type(missing_indices_truncated) is not bool or missing_indices_truncated
+    ):
+        return None, False
+
+    members: list[dict[str, str]] = []
+    resolved_member_identities: set[tuple[int | str, ...]] = set()
+    for shard_path in sorted(raw_shards):
+        try:
+            resolved_path = str(Path(shard_path).resolve(strict=True))
+            shard_stat = os.stat(resolved_path, follow_symlinks=False)
+            if not stat.S_ISREG(shard_stat.st_mode):
+                return None, False
+            content_hash = hasher.hash_file(resolved_path)
+        except Exception:
+            return None, False
+        normalized_resolved_path = os.path.normcase(os.path.normpath(resolved_path))
+        resolved_identity: tuple[int | str, ...]
+        if shard_stat.st_ino:
+            resolved_identity = ("inode", shard_stat.st_dev, shard_stat.st_ino)
+        else:
+            resolved_identity = ("path", normalized_resolved_path)
+        if resolved_identity in resolved_member_identities:
+            return None, False
+        resolved_member_identities.add(resolved_identity)
+        if type(content_hash) is not str or not content_hash.startswith("secure:") or not content_hash[7:]:
+            return None, False
+        members.append({"path": resolved_path, "content_hash": content_hash})
+
+    return (
+        {
+            "pattern": pattern,
+            "expected_total_shards": expected_total_shards,
+            "members": members,
+        },
+        True,
+    )
+
+
+def _build_advanced_shard_model_config_cache_fingerprint(
+    file_path: str,
+    hasher: Any,
+) -> tuple[dict[str, str] | None, bool]:
+    """Return the selected model config identity, or mark cache unsafe."""
+    config_path = ShardedModelDetector.find_model_config(file_path)
+    if config_path is None:
+        return None, True
+
+    try:
+        resolved_path = str(Path(config_path).resolve(strict=True))
+        config_stat = os.stat(config_path, follow_symlinks=False)
+        if not stat.S_ISREG(config_stat.st_mode):
+            return None, False
+        content_hash = hasher.hash_file(resolved_path)
+        post_resolved_path = str(Path(config_path).resolve(strict=True))
+        post_hash_stat = os.stat(config_path, follow_symlinks=False)
+    except Exception:
+        return None, False
+
+    if (
+        resolved_path != post_resolved_path
+        or not stat.S_ISREG(post_hash_stat.st_mode)
+        or not os.path.samestat(config_stat, post_hash_stat)
+        or any(
+            current_value != previous_value
+            for current_value, previous_value in (
+                (post_hash_stat.st_size, config_stat.st_size),
+                (post_hash_stat.st_mtime_ns, config_stat.st_mtime_ns),
+                (post_hash_stat.st_ctime_ns, config_stat.st_ctime_ns),
+            )
+        )
+        or type(content_hash) is not str
+        or not content_hash.startswith("secure:")
+        or not content_hash[7:]
+    ):
+        return None, False
+
+    return {"path": resolved_path, "content_hash": content_hash}, True
 
 
 def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
@@ -993,12 +1339,14 @@ class ParallelShardHandler:
             else self.scanner_class()
         )
         scan_path = shard_path
-        target_validator: Callable[[str], os.stat_result] | None = None
+        target_validator: Callable[..., os.stat_result] | None = None
         validated_stat: os.stat_result | None = None
+        validated_target: dict[str, int | str] | None = None
         shard_targets = self.shard_info.get("shard_targets")
         if isinstance(shard_targets, dict):
             target = shard_targets.get(shard_path)
             if isinstance(target, dict):
+                validated_target = target
                 resolved_path = target.get("resolved_path")
                 expected_device = target.get("device")
                 expected_inode = target.get("inode")
@@ -1008,7 +1356,7 @@ class ParallelShardHandler:
                 if not isinstance(resolved_path, str):
                     raise OSError(f"Missing validated target for shard {Path(shard_path).name}")
 
-                def _validate_target(phase: str) -> os.stat_result:
+                def _validate_target(phase: str, *, ignore_ctime: bool = False) -> os.stat_result:
                     try:
                         current_resolved = str(Path(shard_path).resolve(strict=True))
                         current_stat = os.stat(resolved_path, follow_symlinks=False)
@@ -1028,7 +1376,9 @@ class ParallelShardHandler:
                     if isinstance(expected_size, int) and current_stat.st_size != expected_size:
                         raise OSError(f"Validated shard size changed {phase}: {Path(shard_path).name}")
                     if (isinstance(expected_mtime_ns, int) and current_stat.st_mtime_ns != expected_mtime_ns) or (
-                        isinstance(expected_ctime_ns, int) and current_stat.st_ctime_ns != expected_ctime_ns
+                        not ignore_ctime
+                        and isinstance(expected_ctime_ns, int)
+                        and current_stat.st_ctime_ns != expected_ctime_ns
                     ):
                         raise OSError(f"Validated shard timestamp changed {phase}: {Path(shard_path).name}")
                     return current_stat
@@ -1037,10 +1387,43 @@ class ParallelShardHandler:
                 validated_stat = target_validator("before scanning")
                 scan_path = resolved_path
 
-        result: ScanResult = scanner.scan(scan_path)
+        pinned_scan: _PinnedShardScan | None = None
+        try:
+            already_pinned = bool(
+                isinstance(self.scanner_config, dict)
+                and self.scanner_config.get(_SHARD_ALREADY_PINNED_CONFIG_KEY) is True
+            )
+            if validated_target is None or already_pinned:
+                result: ScanResult = scanner.scan(scan_path)
+            else:
+                with _pinned_shard_scan_path(scan_path, validated_target) as pinned_scan:
+                    result = scanner.scan(pinned_scan.path)
+        except _ShardPinUnavailableError as error:
+            result = ScanResult(scanner_name=getattr(scanner, "name", "shard_scanner"))
+            _mark_inconclusive_scan_outcome(result, "shard_pin_unavailable")
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "shard_pin_unavailable"
+            result.add_check(
+                name="Shard Scan Pinning",
+                passed=False,
+                message=f"Unable to bind shard to a stable scan path: {Path(shard_path).name}",
+                severity=IssueSeverity.INFO,
+                location=shard_path,
+                details={
+                    "error": "descriptor-bound shard pinning unavailable",
+                    "exception_type": type(error).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_pin_unavailable",
+                },
+            )
+            result.finish(success=False)
+            return result
         if target_validator is not None and validated_stat is not None:
             try:
-                post_scan_stat = target_validator("during scanning")
+                if pinned_scan is not None and pinned_scan.changed_during_scan:
+                    raise OSError(f"Validated shard content changed during scanning: {Path(shard_path).name}")
+                post_scan_stat = target_validator("during scanning", ignore_ctime=pinned_scan is not None)
                 identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
                 if any(getattr(validated_stat, field) != getattr(post_scan_stat, field) for field in identity_fields):
                     raise OSError(f"Validated shard target changed during scanning: {Path(shard_path).name}")
@@ -1527,10 +1910,42 @@ def scan_advanced_large_file(
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
         version_config = dict(config)
+        cache_hasher = cache_manager.cache.hasher if cache_manager.cache is not None else None
+        model_config_fingerprint: dict[str, str] | None = None
         if shard_info is not None:
             # A representative file key alone cannot describe sibling shard
             # membership, target identity, or incomplete-family state.
             version_config["advanced_shard_family"] = shard_info
+            shard_family_fingerprint, shard_family_cacheable = _build_advanced_shard_family_cache_fingerprint(
+                shard_info,
+                cache_hasher,
+            )
+            if not shard_family_cacheable:
+                logger.debug("Bypassing advanced-file cache for uncacheable shard family identity: %s", file_path)
+                return _scan_advanced_large_file_internal(
+                    file_path,
+                    scanner,
+                    progress_callback,
+                    timeout,
+                    allowed_shard_paths=allowed_shard_paths,
+                    allowed_shard_targets=allowed_shard_targets,
+                )
+            if shard_family_fingerprint is not None:
+                version_config["advanced_shard_family_cache_fingerprint"] = shard_family_fingerprint
+            model_config_fingerprint, model_config_cacheable = _build_advanced_shard_model_config_cache_fingerprint(
+                file_path, cache_hasher
+            )
+            if not model_config_cacheable:
+                logger.debug("Bypassing advanced-file cache for uncacheable shard model config: %s", file_path)
+                return _scan_advanced_large_file_internal(
+                    file_path,
+                    scanner,
+                    progress_callback,
+                    timeout,
+                    allowed_shard_paths=allowed_shard_paths,
+                    allowed_shard_targets=allowed_shard_targets,
+                )
+            version_config["advanced_shard_model_config_cache_fingerprint"] = model_config_fingerprint
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
             version_config["advanced_allowed_shard_paths"] = sorted(
@@ -1562,6 +1977,17 @@ def scan_advanced_large_file(
                     file_path,
                     {"path": file_path, "reason": "shard_family_changed_during_scan"},
                 )
+            if shard_info is not None:
+                current_model_config_fingerprint, current_model_config_cacheable = (
+                    _build_advanced_shard_model_config_cache_fingerprint(file_path, cache_hasher)
+                )
+                if not current_model_config_cacheable or current_model_config_fingerprint != model_config_fingerprint:
+                    result = _preserve_findings_with_shard_boundary_failure(
+                        result,
+                        scanner.name,
+                        file_path,
+                        {"path": file_path, "reason": "shard_model_config_changed_during_scan"},
+                    )
             return result.to_dict(include_private_metadata=True)
 
         # Get cached result or perform scan
@@ -1588,6 +2014,18 @@ def scan_advanced_large_file(
                 file_path,
                 {"path": file_path, "reason": "shard_family_changed_during_scan"},
             )
+
+        if shard_info is not None:
+            post_scan_model_config_fingerprint, post_scan_model_config_cacheable = (
+                _build_advanced_shard_model_config_cache_fingerprint(file_path, cache_hasher)
+            )
+            if not post_scan_model_config_cacheable or post_scan_model_config_fingerprint != model_config_fingerprint:
+                return _preserve_findings_with_shard_boundary_failure(
+                    result,
+                    scanner.name,
+                    file_path,
+                    {"path": file_path, "reason": "shard_model_config_changed_during_scan"},
+                )
 
         return result
 

@@ -637,6 +637,41 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
     )
 
 
+def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:
+    """Repeating one exact shard argument must not invalidate a complete family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            shard_paths[0],
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["success"] is True
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
 def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: Path) -> None:
     """Shard reconciliation must not clear a separate caller-level path error."""
     header = b'{"__metadata__":{"format":"pt"}}'
@@ -4899,6 +4934,37 @@ def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
 
     assert result.exit_code == 2
     assert "Download refused by configured size budget" in result.output
+    mock_record_download_completed.assert_not_called()
+
+
+@patch("modelaudit.cli.record_download_completed")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_path_refusal_is_not_recorded_as_completed(
+    mock_scan_mlflow: MagicMock,
+    mock_record_download_completed: MagicMock,
+) -> None:
+    """Staging safety refusals must not emit successful-download output or telemetry."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=0,
+        issues=[
+            {
+                "message": "MLflow staging directory changed during artifact download",
+                "severity": "info",
+                "type": "mlflow_download_path",
+            }
+        ],
+        files_scanned=0,
+        has_errors=True,
+        success=False,
+        scanners=["mlflow"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"])
+
+    assert result.exit_code == 2
+    assert "Download refused by MLflow staging safety checks" in result.output
+    assert "Downloaded and scanned successfully" not in result.output
     mock_record_download_completed.assert_not_called()
 
 

@@ -11,7 +11,11 @@ import click
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
-from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud_error_for_display
+from modelaudit.utils.sources.cloud_storage import (
+    get_cloud_filesystem_config,
+    get_fs_protocol,
+    redact_cloud_error_for_display,
+)
 
 from .detection import _has_zip_magic
 
@@ -75,6 +79,14 @@ def _is_unproven_partial_scan_issue(issue: Any, *, known_file_size: int | None) 
     }
 
 
+def _get_streaming_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
+    """Resolve provider URLs while retaining support for non-cloud test filesystems."""
+    protocol = get_fs_protocol(url)
+    if protocol not in {"s3", "gcs"}:
+        return protocol, url, {}
+    return get_cloud_filesystem_config(url)
+
+
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
     # Currently support streaming for pickle files
@@ -86,7 +98,16 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
 
 def stream_source_path(url: str) -> str:
     """Return the decoded URL path used for scanner routing and file naming."""
-    parsed_path = urlparse(url).path
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+        parsed_path = parsed.path
+        if parsed.query:
+            parsed_path = f"{parsed_path}?{parsed.query}"
+        if parsed.fragment:
+            parsed_path = f"{parsed_path}#{parsed.fragment}"
+        return parsed_path or url
+
+    parsed_path = parsed.path
     for _ in range(_MAX_STREAM_SOURCE_PATH_DECODE_PASSES):
         decoded_path = unquote(parsed_path)
         if decoded_path == parsed_path:
@@ -171,13 +192,12 @@ def stream_analyze_file(
             "Try reinstalling modelaudit: 'pip install --force-reinstall modelaudit'"
         ) from e
 
-    fs_protocol = get_fs_protocol(url)
-    # Use anonymous access for public buckets
-    fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+    fs_protocol, fs_url, fs_args = _get_streaming_filesystem_config(url)
+    fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     try:
         # Get file info first
-        info = fs.info(url)
+        info = fs.info(fs_url)
         reported_file_size = info.get("size")
         known_file_size = (
             reported_file_size
@@ -200,14 +220,20 @@ def stream_analyze_file(
 
         # Read partial content
         extra_byte_observed = False
-        with fs.open(url, "rb") as f:
+        with fs.open(fs_url, "rb") as f:
             content = f.read(bytes_to_read)
+            if not isinstance(content, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
             if known_file_size is not None and known_file_size < resolved_max_bytes and len(content) == known_file_size:
                 # A legal short read can stop at the stale reported size even
                 # when the object grew. Probe EOF separately before treating
                 # exact-size coverage as complete.
-                extra_byte_observed = bool(f.read(1))
+                extra = f.read(1)
+                if not isinstance(extra, bytes):
+                    raise TypeError("cloud filesystem returned non-bytes content")
+                extra_byte_observed = bool(extra)
         bytes_read = len(content)
+        reported_size_disproven = known_file_size is not None and (bytes_read > known_file_size or extra_byte_observed)
         bytes_complete = (
             known_file_size is not None
             and known_file_size < resolved_max_bytes
@@ -352,16 +378,19 @@ def stream_analyze_file(
         scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
         result.bytes_scanned = scanned or bytes_read
         result.issues = issues
-        result.metadata = {
-            "streaming_analysis": True,
-            "bytes_analyzed": bytes_read,
-            "bytes_complete": bytes_complete,
-            "analysis_complete": analysis_complete,
-            "file_size": reported_file_size,
-            "file_size_known": known_file_size is not None,
-            "max_bytes": resolved_max_bytes,
-        }
-        result.metadata.update(metadata)
+        result.metadata = dict(metadata)
+        result.metadata.update(
+            {
+                "streaming_analysis": True,
+                "bytes_analyzed": bytes_read,
+                "bytes_complete": bytes_complete,
+                "analysis_complete": analysis_complete,
+                "file_size": None if reported_size_disproven else reported_file_size,
+                "file_size_known": known_file_size is not None and not reported_size_disproven,
+                "reported_file_size": reported_file_size,
+                "max_bytes": resolved_max_bytes,
+            }
+        )
         if not analysis_complete:
             _mark_streaming_analysis_incomplete(result, header_only_fallback=scan_result is None)
         scanner_success = bool(getattr(scan_result, "success", True)) if scan_result is not None else True
@@ -388,11 +417,11 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> dict[str, Any] | N
         return None
 
     try:
-        fs_protocol = get_fs_protocol(url)
-        fs = fsspec.filesystem(fs_protocol, token="anon") if fs_protocol == "gcs" else fsspec.filesystem(fs_protocol)
+        fs_protocol, fs_url, fs_args = _get_streaming_filesystem_config(url)
+        fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         # Read first few bytes
-        with fs.open(url, "rb") as f:
+        with fs.open(fs_url, "rb") as f:
             header = f.read(max_bytes)
 
         # Analyze header

@@ -21,6 +21,7 @@ from urllib.parse import ParseResult, unquote, urljoin, urlparse, urlunparse
 
 import click
 import requests
+from requests.auth import AuthBase
 
 from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
 
@@ -36,6 +37,14 @@ _MAX_JFROG_LISTING_ENTRIES = 100_000
 _MAX_JFROG_LISTED_FOLDERS = 10_000
 _MAX_JFROG_STORAGE_RESPONSE_BYTES = 64 * 1024 * 1024
 _JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_JFROG_IPV6_TRANSITION_NETWORKS = (
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("2001::/32"),
+    ipaddress.ip_network("2002::/16"),
+)
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
     re.IGNORECASE,
@@ -47,6 +56,16 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _WINDOWS_RESERVED_LOCAL_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
 )
+
+
+class _NoNetrcAuth(AuthBase):
+    """Prevent Requests from sourcing origin credentials from .netrc."""
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        return request
+
+
+_JFROG_NO_NETRC_AUTH = _NoNetrcAuth()
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -248,6 +267,12 @@ def _get_trusted_jfrog_hosts() -> set[str]:
     return {host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)}
 
 
+def _get_allowed_jfrog_redirect_hosts() -> set[str]:
+    """Return redirect hostnames explicitly allowed as untrusted download targets."""
+    raw_hosts = os.getenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "")
+    return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
+
+
 def _is_local_jfrog_host(hostname: str) -> bool:
     """Return True when a hostname is local-only development infrastructure."""
     if not hostname:
@@ -274,6 +299,33 @@ def _is_local_jfrog_host(hostname: str) -> bool:
 
 def _is_jfrog_service_host(hostname: str) -> bool:
     return hostname == "jfrog.io" or hostname.endswith(".jfrog.io")
+
+
+def _parse_jfrog_host_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
+
+
+def _is_public_jfrog_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.scope_id is not None:
+            return False
+        if any(address in network for network in _JFROG_IPV6_TRANSITION_NETWORKS):
+            return False
+        if address.packed[8:12] in {b"\x00\x00\x5e\xfe", b"\x02\x00\x5e\xfe"}:
+            return False
+    return (
+        address.is_global
+        and not address.is_private
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+        and not (isinstance(address, ipaddress.IPv6Address) and address.is_site_local)
+    )
 
 
 def _get_requests_prepared_hostname(url: str) -> str:
@@ -410,9 +462,23 @@ def _safe_jfrog_relative_path(base_url: str, artifact_url: str) -> str:
 
 
 def _is_safe_jfrog_download_target(url: str) -> bool:
-    """Return True for unambiguous, non-local HTTPS download targets."""
+    """Return True for HTTPS targets with an explicit hostname trust decision."""
     origin = _get_jfrog_probe_origin(url)
-    return origin is not None and origin[0] == "https" and not _is_local_jfrog_host(origin[1])
+    if origin is None or origin[0] != "https":
+        return False
+
+    hostname = origin[1]
+    if (
+        _is_jfrog_service_host(hostname)
+        or hostname in _get_trusted_jfrog_hosts()
+        or hostname in _get_allowed_jfrog_redirect_hosts()
+    ):
+        return True
+    if _is_local_jfrog_host(hostname):
+        return False
+
+    parsed_ip = _parse_jfrog_host_ip(hostname)
+    return parsed_ip is not None and _is_public_jfrog_ip(parsed_ip)
 
 
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
@@ -582,19 +648,21 @@ def _get_with_jfrog_redirect_policy(
     """GET a JFrog URL while isolating credentials from untrusted redirects."""
     current_url = url
     current_headers = headers
-    current_is_trusted = _is_trusted_jfrog_auth_target(url)
-    trusted_redirect_cookies = requests.cookies.RequestsCookieJar()
-    untrusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    credential_origin = _get_jfrog_probe_origin(url) if _is_trusted_jfrog_auth_target(url) else None
+    credentials_allowed = credential_origin is not None
+    redirect_cookie_jars: dict[tuple[str, str, int | None], requests.cookies.RequestsCookieJar] = {}
     for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
-        if not _is_safe_jfrog_download_target(current_url):
+        current_origin = _get_jfrog_probe_origin(current_url)
+        if current_origin is None or not _is_safe_jfrog_download_target(current_url):
             raise requests.exceptions.RequestException(
                 f"Refusing unsafe JFrog download target {redact_jfrog_url_for_display(current_url)}"
             )
-        current_cookies = trusted_redirect_cookies if current_is_trusted else untrusted_redirect_cookies
+        current_cookies = redirect_cookie_jars.setdefault(current_origin, requests.cookies.RequestsCookieJar())
         response = requests.get(
             current_url,
             headers=current_headers,
             cookies=current_cookies,
+            auth=_JFROG_NO_NETRC_AUTH,
             timeout=timeout,
             stream=stream,
             allow_redirects=False,
@@ -613,8 +681,13 @@ def _get_with_jfrog_redirect_policy(
             )
 
         current_url = urljoin(current_url, location)
-        current_is_trusted = _is_trusted_jfrog_auth_target(current_url)
-        current_headers = headers if current_is_trusted else {}
+        next_is_trusted = _get_jfrog_probe_origin(current_url) == credential_origin and _is_trusted_jfrog_auth_target(
+            current_url
+        )
+        if credentials_allowed and not next_is_trusted:
+            redirect_cookie_jars.clear()
+        credentials_allowed = credentials_allowed and next_is_trusted
+        current_headers = headers if credentials_allowed else {}
 
     raise requests.exceptions.TooManyRedirects(
         f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
@@ -927,6 +1000,7 @@ def _get_jfrog_response_with_redirect_policy(
             current_url,
             headers=headers,
             cookies=redirect_cookies,
+            auth=_JFROG_NO_NETRC_AUTH,
             stream=True,
             timeout=timeout,
             allow_redirects=False,
