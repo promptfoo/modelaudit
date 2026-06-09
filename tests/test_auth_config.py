@@ -268,6 +268,34 @@ def test_validate_api_host_for_bearer_auth_accepts_explicitly_allowed_https_host
         auth_config.validate_api_host_for_bearer_auth("https://api.internal/")
 
 
+@pytest.mark.parametrize(
+    ("configured_host", "api_host", "expected"),
+    [
+        ("https://[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443", "https://[::1]:8443"),
+        ("[::1]", "https://[0:0:0:0:0:0:0:1]", "https://[::1]"),
+        ("[::ffff:127.0.0.1]", "https://[::ffff:7f00:1]", "https://[::ffff:127.0.0.1]"),
+    ],
+)
+def test_validate_api_host_for_bearer_auth_canonicalizes_allowed_ipv6_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_host: str,
+    api_host: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", configured_host)
+
+    assert auth_config.validate_api_host_for_bearer_auth(api_host) == expected
+
+
+def test_validate_api_host_for_bearer_auth_rejects_allowlisted_invalid_ip_literal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "[v1.fe80::]")
+
+    with pytest.raises(ValueError, match="valid HTTPS URL"):
+        auth_config.validate_api_host_for_bearer_auth("https://[v1.fe80::]")
+
+
 @pytest.mark.parametrize("env_name", ["MODELAUDIT_API_HOST", "API_HOST"])
 def test_validate_api_host_for_bearer_auth_trusts_exact_environment_host(
     monkeypatch: pytest.MonkeyPatch,

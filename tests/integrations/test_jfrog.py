@@ -28,6 +28,7 @@ from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
 )
@@ -78,6 +79,12 @@ class _FakeStreamingResponse:
     [
         pytest.param("pickle", "zip", [], id="reject-unselected-pytorch-zip"),
         pytest.param("pytorch_zip", "zip", "routed", id="retain-selected-pytorch-zip"),
+        pytest.param(
+            "pickle",
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+            "routed",
+            id="retain-inconclusive-pickle-route",
+        ),
         pytest.param("pickle", None, "original", id="retain-inconclusive-shared-suffix"),
     ],
 )
@@ -2471,6 +2478,10 @@ class TestJFrogFolderDownload:
         pmml_payload = b'<?xml version="1.0"?><PMML version="4.4"></PMML>'
         flax_payload = b"\x81\xa6params\x81\xa1x\x01"
         llamafile_payload = b"\x7fELF" + (b"\x00" * 16) + b"llamafile runtime"
+        pickle_payload = (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+        bounded_pickle_payload = (
+            b"\x8c\x01x0" * ((64 * 1024) // 4)
+        ) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
         payloads = {
             "https://company.jfrog.io/artifactory/repo/models/cntk.payload": cntk_payload,
             "https://company.jfrog.io/artifactory/repo/models/lightgbm.payload": lightgbm_payload,
@@ -2481,6 +2492,8 @@ class TestJFrogFolderDownload:
             "https://company.jfrog.io/artifactory/repo/models/pmml.payload": pmml_payload,
             "https://company.jfrog.io/artifactory/repo/models/flax.payload": flax_payload,
             "https://company.jfrog.io/artifactory/repo/models/llamafile.payload": llamafile_payload,
+            "https://company.jfrog.io/artifactory/repo/models/pickle.payload": pickle_payload,
+            "https://company.jfrog.io/artifactory/repo/models/bounded-pickle.payload": bounded_pickle_payload,
         }
         mock_list.return_value = [
             {"name": Path(url).name, "path": url, "size": len(payload), "human_size": "Unknown"}

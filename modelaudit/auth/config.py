@@ -3,6 +3,7 @@
 import os
 import re
 from contextlib import suppress
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -30,7 +31,13 @@ def _normalize_api_hostname(hostname: str) -> str:
     """Normalize hostnames before trust comparisons."""
     normalized = hostname.lower().rstrip(".")
     if ":" in normalized:
-        return normalized
+        try:
+            address = ip_address(normalized)
+        except ValueError as error:
+            raise ValueError("Invalid API hostname") from error
+        if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+            return f"::ffff:{address.ipv4_mapped}"
+        return address.compressed
 
     try:
         ascii_hostname = normalized.encode("idna").decode("ascii")

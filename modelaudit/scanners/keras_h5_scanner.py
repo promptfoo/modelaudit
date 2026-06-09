@@ -26,7 +26,12 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.hdf5 import find_hdf5_signature_offset
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import (
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+    redact_untrusted_error_message,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -338,6 +343,7 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
     _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
+    _MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
     _MAX_SERIALIZED_CONFIG_NODES: ClassVar[int] = 10_000
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
@@ -352,6 +358,7 @@ class KerasH5Scanner(BaseScanner):
         self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
+        self._current_h5_keras_version: str | None = None
         self._checked_config_module_references: set[tuple[int, str, str]] = set()
         self._remaining_serialized_config_nodes = self._MAX_SERIALIZED_CONFIG_NODES
         self._serialized_config_limit_reported = False
@@ -376,6 +383,7 @@ class KerasH5Scanner(BaseScanner):
         """Scan a Keras model file for suspicious configurations"""
         # Initialize context for this file
         self._initialize_context(path)
+        self._current_h5_keras_version = None
         self._checked_config_module_references.clear()
         self._remaining_serialized_config_nodes = self._MAX_SERIALIZED_CONFIG_NODES
         self._serialized_config_limit_reported = False
@@ -425,11 +433,14 @@ class KerasH5Scanner(BaseScanner):
 
             with h5py.File(path, "r") as f:
                 result.bytes_scanned = file_size
+                raw_keras_version: str | None = None
                 keras_version_attr = f.attrs.get("keras_version")
                 if isinstance(keras_version_attr, bytes):
                     keras_version_attr = keras_version_attr.decode("utf-8", errors="ignore")
                 if isinstance(keras_version_attr, str) and keras_version_attr.strip():
-                    result.metadata["keras_version"] = keras_version_attr.strip()
+                    raw_keras_version = keras_version_attr.strip()
+                    result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
+                self._current_h5_keras_version = raw_keras_version
 
                 # CVE-2026-1669 applies to weight loading too. Inspect full
                 # Keras files and weights-like HDF5 layouts while leaving
@@ -499,7 +510,7 @@ class KerasH5Scanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=f"{self.current_file_path} (model_config)",
                         rule_code="S302",
-                        details={"custom_objects": custom_objects_list},
+                        details={"custom_objects": redact_evidence_value(custom_objects_list, max_string_chars=200)},
                     )
 
                 # Check for custom metrics and custom loss
@@ -509,15 +520,16 @@ class KerasH5Scanner(BaseScanner):
                         self._scan_training_config(training_config, result)
 
         except OSError as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_h5_read_failed")
             result.add_check(
                 name="Keras H5 File Read",
                 passed=False,
-                message=f"Unable to read Keras H5 content: {e!s}",
+                message=f"Unable to read Keras H5 content: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_h5_read_failed",
@@ -527,15 +539,16 @@ class KerasH5Scanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_h5_scan_failed")
             result.add_check(
                 name="Keras H5 File Scan",
                 passed=False,
-                message=f"Error scanning Keras H5 file: {e!s}",
+                message=f"Error scanning Keras H5 file: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_h5_scan_failed",
@@ -583,6 +596,7 @@ class KerasH5Scanner(BaseScanner):
                 attr_value = attr_value.decode("utf-8")
             return json.loads(attr_value)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, f"keras_h5_{attr_name}_parse_failed")
             result.add_check(
                 name="Keras H5 Config Parse",
@@ -592,7 +606,7 @@ class KerasH5Scanner(BaseScanner):
                 location=self.current_file_path,
                 details={
                     "attribute": attr_name,
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                 },
                 rule_code="S902",
@@ -808,8 +822,18 @@ class KerasH5Scanner(BaseScanner):
                 names.append(item)
         return [name for name in names if name]
 
-    def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
+    def _check_hdf5_external_references(
+        self,
+        h5_file: Any,
+        result: ScanResult,
+        source_path: str,
+        *,
+        keras_version: str | None = None,
+    ) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""
+        if keras_version is None:
+            keras_version = self._current_h5_keras_version
+
         findings: list[dict[str, Any]] = []
         external_reference_count = 0
         external_storage_segments_truncated = False
@@ -820,14 +844,22 @@ class KerasH5Scanner(BaseScanner):
             if isinstance(link, h5py.ExternalLink):
                 external_reference_count += 1
                 if len(findings) < self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
-                    findings.append(
-                        {
-                            "kind": "ExternalLink",
-                            "hdf5_path": f"/{name}".replace("//", "/"),
-                            "filename": link.filename,
-                            "path": link.path,
-                        },
-                    )
+                    hdf5_path, hdf5_path_truncated = self._bounded_hdf5_reference_text(f"/{name}".replace("//", "/"))
+                    filename, filename_truncated = self._bounded_hdf5_reference_text(link.filename)
+                    target_path, target_path_truncated = self._bounded_hdf5_reference_text(link.path)
+                    external_link_finding: dict[str, Any] = {
+                        "kind": "ExternalLink",
+                        "hdf5_path": hdf5_path,
+                        "filename": filename,
+                        "path": target_path,
+                    }
+                    if hdf5_path_truncated:
+                        external_link_finding["hdf5_path_truncated"] = True
+                    if filename_truncated:
+                        external_link_finding["filename_truncated"] = True
+                    if target_path_truncated:
+                        external_link_finding["path_truncated"] = True
+                    findings.append(external_link_finding)
                 return
 
             if not isinstance(link, h5py.HardLink):
@@ -842,7 +874,11 @@ class KerasH5Scanner(BaseScanner):
                     if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
                         return
                     segments = [
-                        {"filename": os.fsdecode(filename), "offset": int(offset), "size": int(size)}
+                        {
+                            **self._hdf5_external_storage_filename_details(filename),
+                            "offset": int(offset),
+                            "size": int(size),
+                        }
                         for filename, offset, size in (
                             storage_properties.get_external(index)
                             for index in range(
@@ -853,16 +889,19 @@ class KerasH5Scanner(BaseScanner):
                             )
                         )
                     ]
-                    finding: dict[str, Any] = {
+                    hdf5_path, hdf5_path_truncated = self._bounded_hdf5_reference_text(f"/{name}".replace("//", "/"))
+                    external_storage_finding: dict[str, Any] = {
                         "kind": "external_storage",
-                        "hdf5_path": f"/{name}".replace("//", "/"),
+                        "hdf5_path": hdf5_path,
                         "segments": segments,
                     }
+                    if hdf5_path_truncated:
+                        external_storage_finding["hdf5_path_truncated"] = True
                     if external_storage_segment_count > len(segments):
                         external_storage_segments_truncated = True
-                        finding["segment_count"] = external_storage_segment_count
-                        finding["segments_truncated"] = True
-                    findings.append(finding)
+                        external_storage_finding["segment_count"] = external_storage_segment_count
+                        external_storage_finding["segments_truncated"] = True
+                    findings.append(external_storage_finding)
 
         visited_link_count = 0
         link_visits_truncated = False
@@ -936,7 +975,6 @@ class KerasH5Scanner(BaseScanner):
         if not findings:
             return
 
-        keras_version = result.metadata.get("keras_version")
         location = f"{source_path} (weights)"
         details = {
             "cve_id": "CVE-2026-1669",
@@ -955,14 +993,15 @@ class KerasH5Scanner(BaseScanner):
             details["external_references_truncated"] = external_references_truncated
             details["external_storage_segments_truncated"] = external_storage_segments_truncated
 
+        display_keras_version = redact_evidence_string(keras_version) if isinstance(keras_version, str) else None
         vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
         if vuln_status is True:
-            details["keras_version"] = keras_version
+            details["keras_version"] = display_keras_version
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
                 passed=False,
                 message=(
-                    f"CVE-2026-1669: Keras {keras_version} weight file uses HDF5 external references that can "
+                    f"CVE-2026-1669: Keras {display_keras_version} weight file uses HDF5 external references that can "
                     "disclose arbitrary local file contents during model loading"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -973,7 +1012,7 @@ class KerasH5Scanner(BaseScanner):
             return
 
         if isinstance(keras_version, str):
-            details["keras_version"] = keras_version
+            details["keras_version"] = display_keras_version
             if vuln_status is False:
                 details["parse_status"] = "untrusted_artifact_version"
                 details["version_source"] = "hdf5_file_attribute"
@@ -982,7 +1021,7 @@ class KerasH5Scanner(BaseScanner):
                     passed=False,
                     message=(
                         "HDF5 external references detected in standalone Keras H5 weights; "
-                        f"the file claims Keras {keras_version}, but artifact-controlled version metadata "
+                        f"the file claims Keras {display_keras_version}, but artifact-controlled version metadata "
                         "cannot prove the loader runtime is outside the CVE-2026-1669 vulnerable ranges"
                     ),
                     severity=IssueSeverity.WARNING,
@@ -1000,7 +1039,7 @@ class KerasH5Scanner(BaseScanner):
             passed=False,
             message=(
                 "HDF5 external references detected in weights, but "
-                f"{self._format_keras_version_context(keras_version)}; cannot confidently attribute "
+                f"{self._format_keras_version_context(display_keras_version)}; cannot confidently attribute "
                 "CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
@@ -1011,6 +1050,30 @@ class KerasH5Scanner(BaseScanner):
             },
             why=get_cve_2026_1669_explanation("hdf5_external_reference"),
         )
+
+    @staticmethod
+    def _fsdecode_evidence(value: Any) -> str:
+        try:
+            return os.fsdecode(value)
+        except TypeError:
+            return str(value)
+
+    @classmethod
+    def _bounded_hdf5_reference_text(cls, value: Any) -> tuple[str, bool]:
+        """Return redacted, bounded HDF5 reference evidence and whether it was truncated."""
+        text = cls._fsdecode_evidence(value)
+        redacted_text = redact_evidence_string(text, max_chars=cls._MAX_HDF5_REFERENCE_TEXT_CHARS)
+        was_truncated = max(len(text), len(redacted_text)) > cls._MAX_HDF5_REFERENCE_TEXT_CHARS
+        return redacted_text[: cls._MAX_HDF5_REFERENCE_TEXT_CHARS], was_truncated
+
+    @classmethod
+    def _hdf5_external_storage_filename_details(cls, filename: Any) -> dict[str, Any]:
+        """Return bounded external-storage filename evidence."""
+        bounded_filename, filename_truncated = cls._bounded_hdf5_reference_text(filename)
+        details: dict[str, Any] = {"filename": bounded_filename}
+        if filename_truncated:
+            details["filename_truncated"] = True
+        return details
 
     @staticmethod
     def _visit_hdf5_links(
@@ -1102,10 +1165,26 @@ class KerasH5Scanner(BaseScanner):
 
         # Check model class name
         model_class = model_config.get("class_name", "")
-        result.metadata["model_class"] = model_class
+        model_class_is_string = isinstance(model_class, str)
+        redacted_model_class = (
+            redact_evidence_string(model_class) if model_class_is_string else f"<invalid:{type(model_class).__name__}>"
+        )
+        result.metadata["model_class"] = redacted_model_class
 
         # Check for subclassed models (custom class names)
-        check_subclassed_model(model_class, result, self.current_file_path)
+        if model_class_is_string:
+            check_subclassed_model(model_class, result, self.current_file_path)
+        else:
+            self._mark_inconclusive_scan_result(result, "keras_h5_model_class_invalid_type")
+            result.add_check(
+                name="Model Class Type Validation",
+                passed=False,
+                message=f"Invalid model class type: expected str, got {type(model_class).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details={"actual_type": type(model_class).__name__, "expected_type": "str"},
+            )
         self._check_layer_module_references(
             model_config,
             result,
@@ -1118,16 +1197,16 @@ class KerasH5Scanner(BaseScanner):
         layers = []
         config_value = model_config.get("config")
         if config_value is None:
-            if model_class in self._MODEL_CONTAINER_CLASSES:
+            if model_class_is_string and model_class in self._MODEL_CONTAINER_CLASSES:
                 self._mark_inconclusive_scan_result(result, "keras_h5_model_layers_missing")
                 result.add_check(
                     name="Layers Presence Validation",
                     passed=False,
-                    message=f"Model config for {model_class} is missing required layers list",
+                    message=f"Model config for {redacted_model_class} is missing required layers list",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
-                    details={"model_class": model_class, "expected_key": "config.layers"},
+                    details={"model_class": redacted_model_class, "expected_key": "config.layers"},
                 )
             else:
                 result.add_check(
@@ -1135,7 +1214,7 @@ class KerasH5Scanner(BaseScanner):
                     passed=True,
                     message="Keras model config has no layer configuration",
                     location=self.current_file_path,
-                    details={"model_class": model_class},
+                    details={"model_class": redacted_model_class},
                 )
         elif not isinstance(config_value, dict):
             self._mark_inconclusive_scan_result(result, "keras_h5_model_config_structure_invalid")
@@ -1163,20 +1242,22 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
                 )
-        elif model_class in self._MODEL_CONTAINER_CLASSES:
+        elif model_class_is_string and model_class in self._MODEL_CONTAINER_CLASSES:
             self._mark_inconclusive_scan_result(result, "keras_h5_model_layers_missing")
             result.add_check(
                 name="Layers Presence Validation",
                 passed=False,
-                message=f"Model config for {model_class} is missing required layers list",
+                message=f"Model config for {redacted_model_class} is missing required layers list",
                 rule_code="S902",
                 severity=IssueSeverity.INFO,
                 location=self.current_file_path,
-                details={"model_class": model_class, "expected_key": "config.layers"},
+                details={"model_class": redacted_model_class, "expected_key": "config.layers"},
             )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
+        layer_count_display_keys: dict[str, str] = {}
+        layer_count_next_occurrences: dict[str, int] = {}
         lambda_layer_count = 0
 
         # Check each layer
@@ -1194,8 +1275,25 @@ class KerasH5Scanner(BaseScanner):
                 )
                 continue
             layer_class = layer.get("class_name", "")
+            layer_class_is_string = isinstance(layer_class, str)
+            redacted_layer_class = (
+                redact_evidence_string(layer_class)
+                if layer_class_is_string
+                else f"<invalid:{type(layer_class).__name__}>"
+            )
+            if not layer_class_is_string:
+                self._mark_inconclusive_scan_result(result, "keras_h5_layer_class_invalid_type")
+                result.add_check(
+                    name="Layer Class Type Validation",
+                    passed=False,
+                    message=f"Invalid layer class type: expected str, got {type(layer_class).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={"actual_type": type(layer_class).__name__, "expected_type": "str"},
+                )
             layer_config = layer.get("config", {})
-            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+            is_lambda_layer = layer_class_is_string and self._is_lambda_layer_class(layer_class)
             layer_count_key = "Lambda" if is_lambda_layer else layer_class
             if not isinstance(layer_config, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
@@ -1243,23 +1341,41 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # Update layer count
-            if layer_count_key in layer_counts:
-                layer_counts[layer_count_key] += 1
-            else:
-                layer_counts[layer_count_key] = 1
+            layer_count_identity = (
+                f"str:{layer_count_key}"
+                if isinstance(layer_count_key, str)
+                else f"invalid:{type(layer_count_key).__name__}"
+            )
+            redacted_layer_count_key = layer_count_display_keys.get(layer_count_identity)
+            if redacted_layer_count_key is None:
+                display_key = (
+                    layer_count_key
+                    if isinstance(layer_count_key, str)
+                    else f"<invalid:{type(layer_count_key).__name__}>"
+                )
+                redacted_layer_count_key = redact_evidence_mapping_key(
+                    display_key,
+                    layer_counts,
+                    next_occurrences=layer_count_next_occurrences,
+                )
+                layer_count_display_keys[layer_count_identity] = redacted_layer_count_key
+            layer_counts[redacted_layer_count_key] = layer_counts.get(redacted_layer_count_key, 0) + 1
 
             # Check for suspicious layer types
-            if layer_class in self.suspicious_layer_types or is_lambda_layer:
+            if (layer_class_is_string and layer_class in self.suspicious_layer_types) or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
                 if is_lambda_layer:
                     lambda_layer_count += 1
                     layer_name = f"lambda_{lambda_layer_count}"
                     self._check_lambda_layer(layer_config, result, layer_name)
                     keras_version = result.metadata.get("keras_version")
+                    classification_keras_version = self._current_h5_keras_version
 
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
                     cve_2024_3660_status = (
-                        self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                        self._is_vulnerable_to_cve_2024_3660(classification_keras_version)
+                        if isinstance(classification_keras_version, str)
+                        else None
                     )
                     if cve_2024_3660_status is True:
                         result.add_check(
@@ -1310,7 +1426,9 @@ class KerasH5Scanner(BaseScanner):
 
                     # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
                     vuln_status = (
-                        self._is_vulnerable_to_cve_2025_9905(keras_version) if isinstance(keras_version, str) else None
+                        self._is_vulnerable_to_cve_2025_9905(classification_keras_version)
+                        if isinstance(classification_keras_version, str)
+                        else None
                     )
                     if vuln_status is True:
                         result.add_check(
@@ -1385,29 +1503,29 @@ class KerasH5Scanner(BaseScanner):
                     result.add_check(
                         name="Suspicious Layer Type Detection",
                         passed=False,
-                        message=f"Suspicious layer type found: {layer_class}",
+                        message=f"Suspicious layer type found: {redacted_layer_class}",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={
-                            "layer_class": layer_class,
+                            "layer_class": redacted_layer_class,
                             "description": self.suspicious_layer_types[layer_class],
-                            "layer_config": layer_config,
+                            "layer_config": redact_evidence_value(layer_config, max_string_chars=200),
                         },
                         why=get_pattern_explanation("lambda_layer") if is_lambda_layer else None,
                         rule_code="S902",
                     )
 
             # Detect unknown/custom layer classes not in the standard Keras set
-            elif layer_class and not is_known_safe_keras_layer_class(layer_class):
+            elif layer_class_is_string and layer_class and not is_known_safe_keras_layer_class(layer_class):
                 result.add_check(
                     name="Custom Layer Class Detection",
                     passed=False,
-                    message=f"Unknown/custom layer class detected: {layer_class}",
+                    message=f"Unknown/custom layer class detected: {redacted_layer_class}",
                     severity=IssueSeverity.WARNING,
                     location=self.current_file_path,
                     details={
-                        "layer_class": layer_class,
-                        "layer_config": layer.get("config", {}),
+                        "layer_class": redacted_layer_class,
+                        "layer_config": redact_evidence_value(layer.get("config", {}), max_string_chars=200),
                         "risk": "Custom layer classes require external code to load and may execute arbitrary logic",
                     },
                     rule_code="S810",
@@ -1417,13 +1535,13 @@ class KerasH5Scanner(BaseScanner):
             self._check_config_for_suspicious_strings(
                 layer_config,
                 result,
-                "Lambda" if is_lambda_layer else layer_class,
+                "Lambda" if is_lambda_layer else redacted_layer_class,
                 redact_nested_context=is_lambda_layer,
                 case_sensitive=is_lambda_layer,
             )
 
             # If there are nested models, scan them recursively
-            if layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
+            if layer_class_is_string and layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
                 nested_config = layer.get("config")
                 if isinstance(nested_config, dict) and "layers" in nested_config:
                     self._scan_model_config(layer, result)
@@ -1432,11 +1550,11 @@ class KerasH5Scanner(BaseScanner):
                     result.add_check(
                         name="Nested Model Layers Presence Validation",
                         passed=False,
-                        message=f"Nested model config for {layer_class} is missing required layers list",
+                        message=f"Nested model config for {redacted_layer_class} is missing required layers list",
                         rule_code="S902",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
-                        details={"layer_class": layer_class, "expected_key": "config.layers"},
+                        details={"layer_class": redacted_layer_class, "expected_key": "config.layers"},
                     )
 
             if not is_lambda_layer:
@@ -2288,16 +2406,19 @@ class KerasH5Scanner(BaseScanner):
                         suspicious_term,
                         case_sensitive=case_sensitive and key == "function",
                     ):
+                        redacted_context = redact_evidence_string(str(context))
                         result.add_check(
                             name="Suspicious Configuration String Check",
                             passed=False,
-                            message=f"Suspicious configuration string found in {context}: '{suspicious_term}'",
+                            message=(
+                                f"Suspicious configuration string found in {redacted_context}: '{suspicious_term}'"
+                            ),
                             severity=IssueSeverity.INFO,
-                            location=f"{self.current_file_path} ({context})",
+                            location=f"{self.current_file_path} ({redacted_context})",
                             rule_code="S902",
                             details={
                                 "suspicious_term": suspicious_term,
-                                "context": context,
+                                "context": redacted_context,
                             },
                         )
             elif isinstance(value, dict):
@@ -2392,7 +2513,7 @@ class KerasH5Scanner(BaseScanner):
                 # Basic H5 structure
                 metadata.update(
                     {
-                        "h5_keys": list(h5_file.keys()),
+                        "h5_keys": redact_evidence_value(list(h5_file.keys()), max_string_chars=200),
                         "has_model_config": "model_config" in h5_file.attrs,
                         "has_model_weights": model_weights_link is not None,
                     }
@@ -2409,10 +2530,16 @@ class KerasH5Scanner(BaseScanner):
 
                         metadata.update(
                             {
-                                "model_class": config.get("class_name", "Unknown"),
-                                "keras_version": h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
-                                if isinstance(h5_file.attrs.get("keras_version"), bytes)
-                                else h5_file.attrs.get("keras_version", "unknown"),
+                                "model_class": redact_evidence_value(
+                                    config.get("class_name", "Unknown"),
+                                    max_string_chars=200,
+                                ),
+                                "keras_version": redact_evidence_value(
+                                    h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
+                                    if isinstance(h5_file.attrs.get("keras_version"), bytes)
+                                    else h5_file.attrs.get("keras_version", "unknown"),
+                                    max_string_chars=200,
+                                ),
                             }
                         )
 
@@ -2422,7 +2549,10 @@ class KerasH5Scanner(BaseScanner):
                             metadata.update(
                                 {
                                     "layer_count": len(layers),
-                                    "layer_types": list({layer.get("class_name", "Unknown") for layer in layers}),
+                                    "layer_types": redact_evidence_value(
+                                        list({layer.get("class_name", "Unknown") for layer in layers}),
+                                        max_string_chars=200,
+                                    ),
                                 }
                             )
 
@@ -2469,7 +2599,7 @@ class KerasH5Scanner(BaseScanner):
                                 total_params += param_count
                                 weight_layers.append(
                                     {
-                                        "name": name,
+                                        "name": redact_evidence_string(name, max_chars=200),
                                         "shape": list(obj.shape),
                                         "dtype": str(obj.dtype),
                                         "size": param_count,
@@ -2486,7 +2616,10 @@ class KerasH5Scanner(BaseScanner):
                             {
                                 "total_parameters": total_params,
                                 "weight_layers": len(weight_layers),
-                                "parameter_details": weight_layers[:10],  # First 10 layers
+                                "parameter_details": redact_evidence_value(
+                                    weight_layers[:10],
+                                    max_string_chars=200,
+                                ),  # First 10 layers
                                 "weight_link_visits": visited_links,
                             }
                         )
@@ -2496,6 +2629,6 @@ class KerasH5Scanner(BaseScanner):
                             metadata["weight_link_visits_truncated"] = True
 
         except Exception as e:
-            metadata["extraction_error"] = str(e)
+            metadata["extraction_error"] = redact_untrusted_error_message(e)
 
         return metadata

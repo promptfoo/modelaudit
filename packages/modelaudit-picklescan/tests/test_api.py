@@ -573,15 +573,48 @@ def test_scan_bytes_ignores_wrapped_version_dunder_metadata() -> None:
     assert report.findings == ()
 
 
-def test_scan_bytes_detects_protocol0_encoded_nested_pickle_mid_literal() -> None:
+@pytest.mark.parametrize(
+    ("encoding", "rule_code"),
+    [("base64", "S601"), ("hex", "S602")],
+)
+def test_scan_bytes_detects_delimited_protocol0_encoded_nested_pickle_mid_literal(
+    encoding: str,
+    rule_code: str,
+) -> None:
     nested = b"cos\nsystem\n)R."
-    encoded = "prefix-" + base64.b64encode(nested).decode("ascii")
+    encoded = base64.b64encode(nested).decode("ascii") if encoding == "base64" else nested.hex()
+    value = f"prefix-{encoded}-suffix"
 
-    report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source="protocol0-nested-b64.pkl")
+    report = scan_bytes(
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"delimited-protocol0-nested-{encoding}.pkl",
+    )
 
+    assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(finding.rule_code == rule_code for finding in report.findings)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ["base64", "hex"],
+)
+def test_scan_bytes_ignores_corrupted_delimited_encoded_nested_pickle_near_match(
+    encoding: str,
+) -> None:
+    corrupted = _corrupt_first_byte(b"cos\nsystem\n)R.")
+    encoded = base64.b64encode(corrupted).decode("ascii") if encoding == "base64" else corrupted.hex()
+    value = f"prefix-{encoded}-suffix"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"corrupted-delimited-protocol0-nested-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize("protocol", [2, 3, 4, 5])
@@ -970,7 +1003,7 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
 
 RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
 RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
-UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode()
 BINARY_STACK_GLOBAL_NESTED_PICKLE = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93)R."
 
 
@@ -1065,7 +1098,7 @@ def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_pa
 
 def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() -> None:
     report = scan_bytes(
-        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode("utf-8")) + b".",
+        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode()) + b".",
         source="mixed-unicode-raw-nested.pkl",
     )
 
@@ -7960,20 +7993,24 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
 
 
 @pytest.mark.parametrize(
-    ("literal", "encoding", "rule_code"),
+    ("literal", "encoding", "rule_code", "embedded"),
     [
-        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601"),
-        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602"),
+        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601", False),
+        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601", True),
+        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602", False),
+        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602", True),
     ],
 )
 def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
     literal: str,
     encoding: str,
     rule_code: str,
+    embedded: bool,
 ) -> None:
+    value = f"prefix-{literal}-suffix" if embedded else literal
     report = scan_bytes(
-        pickle.dumps({"outer": literal}, protocol=4),
-        source=f"oversized-{encoding}-nested.pkl",
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"oversized-{encoding}-nested-embedded-{embedded}.pkl",
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 
