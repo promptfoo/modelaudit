@@ -6,9 +6,11 @@ import logging
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +25,7 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _explicit_local_shard_family_groups,
     _resolve_scan_runtime_config,
     _ScanPathState,
     _summarize_progress_tree,
@@ -600,6 +603,268 @@ def test_scan_multiple_paths(tmp_path):
         or "Size:" in result.output
         or "bytes_scanned" in result.output
         or "files_scanned" in result.output
+    )
+
+
+def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_path: Path) -> None:
+    """Explicit shard paths should be reconciled across their separate parent directories."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 4):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 3
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:
+    """Repeating one exact shard argument must not invalidate a complete family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            shard_paths[0],
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["success"] is True
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
+def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: Path) -> None:
+    """Shard reconciliation must not clear a separate caller-level path error."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+    nonexistent_path = tmp_path / "missing.safetensors"
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            str(nonexistent_path),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert f"Path does not exist: {nonexistent_path}" in result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["has_errors"] is True
+    assert output_payload["success"] is False
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tmp_path: Path) -> None:
+    """Explicit opt-in should keep independently templated shard families separate."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for family_name in ("model-a", "model-b"):
+        for shard_index, shard_directory_name in ((1, "left"), (2, "right")):
+            shard_dir = tmp_path / family_name / shard_directory_name
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_cross_directory_shards_keeps_ambiguous_incomplete_families(tmp_path: Path) -> None:
+    """Unmatched shards must not complete each other through a shared fallback group."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    incomplete_paths: set[str] = set()
+    for family_name, shard_directory_name, shard_index in (
+        ("complete", "left", 1),
+        ("complete", "right", 2),
+        ("incomplete-a", "left", 1),
+        ("incomplete-b", "right", 2),
+    ):
+        shard_dir = tmp_path / family_name / shard_directory_name
+        shard_dir.mkdir(parents=True)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+        if family_name.startswith("incomplete-"):
+            incomplete_paths.add(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is False
+    missing_locations = {
+        issue.get("location")
+        for issue in output_payload["issues"]
+        if issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+    }
+    assert missing_locations == incomplete_paths
+
+
+def test_scan_directory_does_not_assume_cross_directory_shard_family(tmp_path: Path) -> None:
+    """The explicit-family opt-in must not combine shards discovered through a directory input."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    for shard_index, family_name in ((1, "model-a"), (2, "model-b")):
+        shard_dir = tmp_path / family_name
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(tmp_path), "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_explicit_shard_family_groups_reject_resolved_non_shard_target(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A shard-looking symlink must not opt its non-shard target into reconciliation."""
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"not a shard")
+    shard_link = tmp_path / "model-00001-of-00002.safetensors"
+    shard_link.symlink_to(target)
+
+    assert _explicit_local_shard_family_groups((str(shard_link),)) == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_explicit_shard_family_groups_reject_publicly_writable_parents(tmp_path: Path) -> None:
+    """Cross-directory reconciliation must not trust mutable public staging directories."""
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir(mode=0o777)
+        shard_dir.chmod(0o777)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+        shard_paths.append(str(shard_path))
+
+    assert _explicit_local_shard_family_groups(tuple(shard_paths)) == {}
+
+
+def test_scan_multiple_cross_directory_shards_requires_explicit_family_opt_in(tmp_path: Path) -> None:
+    """Numeric directory names must not silently merge unrelated local checkpoints."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"checkpoint-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
     )
 
 
@@ -3229,6 +3494,7 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
     assert mock_download_streaming.call_args.kwargs["timeout"] > 0
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @pytest.mark.parametrize(
@@ -3321,6 +3587,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
     streaming_provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
     assert streaming_provenance.model_id == "test/streaming-model"
     assert streaming_provenance.model_source == "huggingface"
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
     # Verify content_hash is in JSON output
     try:
@@ -3330,6 +3597,61 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A cache-enabled HF stream should trust aliases of one logical snapshot parent."""
+    mock_is_hf_url.return_value = True
+    header = b'{"__metadata__":{"format":"pt"}}'
+    cache_root = tmp_path / "persistent-cache"
+    snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+    snapshot_dir.mkdir(parents=True)
+    alias_root = cache_root / "huggingface" / "test" / "model"
+    alias_root.mkdir(parents=True)
+    first_alias = alias_root / "cache-a"
+    second_alias = alias_root / "cache-b"
+    first_alias.symlink_to(snapshot_dir, target_is_directory=True)
+    second_alias.symlink_to(snapshot_dir, target_is_directory=True)
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        for shard_index, alias_path in ((1, first_alias), (2, second_alias)):
+            shard_name = f"model-{shard_index:05d}-of-00002.safetensors"
+            snapshot_path = snapshot_dir / shard_name
+            snapshot_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            yield (alias_path / shard_name, shard_index == 2)
+
+    mock_download_streaming.return_value = file_generator()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--cache-dir",
+            str(cache_root),
+            "hf://test/model",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert output_payload["files_scanned"] == 2
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -3820,6 +4142,7 @@ def test_scan_cloud_url_streaming_passes_scanner_selection_to_content_filter(
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
     assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset()
     assert mock_download_streaming.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @patch("os.remove")
