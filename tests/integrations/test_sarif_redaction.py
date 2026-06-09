@@ -10,6 +10,7 @@ import pytest
 from modelaudit.cli import _format_scan_output
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.source_redaction import (
+    redact_prevalidated_source_value,
     redact_source_identifier,
     redact_source_reference,
     redact_source_text,
@@ -483,6 +484,53 @@ def test_redact_source_text_handles_dense_credential_assignments() -> None:
 
     assert "EXPORT-SECRET-123" not in redacted
     assert redacted.count("<redacted>") == 5_000
+
+
+@pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
+def test_sensitive_key_comparisons_are_not_treated_as_assignments(operator: str) -> None:
+    text = f'config={{"client_secret" {operator} "public": "os.system(15)"}}'
+
+    assert redact_source_text(text) == text
+
+
+def test_preserved_redacted_assignment_does_not_exempt_neighboring_secret() -> None:
+    text = 'client_secret=os.system("curl -u alice:<redacted>"); token=RAW-NEIGHBOR-SECRET'
+
+    redacted = redact_prevalidated_source_value(text)
+
+    assert 'client_secret=os.system("curl -u alice:<redacted>")' in redacted
+    assert "RAW-NEIGHBOR-SECRET" not in redacted
+
+
+def test_catboost_sarif_revalidates_attacker_supplied_redaction_marker() -> None:
+    attacker_tail = "ATTACKER-MARKER-RAW-SECRET-123456"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Suspicious command execution primitives detected",
+            severity=IssueSeverity.CRITICAL,
+            details={
+                "matches": [
+                    {
+                        "excerpt": (
+                            f'client_secret=os.system("<redacted> {attacker_tail}"); token=NEIGHBOR-RAW-SECRET-123456'
+                        ),
+                    }
+                ],
+                "set_evidence": {f'client_secret=os.system("<redacted> {attacker_tail}-SET")'},
+                "binary_evidence": f"token={attacker_tail}-BYTES".encode(),
+            },
+            type="catboost_check",
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.cbm"])
+
+    assert attacker_tail not in output
+    assert "NEIGHBOR-RAW-SECRET-123456" not in output
+    assert "client_secret=os.system(<redacted>)" in output
 
 
 @pytest.mark.parametrize(

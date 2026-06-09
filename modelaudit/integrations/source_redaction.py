@@ -100,7 +100,7 @@ _EXPORT_ASSIGNMENT_RE = re.compile(
     rf"(?P<key_escape>\\?)(?P<quote>[\"'])"
     rf"(?P<quoted_key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*)(?P=key_escape)(?P=quote)"
     rf"|(?P<key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*))"
-    r"(?P<separator>\s*(?::|=|<<?-)\s*)",
+    r"(?P<separator>\s*(?::|(?<![!<=>])=(?!=)|<<?-)\s*)",
     re.IGNORECASE,
 )
 _EXPORT_EQUALS_KEY_RE = re.compile(
@@ -276,6 +276,15 @@ def redact_source_identifier(source: str) -> str:
 
 def redact_source_text(text: str) -> str:
     """Redact signed URL tokens embedded in exported text fields."""
+    return _redact_source_text(text, preserve_redacted_assignments=False)
+
+
+def _redact_prevalidated_source_text(text: str) -> str:
+    """Redact source identifiers after a domain sanitizer validated markers."""
+    return _redact_source_text(text, preserve_redacted_assignments=True)
+
+
+def _redact_source_text(text: str, *, preserve_redacted_assignments: bool) -> str:
     if len(text) > _MAX_SOURCE_TEXT_CHARS:
         return "<redacted oversized value>"
     normalized_text = _normalize_escaped_url_delimiters_for_display(text)
@@ -306,12 +315,22 @@ def redact_source_text(text: str) -> str:
         lambda match: _redact_email_suffix_token(match.group("identifier")),
         redacted_text,
     )
-    return _redact_assignments_outside_url_tokens(redacted_text)
+    return _redact_assignments_outside_url_tokens(
+        redacted_text,
+        preserve_redacted_assignments=preserve_redacted_assignments,
+    )
 
 
-def _redact_assignments_outside_url_tokens(text: str) -> str:
+def _redact_assignments_outside_url_tokens(
+    text: str,
+    *,
+    preserve_redacted_assignments: bool,
+) -> str:
     """Redact free-text assignments after source tokens have been sanitized."""
-    return _redact_export_alias_assignments(text)
+    return _redact_export_alias_assignments(
+        text,
+        preserve_redacted_assignments=preserve_redacted_assignments,
+    )
 
 
 def _redact_url_adjacent_assignments(text: str) -> str:
@@ -398,21 +417,52 @@ def _has_safe_schemeless_provenance_suffix(source: str) -> bool:
 
 def redact_source_value(value: Any) -> Any:
     """Recursively redact exported values that may contain source identifiers."""
-    return _redact_source_value(value, seen=set(), depth=0)
+    return _redact_source_value(
+        value,
+        seen=set(),
+        depth=0,
+        preserve_redacted_assignments=False,
+    )
 
 
-def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
+def redact_prevalidated_source_value(value: Any) -> Any:
+    """Redact source identifiers after a domain sanitizer validated markers."""
+    return _redact_source_value(
+        value,
+        seen=set(),
+        depth=0,
+        preserve_redacted_assignments=True,
+    )
+
+
+def _redact_source_value(
+    value: Any,
+    *,
+    seen: set[int],
+    depth: int,
+    preserve_redacted_assignments: bool,
+) -> Any:
     if depth > _MAX_REDACTION_DEPTH:
         return "<redacted>"
     if isinstance(value, BaseModel):
-        return _redact_source_value(value.model_dump(mode="python"), seen=seen, depth=depth + 1)
+        return _redact_source_value(
+            value.model_dump(mode="python"),
+            seen=seen,
+            depth=depth + 1,
+            preserve_redacted_assignments=preserve_redacted_assignments,
+        )
     if isinstance(value, AnyUrl):
         return redact_source_text(str(value))
     if isinstance(value, str):
+        if preserve_redacted_assignments:
+            return _redact_prevalidated_source_text(value)
         return redact_source_text(value)
     if isinstance(value, (bytes, bytearray)):
         try:
-            return redact_source_text(bytes(value).decode("utf-8"))
+            decoded = bytes(value).decode("utf-8")
+            if preserve_redacted_assignments:
+                return _redact_prevalidated_source_text(decoded)
+            return redact_source_text(decoded)
         except UnicodeDecodeError:
             return "<binary data>"
     if isinstance(value, dict):
@@ -431,7 +481,12 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
                 redacted_mapping[redacted_key] = (
                     "<redacted>"
                     if _mapping_key_requires_redaction(key)
-                    else _redact_source_value(item, seen=seen, depth=depth + 1)
+                    else _redact_source_value(
+                        item,
+                        seen=seen,
+                        depth=depth + 1,
+                        preserve_redacted_assignments=preserve_redacted_assignments,
+                    )
                 )
             return redacted_mapping
         finally:
@@ -441,7 +496,15 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
             return "<redacted recursive value>"
         seen.add(id(value))
         try:
-            return [_redact_source_value(item, seen=seen, depth=depth + 1) for item in value]
+            return [
+                _redact_source_value(
+                    item,
+                    seen=seen,
+                    depth=depth + 1,
+                    preserve_redacted_assignments=preserve_redacted_assignments,
+                )
+                for item in value
+            ]
         finally:
             seen.remove(id(value))
     if isinstance(value, tuple):
@@ -449,7 +512,15 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
             return "<redacted recursive value>"
         seen.add(id(value))
         try:
-            return tuple(_redact_source_value(item, seen=seen, depth=depth + 1) for item in value)
+            return tuple(
+                _redact_source_value(
+                    item,
+                    seen=seen,
+                    depth=depth + 1,
+                    preserve_redacted_assignments=preserve_redacted_assignments,
+                )
+                for item in value
+            )
         finally:
             seen.remove(id(value))
     if isinstance(value, (set, frozenset)):
@@ -458,7 +529,15 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
         seen.add(id(value))
         try:
             return sorted(
-                (_redact_source_value(item, seen=seen, depth=depth + 1) for item in value),
+                (
+                    _redact_source_value(
+                        item,
+                        seen=seen,
+                        depth=depth + 1,
+                        preserve_redacted_assignments=preserve_redacted_assignments,
+                    )
+                    for item in value
+                ),
                 key=repr,
             )
         finally:
@@ -756,7 +835,11 @@ def _is_sensitive_export_key(key: object) -> bool:
     )
 
 
-def _redact_export_alias_assignments(value: str) -> str:
+def _redact_export_alias_assignments(
+    value: str,
+    *,
+    preserve_redacted_assignments: bool = False,
+) -> str:
     value = _normalize_encoded_sensitive_assignment_separators(value)
     redacted_parts: list[str] = []
     previous_end = 0
@@ -767,6 +850,10 @@ def _redact_export_alias_assignments(value: str) -> str:
         if not _is_sensitive_export_key(key) or _assignment_value_is_already_redacted(value, match.end()):
             continue
         value_end = _assignment_value_end(value, match.end(), key=key)
+        if preserve_redacted_assignments and any(
+            marker in value[match.end() : value_end] for marker in ("<redacted>", "<credentials-redacted>")
+        ):
+            continue
         redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
         previous_end = value_end
     redacted_parts.append(value[previous_end:])

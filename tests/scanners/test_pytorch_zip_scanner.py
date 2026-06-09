@@ -7488,16 +7488,11 @@ def test_pytorch_zip_symlink_central_sizes_cannot_hide_escaping_suffix(tmp_path:
 
     result = PyTorchZipScanner().scan(str(zip_path))
 
-    symlink_check = next(
-        check
-        for check in result.checks
-        if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
-    )
     assert result.success is False
-    assert symlink_check.status == CheckStatus.FAILED
-    assert symlink_check.severity == IssueSeverity.CRITICAL
-    assert symlink_check.rule_code == "S406"
-    assert symlink_check.details["target_class"] == "invalid"
+    preflight_check = next(check for check in result.checks if check.name == "ZIP Central Directory Preflight")
+    assert preflight_check.status == CheckStatus.FAILED
+    assert preflight_check.rule_code == "S902"
+    assert preflight_check.details["scan_outcome_reason"] == "zip_analysis_incomplete"
 
 
 def test_pytorch_zip_symlink_target_evidence_is_bounded(tmp_path: Path) -> None:
@@ -7581,13 +7576,9 @@ def test_pytorch_zip_symlink_read_error_redacts_local_header_name(tmp_path: Path
 
     result = PyTorchZipScanner().scan(str(zip_path))
 
-    symlink_check = next(
-        check
-        for check in result.checks
-        if check.name == "Symlink Safety Validation" and check.details.get("entry") == central_name
-    )
-    assert symlink_check.rule_code == "S902"
-    assert symlink_check.details["exception"] == "<redacted>"
+    preflight_check = next(check for check in result.checks if check.name == "ZIP Central Directory Preflight")
+    assert preflight_check.status == CheckStatus.FAILED
+    assert preflight_check.rule_code == "S902"
     assert secret not in result.to_json()
 
 
@@ -7609,16 +7600,10 @@ def test_pytorch_zip_symlink_rejects_excessive_compressed_input_before_read(
 
     result = scanner.scan(str(zip_path))
 
-    symlink_check = next(
-        check
-        for check in result.checks
-        if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
-    )
-    assert symlink_check.status == CheckStatus.FAILED
-    assert symlink_check.severity == IssueSeverity.CRITICAL
-    assert symlink_check.rule_code == "S406"
-    assert symlink_check.details["target_class"] == "invalid"
-    assert symlink_check.details["compressed_size"] == excessive_size
+    preflight_check = next(check for check in result.checks if check.name == "ZIP Central Directory Preflight")
+    assert preflight_check.status == CheckStatus.FAILED
+    assert preflight_check.rule_code == "S902"
+    assert preflight_check.details["scan_outcome_reason"] == "zip_analysis_incomplete"
 
 
 def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:

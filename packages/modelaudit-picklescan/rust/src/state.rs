@@ -1407,10 +1407,18 @@ impl<'a> ScanState<'a> {
                                     raw_position.saturating_add(cursor),
                                 );
                             }
-                        } else if scan_limit > 0 {
-                            self.scan_raw_nested_pickle_bytes(&bytes[..scan_limit], raw_position);
-                            let suffix_start =
-                                bytes.len().saturating_sub(scan_limit).max(scan_limit);
+                        } else {
+                            let raw_scan_limit = scan_limit
+                                .max(self.options.max_nested_pickle_bytes)
+                                .min(bytes.len());
+                            self.scan_raw_nested_pickle_bytes(
+                                &bytes[..raw_scan_limit],
+                                raw_position,
+                            );
+                            let suffix_start = bytes
+                                .len()
+                                .saturating_sub(raw_scan_limit)
+                                .max(raw_scan_limit);
                             if suffix_start < bytes.len() {
                                 self.scan_raw_nested_pickle_bytes(
                                     &bytes[suffix_start..],

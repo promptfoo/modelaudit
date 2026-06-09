@@ -1509,16 +1509,24 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
 ) -> None:
     source_root = tmp_path / "src"
     source_root.mkdir()
-    helper_path = source_root / "helper.py"
+    helper_module = "modelaudit_picklescan_test_combined_helper"
+    other_module = "modelaudit_picklescan_test_combined_other"
+    helper_path = source_root / f"{helper_module}.py"
     helper_path.write_text("def entrypoint():\n    return 1\n")
-    other_path = source_root / "other.py"
+    other_path = source_root / f"{other_module}.py"
     other_path.write_text("def entrypoint():\n    return 2\n")
     monkeypatch.syspath_prepend(str(source_root))
 
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", b"\x80\x04" + _global(b"helper", b"entrypoint") + b")R.")
-        archive.writestr("archive/extra.pkl", b"\x80\x04" + _global(b"other", b"entrypoint") + b")R.")
+        archive.writestr(
+            "archive/data.pkl",
+            b"\x80\x04" + _global(helper_module.encode(), b"entrypoint") + b")R.",
+        )
+        archive.writestr(
+            "archive/extra.pkl",
+            b"\x80\x04" + _global(other_module.encode(), b"entrypoint") + b")R.",
+        )
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
 
@@ -1533,8 +1541,8 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
     assert str(helper_path.absolute()) in source_fingerprints["read_fingerprints"]
     assert str(other_path.absolute()) in source_fingerprints["read_fingerprints"]
     assert source_fingerprints["module_sources"] == {
-        "helper": str(helper_path.absolute()),
-        "other": str(other_path.absolute()),
+        helper_module: str(helper_path.absolute()),
+        other_module: str(other_path.absolute()),
     }
     assert source_fingerprints["loaded_module_sources"] == {}
 

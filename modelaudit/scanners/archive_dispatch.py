@@ -517,8 +517,12 @@ def merge_hdf5_userblock_zip_findings(
                     has_trailing_content = True
                 trailing_bytes -= len(chunk)
 
+        previous_logical_end = 0
         for logical_end in logical_zip_ends:
-            temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            if previous_logical_end == 0:
+                temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            else:
+                temp_path = _copy_file_range_to_temp(path, previous_logical_end, logical_end, temp_suffix)
             supplemental_result = ScanResult(scanner_name="zip")
             merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
             _replace_scan_result_path(supplemental_result, temp_path, path)
@@ -526,6 +530,7 @@ def merge_hdf5_userblock_zip_findings(
             with suppress(OSError):
                 os.unlink(temp_path)
             temp_path = None
+            previous_logical_end = logical_end
         if has_trailing_content:
             reason = "hdf5_userblock_zip_trailing_content_unanalyzed"
             mark_inconclusive_scan_result(result, reason)
@@ -687,6 +692,28 @@ def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("HDF5 user-block ZIP ended before its validated logical EOF")
+                temp_file.write(chunk)
+                remaining -= len(chunk)
+        return temp_path
+    except BaseException:
+        if temp_path is not None:
+            with suppress(OSError):
+                os.unlink(temp_path)
+        raise
+
+
+def _copy_file_range_to_temp(path: str, start: int, end: int, suffix: str) -> str:
+    """Copy one validated concatenated ZIP segment to a temporary file."""
+    temp_path: str | None = None
+    try:
+        with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            source.seek(start)
+            temp_path = temp_file.name
+            remaining = end - start
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError("HDF5 user-block ZIP segment ended before its validated logical EOF")
                 temp_file.write(chunk)
                 remaining -= len(chunk)
         return temp_path
