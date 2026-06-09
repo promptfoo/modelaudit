@@ -709,9 +709,9 @@ def _reconcile_cross_directory_shard_coverage(
     results: ModelAuditResultModel,
     validated_targets: ValidatedShardTargets,
     *,
-    preserve_has_errors: bool = False,
+    missing_shard_errors_only: bool = False,
 ) -> bool:
-    """Remove only missing-shard outcomes disproven by this scan's validated targets."""
+    """Remove missing-shard outcomes, clearing errors only with explicit ownership proof."""
     complete_sources = _complete_validated_shard_family_sources(validated_targets)
     if not complete_sources:
         return False
@@ -815,7 +815,7 @@ def _reconcile_cross_directory_shard_coverage(
     if reconciled:
         had_errors = results.has_errors
         results.has_errors = _results_have_explicit_operational_error(results) or (
-            had_errors and (preserve_has_errors or _results_have_retained_incomplete_outcome(results))
+            had_errors and (not missing_shard_errors_only or _results_have_retained_incomplete_outcome(results))
         )
         results.success = not _results_should_be_unsuccessful(results)
     return reconciled
@@ -4178,7 +4178,7 @@ def scan_model_streaming(
         _reconcile_cross_directory_shard_coverage(
             results,
             validated_shard_targets,
-            preserve_has_errors=preserve_shard_reconciliation_errors,
+            missing_shard_errors_only=not preserve_shard_reconciliation_errors,
         )
 
         # Compute aggregate hash from all file hashes

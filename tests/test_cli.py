@@ -636,6 +636,47 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
     )
 
 
+def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: Path) -> None:
+    """Shard reconciliation must not clear a separate caller-level path error."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+    nonexistent_path = tmp_path / "missing.safetensors"
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            str(nonexistent_path),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert f"Path does not exist: {nonexistent_path}" in result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["has_errors"] is True
+    assert output_payload["success"] is False
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
 def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tmp_path: Path) -> None:
     """Explicit opt-in should keep independently templated shard families separate."""
     header = b'{"__metadata__":{"format":"pt"}}'

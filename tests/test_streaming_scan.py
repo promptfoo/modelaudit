@@ -919,7 +919,14 @@ def test_cross_directory_shard_reconciliation_clears_stale_operational_error_sta
                 scan_outcome_reasons=["missing_model_shards"],
             )
 
-        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
         assert result.has_errors is False
         assert result.success is True
         assert determine_exit_code(result) == 0
@@ -958,7 +965,14 @@ def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failu
             )
         )
 
-        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
         assert result.has_errors is True
         assert result.success is False
         assert determine_exit_code(result) == 2
@@ -994,7 +1008,6 @@ def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_fai
             _reconcile_cross_directory_shard_coverage(
                 result,
                 validated_targets,
-                preserve_has_errors=True,
             )
             is True
         )
@@ -1033,7 +1046,14 @@ def test_cross_directory_shard_reconciliation_preserves_independent_operational_
             operational_error_reason="download_failed",
         )
 
-        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
         assert result.has_errors is True
         assert result.success is False
         assert determine_exit_code(result) == 2
