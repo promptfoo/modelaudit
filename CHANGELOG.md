@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - use credential-free, cross-platform cloud routing filenames without changing native object-key suffix semantics
 - encode native cloud object keys into collision-resistant, prefix-safe Windows paths and reject out-of-target listings
+- fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
 - discover extensionless pickle payloads inside ExecuTorch ZIP archives with bounded structural probing, including repeated protocol-0 comment-token evasions
 - report TAR external link escapes with the dedicated symlink rule code, resolve link targets from their correct archive bases, and avoid retaining passing checks for benign link floods
 - bind direct sharded-model cache entries to sibling shard and selected model configuration content fingerprints, and strengthen cache configuration hashes
@@ -50,7 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets
 - preserve registrable network domains and redact delimiter-split credentials in bounded finding evidence
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
+- require explicit public progress hook egress hosts and reject internal webhook and SMTP destinations before sending scan details.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
+- detect interpolated Hydra helper configs, legacy Hydra global-state aliases, and unsafe local or remote NeMo model-loader paths.
 - bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
 - keep bounded ExecuTorch ZIP snapshots seekable on Python 3.10 so benign and malicious pickle members remain analyzable
 

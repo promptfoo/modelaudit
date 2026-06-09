@@ -167,7 +167,7 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
                 _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
             ),
             _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
-            minimum=0,
+            minimum=2,
         ),
         max_nested_depth=_parse_min_int(
             config.get(
