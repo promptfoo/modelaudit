@@ -167,6 +167,10 @@ _DANGEROUS_TARGETS = {
     "builtins.__import__",
     "hydra.compose",
     "hydra.compose.compose",
+    "hydra.experimental.compose",
+    "hydra.experimental.initialize",
+    "hydra.experimental.initialize_config_dir",
+    "hydra.experimental.initialize_config_module",
     "hydra.initialize",
     "hydra.initialize.initialize",
     "hydra.initialize.initialize_config_dir",
@@ -1068,6 +1072,24 @@ _DANGEROUS_TARGET_PREFIXES = (
 _DANGEROUS_NUMPY_TARGET_SUFFIXES = (".dump", ".tofile")
 _DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES = (".from_pretrained", ".push_to_hub", ".save_pretrained")
 _TARGET_CALL_ALIAS_SUFFIX = ".__call__"
+_HYDRA_DYNAMIC_CONFIG_TARGETS = frozenset(
+    {
+        "hydra.utils.call",
+        "hydra.utils.instantiate",
+        "hydra.experimental.call",
+        "hydra.experimental.instantiate",
+    }
+)
+_MODEL_LOAD_ARGUMENT_KEYS_BY_SUFFIX = {
+    ".load_from_checkpoint": frozenset({"checkpoint_path", "hparams_file"}),
+    ".restore_from": frozenset({"override_config_path", "restore_path"}),
+    ".from_pretrained": frozenset(
+        {"model_name", "model_name_or_path", "override_config_path", "pretrained_model_name_or_path"}
+    ),
+}
+_HYDRA_CONFIG_ARGUMENT_KEYS = frozenset({"config"})
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_HYDRA_DYNAMIC_CONFIG_SCAN_NODES = 1024
 
 # Patterns in _target_ that are suspicious even if not exact matches
 _SUSPICIOUS_TARGET_PATTERNS = (
@@ -1169,6 +1191,20 @@ def _unwrap_target_call_aliases(target: str) -> str:
     while target.endswith(_TARGET_CALL_ALIAS_SUFFIX):
         target = target[: -len(_TARGET_CALL_ALIAS_SUFFIX)]
     return target
+
+
+def _is_dangerous_callable_target(callable_target: str) -> bool:
+    """Return whether a Hydra callable target is an immediate dangerous sink."""
+    return (
+        callable_target in _DANGEROUS_TARGETS
+        or callable_target.startswith(_DANGEROUS_TARGET_PREFIXES)
+        or (callable_target.startswith("numpy.") and callable_target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
+        or (
+            callable_target not in _SAFE_TARGETS
+            and callable_target.startswith("transformers.")
+            and callable_target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
+        )
+    )
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -3186,9 +3222,9 @@ class NemoScanner(BaseScanner):
         path_prefix: str = "",
     ) -> None:
         """Check _target_ values in Hydra config within shared traversal bounds."""
-        for config_path, value, _parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
+        for config_path, value, parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, config_path, config_name, archive_path, result)
+                self._evaluate_target(value, config_path, config_name, archive_path, result, parent)
 
     def _evaluate_target(
         self,
@@ -3197,6 +3233,7 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
+        target_config: dict[Any, Any] | None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
         display_target = _redact_config_evidence(target)
@@ -3209,16 +3246,7 @@ class NemoScanner(BaseScanner):
             return
 
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if (
-            callable_target in _DANGEROUS_TARGETS
-            or callable_target.startswith(_DANGEROUS_TARGET_PREFIXES)
-            or (callable_target.startswith("numpy.") and callable_target.endswith(_DANGEROUS_NUMPY_TARGET_SUFFIXES))
-            or (
-                callable_target not in _SAFE_TARGETS
-                and callable_target.startswith("transformers.")
-                and callable_target.endswith(_DANGEROUS_TRANSFORMERS_TARGET_SUFFIXES)
-            )
-        ):
+        if _is_dangerous_callable_target(callable_target):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
@@ -3252,6 +3280,25 @@ class NemoScanner(BaseScanner):
         if callable_target in _SAFE_TARGETS or any(
             callable_target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES
         ):
+            helper_argument = self._find_dangerous_safe_target_argument(
+                callable_target,
+                target_config,
+                config_path,
+            )
+            if helper_argument is not None:
+                self._add_dangerous_hydra_helper_argument_check(
+                    target,
+                    helper_argument["argument_name"],
+                    helper_argument["argument_path"],
+                    helper_argument["argument_value"],
+                    helper_argument["reason"],
+                    config_path,
+                    config_name,
+                    archive_path,
+                    result,
+                )
+                return
+
             pattern = _find_suspicious_safe_prefixed_target_pattern(callable_target)
             if pattern is not None:
                 self._add_suspicious_target_check(
@@ -3293,6 +3340,224 @@ class NemoScanner(BaseScanner):
                 "config_path": display_config_path,
                 "config_file": display_config_name,
             },
+        )
+
+    @classmethod
+    def _find_dangerous_safe_target_argument(
+        cls,
+        callable_target: str,
+        target_config: dict[Any, Any] | None,
+        config_path: str,
+    ) -> dict[str, str] | None:
+        """Return the first unsafe helper/load argument for a safe-prefixed target."""
+        if not target_config:
+            return None
+
+        dynamic_config_target = callable_target in _HYDRA_DYNAMIC_CONFIG_TARGETS
+        model_load_argument_keys = cls._model_load_argument_keys(callable_target)
+        if not (dynamic_config_target or model_load_argument_keys):
+            return None
+
+        if dynamic_config_target:
+            scan_limit_exceeded = [False]
+            arguments = cls._iter_dynamic_config_argument_strings(
+                target_config,
+                cls._target_parent_config_path(config_path),
+                scan_limit_exceeded,
+            )
+        else:
+            scan_limit_exceeded = [False]
+            arguments = cls._iter_direct_target_argument_strings(
+                target_config,
+                cls._target_parent_config_path(config_path),
+                model_load_argument_keys,
+                scan_limit_exceeded,
+            )
+
+        for argument_path, argument_name, argument_value in arguments:
+            reason = cls._classify_hydra_helper_argument(
+                argument_value,
+                dynamic_config_target=dynamic_config_target,
+                model_load_suffix=cls._model_load_suffix(callable_target),
+            )
+            if reason is not None:
+                return {
+                    "argument_path": argument_path,
+                    "argument_name": argument_name,
+                    "argument_value": argument_value,
+                    "reason": reason,
+                }
+        if scan_limit_exceeded[0]:
+            return {
+                "argument_path": cls._target_parent_config_path(config_path),
+                "argument_name": "config",
+                "argument_value": "<scan limit exceeded>",
+                "reason": "helper_config_scan_limit",
+            }
+        return None
+
+    @staticmethod
+    def _target_parent_config_path(config_path: str) -> str:
+        if config_path == "_target_":
+            return ""
+        suffix = "._target_"
+        if config_path.endswith(suffix):
+            return config_path[: -len(suffix)]
+        return config_path
+
+    @classmethod
+    def _iter_direct_target_argument_strings(
+        cls,
+        target_config: dict[Any, Any],
+        target_config_path: str,
+        argument_keys: frozenset[str],
+        scan_limit_exceeded: list[bool],
+    ) -> Iterator[tuple[str, str, str]]:
+        for key, value in target_config.items():
+            if key == "_target_":
+                continue
+            argument_name = str(key)
+            argument_path = _append_config_path(target_config_path, argument_name)
+            if argument_name in argument_keys and isinstance(value, str):
+                yield argument_path, argument_name, value
+            elif argument_name == "_args_" and isinstance(value, list):
+                for index, positional_value in enumerate(value):
+                    if index >= _HYDRA_DYNAMIC_CONFIG_SCAN_NODES:
+                        scan_limit_exceeded[0] = True
+                        break
+                    if isinstance(positional_value, str):
+                        yield _append_config_path(argument_path, f"[{index}]"), argument_name, positional_value
+
+    @classmethod
+    def _iter_dynamic_config_argument_strings(
+        cls,
+        target_config: dict[Any, Any],
+        target_config_path: str,
+        scan_limit_exceeded: list[bool],
+    ) -> Iterator[tuple[str, str, str]]:
+        """Yield strings beneath the config argument Hydra resolves recursively."""
+        remaining = [_HYDRA_DYNAMIC_CONFIG_SCAN_NODES]
+        for key, value in target_config.items():
+            argument_name = str(key)
+            argument_path = _append_config_path(target_config_path, argument_name)
+            selected_values: Iterator[tuple[str, Any]]
+            if argument_name in _HYDRA_CONFIG_ARGUMENT_KEYS:
+                selected_values = iter(((argument_path, value),))
+            elif argument_name == "_args_" and isinstance(value, list):
+                selected_values = (
+                    (_append_config_path(argument_path, f"[{index}]"), positional_value)
+                    for index, positional_value in enumerate(value)
+                )
+            else:
+                continue
+
+            for selected_path, selected_value in selected_values:
+                if remaining[0] <= 0:
+                    scan_limit_exceeded[0] = True
+                    return
+                for nested_path, nested_value, _parent, _key in cls._iter_config_nodes(
+                    selected_value,
+                    path_prefix=selected_path,
+                ):
+                    if remaining[0] <= 0:
+                        scan_limit_exceeded[0] = True
+                        return
+                    remaining[0] -= 1
+                    if isinstance(nested_value, str):
+                        yield nested_path, argument_name, nested_value
+
+    @staticmethod
+    def _model_load_suffix(callable_target: str) -> str | None:
+        return next(
+            (suffix for suffix in _MODEL_LOAD_ARGUMENT_KEYS_BY_SUFFIX if callable_target.endswith(suffix)),
+            None,
+        )
+
+    @classmethod
+    def _model_load_argument_keys(cls, callable_target: str) -> frozenset[str]:
+        suffix = cls._model_load_suffix(callable_target)
+        if suffix is None:
+            return frozenset()
+        return _MODEL_LOAD_ARGUMENT_KEYS_BY_SUFFIX[suffix]
+
+    @classmethod
+    def _classify_hydra_helper_argument(
+        cls,
+        argument_value: str,
+        *,
+        dynamic_config_target: bool,
+        model_load_suffix: str | None,
+    ) -> str | None:
+        candidate = argument_value.strip()
+        if not candidate:
+            return None
+        if _HYDRA_INTERPOLATION_OPENER in candidate:
+            return "interpolated_helper_argument"
+
+        if dynamic_config_target:
+            return None
+
+        normalized_path = candidate.replace("\\", "/")
+        normalized_relative_path = posixpath.normpath(normalized_path)
+        escapes_relative_root = normalized_relative_path == ".." or normalized_relative_path.startswith("../")
+        if model_load_suffix is not None:
+            if is_absolute_archive_path(normalized_path):
+                return "absolute_model_load_path"
+            if model_load_suffix == ".restore_from" and normalized_path.startswith("~"):
+                return "absolute_model_load_path"
+            if _URI_SCHEME_RE.match(normalized_path):
+                return "remote_model_load_path"
+            if escapes_relative_root:
+                return "traversal_model_load_path"
+
+        return None
+
+    def _add_dangerous_hydra_helper_argument_check(
+        self,
+        target: str,
+        argument_name: str,
+        argument_path: str,
+        argument_value: str,
+        reason: str,
+        config_path: str,
+        config_name: str,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        display_target = _redact_config_evidence(target)
+        display_argument_name = _redact_config_evidence(argument_name)
+        display_argument_path = _redact_config_evidence(argument_path)
+        display_argument_value = _redact_config_evidence(argument_value)
+        display_config_path = _redact_config_evidence(config_path)
+        display_config_name = _redact_config_evidence(config_name)
+        result.add_check(
+            name=f"{CVE_2025_23304_ID}: Dangerous Hydra helper argument",
+            passed=False,
+            message=(
+                f"{CVE_2025_23304_ID}: Safe-prefixed _target_ "
+                f"'{display_target}' has unsafe helper argument "
+                f"'{display_argument_path}' in {display_config_name}"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{display_config_name}",
+            details={
+                "target": display_target,
+                "argument": display_argument_path,
+                "argument_name": display_argument_name,
+                "argument_value": display_argument_value,
+                "reason": reason,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
+            },
+            why=(
+                "Hydra resolves interpolated helper configs before dispatch, and model loader targets can read "
+                "attacker-selected local or remote checkpoints."
+            ),
         )
 
     def _add_interpolated_target_check(
