@@ -100,6 +100,21 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
     assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_or_file_streaming_path_enforces_max_file_size() -> None:
+    """The configured file limit must cap the actual remote stream read."""
+    stream_url = "s3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, False)) as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()) as mock_scanner,
+    ):
+        scan_model_directory_or_file(f"stream://{stream_url}", max_file_size=4096)
+
+    mock_stream.assert_called_once_with(stream_url, mock_scanner.return_value, max_bytes=4096)
+
+
 def test_scan_model_directory_or_file_encoded_signed_query_preserves_routing() -> None:
     """Encoded signed queries must not hide the model suffix from scanner routing."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl%3FX-Amz-Signature%3Ddeadbeef%26token%3Dsecret-token"

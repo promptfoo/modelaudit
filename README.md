@@ -143,6 +143,8 @@ modelaudit model.dvc
 - `GOOGLE_APPLICATION_CREDENTIALS` for GCS
 - `MLFLOW_TRACKING_URI` for MLflow registry access
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- `MODELAUDIT_JFROG_ALLOWED_HOSTS` for comma-separated custom JFrog hostnames that may receive credentials
+- `MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS` for comma-separated external redirect hostnames that may be downloaded without credentials
 - Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
 
 ## Installation
@@ -251,11 +253,10 @@ modelaudit metadata model.onnx --security-only
 
 ModelAudit includes telemetry for product reliability and usage analytics.
 
-- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, sanitized model names/references, and coarse metadata like file extension/domain.
-- URL telemetry strips userinfo, query strings, and fragments from model references. Avoid putting credentials in model names, file names, or artifact paths when telemetry is enabled.
-- Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
-- Telemetry is disabled automatically when `CI=true` is set or `IS_TESTING=true` is set, and in editable development installs by default. Events that are sent from other CI providers (TeamCity, CodeBuild, Bitbucket Pipelines, Jenkins) are tagged with `isRunningInCi=true` so they can be filtered downstream.
-- The anonymous user identifier is stored in `~/.promptfoo/promptfoo.yaml` for cross-tool correlation with [Promptfoo](https://www.promptfoo.dev/). Existing IDs from `~/.modelaudit/user_config.json` are migrated on first run after upgrade.
+- Collected metadata can include command and feature usage, scan and download timing or size metadata, scanner/file-type usage, stable rule or CVE identifiers, severity aggregates, registered file extensions, coarse source or provider categories, and runtime version, platform, and CI metadata.
+- Telemetry does not include raw local paths, filenames, model IDs or names, repository or artifact identifiers, bucket or object keys, remote URL paths, free-form issue or error text, URL userinfo, query strings, fragments, or model binary contents.
+- Packaged installs enable telemetry by default. Telemetry is disabled automatically when `CI=true` is set or `IS_TESTING=true` is set, and in editable development installs unless `MODELAUDIT_TELEMETRY_DEV=1`. Events that are sent from other CI providers (TeamCity, CodeBuild, Bitbucket Pipelines, Jenkins) are tagged with `isRunningInCi=true` so they can be filtered downstream.
+- A persistent pseudonymous user identifier is stored in `~/.promptfoo/promptfoo.yaml` for cross-tool correlation with [Promptfoo](https://www.promptfoo.dev/), and each telemetry session uses a new session identifier. Existing IDs from `~/.modelaudit/user_config.json` are migrated on first run after upgrade. A legacy email value in that file, if present, may be attached to the analytics user profile.
 
 Opt out explicitly with either environment variable:
 

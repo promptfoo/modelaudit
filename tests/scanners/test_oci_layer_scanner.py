@@ -30,6 +30,25 @@ def _gzip_with_comment(payload: bytes, comment: bytes) -> bytes:
     return bytes(member[:10] + comment + b"\0" + member[10:])
 
 
+def _pax_record(key: str, value: str) -> bytes:
+    """Return one length-prefixed PAX record."""
+    body = f" {key}={value}\n".encode()
+    record_size = len(body) + 1
+    while len(str(record_size)) + len(body) != record_size:
+        record_size = len(str(record_size)) + len(body)
+    return str(record_size).encode() + body
+
+
+def _tar_block(info: tarfile.TarInfo) -> bytes:
+    """Return one raw PAX-format TAR header block."""
+    return info.tobuf(format=tarfile.PAX_FORMAT, encoding="utf-8", errors="surrogateescape")
+
+
+def _pad_tar_payload(payload: bytes) -> bytes:
+    """Pad a raw TAR payload to its next block boundary."""
+    return payload + (b"\0" * ((-len(payload)) % tarfile.BLOCKSIZE))
+
+
 def _assert_inconclusive_aggregate_not_cached(
     path: Path,
     expected_reason: str,
@@ -1368,6 +1387,260 @@ class TestOciLayerScanner:
         check = next(check for check in result.checks if check.name == "Layer Decompression Budget Check")
         assert check.details["hidden_entries"] == 1
 
+    @pytest.mark.parametrize(
+        "pax_type",
+        [tarfile.XHDTYPE, tarfile.SOLARIS_XHDTYPE],
+        ids=["pax", "solaris-pax"],
+    )
+    def test_scan_layer_rejects_pax_size_override_entry_budget_bypass(
+        self,
+        tmp_path: Path,
+        pax_type: bytes,
+    ) -> None:
+        """A PAX size override must not hide a later malicious member from raw preflight."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        evil_payload = evil_pickle.read_bytes()
+
+        pax_payload = _pax_record("size", "0")
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = pax_type
+        pax_header.size = len(pax_payload)
+
+        payload_header = tarfile.TarInfo("payload.pkl")
+        payload_header.size = len(evil_payload)
+        hidden_payload = _tar_block(payload_header) + _pad_tar_payload(evil_payload)
+
+        cover_header = tarfile.TarInfo("cover.bin")
+        cover_header.size = len(hidden_payload)
+        raw_tar = (
+            _tar_block(pax_header)
+            + _pad_tar_payload(pax_payload)
+            + _tar_block(cover_header)
+            + hidden_payload
+            + (b"\0" * (2 * tarfile.BLOCKSIZE))
+        )
+        layer_path = tmp_path / "pax-size-override.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "pax-size-override.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner(
+                {
+                    "max_oci_layer_entries": 2,
+                    "compressed_max_decompression_ratio": 10000.0,
+                }
+            ).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_tar_size_override_unsupported" in result.metadata["scan_outcome_reasons"]
+        check = next(check for check in result.checks if check.name == "Layer TAR Structure Check")
+        assert check.details["raw_entries"] == 1
+        assert check.details["hidden_entries"] == 1
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_tar_size_override_unsupported",
+            tmp_path / "pax-size-override-cache",
+            max_oci_layer_entries=2,
+            compressed_max_decompression_ratio=10000.0,
+        )
+
+    def test_scan_layer_preserves_early_finding_before_pax_size_override(self, tmp_path: Path) -> None:
+        """A late PAX size override must not suppress an earlier malicious finding."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        evil_payload = evil_pickle.read_bytes()
+        evil_header = tarfile.TarInfo("early.pkl")
+        evil_header.size = len(evil_payload)
+
+        pax_payload = _pax_record("size", "0")
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = tarfile.XHDTYPE
+        pax_header.size = len(pax_payload)
+        cover_header = tarfile.TarInfo("cover.bin")
+        cover_header.size = 0
+        raw_tar = (
+            _tar_block(evil_header)
+            + _pad_tar_payload(evil_payload)
+            + _tar_block(pax_header)
+            + _pad_tar_payload(pax_payload)
+            + _tar_block(cover_header)
+            + (b"\0" * (2 * tarfile.BLOCKSIZE))
+        )
+        layer_path = tmp_path / "late-pax-size-override.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "late-pax-size-override.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_tar_size_override_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert "oci_layer_tar_structure_incomplete" not in result.metadata["scan_outcome_reasons"]
+        structure_checks = [check for check in result.checks if check.name == "Layer TAR Structure Check"]
+        assert len(structure_checks) == 1
+        assert structure_checks[0].details["scan_outcome_reason"] == "oci_layer_tar_size_override_unsupported"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "late-pax-size-override.manifest:late-pax-size-override.tar.gz:early.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_layer_rejects_pax_size_override_hidden_in_block_padding(self, tmp_path: Path) -> None:
+        """PAX records parsed by tarfile from block padding must be visible to preflight."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        evil_payload = evil_pickle.read_bytes()
+
+        declared_pax_payload = _pax_record("comment", "safe")
+        padded_size_override = _pax_record("size", "0")
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = tarfile.XGLTYPE
+        pax_header.size = len(declared_pax_payload)
+        pax_block_payload = _pad_tar_payload(declared_pax_payload + padded_size_override)
+
+        payload_header = tarfile.TarInfo("payload.pkl")
+        payload_header.size = len(evil_payload)
+        raw_tar = (
+            _tar_block(pax_header)
+            + pax_block_payload
+            + _tar_block(payload_header)
+            + _pad_tar_payload(evil_payload)
+            + (b"\0" * (2 * tarfile.BLOCKSIZE))
+        )
+        layer_path = tmp_path / "pax-padding-size-override.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "pax-padding-size-override.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_tar_size_override_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_tar_size_override_unsupported",
+            tmp_path / "pax-padding-size-override-cache",
+            compressed_max_decompression_ratio=10000.0,
+        )
+
+    @pytest.mark.parametrize("size_field", ["GNU.sparse.size", "GNU.sparse.realsize"])
+    def test_scan_layer_rejects_pax_sparse_size_override(
+        self,
+        tmp_path: Path,
+        size_field: str,
+    ) -> None:
+        """GNU sparse aliases that overwrite member size must fail bounded preflight."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        evil_payload = evil_pickle.read_bytes()
+
+        pax_payload = _pax_record(size_field, "0")
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = tarfile.XGLTYPE
+        pax_header.size = len(pax_payload)
+        payload_header = tarfile.TarInfo("payload.pkl")
+        payload_header.size = len(evil_payload)
+        raw_tar = (
+            _tar_block(pax_header)
+            + _pad_tar_payload(pax_payload)
+            + _tar_block(payload_header)
+            + _pad_tar_payload(evil_payload)
+            + (b"\0" * (2 * tarfile.BLOCKSIZE))
+        )
+        layer_path = tmp_path / f"{size_field}.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / f"{size_field}.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_tar_size_override_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_scan_layer_allows_benign_pax_metadata_without_size_override(self, tmp_path: Path) -> None:
+        """Ordinary PAX metadata must not be rejected by size-override hardening."""
+        pax_payload = _pax_record("comment", "safe") + (b"\0" * 8)
+        pax_header = tarfile.TarInfo("././@PaxHeader")
+        pax_header.type = tarfile.XHDTYPE
+        pax_header.size = len(pax_payload)
+
+        member_payload = b"safe payload"
+        member_header = tarfile.TarInfo("payload.bin")
+        member_header.size = len(member_payload)
+        raw_tar = (
+            _tar_block(pax_header)
+            + _pad_tar_payload(pax_payload)
+            + _tar_block(member_header)
+            + _pad_tar_payload(member_payload)
+            + (b"\0" * (2 * tarfile.BLOCKSIZE))
+        )
+        layer_path = tmp_path / "benign-pax.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "benign-pax.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 1
+        assert "oci_layer_tar_size_override_unsupported" not in result.metadata.get("scan_outcome_reasons", [])
+        assert "oci_layer_tar_structure_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_scan_layer_rejects_incomplete_tar_structure_without_safe_prefix(self, tmp_path: Path) -> None:
+        """A partial first TAR header must fail before handing the layer to tarfile."""
+        member_header = tarfile.TarInfo("payload.bin")
+        member_header.size = 128
+        raw_tar = _tar_block(member_header)[:128]
+
+        layer_path = tmp_path / "unterminated.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "unterminated.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert result.success is False
+        assert "oci_layer_tar_structure_incomplete" in result.metadata["scan_outcome_reasons"]
+        check = next(check for check in result.checks if check.name == "Layer TAR Structure Check")
+        assert check.details["raw_entries"] == 0
+        assert check.details["hidden_entries"] == 0
+
+    def test_scan_layer_preserves_early_finding_before_incomplete_tar_structure(self, tmp_path: Path) -> None:
+        """A truncated late member must not suppress an earlier malicious finding."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        evil_payload = evil_pickle.read_bytes()
+        evil_header = tarfile.TarInfo("early.pkl")
+        evil_header.size = len(evil_payload)
+        late_header = tarfile.TarInfo("late.bin")
+        late_header.size = 4096
+        raw_tar = _tar_block(evil_header) + _pad_tar_payload(evil_payload) + _tar_block(late_header) + (b"A" * 128)
+
+        layer_path = tmp_path / "late-incomplete.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar))
+        manifest_path = tmp_path / "late-incomplete.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_tar_structure_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "late-incomplete.manifest:late-incomplete.tar.gz:early.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
+
     def test_scan_layer_stops_after_visible_members_within_raw_entry_budget(self, tmp_path: Path) -> None:
         """Visible entries beyond a hidden-header-adjusted raw limit must not be parsed."""
         first_payload = tmp_path / "first.bin"
@@ -1527,6 +1800,238 @@ class TestOciLayerScanner:
             and "early-malicious.manifest:early-malicious.tar.gz:payload.pkl" in (issue.location or "")
             for issue in result.issues
         )
+
+    def test_scan_layer_rejects_late_malicious_member_beyond_entry_budget(self, tmp_path: Path) -> None:
+        """Members after the raw-entry cap must not be extracted or reported as findings."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_text("safe")
+
+        layer_path = tmp_path / "late-malicious-entry.tar.gz"
+        with tarfile.open(layer_path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+            tar.add(benign_member, arcname="notes.txt")
+            tar.add(evil_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "late-malicious-entry.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_entries": 1}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_entry_count_exceeded",
+            tmp_path / "late-entry-cache",
+            max_oci_layer_entries=1,
+        )
+
+    def test_scan_layer_reports_early_malicious_member_before_extraction_budget_exhaustion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Aggregate extraction exhaustion should preserve already-scanned malicious members."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        filler = tmp_path / "filler.bin"
+        filler.write_bytes(b"A" * 256)
+
+        layer_path = tmp_path / "early-malicious-extraction.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+            tar.add(filler, arcname="filler.bin")
+
+        manifest_path = tmp_path / "early-malicious-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"max_oci_layer_extracted_bytes": evil_pickle.stat().st_size}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "early-malicious-extraction.manifest:early-malicious-extraction.tar.gz:payload.pkl"
+            in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_layer_rejects_late_malicious_member_beyond_extraction_budget(self, tmp_path: Path) -> None:
+        """A later malicious member outside the aggregate copied-byte budget must fail closed."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_bytes(b"safe notes")
+        max_extracted_bytes = benign_member.stat().st_size + evil_pickle.stat().st_size - 1
+
+        layer_path = tmp_path / "late-malicious-extraction.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(benign_member, arcname="notes.txt")
+            tar.add(evil_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "late-malicious-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_extracted_bytes": max_extracted_bytes}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["member"] == "payload.pkl"
+        assert checks[0].details["previous_extracted_bytes"] == benign_member.stat().st_size
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_extracted_size_exceeded",
+            tmp_path / "late-extraction-cache",
+            max_oci_layer_extracted_bytes=max_extracted_bytes,
+        )
+
+    def test_scan_layer_allows_members_at_aggregate_extraction_limit(self, tmp_path: Path) -> None:
+        """Benign members that exactly meet the aggregate extraction limit remain scannable."""
+        first_member = tmp_path / "first.txt"
+        first_member.write_bytes(b"A" * 128)
+        second_member = tmp_path / "second.txt"
+        second_member.write_bytes(b"B" * 128)
+        max_extracted_bytes = first_member.stat().st_size + second_member.stat().st_size
+
+        layer_path = tmp_path / "exact-extraction-limit.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(first_member, arcname="first.txt")
+            tar.add(second_member, arcname="second.txt")
+
+        manifest_path = tmp_path / "exact-extraction-limit.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_extracted_bytes": max_extracted_bytes}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 2
+        assert "oci_layer_extracted_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+
+    def test_scan_layer_does_not_treat_max_file_size_as_aggregate_extraction_limit(self, tmp_path: Path) -> None:
+        """The public per-file limit must not become a cumulative layer budget."""
+        first_member = tmp_path / "first.bin"
+        first_member.write_bytes(b"A" * 700)
+        second_member = tmp_path / "second.bin"
+        second_member.write_bytes(b"B" * 700)
+
+        layer_path = tmp_path / "per-file-limit.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(first_member, arcname="first.bin")
+            tar.add(second_member, arcname="second.bin")
+
+        manifest_path = tmp_path / "per-file-limit.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_file_size": 1000}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 2
+        assert "oci_layer_extracted_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_scan_manifest_rejects_late_malicious_member_beyond_total_extraction_budget(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The public total-size budget must span every layer in one manifest."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_bytes(b"safe notes")
+        max_total_size = benign_member.stat().st_size + evil_pickle.stat().st_size - 1
+
+        first_layer = tmp_path / "first-layer.tar.gz"
+        with tarfile.open(first_layer, "w:gz") as tar:
+            tar.add(benign_member, arcname="notes.txt")
+        second_layer = tmp_path / "second-layer.tar.gz"
+        with tarfile.open(second_layer, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "total-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [first_layer.name, second_layer.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_total_size": max_total_size}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_total_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["layer"] == second_layer.name
+        assert checks[0].details["member"] == "payload.pkl"
+        assert checks[0].details["previous_total_extracted_bytes"] == benign_member.stat().st_size
+        assert checks[0].details["max_total_extracted_bytes"] == max_total_size
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_total_extracted_size_exceeded",
+            tmp_path / "total-extraction-cache",
+            max_total_size=max_total_size,
+        )
+
+    def test_scan_manifest_preserves_early_finding_before_total_extraction_budget_exhaustion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A later total-budget failure must retain findings from an earlier layer."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        filler = tmp_path / "filler.bin"
+        filler.write_bytes(b"A" * 256)
+
+        first_layer = tmp_path / "malicious-layer.tar.gz"
+        with tarfile.open(first_layer, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+        second_layer = tmp_path / "filler-layer.tar.gz"
+        with tarfile.open(second_layer, "w:gz") as tar:
+            tar.add(filler, arcname="filler.bin")
+
+        manifest_path = tmp_path / "early-total-finding.manifest"
+        manifest_path.write_text(json.dumps({"layers": [first_layer.name, second_layer.name]}))
+
+        result = OciLayerScanner({"max_total_size": evil_pickle.stat().st_size}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_total_extracted_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "early-total-finding.manifest:malicious-layer.tar.gz:payload.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_manifest_allows_members_at_total_extraction_limit(self, tmp_path: Path) -> None:
+        """Members across multiple layers may exactly consume the public total-size budget."""
+        first_member = tmp_path / "first.txt"
+        first_member.write_bytes(b"A" * 128)
+        second_member = tmp_path / "second.txt"
+        second_member.write_bytes(b"B" * 128)
+        max_total_size = first_member.stat().st_size + second_member.stat().st_size
+
+        first_layer = tmp_path / "first-exact-layer.tar.gz"
+        with tarfile.open(first_layer, "w:gz") as tar:
+            tar.add(first_member, arcname="first.txt")
+        second_layer = tmp_path / "second-exact-layer.tar.gz"
+        with tarfile.open(second_layer, "w:gz") as tar:
+            tar.add(second_member, arcname="second.txt")
+
+        manifest_path = tmp_path / "exact-total-extraction.manifest"
+        manifest_path.write_text(json.dumps({"layers": [first_layer.name, second_layer.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_total_size": max_total_size}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 2
+        assert "oci_total_extracted_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
     def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
         """Embedded scan results should reference the OCI member, not temp extraction paths."""
@@ -1832,6 +2337,602 @@ class TestOciLayerScanner:
         assert result.success is True
         checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
         assert checks == []
+
+    @pytest.mark.parametrize(
+        ("link_type", "link_target"),
+        [(tarfile.SYMTYPE, "../payload.bin"), (tarfile.LNKTYPE, "payload.bin")],
+        ids=["symlink", "hardlink"],
+    )
+    def test_scan_layer_scans_safe_model_link_targets(
+        self,
+        tmp_path: Path,
+        link_type: bytes,
+        link_target: str,
+    ) -> None:
+        """Safe in-layer links with model-looking names must not bypass nested scanning."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        layer_path = tmp_path / "linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.bin")
+            link_info = tarfile.TarInfo("models/weights.pkl")
+            link_info.type = link_type
+            link_info.linkname = link_target
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert any(
+            f"{manifest_path}:linked-model.tar.gz:models/weights.pkl" in (issue.location or "")
+            for issue in critical_issues
+        )
+
+    @pytest.mark.parametrize("link_target", ["../payload.bin", "/payload.bin"])
+    def test_scan_layer_scans_forward_model_symlink_targets(
+        self,
+        tmp_path: Path,
+        link_target: str,
+    ) -> None:
+        """Forward and container-absolute symlinks must resolve within the admitted layer."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        layer_path = tmp_path / "forward-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("models/weights.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = link_target
+            tar.addfile(link_info)
+            tar.add(evil_pickle, arcname="payload.bin")
+
+        manifest_path = tmp_path / "forward-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and f"{manifest_path}:{layer_path.name}:models/weights.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_layer_applies_member_size_limit_to_link_payload(self, tmp_path: Path) -> None:
+        """A zero-size link header must not bypass the target payload size budget."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"A" * 8192)
+        layer_path = tmp_path / "oversized-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="payload.bin")
+            link_info = tarfile.TarInfo("models/weights.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../payload.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "oversized-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner({"max_file_size": 4096}).scan(str(manifest_path))
+
+        link_size_checks = [
+            check
+            for check in result.checks
+            if check.name == "Layer Member Size Check" and check.details.get("member") == "models/weights.pkl"
+        ]
+        assert result.success is False
+        assert mock_scan.call_count == 0
+        assert len(link_size_checks) == 1
+        assert link_size_checks[0].details["size"] == 8192
+        assert link_size_checks[0].details["target_member"] == "payload.bin"
+        assert "oci_member_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("budget_key", "reason", "previous_bytes_key"),
+        [
+            (
+                "max_oci_layer_extracted_bytes",
+                "oci_layer_extracted_size_exceeded",
+                "previous_extracted_bytes",
+            ),
+            ("max_total_size", "oci_total_extracted_size_exceeded", "previous_total_extracted_bytes"),
+        ],
+    )
+    def test_scan_layer_counts_link_payload_against_extraction_budgets(
+        self,
+        tmp_path: Path,
+        budget_key: str,
+        reason: str,
+        previous_bytes_key: str,
+    ) -> None:
+        """A model-looking alias must not recopy its target beyond aggregate budgets."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        layer_path = tmp_path / "budgeted-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="payload.bin")
+            link_info = tarfile.TarInfo("models/weights.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../payload.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "budgeted-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        def clean_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="pickle")
+            nested_result.finish()
+            return nested_result
+
+        with (
+            patch("modelaudit.core.scan_file", side_effect=clean_scan) as mock_scan,
+            patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy,
+        ):
+            result = OciLayerScanner({budget_key: payload.stat().st_size}).scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "Layer Extraction Budget Check"]
+        assert result.success is False
+        assert mock_scan.call_count == 1
+        assert mock_copy.call_count == 1
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert len(checks) == 1
+        assert checks[0].details["member"] == "models/weights.pkl"
+        assert checks[0].details["target_member"] == "payload.bin"
+        assert checks[0].details[previous_bytes_key] == payload.stat().st_size
+
+    def test_resolve_link_payload_member_memoizes_long_chains(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resolving every alias in a long chain should take linear total work."""
+        chain_length = 256
+        payload = tarfile.TarInfo("payload.bin")
+        payload.type = tarfile.REGTYPE
+        members_by_name = {payload.name: payload}
+        links: list[tarfile.TarInfo] = []
+        for index in range(chain_length):
+            link = tarfile.TarInfo(f"link-{index}.pkl")
+            link.type = tarfile.SYMTYPE
+            link.linkname = f"link-{index + 1}.pkl" if index + 1 < chain_length else payload.name
+            members_by_name[link.name] = link
+            links.append(link)
+
+        resolve_calls = 0
+        original_resolver = OciLayerScanner._resolve_link_target
+
+        def counted_resolver(
+            target: str,
+            *,
+            resolved_member_name: str,
+            extraction_root: str,
+            is_symlink: bool,
+        ) -> tuple[str, bool]:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return original_resolver(
+                target,
+                resolved_member_name=resolved_member_name,
+                extraction_root=extraction_root,
+                is_symlink=is_symlink,
+            )
+
+        monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        for link in links:
+            assert (
+                OciLayerScanner._resolve_link_payload_member(
+                    link,
+                    members_by_name,
+                    resolved_payload_cache,
+                    resolved_member_path_cache,
+                )
+                is payload
+            )
+
+        assert resolve_calls == chain_length
+
+    def test_resolve_link_payload_member_memoizes_component_symlink_chains(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Equivalent component-link paths should be resolved only once across aliases."""
+        chain_length = 128
+        alias_count = 128
+        members_by_name: dict[str, tarfile.TarInfo] = {}
+        for index in range(chain_length):
+            link = tarfile.TarInfo(f"d{index}")
+            link.type = tarfile.SYMTYPE
+            link.linkname = f"d{index + 1}"
+            members_by_name[link.name] = link
+
+        payload = tarfile.TarInfo(f"d{chain_length}/payload.bin")
+        payload.type = tarfile.REGTYPE
+        members_by_name[payload.name] = payload
+        aliases: list[tarfile.TarInfo] = []
+        for index in range(alias_count):
+            alias = tarfile.TarInfo(f"model-{index}.pkl")
+            alias.type = tarfile.SYMTYPE
+            alias.linkname = "d0/payload.bin"
+            aliases.append(alias)
+
+        resolve_calls = 0
+        original_resolver = OciLayerScanner._resolve_link_target
+
+        def counted_resolver(
+            target: str,
+            *,
+            resolved_member_name: str,
+            extraction_root: str,
+            is_symlink: bool,
+        ) -> tuple[str, bool]:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return original_resolver(
+                target,
+                resolved_member_name=resolved_member_name,
+                extraction_root=extraction_root,
+                is_symlink=is_symlink,
+            )
+
+        monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        for alias in aliases:
+            assert (
+                OciLayerScanner._resolve_link_payload_member(
+                    alias,
+                    members_by_name,
+                    resolved_payload_cache,
+                    resolved_member_path_cache,
+                )
+                is payload
+            )
+
+        assert resolve_calls == chain_length + alias_count
+        assert resolved_member_path_cache["d0/payload.bin"] is payload
+
+    def test_resolve_link_payload_member_does_not_cache_suffix_specific_cycle(self) -> None:
+        """A cyclic child path must not poison benign siblings through the same directory link."""
+        directory_link = tarfile.TarInfo("a")
+        directory_link.type = tarfile.SYMTYPE
+        directory_link.linkname = "base"
+
+        cyclic_child = tarfile.TarInfo("base/x")
+        cyclic_child.type = tarfile.SYMTYPE
+        cyclic_child.linkname = "../a/x"
+
+        payload = tarfile.TarInfo("base/z/file.bin")
+        payload.type = tarfile.REGTYPE
+        members_by_name = {
+            directory_link.name: directory_link,
+            cyclic_child.name: cyclic_child,
+            payload.name: payload,
+        }
+
+        cyclic_alias = tarfile.TarInfo("cyclic.pkl")
+        cyclic_alias.type = tarfile.SYMTYPE
+        cyclic_alias.linkname = "a/x/file.bin"
+        benign_alias = tarfile.TarInfo("benign.pkl")
+        benign_alias.type = tarfile.SYMTYPE
+        benign_alias.linkname = "a/z/file.bin"
+
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                cyclic_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is None
+        )
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                benign_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is payload
+        )
+        assert resolved_member_path_cache["a/x/file.bin"] is None
+        assert resolved_member_path_cache["a/z/file.bin"] is payload
+
+    def test_resolve_link_payload_member_does_not_cache_suffix_rewrite_as_parent_target(self) -> None:
+        """A child symlink rewrite must not change the cached target of its parent directory link."""
+        directory_link = tarfile.TarInfo("a")
+        directory_link.type = tarfile.SYMTYPE
+        directory_link.linkname = "base"
+
+        child_link = tarfile.TarInfo("base/x")
+        child_link.type = tarfile.SYMTYPE
+        child_link.linkname = "../other/x"
+
+        rewritten_payload = tarfile.TarInfo("other/x/file.bin")
+        rewritten_payload.type = tarfile.REGTYPE
+        sibling_payload = tarfile.TarInfo("base/z/file.bin")
+        sibling_payload.type = tarfile.REGTYPE
+        members_by_name = {
+            directory_link.name: directory_link,
+            child_link.name: child_link,
+            rewritten_payload.name: rewritten_payload,
+            sibling_payload.name: sibling_payload,
+        }
+
+        rewritten_alias = tarfile.TarInfo("rewritten.pkl")
+        rewritten_alias.type = tarfile.SYMTYPE
+        rewritten_alias.linkname = "a/x/file.bin"
+        sibling_alias = tarfile.TarInfo("sibling.pkl")
+        sibling_alias.type = tarfile.SYMTYPE
+        sibling_alias.linkname = "a/z/file.bin"
+
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                rewritten_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is rewritten_payload
+        )
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                sibling_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is sibling_payload
+        )
+        assert resolved_member_path_cache["a/x/file.bin"] is rewritten_payload
+        assert resolved_member_path_cache["a/z/file.bin"] is sibling_payload
+
+    def test_scan_layer_fails_closed_when_link_resolution_work_limit_is_exhausted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Adversarial link graphs should stop at an explicit aggregate work budget."""
+        layer_path = tmp_path / "link-resolution-budget.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            payload_info = tarfile.TarInfo("d1/payload.bin")
+            payload_info.size = len(payload)
+            tar.addfile(payload_info, io.BytesIO(payload))
+
+            directory_link = tarfile.TarInfo("d0")
+            directory_link.type = tarfile.SYMTYPE
+            directory_link.linkname = "d1"
+            tar.addfile(directory_link)
+
+            model_link = tarfile.TarInfo("model.pkl")
+            model_link.type = tarfile.SYMTYPE
+            model_link.linkname = "d0/payload.bin"
+            tar.addfile(model_link)
+
+        manifest_path = tmp_path / "link-resolution-budget.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+        monkeypatch.setattr(OciLayerScanner, "_LINK_RESOLUTION_STEPS_PER_ENTRY", 0)
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "Layer Link Resolution Budget Check"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].details["member"] == "model.pkl"
+        assert checks[0].details["max_resolution_steps"] == 1
+        assert "oci_link_resolution_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_does_not_resolve_link_beyond_entry_limit(self, tmp_path: Path) -> None:
+        """Link resolution must not make tarfile inspect a target outside the admitted entry window."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        layer_path = tmp_path / "limited-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("model.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "payload.bin"
+            tar.addfile(link_info)
+            tar.add(payload, arcname="payload.bin")
+
+        manifest_path = tmp_path / "limited-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner({"max_oci_layer_entries": 1}).scan(str(manifest_path))
+
+        extraction_checks = [check for check in result.checks if check.name == "Layer Member Extraction"]
+        assert result.success is False
+        mock_scan.assert_not_called()
+        assert len(extraction_checks) == 1
+        assert extraction_checks[0].details["member"] == "model.pkl"
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert "oci_member_extraction_failed" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_reports_model_link_cycle_as_incomplete(self, tmp_path: Path) -> None:
+        """Cyclic model links must terminate and fail closed without nested scans."""
+        layer_path = tmp_path / "cyclic-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            first_link = tarfile.TarInfo("models/first.pkl")
+            first_link.type = tarfile.SYMTYPE
+            first_link.linkname = "second.pkl"
+            tar.addfile(first_link)
+            second_link = tarfile.TarInfo("models/second.pkl")
+            second_link.type = tarfile.SYMTYPE
+            second_link.linkname = "first.pkl"
+            tar.addfile(second_link)
+
+        manifest_path = tmp_path / "cyclic-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        extraction_checks = [check for check in result.checks if check.name == "Layer Member Extraction"]
+        assert result.success is False
+        mock_scan.assert_not_called()
+        assert {check.details["member"] for check in extraction_checks} == {
+            "models/first.pkl",
+            "models/second.pkl",
+        }
+        assert "oci_member_extraction_failed" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_does_not_resolve_ambiguous_duplicate_link_target(self, tmp_path: Path) -> None:
+        """A model link must fail closed when its target path appears more than once."""
+        layer_path = tmp_path / "duplicate-target-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            for payload in (b"first", b"second", b"third"):
+                payload_info = tarfile.TarInfo("payload.bin")
+                payload_info.size = len(payload)
+                tar.addfile(payload_info, io.BytesIO(payload))
+            link_info = tarfile.TarInfo("model.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "payload.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "duplicate-target-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        extraction_checks = [check for check in result.checks if check.name == "Layer Member Extraction"]
+        assert result.success is False
+        assert len(extraction_checks) == 1
+        assert extraction_checks[0].details["member"] == "model.pkl"
+        assert mock_scan.call_count == 3
+        assert "oci_member_extraction_failed" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_layer_does_not_reuse_cached_target_for_duplicate_link_names(self, tmp_path: Path) -> None:
+        """Duplicate link headers must resolve their own targets instead of sharing a name-keyed cache entry."""
+        layer_path = tmp_path / "duplicate-link-name.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            for name, payload in (("benign.bin", b"benign"), ("malicious.bin", b"malicious")):
+                payload_info = tarfile.TarInfo(name)
+                payload_info.size = len(payload)
+                tar.addfile(payload_info, io.BytesIO(payload))
+            for target in ("benign.bin", "malicious.bin"):
+                link_info = tarfile.TarInfo("model.onnx")
+                link_info.type = tarfile.SYMTYPE
+                link_info.linkname = target
+                tar.addfile(link_info)
+
+        manifest_path = tmp_path / "duplicate-link-name.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+        routed_payloads: list[bytes] = []
+
+        def record_scan(scan_path: str, _config: dict[str, Any]) -> ScanResult:
+            if scan_path.endswith(".onnx"):
+                routed_payloads.append(Path(scan_path).read_bytes())
+            nested_result = ScanResult(scanner_name="unknown")
+            nested_result.finish()
+            return nested_result
+
+        with patch("modelaudit.core.scan_file", side_effect=record_scan):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert routed_payloads == [b"benign", b"malicious"]
+
+    def test_scan_layer_resolves_model_link_through_directory_symlink(self, tmp_path: Path) -> None:
+        """A safe model link may traverse an admitted same-layer directory symlink."""
+        payload = b"model-payload"
+        layer_path = tmp_path / "component-symlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload_info = tarfile.TarInfo("payloads/data.bin")
+            payload_info.size = len(payload)
+            tar.addfile(payload_info, io.BytesIO(payload))
+
+            directory_link = tarfile.TarInfo("models")
+            directory_link.type = tarfile.SYMTYPE
+            directory_link.linkname = "payloads"
+            tar.addfile(directory_link)
+
+            model_link = tarfile.TarInfo("weights.onnx")
+            model_link.type = tarfile.SYMTYPE
+            model_link.linkname = "models/data.bin"
+            tar.addfile(model_link)
+
+        manifest_path = tmp_path / "component-symlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+        routed_payloads: list[bytes] = []
+
+        def record_scan(scan_path: str, _config: dict[str, Any]) -> ScanResult:
+            if scan_path.endswith(".onnx"):
+                routed_payloads.append(Path(scan_path).read_bytes())
+            nested_result = ScanResult(scanner_name="unknown")
+            nested_result.finish()
+            return nested_result
+
+        with patch("modelaudit.core.scan_file", side_effect=record_scan):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True, [
+            (check.name, check.message) for check in result.checks if check.status.value == "failed"
+        ]
+        assert routed_payloads == [payload]
+
+    def test_scan_layer_deduplicates_equivalent_model_link_payloads(self, tmp_path: Path) -> None:
+        """Equivalent model aliases should not multiply nested scans of the same payload."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        layer_path = tmp_path / "duplicate-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="payload.bin")
+            for name in ("models/first.pkl", "models/second.pkl"):
+                link_info = tarfile.TarInfo(name)
+                link_info.type = tarfile.SYMTYPE
+                link_info.linkname = "../payload.bin"
+                tar.addfile(link_info)
+
+        manifest_path = tmp_path / "duplicate-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        def clean_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="unknown")
+            nested_result.finish()
+            return nested_result
+
+        with (
+            patch("modelaudit.core.scan_file", side_effect=clean_scan),
+            patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy,
+        ):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert mock_copy.call_count == 2
+
+    def test_scan_layer_allows_benign_safe_model_link_target(self, tmp_path: Path) -> None:
+        """Safe links to benign in-layer model payloads should scan without false positives."""
+        benign_pickle = tmp_path / "benign.pickle"
+        benign_pickle.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        layer_path = tmp_path / "benign-linked-model.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(benign_pickle, arcname="payload.bin")
+            link_info = tarfile.TarInfo("models/weights.pkl")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../payload.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "benign-linked-model.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 10000.0}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert not [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
 
     def test_scan_layer_allows_symlink_target_under_layer_root(self, tmp_path: Path) -> None:
         """Symlink targets are resolved from the link directory but contained by the layer root."""
