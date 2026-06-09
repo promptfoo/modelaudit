@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
 - discover extensionless pickle payloads inside ExecuTorch ZIP archives with bounded structural probing, including repeated protocol-0 comment-token evasions
 - report TAR external link escapes with the dedicated symlink rule code, resolve link targets from their correct archive bases, and avoid retaining passing checks for benign link floods
 - bind direct sharded-model cache entries to sibling shard and selected model configuration content fingerprints, and strengthen cache configuration hashes

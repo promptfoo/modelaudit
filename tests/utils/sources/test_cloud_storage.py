@@ -29,8 +29,12 @@ from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     _CLOUD_CONTENT_SNIFF_BYTES,
     GCSCache,
+    _build_cloud_download_plan,
     _build_safe_local_path,
+    _cloud_directory_cache_scope,
+    _cloud_url_local_basename,
     _CloudContentSniffBudget,
+    _download_cloud_object,
     _filter_scannable_cloud_files,
     _run_coroutine_sync,
     analyze_cloud_target,
@@ -2353,10 +2357,12 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     fs.get.assert_called_once()
     call_args = fs.get.call_args[0]
     assert call_args[0] == url
-    assert "model.pt" in call_args[1]
+    assert isinstance(result, Path)
+    temporary_path = Path(call_args[1])
+    assert temporary_path.parent == result.parent
+    assert temporary_path.name.startswith(".modelaudit-")
 
     # Result should be a path containing the filename
-    assert isinstance(result, Path)
     assert result.name == "model.pt"
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
@@ -2380,7 +2386,12 @@ def test_download_from_cloud_uses_normalized_https_object_path(mock_fs: MagicMoc
 
     assert result == tmp_path / "model.pkl"
     metadata_fs.info.assert_called_once_with("s3://bucket/models/model.pkl")
-    download_fs.get.assert_called_once_with("s3://bucket/models/model.pkl", str(result))
+    download_fs.get.assert_called_once()
+    source, destination = download_fs.get.call_args.args
+    assert source == "s3://bucket/models/model.pkl"
+    assert Path(destination).parent == tmp_path
+    assert Path(destination).name.startswith(".modelaudit-")
+    assert result.read_bytes() == b"data"
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -2422,7 +2433,12 @@ def test_download_from_cloud_preserves_normalized_directory_hierarchy(
     )
 
     assert result == tmp_path
-    fs.get.assert_called_once_with(model_url, str(tmp_path / "nested" / "model.pkl"))
+    fs.get.assert_called_once()
+    source, destination = fs.get.call_args.args
+    assert source == model_url
+    assert Path(destination).parent == tmp_path / "nested"
+    assert Path(destination).name.startswith(".modelaudit-")
+    assert (tmp_path / "nested" / "model.pkl").read_bytes() == b"data"
 
 
 @patch("fsspec.filesystem")
@@ -2691,7 +2707,12 @@ def test_download_from_cloud_preserves_native_query_text_in_local_path(
 
     assert isinstance(result, Path)
     assert result.name == "model?variant.bin"
-    fs.get.assert_called_once_with(url, str(result))
+    fs.get.assert_called_once()
+    source, destination = fs.get.call_args.args
+    assert source == url
+    assert Path(destination).parent == tmp_path
+    assert Path(destination).name.startswith(".modelaudit-")
+    assert result.read_bytes() == b"data"
 
 
 def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_path: Path) -> None:
@@ -2712,8 +2733,9 @@ def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_pat
 def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Path) -> None:
     base_url = "s3://bucket/models"
 
-    question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
-    fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
+        fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
 
     assert question_path == tmp_path / "model?one.pkl"
     assert fragment_path == tmp_path / "model#two.pkl"
@@ -2722,12 +2744,84 @@ def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Pat
 
 def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_path: Path) -> None:
     base_url = "s3://bucket/models"
-    first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
-    second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
+        second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
 
     assert first == tmp_path / "model.pkl?X-Amz-Signature=one"
     assert second == tmp_path / "model.pkl?X-Amz-Signature=two"
     assert first != second
+
+
+@pytest.mark.parametrize(
+    ("file_url", "expected_name"),
+    [
+        pytest.param("bucket/models/model?variant.pkl", "model?variant.pkl", id="question-mark"),
+        pytest.param("bucket/models/model#variant.pkl", "model#variant.pkl", id="fragment-marker"),
+    ],
+)
+def test_build_safe_local_path_preserves_protocol_less_literal_delimiters(
+    tmp_path: Path,
+    file_url: str,
+    expected_name: str,
+) -> None:
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        local_path = _build_safe_local_path("s3://bucket/models", file_url, tmp_path)
+
+    assert local_path == tmp_path / expected_name
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Colon-bearing object keys are not valid Win32 filenames")
+def test_build_safe_local_path_preserves_protocol_less_scheme_like_key(tmp_path: Path) -> None:
+    local_path = _build_safe_local_path("s3://bucket/models", "a:model.pkl", tmp_path)
+
+    assert local_path == tmp_path / "a:model.pkl"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Backslashes are path separators on Windows")
+def test_build_safe_local_path_preserves_posix_backslash_key(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, rf"{base_url}/folder\model.pkl", tmp_path)
+
+    assert local_path == tmp_path / r"folder\model.pkl"
+
+
+def test_build_safe_local_path_rejects_windows_backslash_traversal(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    with (
+        patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=True),
+        pytest.raises(ValueError, match=r"Path traversal attempt detected|Invalid cloud object basename"),
+    ):
+        _build_safe_local_path(base_url, rf"{base_url}/..\outside.pkl", tmp_path)
+
+
+@pytest.mark.parametrize(
+    "file_url",
+    [
+        "https://bucket.s3.amazonaws.com/models/model.pkl?X-Amz-Signature=secret",
+        "https://bucket.s3.amazonaws.com/models/model.pkl#fragment-secret",
+    ],
+)
+def test_build_safe_local_path_strips_https_query_and_fragment_syntax(tmp_path: Path, file_url: str) -> None:
+    local_path = _build_safe_local_path("https://bucket.s3.amazonaws.com/models", file_url, tmp_path)
+
+    assert local_path == tmp_path / "model.pkl"
+    assert "secret" not in str(local_path)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.urlsplit", side_effect=ValueError("malformed secret URL"))
+def test_cloud_url_local_basename_logs_parse_fallback_without_url(
+    _mock_urlsplit: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="modelaudit.utils.sources.cloud_storage"):
+        basename = _cloud_url_local_basename("model.pkl?token=secret")
+
+    assert basename == "model.pkl?token=secret"
+    assert "Unable to parse cloud URL for local basename; using fallback path handling" in caplog.text
+    assert "token=secret" not in caplog.text
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -2847,7 +2941,10 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
     fs.get.assert_called_once()
     get_args = fs.get.call_args.args
     assert get_args[0] == "s3://bucket/model.pt"
-    assert Path(get_args[1]) == result
+    temporary_path = Path(get_args[1])
+    assert temporary_path.parent == result.parent
+    assert temporary_path.name.startswith(".modelaudit-")
+    assert not temporary_path.exists()
     assert result.exists()
     assert result.read_bytes() == downloaded_content
 
@@ -3435,6 +3532,427 @@ class TestDiskSpaceCheckingForCloud:
 class TestCloudPathSecurity:
     """Test path-safety behavior for cloud downloads."""
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            pytest.param("s3://bucket/", id="empty"),
+            pytest.param("s3://bucket/.", id="dot"),
+            pytest.param("s3://bucket/..", id="dotdot"),
+        ],
+    )
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_unsafe_single_file_basename_before_get(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+        url: str,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.pkl",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Invalid cloud object basename"):
+            download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+        fs.get.assert_not_called()
+
+    @pytest.mark.parametrize("max_size", [None, 4])
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_symlink_destination_before_write(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+        max_size: int | None,
+    ) -> None:
+        url = "s3://bucket/model.pkl"
+        download_dir = tmp_path / "download"
+        download_dir.mkdir()
+        outside_file = tmp_path / "outside.pkl"
+        outside_file.write_bytes(b"keep")
+        (download_dir / "model.pkl").symlink_to(outside_file)
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        fs.open.return_value = BytesIO(b"evil")
+        fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"evil")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.pkl",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="symlink destination"):
+            download_from_cloud(
+                url,
+                cache_dir=download_dir,
+                max_size=max_size,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        assert outside_file.read_bytes() == b"keep"
+        fs.get.assert_not_called()
+        fs.open.assert_not_called()
+
+    @pytest.mark.skipif(os.name == "nt", reason="Colon-bearing object keys are not valid Win32 filenames")
+    def test_download_plan_preserves_colons_in_posix_object_keys(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/a:model.pkl"},
+            {"path": f"{base_url}/b:model.pkl"},
+        ]
+
+        plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.relative_to(tmp_path) for _, _, local_path in plan] == [
+            Path("a:model.pkl"),
+            Path("b:model.pkl"),
+        ]
+
+    def test_download_plan_preserves_protocol_less_nested_object_paths(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": "bucket/models/a/model.pkl"},
+            {"path": "bucket/models/b/model.pkl"},
+        ]
+
+        plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.relative_to(tmp_path) for _, _, local_path in plan] == [
+            Path("a/model.pkl"),
+            Path("b/model.pkl"),
+        ]
+
+    def test_download_plan_preserves_distinct_protocol_less_literal_delimiters(self, tmp_path: Path) -> None:
+        files = [
+            {"path": "bucket/models/model?one.pkl"},
+            {"path": "bucket/models/model#two.pkl"},
+        ]
+
+        with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+            plan = _build_cloud_download_plan("s3://bucket/models", files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["model?one.pkl", "model#two.pkl"]
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://bucket.s3.amazonaws.com/models",
+            "https://bucket.s3.us-west-2.amazonaws.com/models",
+            "https://s3.us-west-2.amazonaws.com/bucket/models",
+            "https://bucket.s3-accelerate.amazonaws.com/models",
+            "https://storage.googleapis.com/bucket/models",
+            "https://bucket.storage.googleapis.com/models",
+            "https://account.r2.cloudflarestorage.com/bucket/models",
+            "https://bucket.account.r2.cloudflarestorage.com/models",
+        ],
+    )
+    def test_download_plan_preserves_https_provider_nested_object_paths(
+        self,
+        tmp_path: Path,
+        base_url: str,
+    ) -> None:
+        files = [
+            {"path": "bucket/models/a/model.pkl"},
+            {"path": "bucket/models/b/model.pkl"},
+        ]
+
+        plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.relative_to(tmp_path) for _, _, local_path in plan] == [
+            Path("a/model.pkl"),
+            Path("b/model.pkl"),
+        ]
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://bucket.s3.amazonaws.com/models",
+            "https://bucket.s3.us-west-2.amazonaws.com/models",
+            "https://s3.us-west-2.amazonaws.com/bucket/models",
+            "https://bucket.s3-accelerate.amazonaws.com/models",
+            "https://storage.googleapis.com/bucket/models",
+            "https://bucket.storage.googleapis.com/models",
+            "https://account.r2.cloudflarestorage.com/bucket/models",
+            "https://bucket.account.r2.cloudflarestorage.com/models",
+        ],
+    )
+    def test_download_plan_rejects_https_provider_path_traversal(
+        self,
+        tmp_path: Path,
+        base_url: str,
+    ) -> None:
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
+            _build_cloud_download_plan(
+                base_url,
+                [{"path": "bucket/models/../secrets/model.pkl"}],
+                tmp_path,
+            )
+
+    def test_download_plan_rejects_protocol_less_path_traversal(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
+            _build_cloud_download_plan(
+                "s3://bucket/models",
+                [{"path": "bucket/models/../secrets/model.pkl"}],
+                tmp_path,
+            )
+
+    def test_download_plan_rejects_case_only_alias_on_case_insensitive_filesystem(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/Model.pkl"},
+            {"path": f"{base_url}/model.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=False),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=True,
+            ),
+            pytest.raises(ValueError, match="alias collision"),
+        ):
+            _build_cloud_download_plan(base_url, files, tmp_path)
+
+    def test_download_plan_preserves_case_only_names_on_case_sensitive_filesystem(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/Model.pkl"},
+            {"path": f"{base_url}/model.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=True),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=True,
+            ),
+        ):
+            plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["Model.pkl", "model.pkl"]
+
+    def test_download_plan_preserves_sharp_s_names_on_case_insensitive_filesystem(self, tmp_path: Path) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/stra\u00dfe.pkl"},
+            {"path": f"{base_url}/strasse.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=False),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=True,
+            ),
+        ):
+            plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["stra\u00dfe.pkl", "strasse.pkl"]
+
+    @pytest.mark.parametrize(
+        "paths",
+        [
+            ("artifact", "artifact/model.pkl"),
+            ("artifact/model.pkl", "artifact"),
+        ],
+    )
+    def test_download_plan_rejects_file_directory_prefix_aliases(
+        self,
+        tmp_path: Path,
+        paths: tuple[str, str],
+    ) -> None:
+        base_url = "s3://bucket/models"
+        files = [{"path": f"{base_url}/{path}"} for path in paths]
+
+        with pytest.raises(ValueError, match="alias collision"):
+            _build_cloud_download_plan(base_url, files, tmp_path)
+
+    def test_download_plan_rejects_unicode_alias_on_normalization_insensitive_filesystem(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/caf\u00e9.pkl"},
+            {"path": f"{base_url}/cafe\u0301.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=True),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=False,
+            ),
+            pytest.raises(ValueError, match="alias collision"),
+        ):
+            _build_cloud_download_plan(base_url, files, tmp_path)
+
+    def test_download_plan_preserves_unicode_variants_on_normalization_sensitive_filesystem(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        base_url = "s3://bucket/models"
+        files = [
+            {"path": f"{base_url}/caf\u00e9.pkl"},
+            {"path": f"{base_url}/cafe\u0301.pkl"},
+        ]
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=True),
+            patch(
+                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
+                return_value=True,
+            ),
+        ):
+            plan = _build_cloud_download_plan(base_url, files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["caf\u00e9.pkl", "cafe\u0301.pkl"]
+
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            pytest.param("model.pkl:stream", id="alternate-data-stream"),
+            pytest.param("CON", id="reserved-device"),
+            pytest.param("NUL.txt", id="reserved-device-extension"),
+            pytest.param("model.pkl.", id="trailing-dot"),
+            pytest.param("model.pkl ", id="trailing-space"),
+            pytest.param("CON/model.pkl", id="reserved-parent-device"),
+            pytest.param("folder:stream/model.pkl", id="parent-alternate-data-stream"),
+            pytest.param("folder./model.pkl", id="parent-trailing-dot"),
+            pytest.param("folder /model.pkl", id="parent-trailing-space"),
+            pytest.param("COM\u00b9/model.pkl", id="superscript-reserved-parent-device"),
+            pytest.param("LPT\u00b2.txt", id="superscript-reserved-device-extension"),
+        ],
+    )
+    def test_build_safe_local_path_rejects_unsafe_windows_filenames(
+        self,
+        tmp_path: Path,
+        relative_path: str,
+    ) -> None:
+        base_url = "s3://bucket/models"
+
+        with (
+            patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=True),
+            pytest.raises(ValueError, match="Invalid cloud object basename"),
+        ):
+            _build_safe_local_path(base_url, f"{base_url}/{relative_path}", tmp_path)
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_symlink_destination_swap_before_commit(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/model.pkl"
+        download_dir = tmp_path / "download"
+        download_dir.mkdir()
+        local_path = download_dir / "model.pkl"
+        outside_file = tmp_path / "outside.pkl"
+        outside_file.write_bytes(b"keep")
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+
+        def swap_destination(_src: str, destination: str) -> None:
+            Path(destination).write_bytes(b"evil")
+            local_path.symlink_to(outside_file)
+
+        fs.get.side_effect = swap_destination
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.pkl",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="symlink destination"):
+            download_from_cloud(
+                url,
+                cache_dir=download_dir,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        assert outside_file.read_bytes() == b"keep"
+        assert local_path.is_symlink()
+        assert not list(download_dir.glob(".modelaudit-*"))
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_nested_parent_symlink_swap_before_commit(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/models"
+        download_dir = tmp_path / "download"
+        download_dir.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_marker = outside_dir / "keep.txt"
+        outside_marker.write_text("keep", encoding="utf-8")
+        captured_dir = download_dir / "captured-subdir"
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+
+        def swap_parent(_src: str, destination: str) -> None:
+            temp_path = Path(destination)
+            temp_path.write_bytes(b"evil")
+            temp_path.parent.rename(captured_dir)
+            temp_path.parent.symlink_to(outside_dir, target_is_directory=True)
+
+        fs.get.side_effect = swap_parent
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 1,
+            "total_size": 4,
+            "human_size": "4 B",
+            "estimated_time": "instant",
+            "files": [
+                {
+                    "path": f"{url}/subdir/model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="escaped parent directory"):
+            download_from_cloud(
+                url,
+                cache_dir=download_dir,
+                use_cache=False,
+                selective=False,
+                show_progress=False,
+            )
+
+        assert outside_marker.read_text(encoding="utf-8") == "keep"
+        assert not (outside_dir / "model.pkl").exists()
+        assert (download_dir / "subdir").is_symlink()
+
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
     def test_download_rejects_path_traversal(
@@ -3473,6 +3991,347 @@ class TestCloudPathSecurity:
             )
 
         fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_directory_destination_alias_before_get(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 8}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": "s3://bucket/models/model.pkl", "name": "model.pkl", "size": 4, "human_size": "4 B"},
+                {
+                    "path": "s3://bucket/models/subdir/../model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+
+        with pytest.raises(ValueError, match="alias collision"):
+            download_from_cloud(
+                "s3://bucket/models",
+                cache_dir=tmp_path,
+                use_cache=False,
+                selective=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_destination_alias_before_clearing_stale_cache(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/models"
+        cache_dir = tmp_path / "cache"
+        metadata = {
+            "type": "directory",
+            "etag": "etag-v2",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": f"{url}/model.pkl", "name": "model.pkl", "size": 4, "human_size": "4 B"},
+                {
+                    "path": f"{url}/subdir/../model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+        cache_scope = _cloud_directory_cache_scope(
+            metadata,
+            selective=False,
+            scannable_extensions=None,
+            scannable_filenames=None,
+            scanner_selection=None,
+        )
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
+        cached_path = cache.cache_dir / cache_key[:2] / cache_key[2:4]
+        cached_path.mkdir(parents=True)
+        (cached_path / "old-model.pkl").write_bytes(b"old")
+        cache.cache_file(url, cached_path, etag="etag-v1", cache_scope=cache_scope)
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 8}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = metadata
+
+        with pytest.raises(ValueError, match="alias collision"):
+            download_from_cloud(
+                url,
+                cache_dir=cache_dir,
+                selective=False,
+                show_progress=False,
+            )
+
+        assert (cached_path / "old-model.pkl").read_bytes() == b"old"
+        assert (
+            GCSCache(cache_dir=cache_dir).get_cached_path(url, etag="etag-v1", cache_scope=cache_scope) == cached_path
+        )
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_prefix_alias_before_clearing_stale_cache(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/models"
+        cache_dir = tmp_path / "cache"
+        metadata = {
+            "type": "directory",
+            "etag": "etag-v2",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": f"{url}/artifact", "name": "artifact", "size": 4, "human_size": "4 B"},
+                {
+                    "path": f"{url}/artifact/model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+        cache_scope = _cloud_directory_cache_scope(
+            metadata,
+            selective=False,
+            scannable_extensions=None,
+            scannable_filenames=None,
+            scanner_selection=None,
+        )
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
+        cached_path = cache.cache_dir / cache_key[:2] / cache_key[2:4]
+        cached_path.mkdir(parents=True)
+        (cached_path / "old-model.pkl").write_bytes(b"old")
+        cache.cache_file(url, cached_path, etag="etag-v1", cache_scope=cache_scope)
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 8}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = metadata
+
+        with pytest.raises(ValueError, match="alias collision"):
+            download_from_cloud(
+                url,
+                cache_dir=cache_dir,
+                selective=False,
+                show_progress=False,
+            )
+
+        assert (cached_path / "old-model.pkl").read_bytes() == b"old"
+        assert (
+            GCSCache(cache_dir=cache_dir).get_cached_path(url, etag="etag-v1", cache_scope=cache_scope) == cached_path
+        )
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_refresh_migrates_legacy_cache_with_nested_symlink_without_touching_target(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "s3://bucket/models"
+        cache_dir = tmp_path / "cache"
+        metadata = {
+            "type": "directory",
+            "etag": "etag-v2",
+            "file_count": 1,
+            "total_size": 4,
+            "human_size": "4 B",
+            "estimated_time": "instant",
+            "files": [
+                {
+                    "path": f"{url}/subdir/model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                }
+            ],
+        }
+        cache_scope = _cloud_directory_cache_scope(
+            metadata,
+            selective=False,
+            scannable_extensions=None,
+            scannable_filenames=None,
+            scanner_selection=None,
+        )
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(url, cache_scope=cache_scope)
+        cached_path = cache.cache_dir / cache_key[:2] / cache_key[2:4]
+        cached_path.mkdir(parents=True)
+        cache.cache_file(url, cached_path, etag="etag-v1", cache_scope=cache_scope)
+
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_marker = outside_dir / "keep.txt"
+        outside_marker.write_text("keep", encoding="utf-8")
+        (cached_path / "subdir").symlink_to(outside_dir, target_is_directory=True)
+
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"new")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = metadata
+
+        result = download_from_cloud(
+            url,
+            cache_dir=cache_dir,
+            selective=False,
+            show_progress=False,
+        )
+
+        assert result == cache.cache_dir / ".entries-v2" / cache_key[:2] / cache_key[2:4] / cache_key
+        assert (cached_path / "subdir").is_symlink()
+        assert not (result / "subdir").is_symlink()
+        assert (result / "subdir" / "model.pkl").read_bytes() == b"new"
+        assert outside_marker.read_text(encoding="utf-8") == "keep"
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_rejects_directory_destination_alias_before_get(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": "s3://bucket/models/model.pkl", "name": "model.pkl", "size": 4, "human_size": "4 B"},
+                {
+                    "path": "s3://bucket/models/subdir/../model.pkl",
+                    "name": "model.pkl",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+
+        with pytest.raises(ValueError, match="alias collision"):
+            list(download_from_cloud_streaming("s3://bucket/models", selective=False, show_progress=False))
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_preserves_benign_nested_directory_files(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 8}
+        fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": "s3://bucket/models/subdir/model.pkl", "name": "model.pkl", "size": 4, "human_size": "4 B"},
+                {
+                    "path": "s3://bucket/models/subdir/weights.safetensors",
+                    "name": "weights.safetensors",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+
+        result = download_from_cloud(
+            "s3://bucket/models",
+            cache_dir=tmp_path,
+            use_cache=False,
+            selective=False,
+            show_progress=False,
+        )
+
+        assert result == tmp_path
+        assert (tmp_path / "subdir" / "model.pkl").read_bytes() == b"data"
+        assert (tmp_path / "subdir" / "weights.safetensors").read_bytes() == b"data"
+        download_destinations = [Path(call.args[1]).relative_to(tmp_path) for call in fs.get.call_args_list]
+        assert [path.parent for path in download_destinations] == [Path("subdir"), Path("subdir")]
+        assert all(path.name.startswith(".modelaudit-") for path in download_destinations)
+        assert len({path.name for path in download_destinations}) == 2
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_preserves_benign_nested_directory_files(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": 8,
+            "human_size": "8 B",
+            "estimated_time": "instant",
+            "files": [
+                {"path": "s3://bucket/models/subdir/model.pkl", "name": "model.pkl", "size": 4, "human_size": "4 B"},
+                {
+                    "path": "s3://bucket/models/subdir/weights.safetensors",
+                    "name": "weights.safetensors",
+                    "size": 4,
+                    "human_size": "4 B",
+                },
+            ],
+        }
+        temp_dir = tmp_path / "streaming-tempdir"
+
+        with patch("modelaudit.utils.sources.cloud_storage.tempfile.mkdtemp", return_value=str(temp_dir)):
+            streamed = list(download_from_cloud_streaming("s3://bucket/models", selective=False, show_progress=False))
+
+        assert [(path.relative_to(temp_dir), is_last) for path, is_last in streamed] == [
+            (Path("subdir/model.pkl"), False),
+            (Path("subdir/weights.safetensors"), True),
+        ]
+        download_destinations = [Path(call.args[1]).relative_to(temp_dir) for call in fs.get.call_args_list]
+        assert [path.parent for path in download_destinations] == [Path("subdir"), Path("subdir")]
+        assert all(path.name.startswith(".modelaudit-") for path in download_destinations)
+        assert len({path.name for path in download_destinations}) == 2
+        assert not temp_dir.exists()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
@@ -3531,7 +4390,13 @@ class TestCloudPathSecurity:
         )
 
         assert result == tmp_path / "model.bin"
-        fs.get.assert_called_once_with("s3://bucket/model.bin", str(result))
+        fs.get.assert_called_once()
+        source, destination = fs.get.call_args.args
+        assert source == "s3://bucket/model.bin"
+        temporary_path = Path(destination)
+        assert temporary_path.parent == result.parent
+        assert temporary_path.name.startswith(".modelaudit-")
+        assert not temporary_path.exists()
         fs.open.assert_not_called()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -3984,6 +4849,84 @@ class TestCloudCacheSafety:
 
         assert cache.get_cached_path(url, etag="etag-v2") is None
 
+    def test_cache_paths_use_full_key_after_sharding(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        first_url = "s3://bucket-28/model.pkl"
+        second_url = "s3://bucket-145/model.pkl"
+        first_key = cache.get_cache_key(first_url)
+        second_key = cache.get_cache_key(second_url)
+        assert first_key[:4] == second_key[:4]
+        assert first_key != second_key
+
+        first_source = tmp_path / "first" / "model.pkl"
+        second_source = tmp_path / "second" / "model.pkl"
+        first_source.parent.mkdir()
+        second_source.parent.mkdir()
+        first_source.write_bytes(b"first")
+        second_source.write_bytes(b"second")
+
+        cache.cache_file(first_url, first_source, etag="etag-first")
+        cache.cache_file(second_url, second_source, etag="etag-second")
+
+        first_cached = cache.get_cached_path(first_url, etag="etag-first")
+        second_cached = cache.get_cached_path(second_url, etag="etag-second")
+        assert first_cached is not None
+        assert second_cached is not None
+        assert first_cached != second_cached
+        assert first_cached.read_bytes() == b"first"
+        assert second_cached.read_bytes() == b"second"
+        assert ".entries-v2" in first_cached.parts
+        assert ".entries-v2" in second_cached.parts
+        assert first_key in first_cached.parts
+        assert second_key in second_cached.parts
+
+    def test_new_cache_namespace_does_not_overlap_legacy_shard_content(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        legacy_url = "s3://bucket-28/model.pkl"
+        new_url = "s3://bucket-145/model.pkl"
+        legacy_key = cache.get_cache_key(legacy_url)
+        new_key = cache.get_cache_key(new_url)
+        assert legacy_key[:4] == new_key[:4]
+
+        legacy_path = cache.cache_dir / legacy_key[:2] / legacy_key[2:4]
+        legacy_path.mkdir(parents=True)
+        legacy_model = legacy_path / "legacy.pkl"
+        legacy_model.write_bytes(b"legacy")
+        cache.cache_file(legacy_url, legacy_path, etag="etag-legacy")
+        cache.metadata[legacy_key]["last_accessed"] = "2000-01-01T00:00:00"
+        cache._save_metadata()
+
+        new_source = tmp_path / "new.pkl"
+        new_source.write_bytes(b"new")
+        cache.cache_file(new_url, new_source, etag="etag-new")
+
+        new_cached = cache.get_cached_path(new_url, etag="etag-new")
+        assert new_cached is not None
+        assert new_cached.read_bytes() == b"new"
+        assert new_cached.is_relative_to(cache.cache_dir / ".entries-v2")
+        assert list(legacy_path.iterdir()) == [legacy_model]
+
+        cache.clean_old_cache(max_age_days=1)
+
+        assert not legacy_path.exists()
+        assert new_cached.read_bytes() == b"new"
+        assert cache.get_cached_path(new_url, etag="etag-new") == new_cached
+
+    @pytest.mark.skipif(os.name == "nt", reason="Creating symlinks may require elevated Windows privileges")
+    def test_cache_metadata_ignores_preplanted_fixed_temp_symlink(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        legacy_temp_file = cache.metadata_file.with_name(f"{cache.metadata_file.name}.tmp")
+        legacy_temp_file.symlink_to(victim)
+        cache.metadata["test"] = {"path": str(cache.cache_dir), "etag": "etag"}
+
+        cache._save_metadata()
+
+        assert victim.read_text(encoding="utf-8") == "keep"
+        assert legacy_temp_file.is_symlink()
+        assert json.loads(cache.metadata_file.read_text(encoding="utf-8"))["test"]["etag"] == "etag"
+
     def test_legacy_cache_without_etag_is_stale_miss_and_migrates_metadata(self, tmp_path: Path) -> None:
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
@@ -4116,6 +5059,45 @@ class TestCloudDownloadCleanup:
             download_from_cloud("s3://bucket/model.bin", use_cache=False, show_progress=False)
 
         assert not temp_download_dir.exists()
+
+
+def test_download_object_logs_cleanup_failure_without_masking_download_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fs = MagicMock()
+    fs.get.side_effect = RuntimeError("download failed")
+    local_path = tmp_path / "model.pkl"
+
+    with (
+        patch.object(Path, "unlink", side_effect=OSError("cleanup failed")),
+        caplog.at_level(logging.DEBUG, logger="modelaudit.utils.sources.cloud_storage"),
+        pytest.raises(RuntimeError, match="download failed"),
+    ):
+        _download_cloud_object(fs, "s3://bucket/model.pkl", local_path, None, tmp_path)
+
+    assert "Unable to remove temporary cloud download after failure: cleanup failed" in caplog.text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="PC_NAME_MAX is a POSIX filesystem limit")
+def test_download_object_uses_bounded_temp_name_for_name_max_leaf(tmp_path: Path) -> None:
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    extension = ".pkl"
+    if name_max <= len(extension):
+        pytest.skip("filesystem does not expose a usable component length")
+
+    local_path = tmp_path / ("m" * (name_max - len(extension)) + extension)
+    fs = MagicMock()
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"model")
+
+    bytes_written = _download_cloud_object(fs, "s3://bucket/model.pkl", local_path, None, tmp_path)
+
+    assert bytes_written == 0
+    assert local_path.read_bytes() == b"model"
+    temporary_path = Path(fs.get.call_args.args[1])
+    assert temporary_path.name.startswith(".modelaudit-")
+    assert len(temporary_path.name) < len(local_path.name)
+    assert not temporary_path.exists()
 
 
 def test_filter_scannable_files_recognizes_pdiparams() -> None:
