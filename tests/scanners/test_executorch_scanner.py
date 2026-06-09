@@ -180,6 +180,9 @@ def test_executorch_scanner_safe_model(tmp_path: Path) -> None:
     result = scanner.scan(str(path))
     assert result.success is True
     assert result.bytes_scanned > 0
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert "scan_outcome_reasons" not in result.metadata
     critical = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
     assert not critical
 
@@ -188,6 +191,10 @@ def test_executorch_scanner_malicious(tmp_path: Path) -> None:
     path = create_executorch_archive(tmp_path, malicious=True)
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(path))
+    assert result.success is True
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert "scan_outcome_reasons" not in result.metadata
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any("eval" in i.message.lower() for i in result.issues)
 

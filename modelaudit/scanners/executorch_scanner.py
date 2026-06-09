@@ -1,5 +1,6 @@
 """Scanner for ExecuTorch model files (.pte)."""
 
+import io
 import os
 import tempfile
 import zipfile
@@ -602,10 +603,11 @@ class ExecuTorchScanner(BaseScanner):
         opened_stat: os.stat_result,
     ) -> BinaryIO:
         """Copy one stable archive view before parsing attacker-controlled metadata."""
-        snapshot = cast(
-            BinaryIO,
-            tempfile.SpooledTemporaryFile(max_size=_ZIP_SNAPSHOT_MEMORY_LIMIT, mode="w+b"),  # noqa: SIM115
-        )
+        snapshot: BinaryIO
+        if opened_stat.st_size <= _ZIP_SNAPSHOT_MEMORY_LIMIT:
+            snapshot = io.BytesIO()
+        else:
+            snapshot = cast(BinaryIO, tempfile.TemporaryFile(mode="w+b"))  # noqa: SIM115
         try:
             source_handle.seek(0)
             remaining = opened_stat.st_size
