@@ -2342,7 +2342,7 @@ if marker.exists():
     assert not marker.exists()
 
 
-def test_scan_bytes_keeps_real_late_loaded_stdlib_source_modules_clean_without_invoking_custom_meta_path_finders(
+def test_scan_bytes_fails_closed_for_late_loaded_stdlib_source_modules_without_invoking_custom_meta_path_finders(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "meta_path_called"
@@ -2375,9 +2375,13 @@ for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
     function.cache_clear()
 payload = b"\\x80\\x04\\x8c\\x0astatistics\\x8c\\x04mean\\x93]\\x85R."
 report = scan_bytes(payload, source="stdlib-source-call-graph-source.pkl")
-if report.status != ScanStatus.COMPLETE or report.verdict != SafetyVerdict.CLEAN:
+if report.status != ScanStatus.COMPLETE or report.verdict != SafetyVerdict.SUSPICIOUS:
     raise SystemExit(f"unexpected report: {report.to_dict()!r}")
-if report.findings:
+if not any(
+    finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+    and finding.details.get("import_reference") == "statistics.mean"
+    for finding in report.findings
+):
     raise SystemExit(f"unexpected findings: {report.to_dict()!r}")
 if marker.exists():
     raise SystemExit("custom meta-path finder was invoked")

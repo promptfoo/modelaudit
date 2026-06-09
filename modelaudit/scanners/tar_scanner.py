@@ -214,6 +214,29 @@ class TarScanner(BaseScanner):
             preserve_non_delimited_suffix=False,
         )
 
+    @staticmethod
+    def _resolve_link_target(
+        target: str,
+        *,
+        resolved_member_name: str,
+        extraction_root: str,
+        is_symlink: bool,
+    ) -> tuple[str, bool]:
+        """Resolve TAR symlinks from their parent and hardlinks from the archive root."""
+        if not is_symlink:
+            return sanitize_archive_path(target, extraction_root)
+        if is_absolute_archive_path(target):
+            return sanitize_archive_path(target, extraction_root)
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_member_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
+
     def _extract_member_to_tempfile(
         self,
         tar: tarfile.TarFile,
@@ -553,41 +576,42 @@ class TarScanner(BaseScanner):
 
                 if member.issym() or member.islnk():
                     target = member.linkname
-                    target_base = os.path.dirname(resolved_name)
-                    _target_resolved, target_safe = sanitize_archive_path(target, target_base)
+                    link_kind = "Symlink" if member.issym() else "Hard link"
+                    if target:
+                        _target_resolved, target_safe = self._resolve_link_target(
+                            target,
+                            resolved_member_name=resolved_name,
+                            extraction_root=temp_base,
+                            is_symlink=member.issym(),
+                        )
+                    else:
+                        target_safe = False
                     if not target_safe:
                         # Check if it's specifically a critical system path
                         if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
-                            message = f"Symlink {name} points to critical system path: {target}"
+                            message = f"{link_kind} {name} points to critical system path: {target}"
+                        elif not target:
+                            message = f"{link_kind} {name} has an empty target"
                         else:
-                            message = f"Symlink {name} resolves outside extraction directory"
+                            message = f"{link_kind} {name} resolves outside extraction directory"
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,
                             message=message,
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target},
-                            rule_code="S902",
+                            details={"target": target, "entry": name},
+                            rule_code="S406",
                         )
                     elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,
-                            message=f"Symlink {name} points to critical system path: {target}",
+                            message=f"{link_kind} {name} points to critical system path: {target}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
-                            details={"target": target},
-                            rule_code="S406",
-                        )
-                    else:
-                        result.add_check(
-                            name="Symlink Safety Validation",
-                            passed=True,
-                            message=f"Symlink {name} is safe",
-                            location=f"{path}:{name}",
                             details={"target": target, "entry": name},
-                            rule_code=None,  # Passing check
+                            rule_code="S406",
                         )
                     continue
 

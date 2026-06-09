@@ -511,7 +511,10 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert "flax_msgpack" in results.scanner_names
         assert determine_exit_code(results) == 2
-        assert any("Msgpack stream object count exceeds configured limit" in issue.message for issue in results.issues)
+        limit_issues = [issue for issue in results.issues if "unvalidated trailing data" in issue.message]
+        assert len(limit_issues) == 1
+        assert limit_issues[0].details["max_msgpack_stream_objects"] == 4096
+        assert limit_issues[0].details["parsed_object_count"] == 4096
 
     def test_disguised_flax_state_wrapper_with_malicious_attribute_is_scanned(self, tmp_path: Path) -> None:
         msgpack = pytest.importorskip("msgpack")

@@ -95,6 +95,7 @@ def pytest_runtest_setup(item):
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_picklescan_adapter.py",
+            "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
@@ -137,6 +138,7 @@ def pytest_runtest_setup(item):
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
+            "test_pmml_dependency_handling.py",  # PMML safe-parser fail-closed regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
             "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
@@ -187,6 +189,7 @@ def pytest_runtest_setup(item):
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
+            "test_jfrog_redirect_security.py",  # JFrog redirect SSRF regression tests
             "test_mlflow_integration.py",  # MLflow integration tests
             "test_streaming_analysis.py",  # signed stream routing and fallback regressions
             "test_tar_scanner.py",  # TAR archive scanner tests
@@ -214,6 +217,7 @@ def pytest_runtest_setup(item):
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
+            "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
@@ -224,6 +228,7 @@ def pytest_runtest_setup(item):
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_patched_version_suffixes",
+            "tests/test_security_enhancements.py::TestNumPyScannerSecurity::test_negative_dimension_rejection",
         ]
 
         # Check if this is an allowed test file
@@ -625,6 +630,8 @@ def mock_cli_scan_command():
         mock_model.files_scanned = mock_result_dict["files_scanned"]
         mock_model.bytes_scanned = mock_result_dict["bytes_scanned"]
         mock_model.has_errors = mock_result_dict["has_errors"]
+        mock_model.assets = mock_result_dict["assets"]
+        mock_model.file_metadata = mock_result_dict["file_metadata"]
 
         mock_scan.return_value = mock_model
         yield mock_scan

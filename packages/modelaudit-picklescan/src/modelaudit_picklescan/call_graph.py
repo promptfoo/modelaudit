@@ -98,6 +98,7 @@ _MAX_TRUSTED_PTH_PATHS = 64
 _MAX_TRUSTED_REFERENCE_FUNCTIONS = 128
 _MAX_TRUSTED_REFERENCE_GLOBALS = 1024
 _MAX_TRUSTED_SLOT_NAMES = 1024
+_REGEX_SUB_METHOD_TYPE = type(re.compile("").sub)
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _BUILTIN_MODULE_NAMES = frozenset(sys.builtin_module_names)
@@ -902,9 +903,25 @@ def _trusted_mutable_global_state_is_safe(function: FunctionType, name: str, val
     ) or (
         function.__module__ == "posixpath"
         and function.__name__ == "expandvars"
-        and name in {"_varprog", "_varprogb"}
-        and (value is None or type(value) is re.Pattern)
+        and _trusted_posixpath_regex_cache_is_safe(name, value)
     )
+
+
+def _trusted_posixpath_regex_cache_is_safe(name: str, value: object) -> bool:
+    if name in {"_varprog", "_varprogb"}:
+        return value is None or type(value) is re.Pattern
+    if name not in {"_varsub", "_varsubb"}:
+        return False
+    if value is None:
+        return True
+    if type(value) is not _REGEX_SUB_METHOD_TYPE:
+        return False
+    try:
+        owner = object.__getattribute__(value, "__self__")
+        method_name = object.__getattribute__(value, "__name__")
+    except AttributeError:
+        return False
+    return type(owner) is re.Pattern and method_name == "sub"
 
 
 def _trusted_executable_value_matches_snapshot(

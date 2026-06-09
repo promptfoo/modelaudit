@@ -12,6 +12,7 @@ import shutil
 import stat
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
@@ -37,6 +38,9 @@ from .config.local_config import find_local_config_for_paths
 from .core import (
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    _make_trusted_stream_shard_root,
+    _reconcile_cross_directory_shard_coverage,
+    _snapshot_validated_shard_target,
     determine_exit_code,
     scan_model_directory_or_file,
 )
@@ -66,6 +70,7 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
+from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -109,33 +114,51 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
+    return _escape_terminal_text(_display_scan_path(path))
+
+
+def _display_scan_path(path: str) -> str:
+    """Return an exact local path or a credential-redacted remote identifier."""
     if path.startswith("models:/"):
         from .integrations.mlflow import _redact_mlflow_error_for_display
 
         return _redact_mlflow_error_for_display(path)
     if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
-    if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path):
+    if (
+        is_cloud_url(path)
+        or is_cleartext_cloud_url(path)
+        or is_pytorch_hub_url(path)
+        or is_cleartext_pytorch_hub_url(path)
+    ):
         return redact_url_for_display(path)
     if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
 
-def _display_scan_path(path: str) -> str:
-    """Return a persisted scan path safe for generated reports."""
-    return _display_path(path)
-
-
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
     if is_stream_url(path):
-        return redact_stream_error_for_display(error, path[9:])
-    return (
-        redact_cloud_error_for_display(error, path)
-        if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path)
-        else str(error)
-    )
+        display_error = redact_stream_error_for_display(error, path[9:])
+    elif is_huggingface_url(path) or is_huggingface_file_url(path):
+        display_error = redact_huggingface_urls_in_text(str(error))
+    elif is_jfrog_url_like(path):
+        display_error = redact_jfrog_error_for_display(error, path)
+    elif is_mlflow_uri(path):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        display_error = _redact_mlflow_error_for_display(error)
+    else:
+        display_error = (
+            redact_cloud_error_for_display(error, path)
+            if is_cloud_url(path)
+            or is_cleartext_cloud_url(path)
+            or is_pytorch_hub_url(path)
+            or is_cleartext_pytorch_hub_url(path)
+            else str(error)
+        )
+    return _escape_terminal_text(display_error)
 
 
 class _OutputWriteError(click.ClickException):
@@ -1333,6 +1356,53 @@ class _ScanPathState:
     sbom_paths_resolved: bool = False
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
+    validated_shard_targets: ValidatedShardTargets = field(default_factory=dict)
+    explicit_shard_family_groups: dict[str, str] = field(default_factory=dict)
+    has_errors_outside_reconciled_shards: bool = False
+
+    def mark_non_shard_error(self, audit_result: ModelAuditResultModel) -> None:
+        """Record an aggregate error that shard reconciliation does not own."""
+        self.has_errors_outside_reconciled_shards = True
+        audit_result.has_errors = True
+
+    def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
+        """Preserve errors from results that cannot join final CLI shard reconciliation."""
+        if scan_result.has_errors:
+            self.has_errors_outside_reconciled_shards = True
+
+    def explicit_shard_family_group_for(self, path: str) -> str | None:
+        """Return the opt-in family group only for an exact explicit file argument."""
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return self.explicit_shard_family_groups.get(normalized_path)
+
+    def record_validated_shard_targets(
+        self,
+        scan_result: ModelAuditResultModel,
+        *,
+        pre_scan_target: ValidatedShardTargets | None = None,
+    ) -> None:
+        """Record stable regular-file identities for shard assets that were scanned."""
+        for asset in scan_result.assets:
+            if not asset.path or asset.type == "error":
+                continue
+            metadata = scan_result.file_metadata.get(asset.path)
+            if metadata is not None and metadata.get("operational_error") is True:
+                continue
+            explicit_family_group = self.explicit_shard_family_group_for(asset.path)
+            post_scan_target = _snapshot_validated_shard_target(
+                asset.path,
+                family_group=explicit_family_group,
+                family_group_policy="explicit" if explicit_family_group else None,
+            )
+            if not post_scan_target:
+                continue
+            if pre_scan_target:
+                common_sources = pre_scan_target.keys() & post_scan_target.keys()
+                if common_sources and any(
+                    pre_scan_target[source_path] != post_scan_target[source_path] for source_path in common_sources
+                ):
+                    continue
+            self.validated_shard_targets.update(post_scan_target)
 
     def track_streaming_paths_for_sbom(
         self,
@@ -1451,6 +1521,29 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
+def _escape_terminal_text(value: Any) -> str:
+    """Render control characters visibly before writing model-controlled text to terminals."""
+    text = "" if value is None else str(value)
+
+    def replace_control(char: str) -> str:
+        if char == "\n":
+            return "\\n"
+        if char == "\r":
+            return "\\r"
+        if char == "\t":
+            return "\\t"
+        codepoint = ord(char)
+        if codepoint <= 0xFF:
+            return f"\\x{codepoint:02x}"
+        if codepoint <= 0xFFFF:
+            return f"\\u{codepoint:04x}"
+        return f"\\U{codepoint:08x}"
+
+    return "".join(
+        replace_control(char) if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} else char for char in text
+    )
+
+
 def get_trusted_config_store() -> TrustedConfigStore:
     """Return the persistent store used for trusted local configs."""
     return TrustedConfigStore()
@@ -1554,6 +1647,76 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     return expanded, missing_globs
 
 
+def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str]:
+    """Map exact local file arguments to conservative explicit-family groups."""
+    grouped_paths: dict[tuple[str, int], list[tuple[str, Path, int]]] = {}
+    seen_paths: set[str] = set()
+    for path_str in paths:
+        if "://" in path_str or "*" in path_str or "?" in path_str:
+            continue
+        path = Path(path_str)
+        if not path.is_file():
+            continue
+        try:
+            resolved_path = str(path.resolve(strict=True))
+            parent_stat = os.stat(Path(resolved_path).parent, follow_symlinks=False)
+        except (OSError, RuntimeError):
+            continue
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            continue
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if callable(get_effective_uid) and parent_stat.st_uid != get_effective_uid():
+                continue
+            if stat.S_IMODE(parent_stat.st_mode) & 0o022:
+                continue
+        shard_match = ShardedModelDetector.match_shard_filename(Path(resolved_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
+        ):
+            continue
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(resolved_path)))
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        grouped_paths.setdefault((pattern, expected_total), []).append(
+            (normalized_path, Path(resolved_path), shard_index)
+        )
+
+    groups: dict[str, str] = {}
+    for (_pattern, expected_total), records in grouped_paths.items():
+        targets_by_scope: dict[str, dict[int, list[str]]] = {}
+        scopes_by_source: dict[str, set[str]] = {}
+        for normalized_path, resolved_path_obj, shard_index in records:
+            source_scopes = scopes_by_source.setdefault(normalized_path, set())
+            for ancestor in (resolved_path_obj.parent, *resolved_path_obj.parent.parents):
+                normalized_scope = os.path.normcase(os.path.normpath(str(ancestor)))
+                source_scopes.add(normalized_scope)
+                targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
+
+        complete_scopes = {
+            scope
+            for scope, targets_by_index in targets_by_scope.items()
+            if len(targets_by_index) == expected_total
+            and all(len(targets) == 1 for targets in targets_by_index.values())
+        }
+        for normalized_path, _resolved_path, _shard_index in records:
+            matching_scopes = scopes_by_source[normalized_path] & complete_scopes
+            if matching_scopes:
+                family_scope = max(matching_scopes, key=lambda scope: len(Path(scope).parts))
+                groups[normalized_path] = f"explicit-cli:{family_scope}"
+    return groups
+
+
 def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
     """Parse CLI severity override arguments of the form CODE=LEVEL."""
     overrides: dict[str, str] = {}
@@ -1597,9 +1760,9 @@ def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any
         try:
             progress_callback(message, percentage)
             if spinner and hasattr(spinner, "text"):
-                spinner.text = message
+                spinner.text = _escape_terminal_text(message)
         except Exception as e:
-            logger.warning(f"Progress callback error: {e}")
+            logger.warning(f"Progress callback error: {_escape_terminal_text(e)}")
 
     return wrapped_callback
 
@@ -2078,7 +2241,7 @@ def _emit_scan_output(
     if output:
         _write_output_text_file(output, output_text)
 
-        click.echo(f"Results written to {output}")
+        click.echo(f"Results written to {_display_path(output)}")
 
         if verbose:
             visible_issues = audit_result.issues
@@ -2145,7 +2308,9 @@ def _announce_suppressed_preferred_scanners(suppressions: list[dict[str, Any]]) 
         err=True,
     )
     for entry in suppressions[:5]:
-        click.echo(f"  - {entry['location']} (would have used: {entry['scanner_id']})", err=True)
+        location = _escape_terminal_text(entry["location"])
+        scanner_id = _escape_terminal_text(entry["scanner_id"])
+        click.echo(f"  - {location} (would have used: {scanner_id})", err=True)
     if len(suppressions) > 5:
         click.echo(f"  … and {len(suppressions) - 5} more", err=True)
 
@@ -2185,17 +2350,18 @@ def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, 
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
+    display_path = _display_path(scan_path)
     if ext in (".py", ".js", ".html", ".css"):
         if verbose:
-            logger.debug(f"Skipped: {scan_path} (non-model file)")
+            logger.debug(f"Skipped: {display_path} (non-model file)")
         if runtime.show_styled_output:
-            click.echo(f"Skipping non-model file: {scan_path}")
+            click.echo(f"Skipping non-model file: {display_path}")
         return True
 
     if verbose:
-        logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
+        logger.debug(f"Skipped: {display_path} (non-model .txt file)")
     if runtime.show_styled_output:
-        click.echo(f"Skipping non-model file: {scan_path}")
+        click.echo(f"Skipping non-model file: {display_path}")
     return True
 
 
@@ -2210,7 +2376,7 @@ def _create_path_progress_callback(
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
-            spinner_bound.text = f"{message} ({percentage:.1f}%)"
+            spinner_bound.text = f"{_escape_terminal_text(message)} ({percentage:.1f}%)"
 
         return update_progress
 
@@ -2231,25 +2397,26 @@ def _create_path_progress_callback(
 
         progress_tracker.stats.total_bytes = total_bytes
         progress_tracker.stats.total_items = total_items
-        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {_display_scan_path(actual_path)}")
+        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {_display_path(actual_path)}")
     except (ImportError, RecursionError):
         return None
 
     def enhanced_progress_callback(message: str, percentage: float) -> None:
+        display_message = _escape_terminal_text(message)
         if progress_tracker:
             bytes_processed = int((percentage / 100.0) * total_bytes) if total_bytes > 0 else 0
-            progress_tracker.update_bytes(bytes_processed, message)
+            progress_tracker.update_bytes(bytes_processed, display_message)
 
             message_lower = message.lower()
             if "loading" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.LOADING, message)
+                progress_tracker.set_phase(ProgressPhase.LOADING, display_message)
             elif "analyzing" in message_lower or "scanning" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
+                progress_tracker.set_phase(ProgressPhase.ANALYZING, display_message)
             elif "checking" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.CHECKING, message)
+                progress_tracker.set_phase(ProgressPhase.CHECKING, display_message)
 
         if spinner:
-            spinner.text = f"{message} ({percentage:.1f}%)"
+            spinner.text = f"{display_message} ({percentage:.1f}%)"
 
     return enhanced_progress_callback
 
@@ -2279,6 +2446,16 @@ def _scan_local_or_downloaded_path(
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
     display_path = _display_path(path)
+    explicit_family_group = path_state.explicit_shard_family_group_for(actual_path)
+    pre_scan_shard_target = (
+        _snapshot_validated_shard_target(
+            actual_path,
+            family_group=explicit_family_group,
+            family_group_policy="explicit" if explicit_family_group else None,
+        )
+        if os.path.isfile(actual_path)
+        else {}
+    )
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
@@ -2323,6 +2500,7 @@ def _scan_local_or_downloaded_path(
                 cache_dir=runtime.cache_dir,
                 **_scanner_selection_overrides(runtime),
             )
+            path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
             path_state.record_dvc_coverage(actual_path, streaming_result, scanner_config=runtime.config)
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
@@ -2369,6 +2547,10 @@ def _scan_local_or_downloaded_path(
             skip_file_types=runtime.skip_non_model_files,
             use_hf_whitelist=runtime.use_hf_whitelist,
             **config_overrides,
+        )
+        path_state.record_validated_shard_targets(
+            scan_results,
+            pre_scan_target=pre_scan_shard_target,
         )
         audit_result.aggregate_scan_result(scan_results.model_dump())
         if is_dvc_pointer and has_prior_dvc_coverage:
@@ -2422,12 +2604,9 @@ def _scan_local_or_downloaded_path(
         elif runtime.show_styled_output:
             click.echo(f"Error scanning {display_path}")
 
-        logger.error(
-            f"Error during scan of {display_path}: {display_error}",
-            exc_info=verbose and not (is_stream_url(actual_path) or is_cloud_url(path)),
-        )
+        logger.error(f"Error during scan of {display_path}: {display_error}")
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         path_state.scanned_paths.append(_display_scan_path(actual_path))
 
         if progress_tracker:
@@ -2446,17 +2625,17 @@ def _resolve_scan_source_for_path(
 ) -> _SourceDispatchResult | None:
     """Resolve one source path and execute source-native scans when they should bypass local scanning."""
     if is_cleartext_cloud_url(path):
-        click.echo(f"Error: Cleartext cloud storage URL is not supported: {redact_url_for_display(path)}", err=True)
-        audit_result.has_errors = True
+        click.echo(f"Error: Cleartext cloud storage URL is not supported: {_display_path(path)}", err=True)
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     if is_cleartext_pytorch_hub_url(path):
-        click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {redact_url_for_display(path)}", err=True)
-        audit_result.has_errors = True
+        click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {_display_path(path)}", err=True)
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     if is_huggingface_file_url(path):
-        display_path = redact_huggingface_url_for_display(path)
+        display_path = _display_path(path)
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2505,10 +2684,10 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
-            error_msg = redact_huggingface_urls_in_text(str(exc))
-            logger.error(f"Failed to download file from {display_path}: {error_msg}", exc_info=verbose)
+            error_msg = _display_error(exc, path)
+            logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2517,7 +2696,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_huggingface_url(path):
-        display_path = redact_huggingface_url_for_display(path)
+        display_path = _display_path(path)
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
@@ -2535,13 +2714,19 @@ def _resolve_scan_source_for_path(
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
 
-                click.echo(f"   Model: {model_info['model_id']}")
-                click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
+                model_id = _escape_terminal_text(str(model_info["model_id"]))
+                file_count = _escape_terminal_text(str(model_info["file_count"]))
+                click.echo(f"   Model: {model_id}")
+                click.echo(f"   Size: {size_str} ({file_count} files)")
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
             except Exception as exc:
-                logger.debug("Unable to display HuggingFace model metadata for %s: %s", path, exc)
+                logger.debug(
+                    "Unable to display HuggingFace model metadata for %s: %s",
+                    display_path,
+                    _display_error(exc, path),
+                )
 
         temp_dir = None
         try:
@@ -2598,6 +2783,12 @@ def _resolve_scan_source_for_path(
 
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
+                    _trusted_shard_family_root=(
+                        _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
+                        if runtime.cache_enabled and trusted_source_provenance is not None
+                        else None
+                    ),
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2610,6 +2801,7 @@ def _resolve_scan_source_for_path(
                     cache_dir=runtime.cache_dir,
                     **streaming_kwargs,
                 )
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
@@ -2664,7 +2856,7 @@ def _resolve_scan_source_for_path(
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
-            error_msg = redact_huggingface_urls_in_text(str(exc))
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
                 logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
@@ -2677,10 +2869,10 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to process model from {display_path}: {error_msg}", exc_info=verbose)
+                logger.error(f"Failed to process model from {display_path}: {error_msg}")
                 click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2689,6 +2881,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_pytorch_hub_url(path):
+        display_path = _display_path(path)
         download_spinner = None
         try:
             record_download_started("pytorch_hub", path)
@@ -2711,6 +2904,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2724,6 +2918,7 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 record_download_completed("pytorch_hub", time.time() - download_start, 0, path)
 
@@ -2733,11 +2928,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(display_path, fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {path}...")
+                click.echo(f"Downloading from {display_path}...")
 
             download_path = download_pytorch_hub_model(
                 path,
@@ -2766,9 +2961,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = str(exc)
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {path}: {error_msg}")
+                logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -2778,13 +2973,14 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
-                click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+                logger.error(f"Failed to download model from {display_path}: {error_msg}")
+                click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_cloud_url(path):
+        display_path = _display_path(path)
         if dry_run:
             import asyncio
 
@@ -2792,7 +2988,7 @@ def _resolve_scan_source_for_path(
 
             try:
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(redact_url_for_display(path), fg='cyan')}:")
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
                 click.echo(f"   Type: {metadata['type']}")
 
                 if metadata["type"] == "file":
@@ -2816,8 +3012,8 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
                 error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {redact_url_for_display(path)}: {error_msg}", err=True)
-                audit_result.has_errors = True
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
                 return None
 
         download_spinner = None
@@ -2850,6 +3046,7 @@ def _resolve_scan_source_for_path(
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
+                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,
@@ -2863,6 +3060,7 @@ def _resolve_scan_source_for_path(
                     **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 record_download_completed("cloud_storage", time.time() - download_start, 0, path)
 
@@ -2872,11 +3070,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(redact_url_for_display(path), fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(display_path, fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {redact_url_for_display(path)}...")
+                click.echo(f"Downloading from {display_path}...")
 
             cloud_download_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
@@ -2921,7 +3119,7 @@ def _resolve_scan_source_for_path(
 
             error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {redact_url_for_display(path)}: {error_msg}")
+                logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -2931,15 +3129,13 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}")
-                click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
+                logger.error(f"Failed to download from {display_path}: {error_msg}")
+                click.echo(f"Error downloading from {display_path}: {error_msg}", err=True)
 
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_mlflow_uri(path):
-        from .integrations.mlflow import _redact_mlflow_error_for_display
-
         display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2968,13 +3164,27 @@ def _resolve_scan_source_for_path(
                 **_scanner_selection_overrides(runtime),
             )
 
+            path_state.record_non_shard_result_errors(results)
             audit_result.aggregate_scan_result(results.model_dump())
-            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
-            if download_refused:
+            download_refusal_type = next(
+                (
+                    issue_type
+                    for issue in results.issues
+                    if isinstance((issue_type := getattr(issue, "type", None)), str)
+                    and issue_type.startswith("mlflow_download_")
+                ),
+                None,
+            )
+            if download_refusal_type is not None:
                 if download_spinner:
                     download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
                 elif runtime.show_styled_output:
-                    click.echo("Download refused by configured size budget")
+                    refusal_reason = (
+                        "configured size budget"
+                        if download_refusal_type == "mlflow_download_budget"
+                        else "MLflow staging safety checks"
+                    )
+                    click.echo(f"Download refused by {refusal_reason}")
             else:
                 record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
                 if download_spinner:
@@ -2988,14 +3198,14 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = _redact_mlflow_error_for_display(exc)
+            error_msg = _display_error(exc, path)
             logger.error(f"Failed to download model from {display_path}: {error_msg}")
             click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if is_jfrog_url(path):
-        display_path = redact_jfrog_url_for_display(path)
+        display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
             download_spinner = yaspin(
@@ -3041,6 +3251,7 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Downloaded and scanned successfully")
 
+            path_state.record_non_shard_result_errors(jfrog_results)
             audit_result.aggregate_scan_result(jfrog_results.model_dump())
             record_download_completed("jfrog", time.time() - download_start, jfrog_results.bytes_scanned, path)
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
@@ -3050,15 +3261,15 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download/scan failed")
 
-            error_msg = redact_jfrog_error_for_display(exc, path)
-            logger.error(f"Failed to download/scan model from {display_path}: {error_msg}", exc_info=verbose)
+            error_msg = _display_error(exc, path)
+            logger.error(f"Failed to download/scan model from {display_path}: {error_msg}")
             click.echo(f"Error downloading/scanning model from {display_path}: {error_msg}", err=True)
-            audit_result.has_errors = True
+            path_state.mark_non_shard_error(audit_result)
             return None
 
     if not os.path.exists(path):
         click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
-        audit_result.has_errors = True
+        path_state.mark_non_shard_error(audit_result)
         return None
 
     return _SourceDispatchResult(actual_path=path)
@@ -3134,7 +3345,10 @@ def auth() -> None:
 @click.option(
     "-h",
     "--host",
-    help="The host of the promptfoo instance. This needs to be the url of the API if different from the app url.",
+    help=(
+        "The API URL of the Promptfoo instance. Custom domains must also be configured through "
+        "MODELAUDIT_API_ALLOWED_HOSTS (a comma-separated hostname or URL list), MODELAUDIT_API_HOST, or API_HOST."
+    ),
 )
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
@@ -3144,7 +3358,7 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     start_time = time.time()
     try:
         token = None
-        api_host = host or cloud_config.get_api_host()
+        api_host = host or config.get_api_host()
 
         # Record telemetry (stub for now)
         # telemetry.record('command_used', {'name': 'auth login'})
@@ -3577,6 +3791,11 @@ def delegate_info() -> None:
     is_flag=True,
     help="Stream scan: download files one-by-one, scan immediately, then delete to save disk space",
 )
+@click.option(
+    "--assume-shard-family",
+    is_flag=True,
+    help="Treat explicitly provided cross-directory shard paths as one model family",
+)
 def scan_command(
     paths: tuple[str, ...],
     format: str | None,
@@ -3599,6 +3818,7 @@ def scan_command(
     no_cache: bool,
     cache_dir: str | None,
     stream: bool,
+    assume_shard_family: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
@@ -3666,6 +3886,7 @@ def scan_command(
         "strict": strict,
         "no_whitelist": no_whitelist,
         "dry_run": dry_run,
+        "assume_shard_family": assume_shard_family,
         "has_scanner_selection": bool(scanners or exclude_scanners),
         "num_paths": len(paths),
     }
@@ -3724,7 +3945,8 @@ def scan_command(
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
-        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths)
+        collect_dvc_coverage=any(os.path.isfile(path) and path.lower().endswith(".dvc") for path in expanded_paths),
+        explicit_shard_family_groups=_explicit_local_shard_family_groups(paths) if assume_shard_family else {},
     )
 
     # Scan each path with interrupt handling
@@ -3762,13 +3984,10 @@ def scan_command(
             except Exception as exc:
                 display_path = _display_path(path)
                 display_error = _display_error(exc, path)
-                logger.error(
-                    f"Unexpected error processing {display_path}: {display_error}",
-                    exc_info=verbose and not is_stream_url(path),
-                )
+                logger.error(f"Unexpected error processing {display_path}: {display_error}")
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
                 path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
-                audit_result.has_errors = True
+                path_state.mark_non_shard_error(audit_result)
 
                 if progress_tracker:
                     progress_tracker.report_error(Exception(display_error))
@@ -3802,6 +4021,11 @@ def scan_command(
 
     _complete_progress_tracking(progress_tracker, verbose=verbose)
     _cleanup_progress_reporters(progress_reporters)
+    _reconcile_cross_directory_shard_coverage(
+        audit_result,
+        path_state.validated_shard_targets,
+        missing_shard_errors_only=not path_state.has_errors_outside_reconciled_shards,
+    )
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
@@ -3886,7 +4110,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Display metrics in a formatted grid
     for label, value, color in metrics:
         label_str = style_text(f"  {label}:", fg="bright_black")
-        value_str = style_text(value, fg=color, bold=True)
+        value_str = style_text(_escape_terminal_text(value), fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
 
     # Add authentication status (inspired by semgrep's approach)
@@ -3931,23 +4155,32 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append(style_text("  Model Information:", fg="bright_black"))
 
                 if "model_type" in model_info:
-                    output_lines.append(f"  • Type: {style_text(model_info['model_type'], fg='cyan')}")
+                    model_type = _escape_terminal_text(model_info["model_type"])
+                    output_lines.append(f"  • Type: {style_text(model_type, fg='cyan')}")
                 if "architectures" in model_info:
                     arch_str = (
-                        ", ".join(model_info["architectures"])
+                        ", ".join(_escape_terminal_text(architecture) for architecture in model_info["architectures"])
                         if isinstance(model_info["architectures"], list)
-                        else model_info["architectures"]
+                        else _escape_terminal_text(model_info["architectures"])
                     )
                     output_lines.append(f"  • Architecture: {style_text(arch_str, fg='cyan')}")
                 if "num_layers" in model_info:
-                    output_lines.append(f"  • Layers: {style_text(str(model_info['num_layers']), fg='cyan')}")
+                    num_layers = _escape_terminal_text(model_info["num_layers"])
+                    output_lines.append(f"  • Layers: {style_text(num_layers, fg='cyan')}")
                 if "hidden_size" in model_info:
-                    output_lines.append(f"  • Hidden Size: {style_text(str(model_info['hidden_size']), fg='cyan')}")
+                    hidden_size = _escape_terminal_text(model_info["hidden_size"])
+                    output_lines.append(f"  • Hidden Size: {style_text(hidden_size, fg='cyan')}")
                 if "vocab_size" in model_info:
-                    vocab_str = f"{model_info['vocab_size']:,}"
+                    vocab_size = model_info["vocab_size"]
+                    vocab_str = (
+                        f"{vocab_size:,}"
+                        if isinstance(vocab_size, (int, float)) and not isinstance(vocab_size, bool)
+                        else _escape_terminal_text(vocab_size)
+                    )
                     output_lines.append(f"  • Vocab Size: {style_text(vocab_str, fg='cyan')}")
                 if "framework_version" in model_info:
-                    output_lines.append(f"  • Framework: {style_text(model_info['framework_version'], fg='cyan')}")
+                    framework_version = _escape_terminal_text(model_info["framework_version"])
+                    output_lines.append(f"  • Framework: {style_text(framework_version, fg='cyan')}")
                 break  # Only show the first model info found
 
     # Add security check statistics
@@ -3991,10 +4224,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         # Group failed checks by name to avoid repetition
         check_groups: dict[str, list[str]] = {}
         for check in failed_checks_list:
-            check_name = check.get("name", "Unknown check")
+            check_name = _escape_terminal_text(check.get("name", "Unknown check"))
             if check_name not in check_groups:
                 check_groups[check_name] = []
-            check_groups[check_name].append(check.get("message", ""))
+            check_groups[check_name].append(_escape_terminal_text(check.get("message", "")))
 
         # Show unique failed check types
         for check_name, messages in list(check_groups.items())[:5]:  # Show first 5 types
@@ -4211,8 +4444,8 @@ def _format_issue(
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
-    message = _get_issue_attr(issue, "message", "Unknown issue")
-    location = _get_issue_attr(issue, "location", "")
+    message = _escape_terminal_text(_get_issue_attr(issue, "message", "Unknown issue"))
+    location = _escape_terminal_text(_get_issue_attr(issue, "location", ""))
 
     # Icon based on severity
     icons = {
@@ -4236,11 +4469,12 @@ def _format_issue(
     why = _get_issue_attr(issue, "why")
     if why:
         why_label = style_text("Why:", fg="magenta", bold=True)
+        why_text = _escape_terminal_text(why)
         # Wrap long explanations
         import textwrap
 
         wrapped_why = textwrap.fill(
-            why,
+            why_text,
             width=65,
             initial_indent="",
             subsequent_indent="           ",
@@ -4252,8 +4486,8 @@ def _format_issue(
     if details:
         for key, value in details.items():
             if value:  # Only show non-empty values
-                detail_label = style_text(f"{key}:", fg="bright_black")
-                detail_value = style_text(str(value), fg="bright_white")
+                detail_label = style_text(f"{_escape_terminal_text(key)}:", fg="bright_black")
+                detail_value = style_text(_escape_terminal_text(value), fg="bright_white")
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
@@ -4325,7 +4559,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
 
         if output:
             _write_output_text_file(output, output_text)
-            click.secho(f"Metadata written to {output}", fg="green")
+            click.secho(f"Metadata written to {_display_path(output)}", fg="green")
         else:
             click.echo(output_text)
 
@@ -4356,7 +4590,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             format=output_format,
             error_type=type(e).__name__,
         )
-        click.secho(f"Error extracting metadata: {e}", fg="red")
+        click.secho(f"Error extracting metadata: {_display_error(e, path)}", fg="red")
         sys.exit(1)
 
 
@@ -4366,22 +4600,23 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
 
     if "directory" in metadata:
         # Directory summary
-        output.append(f"Directory: {metadata['directory']}")
-        output.append(f"Total Files: {metadata['summary']['total_files']}")
+        output.append(f"Directory: {_escape_terminal_text(metadata['directory'])}")
+        output.append(f"Total Files: {_escape_terminal_text(metadata['summary']['total_files'])}")
         if metadata.get("analysis_incomplete"):
             output.append("\nWarning: Metadata extraction is incomplete")
             for event in metadata.get("budget_events", []):
-                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
+                output.append(f"  Budget exceeded: {_escape_terminal_text(event.get('limit', 'unknown'))}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
-            output.append(f"  {fmt}: {count}")
+            output.append(f"  {_escape_terminal_text(fmt)}: {_escape_terminal_text(count)}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            file_name = file_meta.get("file", "unknown")
+            file_name = _escape_terminal_text(file_meta.get("file", "unknown"))
             if error := file_meta.get("error"):
-                output.append(f"  {file_name} (error: {error})")
+                output.append(f"  {file_name} (error: {_escape_terminal_text(error)})")
             else:
-                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                file_format = _escape_terminal_text(file_meta.get("format", "unknown"))
+                output.append(f"  {file_name} ({file_format})")
                 for key in (
                     "has_custom_metadata",
                     "custom_metadata_entry_count",
@@ -4394,27 +4629,35 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
                         continue
                     value = file_meta[key]
                     if isinstance(value, list):
-                        value = ", ".join(map(str, value)) if value else "none"
-                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
+                        value = ", ".join(_escape_terminal_text(item) for item in value) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {_escape_terminal_text(value)}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:
         # Single file
-        output.append(f"File: {metadata.get('file', 'unknown')}")
-        output.append(f"Format: {metadata.get('format', 'unknown')}")
-        output.append(f"Size: {metadata.get('file_size', 0):,} bytes")
+        output.append(f"File: {_escape_terminal_text(metadata.get('file', 'unknown'))}")
+        output.append(f"Format: {_escape_terminal_text(metadata.get('format', 'unknown'))}")
+        file_size = metadata.get("file_size", 0)
+        size_text = (
+            f"{file_size:,}"
+            if isinstance(file_size, (int, float)) and not isinstance(file_size, bool)
+            else _escape_terminal_text(file_size)
+        )
+        output.append(f"Size: {size_text} bytes")
 
         # Show key metadata fields
         for key, value in metadata.items():
             if key not in ["file", "path", "format", "file_size"]:
+                label = _escape_terminal_text(str(key).replace("_", " ").title())
                 if isinstance(value, str | int | float | bool):
-                    output.append(f"{key.replace('_', ' ').title()}: {value}")
+                    output.append(f"{label}: {_escape_terminal_text(value)}")
                 elif isinstance(value, dict) and len(value) <= 5:
-                    output.append(f"{key.replace('_', ' ').title()}:")
+                    output.append(f"{label}:")
                     for k, v in value.items():
-                        output.append(f"  {k}: {v}")
+                        output.append(f"  {_escape_terminal_text(k)}: {_escape_terminal_text(v)}")
                 elif isinstance(value, list) and len(value) <= 10:
-                    output.append(f"{key.replace('_', ' ').title()}: {', '.join(map(str, value))}")
+                    values = ", ".join(_escape_terminal_text(item) for item in value)
+                    output.append(f"{label}: {values}")
 
     return "\n".join(output)
 

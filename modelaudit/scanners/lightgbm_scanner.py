@@ -355,6 +355,8 @@ class LightGBMScanner(BaseScanner):
             )
 
         if critical_command_hits and network_hits:
+            command_lines = {hit["line"] for hit in critical_command_hits}
+            network_lines = {hit["line"] for hit in network_hits}
             result.add_check(
                 name="Command/Network Correlation Check",
                 passed=False,
@@ -364,6 +366,7 @@ class LightGBMScanner(BaseScanner):
                 details={
                     "command_examples": critical_command_hits[:3],
                     "network_examples": network_hits[:3],
+                    "same_fragment_correlation": bool(command_lines & network_lines),
                 },
                 why="Combined command execution and external endpoint indicators raise exploitation confidence.",
             )

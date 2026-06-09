@@ -5,7 +5,6 @@ from __future__ import annotations
 import _imp
 import os
 import posixpath
-import re
 import subprocess
 import sys
 import tarfile
@@ -25,6 +24,13 @@ from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanStatus
 def _clear_call_graph_caches() -> None:
     for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
         function.cache_clear()
+
+
+def _posixpath_text_regex_cache_name() -> str:
+    for name in ("_varsub", "_varprog"):
+        if name in posixpath.expandvars.__code__.co_names:
+            return name
+    pytest.skip("posixpath.expandvars has no recognized text regex cache")
 
 
 def _has_source_unavailable_notice(report: PickleReport, module: str, name: str) -> bool:
@@ -671,14 +677,17 @@ def test_loaded_trusted_tempdir_posixpath_regex_cache_transition_remains_allowli
     assert baseline is not None
     assert baseline[2][0][2] is True
     namespace = ModuleType.__getattribute__(posixpath, "__dict__")
-    monkeypatch.setitem(namespace, "_varprog", None)
+    cache_name = _posixpath_text_regex_cache_name()
+    monkeypatch.setitem(namespace, cache_name, None)
     _clear_call_graph_caches()
 
     initial_report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="tempdir-before-regex.pkl")
     assert initial_report.verdict == SafetyVerdict.CLEAN
 
     assert posixpath.expandvars("$MODELAUDIT_MISSING_VARIABLE") == "$MODELAUDIT_MISSING_VARIABLE"
-    assert type(namespace["_varprog"]) is re.Pattern
+    cache_value = namespace[cache_name]
+    assert cache_value is not None
+    assert call_graph._trusted_posixpath_regex_cache_is_safe(cache_name, cache_value) is True
     _clear_call_graph_caches()
     populated_report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="tempdir-after-regex.pkl")
 
@@ -693,13 +702,18 @@ def test_loaded_trusted_tempdir_rejects_hostile_posixpath_regex_cache(
     calls: list[str] = []
 
     class HostileRegex:
+        def __call__(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("__call__")
+            raise AssertionError("hostile regex cache executed")
+
         def search(self, value: object) -> object:
             del value
             calls.append("search")
             raise AssertionError("hostile regex cache executed")
 
     namespace = ModuleType.__getattribute__(posixpath, "__dict__")
-    monkeypatch.setitem(namespace, "_varprog", HostileRegex())
+    cache_name = _posixpath_text_regex_cache_name()
+    monkeypatch.setitem(namespace, cache_name, HostileRegex())
     _clear_call_graph_caches()
 
     report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="hostile-posixpath-regex.pkl")
