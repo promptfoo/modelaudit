@@ -1274,6 +1274,8 @@ def _detect_jfrog_content_route_format(
         prefix[:16],
         max(size_hint, len(prefix), 1),
         None,
+        pickle_probe_sample=prefix,
+        pickle_probe_is_prefix=size_hint > len(prefix) or (size_hint <= 0 and len(prefix) >= probe_limit),
     )
     if (
         detected_format == "unknown"

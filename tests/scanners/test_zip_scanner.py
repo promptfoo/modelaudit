@@ -1555,29 +1555,43 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "original = c.CDLL\nc.CDLL = print\nfor (c.CDLL,) in [(print,), (original,)]:\n    pass\n",
         "original = c.CDLL\nc.CDLL = print\nns = c.__dict__\nfor (ns['CDLL'],) in [(print,), (original,)]:\n    pass\n",
         "import contextlib\nwith contextlib.nullcontext(c.CDLL) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.nullcontext = lambda ignored: real(original)\n"
-        "with contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.update([('nullcontext', lambda **ignored: real(original))])\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.__ior__({'nullcontext': lambda **ignored: real(original)})\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "dict.__ior__(contextlib.__dict__, {'nullcontext': lambda **ignored: real(original)})\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "contextlib.__dict__.pop('nullcontext')\n"
-        "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "del contextlib.__dict__['nullcontext']\n"
-        "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
-        "def enable():\n    contextlib.nullcontext = lambda ignored: real(original)\n"
-        "enable()\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.nullcontext = lambda ignored: real(original)\n"
+            + "with contextlib.nullcontext(print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.update([('nullcontext', lambda **ignored: real(original))])\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.__ior__({'nullcontext': lambda **ignored: real(original)})\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "dict.__ior__(contextlib.__dict__, {'nullcontext': lambda **ignored: real(original)})\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "contextlib.__dict__.pop('nullcontext')\n"
+            + "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "del contextlib.__dict__['nullcontext']\n"
+            + "contextlib.__dict__.setdefault('nullcontext', lambda **ignored: real(original))\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
+        (
+            "import contextlib\noriginal = c.CDLL\nc.CDLL = print\nreal = contextlib.nullcontext\n"
+            + "def enable():\n    contextlib.nullcontext = lambda ignored: real(original)\n"
+            + "enable()\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_ctypes_risk_after_qualified_control_target(tmp_path: Path, mutation: str) -> None:
@@ -1604,9 +1618,11 @@ def test_scan_zip_preserves_ctypes_risk_after_qualified_control_target(tmp_path:
         "for (c.CDLL,) in [(c.CDLL,), (print,)]:\n    pass\n",
         "import contextlib\nc.CDLL = print\nwith contextlib.nullcontext(print) as c.CDLL:\n    pass\n",
         "import contextlib\nc.CDLL = print\nwith contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
-        "import contextlib\nc.CDLL = print\nreal = contextlib.nullcontext\ncontextlib.__dict__.pop('nullcontext')\n"
-        "contextlib.__dict__.setdefault('nullcontext', real)\n"
-        "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n",
+        (
+            "import contextlib\nc.CDLL = print\nreal = contextlib.nullcontext\ncontextlib.__dict__.pop('nullcontext')\n"
+            + "contextlib.__dict__.setdefault('nullcontext', real)\n"
+            + "with contextlib.nullcontext(enter_result=print) as c.CDLL:\n    pass\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_safe_final_qualified_control_target(tmp_path: Path, mutation: str) -> None:
@@ -2061,8 +2077,10 @@ def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_
         "del runpy.__dict__['run_path']\nrunpy.__dict__.setdefault('run_path', original)\n",
         "runpy.__dict__.pop('run_path')\nrunpy.__dict__.setdefault('run_path', original)\n",
         "import builtins\nbuiltins.delattr(runpy, 'run_path')\nrunpy.__dict__.setdefault('run_path', original)\n",
-        "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
-        "runpy.__dict__.setdefault('run_path', original)\n",
+        (
+            "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
+            + "runpy.__dict__.setdefault('run_path', original)\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_restored_runpy_execution_after_namespace_overwrite(tmp_path: Path, restore: str) -> None:
@@ -2104,8 +2122,10 @@ def test_scan_zip_preserves_restored_runpy_execution_after_namespace_overwrite(t
         "del runpy.__dict__['run_path']\nrunpy.__dict__.setdefault('run_path', len)\n",
         "runpy.__dict__.pop('run_path')\nrunpy.__dict__.setdefault('run_path', len)\n",
         "import builtins\nbuiltins.delattr(runpy, 'run_path')\nrunpy.__dict__.setdefault('run_path', len)\n",
-        "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
-        "runpy.__dict__.setdefault('run_path', len)\n",
+        (
+            "import builtins\nremove = builtins.delattr\nremove(runpy, 'run_path')\n"
+            + "runpy.__dict__.setdefault('run_path', len)\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_safe_runpy_namespace_overwrite(tmp_path: Path, overwrite: str) -> None:
@@ -3619,8 +3639,10 @@ def test_scan_zip_allows_shadowed_direct_python_member_primitives(tmp_path: Path
             "ctypes.LibraryLoader.__setattr__ = restore\n"
             "loader._dlltype\nrunpy.run_path('safe')\n"
         ),
-        "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\nrunpy.run_path = print\n"
-        "del loader._dlltype\nloader._dlltype\nrunpy.run_path('safe')\n",
+        (
+            "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\nrunpy.run_path = print\n"
+            + "del loader._dlltype\nloader._dlltype\nrunpy.run_path('safe')\n"
+        ),
         (
             "import ctypes\nimport runpy\nloader = ctypes.LibraryLoader(len)\n"
             "loader.label = object()\nrunpy.run_path = print\n"
@@ -5111,6 +5133,83 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
             "S101",
             "os.system",
         ),
+        (
+            b"import operator, os\ndel os.getcwd\n"
+            b"operator.methodcaller('get', 'getcwd', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print]\npayload += [os.system]\noperator.itemgetter(-1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [os.system]\npayload *= 2\noperator.itemgetter(1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', run=os.system)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', {**{'run': print}, 'run': os.system})\n"
+            b"writer(payload)\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nupdates = {'run': os.system}\npayload = {}\n"
+            b"writer = operator.methodcaller('update', **updates)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nupdates = {'run': os.system}\npayload = {}\npayload.update(**updates)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {**{'run': os.system}}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.itemgetter(b'run')({b'run': os.system})('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter(1 + 2j)({1 + 2j: os.system})('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter(...)({...: os.system})('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\noperator.itemgetter(('run', 1))({('run', 1): os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.itemgetter(+True)({1: os.system})('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\npayload = {}\nalias = payload\nalias['run'] = os.system\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = (print,)\nalias = payload\npayload += (os.system,)\n"
+            b"operator.itemgetter(-1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nwriter = operator.methodcaller('__setitem__', 'runner', os.system)\n"
+            b"writer(os.__dict__)\nos.__dict__['runner']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.attrgetter('system', **{})(os)('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter('system')(os.__dict__, **{})('id')\n", "S101", "os.system"),
     ],
 )
 def test_high_risk_python_calls_resolves_operator_accessor_execution(
@@ -5198,6 +5297,45 @@ def test_high_risk_python_calls_resolves_operator_accessor_execution(
         (
             b"import operator, os\npayload = {}\npayload[dynamic_key] = print\n"
             b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        b"import operator, os\noperator.methodcaller('get', 'getcwd', os.system)(os.__dict__)()\n",
+        (
+            b"import operator, os\npayload = {'run': os.system}\nalias = payload\nalias['run'] = print\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = [os.system]\nalias = payload\nalias[0] = print\n"
+            b"operator.itemgetter(0)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = (print,)\nalias = payload\npayload += (os.system,)\n"
+            b"operator.itemgetter(-1)(alias)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = (print,)\n"
+            b"writer = operator.methodcaller('append', os.system)\nwriter(payload)\n"
+            b"operator.itemgetter(-1)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\nleft = {}\nright = {}\nleft['run'] = os.system\n"
+            b"operator.itemgetter('run')(right)('safe')\n"
+        ),
+        b"import operator, os\noperator.itemgetter('run')({**[('run', os.system)]})('id')\n",
+        (
+            b"import operator, os\nupdates = {1: os.system}\n"
+            b"writer = operator.methodcaller('update', **updates)\npayload = {}\nwriter(payload)\n"
+            b"operator.itemgetter(1)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\nwriter = operator.methodcaller('update', run=print, **{'run': os.system})\n"
+            b"payload = {}\nwriter(payload)\noperator.itemgetter('run')(payload)('safe')\n"
+        ),
+        b"import operator, os\noperator.methodcaller('get', 'run', extra=1)({'run': os.system})('id')\n",
+        b"import operator, os\noperator.methodcaller('__getitem__', 'run', 1)({'run': os.system})('id')\n",
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', {**{'run': os.system}, 'run': print})\n"
+            b"writer(payload)\noperator.itemgetter('run')(payload)('safe')\n"
         ),
     ],
 )
@@ -5856,6 +5994,24 @@ def test_scan_nested_file_fails_closed_when_tensorflow_protobuf_routing_budget_i
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
     check = next(check for check in result.checks if check.name == "TensorFlow Protobuf Routing")
+    assert "bounded structural probe reached its limit" in check.message
+
+
+def test_scan_nested_file_fails_closed_when_protocolless_pickle_routing_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "ambiguous-routing.py"
+    extracted_member.write_bytes(b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_OPCODES + 1))
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "Pickle Routing")
+    assert check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     assert "bounded structural probe reached its limit" in check.message
 
 

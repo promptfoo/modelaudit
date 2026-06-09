@@ -8,6 +8,7 @@ import re
 import shlex
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from types import EllipsisType
 from typing import TYPE_CHECKING, Literal
 
 from ._archive_outcomes import mark_archive_scan_incomplete
@@ -178,6 +179,7 @@ _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES = frozenset({"contextlib.nullcontext"}
 _STATIC_OPERATOR_ACCESSOR_HELPER_REFERENCES = frozenset(
     {"operator.attrgetter", "operator.itemgetter", "operator.methodcaller"}
 )
+_STATIC_KNOWN_PRESENT_MODULE_REFERENCES = frozenset({"os.getcwd"})
 _STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES = frozenset(
     {"ctypes.LibraryLoader.__new__", "ctypes.LibraryLoader.__init__", "ctypes.LibraryLoader.__setattr__"}
 )
@@ -570,6 +572,8 @@ _STATIC_DICT_UNCERTAIN_ALIAS = "<static dict uncertain>"
 _STATIC_SEQUENCE_ITEM_ALIAS_PREFIX = "<static sequence item>"
 _STATIC_SEQUENCE_COMPLETE_ALIAS = "<static sequence complete>"
 _STATIC_SEQUENCE_UNCERTAIN_ALIAS = "<static sequence uncertain>"
+_STATIC_MUTABLE_SEQUENCE_ALIAS = "<static mutable sequence>"
+_STATIC_CONTAINER_ID_ALIAS_PREFIX = "<static container id>"
 _STATIC_CONTAINER_POSSIBLE_ITEM_ALIAS_PREFIX = "<static container possible item>"
 _OPERATOR_ATTRGETTER_ALIAS_PREFIX = "<operator.attrgetter>"
 _OPERATOR_ITEMGETTER_ALIAS_PREFIX = "<operator.itemgetter>"
@@ -982,28 +986,64 @@ def _resolve_static_integer(node: ast.AST) -> int | None:
     return None
 
 
-_StaticItemKey = str | int | float | bool | None
+_MAX_STATIC_ITEM_KEY_BYTES = 1024
+_MAX_STATIC_ITEM_KEY_TUPLE_ITEMS = 64
+_MAX_STATIC_ITEM_KEY_DEPTH = 8
+_MAX_STATIC_CONTAINER_UPDATE_ITEMS = 256
+_StaticItemKey = str | int | float | complex | bool | bytes | None | EllipsisType | tuple["_StaticItemKey", ...]
 
 
-def _resolve_static_item_key(node: ast.AST) -> tuple[bool, _StaticItemKey]:
+def _resolve_static_item_key(
+    node: ast.AST,
+    *,
+    _depth: int = 0,
+) -> tuple[bool, _StaticItemKey]:
+    if _depth > _MAX_STATIC_ITEM_KEY_DEPTH:
+        return False, None
     string_value = _resolve_static_string(node)
     if string_value is not None:
         return True, string_value
-    if isinstance(node, ast.Constant) and node.value is None:
-        return True, None
-    if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
-        if isinstance(node.value, float) and not math.isfinite(node.value):
+    if isinstance(node, ast.Constant):
+        if node.value is None or node.value is Ellipsis:
+            return True, node.value
+        if isinstance(node.value, bytes):
+            return (True, node.value) if len(node.value) <= _MAX_STATIC_ITEM_KEY_BYTES else (False, None)
+        if isinstance(node.value, (bool, int, float, complex)):
+            if isinstance(node.value, (float, complex)) and not (
+                math.isfinite(node.value.real) and math.isfinite(node.value.imag)
+            ):
+                return False, None
+            return True, node.value
+    if isinstance(node, ast.Tuple):
+        if len(node.elts) > _MAX_STATIC_ITEM_KEY_TUPLE_ITEMS:
             return False, None
-        return True, node.value
+        resolved_items = tuple(_resolve_static_item_key(element, _depth=_depth + 1) for element in node.elts)
+        if not all(resolved for resolved, _item in resolved_items):
+            return False, None
+        return True, tuple(item for _resolved, item in resolved_items)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        left_resolved, left = _resolve_static_item_key(node.left, _depth=_depth + 1)
+        right_resolved, right = _resolve_static_item_key(node.right, _depth=_depth + 1)
+        if (
+            left_resolved
+            and right_resolved
+            and isinstance(left, (int, float, complex))
+            and isinstance(right, (int, float, complex))
+            and not isinstance(left, bool)
+            and not isinstance(right, bool)
+        ):
+            value = left + right if isinstance(node.op, ast.Add) else left - right
+            if isinstance(value, (float, complex)) and not (math.isfinite(value.real) and math.isfinite(value.imag)):
+                return False, None
+            return True, value
     if (
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, (ast.UAdd, ast.USub))
         and isinstance(node.operand, ast.Constant)
-        and isinstance(node.operand.value, (int, float))
-        and not isinstance(node.operand.value, bool)
+        and isinstance(node.operand.value, (int, float, complex))
     ):
         value = node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
-        if isinstance(value, float) and not math.isfinite(value):
+        if isinstance(value, (float, complex)) and not (math.isfinite(value.real) and math.isfinite(value.imag)):
             return False, None
         return True, value
     return False, None
@@ -1014,9 +1054,20 @@ def _resolve_static_namespace_update_items(node: ast.AST) -> list[tuple[str, ast
     if isinstance(node, ast.Dict):
         updates: list[tuple[str, ast.expr]] = []
         for key, value in zip(node.keys, node.values, strict=True):
-            if key is None or (resolved_key := _resolve_static_string(key)) is None:
+            if key is None:
+                if not isinstance(value, ast.Dict):
+                    return None
+                expanded = _resolve_static_namespace_update_items(value)
+                if expanded is None:
+                    return None
+                updates.extend(expanded)
+            else:
+                resolved_key = _resolve_static_string(key)
+                if resolved_key is None:
+                    return None
+                updates.append((resolved_key, value))
+            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
                 return None
-            updates.append((resolved_key, value))
         return updates
     if isinstance(node, (ast.List, ast.Tuple)):
         updates = []
@@ -1027,6 +1078,8 @@ def _resolve_static_namespace_update_items(node: ast.AST) -> list[tuple[str, ast
             if resolved_key is None:
                 return None
             updates.append((resolved_key, element.elts[1]))
+            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                return None
         return updates
     return None
 
@@ -1037,11 +1090,19 @@ def _resolve_static_container_update_items(node: ast.AST) -> list[tuple[_StaticI
         updates: list[tuple[_StaticItemKey, ast.expr]] = []
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             if key_node is None:
+                if not isinstance(value_node, ast.Dict):
+                    return None
+                expanded = _resolve_static_container_update_items(value_node)
+                if expanded is None:
+                    return None
+                updates.extend(expanded)
+            else:
+                key_resolved, key = _resolve_static_item_key(key_node)
+                if not key_resolved:
+                    return None
+                updates.append((key, value_node))
+            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
                 return None
-            key_resolved, key = _resolve_static_item_key(key_node)
-            if not key_resolved:
-                return None
-            updates.append((key, value_node))
         return updates
     if isinstance(node, (ast.List, ast.Tuple)):
         updates = []
@@ -1052,6 +1113,8 @@ def _resolve_static_container_update_items(node: ast.AST) -> list[tuple[_StaticI
             if not key_resolved:
                 return None
             updates.append((key, element.elts[1]))
+            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                return None
         return updates
     return None
 
@@ -1101,13 +1164,21 @@ def _decode_operator_accessor_fields(name: str, prefix: str) -> tuple[str, ...] 
 def _encode_operator_itemgetter_key(key: _StaticItemKey) -> str:
     if key is None:
         return "n:"
+    if key is Ellipsis:
+        return "e:"
     if isinstance(key, str):
         return f"s:{key}"
+    if isinstance(key, bytes):
+        return f"y:{key.hex()}"
     if isinstance(key, bool):
         return f"b:{int(key)}"
     if isinstance(key, int):
         return f"i:{key}"
-    return f"f:{key!r}"
+    if isinstance(key, float):
+        return f"f:{key!r}"
+    if isinstance(key, complex):
+        return _encode_operator_accessor_name("c:", repr(key.real), repr(key.imag))
+    return _encode_operator_accessor_name("t:", *(_encode_operator_itemgetter_key(item) for item in key))
 
 
 def _decode_operator_itemgetter_key(field: str) -> tuple[bool, _StaticItemKey]:
@@ -1116,8 +1187,17 @@ def _decode_operator_itemgetter_key(field: str) -> tuple[bool, _StaticItemKey]:
         return False, None
     if kind == "n" and not value:
         return True, None
+    if kind == "e" and not value:
+        return True, Ellipsis
     if kind == "s":
         return True, value
+    if kind == "y":
+        if len(value) > _MAX_STATIC_ITEM_KEY_BYTES * 2:
+            return False, None
+        try:
+            return True, bytes.fromhex(value)
+        except ValueError:
+            return False, None
     if kind == "b" and value in {"0", "1"}:
         return True, value == "1"
     if kind == "i":
@@ -1127,15 +1207,82 @@ def _decode_operator_itemgetter_key(field: str) -> tuple[bool, _StaticItemKey]:
             return False, None
     if kind == "f":
         try:
-            decoded = float(value)
+            decoded_float = float(value)
         except ValueError:
             return False, None
-        return (True, decoded) if math.isfinite(decoded) else (False, None)
+        return (True, decoded_float) if math.isfinite(decoded_float) else (False, None)
+    if kind == "c":
+        fields = _decode_operator_accessor_fields(value, "")
+        if fields is None or len(fields) != 2:
+            return False, None
+        try:
+            decoded_complex = complex(float(fields[0]), float(fields[1]))
+        except ValueError:
+            return False, None
+        return (
+            (True, decoded_complex)
+            if math.isfinite(decoded_complex.real) and math.isfinite(decoded_complex.imag)
+            else (False, None)
+        )
+    if kind == "t":
+        if not value:
+            return True, ()
+        fields = _decode_operator_accessor_fields(value, "")
+        if fields is None or len(fields) > _MAX_STATIC_ITEM_KEY_TUPLE_ITEMS:
+            return False, None
+        decoded_items = tuple(_decode_operator_itemgetter_key(item) for item in fields)
+        if not all(resolved for resolved, _item in decoded_items):
+            return False, None
+        return True, tuple(item for _resolved, item in decoded_items)
     return False, None
 
 
 def _resolve_operator_itemgetter_key(node: ast.AST) -> tuple[bool, _StaticItemKey]:
     return _resolve_static_item_key(node)
+
+
+def _resolve_static_container_update_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> list[tuple[_StaticItemKey, _AliasValue]] | None:
+    literal_updates = _resolve_static_container_update_items(node)
+    if literal_updates is not None:
+        return [
+            (
+                key,
+                _resolve_static_reference_names(
+                    value_node,
+                    alias_scopes,
+                    allow_module_locals_mapping=allow_module_locals_mapping,
+                    allow_local_namespace_mapping=allow_local_namespace_mapping,
+                ),
+            )
+            for key, value_node in literal_updates
+        ]
+
+    aliases = _resolve_static_reference_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if aliases is None or _STATIC_DICT_COMPLETE_ALIAS not in aliases or _STATIC_DICT_UNCERTAIN_ALIAS in aliases:
+        return None
+    decoded_updates: dict[_StaticItemKey, set[str]] = {}
+    for alias in aliases:
+        decoded = _decode_operator_accessor_name(alias, _STATIC_DICT_ITEM_ALIAS_PREFIX, 2)
+        if decoded is None:
+            continue
+        key_resolved, key = _decode_operator_itemgetter_key(decoded[0])
+        if not key_resolved:
+            return None
+        decoded_updates.setdefault(key, set())
+        if decoded[1]:
+            decoded_updates[key].add(decoded[1])
+    return [(key, frozenset(value_names) or None) for key, value_names in decoded_updates.items()]
 
 
 def _is_static_non_string(node: ast.AST) -> bool:
@@ -1702,6 +1849,31 @@ def _resolve_local_namespace_key_names(key: str, alias_scopes: _AliasScopes) -> 
     return current_scope[key], True
 
 
+def _resolve_mapping_root_item_names(
+    root: str,
+    key: str,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+) -> tuple[frozenset[str] | None, bool]:
+    if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+        return _resolve_module_namespace_key_names(
+            key,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+        )
+    if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+        return _resolve_local_namespace_key_names(key, alias_scopes)
+
+    member_name = f"{root}.{key}"
+    member_names, member_is_bound = _lookup_bound_alias(member_name, alias_scopes)
+    if member_is_bound:
+        return member_names, member_names != frozenset()
+    return frozenset({member_name}), member_name in (
+        _TRACKED_STATIC_MEMBER_REFERENCES | _STATIC_KNOWN_PRESENT_MODULE_REFERENCES
+    )
+
+
 def _resolve_globals_builtins_mapping_roots(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1894,27 +2066,15 @@ def _resolve_namespace_mapping_lookup_names(
     selected_names: set[str] = set()
     selected_value_guaranteed = bool(resolved_roots)
     for resolved_root in resolved_roots:
-        if resolved_root in _TRACKED_MODULE_NAMESPACE_ALIASES:
-            namespace_names, guaranteed = _resolve_module_namespace_key_names(
-                key, alias_scopes, allow_module_locals_mapping=allow_module_locals_mapping
-            )
-            if namespace_names is not None:
-                selected_names.update(namespace_names)
-            selected_value_guaranteed = selected_value_guaranteed and guaranteed
-            continue
-        if resolved_root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
-            namespace_names, guaranteed = _resolve_local_namespace_key_names(key, alias_scopes)
-            if namespace_names is not None:
-                selected_names.update(namespace_names)
-            selected_value_guaranteed = selected_value_guaranteed and guaranteed
-            continue
-        member_name = f"{resolved_root}.{key}"
-        member_names, member_is_bound = _lookup_bound_alias(member_name, alias_scopes)
-        if not member_is_bound:
-            member_names = frozenset({member_name})
+        member_names, guaranteed = _resolve_mapping_root_item_names(
+            resolved_root,
+            key,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+        )
         if member_names is not None:
             selected_names.update(member_names)
-        selected_value_guaranteed = selected_value_guaranteed and member_is_bound
+        selected_value_guaranteed = selected_value_guaranteed and guaranteed
     resolved_names = frozenset(selected_names)
     if default_names is not None and not selected_value_guaranteed:
         resolved_names = resolved_names | default_names
@@ -1955,7 +2115,7 @@ def _expanded_static_call_args(node: ast.Call) -> list[ast.expr] | None:
 
 
 def _operator_accessor_target_node(node: ast.Call) -> ast.AST | None:
-    if node.keywords:
+    if not _keywords_are_all_empty_static_kwargs(node.keywords):
         return None
     expanded_args = _expanded_static_call_args(node)
     if expanded_args is None or len(expanded_args) != 1:
@@ -1986,14 +2146,22 @@ def _resolve_operator_accessor_factory_names(
         return None
 
     accessor_names: set[str] = set()
-    if "operator.attrgetter" in normalized_helper_names and not node.keywords and expanded_args:
+    if (
+        "operator.attrgetter" in normalized_helper_names
+        and _keywords_are_all_empty_static_kwargs(node.keywords)
+        and expanded_args
+    ):
         attr_names = tuple(
             attr_name for arg in expanded_args if (attr_name := _resolve_static_string(arg)) is not None and attr_name
         )
         if len(attr_names) == len(expanded_args):
             accessor_names.add(_encode_operator_accessor_name(_OPERATOR_ATTRGETTER_ALIAS_PREFIX, *attr_names))
 
-    if "operator.itemgetter" in normalized_helper_names and not node.keywords and expanded_args:
+    if (
+        "operator.itemgetter" in normalized_helper_names
+        and _keywords_are_all_empty_static_kwargs(node.keywords)
+        and expanded_args
+    ):
         resolved_item_keys = tuple(_resolve_operator_itemgetter_key(arg) for arg in expanded_args)
         if all(resolved for resolved, _item_key in resolved_item_keys):
             accessor_names.add(
@@ -2006,26 +2174,97 @@ def _resolve_operator_accessor_factory_names(
     if "operator.methodcaller" in normalized_helper_names and expanded_args:
         method_name = _resolve_static_string(expanded_args[0])
         if method_name:
-            if method_name in {"update", "__ior__"} and len(expanded_args) == 2 and not node.keywords:
-                updates = _resolve_static_container_update_items(expanded_args[1])
-                if updates is not None:
-                    for key, value_node in updates:
-                        value_names = _resolve_static_reference_names(
-                            value_node,
+            if method_name in {"update", "__ior__"} and len(expanded_args) <= 2:
+                updates = (
+                    _resolve_static_container_update_names(
+                        expanded_args[1],
+                        alias_scopes,
+                        allow_module_locals_mapping=allow_module_locals_mapping,
+                        allow_local_namespace_mapping=allow_local_namespace_mapping,
+                    )
+                    if len(expanded_args) == 2
+                    else []
+                )
+                if updates is not None and (
+                    method_name == "update" or _keywords_are_all_empty_static_kwargs(node.keywords)
+                ):
+                    precise_updates = True
+                    keyword_names: set[str] = set()
+                    for keyword in node.keywords:
+                        if keyword.arg is not None:
+                            if keyword.arg in keyword_names:
+                                precise_updates = False
+                                break
+                            keyword_names.add(keyword.arg)
+                            value_names = _resolve_static_reference_names(
+                                keyword.value,
+                                alias_scopes,
+                                allow_module_locals_mapping=allow_module_locals_mapping,
+                                allow_local_namespace_mapping=allow_local_namespace_mapping,
+                            )
+                            updates.append((keyword.arg, value_names))
+                            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                                precise_updates = False
+                                break
+                            continue
+                        expanded_updates = _resolve_static_container_update_names(
+                            keyword.value,
                             alias_scopes,
                             allow_module_locals_mapping=allow_module_locals_mapping,
                             allow_local_namespace_mapping=allow_local_namespace_mapping,
                         )
-                        for value_name in value_names or frozenset({""}):
-                            accessor_names.add(
-                                _encode_operator_accessor_name(
-                                    _OPERATOR_METHODCALLER_ALIAS_PREFIX,
-                                    method_name,
-                                    _encode_operator_itemgetter_key(key),
-                                    value_name,
+                        if expanded_updates is None:
+                            precise_updates = False
+                            break
+                        expanded_keyword_names: set[str] = set()
+                        for key, _value_names in expanded_updates:
+                            if not isinstance(key, str):
+                                precise_updates = False
+                                break
+                            expanded_keyword_names.add(key)
+                        if not precise_updates or keyword_names & expanded_keyword_names:
+                            precise_updates = False
+                            break
+                        keyword_names.update(expanded_keyword_names)
+                        updates.extend(expanded_updates)
+                        if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                            precise_updates = False
+                            break
+                    if precise_updates and updates:
+                        final_updates: dict[_StaticItemKey, _AliasValue] = {}
+                        for key, value_names in updates:
+                            final_updates[key] = value_names
+                        for key, value_names in final_updates.items():
+                            for value_name in value_names or frozenset({""}):
+                                accessor_names.add(
+                                    _encode_operator_accessor_name(
+                                        _OPERATOR_METHODCALLER_ALIAS_PREFIX,
+                                        method_name,
+                                        _encode_operator_itemgetter_key(key),
+                                        value_name,
+                                    )
                                 )
-                            )
-                    return frozenset(accessor_names) or None
+                        return frozenset(accessor_names) or None
+            if method_name in _OPERATOR_METHODCALLER_DYNAMIC_ACCESS_METHODS and not (
+                _keywords_are_all_empty_static_kwargs(node.keywords)
+            ):
+                return frozenset(accessor_names) or None
+            dynamic_method_arg_counts = {
+                "__delitem__": {2},
+                "__getattribute__": {2},
+                "__getitem__": {2},
+                "__setitem__": {3},
+                "append": {2},
+                "get": {2, 3},
+                "insert": {3},
+                "pop": {1, 2, 3},
+                "setdefault": {2, 3},
+            }
+            if (
+                method_name in dynamic_method_arg_counts
+                and len(expanded_args) not in dynamic_method_arg_counts[method_name]
+            ):
+                return frozenset(accessor_names) or None
             lookup_name = ""
             fallback_names: frozenset[str] | None = None
             if method_name in _OPERATOR_METHODCALLER_DYNAMIC_ACCESS_METHODS and len(expanded_args) >= 2:
@@ -2082,15 +2321,10 @@ def _resolve_static_container_item_names(
 ) -> tuple[frozenset[str] | None, bool] | None:
     selected_node: ast.AST | None = None
     if isinstance(node, ast.Dict):
-        resolved_keys: list[_StaticItemKey] = []
-        for key_node in node.keys:
-            if key_node is None:
-                return None
-            key_resolved, resolved_key = _resolve_operator_itemgetter_key(key_node)
-            if not key_resolved:
-                return None
-            resolved_keys.append(resolved_key)
-        for resolved_key, value_node in reversed(tuple(zip(resolved_keys, node.values, strict=True))):
+        updates = _resolve_static_container_update_items(node)
+        if updates is None:
+            return None
+        for resolved_key, value_node in reversed(updates):
             if resolved_key == key:
                 selected_node = value_node
                 break
@@ -2188,12 +2422,10 @@ def _resolve_static_container_aliases(
     complete_alias: str
     if isinstance(node, ast.Dict):
         entries = {}
-        for key_node, value_node in zip(node.keys, node.values, strict=True):
-            if key_node is None:
-                return None
-            key_resolved, key = _resolve_operator_itemgetter_key(key_node)
-            if not key_resolved:
-                return None
+        updates = _resolve_static_container_update_items(node)
+        if updates is None:
+            return None
+        for key, value_node in updates:
             entries[key] = value_node
         item_alias_prefix = _STATIC_DICT_ITEM_ALIAS_PREFIX
         complete_alias = _STATIC_DICT_COMPLETE_ALIAS
@@ -2249,7 +2481,16 @@ def _resolve_operator_itemgetter_target_names(
         allow_module_locals_mapping=allow_module_locals_mapping,
         allow_local_namespace_mapping=allow_local_namespace_mapping,
     )
-    return _resolve_static_member_names(mapping_roots, key, alias_scopes)
+    selected_names: set[str] = set()
+    for mapping_root in mapping_roots or frozenset():
+        member_names, _guaranteed = _resolve_mapping_root_item_names(
+            mapping_root,
+            key,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+        )
+        selected_names.update(member_names or frozenset())
+    return frozenset(selected_names) or None
 
 
 def _operator_accessor_field_groups(accessor_names: frozenset[str] | None, prefix: str) -> frozenset[tuple[str, ...]]:
@@ -2598,10 +2839,19 @@ def _resolve_operator_methodcaller_dynamic_access_names(
                     allow_local_namespace_mapping=allow_local_namespace_mapping,
                 )
             if isinstance(lookup_key, str):
-                resolved_names.update(
-                    _resolve_static_member_names(mapping_roots, lookup_key, alias_scopes) or frozenset()
-                )
-            if fallback_name:
+                selected_value_guaranteed = bool(mapping_roots)
+                for mapping_root in mapping_roots or frozenset():
+                    selected_names, guaranteed = _resolve_mapping_root_item_names(
+                        mapping_root,
+                        lookup_key,
+                        alias_scopes,
+                        allow_module_locals_mapping=allow_module_locals_mapping,
+                    )
+                    resolved_names.update(selected_names or frozenset())
+                    selected_value_guaranteed = selected_value_guaranteed and guaranteed
+            else:
+                selected_value_guaranteed = False
+            if fallback_name and not selected_value_guaranteed:
                 resolved_names.update(_apply_aliases(fallback_name, alias_scopes) or frozenset())
     return frozenset(resolved_names) or None
 
@@ -3112,6 +3362,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._classes_with_forwarding_initializers: set[str] = set()
         self._class_identity_aliases: dict[str, frozenset[str]] = {}
         self._instance_binding_generations: dict[str, int] = {}
+        self._static_container_generation = 0
         self._non_module_scope_depth = 0
         self._annotations_are_postponed = False
         self.risky_calls: set[str] = set()
@@ -3507,7 +3758,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
         if static_container_aliases is not None:
-            return static_container_aliases
+            self._static_container_generation += 1
+            aliases = {
+                *static_container_aliases,
+                f"{_STATIC_CONTAINER_ID_ALIAS_PREFIX}{self._static_container_generation}",
+            }
+            if isinstance(value, ast.List):
+                aliases.add(_STATIC_MUTABLE_SEQUENCE_ALIAS)
+            return frozenset(aliases)
         operator_accessor_sequence_aliases = _resolve_operator_accessor_result_sequence_aliases(
             value,
             self.alias_scopes,
@@ -3515,7 +3773,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
         if operator_accessor_sequence_aliases is not None:
-            return operator_accessor_sequence_aliases
+            self._static_container_generation += 1
+            return frozenset(
+                {
+                    *operator_accessor_sequence_aliases,
+                    f"{_STATIC_CONTAINER_ID_ALIAS_PREFIX}{self._static_container_generation}",
+                }
+            )
         inert_call_result = self._statically_inert_call_result_names(value)
         if inert_call_result is not None:
             return inert_call_result
@@ -3661,9 +3925,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             has_tracked_local_binding = self._has_tracked_local_static_member_binding(syntactic_name)
             if has_tracked_local_binding and syntactic_name is not None:
                 target_names.add(syntactic_name)
-            if syntactic_name in _TRACKED_STATIC_MEMBER_REFERENCES and self._should_track_syntactic_static_reference(
-                syntactic_name
-            ):
+            if syntactic_name in (
+                _TRACKED_STATIC_MEMBER_REFERENCES | _STATIC_KNOWN_PRESENT_MODULE_REFERENCES
+            ) and self._should_track_syntactic_static_reference(syntactic_name):
                 target_names.add(syntactic_name)
             module_roots = frozenset(
                 owner_name
@@ -3790,9 +4054,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if module_roots and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
                 self._invalidate_unknown_callable_side_effects()
                 return
-            if syntactic_name in _TRACKED_STATIC_MEMBER_REFERENCES and self._should_track_syntactic_static_reference(
-                syntactic_name
-            ):
+            if syntactic_name in (
+                _TRACKED_STATIC_MEMBER_REFERENCES | _STATIC_KNOWN_PRESENT_MODULE_REFERENCES
+            ) and self._should_track_syntactic_static_reference(syntactic_name):
                 target_names = frozenset({*target_names, syntactic_name})
             dynamic_target_names = {
                 target_name for target_name in target_names if _is_dynamic_overwritable_high_risk_reference(target_name)
@@ -3967,7 +4231,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
         self._record_deleted_statically_inert_loader_member(frozenset({root}), key)
         dotted_name = f"{root}.{key}"
-        if dotted_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+        if dotted_name in (_TRACKED_STATIC_MEMBER_REFERENCES | _STATIC_KNOWN_PRESENT_MODULE_REFERENCES):
             self._bind_member_reference(dotted_name, frozenset())
             return
         for scope in self.alias_scopes:
@@ -4037,6 +4301,30 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return target_name, target_aliases
 
     @staticmethod
+    def _static_container_identities(aliases: frozenset[str]) -> frozenset[str]:
+        return frozenset(alias for alias in aliases if alias.startswith(_STATIC_CONTAINER_ID_ALIAS_PREFIX))
+
+    def _bind_mutated_static_container(
+        self,
+        target_name: str,
+        previous_aliases: frozenset[str],
+        updated_aliases: frozenset[str],
+    ) -> None:
+        identities = self._static_container_identities(previous_aliases)
+        if len(identities) != 1:
+            self._bind_name(target_name, updated_aliases)
+            return
+        identity = next(iter(identities))
+        rebound = False
+        for scope in self.alias_scopes:
+            for name, value in tuple(scope.items()):
+                if isinstance(value, frozenset) and identity in value:
+                    scope[name] = updated_aliases
+                    rebound = True
+        if not rebound:
+            self._bind_name(target_name, updated_aliases)
+
+    @staticmethod
     def _static_sequence_equivalent_keys(aliases: frozenset[str], key: _StaticItemKey) -> frozenset[_StaticItemKey]:
         if not isinstance(key, (bool, int)):
             return frozenset({key})
@@ -4104,7 +4392,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         value_name,
                     )
                 )
-        self._bind_name(target_name, frozenset(updated_aliases))
+        self._bind_mutated_static_container(target_name, aliases, frozenset(updated_aliases))
 
     def _delete_static_container_item(self, target_name: str, aliases: frozenset[str], key: _StaticItemKey) -> None:
         kind = self._static_container_kind(aliases)
@@ -4124,7 +4412,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if not -len(sequence_items) <= index < len(sequence_items):
                 return
             del sequence_items[index]
-            self._bind_static_sequence_items(target_name, sequence_items)
+            self._bind_static_sequence_items(target_name, aliases, sequence_items)
             return
         equivalent_keys = (
             self._static_sequence_equivalent_keys(aliases, key)
@@ -4139,7 +4427,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             resolved, decoded_key = _decode_operator_itemgetter_key(decoded[0])
             if resolved and decoded_key in equivalent_keys:
                 updated_aliases.discard(alias)
-        self._bind_name(target_name, frozenset(updated_aliases))
+        self._bind_mutated_static_container(target_name, aliases, frozenset(updated_aliases))
 
     @staticmethod
     def _static_sequence_items(aliases: frozenset[str]) -> list[frozenset[str]] | None:
@@ -4159,8 +4447,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return None
         return [frozenset(indexed_names[index]) for index in range(item_count)]
 
-    def _bind_static_sequence_items(self, target_name: str, items: list[frozenset[str]]) -> None:
-        aliases = {_STATIC_SEQUENCE_COMPLETE_ALIAS}
+    def _bind_static_sequence_items(
+        self,
+        target_name: str,
+        previous_aliases: frozenset[str],
+        items: list[frozenset[str]],
+        *,
+        propagate: bool = True,
+    ) -> None:
+        aliases = {
+            _STATIC_SEQUENCE_COMPLETE_ALIAS,
+            *(alias for alias in previous_aliases if alias.startswith(_STATIC_CONTAINER_ID_ALIAS_PREFIX)),
+        }
+        if _STATIC_MUTABLE_SEQUENCE_ALIAS in previous_aliases:
+            aliases.add(_STATIC_MUTABLE_SEQUENCE_ALIAS)
         item_count = len(items)
         for index, value_names in enumerate(items):
             for equivalent_index in (index, index - item_count):
@@ -4172,7 +4472,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                             value_name,
                         )
                     )
-        self._bind_name(target_name, frozenset(aliases))
+        updated_aliases = frozenset(aliases)
+        if propagate:
+            self._bind_mutated_static_container(target_name, previous_aliases, updated_aliases)
+        else:
+            self._bind_name(target_name, updated_aliases)
 
     def _mark_static_container_uncertain(
         self,
@@ -4204,14 +4508,19 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     possible_name,
                 )
             )
-        self._bind_name(target_name, frozenset(updated_aliases))
+        self._bind_mutated_static_container(target_name, aliases, frozenset(updated_aliases))
 
     def _clear_static_container(self, target_name: str, aliases: frozenset[str]) -> None:
         kind = self._static_container_kind(aliases)
         if kind is None:
             return
         _item_prefix, complete_alias, _uncertain_alias = kind
-        self._bind_name(target_name, frozenset({complete_alias}))
+        preserved_aliases = {
+            alias
+            for alias in aliases
+            if alias.startswith(_STATIC_CONTAINER_ID_ALIAS_PREFIX) or alias == _STATIC_MUTABLE_SEQUENCE_ALIAS
+        }
+        self._bind_mutated_static_container(target_name, aliases, frozenset({complete_alias, *preserved_aliases}))
 
     def _static_container_mutation_target(
         self, node: ast.Call
@@ -4269,6 +4578,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if kind is None:
             return
         item_prefix, complete_alias, _uncertain_alias = kind
+        if item_prefix == _STATIC_SEQUENCE_ITEM_ALIAS_PREFIX and _STATIC_MUTABLE_SEQUENCE_ALIAS not in aliases:
+            return
         methodcaller_fields = frozenset(
             fields
             for fields in _operator_methodcaller_fields(self._resolve_reference_names(node.func))
@@ -4338,7 +4649,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                                 min(index if index >= 0 else len(sequence_items) + index, len(sequence_items)),
                             )
                             sequence_items.insert(insertion_index, value_names or frozenset({""}))
-                            self._bind_static_sequence_items(target_name, sequence_items)
+                            self._bind_static_sequence_items(target_name, aliases, sequence_items)
                             return
             if (
                 method_name == "append"
@@ -4348,7 +4659,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 sequence_items = self._static_sequence_items(aliases)
                 if sequence_items is not None:
                     sequence_items.append(value_names or frozenset({""}))
-                    self._bind_static_sequence_items(target_name, sequence_items)
+                    self._bind_static_sequence_items(target_name, aliases, sequence_items)
                     return
 
         if method_name == "clear" and not arguments and not keywords:
@@ -4393,27 +4704,52 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     return
 
         if method_name in {"update", "__ior__"} and item_prefix == _STATIC_DICT_ITEM_ALIAS_PREFIX:
-            updates: list[tuple[_StaticItemKey, ast.expr]] = []
+            updates: list[tuple[_StaticItemKey, _AliasValue]] = []
             if len(arguments) <= 1:
-                positional_updates = _resolve_static_container_update_items(arguments[0]) if arguments else []
+                positional_updates = (
+                    _resolve_static_container_update_names(
+                        arguments[0],
+                        self.alias_scopes,
+                        allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                        allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+                    )
+                    if arguments
+                    else []
+                )
                 if positional_updates is not None:
                     updates.extend(positional_updates)
                     precise_keywords = True
                     for keyword in keywords:
                         if keyword.arg is not None:
-                            updates.append((keyword.arg, keyword.value))
+                            updates.append((keyword.arg, self._resolve_binding_value_names(keyword.value)))
+                            if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                                precise_keywords = False
+                                break
                             continue
-                        expanded_updates = _resolve_static_container_update_items(keyword.value)
+                        expanded_updates = _resolve_static_container_update_names(
+                            keyword.value,
+                            self.alias_scopes,
+                            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+                        )
                         if expanded_updates is None:
                             precise_keywords = False
                             break
                         updates.extend(expanded_updates)
+                        if len(updates) > _MAX_STATIC_CONTAINER_UPDATE_ITEMS:
+                            precise_keywords = False
+                            break
                     if precise_keywords:
-                        for key, value_node in updates:
+                        for key, value_names in updates:
                             current_aliases = _apply_aliases(target_name, self.alias_scopes)
                             if current_aliases is None:
                                 break
-                            self._replace_static_container_item(target_name, current_aliases, key, value_node)
+                            self._replace_static_container_item_names(
+                                target_name,
+                                current_aliases,
+                                key,
+                                value_names,
+                            )
                         return
 
         if item_prefix == _STATIC_SEQUENCE_ITEM_ALIAS_PREFIX and complete_alias in aliases and not keywords:
@@ -4421,7 +4757,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if sequence_items is not None:
                 if method_name == "append" and len(arguments) == 1:
                     sequence_items.append(self._resolve_binding_value_names(arguments[0]) or frozenset({""}))
-                    self._bind_static_sequence_items(target_name, sequence_items)
+                    self._bind_static_sequence_items(target_name, aliases, sequence_items)
                     return
                 if method_name == "insert" and len(arguments) == 2:
                     resolved_index = _resolve_static_integer(arguments[0])
@@ -4437,7 +4773,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                             insertion_index,
                             self._resolve_binding_value_names(arguments[1]) or frozenset({""}),
                         )
-                        self._bind_static_sequence_items(target_name, sequence_items)
+                        self._bind_static_sequence_items(target_name, aliases, sequence_items)
                         return
                 if (
                     method_name in {"extend", "__iadd__"}
@@ -4447,16 +4783,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     sequence_items.extend(
                         self._resolve_binding_value_names(element) or frozenset({""}) for element in arguments[0].elts
                     )
-                    self._bind_static_sequence_items(target_name, sequence_items)
+                    self._bind_static_sequence_items(target_name, aliases, sequence_items)
                     return
                 if method_name == "reverse" and not arguments:
                     sequence_items.reverse()
-                    self._bind_static_sequence_items(target_name, sequence_items)
+                    self._bind_static_sequence_items(target_name, aliases, sequence_items)
                     return
                 if method_name == "__imul__" and len(arguments) == 1:
                     multiplier = _resolve_static_integer(arguments[0])
                     if multiplier is not None and max(multiplier, 0) * len(sequence_items) <= 256:
-                        self._bind_static_sequence_items(target_name, sequence_items * max(multiplier, 0))
+                        self._bind_static_sequence_items(target_name, aliases, sequence_items * max(multiplier, 0))
                         return
 
         if complete_alias in aliases or self._static_container_kind(aliases) is not None:
@@ -4467,7 +4803,94 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 include_existing_as_possible=item_prefix == _STATIC_SEQUENCE_ITEM_ALIAS_PREFIX,
             )
 
+    def _apply_resolved_namespace_item_write(
+        self,
+        method_name: str,
+        roots: frozenset[str],
+        key: str,
+        value_names: _AliasValue,
+    ) -> None:
+        if method_name in {"pop", "__delitem__"}:
+            for root in roots:
+                self._delete_namespace_key(root, key)
+            return
+        roots = self._promote_mutated_statically_inert_loader_roots(roots, key, None, value_names)
+        for root in roots:
+            resolved_value = (
+                self._setdefault_value_for_key(root, key, value_names) if method_name == "setdefault" else value_names
+            )
+            if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                self._bind_module_namespace_key(key, resolved_value)
+                self._restore_reassigned_instance_member_defaults(key, resolved_value)
+            elif root == _SYS_MODULES_NAMESPACE_ALIAS:
+                if key in _TRACKED_STATIC_MODULE_ROOTS:
+                    self._bind_name(f"{_SYS_MODULES_BINDING_PREFIX}{key}", resolved_value)
+            elif root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                self._bind_name(key, resolved_value)
+                self._restore_reassigned_instance_member_defaults(key, resolved_value)
+            else:
+                self._bind_member_reference(f"{root}.{key}", resolved_value)
+
     def _record_namespace_write_call(self, node: ast.Call) -> bool:
+        methodcaller_fields = _operator_methodcaller_fields(self._resolve_reference_names(node.func))
+        methodcaller_target = _operator_accessor_target_node(node) if methodcaller_fields else None
+        methodcaller_roots = (
+            _resolve_namespace_mapping_roots(
+                methodcaller_target,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if methodcaller_target is not None
+            else None
+        )
+        if methodcaller_roots is not None:
+            if self._namespace_mapping_dispatch_is_uncertain(methodcaller_roots):
+                self._invalidate_unknown_callable_side_effects()
+                return True
+            method_names = {method_name for method_name, _key, _value in methodcaller_fields}
+            if len(method_names) == 1:
+                method_name = next(iter(method_names))
+                if method_name in {"update", "__ior__"}:
+                    decoded_updates: dict[str, set[str]] = {}
+                    for _method_name, key_field, value_name in methodcaller_fields:
+                        key_resolved, key = _decode_operator_itemgetter_key(key_field)
+                        if not key_resolved or not isinstance(key, str):
+                            break
+                        decoded_updates.setdefault(key, set())
+                        if value_name:
+                            decoded_updates[key].add(value_name)
+                    else:
+                        for key, decoded_value_names in decoded_updates.items():
+                            self._apply_resolved_namespace_item_write(
+                                method_name,
+                                methodcaller_roots,
+                                key,
+                                frozenset(decoded_value_names) or None,
+                            )
+                        return True
+                elif method_name in _NAMESPACE_MUTATION_METHODS:
+                    decoded_keys = {
+                        key
+                        for _method_name, key_field, _value_name in methodcaller_fields
+                        for key_resolved, key in (_decode_operator_itemgetter_key(key_field),)
+                        if key_resolved and isinstance(key, str)
+                    }
+                    if len(decoded_keys) == 1:
+                        methodcaller_value_names: _AliasValue = (
+                            frozenset(
+                                value_name for _method_name, _key_field, value_name in methodcaller_fields if value_name
+                            )
+                            or None
+                        )
+                        self._apply_resolved_namespace_item_write(
+                            method_name,
+                            methodcaller_roots,
+                            next(iter(decoded_keys)),
+                            methodcaller_value_names,
+                        )
+                        return True
+
         update_roots: frozenset[str] | None = None
         update_arguments = node.args
         update_methods = {"update", "__ior__"}
@@ -6747,6 +7170,51 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._record_static_container_mutation(synthetic_call)
                 self.visit(node.target)
                 return
+        if isinstance(node.op, (ast.Add, ast.Mult)):
+            tracked_container = self._tracked_static_container(node.target)
+            if tracked_container is not None:
+                target_name, aliases = tracked_container
+                kind = self._static_container_kind(aliases)
+                if kind is not None and kind[0] == _STATIC_SEQUENCE_ITEM_ALIAS_PREFIX:
+                    method_name = "__iadd__" if isinstance(node.op, ast.Add) else "__imul__"
+                    if _STATIC_MUTABLE_SEQUENCE_ALIAS in aliases:
+                        synthetic_call = ast.Call(
+                            func=ast.Attribute(value=node.target, attr=method_name, ctx=ast.Load()),
+                            args=[node.value],
+                            keywords=[],
+                        )
+                        self._record_static_container_mutation(synthetic_call)
+                        self.visit(node.target)
+                        return
+
+                    sequence_items = self._static_sequence_items(aliases)
+                    if sequence_items is not None:
+                        rebound_items: list[frozenset[str]] | None = None
+                        if isinstance(node.op, ast.Add) and isinstance(node.value, ast.Tuple):
+                            rebound_items = [
+                                *sequence_items,
+                                *(
+                                    self._resolve_binding_value_names(element) or frozenset({""})
+                                    for element in node.value.elts
+                                ),
+                            ]
+                        elif isinstance(node.op, ast.Mult):
+                            multiplier = _resolve_static_integer(node.value)
+                            if multiplier is not None and max(multiplier, 0) * len(sequence_items) <= 256:
+                                rebound_items = sequence_items * max(multiplier, 0)
+                        if rebound_items is not None:
+                            self._static_container_generation += 1
+                            rebound_aliases = frozenset(
+                                {f"{_STATIC_CONTAINER_ID_ALIAS_PREFIX}{self._static_container_generation}"}
+                            )
+                            self._bind_static_sequence_items(
+                                target_name,
+                                rebound_aliases,
+                                rebound_items,
+                                propagate=False,
+                            )
+                            self.visit(node.target)
+                            return
         resolved_names = self._resolve_reference_names(node.target)
         if resolved_names is not None:
             for resolved_name in resolved_names:
