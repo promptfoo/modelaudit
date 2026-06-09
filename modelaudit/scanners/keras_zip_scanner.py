@@ -6,8 +6,11 @@ import os
 import re
 import tempfile
 import zipfile
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from modelaudit.detectors.network_comm import redact_url_for_finding
 from modelaudit.detectors.suspicious_symbols import (
@@ -35,13 +38,18 @@ from ..utils.file.hdf5 import (
     is_hdf5_signature_probe_complete,
 )
 from ._archive_config import get_archive_depth
-from ._evidence_redaction import redact_evidence_string, redact_evidence_value
+from ._evidence_redaction import (
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+    redact_untrusted_error_message,
+)
 from .archive_dispatch import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
     SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
 )
 from .archive_member_security import is_executable_archive_member_name
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
@@ -239,7 +247,11 @@ _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
-_MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
+_MAX_CONFIG_TRAVERSAL_PATH_CHARS = 512
+_CONFIG_TRAVERSAL_DEPTH_EXCEEDED_REASON = "keras_zip_config_traversal_depth_exceeded"
+_CONFIG_TRAVERSAL_ITEM_LIMIT_EXCEEDED_REASON = "keras_zip_config_traversal_item_limit_exceeded"
+_CONFIG_STRING_LITERAL_LIMIT_EXCEEDED_REASON = "keras_zip_config_string_literal_limit_exceeded"
+_CONFIG_STRING_CHAR_LIMIT_EXCEEDED_REASON = "keras_zip_config_string_char_limit_exceeded"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.*+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
     r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
@@ -369,6 +381,28 @@ class _AmbiguousKerasArchiveMemberError(Exception):
         self.candidate_filenames = candidate_filenames
 
 
+@dataclass
+class _ConfigTraversalState:
+    """Mutable accounting for one bounded config.json traversal."""
+
+    max_depth: int
+    max_items: int
+    max_string_literals: int
+    max_string_chars: int
+    items_seen: int = 0
+    items_pending: int = 0
+    direct_items_seen: int = 0
+    string_literals_seen: int = 0
+    string_chars_seen: int = 0
+    item_limit_reached: bool = False
+    direct_item_limit_reached: bool = False
+    halted: bool = False
+
+    @property
+    def exhausted(self) -> bool:
+        return self.halted or self.item_limit_reached
+
+
 class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
 
@@ -379,8 +413,57 @@ class KerasZipScanner(BaseScanner):
     MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
+    MAX_ARCHIVE_MEMBER_TEXT_CHARS: ClassVar[int] = 4096
     MAX_NESTED_LAYER_DEPTH: ClassVar[int] = 64
     MAX_NESTED_LAYER_ITEMS: ClassVar[int] = 1_000
+    MAX_CONFIG_TRAVERSAL_DEPTH: ClassVar[int] = 256
+    MAX_CONFIG_TRAVERSAL_ITEMS: ClassVar[int] = 100_000
+    MAX_CONFIG_STRING_LITERALS: ClassVar[int] = 100_000
+    MAX_CONFIG_STRING_CHARS: ClassVar[int] = 2 * 1024 * 1024
+    MAX_CONFIG_SECURITY_LITERAL_CHARS: ClassVar[int] = 256
+    _CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT: ClassVar[frozenset[str]] = frozenset(
+        {
+            "args",
+            "backward_layer",
+            "callable",
+            "cell",
+            "cells",
+            "class_name",
+            "compile_config",
+            "config",
+            "fn",
+            "fn_module",
+            "function",
+            "function_name",
+            "inbound_nodes",
+            "kwargs",
+            "layer",
+            "layers",
+            "loss",
+            "metrics",
+            "module",
+            "name",
+            "registered_name",
+            "weighted_metrics",
+        }
+    )
+    _CONFIG_SECURITY_STRING_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "callable",
+            "class_name",
+            "config",
+            "fn",
+            "fn_module",
+            "function",
+            "function_name",
+            "loss",
+            "metrics",
+            "module",
+            "name",
+            "registered_name",
+            "weighted_metrics",
+        }
+    )
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
     _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
@@ -417,10 +500,63 @@ class KerasZipScanner(BaseScanner):
         if self.max_file_read_size > 0:
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
+        self.max_config_traversal_depth = min(
+            self._normalize_positive_int_config(
+                self.config.get("max_config_traversal_depth"),
+                self.MAX_CONFIG_TRAVERSAL_DEPTH,
+            ),
+            self.MAX_CONFIG_TRAVERSAL_DEPTH,
+        )
+        self.max_config_traversal_items = self._normalize_positive_int_config(
+            self.config.get("max_config_traversal_items"),
+            self.MAX_CONFIG_TRAVERSAL_ITEMS,
+        )
+        self.max_config_string_literals = self._normalize_positive_int_config(
+            self.config.get("max_config_string_literals"),
+            self.MAX_CONFIG_STRING_LITERALS,
+        )
+        self.max_config_string_chars = self._normalize_positive_int_config(
+            self.config.get("max_config_string_chars"),
+            self.MAX_CONFIG_STRING_CHARS,
+        )
         self._nested_layer_items_scanned = 0
         self._content_route_embedded_weights = False
         self._checked_config_module_references: set[tuple[int, str, str]] = set()
+        self._current_keras_version: str | None = None
         self._torchmodule_version_status: bool | None = None
+
+    @classmethod
+    def _redact_archive_member_name(cls, member_name: str) -> str:
+        """Return bounded, redacted archive-member evidence for serialized findings."""
+        return redact_evidence_string(member_name, max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS)
+
+    @classmethod
+    def _redact_recursive_archive_scan_result(cls, nested_result: ScanResult) -> None:
+        """Redact model-controlled ZIP member evidence before merging generic archive findings."""
+        findings: list[Check | Issue] = [*nested_result.checks, *nested_result.issues]
+        for finding in findings:
+            finding.message = redact_evidence_string(
+                finding.message,
+                max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+            )
+            if finding.location is not None:
+                finding.location = redact_evidence_string(
+                    finding.location,
+                    max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+                )
+            finding.details = cast(
+                dict[str, Any],
+                redact_evidence_value(
+                    finding.details,
+                    max_string_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+                ),
+            )
+
+        if "contents" in nested_result.metadata:
+            nested_result.metadata["contents"] = redact_evidence_value(
+                nested_result.metadata["contents"],
+                max_string_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+            )
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -643,6 +779,7 @@ class KerasZipScanner(BaseScanner):
         )
         if has_embedded_weights_limit:
             self._suppress_expected_embedded_weights_limit_noise(nested_result)
+        self._redact_recursive_archive_scan_result(nested_result)
         preserved_metadata = dict(result.metadata)
         nested_contents = nested_result.metadata.get("contents")
         result.merge(nested_result)
@@ -667,6 +804,7 @@ class KerasZipScanner(BaseScanner):
         self._nested_layer_items_scanned = 0
         self._content_route_embedded_weights = False
         self._checked_config_module_references.clear()
+        self._current_keras_version = None
         self._torchmodule_version_status = None
 
         # Check if path is valid
@@ -702,7 +840,7 @@ class KerasZipScanner(BaseScanner):
                         message="No config.json found in Keras ZIP file",
                         severity=IssueSeverity.INFO,
                         location=path,
-                        details={"files": zf.namelist()},
+                        details={"files": [self._redact_archive_member_name(name) for name in zf.namelist()]},
                     )
                     self._load_keras_metadata(zf, result)
                     self._check_archive_security_members(zf, path, result)
@@ -721,6 +859,11 @@ class KerasZipScanner(BaseScanner):
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     model_config = json.loads(config_data)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    redacted_error = (
+                        str(e)
+                        if type(e) is ValueError and str(e) == "ZIP member exceeds bounded read size"
+                        else redact_untrusted_error_message(e)
+                    )
                     self._mark_inconclusive_scan_result(result, "keras_zip_config_parse_failed")
                     # Fall back to a structure-aware raw scan only when the archive
                     # config is malformed and cannot be parsed as JSON.
@@ -729,11 +872,11 @@ class KerasZipScanner(BaseScanner):
                     result.add_check(
                         name="Config JSON Parsing",
                         passed=False,
-                        message=f"Failed to parse config.json: {e}",
+                        message=f"Failed to parse config.json: {redacted_error}",
                         severity=IssueSeverity.INFO,
-                        location=f"{path}/{config_info.filename}",
+                        location=f"{path}/{self._redact_archive_member_name(config_info.filename)}",
                         details={
-                            "error": str(e),
+                            "error": redacted_error,
                             "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
                         },
                     )
@@ -745,6 +888,7 @@ class KerasZipScanner(BaseScanner):
 
                 # CVE-2025-9906 can be detected in any parsed JSON shape; the
                 # rest of the structured model scan requires a top-level object.
+                bounded_model_config = self._validate_config_traversal_budget(model_config, result)
                 self._check_unsafe_deserialization_bypass(model_config, result)
                 self._check_get_file_archive_extraction(model_config, result)
                 self._check_get_file_gadget(model_config, result)
@@ -757,7 +901,7 @@ class KerasZipScanner(BaseScanner):
                         passed=False,
                         message=f"Invalid config.json type: expected dict, got {type(model_config).__name__}",
                         severity=IssueSeverity.INFO,
-                        location=f"{path}/{config_info.filename}",
+                        location=f"{path}/{self._redact_archive_member_name(config_info.filename)}",
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
                     self._check_archive_security_members(zf, path, result)
@@ -766,37 +910,45 @@ class KerasZipScanner(BaseScanner):
                     return result
 
                 # Scan model configuration
-                self._scan_model_config(model_config, result)
+                self._scan_model_config(bounded_model_config, result)
 
                 self._check_archive_security_members(zf, path, result)
 
                 self._merge_recursive_archive_scan(path, result)
 
         except _AmbiguousKerasArchiveMemberError as e:
+            redacted_member_name = self._redact_archive_member_name(e.member_name)
+            redacted_candidate_filenames = [
+                self._redact_archive_member_name(filename) for filename in e.candidate_filenames
+            ]
             result.add_check(
                 name="Keras ZIP Member Path Validation",
                 passed=False,
-                message=str(e),
+                message=(
+                    f"Ambiguous Keras ZIP member '{redacted_member_name}' matches multiple archive entries: "
+                    f"{', '.join(redacted_candidate_filenames)}"
+                ),
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "member_name": e.member_name,
-                    "candidate_filenames": e.candidate_filenames,
+                    "member_name": redacted_member_name,
+                    "candidate_filenames": redacted_candidate_filenames,
                 },
             )
             self._merge_recursive_archive_scan(path, result)
             result.finish(success=False)
             return result
         except OSError as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_read_failed")
             result.add_check(
                 name="Keras ZIP File Read",
                 passed=False,
-                message=f"Unable to read Keras ZIP content: {e!s}",
+                message=f"Unable to read Keras ZIP content: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_read_failed",
@@ -806,15 +958,16 @@ class KerasZipScanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_scan_failed")
             result.add_check(
                 name="Keras ZIP File Scan",
                 passed=False,
-                message=f"Error scanning Keras ZIP file: {e!s}",
+                message=f"Error scanning Keras ZIP file: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_scan_failed",
@@ -849,6 +1002,7 @@ class KerasZipScanner(BaseScanner):
         keras_version = metadata.get("keras_version")
         if isinstance(keras_version, str) and keras_version.strip():
             raw_keras_version = keras_version.strip()
+            self._current_keras_version = raw_keras_version
             # Classify before evidence truncation can alter a valid long local-version label.
             self._torchmodule_version_status = self._is_vulnerable_keras_3_11_x(raw_keras_version)
             result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
@@ -864,22 +1018,24 @@ class KerasZipScanner(BaseScanner):
         for filename in archive.namelist():
             normalized_name = filename.lower()
             if normalized_name.endswith((".py", ".pyc", ".pyo")):
+                redacted_filename = self._redact_archive_member_name(filename)
                 result.add_check(
                     name="Python File Detection",
                     passed=False,
-                    message=f"Python file found in Keras ZIP: {filename}",
+                    message=f"Python file found in Keras ZIP: {redacted_filename}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}/{filename}",
-                    details={"filename": filename},
+                    location=f"{archive_path}/{redacted_filename}",
+                    details={"filename": redacted_filename},
                 )
             elif is_executable_archive_member_name(normalized_name):
+                redacted_filename = self._redact_archive_member_name(filename)
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
-                    message=f"Executable file found in Keras ZIP: {filename}",
+                    message=f"Executable file found in Keras ZIP: {redacted_filename}",
                     severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}/{filename}",
-                    details={"filename": filename},
+                    location=f"{archive_path}/{redacted_filename}",
+                    details={"filename": redacted_filename},
                 )
 
     @staticmethod
@@ -893,6 +1049,434 @@ class KerasZipScanner(BaseScanner):
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata["scan_outcome_reasons"] = reasons
         result.metadata["analysis_incomplete"] = True
+
+    def _new_config_traversal_state(self) -> _ConfigTraversalState:
+        return _ConfigTraversalState(
+            max_depth=self.max_config_traversal_depth,
+            max_items=self.max_config_traversal_items,
+            max_string_literals=self.max_config_string_literals,
+            max_string_chars=self.max_config_string_chars,
+        )
+
+    @staticmethod
+    def _bounded_config_path(path: str) -> str:
+        if len(path) <= _MAX_CONFIG_TRAVERSAL_PATH_CHARS:
+            return path
+        return f"{path[: _MAX_CONFIG_TRAVERSAL_PATH_CHARS - 3]}..."
+
+    @classmethod
+    def _config_child_path(cls, path: str, child: str) -> str:
+        return cls._bounded_config_path(f"{path}{child}")
+
+    def _mark_config_traversal_limit_exceeded(
+        self,
+        result: ScanResult,
+        reason: str,
+        *,
+        name: str,
+        message: str,
+        context: str,
+        details: dict[str, Any],
+    ) -> None:
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        already_reported = isinstance(existing_reasons, list) and reason in existing_reasons
+        self._mark_inconclusive_scan_result(result, reason)
+        if already_reported:
+            return
+
+        result.add_check(
+            name=name,
+            passed=False,
+            message=message,
+            rule_code="S902",
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path}/config.json",
+            details={
+                "scan_outcome_reason": reason,
+                "context": context,
+                **details,
+            },
+        )
+
+    def _config_traversal_depth_allowed(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+    ) -> bool:
+        if depth > state.max_depth:
+            self._mark_config_traversal_limit_exceeded(
+                result,
+                _CONFIG_TRAVERSAL_DEPTH_EXCEEDED_REASON,
+                name="Config Traversal Depth Limit",
+                message=f"Keras config.json traversal exceeds maximum depth of {state.max_depth}",
+                context=context,
+                details={
+                    "actual_depth": depth,
+                    "max_config_traversal_depth": state.max_depth,
+                    "items_seen": state.items_seen,
+                },
+            )
+            return False
+
+        return True
+
+    def _mark_config_item_limit_exceeded(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        actual_items: int,
+    ) -> None:
+        state.item_limit_reached = True
+        self._mark_config_traversal_limit_exceeded(
+            result,
+            _CONFIG_TRAVERSAL_ITEM_LIMIT_EXCEEDED_REASON,
+            name="Config Traversal Item Limit",
+            message=f"Keras config.json traversal exceeds maximum of {state.max_items} items",
+            context=context,
+            details={
+                "actual_items": actual_items,
+                "max_config_traversal_items": state.max_items,
+            },
+        )
+
+    def _reserve_config_traversal_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+        allow_depth_exceeded: bool = False,
+    ) -> bool:
+        depth_allowed = self._config_traversal_depth_allowed(state, result, context=context, depth=depth)
+        if not depth_allowed and not allow_depth_exceeded:
+            return False
+
+        if state.items_seen >= state.max_items:
+            self._mark_config_item_limit_exceeded(
+                state,
+                result,
+                context=context,
+                actual_items=state.items_seen + 1,
+            )
+            return False
+
+        state.items_seen += 1
+        return True
+
+    def _queue_config_traversal_item(
+        self,
+        pending: deque[Any],
+        item: Any,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+        allow_depth_exceeded: bool = False,
+    ) -> bool:
+        if not self._reserve_config_traversal_pending_item(
+            state,
+            result,
+            context=context,
+            depth=depth,
+            allow_depth_exceeded=allow_depth_exceeded,
+        ):
+            return False
+
+        pending.append(item)
+        return True
+
+    def _reserve_config_traversal_pending_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+        allow_depth_exceeded: bool = False,
+    ) -> bool:
+        if state.exhausted:
+            return False
+        depth_allowed = self._config_traversal_depth_allowed(state, result, context=context, depth=depth)
+        if not depth_allowed and not allow_depth_exceeded:
+            return False
+        if state.items_seen + state.items_pending >= state.max_items:
+            self._mark_config_item_limit_exceeded(
+                state,
+                result,
+                context=context,
+                actual_items=state.items_seen + state.items_pending + 1,
+            )
+            return False
+
+        state.items_pending += 1
+        return True
+
+    def _reserve_config_direct_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+        allow_depth_exceeded: bool = False,
+    ) -> bool:
+        """Reserve bounded work for a direct mapping value not queued for traversal."""
+        if state.halted or state.direct_item_limit_reached:
+            return False
+        depth_allowed = self._config_traversal_depth_allowed(state, result, context=context, depth=depth)
+        if not depth_allowed and not allow_depth_exceeded:
+            return False
+        if state.direct_items_seen >= state.max_items:
+            state.direct_item_limit_reached = True
+            self._mark_config_item_limit_exceeded(
+                state,
+                result,
+                context=context,
+                actual_items=state.direct_items_seen + 1,
+            )
+            return False
+
+        state.direct_items_seen += 1
+        return True
+
+    def _record_config_string_literal(
+        self,
+        value: str,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+    ) -> str | None:
+        if state.string_literals_seen >= state.max_string_literals:
+            state.halted = True
+            self._mark_config_traversal_limit_exceeded(
+                result,
+                _CONFIG_STRING_LITERAL_LIMIT_EXCEEDED_REASON,
+                name="Config String Literal Limit",
+                message=f"Keras config.json traversal exceeds maximum of {state.max_string_literals} string literals",
+                context=context,
+                details={
+                    "actual_string_literals": state.string_literals_seen + 1,
+                    "max_config_string_literals": state.max_string_literals,
+                },
+            )
+            return None
+
+        state.string_literals_seen += 1
+        next_string_chars_seen = state.string_chars_seen + len(value)
+        if next_string_chars_seen > state.max_string_chars:
+            state.halted = True
+            state.string_chars_seen = state.max_string_chars
+            self._mark_config_traversal_limit_exceeded(
+                result,
+                _CONFIG_STRING_CHAR_LIMIT_EXCEEDED_REASON,
+                name="Config String Character Limit",
+                message=f"Keras config.json traversal exceeds maximum of {state.max_string_chars} string characters",
+                context=context,
+                details={
+                    "actual_string_chars": next_string_chars_seen,
+                    "max_config_string_chars": state.max_string_chars,
+                    "string_literals_seen": state.string_literals_seen,
+                },
+            )
+            return None
+
+        state.string_chars_seen = next_string_chars_seen
+        return value
+
+    def _validate_config_traversal_budget(self, model_config: Any, result: ScanResult) -> Any:
+        """Return the admitted config.json projection and fail closed on omitted coverage."""
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        security_literal_state = self._new_config_traversal_state()
+        root: dict[str, Any] = {}
+        pending: deque[tuple[Any, int, str, dict[Any, Any] | list[Any], Any, bool]] = deque(
+            [(model_config, 0, "root", root, "value", False)]
+        )
+
+        def attach(parent: dict[Any, Any] | list[Any], slot: Any, value: Any) -> None:
+            if isinstance(parent, list):
+                parent.append(value)
+            else:
+                parent[slot] = value
+
+        traversal_state.items_pending = 1
+        while pending:
+            node, depth, context, parent, slot, preserve_security_string = pending.popleft()
+            traversal_state.items_pending -= 1
+            allow_depth_exceeded = not isinstance(node, (dict, list))
+            if not self._reserve_config_traversal_item(
+                traversal_state,
+                result,
+                context=context,
+                depth=depth,
+                allow_depth_exceeded=allow_depth_exceeded,
+            ):
+                continue
+
+            if isinstance(node, str):
+                bounded_value = None
+                if not literal_state.halted:
+                    bounded_value = self._record_config_string_literal(node, literal_state, result, context=context)
+                if (
+                    bounded_value is None
+                    and preserve_security_string
+                    and not security_literal_state.halted
+                    and len(node) <= self.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                ):
+                    bounded_value = self._record_config_string_literal(
+                        node,
+                        security_literal_state,
+                        result,
+                        context=context,
+                    )
+                if bounded_value is not None:
+                    attach(parent, slot, bounded_value)
+                continue
+
+            if isinstance(node, dict):
+                bounded_node: dict[Any, Any] = {}
+                attach(parent, slot, bounded_node)
+                if traversal_state.item_limit_reached:
+                    for key, value in node.items():
+                        redacted_key = redact_evidence_string(str(key), max_chars=64)
+                        child_context = self._config_child_path(context, f".{redacted_key}")
+                        if not self._reserve_config_direct_item(
+                            traversal_state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                            allow_depth_exceeded=True,
+                        ):
+                            break
+                        key_context = self._config_child_path(context, f".<key:{redacted_key}>")
+                        bounded_key = key
+                        if isinstance(key, str):
+                            bounded_key = None
+                            if not literal_state.halted:
+                                bounded_key = self._record_config_string_literal(
+                                    key,
+                                    literal_state,
+                                    result,
+                                    context=key_context,
+                                )
+                            if bounded_key is None and key in self._CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT:
+                                bounded_key = key
+                            if bounded_key is None:
+                                continue
+                        if isinstance(value, (dict, list)):
+                            continue
+                        bounded_value = value
+                        if isinstance(value, str):
+                            bounded_value = None
+                            if not literal_state.halted:
+                                bounded_value = self._record_config_string_literal(
+                                    value,
+                                    literal_state,
+                                    result,
+                                    context=child_context,
+                                )
+                            if (
+                                bounded_value is None
+                                and isinstance(key, str)
+                                and key in self._CONFIG_SECURITY_STRING_KEYS
+                                and not security_literal_state.halted
+                                and len(value) <= self.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                            ):
+                                bounded_value = self._record_config_string_literal(
+                                    value,
+                                    security_literal_state,
+                                    result,
+                                    context=child_context,
+                                )
+                            if bounded_value is None:
+                                continue
+                        bounded_node[bounded_key] = bounded_value
+                    continue
+                for key, value in node.items():
+                    redacted_key = redact_evidence_string(str(key), max_chars=64)
+                    key_context = self._config_child_path(context, f".<key:{redacted_key}>")
+                    bounded_key = key
+                    if isinstance(key, str):
+                        bounded_key = None
+                        if not literal_state.halted:
+                            bounded_key = self._record_config_string_literal(
+                                key,
+                                literal_state,
+                                result,
+                                context=key_context,
+                            )
+                        if bounded_key is None and key in self._CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT:
+                            bounded_key = key
+                        if bounded_key is None:
+                            if not self._reserve_config_direct_item(
+                                traversal_state,
+                                result,
+                                context=key_context,
+                                depth=depth + 1,
+                                allow_depth_exceeded=True,
+                            ):
+                                break
+                            continue
+
+                    child_context = self._config_child_path(context, f".{redacted_key}")
+                    child_is_scalar = not isinstance(value, (dict, list))
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (
+                            value,
+                            depth + 1,
+                            child_context,
+                            bounded_node,
+                            bounded_key,
+                            isinstance(key, str) and key in self._CONFIG_SECURITY_STRING_KEYS,
+                        ),
+                        traversal_state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                        allow_depth_exceeded=child_is_scalar,
+                    ):
+                        break
+                continue
+
+            if isinstance(node, list):
+                bounded_node_list: list[Any] = []
+                attach(parent, slot, bounded_node_list)
+                if traversal_state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    child_is_scalar = not isinstance(value, (dict, list))
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (
+                            value,
+                            depth + 1,
+                            child_context,
+                            bounded_node_list,
+                            None,
+                            preserve_security_string,
+                        ),
+                        traversal_state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                        allow_depth_exceeded=child_is_scalar,
+                    ):
+                        break
+                continue
+
+            attach(parent, slot, node)
+
+        return root.get("value")
 
     @staticmethod
     def _has_embedded_weights_limit_reason(result: ScanResult) -> bool:
@@ -978,11 +1562,26 @@ class KerasZipScanner(BaseScanner):
 
         # Check model class name
         model_class = model_config.get("class_name", "")
-        redacted_model_class = redact_evidence_string(str(model_class))
+        model_class_is_string = isinstance(model_class, str)
+        redacted_model_class = (
+            redact_evidence_string(model_class) if model_class_is_string else f"<invalid:{type(model_class).__name__}>"
+        )
         result.metadata["model_class"] = redacted_model_class
 
         # Check for subclassed models (custom class names)
-        check_subclassed_model(model_class, result, self.current_file_path)
+        if model_class_is_string:
+            check_subclassed_model(model_class, result, self.current_file_path)
+        else:
+            self._mark_inconclusive_scan_result(result, "keras_zip_model_class_invalid_type")
+            result.add_check(
+                name="Model Class Type Validation",
+                passed=False,
+                message=f"Invalid model class type: expected str, got {type(model_class).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path}/config.json",
+                details={"actual_type": type(model_class).__name__, "expected_type": "str"},
+            )
 
         # Root configs can themselves be serialized callables rather than model containers.
         self._check_layer_module_references(
@@ -994,7 +1593,7 @@ class KerasZipScanner(BaseScanner):
         )
 
         # Check for suspicious model types (Lambda, etc.)
-        if model_class in self.suspicious_layer_types:
+        if model_class_is_string and model_class in self.suspicious_layer_types:
             result.add_check(
                 name="Model Type Security Check",
                 passed=False,
@@ -1059,6 +1658,8 @@ class KerasZipScanner(BaseScanner):
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
+        layer_count_display_keys: dict[str, str] = {}
+        layer_count_next_occurrences: dict[str, int] = {}
 
         # Check each layer
         for i, layer in enumerate(layers):
@@ -1097,11 +1698,18 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Update layer count
-            layer_count_key = (
-                redact_evidence_string(layer_class)
-                if isinstance(layer_class, str)
-                else f"<invalid:{type(layer_class).__name__}>"
+            layer_count_identity = (
+                f"str:{layer_class}" if isinstance(layer_class, str) else f"invalid:{type(layer_class).__name__}"
             )
+            layer_count_key = layer_count_display_keys.get(layer_count_identity)
+            if layer_count_key is None:
+                display_key = layer_class if isinstance(layer_class, str) else f"<invalid:{type(layer_class).__name__}>"
+                layer_count_key = redact_evidence_mapping_key(
+                    display_key,
+                    layer_counts,
+                    next_occurrences=layer_count_next_occurrences,
+                )
+                layer_count_display_keys[layer_count_identity] = layer_count_key
             layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
@@ -1119,8 +1727,11 @@ class KerasZipScanner(BaseScanner):
             if is_lambda_layer:
                 self._check_lambda_layer(layer, result, layer_name)
                 keras_version = result.metadata.get("keras_version")
+                classification_keras_version = self._current_keras_version
                 cve_2024_3660_status = (
-                    self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                    self._is_vulnerable_to_cve_2024_3660(classification_keras_version)
+                    if isinstance(classification_keras_version, str)
+                    else None
                 )
                 if cve_2024_3660_status is True:
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
@@ -1204,14 +1815,15 @@ class KerasZipScanner(BaseScanner):
                     },
                 )
             elif layer_class in self.suspicious_layer_types:
+                redacted_layer_class = redact_evidence_string(layer_class)
                 result.add_check(
                     name="Suspicious Layer Type Detection",
                     passed=False,
-                    message=f"Suspicious layer type found: {layer_class}",
+                    message=f"Suspicious layer type found: {redacted_layer_class}",
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_class": layer_class,
+                        "layer_class": redacted_layer_class,
                         "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
                     },
@@ -1271,7 +1883,13 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
-            self._scan_wrapped_layer_config(layer_class, layer_config, result, layer_name, nested_layer_depth)
+            self._scan_wrapped_layer_config(
+                layer_class,
+                layer_config,
+                result,
+                redacted_layer_name,
+                nested_layer_depth,
+            )
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
@@ -1765,11 +2383,37 @@ class KerasZipScanner(BaseScanner):
         trusted_container: bool = False,
     ) -> None:
         """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
-        pending: list[tuple[Any, str | None, bool]] = [(config_value, None, trusted_container)]
+        state = self._new_config_traversal_state()
+        pending: deque[tuple[Any, str | None, bool, int, str]] = deque(
+            [(config_value, None, trusted_container, 0, f"layer:{layer_name}")]
+        )
+        state.items_pending = 1
         while pending:
-            node, parent_key, container_is_trusted = pending.pop()
+            node, parent_key, container_is_trusted, depth, context = pending.popleft()
+            state.items_pending -= 1
+            if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
+                continue
+
             if isinstance(node, list):
-                pending.extend((item, parent_key, container_is_trusted) for item in node)
+                if state.item_limit_reached:
+                    continue
+                for index, item in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (
+                            item,
+                            parent_key,
+                            container_is_trusted,
+                            depth + 1,
+                            child_context,
+                        ),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
                 continue
             if not isinstance(node, dict):
                 continue
@@ -1798,11 +2442,27 @@ class KerasZipScanner(BaseScanner):
                         )
 
             next_container_is_trusted = container_is_trusted and not is_serialized_object
-            pending.extend(
-                (value, str(key).lower(), next_container_is_trusted)
-                for key, value in node.items()
-                if key not in {"module", "fn_module", "class_name", "registered_name"}
-            )
+            if state.item_limit_reached:
+                continue
+            for key, value in node.items():
+                if key in {"module", "fn_module", "class_name", "registered_name"}:
+                    continue
+                child_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
+                if not self._queue_config_traversal_item(
+                    pending,
+                    (
+                        value,
+                        str(key).lower(),
+                        next_container_is_trusted,
+                        depth + 1,
+                        child_context,
+                    ),
+                    state,
+                    result,
+                    context=child_context,
+                    depth=depth + 1,
+                ):
+                    break
 
     def _check_layer_module_references(
         self,
@@ -1883,18 +2543,86 @@ class KerasZipScanner(BaseScanner):
         as a gadget to download and execute arbitrary files even with safe_mode=True.
         Detected when a single config object references get_file and includes URL arguments.
         """
-        for context, node in self._iter_dict_nodes(model_config):
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        url_literal_state = self._new_config_traversal_state()
+        for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
-            direct_string_values: list[str] = []
-            url_candidate_values: list[str] = []
-            for key, value in node.items():
-                direct_string_values.extend(self._extract_string_literals(value))
-                key_lower = str(key).lower()
-                if key_lower in {"url", "origin", "args", "kwargs"}:
-                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
-            has_get_file = _has_get_file_reference(direct_string_values)
-            has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
+            has_get_file = self._node_has_direct_get_file_reference(node)
+            has_url = has_get_file and self._node_has_direct_get_file_url(node)
+            if not literal_state.halted and not literal_state.direct_item_limit_reached:
+                direct_string_values: list[str] = []
+                url_candidate_values: list[str] = []
+                nested_url_candidates: list[tuple[Any, str]] = []
+                for key, value in node.items():
+                    value_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
+                    value_is_direct_string = isinstance(value, str)
+                    if value_is_direct_string:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                    elif literal_state.item_limit_reached:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                        continue
+                    key_lower = str(key).lower()
+                    is_url_candidate_field = key_lower in {"url", "origin", "args", "kwargs"}
+                    extracted_literals = self._extract_string_literals(
+                        value,
+                        result=result,
+                        state=literal_state,
+                        context=value_context,
+                        root_reserved=value_is_direct_string,
+                    )
+                    if not isinstance(value, dict):
+                        direct_string_values.extend(extracted_literals)
+                    if is_url_candidate_field:
+                        if isinstance(value, dict):
+                            nested_url_candidates.append((value, value_context))
+                        else:
+                            url_candidate_values.extend(extracted_literals)
+                bounded_has_get_file = _has_get_file_reference(direct_string_values)
+                has_get_file = has_get_file or bounded_has_get_file
+                if bounded_has_get_file:
+                    for value, value_context in nested_url_candidates:
+                        if url_literal_state.halted:
+                            break
+                        for key, candidate in value.items():
+                            candidate_context = self._config_child_path(
+                                value_context,
+                                f".{redact_evidence_string(str(key), max_chars=64)}",
+                            )
+                            if not self._reserve_config_direct_item(
+                                url_literal_state,
+                                result,
+                                context=candidate_context,
+                                depth=1,
+                            ):
+                                break
+                            if not isinstance(candidate, str):
+                                continue
+                            bounded_candidate = self._record_config_string_literal(
+                                candidate,
+                                url_literal_state,
+                                result,
+                                context=candidate_context,
+                            )
+                            if bounded_candidate is not None:
+                                url_candidate_values.append(bounded_candidate)
+                has_url = has_url or any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
                 continue
             result.add_check(
@@ -1908,7 +2636,7 @@ class KerasZipScanner(BaseScanner):
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-8747",
-                    "context": context,
+                    "context": redact_evidence_string(context),
                     "cvss": 8.8,
                     "cwe": "CWE-502",
                     "description": (
@@ -1924,15 +2652,48 @@ class KerasZipScanner(BaseScanner):
 
     def _check_get_file_archive_extraction(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-12060: truthy get_file tar extraction arguments."""
-        for context, node in self._iter_dict_nodes(model_config):
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
+            has_get_file = self._node_has_direct_get_file_reference(node)
+            if not literal_state.halted and not literal_state.direct_item_limit_reached:
+                direct_string_values: list[str] = []
+                for key, value in node.items():
+                    value_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
+                    value_is_direct_string = isinstance(value, str)
+                    if value_is_direct_string:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                    elif literal_state.item_limit_reached:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                        continue
+                    direct_string_values.extend(
+                        self._extract_string_literals(
+                            value,
+                            result=result,
+                            state=literal_state,
+                            context=value_context,
+                            root_reserved=value_is_direct_string,
+                        )
+                    )
 
-            direct_string_values: list[str] = []
-            for value in node.values():
-                direct_string_values.extend(self._extract_string_literals(value))
-
-            has_get_file = _has_get_file_reference(direct_string_values)
+                has_get_file = has_get_file or _has_get_file_reference(direct_string_values)
             origin = self._node_get_file_origin(node)
             if (
                 not has_get_file
@@ -1952,7 +2713,7 @@ class KerasZipScanner(BaseScanner):
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-12060",
-                    "context": context,
+                    "context": redact_evidence_string(context),
                     "urls": [_redact_url_for_display(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
@@ -1969,6 +2730,45 @@ class KerasZipScanner(BaseScanner):
                 why=get_cve_2025_12060_explanation("get_file_extract_tar"),
             )
             return
+
+    @staticmethod
+    def _node_has_direct_get_file_reference(node: dict[str, Any]) -> bool:
+        """Check bounded callable fields without consuming the shared literal budget."""
+        for key in ("fn", "function", "callable", "class_name", "registered_name", "config", "module"):
+            value = node.get(key)
+            if (
+                isinstance(value, str)
+                and len(value) <= KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                and _has_get_file_reference([value])
+            ):
+                return True
+            if key not in {"fn", "function", "callable"} or not isinstance(value, dict):
+                continue
+            for nested_key in ("fn", "function", "callable", "class_name", "registered_name", "config", "module"):
+                nested_value = value.get(nested_key)
+                if (
+                    isinstance(nested_value, str)
+                    and len(nested_value) <= KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                    and _has_get_file_reference([nested_value])
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _node_has_direct_get_file_url(node: dict[str, Any]) -> bool:
+        """Check bounded get_file argument positions for an HTTP(S) URL."""
+        candidates: list[Any] = [node.get("origin"), node.get("url")]
+        kwargs = node.get("kwargs")
+        if isinstance(kwargs, dict):
+            candidates.extend((kwargs.get("origin"), kwargs.get("url")))
+        args = node.get("args")
+        if isinstance(args, (list, tuple)):
+            candidates.extend(args[:9])
+        return any(
+            isinstance(value, str)
+            and _URL_PATTERN.search(value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS]) is not None
+            for value in candidates
+        )
 
     @staticmethod
     def _node_get_file_argument(node: dict[str, Any], name: str, position: int, default: Any) -> Any:
@@ -1995,12 +2795,14 @@ class KerasZipScanner(BaseScanner):
             for key in ("origin", "url"):
                 if key in container:
                     value = container[key]
-                    return value if isinstance(value, str) else None
+                    return (
+                        value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS] if isinstance(value, str) else None
+                    )
 
         args = node.get("args")
         if isinstance(args, (list, tuple)) and len(args) > 1:
             value = args[1]
-            return value if isinstance(value, str) else None
+            return value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS] if isinstance(value, str) else None
 
         return None
 
@@ -2028,7 +2830,7 @@ class KerasZipScanner(BaseScanner):
         if self._has_cve_2025_9906_issue(result):
             return
 
-        if self._has_unsafe_deserialization_reference(model_config):
+        if self._has_unsafe_deserialization_reference(model_config, result):
             result.add_check(
                 name="CVE-2025-9906: Unsafe Deserialization Bypass",
                 passed=False,
@@ -2100,63 +2902,165 @@ class KerasZipScanner(BaseScanner):
             why=get_cve_2025_9906_explanation("config_bypass"),
         )
 
-    def _has_unsafe_deserialization_reference(self, obj: Any) -> bool:
-        """Recursively detect object-scoped unsafe-deserialization references."""
-        if isinstance(obj, str):
-            token = obj.strip()
-            if self._is_primarily_documentation_text(token):
-                return False
-            lowered = token.lower()
-            return lowered in {
+    def _has_unsafe_deserialization_reference(self, obj: Any, result: ScanResult) -> bool:
+        """Detect object-scoped unsafe-deserialization references with bounded traversal."""
+        state = self._new_config_traversal_state()
+        pending: deque[tuple[Any, int, str, bool]] = deque([(obj, 0, "root", False)])
+        state.items_pending = 1
+        while pending:
+            node, depth, context, has_ancestor_keras_config_context = pending.popleft()
+            state.items_pending -= 1
+            if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
+                continue
+
+            if isinstance(node, str):
+                if state.halted:
+                    continue
+                token = self._unsafe_deserialization_token(node, state, result, context)
+                if token is None:
+                    continue
+                if token in {
+                    "keras.config.enable_unsafe_deserialization",
+                    "keras.src.config.enable_unsafe_deserialization",
+                }:
+                    return True
+                if has_ancestor_keras_config_context and self._is_enable_unsafe_token(token):
+                    return True
+                continue
+
+            if isinstance(node, dict):
+                if self._node_has_direct_unsafe_deserialization_reference(
+                    node,
+                    has_ancestor_keras_config_context=has_ancestor_keras_config_context,
+                ):
+                    return True
+                if state.halted:
+                    continue
+                if state.direct_item_limit_reached:
+                    continue
+                has_enable_unsafe = False
+                has_keras_config_context = False
+                deferred_children: list[tuple[Any, int, str]] = []
+                for key, value in node.items():
+                    child_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
+                    if not isinstance(value, str):
+                        if self._reserve_config_traversal_pending_item(
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            deferred_children.append((value, depth + 1, child_context))
+                        elif not self._reserve_config_direct_item(
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            break
+                        continue
+                    if not self._reserve_config_direct_item(
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
+                    token = self._unsafe_deserialization_token(
+                        value,
+                        state,
+                        result,
+                        child_context,
+                    )
+                    if token is None:
+                        continue
+                    if token in {
+                        "keras.config.enable_unsafe_deserialization",
+                        "keras.src.config.enable_unsafe_deserialization",
+                    }:
+                        return True
+                    has_enable_unsafe = has_enable_unsafe or self._is_enable_unsafe_token(token)
+                    has_keras_config_context = has_keras_config_context or self._is_keras_config_context_token(token)
+
+                if has_enable_unsafe and (has_keras_config_context or has_ancestor_keras_config_context):
+                    return True
+
+                child_has_keras_config_context = has_ancestor_keras_config_context or has_keras_config_context
+                pending.extend(
+                    (value, child_depth, child_context, child_has_keras_config_context)
+                    for value, child_depth, child_context in deferred_children
+                )
+                continue
+
+            if isinstance(node, list):
+                if state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, depth + 1, child_context, has_ancestor_keras_config_context),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
+
+        return False
+
+    @classmethod
+    def _node_has_direct_unsafe_deserialization_reference(
+        cls,
+        node: dict[str, Any],
+        *,
+        has_ancestor_keras_config_context: bool,
+    ) -> bool:
+        """Check fixed executable fields after generic literal accounting stops."""
+        has_enable_unsafe = False
+        has_keras_config_context = False
+        for key in ("loader", "fn", "function", "callable", "module", "fn_module"):
+            value = node.get(key)
+            if not isinstance(value, str) or len(value) > cls.MAX_CONFIG_SECURITY_LITERAL_CHARS:
+                continue
+            token = value.strip().lower()
+            if token in {
                 "keras.config.enable_unsafe_deserialization",
                 "keras.src.config.enable_unsafe_deserialization",
-            }
-
-        if isinstance(obj, dict):
-            string_values = [
-                value.strip().lower()
-                for value in obj.values()
-                if isinstance(value, str) and not self._is_primarily_documentation_text(value)
-            ]
-            has_enable_unsafe = any(
-                token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
-                for token in string_values
-            )
-            has_keras_config_context = any(
-                token == "keras.config"
-                or token.startswith("keras.config.")
-                or token == "keras.src.config"
-                or token.startswith("keras.src.config.")
-                for token in string_values
-            )
-            if has_enable_unsafe and has_keras_config_context:
+            }:
                 return True
+            has_enable_unsafe = has_enable_unsafe or cls._is_enable_unsafe_token(token)
+            has_keras_config_context = has_keras_config_context or cls._is_keras_config_context_token(token)
 
-            if has_keras_config_context and any(self._subtree_has_enable_unsafe(value) for value in obj.values()):
-                return True
+        return has_enable_unsafe and (has_keras_config_context or has_ancestor_keras_config_context)
 
-            return any(self._has_unsafe_deserialization_reference(value) for value in obj.values())
+    def _unsafe_deserialization_token(
+        self,
+        value: str,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        context: str,
+    ) -> str | None:
+        bounded_value = self._record_config_string_literal(value, state, result, context=context)
+        if bounded_value is None or self._is_primarily_documentation_text(bounded_value):
+            return None
+        return bounded_value.strip().lower()
 
-        if isinstance(obj, list):
-            return any(self._has_unsafe_deserialization_reference(value) for value in obj)
+    @staticmethod
+    def _is_enable_unsafe_token(token: str) -> bool:
+        return token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
 
-        return False
-
-    def _subtree_has_enable_unsafe(self, obj: Any) -> bool:
-        """Return True if subtree contains an enable_unsafe_deserialization token."""
-        if isinstance(obj, str):
-            if self._is_primarily_documentation_text(obj):
-                return False
-            token = obj.strip().lower()
-            return token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
-
-        if isinstance(obj, dict):
-            return any(self._subtree_has_enable_unsafe(value) for value in obj.values())
-
-        if isinstance(obj, list):
-            return any(self._subtree_has_enable_unsafe(value) for value in obj)
-
-        return False
+    @staticmethod
+    def _is_keras_config_context_token(token: str) -> bool:
+        return (
+            token == "keras.config"
+            or token.startswith("keras.config.")
+            or token == "keras.src.config"
+            or token.startswith("keras.src.config.")
+        )
 
     @staticmethod
     def _has_cve_2025_9906_issue(result: ScanResult) -> bool:
@@ -2174,6 +3078,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
+        classification_keras_version = self._current_keras_version
         redacted_vocabulary = (
             redact_url_for_finding(vocabulary)
             if _URL_SCHEME_PATTERN.match(vocabulary.strip())
@@ -2195,7 +3100,9 @@ class KerasZipScanner(BaseScanner):
             "affected_versions": "Keras < 3.12.0",
         }
         vulnerability_status = (
-            self._is_vulnerable_to_cve_2025_12058(keras_version) if isinstance(keras_version, str) else None
+            self._is_vulnerable_to_cve_2025_12058(classification_keras_version)
+            if isinstance(classification_keras_version, str)
+            else None
         )
 
         if vulnerability_status is True:
@@ -2267,6 +3174,7 @@ class KerasZipScanner(BaseScanner):
 
         if weights_info.file_size > self.max_embedded_weights_bytes:
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
@@ -2276,9 +3184,9 @@ class KerasZipScanner(BaseScanner):
                     f"exceeds the configured size limit ({weights_info.file_size} > {self.max_embedded_weights_bytes})"
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
                     "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
@@ -2299,6 +3207,7 @@ class KerasZipScanner(BaseScanner):
                 return
 
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             reason = "keras_zip_embedded_weights_h5py_unavailable"
             result.metadata["embedded_weights_hdf5_signature_offset"] = hdf5_signature_offset
             self._mark_inconclusive_scan_result(result, reason)
@@ -2317,9 +3226,9 @@ class KerasZipScanner(BaseScanner):
                     "analysis. Install with 'pip install modelaudit[h5]'."
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "required_package": "h5py",
                     "hdf5_signature_offset": hdf5_signature_offset,
                     "analysis_incomplete": True,
@@ -2357,15 +3266,16 @@ class KerasZipScanner(BaseScanner):
                 )
         except _EmbeddedWeightsLimitExceeded as exc:
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
                 message=str(exc),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "extracted_bytes": exc.extracted_bytes,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
@@ -2391,7 +3301,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message="Embedded Keras HDF5 external-reference analysis reached a configured safety limit",
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_info.filename}",
+                location=f"{self.current_file_path}:{self._redact_archive_member_name(weights_info.filename)}",
                 details={
                     "analysis_incomplete": True,
                     "scan_outcome_reason": reason,
@@ -2404,7 +3314,8 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
-        location = f"{self.current_file_path}:{weights_info.filename}"
+        classification_keras_version = self._current_keras_version
+        location = f"{self.current_file_path}:{self._redact_archive_member_name(weights_info.filename)}"
         details = {
             "cve_id": "CVE-2026-1669",
             "cvss": 8.1,
@@ -2434,7 +3345,9 @@ class KerasZipScanner(BaseScanner):
             )
 
         cve_2026_1669_status = (
-            self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+            self._is_vulnerable_to_cve_2026_1669(classification_keras_version)
+            if isinstance(classification_keras_version, str)
+            else None
         )
         if cve_2026_1669_status is True:
             details["keras_version"] = keras_version
@@ -2507,6 +3420,7 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         weights_entry = weights_info.filename
+        display_weights_entry = self._redact_archive_member_name(weights_entry)
         reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
         self._mark_inconclusive_scan_result(result, reason)
         result.add_check(
@@ -2518,9 +3432,9 @@ class KerasZipScanner(BaseScanner):
                 "Install with 'pip install modelaudit[h5]'."
             ),
             severity=IssueSeverity.INFO,
-            location=f"{self.current_file_path}:{weights_entry}",
+            location=f"{self.current_file_path}:{display_weights_entry}",
             details={
-                "entry": weights_entry,
+                "entry": display_weights_entry,
                 "required_package": "h5py",
                 "file_size": weights_info.file_size,
                 "hdf5_signature_probe_max_bytes": HDF5_SIGNATURE_SCAN_MAX_BYTES,
@@ -2544,6 +3458,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         weights_entry = weights_info.filename
+        display_weights_entry = self._redact_archive_member_name(weights_entry)
         from .pickle_scanner import PickleScanner
         from .picklescan_adapter import apply_pickle_member_context
 
@@ -2585,11 +3500,11 @@ class KerasZipScanner(BaseScanner):
                         prefix_result,
                         temp_path,
                         self.current_file_path,
-                        weights_entry,
+                        display_weights_entry,
                     )
                     self._annotate_embedded_weights_security_prefix_result(
                         prefix_result,
-                        weights_entry=weights_entry,
+                        weights_entry=display_weights_entry,
                         hdf5_signature_offset=hdf5_signature_offset,
                     )
                     result.merge(prefix_result)
@@ -2604,7 +3519,9 @@ class KerasZipScanner(BaseScanner):
                 if temp_path is not None:
                     Path(temp_path).unlink(missing_ok=True)
 
-            pickle_source = f"{self.current_file_path}:{weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            pickle_source = (
+                f"{self.current_file_path}:{display_weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            )
             pickle_result = PickleScanner(config=self.config).scan_stream(
                 io.BytesIO(prefix),
                 len(prefix),
@@ -2614,11 +3531,11 @@ class KerasZipScanner(BaseScanner):
                 apply_pickle_member_context(
                     pickle_result,
                     archive_path=self.current_file_path,
-                    member_name=weights_entry,
+                    member_name=display_weights_entry,
                 )
                 self._annotate_embedded_weights_security_prefix_result(
                     pickle_result,
-                    weights_entry=weights_entry,
+                    weights_entry=display_weights_entry,
                     hdf5_signature_offset=hdf5_signature_offset,
                 )
                 result.merge(pickle_result)
@@ -2657,11 +3574,11 @@ class KerasZipScanner(BaseScanner):
                 full_result,
                 temp_path,
                 self.current_file_path,
-                weights_info.filename,
+                self._redact_archive_member_name(weights_info.filename),
             )
             self._annotate_embedded_weights_security_prefix_result(
                 full_result,
-                weights_entry=weights_info.filename,
+                weights_entry=self._redact_archive_member_name(weights_info.filename),
                 hdf5_signature_offset=hdf5_signature_offset,
             )
             result.merge(full_result)
@@ -2677,15 +3594,19 @@ class KerasZipScanner(BaseScanner):
         weights_entry: str,
         hdf5_signature_offset: int | None,
     ) -> None:
+        display_weights_entry = redact_evidence_string(
+            weights_entry,
+            max_chars=KerasZipScanner.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+        )
         for check in prefix_result.checks:
-            check.details.setdefault("zip_entry", weights_entry)
+            check.details.setdefault("zip_entry", display_weights_entry)
             check.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
                 check.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES
             else:
                 check.details["hdf5_signature_offset"] = hdf5_signature_offset
         for issue in prefix_result.issues:
-            issue.details.setdefault("zip_entry", weights_entry)
+            issue.details.setdefault("zip_entry", display_weights_entry)
             issue.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
                 issue.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES
@@ -2933,55 +3854,85 @@ class KerasZipScanner(BaseScanner):
             except Exception:
                 return ("python_id", id(obj))
 
-    @staticmethod
     def _extract_string_literals(
+        self,
         value: Any,
         *,
         include_dict_values: bool = False,
         include_dict_keys: bool = False,
-        _depth: int = 0,
+        result: ScanResult,
+        state: _ConfigTraversalState,
+        context: str,
+        root_reserved: bool = False,
     ) -> list[str]:
         """Extract string literals from simple container values."""
-        if _depth >= _MAX_STRING_LITERAL_EXTRACTION_DEPTH:
-            return []
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, (list, tuple, set)):
-            values: list[str] = []
-            for item in value:
-                values.extend(
-                    KerasZipScanner._extract_string_literals(
-                        item,
-                        include_dict_values=include_dict_values,
-                        include_dict_keys=include_dict_keys,
-                        _depth=_depth + 1,
-                    )
-                )
-            return values
-        if isinstance(value, dict):
-            literals: list[str] = []
-            if include_dict_keys:
-                for key in value:
-                    literals.extend(
-                        KerasZipScanner._extract_string_literals(
-                            key,
-                            include_dict_values=include_dict_values,
-                            include_dict_keys=True,
-                            _depth=_depth + 1,
+        literals: list[str] = []
+        pending: deque[tuple[Any, int, str, bool]] = deque([(value, 0, context, not root_reserved)])
+        if not root_reserved:
+            state.items_pending = 1
+        while pending and not state.halted:
+            node, depth, node_context, pending_reservation = pending.popleft()
+            if pending_reservation:
+                state.items_pending -= 1
+                if not self._reserve_config_traversal_item(state, result, context=node_context, depth=depth):
+                    continue
+
+            if isinstance(node, str):
+                bounded_value = self._record_config_string_literal(node, state, result, context=node_context)
+                if bounded_value is not None:
+                    literals.append(bounded_value)
+                continue
+
+            if isinstance(node, list | tuple | set):
+                if state.item_limit_reached:
+                    continue
+                for index, item in enumerate(node):
+                    child_context = self._config_child_path(node_context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (item, depth + 1, child_context, True),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
+                continue
+
+            if isinstance(node, dict):
+                if state.item_limit_reached:
+                    continue
+                if include_dict_keys:
+                    for key in node:
+                        child_context = self._config_child_path(
+                            node_context,
+                            f".<key:{redact_evidence_string(str(key), max_chars=64)}>",
                         )
-                    )
-            if include_dict_values:
-                for item in value.values():
-                    literals.extend(
-                        KerasZipScanner._extract_string_literals(
-                            item,
-                            include_dict_values=True,
-                            include_dict_keys=include_dict_keys,
-                            _depth=_depth + 1,
+                        if not self._queue_config_traversal_item(
+                            pending,
+                            (key, depth + 1, child_context, True),
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            break
+                if include_dict_values and not state.item_limit_reached:
+                    for key, item in node.items():
+                        child_context = self._config_child_path(
+                            node_context,
+                            f".{redact_evidence_string(str(key), max_chars=64)}",
                         )
-                    )
-            return literals
-        return []
+                        if not self._queue_config_traversal_item(
+                            pending,
+                            (item, depth + 1, child_context, True),
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            break
+        return literals
 
     @staticmethod
     def _references_dangerous_module_literal(module_literal: str, dangerous_modules: set[str]) -> bool:
@@ -3088,19 +4039,57 @@ class KerasZipScanner(BaseScanner):
 
         return (doc_like_lines / len(lines)) > 0.5
 
-    def _iter_dict_nodes(self, obj: Any, path: str = "root") -> list[tuple[str, dict[str, Any]]]:
+    def _iter_dict_nodes(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        state: _ConfigTraversalState,
+        path: str = "root",
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield all dict nodes with their traversal path."""
-        nodes: list[tuple[str, dict[str, Any]]] = []
-        if isinstance(obj, dict):
-            nodes = [(path, obj)]
-            for key, value in obj.items():
-                nodes.extend(self._iter_dict_nodes(value, f"{path}.{key}"))
-            return nodes
-        if isinstance(obj, list):
-            for idx, value in enumerate(obj):
-                nodes.extend(self._iter_dict_nodes(value, f"{path}[{idx}]"))
-            return nodes
-        return []
+        pending: deque[tuple[Any, str, int]] = deque([(obj, path, 0)])
+        state.items_pending = 1
+        while pending and not state.halted:
+            node, node_path, depth = pending.popleft()
+            state.items_pending -= 1
+            if not self._reserve_config_traversal_item(state, result, context=node_path, depth=depth):
+                continue
+
+            if isinstance(node, dict):
+                yield node_path, node
+                if state.item_limit_reached:
+                    continue
+                for key, value in node.items():
+                    child_path = self._config_child_path(
+                        node_path,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, child_path, depth + 1),
+                        state,
+                        result,
+                        context=child_path,
+                        depth=depth + 1,
+                    ):
+                        break
+                continue
+
+            if isinstance(node, list):
+                if state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_path = self._config_child_path(node_path, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, child_path, depth + 1),
+                        state,
+                        result,
+                        context=child_path,
+                        depth=depth + 1,
+                    ):
+                        break
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
@@ -3155,6 +4144,9 @@ class KerasZipScanner(BaseScanner):
                     module_name,
                     include_dict_values=True,
                     include_dict_keys=True,
+                    result=result,
+                    state=self._new_config_traversal_state(),
+                    context=f"{location}.module",
                 )
             )
             dangerous_module = next(

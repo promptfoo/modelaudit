@@ -392,6 +392,7 @@ def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
         EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
         MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
         XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -419,6 +420,8 @@ def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
         scanner_ids.update({"jax_checkpoint", "mxnet"})
     if detected_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.add("xgboost")
+    if detected_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("pickle")
     if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"openvino", "pmml"})
     return frozenset(scanner_ids)
