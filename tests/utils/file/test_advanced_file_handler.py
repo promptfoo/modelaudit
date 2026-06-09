@@ -1468,6 +1468,57 @@ class TestAdvancedFileHandler:
             check.name == "Malicious Shard Payload" and check.status == CheckStatus.FAILED for check in second.checks
         )
 
+    def test_cached_advanced_scan_keys_selected_model_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Adding, changing, or removing the selected config must select matching shard results."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        config_path = tmp_path / "config.json"
+        scanned_paths: list[str] = []
+
+        class RecordingShardScanner(CompletingShardScanner):
+            name = "config_identity_shard_scanner"
+
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_paths.append(shard_path)
+                return super().scan(shard_path)
+
+        scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(tmp_path / "cache")})
+
+        reset_cache_manager()
+        try:
+            absent = scan_advanced_large_file(str(shard_one), scanner)
+            assert len(scanned_paths) == 2
+            assert not any(check.name == "PyTorch Configuration Detection" for check in absent.checks)
+
+            config_path.write_text('{"torch_dtype": "float16"}')
+            present = scan_advanced_large_file(str(shard_one), scanner)
+            assert len(scanned_paths) == 4
+            assert any(check.name == "PyTorch Configuration Detection" for check in present.checks)
+
+            cached = scan_advanced_large_file(str(shard_one), scanner)
+            assert len(scanned_paths) == 4
+            assert any(check.name == "PyTorch Configuration Detection" for check in cached.checks)
+
+            config_path.write_text("{}")
+            changed = scan_advanced_large_file(str(shard_one), scanner)
+            assert len(scanned_paths) == 6
+            assert not any(check.name == "PyTorch Configuration Detection" for check in changed.checks)
+
+            config_path.unlink()
+            removed = scan_advanced_large_file(str(shard_one), scanner)
+            assert len(scanned_paths) == 6
+            assert not any(check.name == "PyTorch Configuration Detection" for check in removed.checks)
+        finally:
+            reset_cache_manager()
+
     def test_absent_shard_family_fingerprint_is_cacheable(self) -> None:
         """A non-sharded scan does not need a sibling-family fingerprint."""
         fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(None, object())

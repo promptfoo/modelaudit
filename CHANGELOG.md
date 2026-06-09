@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- bind direct sharded-model cache entries to sibling shard content fingerprints and strengthen cache configuration hashes
+- bind direct sharded-model cache entries to sibling shard and selected model configuration content fingerprints, and strengthen cache configuration hashes
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
 - redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters

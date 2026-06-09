@@ -161,6 +161,47 @@ def _build_advanced_shard_family_cache_fingerprint(
     )
 
 
+def _build_advanced_shard_model_config_cache_fingerprint(
+    file_path: str,
+    hasher: Any,
+) -> tuple[dict[str, str] | None, bool]:
+    """Return the selected model config identity, or mark cache unsafe."""
+    config_path = ShardedModelDetector.find_model_config(file_path)
+    if config_path is None:
+        return None, True
+
+    try:
+        resolved_path = str(Path(config_path).resolve(strict=True))
+        config_stat = os.stat(config_path, follow_symlinks=False)
+        if not stat.S_ISREG(config_stat.st_mode):
+            return None, False
+        content_hash = hasher.hash_file(resolved_path)
+        post_resolved_path = str(Path(config_path).resolve(strict=True))
+        post_hash_stat = os.stat(config_path, follow_symlinks=False)
+    except Exception:
+        return None, False
+
+    if (
+        resolved_path != post_resolved_path
+        or not stat.S_ISREG(post_hash_stat.st_mode)
+        or not os.path.samestat(config_stat, post_hash_stat)
+        or any(
+            current_value != previous_value
+            for current_value, previous_value in (
+                (post_hash_stat.st_size, config_stat.st_size),
+                (post_hash_stat.st_mtime_ns, config_stat.st_mtime_ns),
+                (post_hash_stat.st_ctime_ns, config_stat.st_ctime_ns),
+            )
+        )
+        or type(content_hash) is not str
+        or not content_hash.startswith("secure:")
+        or not content_hash[7:]
+    ):
+        return None, False
+
+    return {"path": resolved_path, "content_hash": content_hash}, True
+
+
 def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
     """Mark a scan result as incomplete while preserving existing reasons."""
     from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME
@@ -1594,13 +1635,15 @@ def scan_advanced_large_file(
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
         version_config = dict(config)
+        cache_hasher = cache_manager.cache.hasher if cache_manager.cache is not None else None
+        model_config_fingerprint: dict[str, str] | None = None
         if shard_info is not None:
             # A representative file key alone cannot describe sibling shard
             # membership, target identity, or incomplete-family state.
             version_config["advanced_shard_family"] = shard_info
             shard_family_fingerprint, shard_family_cacheable = _build_advanced_shard_family_cache_fingerprint(
                 shard_info,
-                cache_manager.cache.hasher if cache_manager.cache is not None else None,
+                cache_hasher,
             )
             if not shard_family_cacheable:
                 logger.debug("Bypassing advanced-file cache for uncacheable shard family identity: %s", file_path)
@@ -1614,6 +1657,20 @@ def scan_advanced_large_file(
                 )
             if shard_family_fingerprint is not None:
                 version_config["advanced_shard_family_cache_fingerprint"] = shard_family_fingerprint
+            model_config_fingerprint, model_config_cacheable = _build_advanced_shard_model_config_cache_fingerprint(
+                file_path, cache_hasher
+            )
+            if not model_config_cacheable:
+                logger.debug("Bypassing advanced-file cache for uncacheable shard model config: %s", file_path)
+                return _scan_advanced_large_file_internal(
+                    file_path,
+                    scanner,
+                    progress_callback,
+                    timeout,
+                    allowed_shard_paths=allowed_shard_paths,
+                    allowed_shard_targets=allowed_shard_targets,
+                )
+            version_config["advanced_shard_model_config_cache_fingerprint"] = model_config_fingerprint
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
             version_config["advanced_allowed_shard_paths"] = sorted(
@@ -1645,6 +1702,17 @@ def scan_advanced_large_file(
                     file_path,
                     {"path": file_path, "reason": "shard_family_changed_during_scan"},
                 )
+            if shard_info is not None:
+                current_model_config_fingerprint, current_model_config_cacheable = (
+                    _build_advanced_shard_model_config_cache_fingerprint(file_path, cache_hasher)
+                )
+                if not current_model_config_cacheable or current_model_config_fingerprint != model_config_fingerprint:
+                    result = _preserve_findings_with_shard_boundary_failure(
+                        result,
+                        scanner.name,
+                        file_path,
+                        {"path": file_path, "reason": "shard_model_config_changed_during_scan"},
+                    )
             return result.to_dict(include_private_metadata=True)
 
         # Get cached result or perform scan
@@ -1671,6 +1739,18 @@ def scan_advanced_large_file(
                 file_path,
                 {"path": file_path, "reason": "shard_family_changed_during_scan"},
             )
+
+        if shard_info is not None:
+            post_scan_model_config_fingerprint, post_scan_model_config_cacheable = (
+                _build_advanced_shard_model_config_cache_fingerprint(file_path, cache_hasher)
+            )
+            if not post_scan_model_config_cacheable or post_scan_model_config_fingerprint != model_config_fingerprint:
+                return _preserve_findings_with_shard_boundary_failure(
+                    result,
+                    scanner.name,
+                    file_path,
+                    {"path": file_path, "reason": "shard_model_config_changed_during_scan"},
+                )
 
         return result
 
