@@ -12,6 +12,7 @@ import shutil
 import stat
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
@@ -109,33 +110,51 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
+    return _escape_terminal_text(_display_scan_path(path))
+
+
+def _display_scan_path(path: str) -> str:
+    """Return an exact local path or a credential-redacted remote identifier."""
     if path.startswith("models:/"):
         from .integrations.mlflow import _redact_mlflow_error_for_display
 
         return _redact_mlflow_error_for_display(path)
     if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
-    if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path):
+    if (
+        is_cloud_url(path)
+        or is_cleartext_cloud_url(path)
+        or is_pytorch_hub_url(path)
+        or is_cleartext_pytorch_hub_url(path)
+    ):
         return redact_url_for_display(path)
     if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
 
-def _display_scan_path(path: str) -> str:
-    """Return a persisted scan path safe for generated reports."""
-    return _display_path(path)
-
-
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
     if is_stream_url(path):
-        return redact_stream_error_for_display(error, path[9:])
-    return (
-        redact_cloud_error_for_display(error, path)
-        if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path)
-        else str(error)
-    )
+        display_error = redact_stream_error_for_display(error, path[9:])
+    elif is_huggingface_url(path) or is_huggingface_file_url(path):
+        display_error = redact_huggingface_urls_in_text(str(error))
+    elif is_jfrog_url_like(path):
+        display_error = redact_jfrog_error_for_display(error, path)
+    elif is_mlflow_uri(path):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        display_error = _redact_mlflow_error_for_display(error)
+    else:
+        display_error = (
+            redact_cloud_error_for_display(error, path)
+            if is_cloud_url(path)
+            or is_cleartext_cloud_url(path)
+            or is_pytorch_hub_url(path)
+            or is_cleartext_pytorch_hub_url(path)
+            else str(error)
+        )
+    return _escape_terminal_text(display_error)
 
 
 class _OutputWriteError(click.ClickException):
@@ -1451,6 +1470,29 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
+def _escape_terminal_text(value: Any) -> str:
+    """Render control characters visibly before writing model-controlled text to terminals."""
+    text = "" if value is None else str(value)
+
+    def replace_control(char: str) -> str:
+        if char == "\n":
+            return "\\n"
+        if char == "\r":
+            return "\\r"
+        if char == "\t":
+            return "\\t"
+        codepoint = ord(char)
+        if codepoint <= 0xFF:
+            return f"\\x{codepoint:02x}"
+        if codepoint <= 0xFFFF:
+            return f"\\u{codepoint:04x}"
+        return f"\\U{codepoint:08x}"
+
+    return "".join(
+        replace_control(char) if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} else char for char in text
+    )
+
+
 def get_trusted_config_store() -> TrustedConfigStore:
     """Return the persistent store used for trusted local configs."""
     return TrustedConfigStore()
@@ -1597,9 +1639,9 @@ def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any
         try:
             progress_callback(message, percentage)
             if spinner and hasattr(spinner, "text"):
-                spinner.text = message
+                spinner.text = _escape_terminal_text(message)
         except Exception as e:
-            logger.warning(f"Progress callback error: {e}")
+            logger.warning(f"Progress callback error: {_escape_terminal_text(e)}")
 
     return wrapped_callback
 
@@ -2078,7 +2120,7 @@ def _emit_scan_output(
     if output:
         _write_output_text_file(output, output_text)
 
-        click.echo(f"Results written to {output}")
+        click.echo(f"Results written to {_display_path(output)}")
 
         if verbose:
             visible_issues = audit_result.issues
@@ -2145,7 +2187,9 @@ def _announce_suppressed_preferred_scanners(suppressions: list[dict[str, Any]]) 
         err=True,
     )
     for entry in suppressions[:5]:
-        click.echo(f"  - {entry['location']} (would have used: {entry['scanner_id']})", err=True)
+        location = _escape_terminal_text(entry["location"])
+        scanner_id = _escape_terminal_text(entry["scanner_id"])
+        click.echo(f"  - {location} (would have used: {scanner_id})", err=True)
     if len(suppressions) > 5:
         click.echo(f"  … and {len(suppressions) - 5} more", err=True)
 
@@ -2185,17 +2229,18 @@ def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, 
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
+    display_path = _display_path(scan_path)
     if ext in (".py", ".js", ".html", ".css"):
         if verbose:
-            logger.debug(f"Skipped: {scan_path} (non-model file)")
+            logger.debug(f"Skipped: {display_path} (non-model file)")
         if runtime.show_styled_output:
-            click.echo(f"Skipping non-model file: {scan_path}")
+            click.echo(f"Skipping non-model file: {display_path}")
         return True
 
     if verbose:
-        logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
+        logger.debug(f"Skipped: {display_path} (non-model .txt file)")
     if runtime.show_styled_output:
-        click.echo(f"Skipping non-model file: {scan_path}")
+        click.echo(f"Skipping non-model file: {display_path}")
     return True
 
 
@@ -2210,7 +2255,7 @@ def _create_path_progress_callback(
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
-            spinner_bound.text = f"{message} ({percentage:.1f}%)"
+            spinner_bound.text = f"{_escape_terminal_text(message)} ({percentage:.1f}%)"
 
         return update_progress
 
@@ -2231,25 +2276,26 @@ def _create_path_progress_callback(
 
         progress_tracker.stats.total_bytes = total_bytes
         progress_tracker.stats.total_items = total_items
-        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {_display_scan_path(actual_path)}")
+        progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {_display_path(actual_path)}")
     except (ImportError, RecursionError):
         return None
 
     def enhanced_progress_callback(message: str, percentage: float) -> None:
+        display_message = _escape_terminal_text(message)
         if progress_tracker:
             bytes_processed = int((percentage / 100.0) * total_bytes) if total_bytes > 0 else 0
-            progress_tracker.update_bytes(bytes_processed, message)
+            progress_tracker.update_bytes(bytes_processed, display_message)
 
             message_lower = message.lower()
             if "loading" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.LOADING, message)
+                progress_tracker.set_phase(ProgressPhase.LOADING, display_message)
             elif "analyzing" in message_lower or "scanning" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.ANALYZING, message)
+                progress_tracker.set_phase(ProgressPhase.ANALYZING, display_message)
             elif "checking" in message_lower:
-                progress_tracker.set_phase(ProgressPhase.CHECKING, message)
+                progress_tracker.set_phase(ProgressPhase.CHECKING, display_message)
 
         if spinner:
-            spinner.text = f"{message} ({percentage:.1f}%)"
+            spinner.text = f"{display_message} ({percentage:.1f}%)"
 
     return enhanced_progress_callback
 
@@ -2422,10 +2468,7 @@ def _scan_local_or_downloaded_path(
         elif runtime.show_styled_output:
             click.echo(f"Error scanning {display_path}")
 
-        logger.error(
-            f"Error during scan of {display_path}: {display_error}",
-            exc_info=verbose and not (is_stream_url(actual_path) or is_cloud_url(path)),
-        )
+        logger.error(f"Error during scan of {display_path}: {display_error}")
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
         path_state.scanned_paths.append(_display_scan_path(actual_path))
@@ -2446,17 +2489,17 @@ def _resolve_scan_source_for_path(
 ) -> _SourceDispatchResult | None:
     """Resolve one source path and execute source-native scans when they should bypass local scanning."""
     if is_cleartext_cloud_url(path):
-        click.echo(f"Error: Cleartext cloud storage URL is not supported: {redact_url_for_display(path)}", err=True)
+        click.echo(f"Error: Cleartext cloud storage URL is not supported: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 
     if is_cleartext_pytorch_hub_url(path):
-        click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {redact_url_for_display(path)}", err=True)
+        click.echo(f"Error: Cleartext PyTorch Hub URL is not supported: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 
     if is_huggingface_file_url(path):
-        display_path = redact_huggingface_url_for_display(path)
+        display_path = _display_path(path)
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2505,8 +2548,8 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
-            error_msg = redact_huggingface_urls_in_text(str(exc))
-            logger.error(f"Failed to download file from {display_path}: {error_msg}", exc_info=verbose)
+            error_msg = _display_error(exc, path)
+            logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             path_state.defer_temp_cleanup(
@@ -2517,7 +2560,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_huggingface_url(path):
-        display_path = redact_huggingface_url_for_display(path)
+        display_path = _display_path(path)
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
@@ -2535,13 +2578,19 @@ def _resolve_scan_source_for_path(
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
 
-                click.echo(f"   Model: {model_info['model_id']}")
-                click.echo(f"   Size: {size_str} ({model_info['file_count']} files)")
+                model_id = _escape_terminal_text(str(model_info["model_id"]))
+                file_count = _escape_terminal_text(str(model_info["file_count"]))
+                click.echo(f"   Model: {model_id}")
+                click.echo(f"   Size: {size_str} ({file_count} files)")
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
             except Exception as exc:
-                logger.debug("Unable to display HuggingFace model metadata for %s: %s", path, exc)
+                logger.debug(
+                    "Unable to display HuggingFace model metadata for %s: %s",
+                    display_path,
+                    _display_error(exc, path),
+                )
 
         temp_dir = None
         try:
@@ -2664,7 +2713,7 @@ def _resolve_scan_source_for_path(
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
-            error_msg = redact_huggingface_urls_in_text(str(exc))
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
                 logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
@@ -2677,7 +2726,7 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to process model from {display_path}: {error_msg}", exc_info=verbose)
+                logger.error(f"Failed to process model from {display_path}: {error_msg}")
                 click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
             audit_result.has_errors = True
@@ -2689,6 +2738,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_pytorch_hub_url(path):
+        display_path = _display_path(path)
         download_spinner = None
         try:
             record_download_started("pytorch_hub", path)
@@ -2733,11 +2783,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(display_path, fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {path}...")
+                click.echo(f"Downloading from {display_path}...")
 
             download_path = download_pytorch_hub_model(
                 path,
@@ -2766,9 +2816,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = str(exc)
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {path}: {error_msg}")
+                logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -2778,13 +2828,14 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download model from {path}: {error_msg}", exc_info=verbose)
-                click.echo(f"Error downloading model from {path}: {error_msg}", err=True)
+                logger.error(f"Failed to download model from {display_path}: {error_msg}")
+                click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
 
             audit_result.has_errors = True
             return None
 
     if is_cloud_url(path):
+        display_path = _display_path(path)
         if dry_run:
             import asyncio
 
@@ -2792,7 +2843,7 @@ def _resolve_scan_source_for_path(
 
             try:
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(redact_url_for_display(path), fg='cyan')}:")
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
                 click.echo(f"   Type: {metadata['type']}")
 
                 if metadata["type"] == "file":
@@ -2816,7 +2867,7 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
                 error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {redact_url_for_display(path)}: {error_msg}", err=True)
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
                 audit_result.has_errors = True
                 return None
 
@@ -2872,11 +2923,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(redact_url_for_display(path), fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(display_path, fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {redact_url_for_display(path)}...")
+                click.echo(f"Downloading from {display_path}...")
 
             cloud_download_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
@@ -2921,7 +2972,7 @@ def _resolve_scan_source_for_path(
 
             error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {redact_url_for_display(path)}: {error_msg}")
+                logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -2931,15 +2982,13 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}")
-                click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
+                logger.error(f"Failed to download from {display_path}: {error_msg}")
+                click.echo(f"Error downloading from {display_path}: {error_msg}", err=True)
 
             audit_result.has_errors = True
             return None
 
     if is_mlflow_uri(path):
-        from .integrations.mlflow import _redact_mlflow_error_for_display
-
         display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2988,14 +3037,14 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = _redact_mlflow_error_for_display(exc)
-            logger.error(f"Failed to download model from {display_path}: {error_msg}")
-            click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
+            display_error = _display_error(exc, path)
+            logger.error(f"Failed to download model from {display_path}: {display_error}")
+            click.echo(f"Error downloading model from {display_path}: {display_error}", err=True)
             audit_result.has_errors = True
             return None
 
     if is_jfrog_url(path):
-        display_path = redact_jfrog_url_for_display(path)
+        display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
             download_spinner = yaspin(
@@ -3050,8 +3099,8 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download/scan failed")
 
-            error_msg = redact_jfrog_error_for_display(exc, path)
-            logger.error(f"Failed to download/scan model from {display_path}: {error_msg}", exc_info=verbose)
+            error_msg = _display_error(exc, path)
+            logger.error(f"Failed to download/scan model from {display_path}: {error_msg}")
             click.echo(f"Error downloading/scanning model from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             return None
@@ -3762,10 +3811,7 @@ def scan_command(
             except Exception as exc:
                 display_path = _display_path(path)
                 display_error = _display_error(exc, path)
-                logger.error(
-                    f"Unexpected error processing {display_path}: {display_error}",
-                    exc_info=verbose and not is_stream_url(path),
-                )
+                logger.error(f"Unexpected error processing {display_path}: {display_error}")
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
                 path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
                 audit_result.has_errors = True
@@ -3886,7 +3932,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Display metrics in a formatted grid
     for label, value, color in metrics:
         label_str = style_text(f"  {label}:", fg="bright_black")
-        value_str = style_text(value, fg=color, bold=True)
+        value_str = style_text(_escape_terminal_text(value), fg=color, bold=True)
         output_lines.append(f"{label_str} {value_str}")
 
     # Add authentication status (inspired by semgrep's approach)
@@ -3931,23 +3977,32 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append(style_text("  Model Information:", fg="bright_black"))
 
                 if "model_type" in model_info:
-                    output_lines.append(f"  • Type: {style_text(model_info['model_type'], fg='cyan')}")
+                    model_type = _escape_terminal_text(model_info["model_type"])
+                    output_lines.append(f"  • Type: {style_text(model_type, fg='cyan')}")
                 if "architectures" in model_info:
                     arch_str = (
-                        ", ".join(model_info["architectures"])
+                        ", ".join(_escape_terminal_text(architecture) for architecture in model_info["architectures"])
                         if isinstance(model_info["architectures"], list)
-                        else model_info["architectures"]
+                        else _escape_terminal_text(model_info["architectures"])
                     )
                     output_lines.append(f"  • Architecture: {style_text(arch_str, fg='cyan')}")
                 if "num_layers" in model_info:
-                    output_lines.append(f"  • Layers: {style_text(str(model_info['num_layers']), fg='cyan')}")
+                    num_layers = _escape_terminal_text(model_info["num_layers"])
+                    output_lines.append(f"  • Layers: {style_text(num_layers, fg='cyan')}")
                 if "hidden_size" in model_info:
-                    output_lines.append(f"  • Hidden Size: {style_text(str(model_info['hidden_size']), fg='cyan')}")
+                    hidden_size = _escape_terminal_text(model_info["hidden_size"])
+                    output_lines.append(f"  • Hidden Size: {style_text(hidden_size, fg='cyan')}")
                 if "vocab_size" in model_info:
-                    vocab_str = f"{model_info['vocab_size']:,}"
+                    vocab_size = model_info["vocab_size"]
+                    vocab_str = (
+                        f"{vocab_size:,}"
+                        if isinstance(vocab_size, (int, float)) and not isinstance(vocab_size, bool)
+                        else _escape_terminal_text(vocab_size)
+                    )
                     output_lines.append(f"  • Vocab Size: {style_text(vocab_str, fg='cyan')}")
                 if "framework_version" in model_info:
-                    output_lines.append(f"  • Framework: {style_text(model_info['framework_version'], fg='cyan')}")
+                    framework_version = _escape_terminal_text(model_info["framework_version"])
+                    output_lines.append(f"  • Framework: {style_text(framework_version, fg='cyan')}")
                 break  # Only show the first model info found
 
     # Add security check statistics
@@ -3991,10 +4046,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         # Group failed checks by name to avoid repetition
         check_groups: dict[str, list[str]] = {}
         for check in failed_checks_list:
-            check_name = check.get("name", "Unknown check")
+            check_name = _escape_terminal_text(check.get("name", "Unknown check"))
             if check_name not in check_groups:
                 check_groups[check_name] = []
-            check_groups[check_name].append(check.get("message", ""))
+            check_groups[check_name].append(_escape_terminal_text(check.get("message", "")))
 
         # Show unique failed check types
         for check_name, messages in list(check_groups.items())[:5]:  # Show first 5 types
@@ -4211,8 +4266,8 @@ def _format_issue(
     severity: str,
 ) -> None:
     """Format a single issue with proper indentation and styling"""
-    message = _get_issue_attr(issue, "message", "Unknown issue")
-    location = _get_issue_attr(issue, "location", "")
+    message = _escape_terminal_text(_get_issue_attr(issue, "message", "Unknown issue"))
+    location = _escape_terminal_text(_get_issue_attr(issue, "location", ""))
 
     # Icon based on severity
     icons = {
@@ -4236,11 +4291,12 @@ def _format_issue(
     why = _get_issue_attr(issue, "why")
     if why:
         why_label = style_text("Why:", fg="magenta", bold=True)
+        why_text = _escape_terminal_text(why)
         # Wrap long explanations
         import textwrap
 
         wrapped_why = textwrap.fill(
-            why,
+            why_text,
             width=65,
             initial_indent="",
             subsequent_indent="           ",
@@ -4252,8 +4308,8 @@ def _format_issue(
     if details:
         for key, value in details.items():
             if value:  # Only show non-empty values
-                detail_label = style_text(f"{key}:", fg="bright_black")
-                detail_value = style_text(str(value), fg="bright_white")
+                detail_label = style_text(f"{_escape_terminal_text(key)}:", fg="bright_black")
+                detail_value = style_text(_escape_terminal_text(value), fg="bright_white")
                 output_lines.append(f"       {detail_label} {detail_value}")
 
 
@@ -4325,7 +4381,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
 
         if output:
             _write_output_text_file(output, output_text)
-            click.secho(f"Metadata written to {output}", fg="green")
+            click.secho(f"Metadata written to {_display_path(output)}", fg="green")
         else:
             click.echo(output_text)
 
@@ -4356,7 +4412,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             format=output_format,
             error_type=type(e).__name__,
         )
-        click.secho(f"Error extracting metadata: {e}", fg="red")
+        click.secho(f"Error extracting metadata: {_display_error(e, path)}", fg="red")
         sys.exit(1)
 
 
@@ -4366,22 +4422,23 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
 
     if "directory" in metadata:
         # Directory summary
-        output.append(f"Directory: {metadata['directory']}")
-        output.append(f"Total Files: {metadata['summary']['total_files']}")
+        output.append(f"Directory: {_escape_terminal_text(metadata['directory'])}")
+        output.append(f"Total Files: {_escape_terminal_text(metadata['summary']['total_files'])}")
         if metadata.get("analysis_incomplete"):
             output.append("\nWarning: Metadata extraction is incomplete")
             for event in metadata.get("budget_events", []):
-                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
+                output.append(f"  Budget exceeded: {_escape_terminal_text(event.get('limit', 'unknown'))}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
-            output.append(f"  {fmt}: {count}")
+            output.append(f"  {_escape_terminal_text(fmt)}: {_escape_terminal_text(count)}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            file_name = file_meta.get("file", "unknown")
+            file_name = _escape_terminal_text(file_meta.get("file", "unknown"))
             if error := file_meta.get("error"):
-                output.append(f"  {file_name} (error: {error})")
+                output.append(f"  {file_name} (error: {_escape_terminal_text(error)})")
             else:
-                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
+                file_format = _escape_terminal_text(file_meta.get("format", "unknown"))
+                output.append(f"  {file_name} ({file_format})")
                 for key in (
                     "has_custom_metadata",
                     "custom_metadata_entry_count",
@@ -4394,27 +4451,35 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
                         continue
                     value = file_meta[key]
                     if isinstance(value, list):
-                        value = ", ".join(map(str, value)) if value else "none"
-                    output.append(f"    {key.replace('_', ' ').title()}: {value}")
+                        value = ", ".join(_escape_terminal_text(item) for item in value) if value else "none"
+                    output.append(f"    {key.replace('_', ' ').title()}: {_escape_terminal_text(value)}")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:
         # Single file
-        output.append(f"File: {metadata.get('file', 'unknown')}")
-        output.append(f"Format: {metadata.get('format', 'unknown')}")
-        output.append(f"Size: {metadata.get('file_size', 0):,} bytes")
+        output.append(f"File: {_escape_terminal_text(metadata.get('file', 'unknown'))}")
+        output.append(f"Format: {_escape_terminal_text(metadata.get('format', 'unknown'))}")
+        file_size = metadata.get("file_size", 0)
+        size_text = (
+            f"{file_size:,}"
+            if isinstance(file_size, (int, float)) and not isinstance(file_size, bool)
+            else _escape_terminal_text(file_size)
+        )
+        output.append(f"Size: {size_text} bytes")
 
         # Show key metadata fields
         for key, value in metadata.items():
             if key not in ["file", "path", "format", "file_size"]:
+                label = _escape_terminal_text(str(key).replace("_", " ").title())
                 if isinstance(value, str | int | float | bool):
-                    output.append(f"{key.replace('_', ' ').title()}: {value}")
+                    output.append(f"{label}: {_escape_terminal_text(value)}")
                 elif isinstance(value, dict) and len(value) <= 5:
-                    output.append(f"{key.replace('_', ' ').title()}:")
+                    output.append(f"{label}:")
                     for k, v in value.items():
-                        output.append(f"  {k}: {v}")
+                        output.append(f"  {_escape_terminal_text(k)}: {_escape_terminal_text(v)}")
                 elif isinstance(value, list) and len(value) <= 10:
-                    output.append(f"{key.replace('_', ' ').title()}: {', '.join(map(str, value))}")
+                    values = ", ".join(_escape_terminal_text(item) for item in value)
+                    output.append(f"{label}: {values}")
 
     return "\n".join(output)
 
