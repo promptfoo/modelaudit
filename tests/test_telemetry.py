@@ -882,6 +882,75 @@ class TestTelemetryClient:
             assert "bucket" not in json.dumps(download_props)
             assert "path/model.pt" not in json.dumps(download_props)
 
+    @pytest.mark.parametrize(
+        ("model_uri", "identifiers", "secrets"),
+        [
+            (
+                "models:/access_token=TELEMETRYSECRET1234567890@champion",
+                ("access_token=", "champion"),
+                ("TELEMETRYSECRET1234567890",),
+            ),
+            (
+                "models:////user:TELEMETRYPASS1234567890@host/model?token=TELEMETRYQUERY1234567890",
+                ("user:", "host/model"),
+                ("TELEMETRYPASS1234567890", "TELEMETRYQUERY1234567890"),
+            ),
+            (
+                "models:/PublicModel/1?auth=TELEMETRYAUTH1234567890&session=TELEMETRYSESSION1234567890",
+                ("PublicModel",),
+                ("TELEMETRYAUTH1234567890", "TELEMETRYSESSION1234567890"),
+            ),
+        ],
+    )
+    def test_mlflow_telemetry_fields_redact_source_credentials(
+        self,
+        model_uri: str,
+        identifiers: tuple[str, ...],
+        secrets: tuple[str, ...],
+    ) -> None:
+        """MLflow telemetry must expose neither credentials nor model identifiers."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_scan_started([model_uri], {"format": "json"})
+            started_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "model_names" not in started_props
+            assert "model_references" not in started_props
+            assert started_props["model_reference_types"] == ["mlflow:no_extension"]
+            assert started_props["source_types"] == ["mlflow"]
+            started_json = json.dumps(started_props)
+            assert all(secret not in started_json for secret in (*identifiers, *secrets))
+
+            client.record_download_started("mlflow", model_uri)
+            download_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "model_name" not in download_props
+            assert "model_reference" not in download_props
+            assert download_props["model_reference_type"] == "mlflow:no_extension"
+            download_json = json.dumps(download_props)
+            assert all(secret not in download_json for secret in (*identifiers, *secrets))
+
+            client.record_download_completed("mlflow", 2.0, 2048, model_uri)
+            completed_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "model_name" not in completed_props
+            assert "model_reference" not in completed_props
+            assert completed_props["model_reference_type"] == "mlflow:no_extension"
+            completed_json = json.dumps(completed_props)
+            assert all(secret not in completed_json for secret in (*identifiers, *secrets))
+
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""
         with (

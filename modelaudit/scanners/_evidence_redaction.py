@@ -117,12 +117,12 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[_.-][a-z0-9]+)*"
 )
 CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*))?"
+    r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*)|[A-Z])?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
     r"RefreshToken|refreshToken|GoogleAccessId|googleAccessId|SAS|Secret|SecretKey|secretKey|"
     r"Signature|Sig|Token)"
-    r"(?:[A-Z][A-Za-z0-9]*)?"
+    r"(?!(?:Algorithm|Cache|Count|Counter|Enabled|Endpoint|Status|Timeout))(?:[A-Z][A-Za-z0-9]*)?"
 )
 AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
 AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
@@ -193,6 +193,10 @@ AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r")"
     r"(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s\"';&|,}\]]+"
 )
+PARAMETERIZED_AUTHORIZATION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?P<prefix>\b(?:proxy(?:[-_ ]?)?)?authorization\s*[:=]\s*)"
+    r"(?:Digest|AWS4-HMAC-SHA256)\b"
+)
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
 QUOTED_VALUE_PATTERN: Final[str] = (
@@ -211,6 +215,16 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     rf"{VALUE_OPENERS_PATTERN})"
     rf"{UNQUOTED_VALUE_PATTERN}"
+)
+SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    r"(?:ApiKey|Bearer|Basic|Custom|Digest|Negotiate|NTLM|OAuth|Token|AWS4-HMAC-SHA256)"
+    rf"[ \t]+{UNQUOTED_VALUE_PATTERN}"
+)
+SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})(?:Digest|AWS4-HMAC-SHA256)\b"
 )
 SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
@@ -1169,6 +1183,145 @@ def _redact_unquoted_assignment(match: re.Match[str]) -> str:
     if _assignment_value_starts_redacted_dangerous_call(match):
         return match.group(0)
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _redact_sensitive_auth_scheme_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _parameterized_authorization_value_end(
+    text: str,
+    start: int,
+    *,
+    fstring: bool = False,
+    stop_at_newline: bool = True,
+) -> int:
+    quote: str | None = None
+    escaped = False
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if char in ("'", '"'):
+            quote = char
+        elif fstring and char == "{" and (index + 1 >= len(text) or text[index + 1] != "{"):
+            expression_end = _find_balanced_container_end(text, index)
+            if expression_end is None:
+                return index
+            index = expression_end
+            continue
+        elif char in "&|}]":
+            return index
+        elif char in "\r\n":
+            if stop_at_newline:
+                return index
+        elif char == ";":
+            if SHELL_OPERATOR_COMMAND_RE.match(text, index) is not None:
+                return index
+            parameter_start = max(start, text.rfind(",", start, index) + 1)
+            parameter = text[parameter_start:index].strip()
+            signed_headers_continue = (
+                re.fullmatch(r"(?i)SignedHeaders\s*=\s*[A-Za-z0-9-]+(?:;[A-Za-z0-9-]+)*", parameter) is not None
+                and re.match(r"[A-Za-z0-9-]+(?=;|,)", text[index + 1 :]) is not None
+            )
+            if not signed_headers_continue:
+                return index
+        index += 1
+    return len(text)
+
+
+def _redact_parameterized_authorization_values(
+    text: str,
+    *,
+    fstring: bool = False,
+    prefix_re: re.Pattern[str] = PARAMETERIZED_AUTHORIZATION_PREFIX_RE,
+    stop_at_newline: bool = True,
+) -> str:
+    redacted_chunks: list[str] = []
+    last_index = 0
+    search_index = 0
+    while match := prefix_re.search(text, search_index):
+        value_end = _parameterized_authorization_value_end(
+            text,
+            match.end(),
+            fstring=fstring,
+            stop_at_newline=stop_at_newline,
+        )
+        trailing_start = value_end
+        while trailing_start > match.end() and text[trailing_start - 1] in " \t":
+            trailing_start -= 1
+        redacted_chunks.append(text[last_index : match.start()])
+        redacted_chunks.append(f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}{text[trailing_start:value_end]}")
+        last_index = value_end
+        search_index = value_end
+
+    if not redacted_chunks:
+        return text
+    redacted_chunks.append(text[last_index:])
+    return "".join(redacted_chunks)
+
+
+def _redact_authorization_literal(literal: str | bytes) -> str | bytes:
+    if isinstance(literal, bytes):
+        decoded = literal.decode("latin-1")
+        redacted = _redact_parameterized_authorization_values(decoded, stop_at_newline=False)
+        redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+        return redacted.encode("latin-1")
+
+    redacted = _redact_parameterized_authorization_values(literal, stop_at_newline=False)
+    return AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+
+
+def _redact_authorization_in_python_strings(text: str) -> str:
+    offsets = _line_offsets(text)
+    replacements: list[tuple[int, int, str]] = []
+    try:
+        tree = ast.parse(text)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return text
+
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            if isinstance(parents.get(node), (ast.FormattedValue, ast.JoinedStr)):
+                continue
+            source = ast.get_source_segment(text, node)
+            if source is None:
+                continue
+            string_match = PYTHON_STRING_QUOTE_RE.match(source)
+            if string_match is None or "f" not in string_match.group("prefix").lower():
+                continue
+            quote = string_match.group("quote")
+            if not source.endswith(quote):
+                continue
+            body = source[string_match.end() : -len(quote)]
+            redacted_body = _redact_parameterized_authorization_values(body, fstring=True, stop_at_newline=False)
+            if redacted_body != body:
+                redacted_source = f"{source[: string_match.end()]}{redacted_body}{quote}"
+                _append_ast_node_replacement(text, offsets, node, replacements, redacted_source)
+            continue
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, (str, bytes)):
+            continue
+        if isinstance(parents.get(node), ast.JoinedStr):
+            continue
+        literal = node.value
+        redacted = _redact_authorization_literal(literal)
+        if redacted == literal:
+            continue
+        _append_ast_node_replacement(text, offsets, node, replacements, repr(redacted))
+
+    for start, end, replacement in sorted(replacements, reverse=True):
+        text = f"{text[:start]}{replacement}{text[end:]}"
+    return text
 
 
 def _redact_bracketed_mapping_assignment(match: re.Match[str]) -> str:
@@ -3138,6 +3291,8 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
             lambda match: _redact_percent_encoded_secret_candidate(match, url_depth=url_depth),
             redacted,
         )
+    if not parseable_python_evidence:
+        redacted = _redact_parameterized_authorization_values(redacted)
     if not r_evidence and (not python_evidence or ".." in redacted):
         redacted = _redact_compound_sensitive_assignments(redacted)
     if python_evidence:
@@ -3188,7 +3343,14 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
-    if not parseable_python_evidence:
+    if parseable_python_evidence:
+        redacted = _redact_authorization_in_python_strings(redacted)
+    else:
+        redacted = _redact_parameterized_authorization_values(redacted)
+        redacted = _redact_parameterized_authorization_values(
+            redacted,
+            prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+        )
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
@@ -3196,6 +3358,8 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = INDEXED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = CREDENTIALS_ASSIGNMENT_RE.sub(redact_unquoted_assignment, redacted)
+    if not parseable_python_evidence:
+        redacted = SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE.sub(_redact_sensitive_auth_scheme_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(redact_scalar_assignment, redacted)
     if python_evidence:
         redacted = _redact_sensitive_comparisons(redacted)
