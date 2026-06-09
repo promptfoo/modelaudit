@@ -619,21 +619,81 @@ def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None
     assert stream_checks[0].details["trailing_objects_are_container_like"] is False
 
 
-def test_flax_msgpack_incomplete_trailing_object_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("trailer_name", "trailer"),
+    [
+        ("partial_fixmap", b"\x81\xa1"),
+        ("partial_array16", b"\xdc"),
+        ("partial_array32", b"\xdd"),
+        ("partial_map16", b"\xde"),
+        ("partial_map32", b"\xdf"),
+    ],
+)
+def test_flax_msgpack_incomplete_trailing_object_fails_closed(
+    tmp_path: Path,
+    trailer_name: str,
+    trailer: bytes,
+) -> None:
     """A partial trailing object must not disappear into the streaming unpacker buffer."""
-    path = tmp_path / "incomplete_trailing_object.msgpack"
-    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + b"\x81\xa1"
+    path = tmp_path / f"incomplete_trailing_{trailer_name}.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + trailer
     path.write_bytes(payload)
 
     result = FlaxMsgpackScanner().scan(str(path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON]
     assert any(
         check.name == "Msgpack Parse Check"
         and check.status == CheckStatus.FAILED
         and check.details["parse_error"] == "incomplete trailing msgpack object"
+        and check.details["analysis_incomplete"] is True
+        and check.details["stream_size"] == len(payload)
         for check in result.checks
     )
+
+
+def test_flax_msgpack_clean_eof_and_valid_width_prefixed_trailer_remain_complete(tmp_path: Path) -> None:
+    """Clean EOF and valid concatenated containers must remain distinguishable from truncation."""
+    primary = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    clean_path = tmp_path / "clean_eof.msgpack"
+    clean_path.write_bytes(primary)
+    concatenated_path = tmp_path / "valid_array16_trailer.msgpack"
+    concatenated_path.write_bytes(primary + msgpack.packb(list(range(16)), use_bin_type=True))
+
+    clean_result = FlaxMsgpackScanner().scan(str(clean_path))
+    concatenated_result = FlaxMsgpackScanner().scan(str(concatenated_path))
+
+    assert clean_result.success is True
+    assert "scan_outcome" not in clean_result.metadata
+    assert concatenated_result.success is True
+    assert concatenated_result.metadata["msgpack_object_count"] == 2
+    assert FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON not in concatenated_result.metadata.get(
+        "scan_outcome_reasons", []
+    )
+
+
+def test_flax_msgpack_truncated_width_prefixed_trailer_exits_with_error_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_map16_trailer.msgpack"
+    path.write_bytes(msgpack.packb({"params": {"w": [1]}}, use_bin_type=True) + b"\xde")
+
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON,
+        tmp_path / "truncated-stream-cache",
+    )
+
+
+def test_flax_msgpack_truncated_trailer_at_stream_object_limit_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_trailer_at_object_limit.msgpack"
+    path.write_bytes(msgpack.packb({"params": {"w": [1]}}, use_bin_type=True) + b"\xdc")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 1}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON]
+    assert not [check for check in result.checks if check.name == "Msgpack Stream Object Limit"]
 
 
 def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:

@@ -377,6 +377,7 @@ class FlaxMsgpackScanner(BaseScanner):
     STRUCTURE_BUDGET_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_structure_budget_exceeded"
     DECODE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_decode_limit_exceeded"
     BINARY_PATTERN_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_binary_pattern_coverage_incomplete"
+    TRUNCATED_STREAM_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_truncated_stream"
     DEFAULT_MAX_STRUCTURE_NODES: ClassVar[int] = 200_000
     DEFAULT_MAX_BOUNDED_TEXT_CHARS: ClassVar[int] = 1_000_000
     DEFAULT_MAX_MSGPACK_DECODE_BYTES: ClassVar[int] = 512 * 1024 * 1024
@@ -2100,6 +2101,29 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         result.finish(success=False)
 
+    def _add_msgpack_truncated_stream_check(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        stream_offset: int,
+        stream_size: int,
+    ) -> None:
+        parse_error = "incomplete trailing msgpack object"
+        self._add_incomplete_check(
+            result,
+            reason=self.TRUNCATED_STREAM_INCONCLUSIVE_REASON,
+            name="Msgpack Parse Check",
+            message=f"Failed to parse msgpack data: {parse_error}",
+            location=path,
+            details={
+                "parse_error": parse_error,
+                "stream_offset": stream_offset,
+                "stream_size": stream_size,
+            },
+        )
+        result.finish(success=False)
+
     def _add_msgpack_stream_object_limit_check(self, result: ScanResult, path: str, parsed_object_count: int) -> None:
         result.add_check(
             name="Msgpack Stream Object Limit",
@@ -2400,6 +2424,7 @@ class FlaxMsgpackScanner(BaseScanner):
         trailing_state = _StreamTraversalState(max_nodes=self.max_structure_nodes)
         try:
             with open(path, "rb") as source:
+                stream_size = os.fstat(source.fileno()).st_size
                 unpacker = msgpack.Unpacker(
                     source,
                     read_size=self._msgpack_stream_read_size(),
@@ -2411,8 +2436,17 @@ class FlaxMsgpackScanner(BaseScanner):
                         try:
                             unpacker.skip()
                         except Exception as error:
-                            if self._is_msgpack_out_of_data(error) and unpacker.tell() == previous_offset:
-                                break
+                            if self._is_msgpack_out_of_data(error):
+                                current_offset = unpacker.tell()
+                                if current_offset == previous_offset and previous_offset == stream_size:
+                                    break
+                                self._add_msgpack_truncated_stream_check(
+                                    result,
+                                    path,
+                                    stream_offset=current_offset,
+                                    stream_size=stream_size,
+                                )
+                                return None
                             raise
                         self._add_msgpack_stream_object_limit_check(result, path, len(object_types))
                         return None
@@ -2434,12 +2468,14 @@ class FlaxMsgpackScanner(BaseScanner):
                         )
                     except Exception as error:
                         if self._is_msgpack_out_of_data(error):
-                            if unpacker.tell() == previous_offset:
+                            current_offset = unpacker.tell()
+                            if current_offset == previous_offset and previous_offset == stream_size:
                                 break
-                            self._add_msgpack_parse_failure_check(
+                            self._add_msgpack_truncated_stream_check(
                                 result,
                                 path,
-                                ValueError("incomplete trailing msgpack object"),
+                                stream_offset=current_offset,
+                                stream_size=stream_size,
                             )
                             return None
                         raise
