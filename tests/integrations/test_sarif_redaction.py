@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cli import _format_scan_output
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.source_redaction import (
     redact_source_identifier,
     redact_source_text,
     redact_source_value,
 )
-from modelaudit.models import AssetModel, create_initial_audit_result
+from modelaudit.models import AssetModel, FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 
 
@@ -300,3 +301,83 @@ def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(
     assert redact_source_identifier(str(missing_path)) == str(tmp_path / "missing.pkl")
     assert redact_source_identifier(str(literal_path)) == str(literal_path)
     assert redact_source_identifier("./missing.pkl%3Ftoken%3Dsource-secret") == "./missing.pkl"
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "./user:password@bucket.example/model.pkl",
+        "./bucket/token=path-secret/model.pkl?revision=v1",
+        "./bucket/token%3Dpath-secret/model.pkl?revision=v1",
+    ],
+)
+def test_nonexistent_posix_local_credential_prefixes_fail_closed(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "safe_path"),
+    [
+        ("/bucket/model.pkl;token=source-secret", "/bucket/model.pkl"),
+        ("./bucket/model.pkl%3Btoken%3Dsource-secret", "./bucket/model.pkl"),
+    ],
+)
+def test_nonexistent_local_semicolon_credentials_are_redacted(raw_path: str, safe_path: str) -> None:
+    assert redact_source_identifier(raw_path) == safe_path
+
+
+def test_existing_local_credential_shaped_filename_is_preserved(tmp_path: Path) -> None:
+    literal_path = tmp_path / "model.pkl;token=filename-text"
+    literal_path.write_bytes(b"model")
+
+    assert redact_source_identifier(str(literal_path)) == str(literal_path)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("model.pkl?OPAQUE-SECRET", "model.pkl"),
+        ("model.pkl%3FOPAQUE-SECRET", "model.pkl"),
+        ("source //bucket.example/model.pkl?OPAQUE-SECRET", "source //bucket.example/model.pkl"),
+        ("model.pkl?version=1", "model.pkl?version=1"),
+        ("model.pkl%3Fversion%3D1", "model.pkl%3Fversion%3D1"),
+        ("./bucket/model.pkl;version=1", "./bucket/model.pkl;version=1"),
+        ("release 1.2.3? maybe", "release 1.2.3? maybe"),
+        ("email user@example.com?subject=safe", "email user@example.com?subject=safe"),
+        ("email user@example.com?token=secret", "email user@example.com"),
+    ],
+)
+def test_bare_and_protocol_relative_opaque_source_text_redaction(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
+
+
+def test_format_scan_output_serializes_pydantic_urls_and_preserves_text_findings() -> None:
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Critical finding",
+            severity=IssueSeverity.CRITICAL,
+            timestamp=time.time(),
+        )
+    ]
+    result.file_metadata = {
+        "model.pkl": FileMetadataModel(
+            license_info=[
+                LicenseInfoModel(
+                    spdx_id="MIT",
+                    name="MIT",
+                    url="https://example.com/license",
+                )
+            ]
+        )
+    }
+    result.finalize_statistics()
+
+    json_output = _format_scan_output(result, ["model.pkl"], output_format="json", verbose=True)
+    assert json.loads(json_output)["file_metadata"]["model.pkl"]["license_info"][0]["url"] == (
+        "https://example.com/license"
+    )
+
+    text_output = _format_scan_output(result, ["model.pkl"], output_format="text", verbose=True)
+    assert "Critical Issues" in text_output
+    assert "Critical finding" in text_output

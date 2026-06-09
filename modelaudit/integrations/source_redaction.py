@@ -5,7 +5,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
-from pydantic import BaseModel
+from pydantic import AnyUrl, BaseModel
 
 from modelaudit.utils.sources.cloud_storage import (
     _normalize_percent_encoded_url_delimiters_for_display as _normalize_percent_encoded_url_delimiters_for_display,
@@ -41,14 +41,35 @@ _USERINFO_TOKEN_RE = re.compile(
 _SCHEMELESS_SUFFIX_TOKEN_RE = re.compile(
     rf"(?<![0-9A-Za-z_%.-])(?P<identifier>"
     rf"(?:(?:[a-z]:[\\/]|/|\.\.?/)?(?:[^\s\"'<>/?#]+/)+)"
-    rf"[^\s\"'<>?#]+[?#]{_URL_TEXT_CHARACTER}+"
+    rf"[^\s\"'<>?#]+[?#;]{_URL_TEXT_CHARACTER}+"
     rf")",
     re.IGNORECASE,
 )
 _SCHEMELESS_ENCODED_SUFFIX_TOKEN_RE = re.compile(
     rf"(?<![0-9A-Za-z_%.-])(?P<identifier>"
     rf"(?:(?:[a-z]:[\\/]|/|\.\.?/)?(?:[^\s\"'<>/?#]+/)+)"
-    rf"[^\s\"'<>?#]+%(?:25)*(?:3f|23){_URL_TEXT_CHARACTER}+"
+    rf"[^\s\"'<>?#]+%(?:25)*(?:3f|23|3b){_URL_TEXT_CHARACTER}+"
+    rf")",
+    re.IGNORECASE,
+)
+_BARE_SUFFIX_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z_%@.-])(?P<identifier>"
+    rf"[0-9A-Za-z._~-]+\.[A-Za-z][0-9A-Za-z]{{0,15}}"
+    rf"[?#;]{_URL_TEXT_CHARACTER}+"
+    rf")",
+    re.IGNORECASE,
+)
+_BARE_ENCODED_SUFFIX_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z_%@.-])(?P<identifier>"
+    rf"[0-9A-Za-z._~-]+\.[A-Za-z][0-9A-Za-z]{{0,15}}"
+    rf"%(?:25)*(?:3f|23|3b){_URL_TEXT_CHARACTER}+"
+    rf")",
+    re.IGNORECASE,
+)
+_EMAIL_SUFFIX_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z_%+.-])(?P<identifier>"
+    rf"[0-9A-Za-z._%+-]+@[0-9A-Za-z.-]+\.[A-Za-z]{{2,}}"
+    rf"[?#]{_URL_TEXT_CHARACTER}+"
     rf")",
     re.IGNORECASE,
 )
@@ -139,7 +160,7 @@ def redact_source_identifier(source: str) -> str:
         return safe_url.removeprefix("https:")
 
     if _is_local_path_identifier(source):
-        return _redact_local_path_suffix(source)
+        return _redact_local_path_identifier(source)
     redacted_userinfo = _redact_userinfo_identifier(normalized_source)
     if redacted_userinfo is not None:
         return redacted_userinfo
@@ -192,19 +213,53 @@ def redact_source_text(text: str) -> str:
         lambda match: _redact_encoded_suffix_token(match.group("identifier")),
         redacted_text,
     )
+    redacted_text = _BARE_SUFFIX_TOKEN_RE.sub(
+        lambda match: redact_source_identifier(match.group("identifier")),
+        redacted_text,
+    )
+    redacted_text = _BARE_ENCODED_SUFFIX_TOKEN_RE.sub(
+        lambda match: redact_source_identifier(match.group("identifier")),
+        redacted_text,
+    )
+    redacted_text = _EMAIL_SUFFIX_TOKEN_RE.sub(
+        lambda match: _redact_email_suffix_token(match.group("identifier")),
+        redacted_text,
+    )
     return _redact_assignments_outside_url_tokens(redacted_text)
 
 
 def _redact_assignments_outside_url_tokens(text: str) -> str:
-    """Redact free-text assignments without reprocessing sanitized URLs."""
+    """Redact free-text assignments without reprocessing sanitized source tokens."""
     redacted_parts: list[str] = []
     previous_end = 0
-    for match in _URL_TOKEN_RE.finditer(text):
+    token_spans = sorted(
+        (
+            (match.start(), match.end())
+            for pattern in (
+                _URL_TOKEN_RE,
+                _USERINFO_TOKEN_RE,
+                _SCHEMELESS_SUFFIX_TOKEN_RE,
+                _SCHEMELESS_ENCODED_SUFFIX_TOKEN_RE,
+                _BARE_SUFFIX_TOKEN_RE,
+                _BARE_ENCODED_SUFFIX_TOKEN_RE,
+                _EMAIL_SUFFIX_TOKEN_RE,
+            )
+            for match in pattern.finditer(text)
+        ),
+    )
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in token_spans:
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(end, merged_spans[-1][1]))
+        else:
+            merged_spans.append((start, end))
+
+    for start, end in merged_spans:
         redacted_parts.append(
-            _redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end : match.start()]))
+            _redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end:start]))
         )
-        redacted_parts.append(match.group(0))
-        previous_end = match.end()
+        redacted_parts.append(text[start:end])
+        previous_end = end
     redacted_parts.append(_redact_export_alias_assignments(_redact_cloud_error_for_display(text[previous_end:])))
     return "".join(redacted_parts)
 
@@ -236,10 +291,13 @@ def redact_source_reference(source: str) -> str:
 
 def _has_safe_schemeless_provenance_suffix(source: str) -> bool:
     """Preserve bounded, explicitly non-sensitive assignments in local-looking names."""
-    suffix_indexes = [index for delimiter in "?#;" if (index := source.find(delimiter)) >= 0]
+    normalized_source = _normalize_percent_encoded_url_delimiters_for_display(
+        _normalize_escaped_url_delimiters_for_display(source)
+    )
+    suffix_indexes = [index for delimiter in "?#;" if (index := normalized_source.find(delimiter)) >= 0]
     if not suffix_indexes:
         return False
-    suffix = source[min(suffix_indexes) + 1 :]
+    suffix = normalized_source[min(suffix_indexes) + 1 :]
     if not suffix or len(suffix) > _MAX_PROVENANCE_QUERY_CHARS:
         return False
 
@@ -269,6 +327,8 @@ def _redact_source_value(value: Any, *, seen: set[int], depth: int) -> Any:
         return "<redacted>"
     if isinstance(value, BaseModel):
         return _redact_source_value(value.model_dump(mode="python"), seen=seen, depth=depth + 1)
+    if isinstance(value, AnyUrl):
+        return redact_source_text(str(value))
     if isinstance(value, str):
         return redact_source_text(value)
     if isinstance(value, (bytes, bytearray)):
@@ -349,6 +409,17 @@ def _redact_encoded_suffix_token(source: str) -> str:
     if _URL_LIKE_PREFIX_RE.match(source):
         return _redact_url_token(source)
     return redact_source_identifier(source)
+
+
+def _redact_email_suffix_token(source: str) -> str:
+    suffix_indexes = [index for delimiter in "?#" if (index := source.find(delimiter)) >= 0]
+    if not suffix_indexes:
+        return source
+    suffix_index = min(suffix_indexes)
+    suffix = source[suffix_index + 1 :]
+    if _contains_sensitive_assignment(suffix) or _contains_opaque_suffix_part(suffix):
+        return source[:suffix_index]
+    return source
 
 
 def _redact_url_identifier(source: str) -> str:
@@ -437,13 +508,29 @@ def _redact_local_path_suffix(source: str) -> str:
     normalized_source = _normalize_percent_encoded_url_delimiters_for_display(
         _normalize_escaped_url_delimiters_for_display(source)
     )
-    suffix_indexes = [index for delimiter in "?#" if (index := normalized_source.find(delimiter)) >= 0]
+    suffix_indexes = [index for delimiter in "?#;" if (index := normalized_source.find(delimiter)) >= 0]
     if not suffix_indexes:
         return source
     suffix_index = min(suffix_indexes)
     suffix = normalized_source[suffix_index + 1 :]
     if _contains_sensitive_assignment(suffix) or _contains_opaque_suffix_part(suffix):
         return normalized_source[:suffix_index] or "<source redacted>"
+    return source
+
+
+def _redact_local_path_identifier(source: str) -> str:
+    safe_source = _redact_local_path_suffix(source)
+    if safe_source != source:
+        return safe_source
+    if _is_windows_or_unc_path(source):
+        return source
+
+    normalized_source = _normalize_percent_encoded_url_delimiters_for_display(
+        _normalize_escaped_url_delimiters_for_display(source)
+    )
+    path_prefix = re.split(r"[?#;]", normalized_source, maxsplit=1)[0]
+    if _USERINFO_TOKEN_RE.search(path_prefix) or _has_sensitive_path_assignment(path_prefix):
+        return "<source redacted>"
     return source
 
 
