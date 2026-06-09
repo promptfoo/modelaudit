@@ -1545,8 +1545,19 @@ class TestJinja2TemplateScannerEdgeCases:
             + "{% macro bind(x) %}{% set x.m=bad %}{% endmacro %}{{ bind(other) }}{{ ns.m() }}",
             "{{ [range][0](100001)|min }}",
             "{{ (range,)[0](100001)|min }}",
+            "{{ (range, range)[-1](100001)|min }}",
+            "{{ ([range] + [range])[0](100001)|min }}",
             "{{ {'r': range}['r'](100001)|min }}",
+            "{{ {'r': range}.get('r')(100001)|min }}",
+            "{% set xs=[range] %}{{ xs[0](100001)|min }}",
+            "{% set funcs={'r': range} %}{{ funcs['r'](100001)|min }}",
             "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{{ [bad][0]() }}",
+            "{% set args=[range] %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(*args) }}",
+            "{% set kw={'r': range} %}{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{{ m(**kw) }}",
+            "{% set args=[100001] %}{{ range(*args)|min }}",
+            "{% macro small(_count) %}0{% endmacro %}"
+            + "{% macro recurse(n, f) %}{% if n %}{{ recurse(0, range) }}"
+            + "{% else %}{{ f(100001)|min }}{% endif %}{% endmacro %}{{ recurse(1, small) }}",
             "{% if condition %}{% set n=100001 %}{% else %}{% set n=1 %}{% endif %}{{ range(n)|min }}",
             "{% if condition %}{% set n=1 %}{% else %}{% set n=200001 %}{% endif %}" + "{{ range(0, 200001, n)|min }}",
             "{% if condition %}{% set n=-1 %}{% else %}{% set n=-200001 %}{% endif %}"
@@ -1567,6 +1578,9 @@ class TestJinja2TemplateScannerEdgeCases:
             "{{ range((10 ** 1000 + 1) - 10 ** 999)|min }}",
             "{{ range(3 ** 1000 - 2 ** 1000)|min }}",
             "{{ range((-(10 ** 1000)) ** 3, 0)|min }}",
+            "{{ range((-2) ** (10 ** 101))|list }}",
+            "{{ range((2 ** 400) % 999983)|list }}",
+            "{{ range(3 ** 300 - (2 ** 400 + 1))|min }}",
         ],
     )
     def test_unavailable_sandbox_worker_fails_closed_for_wrapped_scalar_range_filters(
@@ -1777,6 +1791,72 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{% macro range(_count) %}12{% endmacro %}{{ range(100001)|list }}",
+            "{% macro range(_count) %}12{% endmacro %}{{ range(100001)|join }}",
+            "{% macro range(_count) %}12{% endmacro %}{% for item in range(100001) %}{{ item }}{% endfor %}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_respects_shadowed_range_in_eager_contexts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "shadowed-range-eager.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_static_range_analysis_fails_closed_when_macro_expansion_budget_is_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RENDER_ANALYSIS_STEPS", 32)
+        definitions: list[str] = []
+        assignments: list[str] = []
+        for index in range(6):
+            next_call = f"f{index + 1}()" if index + 1 < 6 else "0"
+            definitions.extend(
+                [
+                    f"{{% macro a{index}() %}}{{{{ {next_call} }}}}{{% endmacro %}}",
+                    f"{{% macro b{index}() %}}{{{{ {next_call} }}}}{{% endmacro %}}",
+                ]
+            )
+            assignments.append(
+                f"{{% if condition{index} %}}{{% set f{index}=a{index} %}}"
+                f"{{% else %}}{{% set f{index}=b{index} %}}{{% endif %}}"
+            )
+        template_content = "".join([*definitions, *assignments, "{{ f0() }}"])
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._template_has_static_render_budget_risk(template_content) is True
+
+    def test_static_range_analysis_fails_closed_when_projection_budget_is_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        monkeypatch.setattr(jinja2_template_scanner, "_MAX_STATIC_RANGE_PROJECTION_ITEMS", 15_000)
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1_000_000})
+
+        assert scanner._template_has_static_render_budget_risk("{{ range(10000)|list }}" * 2) is True
+
     def test_unavailable_sandbox_worker_respects_overwritten_range_function_alias(
         self,
         tmp_path: Path,
@@ -1960,6 +2040,8 @@ class TestJinja2TemplateScannerEdgeCases:
             "{{ range(10 ** 1000 - 10 ** 1000)|list }}",
             "{{ range((10 ** 1000) // (10 ** 1000))|list }}",
             "{{ range((10 ** 1000) % (10 ** 1000))|list }}",
+            "{{ range((10 ** 101) // 10 - 10 ** 100)|list }}",
+            "{{ range(0, (10 ** 100) % (-(10 ** 100 + 1)), -1)|list }}",
             "{{ range(-(10 ** 1000))|list }}",
             "{{ range(10 ** 1000, 0)|list }}",
         ],
@@ -1973,6 +2055,50 @@ class TestJinja2TemplateScannerEdgeCases:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "invalid-range.jinja"
         template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_keeps_exact_saturated_power_quotient_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "exact-power-quotient.jinja"
+        template_file.write_text("{{ range((10 ** 101) // (10 ** 100))|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1000})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    @pytest.mark.parametrize("numeric_text", ["x" * 4097, "0" * 4097])
+    def test_unavailable_sandbox_worker_keeps_long_non_amplifying_int_filters_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        numeric_text: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "long-int-filter.jinja"
+        template_file.write_text(f'{{{{ range("{numeric_text}"|int)|list }}}}', encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
         monkeypatch.setattr(

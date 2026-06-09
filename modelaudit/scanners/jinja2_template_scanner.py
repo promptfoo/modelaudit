@@ -96,6 +96,8 @@ _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
 _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS = 2.0
 _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
 _STATIC_INT_EVAL_MAX_ABS = 10**100
+_MAX_STATIC_RENDER_ANALYSIS_STEPS = 20_000
+_MAX_STATIC_RANGE_PROJECTION_ITEMS = 200_000
 _SANDBOX_MAX_RANGE_ITERATIONS = int(jinja2.sandbox.MAX_RANGE) if HAS_JINJA2_SANDBOX else 100_000
 _EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "sort"})
 _LAZY_RANGE_ITERATION_FILTERS = frozenset(
@@ -111,6 +113,41 @@ class _StaticIntCandidates:
 
 
 _StaticIntBinding = _StaticIntResult | _StaticIntCandidates
+
+
+class _StaticMacroAnalysisState(set[int]):
+    def __init__(
+        self,
+        values: set[int] | None = None,
+        remaining_steps: list[int] | None = None,
+        remaining_range_items: list[int] | None = None,
+        preflight_only: bool = False,
+    ):
+        super().__init__(values or ())
+        self.remaining_steps = remaining_steps or [_MAX_STATIC_RENDER_ANALYSIS_STEPS]
+        self.remaining_range_items = remaining_range_items or [_MAX_STATIC_RANGE_PROJECTION_ITEMS]
+        self.preflight_only = preflight_only
+
+    def consume(self) -> bool:
+        if self.remaining_steps[0] <= 0:
+            return False
+        self.remaining_steps[0] -= 1
+        return True
+
+    def nested(self, macro_id: int) -> "_StaticMacroAnalysisState":
+        return _StaticMacroAnalysisState(
+            {*self, macro_id},
+            self.remaining_steps,
+            self.remaining_range_items,
+            self.preflight_only,
+        )
+
+    def consume_range_items(self, count: int) -> bool:
+        if count > self.remaining_range_items[0]:
+            self.remaining_range_items[0] = 0
+            return False
+        self.remaining_range_items[0] -= count
+        return True
 
 
 class _SandboxRenderBudgetExceeded(Exception):
@@ -1587,11 +1624,10 @@ class Jinja2TemplateScanner(BaseScanner):
         parsed = self._parse_template_ast(template_content)
         if parsed is None:
             return False
-        return (
-            self._template_ast_has_static_range_list_budget_risk(parsed)
-            or self._template_ast_has_static_range_join_budget_risk(parsed)
-            or self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
-        )
+        return self._template_ast_has_oversized_sandbox_range_call(
+            parsed,
+            preflight_only=True,
+        ) or self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
 
     def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
         return bool(
@@ -1639,13 +1675,6 @@ class Jinja2TemplateScanner(BaseScanner):
 
         if self._template_ast_has_oversized_sandbox_range_call(parsed):
             return True
-
-        if self._template_ast_has_static_range_list_budget_risk(parsed):
-            return True
-
-        if self._template_ast_has_static_iterated_range_budget_risk(parsed):
-            return True
-
         return self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
 
     def _template_ast_has_static_repeated_sequence_budget_risk(self, parsed: Any) -> bool:
@@ -1671,7 +1700,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return False
 
-    def _template_ast_has_oversized_sandbox_range_call(self, parsed: Any) -> bool:
+    def _template_ast_has_oversized_sandbox_range_call(self, parsed: Any, *, preflight_only: bool = False) -> bool:
         range_aliases = {"range"}
         int_bindings: dict[str, _StaticIntBinding] = {}
         namespace_range_attrs: dict[str, set[str]] = {}
@@ -1682,7 +1711,7 @@ class Jinja2TemplateScanner(BaseScanner):
             int_bindings,
             namespace_range_attrs,
             macro_bindings,
-            set(),
+            _StaticMacroAnalysisState(preflight_only=preflight_only),
         )
 
     def _static_node_has_oversized_sandbox_range_call(
@@ -1694,6 +1723,8 @@ class Jinja2TemplateScanner(BaseScanner):
         macro_bindings: dict[str, tuple[Any, ...]],
         active_macros: set[int],
     ) -> bool:
+        if isinstance(active_macros, _StaticMacroAnalysisState) and not active_macros.consume():
+            return True
         if isinstance(node, jinja2.nodes.Block):
             block_aliases = set(range_aliases)
             block_int_bindings = dict(int_bindings)
@@ -1942,7 +1973,9 @@ class Jinja2TemplateScanner(BaseScanner):
             )
 
         if isinstance(node, jinja2.nodes.For):
-            if self._static_range_iterable_exceeds_budget(
+            if not (
+                isinstance(active_macros, _StaticMacroAnalysisState) and active_macros.preflight_only
+            ) and self._static_range_iterable_exceeds_budget(
                 node.iter,
                 max(1, self.sandbox_render_max_output_chars),
                 range_aliases,
@@ -1975,7 +2008,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
             literal_items = node.iter.items if isinstance(node.iter, jinja2.nodes.List | jinja2.nodes.Tuple) else None
             iteration_count: int | None = len(literal_items) if literal_items is not None else None
-            range_call = self._static_iterable_range_call(node.iter, range_aliases, namespace_range_attrs)
+            range_call = self._static_iterable_range_call(
+                node.iter,
+                range_aliases,
+                int_bindings,
+                namespace_range_attrs,
+            )
             if range_call is not None:
                 iteration_count = self._constant_range_iteration_count_with_bindings(
                     range_call.args,
@@ -2189,12 +2227,18 @@ class Jinja2TemplateScanner(BaseScanner):
         if (
             isinstance(node, jinja2.nodes.Filter)
             and node.name in _EAGER_RANGE_ITERATION_FILTERS
+            and (
+                not isinstance(active_macros, _StaticMacroAnalysisState)
+                or not active_macros.preflight_only
+                or node.name in {"list", "join"}
+            )
             and self._static_range_filter_exceeds_budget(
                 node,
                 max(1, self.sandbox_render_max_output_chars),
                 range_aliases,
                 int_bindings,
                 namespace_range_attrs,
+                active_macros if isinstance(active_macros, _StaticMacroAnalysisState) else None,
             )
         ):
             return True
@@ -2237,11 +2281,15 @@ class Jinja2TemplateScanner(BaseScanner):
         ):
             return True
 
-        normalized_range_call = self._range_call_with_literal_unpacking(node)
-        if normalized_range_call is not None and self._is_static_range_callable(
-            normalized_range_call.node,
-            range_aliases,
-            namespace_range_attrs,
+        normalized_range_call = self._range_call_with_static_unpacking(node, int_bindings)
+        if (
+            not (isinstance(active_macros, _StaticMacroAnalysisState) and active_macros.preflight_only)
+            and normalized_range_call is not None
+            and self._is_static_range_callable(
+                normalized_range_call.node,
+                range_aliases,
+                namespace_range_attrs,
+            )
         ):
             count = self._constant_range_iteration_count_with_bindings(
                 normalized_range_call.args,
@@ -2273,9 +2321,24 @@ class Jinja2TemplateScanner(BaseScanner):
         active_macros: set[int],
     ) -> bool:
         macros = self._static_macro_binding_for_node(node.node, macro_bindings)
-        return any(
-            id(macro) not in active_macros
-            and self._static_single_macro_call_has_oversized_sandbox_range_call(
+        for macro in macros:
+            if id(macro) in active_macros:
+                normalized_arguments = self._static_macro_call_arguments(
+                    node,
+                    int_bindings,
+                    namespace_range_attrs,
+                    macro_bindings,
+                )
+                if normalized_arguments is None:
+                    continue
+                positional_arguments, keyword_arguments = normalized_arguments
+                if any(
+                    self._is_static_range_callable(value, range_aliases, namespace_range_attrs)
+                    for value in [*positional_arguments, *(value for _, value in keyword_arguments)]
+                ):
+                    return True
+                continue
+            if self._static_single_macro_call_has_oversized_sandbox_range_call(
                 node,
                 macro,
                 range_aliases,
@@ -2283,9 +2346,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 namespace_range_attrs,
                 macro_bindings,
                 active_macros,
-            )
-            for macro in macros
-        )
+            ):
+                return True
+        return False
 
     def _static_single_macro_call_has_oversized_sandbox_range_call(
         self,
@@ -2297,7 +2360,12 @@ class Jinja2TemplateScanner(BaseScanner):
         macro_bindings: dict[str, tuple[Any, ...]],
         active_macros: set[int],
     ) -> bool:
-        normalized_arguments = self._static_macro_call_arguments(node)
+        normalized_arguments = self._static_macro_call_arguments(
+            node,
+            int_bindings,
+            namespace_range_attrs,
+            macro_bindings,
+        )
         if normalized_arguments is None:
             return False
         positional_arguments, keyword_arguments = normalized_arguments
@@ -2409,7 +2477,11 @@ class Jinja2TemplateScanner(BaseScanner):
                 if vararg_macros:
                     nested_macro_bindings[f"varargs.{index}"] = vararg_macros
 
-        nested_active_macros = {*active_macros, id(macro)}
+        nested_active_macros = (
+            active_macros.nested(id(macro))
+            if isinstance(active_macros, _StaticMacroAnalysisState)
+            else {*active_macros, id(macro)}
+        )
         has_risk = any(
             self._static_node_has_oversized_sandbox_range_call(
                 child,
@@ -2446,23 +2518,114 @@ class Jinja2TemplateScanner(BaseScanner):
                     macro_bindings[f"{source_prefix}{attribute}"] = macros
         return False
 
-    @staticmethod
-    def _static_macro_call_arguments(node: Any) -> tuple[list[Any], list[tuple[str, Any]]] | None:
+    def _static_macro_call_arguments(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding],
+        namespace_range_attrs: dict[str, set[str]],
+        macro_bindings: dict[str, tuple[Any, ...]],
+    ) -> tuple[list[Any], list[tuple[str, Any]]] | None:
         positional_arguments = list(node.args)
         if node.dyn_args is not None:
-            if not isinstance(node.dyn_args, jinja2.nodes.List | jinja2.nodes.Tuple):
+            if isinstance(node.dyn_args, jinja2.nodes.List | jinja2.nodes.Tuple):
+                positional_arguments.extend(node.dyn_args.items)
+            elif isinstance(node.dyn_args, jinja2.nodes.Name):
+                bound_arguments = self._static_bound_sequence_arguments(
+                    node.dyn_args.name,
+                    int_bindings,
+                    namespace_range_attrs,
+                    macro_bindings,
+                )
+                if bound_arguments is None:
+                    return None
+                positional_arguments.extend(bound_arguments)
+            else:
                 return None
-            positional_arguments.extend(node.dyn_args.items)
 
         keyword_arguments = [(keyword.key, keyword.value) for keyword in node.kwargs]
         if node.dyn_kwargs is not None:
-            if not isinstance(node.dyn_kwargs, jinja2.nodes.Dict):
-                return None
-            for pair in node.dyn_kwargs.items:
-                if not isinstance(pair.key, jinja2.nodes.Const) or not isinstance(pair.key.value, str):
+            if isinstance(node.dyn_kwargs, jinja2.nodes.Dict):
+                for pair in node.dyn_kwargs.items:
+                    if not isinstance(pair.key, jinja2.nodes.Const) or not isinstance(pair.key.value, str):
+                        return None
+                    keyword_arguments.append((pair.key.value, pair.value))
+            elif isinstance(node.dyn_kwargs, jinja2.nodes.Name):
+                bound_keywords = self._static_bound_mapping_arguments(
+                    node.dyn_kwargs.name,
+                    int_bindings,
+                    namespace_range_attrs,
+                    macro_bindings,
+                )
+                if bound_keywords is None:
                     return None
-                keyword_arguments.append((pair.key.value, pair.value))
+                keyword_arguments.extend(bound_keywords)
+            else:
+                return None
         return positional_arguments, keyword_arguments
+
+    def _static_bound_sequence_arguments(
+        self,
+        name: str,
+        int_bindings: dict[str, _StaticIntBinding],
+        namespace_range_attrs: dict[str, set[str]],
+        macro_bindings: dict[str, tuple[Any, ...]],
+    ) -> list[Any] | None:
+        length_binding = int_bindings.get(self._static_container_length_key(name))
+        if length_binding is None or isinstance(length_binding, _StaticIntCandidates) or length_binding[1]:
+            return None
+        return [
+            self._static_bound_container_value_node(
+                name,
+                str(index),
+                namespace_range_attrs,
+                macro_bindings,
+            )
+            for index in range(length_binding[0])
+        ]
+
+    def _static_bound_mapping_arguments(
+        self,
+        name: str,
+        int_bindings: dict[str, _StaticIntBinding],
+        namespace_range_attrs: dict[str, set[str]],
+        macro_bindings: dict[str, tuple[Any, ...]],
+    ) -> list[tuple[str, Any]] | None:
+        prefix = f"{name}."
+        keys = set(namespace_range_attrs.get(name, set()))
+        keys.update(key.removeprefix(prefix) for key in int_bindings if key.startswith(prefix))
+        keys.update(key.removeprefix(prefix) for key in macro_bindings if key.startswith(prefix))
+        if not keys:
+            return None
+        return [
+            (
+                key,
+                self._static_bound_container_value_node(
+                    name,
+                    key,
+                    namespace_range_attrs,
+                    macro_bindings,
+                ),
+            )
+            for key in sorted(keys)
+        ]
+
+    @staticmethod
+    def _static_bound_container_value_node(
+        name: str,
+        key: str,
+        namespace_range_attrs: dict[str, set[str]],
+        macro_bindings: dict[str, tuple[Any, ...]],
+    ) -> Any:
+        if key in namespace_range_attrs.get(name, set()):
+            return jinja2.nodes.Name("range", "load")
+        binding_name = f"{name}.{key}"
+        if binding_name in macro_bindings:
+            return jinja2.nodes.Name(binding_name, "load")
+        return jinja2.nodes.Name(binding_name, "load")
+
+    @staticmethod
+    def _static_container_length_key(name: str) -> str:
+        return f"{name}\0length"
 
     def _bind_static_macro_argument(
         self,
@@ -2597,6 +2760,14 @@ class Jinja2TemplateScanner(BaseScanner):
             macro_bindings[target.name] = source_macros
         if not isinstance(target, jinja2.nodes.Name):
             return
+        container_entries = cls._static_literal_container_entries(value)
+        if container_entries is not None:
+            entries, _ = container_entries
+            for key, item in entries:
+                item_macros = cls._static_macro_binding_for_node(item, original_bindings)
+                if item_macros:
+                    macro_bindings[f"{target.name}.{key}"] = item_macros
+            return
         if (
             isinstance(value, jinja2.nodes.Call)
             and isinstance(value.node, jinja2.nodes.Name)
@@ -2672,7 +2843,12 @@ class Jinja2TemplateScanner(BaseScanner):
         int_bindings: dict[str, _StaticIntBinding],
         namespace_range_attrs: dict[str, set[str]],
     ) -> bool:
-        range_call = self._static_iterable_range_call(node, range_aliases, namespace_range_attrs)
+        range_call = self._static_iterable_range_call(
+            node,
+            range_aliases,
+            int_bindings,
+            namespace_range_attrs,
+        )
         if range_call is None:
             return False
         count = self._constant_range_iteration_count_with_bindings(range_call.args, threshold, int_bindings)
@@ -2685,10 +2861,24 @@ class Jinja2TemplateScanner(BaseScanner):
         range_aliases: set[str],
         int_bindings: dict[str, _StaticIntBinding],
         namespace_range_attrs: dict[str, set[str]],
+        analysis_state: _StaticMacroAnalysisState | None = None,
     ) -> bool:
-        range_call = self._static_iterable_range_call(node.node, range_aliases, namespace_range_attrs)
+        range_call = self._static_iterable_range_call(
+            node.node,
+            range_aliases,
+            int_bindings,
+            namespace_range_attrs,
+        )
         if range_call is None:
             return False
+        if node.name in {"list", "join"} and analysis_state is not None:
+            count = self._constant_range_iteration_count_with_bindings(
+                range_call.args,
+                _SANDBOX_MAX_RANGE_ITERATIONS,
+                int_bindings,
+            )
+            if count is not None and not analysis_state.consume_range_items(min(count, _SANDBOX_MAX_RANGE_ITERATIONS)):
+                return True
         if node.name == "list":
             projected_size = self._constant_range_rendered_list_size_with_bindings(
                 range_call.args,
@@ -2711,11 +2901,12 @@ class Jinja2TemplateScanner(BaseScanner):
         self,
         node: Any,
         range_aliases: set[str],
+        int_bindings: dict[str, _StaticIntBinding],
         namespace_range_attrs: dict[str, set[str]],
     ) -> Any | None:
         while isinstance(node, jinja2.nodes.Filter) and node.name in _LAZY_RANGE_ITERATION_FILTERS:
             node = node.node
-        normalized_range_call = self._range_call_with_literal_unpacking(node)
+        normalized_range_call = self._range_call_with_static_unpacking(node, int_bindings)
         if normalized_range_call is not None and self._is_static_range_callable(
             normalized_range_call.node,
             range_aliases,
@@ -2723,6 +2914,27 @@ class Jinja2TemplateScanner(BaseScanner):
         ):
             return normalized_range_call
         return None
+
+    def _range_call_with_static_unpacking(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding],
+    ) -> Any | None:
+        normalized = self._range_call_with_literal_unpacking(node)
+        if normalized is not None or not isinstance(node, jinja2.nodes.Call) or node.dyn_args is None:
+            return normalized
+        if not isinstance(node.dyn_args, jinja2.nodes.Name) or node.kwargs or node.dyn_kwargs is not None:
+            return None
+        length_binding = int_bindings.get(self._static_container_length_key(node.dyn_args.name))
+        if length_binding is None or isinstance(length_binding, _StaticIntCandidates) or length_binding[1]:
+            return None
+        arguments = [*node.args]
+        arguments.extend(
+            jinja2.nodes.Name(f"{node.dyn_args.name}.{index}", "load") for index in range(length_binding[0])
+        )
+        if not 1 <= len(arguments) <= 3:
+            return None
+        return jinja2.nodes.Call(node.node, arguments, [], None, None)
 
     @staticmethod
     def _range_call_with_literal_unpacking(node: Any) -> Any | None:
@@ -2759,6 +2971,10 @@ class Jinja2TemplateScanner(BaseScanner):
             return
         range_aliases.discard(target.name)
         int_bindings.pop(target.name, None)
+        int_bindings.pop(self._static_container_length_key(target.name), None)
+        prefix = f"{target.name}."
+        for name in [name for name in int_bindings if name.startswith(prefix)]:
+            int_bindings.pop(name, None)
         namespace_range_attrs.pop(target.name, None)
 
     @staticmethod
@@ -2848,6 +3064,7 @@ class Jinja2TemplateScanner(BaseScanner):
         if not isinstance(target, jinja2.nodes.Name):
             return False
 
+        original_int_bindings = dict(int_bindings)
         changed = False
         if self._is_static_range_callable(value, range_aliases, namespace_range_attrs):
             previous_size = len(range_aliases)
@@ -2868,6 +3085,36 @@ class Jinja2TemplateScanner(BaseScanner):
         elif int_binding is None:
             int_bindings.pop(target.name, None)
 
+        int_bindings.pop(self._static_container_length_key(target.name), None)
+        target_prefix = f"{target.name}."
+        for name in [name for name in int_bindings if name.startswith(target_prefix)]:
+            int_bindings.pop(name, None)
+
+        container_entries = self._static_literal_container_entries(value)
+        if container_entries is not None:
+            entries, is_sequence = container_entries
+            attrs = {
+                key
+                for key, item in entries
+                if self._is_static_range_callable(item, range_aliases, namespace_range_attrs)
+            }
+            namespace_range_attrs[target.name] = attrs
+            if is_sequence:
+                int_bindings[self._static_container_length_key(target.name)] = self._constant_int_result(
+                    len(entries),
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                )
+            for key, item in entries:
+                nested_results = self._constant_int_expression_results_with_bindings(
+                    item,
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                    original_int_bindings,
+                )
+                nested_binding = self._make_static_int_binding(nested_results)
+                if nested_binding is not None:
+                    int_bindings[f"{target.name}.{key}"] = nested_binding
+            return True
+
         if (
             isinstance(value, jinja2.nodes.Call)
             and isinstance(value.node, jinja2.nodes.Name)
@@ -2887,6 +3134,13 @@ class Jinja2TemplateScanner(BaseScanner):
             if namespace_range_attrs.get(target.name) is not attrs:
                 namespace_range_attrs[target.name] = attrs
                 changed = True
+            source_length_key = self._static_container_length_key(value.name)
+            if source_length_key in original_int_bindings:
+                int_bindings[self._static_container_length_key(target.name)] = original_int_bindings[source_length_key]
+            source_prefix = f"{value.name}."
+            for name, binding in original_int_bindings.items():
+                if name.startswith(source_prefix):
+                    int_bindings[f"{target.name}.{name.removeprefix(source_prefix)}"] = binding
         else:
             namespace_range_attrs.pop(target.name, None)
 
@@ -2959,20 +3213,83 @@ class Jinja2TemplateScanner(BaseScanner):
             and node.attr in namespace_range_attrs.get(node.node.name, set())
         )
 
-    @staticmethod
-    def _static_literal_container_item(node: Any) -> Any | None:
-        if not isinstance(node, jinja2.nodes.Getitem) or not isinstance(node.arg, jinja2.nodes.Const):
+    @classmethod
+    def _static_literal_container_item(cls, node: Any) -> Any | None:
+        if (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Getattr)
+            and node.node.attr == "get"
+            and isinstance(node.node.node, jinja2.nodes.Dict)
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and 1 <= len(node.args) <= 2
+        ):
+            key = cls._static_literal_container_key(node.args[0])
+            if key is None:
+                return None
+            for pair in reversed(node.node.node.items):
+                if isinstance(pair.key, jinja2.nodes.Const) and pair.key.value == key:
+                    return pair.value
+            return node.args[1] if len(node.args) == 2 else None
+        if not isinstance(node, jinja2.nodes.Getitem):
             return None
-        key = node.arg.value
-        if isinstance(node.node, jinja2.nodes.List | jinja2.nodes.Tuple) and isinstance(key, int):
+        key = cls._static_literal_container_key(node.arg)
+        if key is None:
+            return None
+        sequence_items = cls._static_literal_sequence_items(node.node)
+        if sequence_items is not None and isinstance(key, int):
             try:
-                return node.node.items[key]
+                return sequence_items[key]
             except IndexError:
                 return None
         if isinstance(node.node, jinja2.nodes.Dict):
             for pair in reversed(node.node.items):
                 if isinstance(pair.key, jinja2.nodes.Const) and pair.key.value == key:
                     return pair.value
+        return None
+
+    @classmethod
+    def _static_literal_sequence_items(cls, node: Any) -> list[Any] | None:
+        if isinstance(node, jinja2.nodes.List | jinja2.nodes.Tuple):
+            return list(node.items)
+        if isinstance(node, jinja2.nodes.Add):
+            left_items = cls._static_literal_sequence_items(node.left)
+            right_items = cls._static_literal_sequence_items(node.right)
+            if left_items is not None and right_items is not None:
+                return [*left_items, *right_items]
+        return None
+
+    @classmethod
+    def _static_literal_container_entries(cls, node: Any) -> tuple[list[tuple[str, Any]], bool] | None:
+        sequence_items = cls._static_literal_sequence_items(node)
+        if sequence_items is not None:
+            return [(str(index), item) for index, item in enumerate(sequence_items)], True
+        if isinstance(node, jinja2.nodes.Dict):
+            entries: list[tuple[str, Any]] = []
+            for pair in node.items:
+                key = cls._static_literal_container_key(pair.key)
+                if not isinstance(key, str | int):
+                    return None
+                entries.append((str(key), pair.value))
+            return entries, False
+        return None
+
+    @staticmethod
+    def _static_literal_container_key(node: Any) -> str | int | None:
+        if (
+            isinstance(node, jinja2.nodes.Const)
+            and isinstance(node.value, str | int)
+            and not isinstance(node.value, bool)
+        ):
+            return node.value
+        if (
+            isinstance(node, jinja2.nodes.Neg)
+            and isinstance(node.node, jinja2.nodes.Const)
+            and isinstance(node.node.value, int)
+            and not isinstance(node.node.value, bool)
+        ):
+            return -node.node.value
         return None
 
     def _constant_int_expression_results_with_bindings(
@@ -3396,6 +3713,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 if node.left == node.right or same_result:
                     return self._constant_int_result(0, cap)
                 if left_saturated or right_saturated:
+                    quotient_signature = self._static_power_quotient_signature(node.left, int_bindings)
+                    if quotient_signature is not None and quotient_signature == self._static_power_signature(
+                        node.right,
+                        int_bindings,
+                    ):
+                        return self._constant_int_result(0, cap)
                     wrapped_difference = self._constant_wrapped_difference_result(
                         node.left,
                         node.right,
@@ -3404,6 +3727,14 @@ class Jinja2TemplateScanner(BaseScanner):
                     )
                     if wrapped_difference is not None:
                         return wrapped_difference
+                    wrapped_right_difference = self._constant_wrapped_right_difference_result(
+                        node.left,
+                        node.right,
+                        cap,
+                        int_bindings,
+                    )
+                    if wrapped_right_difference is not None:
+                        return wrapped_right_difference
                     if left_saturated and right_saturated:
                         if (left < 0) == (right < 0):
                             magnitude_comparison = self._compare_static_power_magnitudes(
@@ -3434,6 +3765,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 if not left_saturated and left == 0:
                     return self._constant_int_result(0, cap)
                 if left_saturated or right_saturated:
+                    quotient_signature = self._static_power_quotient_signature(node, int_bindings)
+                    if quotient_signature is not None:
+                        return self._constant_power_signature_result(quotient_signature, cap)
                     if not left_saturated:
                         quotient = -1 if left * right < 0 else 0
                         return self._constant_int_result(quotient, cap)
@@ -3444,9 +3778,25 @@ class Jinja2TemplateScanner(BaseScanner):
             if node.left == node.right or same_result or (not left_saturated and left == 0):
                 return self._constant_int_result(0, cap)
             if left_saturated or right_saturated:
+                wrapped_modulo = self._constant_wrapped_modulo_result(
+                    node.left,
+                    node.right,
+                    cap,
+                    int_bindings,
+                )
+                if wrapped_modulo is not None:
+                    return wrapped_modulo
                 if left_saturated:
                     if right_saturated:
                         return None
+                    power_modulo = self._constant_power_modulo_result(
+                        node.left,
+                        right,
+                        cap,
+                        int_bindings,
+                    )
+                    if power_modulo is not None:
+                        return power_modulo
                     if abs(right) == 1:
                         return self._constant_int_result(0, cap)
                     return None
@@ -3475,7 +3825,10 @@ class Jinja2TemplateScanner(BaseScanner):
                 return self._constant_int_result(-1 if right % 2 else 1, cap)
             if right_saturated:
                 if left < 0:
-                    return None
+                    exponent_parity = self._constant_int_expression_parity(node.right, int_bindings)
+                    if exponent_parity is None:
+                        return None
+                    return self._saturated_constant_int_result(cap, -1 if exponent_parity else 1)
                 return self._saturated_constant_int_result(cap)
             if left_saturated:
                 sign = -1 if left < 0 and right % 2 else 1
@@ -3493,6 +3846,92 @@ class Jinja2TemplateScanner(BaseScanner):
             return self._constant_int_expression_result(branch, cap, int_bindings) if branch is not None else None
         if isinstance(node, jinja2.nodes.Filter):
             return self._constant_int_filter_result(node, cap, int_bindings)
+        return None
+
+    def _static_power_signature(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> tuple[int, int] | None:
+        if not isinstance(node, jinja2.nodes.Pow):
+            return None
+        base_result = self._constant_int_expression_result(node.left, _STATIC_INT_EVAL_MAX_ABS, int_bindings)
+        exponent_result = self._constant_int_expression_result(node.right, _STATIC_INT_EVAL_MAX_ABS, int_bindings)
+        if (
+            base_result is None
+            or exponent_result is None
+            or base_result[1]
+            or exponent_result[1]
+            or abs(base_result[0]) <= 1
+            or exponent_result[0] < 0
+        ):
+            return None
+        return base_result[0], exponent_result[0]
+
+    def _static_power_quotient_signature(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> tuple[int, int] | None:
+        if not isinstance(node, jinja2.nodes.FloorDiv):
+            return None
+        numerator = self._static_power_signature(node.left, int_bindings)
+        if numerator is None:
+            return None
+        denominator = self._static_power_signature(node.right, int_bindings)
+        if denominator is None:
+            denominator_result = self._constant_int_expression_result(
+                node.right,
+                _STATIC_INT_EVAL_MAX_ABS,
+                int_bindings,
+            )
+            if denominator_result is None or denominator_result[1] or denominator_result[0] != numerator[0]:
+                return None
+            denominator = (numerator[0], 1)
+        if numerator[0] != denominator[0] or numerator[1] < denominator[1]:
+            return None
+        return numerator[0], numerator[1] - denominator[1]
+
+    def _constant_power_signature_result(self, signature: tuple[int, int], cap: int) -> tuple[int, bool]:
+        base, exponent = signature
+        if exponent == 0:
+            return self._constant_int_result(1, cap)
+        magnitude_cap = self._constant_int_magnitude_cap(cap)
+        if (abs(base).bit_length() - 1) * exponent >= magnitude_cap.bit_length():
+            return self._saturated_constant_int_result(cap, -1 if base < 0 and exponent % 2 else 1)
+        return self._constant_int_result(base**exponent, cap)
+
+    def _constant_int_expression_parity(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> int | None:
+        if isinstance(node, jinja2.nodes.Name):
+            binding = int_bindings.get(node.name) if int_bindings is not None else None
+            if binding is None or isinstance(binding, _StaticIntCandidates) or binding[1]:
+                return None
+            return binding[0] % 2
+        if isinstance(node, jinja2.nodes.Const):
+            if isinstance(node.value, bool) or not isinstance(node.value, int):
+                return None
+            return node.value % 2
+        if isinstance(node, jinja2.nodes.Neg | jinja2.nodes.Pos):
+            return self._constant_int_expression_parity(node.node, int_bindings)
+        if isinstance(node, jinja2.nodes.Add | jinja2.nodes.Sub):
+            left = self._constant_int_expression_parity(node.left, int_bindings)
+            right = self._constant_int_expression_parity(node.right, int_bindings)
+            return None if left is None or right is None else (left + right) % 2
+        if isinstance(node, jinja2.nodes.Mul):
+            left = self._constant_int_expression_parity(node.left, int_bindings)
+            right = self._constant_int_expression_parity(node.right, int_bindings)
+            return None if left is None or right is None else left * right
+        if isinstance(node, jinja2.nodes.Pow):
+            exponent = self._constant_int_expression_result(node.right, _STATIC_INT_EVAL_MAX_ABS, int_bindings)
+            if exponent is None or exponent[0] < 0:
+                return None
+            if not exponent[1] and exponent[0] == 0:
+                return 1
+            return self._constant_int_expression_parity(node.left, int_bindings)
         return None
 
     def _compare_static_power_magnitudes(
@@ -3591,6 +4030,80 @@ class Jinja2TemplateScanner(BaseScanner):
             return offset_result
         return None
 
+    def _constant_wrapped_modulo_result(
+        self,
+        left: Any,
+        right: Any,
+        cap: int,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> tuple[int, bool] | None:
+        if not isinstance(right, jinja2.nodes.Neg) or not isinstance(right.node, jinja2.nodes.Add):
+            return None
+        left_result = self._constant_int_expression_result(left, cap, int_bindings)
+        if left_result is None or left_result[0] < 0:
+            return None
+        for dominant, offset in ((right.node.left, right.node.right), (right.node.right, right.node.left)):
+            dominant_result = self._constant_int_expression_result(dominant, cap, int_bindings)
+            offset_result = self._constant_int_expression_result(offset, cap, int_bindings)
+            if (
+                dominant_result is None
+                or dominant_result[0] < 0
+                or offset_result is None
+                or offset_result[1]
+                or offset_result[0] <= 0
+            ):
+                continue
+            if dominant != left and self._compare_static_power_magnitudes(dominant, left, int_bindings) != 0:
+                continue
+            return self._constant_int_result(-offset_result[0], cap)
+        return None
+
+    def _constant_wrapped_right_difference_result(
+        self,
+        left: Any,
+        right: Any,
+        cap: int,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> tuple[int, bool] | None:
+        if not isinstance(right, jinja2.nodes.Add):
+            return None
+        left_result = self._constant_int_expression_result(left, cap, int_bindings)
+        if left_result is None or not left_result[1]:
+            return None
+        for dominant, offset in ((right.left, right.right), (right.right, right.left)):
+            dominant_result = self._constant_int_expression_result(dominant, cap, int_bindings)
+            offset_result = self._constant_int_expression_result(offset, cap, int_bindings)
+            if dominant_result is None or not dominant_result[1] or offset_result is None or offset_result[1]:
+                continue
+            comparison = self._compare_static_power_magnitudes(left, dominant, int_bindings)
+            if comparison is None:
+                continue
+            left_sign = -1 if left_result[0] < 0 else 1
+            dominant_sign = -1 if dominant_result[0] < 0 else 1
+            if left_sign != dominant_sign or comparison > 0:
+                return self._saturated_constant_int_result(cap, left_sign)
+            if comparison < 0:
+                return self._saturated_constant_int_result(cap, -dominant_sign)
+            return self._constant_int_result(-offset_result[0], cap)
+        return None
+
+    def _constant_power_modulo_result(
+        self,
+        left: Any,
+        divisor: int,
+        cap: int,
+        int_bindings: dict[str, _StaticIntBinding] | None,
+    ) -> tuple[int, bool] | None:
+        signature = self._static_power_signature(left, int_bindings)
+        if signature is None or divisor == 0:
+            return None
+        base, exponent = signature
+        modulus = abs(divisor)
+        remainder = pow(base, exponent, modulus)
+        if divisor < 0 and remainder:
+            remainder -= modulus
+        return self._constant_int_result(remainder, cap)
+
     def _constant_int_filter_result(
         self,
         node: Any,
@@ -3638,6 +4151,17 @@ class Jinja2TemplateScanner(BaseScanner):
             elif isinstance(value, str):
                 text = value.strip()
                 if len(text) > 4096:
+                    if base == 10:
+                        sign = -1 if text.startswith("-") else 1
+                        digits = text[1:] if text.startswith(("-", "+")) else text
+                        if not digits or not digits.isdecimal():
+                            return default_result
+                        significant_digits = digits.lstrip("0")
+                        if not significant_digits:
+                            return self._constant_int_result(0, cap)
+                        if len(significant_digits) <= 4096:
+                            return self._constant_int_result(sign * int(significant_digits), cap)
+                        return self._saturated_constant_int_result(cap, sign)
                     return self._saturated_constant_int_result(cap, -1 if text.startswith("-") else 1)
                 try:
                     parsed = int(text, base)
