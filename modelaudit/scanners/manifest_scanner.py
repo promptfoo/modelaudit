@@ -5,6 +5,8 @@ import importlib
 import json
 import os
 import re
+from dataclasses import dataclass
+from itertools import chain
 from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -13,6 +15,7 @@ from modelaudit.core_results import mark_operational_scan_error, scan_result_has
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 try:
@@ -178,6 +181,37 @@ HASH_INTEGRITY_KEYS = [
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
 JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+JINJA_TEMPLATE_COLLECTION_BUDGET_REASON: Final[str] = "manifest_jinja_template_collection_budget_exceeded"
+JINJA_TEMPLATE_COLLECTION_MAX_DEPTH_CONFIG_KEY: Final[str] = "jinja_template_collection_max_depth"
+JINJA_TEMPLATE_COLLECTION_MAX_ITEMS_CONFIG_KEY: Final[str] = "jinja_template_collection_max_items"
+DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_DEPTH: Final[int] = 64
+DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_ITEMS: Final[int] = 50_000
+JINJA_TEMPLATE_LOCATION_MAX_CHARS: Final[int] = 240
+_JINJA_COLLECTION_MODE_FIELDS: Final[str] = "fields"
+_JINJA_COLLECTION_MODE_CONTAINER: Final[str] = "container"
+
+
+@dataclass
+class _JinjaTemplateCollection:
+    templates: dict[str, str]
+    budget_exceeded: bool = False
+    limit_type: str = ""
+    path: str = ""
+    items_visited: int = 0
+    max_depth: int = DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_DEPTH
+    max_items: int = DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_ITEMS
+
+
+@dataclass
+class _JinjaTraversalFrame:
+    mode: str
+    value: Any
+    path: str
+    depth: int
+    allow_plain_field_scalar: bool = False
+    iterator: Any | None = None
+    visited: bool = False
+
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -952,10 +986,6 @@ class ManifestScanner(BaseScanner):
         return _PARSE_FAILED
 
     def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
-        templates = self._collect_jinja_template_fields(content)
-        if not templates:
-            return
-
         scanner_selection = policy_from_config(self.config)
         if not scanner_selection.allows("jinja2_template"):
             if scanner_selection.active:
@@ -968,68 +998,254 @@ class ManifestScanner(BaseScanner):
                 )
             return
 
+        collection = self._collect_jinja_template_fields_with_budget(content)
+        templates = collection.templates
+        if collection.budget_exceeded:
+            self._record_jinja_collection_budget_exceeded(result, path, collection)
+            self._check_timeout()
+
+        if not templates:
+            return
+
         from .jinja2_template_scanner import Jinja2TemplateScanner
 
-        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
+        safe_templates = self._redact_jinja_template_locations(templates)
+        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, safe_templates))
 
     def _collect_jinja_template_fields(self, value: Any, path: str = "") -> dict[str, str]:
-        self._check_timeout()
-        if isinstance(value, dict):
-            templates: dict[str, str] = {}
-            for key, item in value.items():
-                self._check_timeout()
-                child_path = f"{path}.{key}" if path else str(key)
-                if key in JINJA_TEMPLATE_FIELD_NAMES:
-                    self._merge_jinja_templates(templates, self._collect_jinja_template_container(item, child_path))
-                    continue
-                self._merge_jinja_templates(templates, self._collect_jinja_template_fields(item, child_path))
-            return templates
-        if isinstance(value, list):
-            list_templates: dict[str, str] = {}
-            for index, item in enumerate(value):
-                self._check_timeout()
-                child_path = f"{path}[{index}]" if path else f"[{index}]"
-                self._merge_jinja_templates(list_templates, self._collect_jinja_template_fields(item, child_path))
-            return list_templates
-        return {}
+        return self._collect_jinja_template_fields_with_budget(value, path).templates
+
+    def _collect_jinja_template_fields_with_budget(self, value: Any, path: str = "") -> _JinjaTemplateCollection:
+        return self._collect_jinja_templates_with_budget(value, path, _JINJA_COLLECTION_MODE_FIELDS)
 
     def _collect_jinja_template_container(self, value: Any, path: str) -> dict[str, str]:
-        self._check_timeout()
-        if isinstance(value, str):
-            if value.strip() and (
-                path.rsplit(".", 1)[-1] in JINJA_TEMPLATE_FIELD_NAMES or self._looks_like_jinja(value)
-            ):
-                return {path: value}
-            return {}
+        return self._collect_jinja_templates_with_budget(value, path, _JINJA_COLLECTION_MODE_CONTAINER).templates
 
-        if isinstance(value, dict):
-            templates: dict[str, str] = {}
-            for key, item in value.items():
-                self._check_timeout()
-                child_path = f"{path}.{key}"
-                if isinstance(item, str):
-                    if item.strip() and self._looks_like_jinja(item):
-                        self._record_jinja_template(templates, child_path, item)
-                    continue
-                self._merge_jinja_templates(templates, self._collect_jinja_template_container(item, child_path))
-            return templates
+    def _collect_jinja_templates_with_budget(
+        self,
+        value: Any,
+        path: str,
+        mode: str,
+    ) -> _JinjaTemplateCollection:
+        max_depth = self._get_positive_int_config(
+            JINJA_TEMPLATE_COLLECTION_MAX_DEPTH_CONFIG_KEY,
+            DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_DEPTH,
+        )
+        max_items = self._get_positive_int_config(
+            JINJA_TEMPLATE_COLLECTION_MAX_ITEMS_CONFIG_KEY,
+            DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_ITEMS,
+        )
+        collection = _JinjaTemplateCollection(
+            templates={},
+            max_depth=max_depth,
+            max_items=max_items,
+        )
+        stack = [
+            _JinjaTraversalFrame(
+                mode=mode,
+                value=value,
+                path=path,
+                depth=0,
+                allow_plain_field_scalar=mode == _JINJA_COLLECTION_MODE_CONTAINER,
+            )
+        ]
+        expanded_container_depths: dict[tuple[str, bool, int], int] = {}
 
-        if isinstance(value, list):
-            list_templates: dict[str, str] = {}
-            for index, item in enumerate(value):
-                self._check_timeout()
-                child_path = f"{path}[{index}]"
-                if isinstance(item, str):
-                    if item.strip() and self._looks_like_jinja(item):
-                        self._record_jinja_template(list_templates, child_path, item)
+        while stack:
+            self._check_timeout()
+            frame = stack[-1]
+
+            if not frame.visited:
+                frame.visited = True
+                collection.items_visited += 1
+                if collection.items_visited > max_items:
+                    self._mark_jinja_collection_budget_exceeded(collection, "items", frame.path)
+                    break
+
+                if isinstance(frame.value, (dict, list)):
+                    container_key = (
+                        frame.mode,
+                        "chat_template" in frame.path.lower(),
+                        id(frame.value),
+                    )
+                    expanded_depth = expanded_container_depths.get(container_key)
+                    if expanded_depth is not None and expanded_depth <= frame.depth:
+                        stack.pop()
+                        continue
+
+                if frame.depth > max_depth:
+                    self._mark_jinja_collection_budget_exceeded(collection, "depth", frame.path)
+                    stack.pop()
                     continue
-                self._merge_jinja_templates(
-                    list_templates,
-                    self._collect_jinja_template_container(item, child_path),
+
+                if isinstance(frame.value, str):
+                    self._record_jinja_scalar_if_template(
+                        collection.templates,
+                        frame.mode,
+                        frame.path,
+                        frame.value,
+                        allow_plain_field_scalar=frame.allow_plain_field_scalar,
+                    )
+                    stack.pop()
+                    continue
+
+                if isinstance(frame.value, dict):
+                    expanded_container_depths[(frame.mode, "chat_template" in frame.path.lower(), id(frame.value))] = (
+                        frame.depth
+                    )
+                    if frame.mode == _JINJA_COLLECTION_MODE_FIELDS:
+                        priority_items = (
+                            (field_name, frame.value[field_name])
+                            for field_name in sorted(JINJA_TEMPLATE_FIELD_NAMES)
+                            if field_name in frame.value
+                        )
+                        remaining_items = (
+                            (key, item) for key, item in frame.value.items() if key not in JINJA_TEMPLATE_FIELD_NAMES
+                        )
+                        frame.iterator = chain(priority_items, remaining_items)
+                    else:
+                        frame.iterator = iter(frame.value.items())
+                    continue
+
+                if isinstance(frame.value, list):
+                    expanded_container_depths[(frame.mode, "chat_template" in frame.path.lower(), id(frame.value))] = (
+                        frame.depth
+                    )
+                    frame.iterator = enumerate(frame.value)
+                    continue
+
+                stack.pop()
+                continue
+
+            if frame.iterator is None:
+                stack.pop()
+                continue
+
+            try:
+                key, item = next(frame.iterator)
+            except StopIteration:
+                stack.pop()
+                continue
+
+            self._check_timeout()
+            child_path = self._jinja_collection_child_path(frame.path, key, isinstance(frame.value, list))
+            child_mode = frame.mode
+            allow_plain_field_scalar = False
+            if frame.mode == _JINJA_COLLECTION_MODE_FIELDS:
+                is_template_field = isinstance(key, str) and key in JINJA_TEMPLATE_FIELD_NAMES
+                child_mode = _JINJA_COLLECTION_MODE_CONTAINER if is_template_field else _JINJA_COLLECTION_MODE_FIELDS
+                allow_plain_field_scalar = is_template_field
+            stack.append(
+                _JinjaTraversalFrame(
+                    mode=child_mode,
+                    value=item,
+                    path=child_path,
+                    depth=frame.depth + 1,
+                    allow_plain_field_scalar=allow_plain_field_scalar,
                 )
-            return list_templates
+            )
 
-        return {}
+        return collection
+
+    def _get_positive_int_config(self, key: str, default: int) -> int:
+        try:
+            value = int(self.config.get(key, default))
+        except (OverflowError, TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    @staticmethod
+    def _mark_jinja_collection_budget_exceeded(
+        collection: _JinjaTemplateCollection,
+        limit_type: str,
+        path: str,
+    ) -> None:
+        if collection.budget_exceeded and limit_type != "items":
+            return
+        collection.budget_exceeded = True
+        collection.limit_type = limit_type
+        collection.path = path
+
+    def _record_jinja_scalar_if_template(
+        self,
+        templates: dict[str, str],
+        mode: str,
+        path: str,
+        value: str,
+        *,
+        allow_plain_field_scalar: bool,
+    ) -> None:
+        if mode != _JINJA_COLLECTION_MODE_CONTAINER or not value.strip():
+            return
+        if allow_plain_field_scalar or self._looks_like_jinja(value):
+            self._record_jinja_template(templates, path, value)
+
+    @staticmethod
+    def _jinja_collection_child_path(path: str, key: Any, parent_is_list: bool) -> str:
+        key_text = str(key)
+        if parent_is_list:
+            candidate = f"{path}[{key_text}]" if path else f"[{key_text}]"
+        else:
+            safe_key = redact_evidence_string(key_text, max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS)
+            candidate = f"{path}.{safe_key}" if path else safe_key
+
+        preserve_chat_template_context = "chat_template" in path.casefold() or "chat_template" in key_text.casefold()
+        context_suffix = ".chat_template" if preserve_chat_template_context else ""
+        safe_path = redact_evidence_string(
+            candidate,
+            max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS - len(context_suffix),
+        )
+        if context_suffix and "chat_template" not in safe_path.casefold():
+            safe_path = f"{safe_path}{context_suffix}"
+        return safe_path
+
+    def _record_jinja_collection_budget_exceeded(
+        self,
+        result: ScanResult,
+        path: str,
+        collection: _JinjaTemplateCollection,
+    ) -> None:
+        self._mark_inconclusive_scan_result(result, JINJA_TEMPLATE_COLLECTION_BUDGET_REASON)
+        result.add_check(
+            name="Embedded Jinja Collection Budget",
+            passed=False,
+            message=(
+                "Embedded Jinja template analysis incomplete because parsed manifest traversal exceeded "
+                "the configured collection budget"
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "reason": JINJA_TEMPLATE_COLLECTION_BUDGET_REASON,
+                "scan_outcome_reason": JINJA_TEMPLATE_COLLECTION_BUDGET_REASON,
+                "analysis_incomplete": True,
+                "limit_type": collection.limit_type,
+                "path": redact_evidence_string(collection.path, max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS),
+                "items_visited": collection.items_visited,
+                "max_depth": collection.max_depth,
+                "max_items": collection.max_items,
+                "templates_collected": len(collection.templates),
+            },
+            why=(
+                "Manifest configs can contain attacker-controlled nested JSON, YAML, TOML, or INI structures. "
+                "The embedded Jinja collector stops at a bounded traversal budget and marks analysis incomplete "
+                "rather than recursively walking untrusted structures without limit."
+            ),
+        )
+
+    @classmethod
+    def _redact_jinja_template_locations(cls, templates: dict[str, str]) -> dict[str, str]:
+        safe_templates: dict[str, str] = {}
+        for path, value in templates.items():
+            context_suffix = ".chat_template" if "chat_template" in path.casefold() else ""
+            safe_path = redact_evidence_string(
+                path,
+                max_chars=JINJA_TEMPLATE_LOCATION_MAX_CHARS - len(context_suffix),
+            )
+            if context_suffix and "chat_template" not in safe_path.casefold():
+                safe_path = f"{safe_path}{context_suffix}"
+            cls._record_jinja_template(safe_templates, safe_path, value)
+        return safe_templates
 
     @staticmethod
     def _record_jinja_template(templates: dict[str, str], path: str, value: str) -> None:
@@ -1113,14 +1329,22 @@ class ManifestScanner(BaseScanner):
 
     def _check_model_name_policies(self, content: Any, result: ScanResult) -> None:
         """Check for blacklisted model names in config values"""
+        visited_containers: set[int] = set()
 
         def check_value(value: Any, prefix: str = "") -> None:
             self._check_timeout()
 
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, dict):
                 for key, nested_value in value.items():
-                    key_lower = key.lower()
-                    full_key = f"{prefix}.{key}" if prefix else key
+                    key_text = str(key)
+                    key_lower = key_text.lower()
+                    full_key = f"{prefix}.{key_text}" if prefix else key_text
 
                     # Check if this key might contain a model name
                     if key_lower in MODEL_NAME_KEYS_LOWER:
@@ -1255,6 +1479,7 @@ class ManifestScanner(BaseScanner):
         detection by registering new domains.
         """
         seen_urls: set[str] = set()
+        visited_containers: set[int] = set()
 
         def is_trusted_domain(url: str) -> bool:
             """Check if URL host is in the trusted domain allowlist."""
@@ -1263,6 +1488,12 @@ class ManifestScanner(BaseScanner):
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
             self._check_timeout()
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, str):
                 urls = URL_PATTERN.findall(value)
                 for url in urls:
@@ -1293,7 +1524,8 @@ class ManifestScanner(BaseScanner):
 
             elif isinstance(value, dict):
                 for k, v in value.items():
-                    new_path = f"{key_path}.{k}" if key_path else k
+                    key_text = str(k)
+                    new_path = f"{key_path}.{key_text}" if key_path else key_text
                     extract_urls_from_value(v, new_path)
             elif isinstance(value, list):
                 for i, item in enumerate(value):
@@ -1377,13 +1609,22 @@ class ManifestScanner(BaseScanner):
                     },
                 )
 
+        visited_containers: set[int] = set()
+
         def traverse_for_hashes(value: Any, prefix: str = "", parent_key: str = "") -> None:
             """Recursively check parsed manifest content for weak hashes."""
             self._check_timeout()
+            if isinstance(value, (dict, list)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    return
+                visited_containers.add(container_id)
+
             if isinstance(value, dict):
                 for key, nested_value in value.items():
-                    full_key = f"{prefix}.{key}" if prefix else key
-                    traverse_for_hashes(nested_value, full_key, key)
+                    key_text = str(key)
+                    full_key = f"{prefix}.{key_text}" if prefix else key_text
+                    traverse_for_hashes(nested_value, full_key, key_text)
             elif isinstance(value, list):
                 for i, item in enumerate(value):
                     item_path = f"{prefix}[{i}]"
