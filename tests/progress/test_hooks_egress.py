@@ -4,7 +4,7 @@ import http.client
 import json
 import socket
 import ssl
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -178,7 +178,7 @@ def test_webhook_rejects_mixed_public_and_private_dns_answers(monkeypatch: pytes
 @pytest.mark.parametrize(
     "address_info",
     [
-        _address_info(family=socket.AF_UNIX),
+        _address_info(family=cast(socket.AddressFamily, -1)),
         _address_info(socket_type=socket.SOCK_DGRAM),
         _address_info(port=444),
     ],
