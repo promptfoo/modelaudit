@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- escape terminal and Unicode formatting controls in human-readable CLI output
 - disable unsafe Joblib and NumPy object metadata deserialization
 - keep concrete active execution, runtime-extension, and blacklist findings from being downgraded by Hugging Face whitelists
 - keep same-fragment command/network correlations and relayed fail-closed findings active across Hugging Face whitelists
