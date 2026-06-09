@@ -1,6 +1,7 @@
 """Progress hook outbound destination validation tests."""
 
 import http.client
+import ipaddress
 import json
 import socket
 import ssl
@@ -176,11 +177,124 @@ def test_webhook_rejects_mixed_public_and_private_dns_answers(monkeypatch: pytes
 
 
 @pytest.mark.parametrize(
+    "hostname",
+    [
+        "192.88.99.2",
+        "100:0:0:1::1",
+        "5f00::1",
+        "::ffff:93.184.216.34",
+    ],
+)
+def test_webhook_rejects_iana_non_global_destinations_when_ipaddress_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    hostname: str,
+) -> None:
+    address = ipaddress.ip_address(hostname)
+    monkeypatch.setattr(type(address), "is_global", property(lambda _address: True))
+    rendered_hostname = f"[{hostname}]" if address.version == 6 else hostname
+
+    with pytest.raises(ValueError, match="not a permitted public egress"):
+        WebhookProgressHook(
+            name="iana-non-global",
+            webhook_url=f"https://{rendered_hostname}/progress",
+            allowed_hosts={hostname},
+        )
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "192.0.0.9",
+        "192.0.0.10",
+        "2001:1::1",
+        "2001:1::2",
+        "2001:1::3",
+        "2001:3::1",
+        "2001:4:112::1",
+        "2001:20::1",
+        "2001:30::1",
+    ],
+)
+def test_webhook_accepts_iana_global_exceptions_when_ipaddress_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    hostname: str,
+) -> None:
+    address = ipaddress.ip_address(hostname)
+    monkeypatch.setattr(type(address), "is_global", property(lambda _address: False))
+    rendered_hostname = f"[{hostname}]" if address.version == 6 else hostname
+
+    hook = WebhookProgressHook(
+        name="iana-global",
+        webhook_url=f"https://{rendered_hostname}/progress",
+        allowed_hosts={hostname},
+    )
+
+    assert hook.webhook_url == f"https://{rendered_hostname}/progress"
+
+
+def test_webhook_accepts_public_ipv4_embedded_in_nat64_destination() -> None:
+    hostname = "64:ff9b::5db8:d822"
+
+    hook = WebhookProgressHook(
+        name="public-nat64",
+        webhook_url=f"https://[{hostname}]/progress",
+        allowed_hosts={hostname},
+    )
+
+    assert hook.webhook_url == f"https://[{hostname}]/progress"
+
+
+@pytest.mark.parametrize(
     "address_info",
     [
         _address_info(family=cast(socket.AddressFamily, -1)),
         _address_info(socket_type=socket.SOCK_DGRAM),
         _address_info(port=444),
+        [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2606:2800:220:1:248:1893:25c8:1946", 443),
+            )
+        ],
+        [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", 443, 0, 0),
+            )
+        ],
+        [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", 443, 0, 0),
+            )
+        ],
+        [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2606:2800:220:1:248:1893:25c8:1946", 443, 1, 0),
+            )
+        ],
+        [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2606:2800:220:1:248:1893:25c8:1946", 443, 0, 1),
+            )
+        ],
     ],
 )
 def test_webhook_rejects_malformed_resolver_answers(

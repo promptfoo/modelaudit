@@ -11,7 +11,7 @@ import ssl
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 from .base import ProgressPhase, ProgressStats
@@ -28,6 +28,45 @@ _NAT64_NETWORKS = (
     ipaddress.ip_network("64:ff9b:1::/48"),
 )
 _ISATAP_MARKERS = frozenset({b"\x00\x00\x5e\xfe", b"\x02\x00\x5e\xfe"})
+_IANA_GLOBAL_IP_NETWORKS = (
+    ipaddress.ip_network("192.0.0.9/32"),
+    ipaddress.ip_network("192.0.0.10/32"),
+    ipaddress.ip_network("2001:1::1/128"),
+    ipaddress.ip_network("2001:1::2/128"),
+    ipaddress.ip_network("2001:1::3/128"),
+    ipaddress.ip_network("2001:3::/32"),
+    ipaddress.ip_network("2001:4:112::/48"),
+    ipaddress.ip_network("2001:20::/28"),
+    ipaddress.ip_network("2001:30::/28"),
+)
+_IANA_NON_GLOBAL_IP_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("192.88.99.2/32"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("100::/64"),
+    ipaddress.ip_network("100:0:0:1::/64"),
+    ipaddress.ip_network("2001::/23"),
+    ipaddress.ip_network("2001:db8::/32"),
+    ipaddress.ip_network("3fff::/20"),
+    ipaddress.ip_network("5f00::/16"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
 _DEFAULT_NETWORK_TIMEOUT_SECONDS = 10.0
 _MAX_NETWORK_TIMEOUT_SECONDS = 60.0
 
@@ -115,7 +154,13 @@ def _embedded_ipv4_addresses(address: ipaddress.IPv6Address) -> tuple[ipaddress.
 
 
 def _is_public_ip_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if not address.is_global or address.is_multicast:
+    if address.is_multicast:
+        return False
+    if any(address in network for network in _IANA_GLOBAL_IP_NETWORKS):
+        return True
+    if any(address in network for network in _IANA_NON_GLOBAL_IP_NETWORKS):
+        return False
+    if not address.is_global:
         return False
     if isinstance(address, ipaddress.IPv6Address):
         return all(_is_public_ip_address(embedded) for embedded in _embedded_ipv4_addresses(address))
@@ -158,10 +203,16 @@ def _resolve_public_addresses(hostname: str, port: int, destination_type: str) -
             raise ValueError(f"{destination_type} host '{hostname}' resolved to an unsupported socket family")
         if socket_type not in {0, socket.SOCK_STREAM} or protocol not in {0, socket.IPPROTO_TCP}:
             raise ValueError(f"{destination_type} host '{hostname}' resolved to a non-TCP socket")
-        if not isinstance(socket_address, tuple) or len(socket_address) < 2:
+        expected_address_length = 2 if family == socket.AF_INET else 4
+        if not isinstance(socket_address, tuple) or len(socket_address) != expected_address_length:
             raise ValueError(f"{destination_type} host '{hostname}' returned a malformed socket address")
         raw_address, resolved_port = socket_address[:2]
-        if not isinstance(raw_address, str) or not isinstance(resolved_port, int) or resolved_port != port:
+        if (
+            not isinstance(raw_address, str)
+            or isinstance(resolved_port, bool)
+            or not isinstance(resolved_port, int)
+            or resolved_port != port
+        ):
             raise ValueError(f"{destination_type} host '{hostname}' returned an invalid socket address or port")
         if "%" in raw_address:
             raise ValueError(f"{destination_type} host '{hostname}' returned a scoped IPv6 address")
@@ -169,6 +220,23 @@ def _resolve_public_addresses(hostname: str, port: int, destination_type: str) -
             parsed_address = ipaddress.ip_address(raw_address)
         except ValueError as exc:
             raise ValueError(f"{destination_type} host '{hostname}' returned an invalid IP address") from exc
+        if family == socket.AF_INET and not isinstance(parsed_address, ipaddress.IPv4Address):
+            raise ValueError(f"{destination_type} host '{hostname}' returned an address-family mismatch")
+        if family == socket.AF_INET6:
+            if not isinstance(parsed_address, ipaddress.IPv6Address):
+                raise ValueError(f"{destination_type} host '{hostname}' returned an address-family mismatch")
+            ipv6_socket_address = cast(tuple[str, int, int, int], socket_address)
+            flow_info = ipv6_socket_address[2]
+            scope_id = ipv6_socket_address[3]
+            if (
+                isinstance(flow_info, bool)
+                or not isinstance(flow_info, int)
+                or flow_info != 0
+                or isinstance(scope_id, bool)
+                or not isinstance(scope_id, int)
+                or scope_id != 0
+            ):
+                raise ValueError(f"{destination_type} host '{hostname}' returned a scoped IPv6 address")
         if not _is_public_ip_address(parsed_address):
             raise ValueError(
                 f"{destination_type} host '{hostname}' did not resolve exclusively to permitted public addresses"
