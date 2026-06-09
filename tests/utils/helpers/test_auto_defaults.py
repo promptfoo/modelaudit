@@ -37,7 +37,8 @@ def test_detect_input_type_cloud():
     assert detect_input_type("https://bucket.s3.amazonaws.com./model.pt") == "cloud_s3"
     assert detect_input_type("https://storage.googleapis.com./bucket/model.pt") == "cloud_gcs"
     assert detect_input_type("https://bucket.s3.cn-north-1.amazonaws.com.cn/model.pt") == "cloud_s3"
-    assert detect_input_type("https://s3.us-iso-east-1.amazonaws.com/bucket/model.pt") == "cloud_s3"
+    assert detect_input_type("https://s3.us-iso-east-1.c2s.ic.gov/bucket/model.pt") == "cloud_s3"
+    assert detect_input_type("https://bucket.s3.eusc-de-east-1.amazonaws.eu/model.pt") == "cloud_s3"
     assert detect_input_type("https://bucket.s3-fips.us-east-1.amazonaws.com/model.pt") == "cloud_s3"
     assert detect_input_type("https://s3-fips.us-east-1.amazonaws.com/bucket/model.pt") == "cloud_s3"
     assert detect_input_type("https://bucket.s3-accelerate.amazonaws.com/model.pt") == "cloud_s3"
@@ -69,6 +70,19 @@ def test_detect_input_type_rejects_cloud_host_suffix_tricks(url: str) -> None:
     ],
 )
 def test_detect_input_type_requires_https_for_provider_hostnames(url: str) -> None:
+    assert detect_input_type(url) == "local_file"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@bucket.s3.amazonaws.com/model.pt",
+        "https://bucket.s3.amazonaws.com:444/model.pt",
+        "https://storage.googleapis.com:not-a-port/bucket/model.pt",
+        "https://account.blob.core.windows.net:8443/container/model.pt",
+    ],
+)
+def test_detect_input_type_rejects_ambiguous_https_authorities(url: str) -> None:
     assert detect_input_type(url) == "local_file"
 
 

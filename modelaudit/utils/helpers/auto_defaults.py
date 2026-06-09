@@ -7,18 +7,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
+_AWS_REGION_HOST_PART = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d"
+_AWS_S3_DNS_SUFFIX = (
+    r"(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov|cloud\.adc-e\.uk|csp\.hci\.ic\.gov)"
+)
 _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(r"^.+\.s3-accelerate(?:\.dualstack)?\.amazonaws\.com$")
 
@@ -37,6 +40,14 @@ def _get_scheme(url: str) -> str:
         return urlparse(url).scheme.casefold()
     except Exception:
         return ""
+
+
+def _has_valid_https_authority(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.username is None and parsed.password is None and parsed.port in {None, 443}
+    except ValueError:
+        return False
 
 
 def _is_s3_https_host(hostname: str) -> bool:
@@ -69,11 +80,12 @@ def detect_input_type(path: str) -> str:
     # Cloud storage detection
     hostname = _get_hostname(path)
     scheme = _get_scheme(path)
-    if scheme in {"s3", "r2"} or (scheme == "https" and (_is_s3_https_host(hostname) or _is_r2_https_host(hostname))):
+    valid_https = scheme == "https" and _has_valid_https_authority(path)
+    if scheme in {"s3", "r2"} or (valid_https and (_is_s3_https_host(hostname) or _is_r2_https_host(hostname))):
         return "cloud_s3"
-    if scheme in {"gs", "gcs"} or (scheme == "https" and _is_gcs_https_host(hostname)):
+    if scheme in {"gs", "gcs"} or (valid_https and _is_gcs_https_host(hostname)):
         return "cloud_gcs"
-    if scheme == "az" or (scheme == "https" and hostname.endswith(".blob.core.windows.net")):
+    if scheme == "az" or (valid_https and hostname.endswith(".blob.core.windows.net")):
         return "cloud_azure"
 
     # HuggingFace detection

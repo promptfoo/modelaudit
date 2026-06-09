@@ -117,18 +117,21 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
-_AWS_REGION_HOST_PART = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
+_AWS_REGION_HOST_PART = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d"
+_AWS_S3_DNS_SUFFIX = (
+    r"(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov|cloud\.adc-e\.uk|csp\.hci\.ic\.gov)"
+)
 _S3_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
+    rf"^s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.amazonaws\.com(?:\.cn)?$"
+    rf"^.+\.s3(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})?\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE = re.compile(
-    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+    rf"^s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(
-    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.amazonaws\.com(?:\.cn)?$"
+    rf"^.+\.s3-fips(?:[.-]{_AWS_REGION_HOST_PART}|\.dualstack\.{_AWS_REGION_HOST_PART})\.{_AWS_S3_DNS_SUFFIX}$"
 )
 _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE = re.compile(r"^.+\.s3-accelerate(?:\.dualstack)?\.amazonaws\.com$")
 
@@ -154,8 +157,14 @@ def _http_cloud_protocol(url: str) -> str | None:
     """Return the provider protocol for a recognized HTTP(S) cloud URL."""
     try:
         parsed = urlparse(url)
-        if parsed.scheme.casefold() not in {"http", "https"}:
+        scheme = parsed.scheme.casefold()
+        if scheme not in {"http", "https"}:
             return None
+        if scheme == "https":
+            if parsed.username is not None or parsed.password is not None:
+                return None
+            if parsed.port not in {None, 443}:
+                return None
         hostname = (parsed.hostname or "").casefold().rstrip(".")
     except ValueError:
         return None
@@ -214,7 +223,22 @@ def is_cloud_url(url: str) -> bool:
         return bool(parsed.netloc or parsed.path)
     if scheme != "https" or _http_cloud_protocol(url) is None:
         return False
-    return bool(parsed.path.lstrip("/"))
+    if parsed.path.lstrip("/"):
+        return True
+
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+        or _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
+    ):
+        return True
+    if hostname.endswith(".storage.googleapis.com"):
+        return bool(hostname[: -len(".storage.googleapis.com")])
+    if _is_r2_https_host(hostname):
+        host_prefix = hostname[: -len(".r2.cloudflarestorage.com")]
+        return "." in host_prefix
+    return False
 
 
 def is_stream_url(url: str) -> bool:
@@ -508,9 +532,12 @@ def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
 
 
 def _cloud_url_basename(url: str) -> str:
-    """Return a local filename derived from a cloud URL without query secrets."""
+    """Return a local filename while stripping only HTTPS query credentials."""
     try:
-        path = urlsplit(url).path
+        parts = urlsplit(url)
+        if parts.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+            return url.rstrip("/").rsplit("/", 1)[-1]
+        path = parts.path
     except Exception:
         path = url
     return Path(path).name
@@ -549,7 +576,30 @@ def _metadata_etag(metadata: Mapping[str, Any] | None) -> str | None:
 def _cloud_url_without_query(url: str) -> str:
     """Return a cloud URL without signed query or fragment material for path comparison."""
     parsed = urlsplit(url)
+    if parsed.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+        return url.rstrip("/")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _normalize_cloud_listing_path(base_url: str, listed_path: object) -> str:
+    """Resolve provider listing variants to a canonical child URL."""
+    child = str(listed_path)
+    child_parts = urlsplit(child)
+    if child_parts.scheme and "://" in child:
+        return child
+
+    base_parts = urlsplit(base_url)
+    if not base_parts.scheme or not base_parts.netloc:
+        return child
+
+    child = child.lstrip("/")
+    bucket = base_parts.netloc
+    base_key = base_parts.path.strip("/")
+    if child == bucket or child.startswith(f"{bucket}/"):
+        return f"{base_parts.scheme}://{child}"
+    if base_key and (child == base_key or child.startswith(f"{base_key}/")):
+        return f"{base_parts.scheme}://{bucket}/{child}"
+    return f"{base_url.rstrip('/')}/{child}"
 
 
 def get_fs_protocol(url: str) -> str:
@@ -597,9 +647,11 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
     if parsed.query:
         return "https", url, {}
 
-    path = unquote(parsed.path).lstrip("/")
+    encoded_path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+    path = unquote(encoded_path)
     bucket = ""
     key = ""
+    endpoint_host: str | None = None
     if _is_r2_https_host(hostname):
         host_prefix = hostname[: -len(".r2.cloudflarestorage.com")]
         host_parts = host_prefix.split(".")
@@ -615,12 +667,15 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
     elif _S3_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname) or _S3_FIPS_PATH_STYLE_HTTPS_HOST_RE.fullmatch(hostname):
         bucket, _, key = path.partition("/")
+        endpoint_host = hostname
     elif (
         _S3_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
         or _S3_FIPS_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
         or _S3_ACCELERATE_VIRTUAL_HOSTED_HTTPS_HOST_RE.fullmatch(hostname)
     ):
-        bucket = hostname[: hostname.find(".s3")]
+        endpoint_boundary = hostname.rfind(".s3")
+        bucket = hostname[:endpoint_boundary]
+        endpoint_host = hostname[endpoint_boundary + 1 :]
         key = path
     elif hostname.endswith(".storage.googleapis.com"):
         bucket = hostname[: -len(".storage.googleapis.com")]
@@ -630,6 +685,10 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
 
     if not bucket:
         raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+    if endpoint_host is not None and endpoint_host != "s3.amazonaws.com":
+        fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
+        if "s3-accelerate" in endpoint_host:
+            fs_args["config_kwargs"] = {"s3": {"addressing_style": "virtual"}}
     canonical_scheme = "gcs" if protocol == "gcs" else "s3"
     canonical_url = f"{canonical_scheme}://{bucket}"
     if key:
@@ -725,27 +784,52 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
 
     total_size = 0
     measured_file_count = 0
+    measured_sizes: dict[str, int] = {}
     walk_observed = False
     walk_error: Exception | None = None
     ls_error: Exception | None = None
+    ls_error_path: str | None = None
+
+    def _record_size(path: object, raw_size: object) -> None:
+        nonlocal total_size, measured_file_count
+        path_key = str(path)
+        parsed_size = _parse_size_value(raw_size)
+        previous_size = measured_sizes.get(path_key)
+        if previous_size is None:
+            measured_sizes[path_key] = parsed_size
+            total_size += parsed_size
+            measured_file_count += 1
+            return
+        if previous_size == parsed_size:
+            return
+        if strict:
+            raise ValueError(f"inconsistent size metadata for duplicate listed object {path_key}")
+        retained_size = max(previous_size, parsed_size)
+        measured_sizes[path_key] = retained_size
+        total_size += retained_size - previous_size
 
     # Try using fs.walk to traverse directories
     try:
-        for _, _, files in fs.walk(url):
+        for root, _, files in fs.walk(url):
             walk_observed = True
             for file_path in files:
+                listed_path = str(file_path)
+                if "://" not in listed_path and "/" not in listed_path.strip("/"):
+                    listed_path = f"{str(root).rstrip('/')}/{listed_path}"
+                resolved_file_path = _normalize_cloud_listing_path(url, listed_path)
                 try:
-                    file_info = fs.info(file_path)
+                    file_info = fs.info(resolved_file_path)
                     if "size" in file_info:
-                        total_size += _parse_size_value(file_info["size"])
-                        measured_file_count += 1
+                        _record_size(resolved_file_path, file_info["size"])
                     elif strict:
                         raise ValueError("cloud provider did not return file size")
                 except Exception as exc:
                     if strict:
-                        safe_path = _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(file_path))
+                        safe_path = _bound_cloud_metadata_error_display(
+                            _redact_cloud_path_for_display(resolved_file_path)
+                        )
                         safe_error = _bound_cloud_metadata_error_display(
-                            redact_cloud_error_for_display(exc, str(file_path))
+                            redact_cloud_error_for_display(exc, resolved_file_path)
                         )
                         raise _CloudObjectMetadataSizeError(
                             "Unable to determine cloud object size for "
@@ -761,30 +845,52 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         walk_error = exc
         total_size = 0
         measured_file_count = 0
+        measured_sizes.clear()
 
     # Fallback to recursive ls if walk is unavailable
     ls_observed = False
+    visited_listing_paths: set[str] = set()
 
     def _collect(path: str) -> None:
-        nonlocal total_size, measured_file_count, ls_error, ls_observed
+        nonlocal total_size, measured_file_count, ls_error, ls_error_path, ls_observed
+        if path in visited_listing_paths:
+            if strict:
+                raise ValueError(
+                    "Unable to determine cloud object size for "
+                    f"{redact_url_for_display(url)}: duplicate or cyclic directory listing at "
+                    f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(path))}"
+                )
+            return
+        visited_listing_paths.add(path)
         try:
             entries = fs.ls(path, detail=True)
             ls_observed = True
         except Exception as exc:
             if ls_error is None:
                 ls_error = exc
+                ls_error_path = path
             return
         for entry in entries:
             if not isinstance(entry, dict):
+                if strict:
+                    raise ValueError(
+                        "Unable to determine cloud object size for "
+                        f"{redact_url_for_display(url)}: cloud provider returned an invalid detailed listing entry"
+                    )
                 continue
             name = entry.get("name") or entry.get("path")
+            if not isinstance(name, str) or not name:
+                if strict:
+                    raise ValueError(
+                        "Unable to determine cloud object size for "
+                        f"{redact_url_for_display(url)}: cloud provider returned a listed object without a valid path"
+                    )
+                continue
             if entry.get("type") == "directory" or (name and name.endswith("/")):
-                if name:
-                    _collect(name)
+                _collect(name)
             elif "size" in entry:
                 try:
-                    total_size += _parse_size_value(entry["size"])
-                    measured_file_count += 1
+                    _record_size(name, entry["size"])
                 except Exception as exc:
                     if strict:
                         raise ValueError(
@@ -802,7 +908,11 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 )
 
     _collect(url)
-    if ls_observed and (info.get("type") == "directory" or measured_file_count > 0):
+    if (
+        (not strict or ls_error is None)
+        and ls_observed
+        and (info.get("type") == "directory" or measured_file_count > 0)
+    ):
         return total_size
 
     if strict:
@@ -812,7 +922,11 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         if walk_error:
             error_parts.append(f"walk() failed: {redact_cloud_error_for_display(walk_error, url)}")
         if ls_error:
-            error_parts.append(f"ls() failed: {redact_cloud_error_for_display(ls_error, url)}")
+            safe_path = _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(ls_error_path or url))
+            error_parts.append(
+                f"recursive listing failed for {safe_path}: "
+                f"{redact_cloud_error_for_display(ls_error, ls_error_path or url)}"
+            )
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
         bounded_errors = _bound_cloud_metadata_error_display("; ".join(error_parts))
@@ -872,16 +986,17 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # Ensure URL ends with / for proper globbing
         glob_pattern = f"{fs_url.rstrip('/')}/**"
         for item in fs.glob(glob_pattern):
+            item_url = _normalize_cloud_listing_path(fs_url, item)
             try:
-                item_info = fs.info(item)
+                item_info = fs.info(item_url)
                 item_type = item_info.get("type")
                 if item_type == "directory":
                     continue
                 if item_type == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
                     file_metadata = {
-                        "path": item,
-                        "name": _cloud_url_basename(item),
+                        "path": item_url,
+                        "name": _cloud_url_basename(item_url),
                         "size": size,
                         "human_size": format_size(size),
                     }
@@ -1751,7 +1866,25 @@ def _detect_cloud_content_route_format(
         prefix[:16],
         max(size, len(prefix)),
         None,
+        pickle_probe_sample=prefix,
+        pickle_probe_is_prefix=not size_is_known,
     )
+    if (
+        detected_format == "pickle"
+        and sniff_budget is not None
+        and sniff_budget.remaining_bytes == 0
+        and not size_is_known
+        and _get_cloud_content_size_for_routing(fs, file_url) == len(prefix)
+    ):
+        detected_format = detect_format_from_magic_bytes(
+            prefix[:4],
+            prefix[:8],
+            prefix[:16],
+            len(prefix),
+            None,
+            pickle_probe_sample=prefix,
+            pickle_probe_is_prefix=False,
+        )
     if (
         detected_format == "unknown"
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
@@ -1885,7 +2018,6 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
         # Fallback to basename for unexpected path shapes.
         relative_path = _cloud_url_basename(file_url)
 
-    relative_path = urlsplit(relative_path).path
     if not relative_path:
         raise ValueError(f"Invalid cloud object path: {file_url}")
 
