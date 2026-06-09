@@ -6024,7 +6024,11 @@ impl<'a> ScanState<'a> {
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
-        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(value);
+        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(
+            value,
+            max_window_chars,
+            self.options.max_nested_pickle_bytes,
+        );
         if !found_candidate
             && (value.len() <= max_window_chars || value.chars().count() <= max_window_chars)
         {
@@ -6036,10 +6040,15 @@ impl<'a> ScanState<'a> {
         let probe_limit_exceeded = probe_windows.limit_exceeded;
         let probe_limit_exceeded_encoding = probe_windows.limit_exceeded_encoding;
         for candidate in probe_windows.windows {
-            if found_candidate && candidate == value {
+            if found_candidate && candidate.synthetic_prefix_bytes == 0 && candidate.value == value
+            {
                 continue;
             }
-            found_candidate |= self.scan_encoded_nested_pickle_candidate(&candidate, position);
+            found_candidate |= self.scan_encoded_nested_pickle_candidate_with_synthetic_prefix(
+                &candidate.value,
+                position,
+                candidate.synthetic_prefix_bytes,
+            );
         }
 
         if probe_coverage_incomplete {
@@ -6077,13 +6086,32 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) -> bool {
+        self.scan_encoded_nested_pickle_candidate_with_synthetic_prefix(value, position, 0)
+    }
+
+    fn scan_encoded_nested_pickle_candidate_with_synthetic_prefix(
+        &mut self,
+        value: &str,
+        position: usize,
+        synthetic_prefix_bytes: usize,
+    ) -> bool {
         let mut decoded_payload_found = false;
+        let scan_limit = self
+            .options
+            .max_nested_pickle_bytes
+            .saturating_add(synthetic_prefix_bytes);
         for DecodedNestedPayload {
             encoding,
-            payload: decoded,
+            payload: mut decoded,
             analysis_incomplete,
-        } in decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
+        } in decode_possible_encoded_pickle(value, scan_limit)
         {
+            if synthetic_prefix_bytes > 0 {
+                if decoded.len() < synthetic_prefix_bytes {
+                    continue;
+                }
+                decoded.drain(..synthetic_prefix_bytes);
+            }
             decoded_payload_found = true;
             let nested_has_execution_opcode = has_execution_opcode(&decoded);
             let surface_outcome = self.surface_nested_pickle_findings(&decoded, encoding, position);
@@ -6102,10 +6130,11 @@ impl<'a> ScanState<'a> {
             );
         }
         let mut oversized_prefix_found = false;
-        for (encoding, payload_size) in
-            detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
+        for (encoding, encoded_payload_size) in
+            detect_oversized_encoded_pickle_prefixes(value, scan_limit)
         {
             oversized_prefix_found = true;
+            let payload_size = encoded_payload_size.saturating_sub(synthetic_prefix_bytes);
             self.add_nested_payload_finding(
                 encoded_nested_payload_finding(encoding, payload_size, position, true, false),
                 true,

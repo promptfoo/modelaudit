@@ -98,6 +98,7 @@ _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
 _STATIC_INT_EVAL_MAX_ABS = 10**100
 _MAX_STATIC_RENDER_ANALYSIS_STEPS = 20_000
 _MAX_STATIC_RANGE_PROJECTION_ITEMS = 200_000
+_MAX_STATIC_CONTAINER_PATHS = 4_096
 _SANDBOX_MAX_RANGE_ITERATIONS = int(jinja2.sandbox.MAX_RANGE) if HAS_JINJA2_SANDBOX else 100_000
 _EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "sort"})
 _LAZY_RANGE_ITERATION_FILTERS = frozenset(
@@ -109,10 +110,22 @@ _StaticIntResult = tuple[int, bool]
 
 @dataclass(frozen=True)
 class _StaticIntCandidates:
-    values: tuple[_StaticIntResult, ...]
+    values: tuple["_StaticBindingValue", ...]
+    truncated: bool = False
+    may_be_undefined: bool = False
 
 
-_StaticIntBinding = _StaticIntResult | _StaticIntCandidates
+@dataclass(frozen=True)
+class _StaticScalarValue:
+    value: str | float
+
+
+_StaticBindingValue = _StaticIntResult | _StaticScalarValue
+_StaticIntBinding = _StaticBindingValue | _StaticIntCandidates
+
+
+class _StaticAnalysisBudgetExceeded(Exception):
+    pass
 
 
 class _StaticMacroAnalysisState(set[int]):
@@ -128,10 +141,11 @@ class _StaticMacroAnalysisState(set[int]):
         self.remaining_range_items = remaining_range_items or [_MAX_STATIC_RANGE_PROJECTION_ITEMS]
         self.preflight_only = preflight_only
 
-    def consume(self) -> bool:
-        if self.remaining_steps[0] <= 0:
+    def consume(self, count: int = 1) -> bool:
+        if count > self.remaining_steps[0]:
+            self.remaining_steps[0] = 0
             return False
-        self.remaining_steps[0] -= 1
+        self.remaining_steps[0] -= count
         return True
 
     def nested(self, macro_id: int) -> "_StaticMacroAnalysisState":
@@ -1705,14 +1719,17 @@ class Jinja2TemplateScanner(BaseScanner):
         int_bindings: dict[str, _StaticIntBinding] = {}
         namespace_range_attrs: dict[str, set[str]] = {}
         macro_bindings: dict[str, tuple[Any, ...]] = {}
-        return self._static_node_has_oversized_sandbox_range_call(
-            parsed,
-            range_aliases,
-            int_bindings,
-            namespace_range_attrs,
-            macro_bindings,
-            _StaticMacroAnalysisState(preflight_only=preflight_only),
-        )
+        try:
+            return self._static_node_has_oversized_sandbox_range_call(
+                parsed,
+                range_aliases,
+                int_bindings,
+                namespace_range_attrs,
+                macro_bindings,
+                _StaticMacroAnalysisState(preflight_only=preflight_only),
+            )
+        except _StaticAnalysisBudgetExceeded:
+            return True
 
     def _static_node_has_oversized_sandbox_range_call(
         self,
@@ -1794,6 +1811,19 @@ class Jinja2TemplateScanner(BaseScanner):
                 active_macros,
             ):
                 return True
+            if (
+                isinstance(active_macros, _StaticMacroAnalysisState)
+                and isinstance(node.target, jinja2.nodes.Tuple)
+                and isinstance(node.node, jinja2.nodes.List | jinja2.nodes.Tuple)
+            ):
+                binding_width = (
+                    len(range_aliases)
+                    + len(int_bindings)
+                    + len(macro_bindings)
+                    + sum(len(attrs) for attrs in namespace_range_attrs.values())
+                )
+                if not active_macros.consume(len(node.target.items) * max(1, binding_width)):
+                    return True
             self._collect_static_range_assignment(
                 node.target,
                 node.node,
@@ -1806,6 +1836,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 node.node,
                 macro_bindings,
                 namespace_range_attrs,
+                range_aliases,
             )
             return False
 
@@ -1839,6 +1870,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 namespace_range_attrs,
             )
             self._clear_static_macro_binding(node.target, macro_bindings)
+            if isinstance(node.target, jinja2.nodes.Name):
+                range_aliases.add(self._static_defined_binding_key(node.target.name))
+                macro_bindings[self._static_defined_binding_key(node.target.name)] = ()
             return False
 
         if isinstance(node, jinja2.nodes.Macro):
@@ -1850,6 +1884,8 @@ class Jinja2TemplateScanner(BaseScanner):
                 namespace_range_attrs,
             )
             self._clear_static_macro_binding(macro_target, macro_bindings)
+            range_aliases.add(self._static_defined_binding_key(node.name))
+            macro_bindings[self._static_defined_binding_key(node.name)] = ()
             macro_bindings[node.name] = (node,)
             return False
 
@@ -2006,7 +2042,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     for child in node.else_
                 )
 
-            literal_items = node.iter.items if isinstance(node.iter, jinja2.nodes.List | jinja2.nodes.Tuple) else None
+            literal_items = self._static_literal_iterable_items(node.iter)
             iteration_count: int | None = len(literal_items) if literal_items is not None else None
             range_call = self._static_iterable_range_call(
                 node.iter,
@@ -2061,6 +2097,7 @@ class Jinja2TemplateScanner(BaseScanner):
                         item,
                         item_macro_bindings,
                         item_namespace_attrs,
+                        item_aliases,
                     )
 
                     test_condition: bool | None = True
@@ -2074,7 +2111,7 @@ class Jinja2TemplateScanner(BaseScanner):
                             active_macros,
                         ):
                             return True
-                        test_condition = self._constant_condition_value(node.test)
+                        test_condition = self._constant_condition_value(node.test, item_int_bindings)
                     if test_condition is False:
                         continue
 
@@ -2204,6 +2241,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     value,
                     with_macro_bindings,
                     with_namespace_attrs,
+                    with_aliases,
                 )
             has_risk = any(
                 self._static_node_has_oversized_sandbox_range_call(
@@ -2322,6 +2360,8 @@ class Jinja2TemplateScanner(BaseScanner):
     ) -> bool:
         macros = self._static_macro_binding_for_node(node.node, macro_bindings)
         for macro in macros:
+            if isinstance(active_macros, _StaticMacroAnalysisState) and not active_macros.consume():
+                return True
             if id(macro) in active_macros:
                 normalized_arguments = self._static_macro_call_arguments(
                     node,
@@ -2383,6 +2423,23 @@ class Jinja2TemplateScanner(BaseScanner):
                 return False
             keyword_names.add(keyword_name)
 
+        supplied_arguments = {
+            argument.name: value for argument, value in zip(macro.args, positional_arguments, strict=False)
+        }
+        supplied_arguments.update(dict(keyword_arguments))
+        default_offset = len(macro.args) - len(macro.defaults)
+        projected_argument_count = len(macro.args)
+        if accepts_varargs:
+            projected_argument_count += max(0, len(positional_arguments) - len(macro.args))
+        if accepts_kwargs:
+            projected_argument_count += sum(name not in argument_names for name, _ in keyword_arguments)
+        if (
+            projected_argument_count
+            and isinstance(active_macros, _StaticMacroAnalysisState)
+            and not active_macros.consume(projected_argument_count * max(1, len(int_bindings)))
+        ):
+            return True
+
         macro_aliases = set(range_aliases)
         macro_int_bindings = dict(int_bindings)
         macro_namespace_attrs = self._clone_static_namespace_bindings(namespace_range_attrs)
@@ -2396,12 +2453,7 @@ class Jinja2TemplateScanner(BaseScanner):
             )
             self._clear_static_macro_binding(argument, nested_macro_bindings)
 
-        supplied_arguments = {
-            argument.name: value for argument, value in zip(macro.args, positional_arguments, strict=False)
-        }
-        supplied_arguments.update(dict(keyword_arguments))
         namespace_argument_sources: dict[str, tuple[tuple[str, ...], set[str]]] = {}
-        default_offset = len(macro.args) - len(macro.defaults)
         for index, argument in enumerate(macro.args):
             value = supplied_arguments.get(argument.name)
             uses_default = False
@@ -2444,38 +2496,109 @@ class Jinja2TemplateScanner(BaseScanner):
                 )
 
         if accepts_kwargs:
-            kwargs_range_attrs = {
-                keyword_name
-                for keyword_name, keyword_value in keyword_arguments
-                if keyword_name not in argument_names
-                and self._is_static_range_callable(keyword_value, range_aliases, namespace_range_attrs)
-            }
-            if kwargs_range_attrs:
-                macro_namespace_attrs["kwargs"] = kwargs_range_attrs
-            else:
-                macro_namespace_attrs.pop("kwargs", None)
+            macro_aliases.discard("kwargs")
+            macro_aliases.add(self._static_defined_binding_key("kwargs"))
+            macro_namespace_attrs.pop("kwargs", None)
+            macro_int_bindings.pop("kwargs", None)
+            nested_macro_bindings.pop("kwargs", None)
+            nested_macro_bindings[self._static_defined_binding_key("kwargs")] = ()
+            for binding_name in [
+                binding_name
+                for binding_name in macro_int_bindings
+                if binding_name.startswith(self._static_container_binding_prefixes("kwargs"))
+            ]:
+                macro_int_bindings.pop(binding_name, None)
+            for binding_name in [
+                binding_name
+                for binding_name in nested_macro_bindings
+                if binding_name.startswith(self._static_container_binding_prefixes("kwargs"))
+            ]:
+                nested_macro_bindings.pop(binding_name, None)
+            kwargs_range_attrs = {self._static_container_kind_attr_key("mapping")}
+            macro_int_bindings[self._static_container_kind_binding_key("kwargs", "mapping")] = (
+                self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+            )
             for keyword_name, keyword_value in keyword_arguments:
                 if keyword_name in argument_names:
                     continue
+                keyword_path = (keyword_name,)
+                kwargs_range_attrs.add(self._static_container_member_attr_key(keyword_path))
+                macro_int_bindings[self._static_container_member_binding_key("kwargs", keyword_path)] = (
+                    self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+                )
+                if self._is_static_range_callable(keyword_value, range_aliases, namespace_range_attrs):
+                    kwargs_range_attrs.add(self._static_container_attr_key(keyword_path))
+                int_results = self._constant_int_expression_results_with_bindings(
+                    keyword_value,
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                    int_bindings,
+                )
+                value_binding = self._make_static_int_binding(int_results)
+                if value_binding is None:
+                    scalar_value = self._constant_scalar_expression_value(keyword_value, int_bindings)
+                    if scalar_value is not None:
+                        value_binding = _StaticScalarValue(scalar_value)
+                if value_binding is not None:
+                    macro_int_bindings[self._static_container_binding_key("kwargs", keyword_path)] = value_binding
                 keyword_macros = self._static_macro_binding_for_node(keyword_value, macro_bindings)
                 if keyword_macros:
-                    nested_macro_bindings[f"kwargs.{keyword_name}"] = keyword_macros
+                    nested_macro_bindings[self._static_container_binding_key("kwargs", (keyword_name,))] = (
+                        keyword_macros
+                    )
+            macro_namespace_attrs["kwargs"] = kwargs_range_attrs
 
         if accepts_varargs:
             extra_arguments = positional_arguments[len(macro.args) :]
-            varargs_range_attrs = {
-                str(index)
-                for index, value in enumerate(extra_arguments)
-                if self._is_static_range_callable(value, range_aliases, namespace_range_attrs)
-            }
-            if varargs_range_attrs:
-                macro_namespace_attrs["varargs"] = varargs_range_attrs
-            else:
-                macro_namespace_attrs.pop("varargs", None)
+            macro_aliases.discard("varargs")
+            macro_aliases.add(self._static_defined_binding_key("varargs"))
+            macro_namespace_attrs.pop("varargs", None)
+            macro_int_bindings.pop("varargs", None)
+            nested_macro_bindings.pop("varargs", None)
+            nested_macro_bindings[self._static_defined_binding_key("varargs")] = ()
+            for binding_name in [
+                binding_name
+                for binding_name in macro_int_bindings
+                if binding_name.startswith(self._static_container_binding_prefixes("varargs"))
+            ]:
+                macro_int_bindings.pop(binding_name, None)
+            for binding_name in [
+                binding_name
+                for binding_name in nested_macro_bindings
+                if binding_name.startswith(self._static_container_binding_prefixes("varargs"))
+            ]:
+                nested_macro_bindings.pop(binding_name, None)
+            varargs_range_attrs = {self._static_container_kind_attr_key("sequence")}
+            macro_int_bindings[self._static_container_kind_binding_key("varargs", "sequence")] = (
+                self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+            )
+            macro_int_bindings[self._static_container_length_key("varargs")] = self._constant_int_result(
+                len(extra_arguments),
+                _SANDBOX_MAX_RANGE_ITERATIONS,
+            )
             for index, value in enumerate(extra_arguments):
+                vararg_path = (index,)
+                varargs_range_attrs.add(self._static_container_member_attr_key(vararg_path))
+                macro_int_bindings[self._static_container_member_binding_key("varargs", vararg_path)] = (
+                    self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+                )
+                if self._is_static_range_callable(value, range_aliases, namespace_range_attrs):
+                    varargs_range_attrs.add(self._static_container_attr_key(vararg_path))
+                int_results = self._constant_int_expression_results_with_bindings(
+                    value,
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                    int_bindings,
+                )
+                value_binding = self._make_static_int_binding(int_results)
+                if value_binding is None:
+                    scalar_value = self._constant_scalar_expression_value(value, int_bindings)
+                    if scalar_value is not None:
+                        value_binding = _StaticScalarValue(scalar_value)
+                if value_binding is not None:
+                    macro_int_bindings[self._static_container_binding_key("varargs", vararg_path)] = value_binding
                 vararg_macros = self._static_macro_binding_for_node(value, macro_bindings)
                 if vararg_macros:
-                    nested_macro_bindings[f"varargs.{index}"] = vararg_macros
+                    nested_macro_bindings[self._static_container_binding_key("varargs", (index,))] = vararg_macros
+            macro_namespace_attrs["varargs"] = varargs_range_attrs
 
         nested_active_macros = (
             active_macros.nested(id(macro))
@@ -2571,12 +2694,12 @@ class Jinja2TemplateScanner(BaseScanner):
         macro_bindings: dict[str, tuple[Any, ...]],
     ) -> list[Any] | None:
         length_binding = int_bindings.get(self._static_container_length_key(name))
-        if length_binding is None or isinstance(length_binding, _StaticIntCandidates) or length_binding[1]:
+        if not isinstance(length_binding, tuple) or length_binding[1]:
             return None
         return [
             self._static_bound_container_value_node(
                 name,
-                str(index),
+                index,
                 namespace_range_attrs,
                 macro_bindings,
             )
@@ -2590,11 +2713,26 @@ class Jinja2TemplateScanner(BaseScanner):
         namespace_range_attrs: dict[str, set[str]],
         macro_bindings: dict[str, tuple[Any, ...]],
     ) -> list[tuple[str, Any]] | None:
-        prefix = f"{name}."
-        keys = set(namespace_range_attrs.get(name, set()))
-        keys.update(key.removeprefix(prefix) for key in int_bindings if key.startswith(prefix))
-        keys.update(key.removeprefix(prefix) for key in macro_bindings if key.startswith(prefix))
-        if not keys:
+        keys = {
+            path[0]
+            for attr in namespace_range_attrs.get(name, set())
+            if (path := self._static_container_path_from_attr_key(attr)) is not None
+            and len(path) == 1
+            and isinstance(path[0], str)
+        }
+        keys.update(
+            path[0]
+            for attr in namespace_range_attrs.get(name, set())
+            if (path := self._static_container_member_path_from_attr_key(attr)) is not None
+            and len(path) == 1
+            and isinstance(path[0], str)
+        )
+        for binding in [*int_bindings, *macro_bindings]:
+            path = self._static_container_path_from_binding_key(name, binding)
+            if path is not None and len(path) == 1 and isinstance(path[0], str):
+                keys.add(path[0])
+        known_mapping = self._static_container_kind_binding_key(name, "mapping") in int_bindings
+        if not keys and not known_mapping:
             return None
         return [
             (
@@ -2609,16 +2747,18 @@ class Jinja2TemplateScanner(BaseScanner):
             for key in sorted(keys)
         ]
 
-    @staticmethod
+    @classmethod
     def _static_bound_container_value_node(
+        cls,
         name: str,
-        key: str,
+        key: str | int | float,
         namespace_range_attrs: dict[str, set[str]],
         macro_bindings: dict[str, tuple[Any, ...]],
     ) -> Any:
-        if key in namespace_range_attrs.get(name, set()):
+        path = (key,)
+        if cls._static_container_attr_key(path) in namespace_range_attrs.get(name, set()):
             return jinja2.nodes.Name("range", "load")
-        binding_name = f"{name}.{key}"
+        binding_name = cls._static_container_binding_key(name, path)
         if binding_name in macro_bindings:
             return jinja2.nodes.Name(binding_name, "load")
         return jinja2.nodes.Name(binding_name, "load")
@@ -2626,6 +2766,213 @@ class Jinja2TemplateScanner(BaseScanner):
     @staticmethod
     def _static_container_length_key(name: str) -> str:
         return f"{name}\0length"
+
+    @staticmethod
+    def _static_defined_binding_key(name: str) -> str:
+        return f"\0defined:{name}"
+
+    @staticmethod
+    def _static_int_binding_is_definitely_present(
+        int_bindings: dict[str, _StaticIntBinding],
+        name: str,
+    ) -> bool:
+        binding = int_bindings.get(name)
+        return binding is not None and not (isinstance(binding, _StaticIntCandidates) and binding.may_be_undefined)
+
+    def _static_value_is_definitely_defined(
+        self,
+        node: Any,
+        range_aliases: set[str],
+        int_bindings: dict[str, _StaticIntBinding],
+        namespace_range_attrs: dict[str, set[str]],
+        depth: int = 0,
+    ) -> bool:
+        if depth > 32:
+            return False
+        if isinstance(node, jinja2.nodes.Const | jinja2.nodes.List | jinja2.nodes.Tuple | jinja2.nodes.Dict):
+            return True
+        if isinstance(node, jinja2.nodes.Name):
+            return (
+                self._static_defined_binding_key(node.name) in range_aliases
+                or self._static_int_binding_is_definitely_present(int_bindings, node.name)
+                or node.name in namespace_range_attrs
+            )
+        if self._is_static_range_callable(node, range_aliases, namespace_range_attrs):
+            return True
+        access = self._static_container_access_path(node)
+        if access is not None:
+            name, path = access
+            binding_name = name if not path else self._static_container_binding_key(name, path)
+            if self._static_int_binding_is_definitely_present(int_bindings, binding_name):
+                return True
+            if path and self._static_int_binding_is_definitely_present(
+                int_bindings,
+                self._static_container_member_binding_key(name, path),
+            ):
+                return True
+        if self._constant_int_expression_results_with_bindings(
+            node,
+            _SANDBOX_MAX_RANGE_ITERATIONS,
+            int_bindings,
+        ):
+            return True
+        if self._constant_scalar_expression_value(node, int_bindings) is not None:
+            return True
+        if (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Name)
+            and node.node.name == "namespace"
+        ):
+            return True
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name in {"d", "default"}
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and len(node.args) <= 2
+        ):
+            if not node.args:
+                return True
+            return self._static_value_is_definitely_defined(
+                node.args[0],
+                range_aliases,
+                int_bindings,
+                namespace_range_attrs,
+                depth + 1,
+            )
+        if isinstance(node, jinja2.nodes.CondExpr):
+            condition = self._constant_condition_value(node.test, int_bindings)
+            if condition is not None:
+                selected = node.expr1 if condition else node.expr2
+                return selected is not None and self._static_value_is_definitely_defined(
+                    selected,
+                    range_aliases,
+                    int_bindings,
+                    namespace_range_attrs,
+                    depth + 1,
+                )
+            return node.expr2 is not None and all(
+                self._static_value_is_definitely_defined(
+                    branch,
+                    range_aliases,
+                    int_bindings,
+                    namespace_range_attrs,
+                    depth + 1,
+                )
+                for branch in (node.expr1, node.expr2)
+            )
+        return False
+
+    @staticmethod
+    def _static_container_path_token(path: tuple[str | int | float, ...]) -> str:
+        return "\0path:" + json.dumps(path, separators=(",", ":"), ensure_ascii=True)
+
+    @classmethod
+    def _static_container_attr_key(cls, path: tuple[str | int | float, ...]) -> str:
+        return cls._static_container_path_token(path)
+
+    @staticmethod
+    def _static_container_path_from_attr_key(key: str) -> tuple[str | int | float, ...] | None:
+        if key.startswith("\0") and not key.startswith("\0path:"):
+            return None
+        if not key.startswith("\0path:"):
+            return (key,)
+        try:
+            values = json.loads(key.removeprefix("\0path:"))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(values, list) or not all(isinstance(value, str | int | float) for value in values):
+            return None
+        return tuple(values)
+
+    @classmethod
+    def _static_container_binding_key(cls, name: str, path: tuple[str | int | float, ...]) -> str:
+        return f"{name}{cls._static_container_attr_key(path)}"
+
+    @staticmethod
+    def _static_container_member_attr_key(path: tuple[str | int | float, ...]) -> str:
+        return "\0member:" + json.dumps(path, separators=(",", ":"), ensure_ascii=True)
+
+    @staticmethod
+    def _static_container_member_path_from_attr_key(key: str) -> tuple[str | int | float, ...] | None:
+        if not key.startswith("\0member:"):
+            return None
+        try:
+            values = json.loads(key.removeprefix("\0member:"))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(values, list) or not all(isinstance(value, str | int | float) for value in values):
+            return None
+        return tuple(values)
+
+    @classmethod
+    def _static_container_member_binding_key(cls, name: str, path: tuple[str | int | float, ...]) -> str:
+        return f"{name}{cls._static_container_member_attr_key(path)}"
+
+    @staticmethod
+    def _static_container_kind_attr_key(kind: str, path: tuple[str | int | float, ...] = ()) -> str:
+        return f"\0kind:{kind}:" + json.dumps(path, separators=(",", ":"), ensure_ascii=True)
+
+    @classmethod
+    def _static_container_kind_binding_key(
+        cls,
+        name: str,
+        kind: str,
+        path: tuple[str | int | float, ...] = (),
+    ) -> str:
+        return f"{name}{cls._static_container_kind_attr_key(kind, path)}"
+
+    @classmethod
+    def _static_container_access_path(cls, node: Any) -> tuple[str, tuple[str | int | float, ...]] | None:
+        if isinstance(node, jinja2.nodes.Name):
+            return node.name, ()
+        if isinstance(node, jinja2.nodes.Getitem):
+            access = cls._static_container_access_path(node.node)
+            key = cls._static_literal_container_key(node.arg)
+        elif isinstance(node, jinja2.nodes.Getattr):
+            access = cls._static_container_access_path(node.node)
+            key = node.attr
+        elif (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Getattr)
+            and node.node.attr == "get"
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and 1 <= len(node.args) <= 2
+        ):
+            access = cls._static_container_access_path(node.node.node)
+            key = cls._static_literal_container_key(node.args[0])
+        else:
+            return None
+        if access is None or key is None:
+            return None
+        name, path = access
+        return name, (*path, key)
+
+    @classmethod
+    def _static_container_binding_prefixes(cls, name: str) -> tuple[str, ...]:
+        return f"{name}.", f"{name}\0path:", f"{name}\0member:", f"{name}\0kind:"
+
+    @classmethod
+    def _static_container_path_from_binding_key(
+        cls,
+        name: str,
+        binding: str,
+    ) -> tuple[str | int | float, ...] | None:
+        if binding.startswith(f"{name}\0path:"):
+            return cls._static_container_path_from_attr_key(binding[len(name) :])
+        if binding.startswith(f"{name}."):
+            return (binding.removeprefix(f"{name}."),)
+        return None
+
+    @classmethod
+    def _static_rebased_container_binding_key(cls, binding: str, source: str, target: str) -> str | None:
+        for prefix in cls._static_container_binding_prefixes(source):
+            if binding.startswith(prefix):
+                return target + binding[len(source) :]
+        return None
 
     def _bind_static_macro_argument(
         self,
@@ -2642,6 +2989,16 @@ class Jinja2TemplateScanner(BaseScanner):
     ) -> None:
         if not isinstance(target, jinja2.nodes.Name):
             return
+        value_is_definitely_defined = self._static_value_is_definitely_defined(
+            value,
+            source_aliases,
+            source_int_bindings,
+            source_namespace_attrs,
+        )
+        defined_key = self._static_defined_binding_key(target.name)
+        if value_is_definitely_defined:
+            range_aliases.add(defined_key)
+            macro_bindings[defined_key] = ()
         if self._is_static_range_callable(value, source_aliases, source_namespace_attrs):
             range_aliases.add(target.name)
         int_results = self._constant_int_expression_results_with_bindings(
@@ -2650,16 +3007,19 @@ class Jinja2TemplateScanner(BaseScanner):
             source_int_bindings,
         )
         int_binding = self._make_static_int_binding(int_results)
+        if int_binding is None:
+            scalar_value = self._constant_scalar_expression_value(value, source_int_bindings)
+            if scalar_value is not None:
+                int_binding = _StaticScalarValue(scalar_value)
         if int_binding is not None:
             int_bindings[target.name] = int_binding
         if isinstance(value, jinja2.nodes.Name):
             if value.name in source_namespace_attrs:
                 namespace_range_attrs[target.name] = source_namespace_attrs[value.name]
-            source_prefix = f"{value.name}."
-            target_prefix = f"{target.name}."
             for name, namespace_macro in source_macro_bindings.items():
-                if name.startswith(source_prefix):
-                    macro_bindings[f"{target_prefix}{name.removeprefix(source_prefix)}"] = namespace_macro
+                rebased = self._static_rebased_container_binding_key(name, value.name, target.name)
+                if rebased is not None:
+                    macro_bindings[rebased] = namespace_macro
         source_macros = self._static_macro_binding_for_node(value, source_macro_bindings)
         if source_macros:
             macro_bindings[target.name] = source_macros
@@ -2673,24 +3033,18 @@ class Jinja2TemplateScanner(BaseScanner):
             macro_bindings.pop(f"{target.name}.{target.attr}", None)
         elif isinstance(target, jinja2.nodes.Name):
             macro_bindings.pop(target.name, None)
-            prefix = f"{target.name}."
-            for name in [name for name in macro_bindings if name.startswith(prefix)]:
+            macro_bindings.pop(cls._static_defined_binding_key(target.name), None)
+            prefixes = cls._static_container_binding_prefixes(target.name)
+            for name in [name for name in macro_bindings if name.startswith(prefixes)]:
                 macro_bindings.pop(name, None)
 
     @classmethod
     def _static_macro_binding_key(cls, node: Any) -> str | None:
-        if isinstance(node, jinja2.nodes.Name):
-            return node.name
-        if isinstance(node, jinja2.nodes.Getattr) and isinstance(node.node, jinja2.nodes.Name):
-            return f"{node.node.name}.{node.attr}"
-        if (
-            isinstance(node, jinja2.nodes.Getitem)
-            and isinstance(node.node, jinja2.nodes.Name)
-            and isinstance(node.arg, jinja2.nodes.Const)
-            and isinstance(node.arg.value, str | int)
-        ):
-            return f"{node.node.name}.{node.arg.value}"
-        return None
+        access = cls._static_container_access_path(node)
+        if access is None:
+            return None
+        name, path = access
+        return name if not path else cls._static_container_binding_key(name, path)
 
     @classmethod
     def _static_macro_binding_for_node(
@@ -2714,11 +3068,98 @@ class Jinja2TemplateScanner(BaseScanner):
                     candidate_ids.add(id(macro))
                     candidates.append(macro)
             return tuple(candidates)
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name in {"d", "default"}
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and len(node.args) <= 2
+        ):
+            source_macros = cls._static_macro_binding_for_node(node.node, macro_bindings)
+            source_is_defined = cls._static_macro_value_is_definitely_defined(
+                node.node,
+                macro_bindings,
+            )
+            if source_macros and source_is_defined:
+                return source_macros
+            fallback_possible = cls._static_default_filter_may_use_fallback(node)
+            if fallback_possible and source_is_defined:
+                boolean_mode = cls._constant_condition_value(node.args[1]) if len(node.args) == 2 else False
+                fallback_possible = boolean_mode is not False
+            candidates = list(source_macros)
+            if node.args and fallback_possible:
+                candidates.extend(cls._static_macro_binding_for_node(node.args[0], macro_bindings))
+            return tuple(dict.fromkeys(candidates))
         literal_item = cls._static_literal_container_item(node)
         if literal_item is not None:
             return cls._static_macro_binding_for_node(literal_item, macro_bindings)
+        if (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Getattr)
+            and node.node.attr == "get"
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and 1 <= len(node.args) <= 2
+        ):
+            container_access = cls._static_container_access_path(node.node.node)
+            key_value = cls._static_literal_container_key(node.args[0])
+            if container_access is not None and key_value is not None:
+                name, container_path = container_access
+                path = (*container_path, key_value)
+                binding_key = cls._static_container_binding_key(name, path)
+                known_mapping = (
+                    cls._static_container_kind_binding_key(name, "mapping", container_path) in macro_bindings
+                )
+                member_exists = cls._static_container_member_binding_key(name, path) in macro_bindings
+                candidates = list(macro_bindings.get(binding_key, ()))
+                if known_mapping and not member_exists and len(node.args) == 2:
+                    candidates.extend(cls._static_macro_binding_for_node(node.args[1], macro_bindings))
+                if candidates:
+                    return tuple(dict.fromkeys(candidates))
+                if known_mapping:
+                    return ()
+        if isinstance(node, jinja2.nodes.Getattr):
+            access = cls._static_container_access_path(node)
+            if access is not None:
+                name, path = access
+                if (
+                    path
+                    and cls._static_container_kind_binding_key(name, "mapping", path[:-1]) in macro_bindings
+                    and isinstance(path[-1], str)
+                    and hasattr({}, path[-1])
+                ):
+                    return ()
         key = cls._static_macro_binding_key(node)
-        return macro_bindings.get(key, ()) if key is not None else ()
+        if key is not None and key in macro_bindings:
+            return macro_bindings[key]
+        if isinstance(node, jinja2.nodes.Getattr) and isinstance(node.node, jinja2.nodes.Name):
+            return macro_bindings.get(f"{node.node.name}.{node.attr}", ())
+        return ()
+
+    @classmethod
+    def _static_macro_value_is_definitely_defined(
+        cls,
+        node: Any,
+        macro_bindings: dict[str, tuple[Any, ...]],
+    ) -> bool:
+        if isinstance(node, jinja2.nodes.Name):
+            return cls._static_defined_binding_key(node.name) in macro_bindings
+        access = cls._static_container_access_path(node)
+        if access is None:
+            return False
+        name, path = access
+        if not path:
+            return cls._static_defined_binding_key(name) in macro_bindings
+        if cls._static_container_member_binding_key(name, path) in macro_bindings:
+            return True
+        return bool(
+            isinstance(node, jinja2.nodes.Getattr)
+            and cls._static_container_kind_binding_key(name, "mapping", path[:-1]) in macro_bindings
+            and isinstance(path[-1], str)
+            and hasattr({}, path[-1])
+        )
 
     @staticmethod
     def _static_macro_uses_special_argument(macro: Any, name: str) -> bool:
@@ -2735,6 +3176,7 @@ class Jinja2TemplateScanner(BaseScanner):
         value: Any,
         macro_bindings: dict[str, tuple[Any, ...]],
         namespace_range_attrs: dict[str, set[str]],
+        range_aliases: set[str],
     ) -> None:
         if isinstance(target, jinja2.nodes.Tuple) and isinstance(value, jinja2.nodes.List | jinja2.nodes.Tuple):
             if len(target.items) != len(value.items):
@@ -2745,6 +3187,9 @@ class Jinja2TemplateScanner(BaseScanner):
             for item_target, item_value in zip(target.items, value.items, strict=False):
                 if not isinstance(item_target, jinja2.nodes.Name):
                     continue
+                defined_key = cls._static_defined_binding_key(item_target.name)
+                if defined_key in range_aliases:
+                    macro_bindings[defined_key] = ()
                 source_macros = cls._static_macro_binding_for_node(item_value, original_bindings)
                 if source_macros:
                     macro_bindings[item_target.name] = source_macros
@@ -2753,20 +3198,28 @@ class Jinja2TemplateScanner(BaseScanner):
         source_macros = cls._static_macro_binding_for_node(value, original_bindings)
         cls._clear_static_macro_binding(target, macro_bindings)
         if isinstance(target, jinja2.nodes.NSRef):
-            if target.name in namespace_range_attrs and source_macros:
-                macro_bindings[f"{target.name}.{target.attr}"] = source_macros
+            if target.name in namespace_range_attrs:
+                macro_bindings[cls._static_container_member_binding_key(target.name, (target.attr,))] = ()
+                if source_macros:
+                    macro_bindings[f"{target.name}.{target.attr}"] = source_macros
             return
         if isinstance(target, jinja2.nodes.Name) and source_macros:
             macro_bindings[target.name] = source_macros
         if not isinstance(target, jinja2.nodes.Name):
             return
+        defined_key = cls._static_defined_binding_key(target.name)
+        if defined_key in range_aliases:
+            macro_bindings[defined_key] = ()
         container_entries = cls._static_literal_container_entries(value)
         if container_entries is not None:
-            entries, _ = container_entries
-            for key, item in entries:
+            for kind_path, container_kind in cls._static_literal_container_kind_paths(value):
+                macro_bindings[cls._static_container_kind_binding_key(target.name, container_kind, kind_path)] = ()
+            for path, item in cls._static_literal_container_leaf_entries(value):
+                for prefix_length in range(1, len(path) + 1):
+                    macro_bindings[cls._static_container_member_binding_key(target.name, path[:prefix_length])] = ()
                 item_macros = cls._static_macro_binding_for_node(item, original_bindings)
                 if item_macros:
-                    macro_bindings[f"{target.name}.{key}"] = item_macros
+                    macro_bindings[cls._static_container_binding_key(target.name, path)] = item_macros
             return
         if (
             isinstance(value, jinja2.nodes.Call)
@@ -2774,15 +3227,15 @@ class Jinja2TemplateScanner(BaseScanner):
             and value.node.name == "namespace"
         ):
             for keyword in value.kwargs:
+                macro_bindings[cls._static_container_member_binding_key(target.name, (keyword.key,))] = ()
                 keyword_macros = cls._static_macro_binding_for_node(keyword.value, original_bindings)
                 if keyword_macros:
                     macro_bindings[f"{target.name}.{keyword.key}"] = keyword_macros
         elif isinstance(value, jinja2.nodes.Name) and value.name in namespace_range_attrs:
-            source_prefix = f"{value.name}."
-            target_prefix = f"{target.name}."
             for name, namespace_macro in original_bindings.items():
-                if name.startswith(source_prefix):
-                    macro_bindings[f"{target_prefix}{name.removeprefix(source_prefix)}"] = namespace_macro
+                rebased = cls._static_rebased_container_binding_key(name, value.name, target.name)
+                if rebased is not None:
+                    macro_bindings[rebased] = namespace_macro
 
     @staticmethod
     def _merge_static_branch_bindings(
@@ -2800,30 +3253,75 @@ class Jinja2TemplateScanner(BaseScanner):
         macro_bindings: dict[str, tuple[Any, ...]],
     ) -> None:
         range_aliases.clear()
-        range_aliases.update(*(aliases for aliases, _, _, _ in branch_states))
+        range_aliases.update(
+            alias for aliases, _, _, _ in branch_states for alias in aliases if not alias.startswith("\0defined:")
+        )
+        defined_aliases = {
+            alias for aliases, _, _, _ in branch_states for alias in aliases if alias.startswith("\0defined:")
+        }
+        range_aliases.update(
+            alias for alias in defined_aliases if all(alias in aliases for aliases, _, _, _ in branch_states)
+        )
 
         int_bindings.clear()
         int_names = {name for _, int_state_bindings, _, _ in branch_states for name in int_state_bindings}
         for name in int_names:
-            candidates: list[_StaticIntResult] = []
+            candidates: list[_StaticBindingValue] = []
+            truncated = False
+            may_be_undefined = False
             for _, int_state_bindings, _, _ in branch_states:
                 binding = int_state_bindings.get(name)
                 if isinstance(binding, _StaticIntCandidates):
                     candidates.extend(binding.values)
+                    truncated |= binding.truncated
+                    may_be_undefined |= binding.may_be_undefined
                 elif binding is not None:
                     candidates.append(binding)
-            merged_binding = Jinja2TemplateScanner._make_static_int_binding(candidates)
-            if merged_binding is not None:
-                int_bindings[name] = merged_binding
+                else:
+                    may_be_undefined = True
+            unique_candidates = tuple(dict.fromkeys(candidates))
+            if not unique_candidates:
+                continue
+            if len(unique_candidates) == 1 and not truncated and not may_be_undefined:
+                int_bindings[name] = unique_candidates[0]
+            else:
+                int_bindings[name] = _StaticIntCandidates(
+                    unique_candidates,
+                    truncated=truncated,
+                    may_be_undefined=may_be_undefined,
+                )
 
         namespace_range_attrs.clear()
-        for _, _, attrs_by_name, _ in branch_states:
-            for name, attrs in attrs_by_name.items():
-                namespace_range_attrs.setdefault(name, set()).update(attrs)
+        namespace_names = {name for _, _, attrs_by_name, _ in branch_states for name in attrs_by_name}
+        for name in namespace_names:
+            merged_attrs: set[str] = set()
+            metadata_attrs = {
+                attr
+                for _, _, attrs_by_name, _ in branch_states
+                for attr in attrs_by_name.get(name, set())
+                if attr.startswith("\0kind:") or attr.startswith("\0member:")
+            }
+            merged_attrs.update(
+                attr
+                for attr in metadata_attrs
+                if all(attr in attrs_by_name.get(name, set()) for _, _, attrs_by_name, _ in branch_states)
+            )
+            merged_attrs.update(
+                attr
+                for _, _, attrs_by_name, _ in branch_states
+                for attr in attrs_by_name.get(name, set())
+                if not attr.startswith("\0kind:") and not attr.startswith("\0member:")
+            )
+            if merged_attrs:
+                namespace_range_attrs[name] = merged_attrs
 
         macro_bindings.clear()
         macro_names = {name for _, _, _, macro_state_bindings in branch_states for name in macro_state_bindings}
         for name in macro_names:
+            if "\0kind:" in name or "\0member:" in name or name.startswith("\0defined:"):
+                if all(name in macro_state_bindings for _, _, _, macro_state_bindings in branch_states):
+                    macro_bindings[name] = ()
+                continue
             macro_candidates: list[Any] = []
             candidate_ids: set[int] = set()
             for _, _, _, macro_state_bindings in branch_states:
@@ -2926,11 +3424,12 @@ class Jinja2TemplateScanner(BaseScanner):
         if not isinstance(node.dyn_args, jinja2.nodes.Name) or node.kwargs or node.dyn_kwargs is not None:
             return None
         length_binding = int_bindings.get(self._static_container_length_key(node.dyn_args.name))
-        if length_binding is None or isinstance(length_binding, _StaticIntCandidates) or length_binding[1]:
+        if not isinstance(length_binding, tuple) or length_binding[1]:
             return None
         arguments = [*node.args]
         arguments.extend(
-            jinja2.nodes.Name(f"{node.dyn_args.name}.{index}", "load") for index in range(length_binding[0])
+            jinja2.nodes.Name(self._static_container_binding_key(node.dyn_args.name, (index,)), "load")
+            for index in range(length_binding[0])
         )
         if not 1 <= len(arguments) <= 3:
             return None
@@ -2970,10 +3469,11 @@ class Jinja2TemplateScanner(BaseScanner):
         if not isinstance(target, jinja2.nodes.Name):
             return
         range_aliases.discard(target.name)
+        range_aliases.discard(self._static_defined_binding_key(target.name))
         int_bindings.pop(target.name, None)
         int_bindings.pop(self._static_container_length_key(target.name), None)
-        prefix = f"{target.name}."
-        for name in [name for name in int_bindings if name.startswith(prefix)]:
+        prefixes = self._static_container_binding_prefixes(target.name)
+        for name in [name for name in int_bindings if name.startswith(prefixes)]:
             int_bindings.pop(name, None)
         namespace_range_attrs.pop(target.name, None)
 
@@ -3055,6 +3555,7 @@ class Jinja2TemplateScanner(BaseScanner):
             attrs = namespace_range_attrs.get(target.name)
             if attrs is None:
                 return False
+            attrs.add(self._static_container_member_attr_key((target.attr,)))
             if self._is_static_range_callable(value, range_aliases, namespace_range_attrs):
                 previous_size = len(attrs)
                 attrs.add(target.attr)
@@ -3064,6 +3565,12 @@ class Jinja2TemplateScanner(BaseScanner):
         if not isinstance(target, jinja2.nodes.Name):
             return False
 
+        value_is_definitely_defined = self._static_value_is_definitely_defined(
+            value,
+            range_aliases,
+            int_bindings,
+            namespace_range_attrs,
+        )
         original_int_bindings = dict(int_bindings)
         changed = False
         if self._is_static_range_callable(value, range_aliases, namespace_range_attrs):
@@ -3072,6 +3579,11 @@ class Jinja2TemplateScanner(BaseScanner):
             changed |= len(range_aliases) != previous_size
         else:
             range_aliases.discard(target.name)
+        defined_key = self._static_defined_binding_key(target.name)
+        if value_is_definitely_defined:
+            range_aliases.add(defined_key)
+        else:
+            range_aliases.discard(defined_key)
 
         int_results = self._constant_int_expression_results_with_bindings(
             value,
@@ -3079,6 +3591,10 @@ class Jinja2TemplateScanner(BaseScanner):
             int_bindings,
         )
         int_binding = self._make_static_int_binding(int_results)
+        if int_binding is None:
+            scalar_value = self._constant_scalar_expression_value(value, original_int_bindings)
+            if scalar_value is not None:
+                int_binding = _StaticScalarValue(scalar_value)
         if int_binding is not None and int_bindings.get(target.name) != int_binding:
             int_bindings[target.name] = int_binding
             changed = True
@@ -3086,33 +3602,48 @@ class Jinja2TemplateScanner(BaseScanner):
             int_bindings.pop(target.name, None)
 
         int_bindings.pop(self._static_container_length_key(target.name), None)
-        target_prefix = f"{target.name}."
-        for name in [name for name in int_bindings if name.startswith(target_prefix)]:
+        target_prefixes = self._static_container_binding_prefixes(target.name)
+        for name in [name for name in int_bindings if name.startswith(target_prefixes)]:
             int_bindings.pop(name, None)
 
         container_entries = self._static_literal_container_entries(value)
         if container_entries is not None:
             entries, is_sequence = container_entries
-            attrs = {
-                key
-                for key, item in entries
-                if self._is_static_range_callable(item, range_aliases, namespace_range_attrs)
-            }
-            namespace_range_attrs[target.name] = attrs
+            leaf_entries = self._static_literal_container_leaf_entries(value)
+            container_attrs: set[str] = set()
+            for kind_path, container_kind in self._static_literal_container_kind_paths(value):
+                container_attrs.add(self._static_container_kind_attr_key(container_kind, kind_path))
+                int_bindings[self._static_container_kind_binding_key(target.name, container_kind, kind_path)] = (
+                    self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+                )
+            for path, item in leaf_entries:
+                for prefix_length in range(1, len(path) + 1):
+                    member_path = path[:prefix_length]
+                    container_attrs.add(self._static_container_member_attr_key(member_path))
+                    int_bindings[self._static_container_member_binding_key(target.name, member_path)] = (
+                        self._constant_int_result(1, _SANDBOX_MAX_RANGE_ITERATIONS)
+                    )
+                if self._is_static_range_callable(item, range_aliases, namespace_range_attrs):
+                    container_attrs.add(self._static_container_attr_key(path))
+            namespace_range_attrs[target.name] = container_attrs
             if is_sequence:
                 int_bindings[self._static_container_length_key(target.name)] = self._constant_int_result(
                     len(entries),
                     _SANDBOX_MAX_RANGE_ITERATIONS,
                 )
-            for key, item in entries:
+            for path, item in leaf_entries:
                 nested_results = self._constant_int_expression_results_with_bindings(
                     item,
                     _SANDBOX_MAX_RANGE_ITERATIONS,
                     original_int_bindings,
                 )
                 nested_binding = self._make_static_int_binding(nested_results)
+                if nested_binding is None:
+                    scalar_value = self._constant_scalar_expression_value(item, original_int_bindings)
+                    if scalar_value is not None:
+                        nested_binding = _StaticScalarValue(scalar_value)
                 if nested_binding is not None:
-                    int_bindings[f"{target.name}.{key}"] = nested_binding
+                    int_bindings[self._static_container_binding_key(target.name, path)] = nested_binding
             return True
 
         if (
@@ -3120,11 +3651,12 @@ class Jinja2TemplateScanner(BaseScanner):
             and isinstance(value.node, jinja2.nodes.Name)
             and value.node.name == "namespace"
         ):
-            attrs = {
+            attrs = {self._static_container_member_attr_key((keyword.key,)) for keyword in value.kwargs}
+            attrs.update(
                 keyword.key
                 for keyword in value.kwargs
                 if self._is_static_range_callable(keyword.value, range_aliases, namespace_range_attrs)
-            }
+            )
             previous_attrs = namespace_range_attrs.get(target.name)
             namespace_range_attrs[target.name] = attrs
             if previous_attrs is not attrs:
@@ -3137,10 +3669,10 @@ class Jinja2TemplateScanner(BaseScanner):
             source_length_key = self._static_container_length_key(value.name)
             if source_length_key in original_int_bindings:
                 int_bindings[self._static_container_length_key(target.name)] = original_int_bindings[source_length_key]
-            source_prefix = f"{value.name}."
             for name, binding in original_int_bindings.items():
-                if name.startswith(source_prefix):
-                    int_bindings[f"{target.name}.{name.removeprefix(source_prefix)}"] = binding
+                rebased = self._static_rebased_container_binding_key(name, value.name, target.name)
+                if rebased is not None:
+                    int_bindings[rebased] = binding
         else:
             namespace_range_attrs.pop(target.name, None)
 
@@ -3174,6 +3706,9 @@ class Jinja2TemplateScanner(BaseScanner):
             return
         if not isinstance(target, jinja2.nodes.Name):
             return
+        defined_key = self._static_defined_binding_key(target.name)
+        if defined_key in source_aliases:
+            range_aliases.add(defined_key)
         if target.name in source_aliases:
             range_aliases.add(target.name)
         if target.name in source_int_bindings:
@@ -3197,24 +3732,150 @@ class Jinja2TemplateScanner(BaseScanner):
                 branch is not None and cls._is_static_range_callable(branch, range_aliases, namespace_range_attrs)
                 for branch in branches
             )
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name in {"d", "default"}
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and len(node.args) <= 2
+        ):
+            if cls._is_static_range_callable(node.node, range_aliases, namespace_range_attrs):
+                return True
+            fallback_possible = cls._static_default_filter_may_use_fallback(node)
+            if fallback_possible and cls._static_range_value_is_definitely_defined(
+                node.node,
+                range_aliases,
+                namespace_range_attrs,
+            ):
+                boolean_mode = cls._constant_condition_value(node.args[1]) if len(node.args) == 2 else False
+                fallback_possible = boolean_mode is not False
+            return bool(
+                node.args
+                and fallback_possible
+                and cls._is_static_range_callable(node.args[0], range_aliases, namespace_range_attrs)
+            )
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name == "attr"
+            and len(node.args) == 1
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and isinstance(node.args[0], jinja2.nodes.Const)
+            and isinstance(node.args[0].value, str)
+        ):
+            attr = node.args[0].value
+            if (
+                isinstance(node.node, jinja2.nodes.Call)
+                and isinstance(node.node.node, jinja2.nodes.Name)
+                and node.node.node.name == "namespace"
+            ):
+                return any(
+                    keyword.key == attr
+                    and cls._is_static_range_callable(keyword.value, range_aliases, namespace_range_attrs)
+                    for keyword in node.node.kwargs
+                )
+            if isinstance(node.node, jinja2.nodes.Name):
+                return attr in namespace_range_attrs.get(node.node.name, set())
         literal_item = cls._static_literal_container_item(node)
         if literal_item is not None:
             return cls._is_static_range_callable(literal_item, range_aliases, namespace_range_attrs)
         if (
-            isinstance(node, jinja2.nodes.Getitem)
-            and isinstance(node.node, jinja2.nodes.Name)
-            and isinstance(node.arg, jinja2.nodes.Const)
-            and isinstance(node.arg.value, str | int)
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Getattr)
+            and node.node.attr == "get"
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and 1 <= len(node.args) <= 2
         ):
-            return str(node.arg.value) in namespace_range_attrs.get(node.node.name, set())
+            container_access = cls._static_container_access_path(node.node.node)
+            key = cls._static_literal_container_key(node.args[0])
+            if container_access is not None and key is not None:
+                name, container_path = container_access
+                path = (*container_path, key)
+                attrs = namespace_range_attrs.get(name, set())
+                if cls._static_container_attr_key(path) in attrs:
+                    return True
+                known_mapping = cls._static_container_kind_attr_key("mapping", container_path) in attrs
+                member_exists = cls._static_container_member_attr_key(path) in attrs
+                if known_mapping and not member_exists and len(node.args) == 2:
+                    return cls._is_static_range_callable(node.args[1], range_aliases, namespace_range_attrs)
+                if known_mapping:
+                    return False
+        access = cls._static_container_access_path(node)
+        if access is None:
+            return False
+        name, path = access
+        if not path:
+            return False
+        attrs = namespace_range_attrs.get(name, set())
+        if (
+            isinstance(node, jinja2.nodes.Getattr)
+            and cls._static_container_kind_attr_key("mapping", path[:-1]) in attrs
+            and isinstance(path[-1], str)
+            and hasattr({}, path[-1])
+        ):
+            return False
+        if cls._static_container_attr_key(path) in attrs:
+            return True
+        return bool(isinstance(node, jinja2.nodes.Getattr) and len(path) == 1 and path[0] in attrs)
+
+    @classmethod
+    def _static_range_value_is_definitely_defined(
+        cls,
+        node: Any,
+        range_aliases: set[str],
+        namespace_range_attrs: dict[str, set[str]],
+    ) -> bool:
+        if isinstance(node, jinja2.nodes.Name):
+            return cls._static_defined_binding_key(node.name) in range_aliases
+        access = cls._static_container_access_path(node)
+        if access is None:
+            return False
+        name, path = access
+        if not path:
+            return cls._static_defined_binding_key(name) in range_aliases
+        attrs = namespace_range_attrs.get(name, set())
+        if cls._static_container_member_attr_key(path) in attrs:
+            return True
         return bool(
             isinstance(node, jinja2.nodes.Getattr)
-            and isinstance(node.node, jinja2.nodes.Name)
-            and node.attr in namespace_range_attrs.get(node.node.name, set())
+            and cls._static_container_kind_attr_key("mapping", path[:-1]) in attrs
+            and isinstance(path[-1], str)
+            and hasattr({}, path[-1])
         )
 
     @classmethod
+    def _static_default_filter_may_use_fallback(cls, node: Any) -> bool:
+        if not node.args:
+            return False
+        boolean_mode = False
+        if len(node.args) == 2:
+            boolean_value = cls._constant_condition_value(node.args[1])
+            if boolean_value is None:
+                return True
+            boolean_mode = boolean_value
+        known, value = cls._constant_condition_scalar(node.node)
+        if not known:
+            return True
+        return boolean_mode and not bool(value)
+
+    @classmethod
     def _static_literal_container_item(cls, node: Any) -> Any | None:
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name in {"first", "last"}
+            and not node.args
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+        ):
+            items = cls._static_literal_iterable_items(node.node)
+            if items:
+                return items[0] if node.name == "first" else items[-1]
+            return None
         if (
             isinstance(node, jinja2.nodes.Call)
             and isinstance(node.node, jinja2.nodes.Getattr)
@@ -3229,7 +3890,7 @@ class Jinja2TemplateScanner(BaseScanner):
             if key is None:
                 return None
             for pair in reversed(node.node.node.items):
-                if isinstance(pair.key, jinja2.nodes.Const) and pair.key.value == key:
+                if cls._static_literal_container_key(pair.key) == key:
                     return pair.value
             return node.args[1] if len(node.args) == 2 else None
         if not isinstance(node, jinja2.nodes.Getitem):
@@ -3245,7 +3906,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 return None
         if isinstance(node.node, jinja2.nodes.Dict):
             for pair in reversed(node.node.items):
-                if isinstance(pair.key, jinja2.nodes.Const) and pair.key.value == key:
+                if cls._static_literal_container_key(pair.key) == key:
                     return pair.value
         return None
 
@@ -3261,35 +3922,150 @@ class Jinja2TemplateScanner(BaseScanner):
         return None
 
     @classmethod
-    def _static_literal_container_entries(cls, node: Any) -> tuple[list[tuple[str, Any]], bool] | None:
+    def _static_literal_iterable_items(cls, node: Any) -> list[Any] | None:
         sequence_items = cls._static_literal_sequence_items(node)
         if sequence_items is not None:
-            return [(str(index), item) for index, item in enumerate(sequence_items)], True
+            return sequence_items
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name == "reverse"
+            and not node.args
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+        ):
+            sequence_items = cls._static_literal_sequence_items(node.node)
+            return list(reversed(sequence_items)) if sequence_items is not None else None
+        if not (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Getattr)
+            and isinstance(node.node.node, jinja2.nodes.Dict)
+            and node.node.attr in {"items", "keys", "values"}
+            and not node.args
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+        ):
+            return None
+        container_entries = cls._static_literal_container_entries(node.node.node)
+        if container_entries is None:
+            return None
+        entries, _ = container_entries
+        if node.node.attr == "keys":
+            return [jinja2.nodes.Const(key) for key, _ in entries]
+        if node.node.attr == "values":
+            return [value for _, value in entries]
+        return [jinja2.nodes.Tuple([jinja2.nodes.Const(key), value], "load") for key, value in entries]
+
+    @classmethod
+    def _static_literal_container_entries(cls, node: Any) -> tuple[list[tuple[str | int | float, Any]], bool] | None:
+        sequence_items = cls._static_literal_sequence_items(node)
+        if sequence_items is not None:
+            return [(index, item) for index, item in enumerate(sequence_items)], True
         if isinstance(node, jinja2.nodes.Dict):
-            entries: list[tuple[str, Any]] = []
+            entries_by_key: dict[str | int | float, Any] = {}
             for pair in node.items:
                 key = cls._static_literal_container_key(pair.key)
-                if not isinstance(key, str | int):
+                if key is None:
                     return None
-                entries.append((str(key), pair.value))
-            return entries, False
+                entries_by_key[key] = pair.value
+            return list(entries_by_key.items()), False
         return None
 
+    @classmethod
+    def _static_literal_container_leaf_entries(
+        cls,
+        node: Any,
+        prefix: tuple[str | int | float, ...] = (),
+        remaining_paths: list[int] | None = None,
+    ) -> list[tuple[tuple[str | int | float, ...], Any]]:
+        if remaining_paths is None:
+            remaining_paths = [_MAX_STATIC_CONTAINER_PATHS]
+        container_entries = cls._static_literal_container_entries(node)
+        if container_entries is None:
+            if not prefix:
+                return []
+            if remaining_paths[0] <= 0:
+                raise _StaticAnalysisBudgetExceeded
+            remaining_paths[0] -= 1
+            return [(prefix, node)]
+        entries, is_sequence = container_entries
+        if not entries:
+            if not prefix:
+                return []
+            if remaining_paths[0] <= 0:
+                raise _StaticAnalysisBudgetExceeded
+            remaining_paths[0] -= 1
+            return [(prefix, node)]
+        leaves: list[tuple[tuple[str | int | float, ...], Any]] = []
+        sequence_length = len(entries)
+        for key, item in entries:
+            aliases: tuple[str | int | float, ...] = (key,)
+            if is_sequence and isinstance(key, int):
+                aliases = (key, key - sequence_length)
+            for alias in dict.fromkeys(aliases):
+                nested = cls._static_literal_container_leaf_entries(item, (*prefix, alias), remaining_paths)
+                leaves.extend(nested)
+        return leaves
+
+    @classmethod
+    def _static_literal_container_kind_paths(
+        cls,
+        node: Any,
+        prefix: tuple[str | int | float, ...] = (),
+        remaining_paths: list[int] | None = None,
+    ) -> list[tuple[tuple[str | int | float, ...], str]]:
+        if remaining_paths is None:
+            remaining_paths = [_MAX_STATIC_CONTAINER_PATHS]
+        container_entries = cls._static_literal_container_entries(node)
+        if container_entries is None:
+            return []
+        if remaining_paths[0] <= 0:
+            raise _StaticAnalysisBudgetExceeded
+        remaining_paths[0] -= 1
+        entries, is_sequence = container_entries
+        kind_paths = [(prefix, "sequence" if is_sequence else "mapping")]
+        sequence_length = len(entries)
+        for key, item in entries:
+            aliases: tuple[str | int | float, ...] = (key,)
+            if is_sequence and isinstance(key, int):
+                aliases = (key, key - sequence_length)
+            for alias in dict.fromkeys(aliases):
+                kind_paths.extend(cls._static_literal_container_kind_paths(item, (*prefix, alias), remaining_paths))
+        return kind_paths
+
     @staticmethod
-    def _static_literal_container_key(node: Any) -> str | int | None:
-        if (
-            isinstance(node, jinja2.nodes.Const)
-            and isinstance(node.value, str | int)
-            and not isinstance(node.value, bool)
-        ):
-            return node.value
+    def _static_literal_container_key(node: Any) -> str | int | float | None:
+        if isinstance(node, jinja2.nodes.Const) and node.value is None:
+            return "\0key:none"
+        if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, str | int | float):
+            value = node.value
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, str) and value.startswith("\0key:"):
+                return "\0key:str:" + json.dumps(value, ensure_ascii=True)
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None
+                return int(value) if value.is_integer() else value
+            return value
+        if isinstance(node, jinja2.nodes.Tuple):
+            items = [Jinja2TemplateScanner._static_literal_container_key(item) for item in node.items]
+            if any(item is None for item in items):
+                return None
+            return "\0key:tuple:" + json.dumps(items, separators=(",", ":"), ensure_ascii=True)
         if (
             isinstance(node, jinja2.nodes.Neg)
             and isinstance(node.node, jinja2.nodes.Const)
-            and isinstance(node.node.value, int)
+            and isinstance(node.node.value, int | float)
             and not isinstance(node.node.value, bool)
         ):
-            return -node.node.value
+            value = -node.node.value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None
+                return int(value) if value.is_integer() else value
+            return value
         return None
 
     def _constant_int_expression_results_with_bindings(
@@ -3321,7 +4097,8 @@ class Jinja2TemplateScanner(BaseScanner):
             return None
         if len(unique_results) == 1:
             return unique_results[0]
-        if len(unique_results) > 8:
+        truncated = len(unique_results) > 8
+        if truncated:
             selected: list[_StaticIntResult] = []
             for candidate in (
                 min(unique_results, key=lambda result: result[0]),
@@ -3338,7 +4115,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     if candidate not in selected:
                         selected.append(candidate)
             unique_results = selected
-        return _StaticIntCandidates(tuple(unique_results))
+        return _StaticIntCandidates(tuple(unique_results), truncated=truncated)
 
     @staticmethod
     def _static_int_binding_variants(
@@ -3350,6 +4127,18 @@ class Jinja2TemplateScanner(BaseScanner):
             if isinstance(node, jinja2.nodes.Name):
                 referenced_names.add(node.name)
             referenced_names.update(candidate.name for candidate in node.find_all(jinja2.nodes.Name))
+            for candidate in [
+                node,
+                *node.find_all(jinja2.nodes.Getitem),
+                *node.find_all(jinja2.nodes.Getattr),
+                *node.find_all(jinja2.nodes.Call),
+            ]:
+                access = Jinja2TemplateScanner._static_container_access_path(candidate)
+                if access is None:
+                    continue
+                name, path = access
+                if path:
+                    referenced_names.add(Jinja2TemplateScanner._static_container_binding_key(name, path))
 
         variants: list[dict[str, _StaticIntBinding]] = [
             {name: binding for name, binding in int_bindings.items() if not isinstance(binding, _StaticIntCandidates)}
@@ -3357,9 +4146,12 @@ class Jinja2TemplateScanner(BaseScanner):
         for name, binding in int_bindings.items():
             if name not in referenced_names or not isinstance(binding, _StaticIntCandidates):
                 continue
-            if len(variants) * len(binding.values) > 4096:
+            variant_count = len(binding.values) + int(binding.may_be_undefined)
+            if binding.truncated or len(variants) * variant_count > 64:
                 return variants, True
-            variants = [{**variant, name: value} for variant in variants for value in binding.values]
+            variants = [{**variant, name: value} for variant in variants for value in binding.values] + (
+                [dict(variant) for variant in variants] if binding.may_be_undefined else []
+            )
         return variants, False
 
     def _constant_range_iteration_count_with_bindings(
@@ -3658,15 +4450,134 @@ class Jinja2TemplateScanner(BaseScanner):
         result = self._constant_int_expression_result(node, cap)
         return result[0] if result is not None else None
 
+    def _constant_scalar_expression_value(
+        self,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding] | None = None,
+        depth: int = 0,
+    ) -> str | float | None:
+        if depth > 32:
+            return None
+        literal_item = self._static_literal_container_item(node)
+        if literal_item is not None:
+            return self._constant_scalar_expression_value(literal_item, int_bindings, depth + 1)
+        access = self._static_container_access_path(node)
+        if access is not None and int_bindings is not None:
+            name, path = access
+            binding_name = name if not path else self._static_container_binding_key(name, path)
+            binding = int_bindings.get(binding_name)
+            if isinstance(binding, _StaticScalarValue):
+                return binding.value
+            if isinstance(binding, tuple):
+                return str(binding[0])
+            if (
+                isinstance(node, jinja2.nodes.Call)
+                and isinstance(node.node, jinja2.nodes.Getattr)
+                and node.node.attr == "get"
+                and path
+                and self._static_container_kind_binding_key(name, "mapping", path[:-1]) in int_bindings
+                and self._static_container_member_binding_key(name, path) not in int_bindings
+                and len(node.args) == 2
+            ):
+                default_value = self._constant_scalar_expression_value(node.args[1], int_bindings, depth + 1)
+                if default_value is not None:
+                    return default_value
+                default_int = self._constant_int_expression_result(
+                    node.args[1],
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                    int_bindings,
+                )
+                return str(default_int[0]) if default_int is not None else None
+        if isinstance(node, jinja2.nodes.Const):
+            if isinstance(node.value, str):
+                return node.value
+            if isinstance(node.value, float) and not isinstance(node.value, bool):
+                return node.value
+            return None
+        if (
+            isinstance(node, jinja2.nodes.Filter)
+            and node.name in {"d", "default"}
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+            and len(node.args) <= 2
+        ):
+            source_value = self._constant_scalar_expression_value(node.node, int_bindings, depth + 1)
+            boolean_mode = len(node.args) == 2 and self._constant_condition_value(node.args[1]) is True
+            if source_value is not None and (not boolean_mode or bool(source_value)):
+                return source_value
+            if node.args and (source_value is None or boolean_mode):
+                fallback_value = self._constant_scalar_expression_value(node.args[0], int_bindings, depth + 1)
+                if fallback_value is not None:
+                    return fallback_value
+                fallback_int = self._constant_int_expression_result(
+                    node.args[0],
+                    _SANDBOX_MAX_RANGE_ITERATIONS,
+                    int_bindings,
+                )
+                return str(fallback_int[0]) if fallback_int is not None else None
+            return None
+        if not isinstance(node, jinja2.nodes.Concat):
+            return None
+        parts: list[str] = []
+        total_length = 0
+        for item in node.nodes:
+            value = self._constant_scalar_expression_value(item, int_bindings, depth + 1)
+            if (
+                value is None
+                and isinstance(item, jinja2.nodes.Const)
+                and isinstance(
+                    item.value,
+                    bool | int,
+                )
+            ):
+                value = str(item.value)
+            if value is None:
+                return None
+            text = str(value)
+            total_length += len(text)
+            if total_length > 4096:
+                return None
+            parts.append(text)
+        return "".join(parts)
+
     def _constant_int_expression_result(
         self,
         node: Any,
         cap: int,
         int_bindings: dict[str, _StaticIntBinding] | None = None,
     ) -> tuple[int, bool] | None:
-        if isinstance(node, jinja2.nodes.Name):
-            binding = int_bindings.get(node.name) if int_bindings is not None else None
-            return None if isinstance(binding, _StaticIntCandidates) else binding
+        literal_item = self._static_literal_container_item(node)
+        if literal_item is not None:
+            return self._constant_int_expression_result(literal_item, cap, int_bindings)
+        access = self._static_container_access_path(node)
+        if access is not None:
+            name, path = access
+            if (
+                isinstance(node, jinja2.nodes.Getattr)
+                and int_bindings is not None
+                and path
+                and self._static_container_kind_binding_key(name, "mapping", path[:-1]) in int_bindings
+                and isinstance(path[-1], str)
+                and hasattr({}, path[-1])
+            ):
+                return None
+            binding_name = name if not path else self._static_container_binding_key(name, path)
+            binding = int_bindings.get(binding_name) if int_bindings is not None else None
+            if isinstance(binding, tuple):
+                return binding
+            if (
+                isinstance(node, jinja2.nodes.Call)
+                and isinstance(node.node, jinja2.nodes.Getattr)
+                and node.node.attr == "get"
+                and path
+                and int_bindings is not None
+                and self._static_container_kind_binding_key(name, "mapping", path[:-1]) in int_bindings
+                and self._static_container_member_binding_key(name, path) not in int_bindings
+                and len(node.args) == 2
+            ):
+                return self._constant_int_expression_result(node.args[1], cap, int_bindings)
+            return None
         if isinstance(node, jinja2.nodes.Const):
             if isinstance(node.value, bool) or not isinstance(node.value, int):
                 return None
@@ -3908,7 +4819,7 @@ class Jinja2TemplateScanner(BaseScanner):
     ) -> int | None:
         if isinstance(node, jinja2.nodes.Name):
             binding = int_bindings.get(node.name) if int_bindings is not None else None
-            if binding is None or isinstance(binding, _StaticIntCandidates) or binding[1]:
+            if not isinstance(binding, tuple) or binding[1]:
                 return None
             return binding[0] % 2
         if isinstance(node, jinja2.nodes.Const):
@@ -4139,17 +5050,16 @@ class Jinja2TemplateScanner(BaseScanner):
         source_result = self._constant_int_expression_result(node.node, cap, int_bindings)
         if source_result is not None:
             return source_result
-        if not isinstance(node.node, jinja2.nodes.Const):
+        scalar_value = self._constant_scalar_expression_value(node.node, int_bindings)
+        if scalar_value is None:
             return None
-
-        value = node.node.value
         try:
-            if isinstance(value, float):
-                if not math.isfinite(value):
+            if isinstance(scalar_value, float):
+                if not math.isfinite(scalar_value):
                     return default_result
-                parsed = int(value)
-            elif isinstance(value, str):
-                text = value.strip()
+                parsed = int(scalar_value)
+            elif isinstance(scalar_value, str):
+                text = scalar_value.strip()
                 if len(text) > 4096:
                     if base == 10:
                         sign = -1 if text.startswith("-") else 1
@@ -4170,32 +5080,84 @@ class Jinja2TemplateScanner(BaseScanner):
                     if not math.isfinite(float_value):
                         return default_result
                     parsed = int(float_value)
-            else:
-                return default_result
         except (OverflowError, TypeError, ValueError):
             return default_result
         return self._constant_int_result(parsed, cap)
 
-    @staticmethod
-    def _constant_condition_value(node: Any) -> bool | None:
-        known, value = Jinja2TemplateScanner._constant_condition_scalar(node)
+    @classmethod
+    def _constant_condition_value(
+        cls,
+        node: Any,
+        int_bindings: dict[str, _StaticIntBinding] | None = None,
+    ) -> bool | None:
+        known, value = cls._constant_condition_scalar(node, int_bindings=int_bindings)
         if not known:
             return None
         if value is None or isinstance(value, bool | int | float | str | bytes):
             return bool(value)
         return None
 
-    @staticmethod
-    def _constant_condition_scalar(node: Any, depth: int = 0) -> tuple[bool, Any]:
+    @classmethod
+    def _constant_condition_scalar(
+        cls,
+        node: Any,
+        depth: int = 0,
+        int_bindings: dict[str, _StaticIntBinding] | None = None,
+    ) -> tuple[bool, Any]:
         if depth > 32:
             return False, None
+        access = cls._static_container_access_path(node)
+        if access is not None and int_bindings is not None:
+            name, path = access
+            binding_name = name if not path else cls._static_container_binding_key(name, path)
+            binding = int_bindings.get(binding_name)
+            if isinstance(binding, tuple) and not binding[1]:
+                return True, binding[0]
+            if isinstance(binding, _StaticScalarValue):
+                return True, binding.value
         if isinstance(node, jinja2.nodes.Const):
             return True, node.value
+        if isinstance(node, jinja2.nodes.Not):
+            known, value = cls._constant_condition_scalar(node.node, depth + 1, int_bindings)
+            return (True, not bool(value)) if known else (False, None)
         if isinstance(node, jinja2.nodes.Neg | jinja2.nodes.Pos):
-            known, value = Jinja2TemplateScanner._constant_condition_scalar(node.node, depth + 1)
+            known, value = cls._constant_condition_scalar(node.node, depth + 1, int_bindings)
             if not known or not isinstance(value, int | float):
                 return False, None
             return True, -value if isinstance(node, jinja2.nodes.Neg) else +value
+        if isinstance(node, jinja2.nodes.Compare):
+            left_known, left = cls._constant_condition_scalar(node.expr, depth + 1, int_bindings)
+            if not left_known:
+                return False, None
+            for operand in node.ops:
+                right_known, right = cls._constant_condition_scalar(
+                    operand.expr,
+                    depth + 1,
+                    int_bindings,
+                )
+                if not right_known:
+                    return False, None
+                try:
+                    if operand.op == "eq":
+                        matches = left == right
+                    elif operand.op == "ne":
+                        matches = left != right
+                    elif operand.op == "lt":
+                        matches = left < right
+                    elif operand.op == "lteq":
+                        matches = left <= right
+                    elif operand.op == "gt":
+                        matches = left > right
+                    elif operand.op == "gteq":
+                        matches = left >= right
+                    else:
+                        return False, None
+                except TypeError:
+                    return False, None
+                if not matches:
+                    return True, False
+                left = right
+            return True, True
         if not isinstance(
             node,
             jinja2.nodes.Add
@@ -4206,8 +5168,8 @@ class Jinja2TemplateScanner(BaseScanner):
             | jinja2.nodes.Pow,
         ):
             return False, None
-        left_known, left = Jinja2TemplateScanner._constant_condition_scalar(node.left, depth + 1)
-        right_known, right = Jinja2TemplateScanner._constant_condition_scalar(node.right, depth + 1)
+        left_known, left = cls._constant_condition_scalar(node.left, depth + 1, int_bindings)
+        right_known, right = cls._constant_condition_scalar(node.right, depth + 1, int_bindings)
         if not left_known or not right_known or not isinstance(left, int | float) or not isinstance(right, int | float):
             return False, None
         try:

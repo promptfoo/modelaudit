@@ -25,6 +25,7 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _display_scan_path,
     _explicit_local_shard_family_groups,
     _resolve_scan_runtime_config,
     _ScanPathState,
@@ -949,6 +950,29 @@ def test_scan_json_output_to_file(tmp_path: Path) -> None:
     assert f"Results written to {output_file}" in result.output
 
 
+def test_scan_output_confirmation_escapes_terminal_controls(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+    output_file = tmp_path / "report\nFORGED\x1b[2J.json"
+    scan_result = create_mock_scan_result(files_scanned=1, issues=[])
+
+    with (
+        patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result),
+        patch("modelaudit.cli._preflight_output_text_file"),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(test_file), "--format", "json", "--output", str(output_file)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_file)
+    assert "report\\nFORGED\\x1b[2J.json" in result.output
+    assert "\nFORGED" not in result.output
+    assert "\x1b" not in result.output
+
+
 def test_scan_json_to_stdout_no_progress_interference(tmp_path):
     """Test that JSON to stdout remains valid (no progress output mixed in)."""
     test_file = tmp_path / "test_file.dat"
@@ -981,6 +1005,31 @@ def test_scan_sbom_output(tmp_path):
         json.loads(sbom_file.read_text())
     except json.JSONDecodeError:
         pytest.fail("SBOM output is not valid JSON")
+
+
+def test_scan_sbom_preserves_format_character_filename_identity(tmp_path: Path) -> None:
+    import hashlib
+    import pickle
+
+    content = pickle.dumps({"weights": [1, 2, 3]})
+    model_path = tmp_path / "model\u202ename.pkl"
+    model_path.write_bytes(content)
+    sbom_file = tmp_path / "sbom.json"
+    scan_result = create_mock_scan_result(
+        assets=[{"path": str(model_path), "type": "pickle", "size": len(content)}],
+    )
+
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--quiet", "--no-cache", "--sbom", str(sbom_file), str(model_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    sbom = json.loads(sbom_file.read_text())
+    component = next(component for component in sbom["components"] if component["name"] == model_path.name)
+    assert component["name"] == "model\u202ename.pkl"
+    assert component["hashes"] == [{"alg": "SHA-256", "content": hashlib.sha256(content).hexdigest()}]
 
 
 def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_symlinks: None) -> None:
@@ -2798,6 +2847,224 @@ def test_format_text_output():
     # Verbose might include details, but we can't guarantee it
 
 
+def test_format_text_output_escapes_terminal_controls_in_issues(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {
+                "message": "unsafe\x1b[2Jtitle\x07",
+                "severity": "warning",
+                "location": "archive.zip\nFORGED",
+                "why": "why\ttext",
+                "details": {"detail\x7fkey": "value\rnext"},
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=True)
+
+    assert "\x1b[2J" not in output
+    assert "\x07" not in output
+    assert "\x7f" not in output
+    assert "archive.zip\nFORGED" not in output
+    assert "value\rnext" not in output
+    assert "unsafe\\x1b[2Jtitle\\x07" in output
+    assert "archive.zip\\nFORGED" in output
+    assert "why\\ttext" in output
+    assert "detail\\x7fkey:" in output
+    assert "value\\rnext" in output
+
+
+def test_format_text_output_escapes_terminal_controls_in_failed_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "total_checks": 1,
+        "passed_checks": 0,
+        "failed_checks": 1,
+        "checks": [
+            {
+                "status": "failed",
+                "name": "Member\x1bName",
+                "message": "bad\r\nline",
+            },
+        ],
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    assert "\x1bName" not in output
+    assert "bad\r\nline" not in output
+    assert "Member\\x1bName: bad\\r\\nline" in output
+
+
+def test_format_text_output_escapes_unicode_controls_and_preserves_missing_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "issues": [
+            {
+                "message": "hidden\u200djoiner\U000e0001tag",
+                "severity": "warning",
+                "location": None,
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results)
+
+    assert "[None]" not in output
+    assert "\u200d" not in output
+    assert "\U000e0001" not in output
+    assert "hidden\\u200djoiner\\U000e0001tag" in output
+
+
+def test_format_text_output_escapes_untrusted_model_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "file_metadata": {
+            "config.json": {
+                "model_info": {
+                    "model_type": "bert\x1b[2J",
+                    "architectures": ["Safe", "Spoof\u202eName"],
+                    "num_layers": "12\nFORGED",
+                    "hidden_size": "768\u200bhidden",
+                    "vocab_size": "oops\x07",
+                    "framework_version": "4.0\rnext",
+                },
+            },
+        },
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results)
+
+    assert "bert\\x1b[2J" in output
+    assert "Safe, Spoof\\u202eName" in output
+    assert "12\\nFORGED" in output
+    assert "768\\u200bhidden" in output
+    assert "oops\\x07" in output
+    assert "4.0\\rnext" in output
+
+
+def test_display_helpers_escape_terminal_controls() -> None:
+    path = "model\x1b[2J\u202efile.pkl"
+    error = RuntimeError("failed\nFORGED\u200btext")
+
+    assert _display_path(path) == "model\\x1b[2J\\u202efile.pkl"
+    assert _display_error(error, path) == "failed\\nFORGED\\u200btext"
+
+
+def test_display_scan_path_preserves_exact_local_path_for_reports() -> None:
+    path = "model\nname\u202e.pkl"
+
+    assert _display_scan_path(path) == path
+    assert _display_path(path) == "model\\nname\\u202e.pkl"
+
+
+def test_metadata_terminal_messages_escape_controls(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.bin"
+    model_path.write_bytes(b"model")
+    output_path = tmp_path / "metadata\nFORGED.json"
+
+    with (
+        patch("modelaudit.metadata_extractor.ModelMetadataExtractor.extract", return_value={}),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["metadata", str(model_path), "--format", "json", "--output", str(output_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_path)
+    assert "metadata\\nFORGED.json" in result.output
+    assert "\nFORGED" not in result.output
+
+    with patch(
+        "modelaudit.metadata_extractor.ModelMetadataExtractor.extract",
+        side_effect=RuntimeError("failed\nFORGED\x1b[2J"),
+    ):
+        error_result = CliRunner().invoke(cli, ["metadata", str(model_path)])
+
+    assert error_result.exit_code == 1
+    assert "failed\\nFORGED\\x1b[2J" in error_result.output
+    assert "\nFORGED" not in error_result.output
+    assert "\x1b" not in error_result.output
+
+
+def test_skipped_path_and_suppression_messages_escape_terminal_controls(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    runtime = cast(
+        Any,
+        types.SimpleNamespace(skip_non_model_files=True, show_styled_output=True),
+    )
+
+    skipped_path = tmp_path / "skip\x1b[2J.py"
+
+    with patch("modelaudit.cli._local_path_will_be_scanned", return_value=False):
+        assert cli_module._should_skip_non_model_file(str(skipped_path), runtime, verbose=True)
+    cli_module._announce_suppressed_preferred_scanners(
+        [{"location": "archive\nFORGED.pkl", "scanner_id": "pickle\u202escanner"}]
+    )
+
+    captured = capsys.readouterr()
+    assert "Skipping non-model file:" in captured.out
+    assert "skip\\x1b[2J.py" in captured.out
+    assert "archive\\nFORGED.pkl" in captured.err
+    assert "pickle\\u202escanner" in captured.err
+
+
+def test_format_metadata_table_escapes_untrusted_values() -> None:
+    single_output = cli_module._format_metadata_table(
+        {
+            "file": "model\x1b[2J.onnx",
+            "format": "onnx\u202e",
+            "file_size": "unknown\nFORGED",
+            "producer\u200bname": "tool\x07",
+            "metadata": {"key\rnext": "value\u2066hidden"},
+            "tags": ["safe", "tag\U000e0001hidden"],
+        }
+    )
+    directory_output = cli_module._format_metadata_table(
+        {
+            "directory": "models\nFORGED",
+            "summary": {"total_files": 1, "formats": {"gguf\u202e": 1}},
+            "files": [
+                {
+                    "file": "bad\x1b[2J.gguf",
+                    "error": "decode\rfailed",
+                }
+            ],
+        }
+    )
+
+    assert "model\\x1b[2J.onnx" in single_output
+    assert "onnx\\u202e" in single_output
+    assert "unknown\\nFORGED" in single_output
+    assert "Producer\\u200bName: tool\\x07" in single_output
+    assert "key\\rnext: value\\u2066hidden" in single_output
+    assert "tag\\U000e0001hidden" in single_output
+    assert "models\\nFORGED" in directory_output
+    assert "gguf\\u202e: 1" in directory_output
+    assert "bad\\x1b[2J.gguf (error: decode\\rfailed)" in directory_output
+
+
 def test_format_text_output_only_debug_issues():
     """Ensure debug-only issues result in a success status."""
     results = {
@@ -2998,6 +3265,72 @@ def test_scan_huggingface_url_passes_max_size_to_download(
     mock_rmtree.assert_called()
 
 
+def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/model\nFORGED\u202e",
+                "total_size": 1024,
+                "file_count": "2\x1b[2J",
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/model"])
+
+    assert result.exit_code == 0, result.output
+    assert "org/model\\nFORGED\\u202e" in result.output
+    assert "2\\x1b[2J files" in result.output
+    assert "org/model\nFORGED\u202e" not in result.output
+
+
+def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    url = "https://huggingface.co/org/model?token=secret-token"
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            side_effect=RuntimeError(f"metadata failed for {url}\nFORGED"),
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+        caplog.at_level(logging.DEBUG, logger="modelaudit"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--verbose", "--no-cache", "--format", "text", url],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "https://huggingface.co/org/model" in caplog.text
+    assert "metadata failed" in caplog.text
+    assert "\\nFORGED" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "?token=" not in caplog.text
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
@@ -3082,23 +3415,38 @@ def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
 
 
 @patch("modelaudit.cli.download_file_from_hf")
-def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
-    """Redact direct-file URL secrets from CLI download failures."""
-    mock_download_file.side_effect = Exception(
-        "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
-    )
+def test_scan_huggingface_file_download_failure_redacts_url(
+    mock_download_file: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Redact secrets from chained direct-file download failures."""
+
+    def raise_chained_download_error(*_args: Any, **_kwargs: Any) -> None:
+        try:
+            raise ValueError(
+                "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret\nFORGED\x1b[2J"
+            )
+        except ValueError as cause:
+            raise RuntimeError("Download failed") from cause
+
+    mock_download_file.side_effect = raise_chained_download_error
 
     runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["scan", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
-    )
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(
+            cli,
+            ["scan", "--verbose", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
+        )
 
     output = strip_ansi(result.output)
     assert result.exit_code == 2
     assert "hf_secret" not in output
     assert "token=" not in output
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+    assert "hf_secret" not in caplog.text
+    assert "token=" not in caplog.text
+    assert "\nFORGED" not in caplog.text
+    assert "\x1b" not in caplog.text
 
 
 @pytest.mark.parametrize(("max_size", "expected_bytes"), [("2KB", 2048), ("0", 0)])
@@ -4352,6 +4700,61 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
 
 
+def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
+    local_path = "model\nname.pkl"
+    scan_result = create_mock_scan_result(assets=[{"path": local_path, "type": "pickle"}])
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(scan_result, None)
+
+    assert path_state.scanned_paths == [local_path]
+
+
+def test_progress_callback_escapes_model_controlled_messages(tmp_path: Path) -> None:
+    model_path = tmp_path / "model\nname.pkl"
+
+    class _Stats:
+        total_bytes = 0
+        total_items = 0
+
+    class _Tracker:
+        stats = _Stats()
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def set_phase(self, _phase: object, message: str) -> None:
+            self.messages.append(message)
+
+        def update_bytes(self, _bytes_processed: int, message: str) -> None:
+            self.messages.append(message)
+
+    tracker = _Tracker()
+    callback = _create_path_progress_callback(
+        spinner=None,
+        progress_tracker=tracker,
+        actual_path=str(model_path),
+    )
+
+    assert callback is not None
+    callback("Scanning member\nFORGED\x1b[2J", 50.0)
+
+    assert tracker.messages[0].endswith("model\\nname.pkl")
+    assert tracker.messages[1:] == ["Scanning member\\nFORGED\\x1b[2J", "Scanning member\\nFORGED\\x1b[2J"]
+
+
+def test_progress_callback_wrapper_escapes_spinner_message() -> None:
+    callback = MagicMock()
+    spinner = types.SimpleNamespace(text="")
+    wrapped_callback = cli_module.create_progress_callback_wrapper(callback, spinner)
+
+    assert wrapped_callback is not None
+    wrapped_callback("Scanning member\nFORGED\x1b[2J", 50.0)
+
+    callback.assert_called_once_with("Scanning member\nFORGED\x1b[2J", 50.0)
+    assert spinner.text == "Scanning member\\nFORGED\\x1b[2J"
+
+
 def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest.LogCaptureFixture) -> None:
     """Verbose stream failures must not reintroduce signed URLs through exception tracebacks."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
@@ -5019,18 +5422,26 @@ def test_scan_mlflow_uri_no_cache_overrides_cache_dir(mock_scan_mlflow: MagicMoc
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_error(mock_scan_mlflow):
+def test_scan_mlflow_uri_error(
+    mock_scan_mlflow: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test error handling for MLflow URI scanning."""
-    # Setup mock to raise an error
-    mock_scan_mlflow.side_effect = Exception("MLflow connection failed")
+    mock_scan_mlflow.side_effect = Exception("MLflow connection failed token=mlflow_secret\nFORGED\x1b[2J")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "models:/TestModel/1"])
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", "models:/TestModel/1"])
 
-    # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
     assert "MLflow connection failed" in result.output
+    assert "mlflow_secret" not in result.output
+    assert "\nFORGED" not in result.output
+    assert "\x1b" not in result.output
+    assert "mlflow_secret" not in caplog.text
+    assert "\nFORGED" not in caplog.text
+    assert "\x1b" not in caplog.text
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
