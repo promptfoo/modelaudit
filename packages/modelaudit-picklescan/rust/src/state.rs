@@ -6016,7 +6016,11 @@ impl<'a> ScanState<'a> {
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
-        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(value);
+        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(
+            value,
+            max_window_chars,
+            self.options.max_nested_pickle_bytes,
+        );
         if !found_candidate
             && (value.len() <= max_window_chars || value.chars().count() <= max_window_chars)
         {

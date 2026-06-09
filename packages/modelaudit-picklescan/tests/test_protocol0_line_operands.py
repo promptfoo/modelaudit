@@ -207,6 +207,21 @@ def test_scan_bytes_detects_lenient_base64_pickle_after_long_protocol0_scalar(
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
+def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None:
+    encoded_scalar = base64.b64encode(b"V" + (b"A" * 257)).decode("ascii")
+    encoded = encoded_scalar + ("!" * ((1024 * 1024) + 512))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="unterminated-protocol0-base64-scalar.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
+
+
 @pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
 def test_scan_bytes_keeps_wrapped_benign_long_scalar_base64_pickle_clean(opcode: bytes) -> None:
     nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"0cos", maxsplit=1)[0] + b"."
