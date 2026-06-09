@@ -1403,6 +1403,19 @@ class _CloudContentSniffBudget:
         self._complete_prefixes: set[str] = set()
         self.incomplete_stream_reads = 0
 
+    def _read_bounded(self, remote_file: Any, max_bytes: int) -> bytes:
+        """Charge each transferred chunk before a later transport read can fail."""
+        payload = bytearray()
+        while len(payload) < max_bytes:
+            chunk = remote_file.read(max_bytes - len(payload))
+            if not isinstance(chunk, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            if not chunk:
+                break
+            payload.extend(chunk)
+            self.remaining_bytes -= len(chunk)
+        return bytes(payload)
+
     def read_prefix(self, fs: Any, file_url: str, max_bytes: int) -> bytes:
         """Return a cached prefix, extending it without rereading transferred bytes."""
         prefix = self._prefixes.get(file_url, b"")
@@ -1416,9 +1429,8 @@ class _CloudContentSniffBudget:
         with fs.open(file_url, "rb") as remote_file:
             if prefix:
                 remote_file.seek(len(prefix))
-            chunk = _read_bounded_cloud_content(remote_file, read_size)
+            chunk = self._read_bounded(remote_file, read_size)
 
-        self.remaining_bytes -= len(chunk)
         prefix += chunk
         self._prefixes[file_url] = prefix
         if len(chunk) < read_size:
@@ -1439,9 +1451,8 @@ class _CloudContentSniffBudget:
 
         with fs.open(file_url, "rb") as remote_file:
             remote_file.seek(range_offset)
-            chunk = _read_bounded_cloud_content(remote_file, read_size)
+            chunk = self._read_bounded(remote_file, read_size)
 
-        self.remaining_bytes -= len(chunk)
         return cached + chunk
 
     def read_stream(self, remote_file: Any, requested_bytes: int | None = -1) -> bytes:
@@ -1829,6 +1840,7 @@ def _detect_cloud_content_route_format(
     size_is_known = sniff_budget.prefix_is_complete(file_url) if sniff_budget is not None else size < prefix_limit
 
     from modelaudit.utils.file.detection import (
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
@@ -1889,21 +1901,50 @@ def _detect_cloud_content_route_format(
         pickle_probe_is_prefix=not size_is_known,
     )
     if (
-        detected_format == "pickle"
-        and sniff_budget is not None
-        and sniff_budget.remaining_bytes == 0
+        sniff_budget is not None
         and not size_is_known
-        and _get_cloud_content_size_for_routing(fs, file_url) == len(prefix)
+        and detected_format in {"pickle", PICKLE_ROUTING_INCONCLUSIVE_FORMAT}
     ):
-        detected_format = detect_format_from_magic_bytes(
-            prefix[:4],
-            prefix[:8],
-            prefix[:16],
-            len(prefix),
-            None,
-            pickle_probe_sample=prefix,
-            pickle_probe_is_prefix=False,
-        )
+        cached_prefix = sniff_budget.cached_prefix(file_url)
+        try:
+            proven_size = _get_cloud_content_size_for_routing(fs, file_url)
+        except ValueError:
+            if detected_format != "pickle":
+                raise
+            proven_size = None
+        if (
+            proven_size is not None
+            and proven_size >= len(cached_prefix)
+            and proven_size - len(cached_prefix) <= sniff_budget.remaining_bytes
+        ):
+            try:
+                reported_size = _parse_size_value(file_info.get("size"))
+            except (TypeError, ValueError):
+                reported_size = None
+            size_proof_is_contradicted = reported_size is not None and reported_size > proven_size
+            if not size_proof_is_contradicted:
+                remaining_probe_bytes = proven_size - len(cached_prefix)
+                complete_probe_limit = proven_size + int(remaining_probe_bytes < sniff_budget.remaining_bytes)
+                try:
+                    complete_probe = _read_cloud_content_prefix(fs, file_url, complete_probe_limit, sniff_budget)
+                except ValueError:
+                    if detected_format != "pickle":
+                        raise
+                else:
+                    if len(complete_probe) != proven_size:
+                        return detected_format
+                    prefix = complete_probe
+                    size = proven_size
+                    size_is_known = True
+                    detected_format = detect_format_from_magic_bytes(
+                        prefix[:4],
+                        prefix[:8],
+                        prefix[:16],
+                        size,
+                        None,
+                        pickle_probe_sample=prefix,
+                        pickle_probe_is_prefix=False,
+                    )
     if (
         detected_format == "unknown"
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
@@ -1956,9 +1997,8 @@ def _detect_cloud_content_route_format(
         sniff_budget=sniff_budget,
     )
     if shared_detected_format is None and sniff_budget is not None:
-        if (
+        if size_is_known or (
             sniff_budget.remaining_bytes == 0
-            and not sniff_budget.prefix_is_complete(file_url)
             and _get_cloud_content_size_for_routing(fs, file_url) == len(sniff_budget.cached_prefix(file_url))
         ):
             return None
@@ -2338,7 +2378,7 @@ def _download_cloud_object(
 ) -> int:
     """Download one cloud object while enforcing an optional transfer budget."""
     _ensure_cloud_download_destination_is_safe(local_path, base_dir)
-    temp_fd, temp_name = tempfile.mkstemp(prefix=f".{local_path.name}.modelaudit-", dir=local_path.parent)
+    temp_fd, temp_name = tempfile.mkstemp(prefix=".modelaudit-", dir=local_path.parent)
     os.close(temp_fd)
     temp_path = Path(temp_name)
     temp_parent = temp_path.parent.resolve()
