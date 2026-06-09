@@ -95,6 +95,7 @@ def pytest_runtest_setup(item):
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_picklescan_adapter.py",
+            "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests

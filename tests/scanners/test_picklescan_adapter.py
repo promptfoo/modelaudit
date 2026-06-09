@@ -46,12 +46,14 @@ def test_scan_options_from_config_parses_string_values() -> None:
         {
             "timeout": "2.5",
             "max_opcodes": "4096",
+            "max_nested_pickle_bytes": "2",
             "post_budget_global_scan_limit_bytes": "8192",
         }
     )
 
     assert parsed.timeout_s == 2.5
     assert parsed.max_opcodes == 4096
+    assert parsed.max_nested_pickle_bytes == 2
     assert parsed.post_budget_scan_bytes == 8192
 
 
@@ -68,12 +70,14 @@ def test_scan_options_from_config_falls_back_for_bad_values() -> None:
         {
             "timeout": float("inf"),
             "max_opcodes": 0,
+            "max_nested_pickle_bytes": 0,
             "post_budget_global_scan_limit_bytes": -1,
         }
     )
 
     assert fallback.timeout_s == defaults.timeout_s
     assert fallback.max_opcodes == defaults.max_opcodes
+    assert fallback.max_nested_pickle_bytes == defaults.max_nested_pickle_bytes
     assert fallback.post_budget_scan_bytes == defaults.post_budget_scan_bytes
 
     nan_fallback = scan_options_from_config({"timeout": "nan"})

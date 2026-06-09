@@ -39,7 +39,8 @@ impl ScanOptions {
                 options,
                 "max_nested_pickle_bytes",
                 DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            )?,
+            )
+            .and_then(|value| require_minimum_usize(value, "max_nested_pickle_bytes", 2))?,
             max_nested_depth: option_usize(options, "max_nested_depth", DEFAULT_MAX_NESTED_DEPTH)?,
         })
     }
@@ -71,6 +72,15 @@ fn option_usize(options: &Bound<'_, PyDict>, key: &str, default: usize) -> PyRes
         Some(value) => value.extract::<usize>(),
         None => Ok(default),
     }
+}
+
+fn require_minimum_usize(value: usize, key: &str, minimum: usize) -> PyResult<usize> {
+    if value < minimum {
+        return Err(PyValueError::new_err(format!(
+            "{key} must be at least {minimum}"
+        )));
+    }
+    Ok(value)
 }
 
 fn option_f64(options: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
