@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from scripts.validate_docker_publish_tag import normalize_publish_tag
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 _ACTION_DIR = _REPO_ROOT / ".github" / "actions"
@@ -143,3 +145,14 @@ def test_action_pin_validation_rejects_mutable_refs() -> None:
         ".github/workflows/example.yml: owner/action@v1",
         ".github/workflows/example.yml: docker://ghcr.io/owner/action:latest",
     ]
+
+
+def test_optional_v_prefix_preserves_maximum_docker_tag_length() -> None:
+    normalized_tag = f"1.2.3-{'a' * 122}"
+    overlong_tag = f"{normalized_tag}a"
+
+    assert len(normalized_tag) == 128
+    assert normalize_publish_tag(normalized_tag) == normalized_tag
+    assert normalize_publish_tag(f"v{normalized_tag}") == normalized_tag
+    assert normalize_publish_tag(overlong_tag) is None
+    assert normalize_publish_tag(f"v{overlong_tag}") is None
