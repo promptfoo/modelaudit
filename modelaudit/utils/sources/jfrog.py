@@ -10,6 +10,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import unicodedata
 import zipfile
 from collections.abc import Collection, Mapping
 from http.cookiejar import CookieJar
@@ -43,6 +44,9 @@ _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECAS
 _JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
+_WINDOWS_RESERVED_LOCAL_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -82,7 +86,12 @@ def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
     """Build a safe local path for downloaded JFrog artifacts."""
     normalized = PurePosixPath(relative_path)
 
-    if normalized.is_absolute() or any(part in {"", ".", ".."} for part in normalized.parts):
+    if normalized.is_absolute() or any(
+        part in {"", ".", ".."}
+        or ":" in part
+        or part.split(".", 1)[0].rstrip(" .").upper() in _WINDOWS_RESERVED_LOCAL_NAMES
+        for part in normalized.parts
+    ):
         raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
 
     local_file = (download_dir / Path(*normalized.parts)).resolve()
@@ -92,6 +101,39 @@ def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
         raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
 
     return local_file
+
+
+def _local_download_path_collision_key(path: Path) -> tuple[str, ...]:
+    """Return a filesystem-independent key for local path alias detection."""
+    return tuple(
+        unicodedata.normalize("NFC", part).rstrip(" .").casefold() for part in path.resolve(strict=False).parts
+    )
+
+
+def _prepare_jfrog_folder_download_targets(
+    download_dir: Path,
+    base_url: str,
+    files: list[dict[str, Any]],
+) -> list[Path]:
+    """Precompute selected JFrog folder destinations and reject local aliases."""
+    prepared_targets: list[tuple[tuple[str, ...], str, Path]] = []
+    for file_info in files:
+        relative_path = _safe_jfrog_relative_path(base_url, str(file_info["path"]))
+        local_file = _safe_download_path(download_dir, relative_path)
+        collision_key = _local_download_path_collision_key(local_file)
+        prepared_targets.append((collision_key, relative_path, local_file))
+
+    sorted_targets = sorted(prepared_targets, key=lambda target: target[0])
+    for index in range(1, len(sorted_targets)):
+        previous_key, previous_path, _ = sorted_targets[index - 1]
+        collision_key, relative_path, _ = sorted_targets[index]
+        if collision_key[: len(previous_key)] == previous_key:
+            raise ValueError(
+                "Colliding local JFrog artifact paths: "
+                f"{previous_path} and {relative_path} resolve to overlapping local destinations"
+            )
+
+    return [local_file for _, _, local_file in prepared_targets]
 
 
 def _cleanup_failed_folder_download(
@@ -589,6 +631,7 @@ def download_artifact(
     *,
     _enforce_zero_max_size: bool = False,
     require_same_origin_redirects: bool = False,
+    _destination_filename: str | None = None,
 ) -> Path:
     """
     Download an artifact from JFrog Artifactory with proper authentication.
@@ -623,7 +666,9 @@ def download_artifact(
         max_size if max_size is not None and (max_size > 0 or (_enforce_zero_max_size and max_size == 0)) else None
     )
 
-    filename = os.path.basename(urlparse(url).path)
+    filename = _destination_filename or os.path.basename(urlparse(url).path)
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError(f"Unsafe JFrog destination filename: {filename!r}")
     temp_dir: Path | None = None
     if cache_dir is None:
         temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_"))
@@ -1229,6 +1274,8 @@ def _detect_jfrog_content_route_format(
         prefix[:16],
         max(size_hint, len(prefix), 1),
         None,
+        pickle_probe_sample=prefix,
+        pickle_probe_is_prefix=size_hint > len(prefix) or (size_hint <= 0 and len(prefix) >= probe_limit),
     )
     if (
         detected_format == "unknown"
@@ -1773,8 +1820,19 @@ def download_jfrog_folder(
             shutil.rmtree(backup_dir, ignore_errors=True)
 
     try:
-        for file_info in files:
-            local_file: Path | None = None
+        local_files = _prepare_jfrog_folder_download_targets(download_dir, url, files)
+    except Exception:
+        _cleanup_failed_folder_download(
+            download_dir,
+            owns_download_dir=owns_download_dir,
+            downloaded_files=[],
+            current_file_candidates=[],
+        )
+        raise
+
+    try:
+        for file_info, prepared_local_file in zip(files, local_files, strict=True):
+            local_file = prepared_local_file
             downloaded_file: Path | None = None
             try:
                 if show_progress:
@@ -1782,23 +1840,21 @@ def download_jfrog_folder(
                     click.echo(f"Downloading {file_info['name']} ({size_display})")
 
                 # Calculate relative path for local storage
-                file_url_parsed = urlparse(file_info["path"])
-                relative_path = _safe_jfrog_relative_path(url, str(file_info["path"]))
-
-                local_file = _safe_download_path(download_dir, relative_path)
+                download_url = str(file_info["path"])
                 local_file.parent.mkdir(parents=True, exist_ok=True)
-                expected_downloaded_file = local_file.parent / Path(file_url_parsed.path).name
+                fallback_downloaded_file = local_file.parent / Path(urlparse(download_url).path).name
                 _backup_existing_file(local_file)
-                if expected_downloaded_file != local_file:
-                    _backup_existing_file(expected_downloaded_file)
+                if fallback_downloaded_file != local_file:
+                    _backup_existing_file(fallback_downloaded_file)
                 remaining_total_size = total_limit - actual_downloaded_size if total_limit is not None else None
                 file_limits = [limit for limit in (per_file_limit, remaining_total_size) if limit is not None]
                 file_download_limit = min(file_limits) if file_limits else None
 
                 # Download the individual file
-                download_url = str(file_info["path"])
                 content_was_probed = "content_probe_download_url" in file_info
                 artifact_download_kwargs: dict[str, Any] = {}
+                if fallback_downloaded_file != local_file:
+                    artifact_download_kwargs["_destination_filename"] = local_file.name
                 if file_download_limit is not None:
                     artifact_download_kwargs["max_size"] = file_download_limit
                     artifact_download_kwargs["_enforce_zero_max_size"] = file_download_limit == 0

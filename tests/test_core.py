@@ -2071,6 +2071,134 @@ def test_scan_file_routes_padded_protocolless_binary_pickle_past_probe_limit(tmp
     _assert_system_pickle_issue(result)
 
 
+def test_scan_file_does_not_route_benign_binary_padding_past_opcode_budget(tmp_path: Path) -> None:
+    near_match = tmp_path / "notes.py"
+    near_match.write_bytes(b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_OPCODES + 1))
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+
+    assert file_detection.detect_file_format(str(near_match)) == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        file_detection.detect_file_format_from_magic(str(near_match))
+        == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert (
+        file_detection.detect_file_format_for_skip_filter(str(near_match))
+        == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    )
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(near_match), config=config)
+        second = scan_file(str(near_match), config=config)
+
+        for result in (first, second):
+            assert result.scanner_name == "unknown"
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == "inconclusive"
+            assert result.metadata["analysis_incomplete"] is True
+            assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+            assert "pickle_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+            check = next(check for check in result.checks if check.name == "Pickle Routing")
+            assert check.status == CheckStatus.FAILED
+            assert check.severity == IssueSeverity.INFO
+            assert "bounded structural probe reached its limit" in check.message
+            assert check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            assert not [
+                issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    nested_result = archive_dispatch.scan_nested_file(str(near_match), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(near_match), cache_scan_results=False)
+
+    assert nested_result.scanner_name == "unknown"
+    assert nested_result.success is False
+    assert nested_result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_when_protocolless_pickle_gadget_follows_opcode_budget(tmp_path: Path) -> None:
+    delayed_gadget = tmp_path / "delayed.py"
+    delayed_gadget.write_bytes(
+        (b"\x8c\x01x0" * file_detection.PROTO0_1_MAX_PROBE_OPCODES) + _build_protocolless_binary_malicious_pickle()
+    )
+
+    assert file_detection.detect_file_format(str(delayed_gadget)) == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    result = scan_file(str(delayed_gadget), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(delayed_gadget), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_when_protocolless_pickle_line_operand_exceeds_budget(tmp_path: Path) -> None:
+    delayed_gadget = tmp_path / "long-line.py"
+    delayed_gadget.write_bytes(
+        b"S'"
+        + (b"a" * (file_detection.PROTO0_1_MAX_PROBE_BYTES + 1))
+        + b"'\n0"
+        + _build_protocolless_binary_malicious_pickle()
+    )
+
+    assert file_detection.detect_file_format(str(delayed_gadget)) == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    result = scan_file(str(delayed_gadget), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+
+
+def test_scan_file_bounds_cumulative_protocolless_pickle_line_operands(tmp_path: Path) -> None:
+    delayed_gadget = tmp_path / "many-lines.py"
+    line_operand = b"S'" + (b"a" * 1024) + b"'\n0"
+    delayed_gadget.write_bytes(
+        (line_operand * ((file_detection.PROTO0_1_MAX_PROBE_BYTES // 1024) + 1))
+        + _build_protocolless_binary_malicious_pickle()
+    )
+
+    assert file_detection.detect_file_format(str(delayed_gadget)) == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "payload.gz",
+        "payload.bz2",
+        "payload.xz",
+        "payload.lz4",
+        "payload.zlib",
+        "payload.tgz",
+        "payload.tbz2",
+        "payload.txz",
+        "payload.tar.gz",
+        "payload.tar.bz2",
+        "payload.tar.xz",
+    ],
+)
+def test_scan_file_routes_protocolless_pickle_with_misleading_compressed_suffix(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    disguised_pickle = tmp_path / filename
+    disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
+
+    assert file_detection.detect_file_format(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(disguised_pickle)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_pickle)) == "pickle"
+
+    result = scan_file(str(disguised_pickle), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
 def test_scan_file_routes_open_mark_protocolless_pickle_past_probe_limit(tmp_path: Path) -> None:
     disguised_pickle = tmp_path / "payload.jpg"
     padding = b"\x8c\x01x0" * ((file_detection.PROTO0_1_MAX_PROBE_BYTES // 4) - 1) + b"N0N("
