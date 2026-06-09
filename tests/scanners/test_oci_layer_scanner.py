@@ -2520,13 +2520,218 @@ class TestOciLayerScanner:
 
         monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
 
         for link in links:
             assert (
-                OciLayerScanner._resolve_link_payload_member(link, members_by_name, resolved_payload_cache) is payload
+                OciLayerScanner._resolve_link_payload_member(
+                    link,
+                    members_by_name,
+                    resolved_payload_cache,
+                    resolved_member_path_cache,
+                )
+                is payload
             )
 
         assert resolve_calls == chain_length
+
+    def test_resolve_link_payload_member_memoizes_component_symlink_chains(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Equivalent component-link paths should be resolved only once across aliases."""
+        chain_length = 128
+        alias_count = 128
+        members_by_name: dict[str, tarfile.TarInfo] = {}
+        for index in range(chain_length):
+            link = tarfile.TarInfo(f"d{index}")
+            link.type = tarfile.SYMTYPE
+            link.linkname = f"d{index + 1}"
+            members_by_name[link.name] = link
+
+        payload = tarfile.TarInfo(f"d{chain_length}/payload.bin")
+        payload.type = tarfile.REGTYPE
+        members_by_name[payload.name] = payload
+        aliases: list[tarfile.TarInfo] = []
+        for index in range(alias_count):
+            alias = tarfile.TarInfo(f"model-{index}.pkl")
+            alias.type = tarfile.SYMTYPE
+            alias.linkname = "d0/payload.bin"
+            aliases.append(alias)
+
+        resolve_calls = 0
+        original_resolver = OciLayerScanner._resolve_link_target
+
+        def counted_resolver(
+            target: str,
+            *,
+            resolved_member_name: str,
+            extraction_root: str,
+            is_symlink: bool,
+        ) -> tuple[str, bool]:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return original_resolver(
+                target,
+                resolved_member_name=resolved_member_name,
+                extraction_root=extraction_root,
+                is_symlink=is_symlink,
+            )
+
+        monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        for alias in aliases:
+            assert (
+                OciLayerScanner._resolve_link_payload_member(
+                    alias,
+                    members_by_name,
+                    resolved_payload_cache,
+                    resolved_member_path_cache,
+                )
+                is payload
+            )
+
+        assert resolve_calls == chain_length + alias_count
+        assert resolved_member_path_cache["d0/payload.bin"] is payload
+
+    def test_resolve_link_payload_member_does_not_cache_suffix_specific_cycle(self) -> None:
+        """A cyclic child path must not poison benign siblings through the same directory link."""
+        directory_link = tarfile.TarInfo("a")
+        directory_link.type = tarfile.SYMTYPE
+        directory_link.linkname = "base"
+
+        cyclic_child = tarfile.TarInfo("base/x")
+        cyclic_child.type = tarfile.SYMTYPE
+        cyclic_child.linkname = "../a/x"
+
+        payload = tarfile.TarInfo("base/z/file.bin")
+        payload.type = tarfile.REGTYPE
+        members_by_name = {
+            directory_link.name: directory_link,
+            cyclic_child.name: cyclic_child,
+            payload.name: payload,
+        }
+
+        cyclic_alias = tarfile.TarInfo("cyclic.pkl")
+        cyclic_alias.type = tarfile.SYMTYPE
+        cyclic_alias.linkname = "a/x/file.bin"
+        benign_alias = tarfile.TarInfo("benign.pkl")
+        benign_alias.type = tarfile.SYMTYPE
+        benign_alias.linkname = "a/z/file.bin"
+
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                cyclic_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is None
+        )
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                benign_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is payload
+        )
+        assert resolved_member_path_cache["a/x/file.bin"] is None
+        assert resolved_member_path_cache["a/z/file.bin"] is payload
+
+    def test_resolve_link_payload_member_does_not_cache_suffix_rewrite_as_parent_target(self) -> None:
+        """A child symlink rewrite must not change the cached target of its parent directory link."""
+        directory_link = tarfile.TarInfo("a")
+        directory_link.type = tarfile.SYMTYPE
+        directory_link.linkname = "base"
+
+        child_link = tarfile.TarInfo("base/x")
+        child_link.type = tarfile.SYMTYPE
+        child_link.linkname = "../other/x"
+
+        rewritten_payload = tarfile.TarInfo("other/x/file.bin")
+        rewritten_payload.type = tarfile.REGTYPE
+        sibling_payload = tarfile.TarInfo("base/z/file.bin")
+        sibling_payload.type = tarfile.REGTYPE
+        members_by_name = {
+            directory_link.name: directory_link,
+            child_link.name: child_link,
+            rewritten_payload.name: rewritten_payload,
+            sibling_payload.name: sibling_payload,
+        }
+
+        rewritten_alias = tarfile.TarInfo("rewritten.pkl")
+        rewritten_alias.type = tarfile.SYMTYPE
+        rewritten_alias.linkname = "a/x/file.bin"
+        sibling_alias = tarfile.TarInfo("sibling.pkl")
+        sibling_alias.type = tarfile.SYMTYPE
+        sibling_alias.linkname = "a/z/file.bin"
+
+        resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                rewritten_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is rewritten_payload
+        )
+        assert (
+            OciLayerScanner._resolve_link_payload_member(
+                sibling_alias,
+                members_by_name,
+                resolved_payload_cache,
+                resolved_member_path_cache,
+            )
+            is sibling_payload
+        )
+        assert resolved_member_path_cache["a/x/file.bin"] is rewritten_payload
+        assert resolved_member_path_cache["a/z/file.bin"] is sibling_payload
+
+    def test_scan_layer_fails_closed_when_link_resolution_work_limit_is_exhausted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Adversarial link graphs should stop at an explicit aggregate work budget."""
+        layer_path = tmp_path / "link-resolution-budget.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            payload = b"benign"
+            payload_info = tarfile.TarInfo("d1/payload.bin")
+            payload_info.size = len(payload)
+            tar.addfile(payload_info, io.BytesIO(payload))
+
+            directory_link = tarfile.TarInfo("d0")
+            directory_link.type = tarfile.SYMTYPE
+            directory_link.linkname = "d1"
+            tar.addfile(directory_link)
+
+            model_link = tarfile.TarInfo("model.pkl")
+            model_link.type = tarfile.SYMTYPE
+            model_link.linkname = "d0/payload.bin"
+            tar.addfile(model_link)
+
+        manifest_path = tmp_path / "link-resolution-budget.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+        monkeypatch.setattr(OciLayerScanner, "_LINK_RESOLUTION_STEPS_PER_ENTRY", 0)
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        checks = [check for check in result.checks if check.name == "Layer Link Resolution Budget Check"]
+        assert result.success is False
+        assert len(checks) == 1
+        assert checks[0].details["member"] == "model.pkl"
+        assert checks[0].details["max_resolution_steps"] == 1
+        assert "oci_link_resolution_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_scan_layer_does_not_resolve_link_beyond_entry_limit(self, tmp_path: Path) -> None:
         """Link resolution must not make tarfile inspect a target outside the admitted entry window."""

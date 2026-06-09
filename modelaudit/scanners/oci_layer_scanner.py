@@ -287,6 +287,22 @@ class _LayerPayloadScanOutcome:
     total_budget_exhausted: bool = False
 
 
+@dataclass
+class _LayerLinkResolutionState:
+    """Bound aggregate path-resolution work across all links in one layer."""
+
+    max_steps: int
+    steps: int = 0
+    exhausted: bool = False
+
+    def consume_step(self) -> bool:
+        if self.steps >= self.max_steps:
+            self.exhausted = True
+            return False
+        self.steps += 1
+        return True
+
+
 class OciLayerScanner(BaseScanner):
     """Scanner for OCI/Artifactory manifest files with .tar.gz layers."""
 
@@ -323,6 +339,7 @@ class OciLayerScanner(BaseScanner):
     _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     _DEFAULT_MAX_EXTRACTED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     _DEFAULT_MAX_DECOMPRESSION_RATIO: ClassVar[float] = 250.0
+    _LINK_RESOLUTION_STEPS_PER_ENTRY: ClassVar[int] = 4
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
     _PARENT_IDENTITY_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset({"file_size", "file_hashes"})
 
@@ -886,33 +903,48 @@ class OciLayerScanner(BaseScanner):
         member: tarfile.TarInfo,
         members_by_name: dict[str, tarfile.TarInfo],
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None],
+        resolved_member_path_cache: dict[str, tarfile.TarInfo | None],
+        resolution_state: _LayerLinkResolutionState | None = None,
     ) -> tarfile.TarInfo | None:
         """Resolve a link chain using only members admitted by the layer preflight."""
         extraction_root = os.path.join(tempfile.gettempdir(), "extract_oci_layer")
+        if resolution_state is None:
+            resolution_state = _LayerLinkResolutionState(max_steps=max(1, len(members_by_name) * 4))
         current = member
         visited: set[str] = set()
         traversed: list[tarfile.TarInfo] = []
 
         def resolve_member_path(target_name: str) -> tarfile.TarInfo | None:
+            original_target_name = target_name
+            if original_target_name in resolved_member_path_cache:
+                return resolved_member_path_cache[original_target_name]
+
             while True:
                 target_member = members_by_name.get(target_name)
                 if target_member is not None:
+                    resolved_member_path_cache[original_target_name] = target_member
                     return target_member
+                if not resolution_state.consume_step():
+                    return None
 
                 parts = target_name.split("/")
                 component_link: tarfile.TarInfo | None = None
                 component_count = 0
                 for index in range(1, len(parts)):
-                    candidate = members_by_name.get("/".join(parts[:index]))
+                    candidate_name = "/".join(parts[:index])
+                    candidate = members_by_name.get(candidate_name)
                     if candidate is not None and candidate.issym():
                         component_link = candidate
                         component_count = index
                         break
                 if component_link is None:
+                    resolved_member_path_cache[original_target_name] = None
                     return None
 
+                suffix_parts = tuple(parts[component_count:])
                 component_name = posixpath.normpath(component_link.name.replace("\\", "/"))
                 if component_name in visited:
+                    resolved_member_path_cache[original_target_name] = None
                     return None
                 visited.add(component_name)
                 resolved_component, component_safe = cls._resolve_link_target(
@@ -925,20 +957,23 @@ class OciLayerScanner(BaseScanner):
                     is_symlink=True,
                 )
                 if not component_safe:
+                    resolved_member_path_cache[original_target_name] = None
                     return None
 
                 try:
                     combined_from_root = os.path.relpath(
-                        os.path.join(resolved_component, *parts[component_count:]),
+                        os.path.join(resolved_component, *suffix_parts),
                         extraction_root,
                     )
                     resolved_target, target_safe = sanitize_archive_path(combined_from_root, extraction_root)
                     if not target_safe:
+                        resolved_member_path_cache[original_target_name] = None
                         return None
                     target_name = posixpath.normpath(
                         os.path.relpath(resolved_target, extraction_root).replace("\\", "/")
                     )
                 except ValueError:
+                    resolved_member_path_cache[original_target_name] = None
                     return None
 
         resolved_payload: tarfile.TarInfo | None
@@ -948,6 +983,9 @@ class OciLayerScanner(BaseScanner):
                 resolved_payload = resolved_payload_cache[current]
                 break
             if current_name in visited:
+                resolved_payload = None
+                break
+            if not resolution_state.consume_step():
                 resolved_payload = None
                 break
             visited.add(current_name)
@@ -1643,6 +1681,10 @@ class OciLayerScanner(BaseScanner):
                     deferred_links: list[tarfile.TarInfo] = []
                     scanned_payloads: set[tuple[int, str | None]] = set()
                     resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
+                    resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
+                    link_resolution_state = _LayerLinkResolutionState(
+                        max_steps=max(1, self.max_layer_entries * self._LINK_RESOLUTION_STEPS_PER_ENTRY)
+                    )
                     layer_extraction_budget_exhausted = False
                     while preflight_member_limit is None or layer_entry_count < preflight_member_limit:
                         member = tar.next()
@@ -1719,7 +1761,33 @@ class OciLayerScanner(BaseScanner):
                                 link_member,
                                 members_by_name,
                                 resolved_payload_cache,
+                                resolved_member_path_cache,
+                                link_resolution_state,
                             )
+                            if link_resolution_state.exhausted:
+                                scan_complete = False
+                                reason = "oci_link_resolution_limit_exceeded"
+                                self._mark_incomplete_coverage(result, reason)
+                                result.add_check(
+                                    name="Layer Link Resolution Budget Check",
+                                    passed=False,
+                                    message=(
+                                        f"Layer {self._normalize_layer_ref(layer_ref)} link resolution exceeded "
+                                        f"the bounded work limit ({link_resolution_state.max_steps} steps)"
+                                    ),
+                                    severity=IssueSeverity.INFO,
+                                    location=f"{path}:{layer_ref}:{link_member.name}",
+                                    details={
+                                        "layer": layer_ref,
+                                        "member": link_member.name,
+                                        "resolution_steps": link_resolution_state.steps,
+                                        "max_resolution_steps": link_resolution_state.max_steps,
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": reason,
+                                    },
+                                    rule_code="S902",
+                                )
+                                break
                             payload_key = (
                                 (payload_member.offset_data, matched_ext) if payload_member is not None else None
                             )
