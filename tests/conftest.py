@@ -95,6 +95,7 @@ def pytest_runtest_setup(item):
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_picklescan_adapter.py",
+            "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
@@ -216,6 +217,7 @@ def pytest_runtest_setup(item):
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
+            "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
@@ -627,6 +629,8 @@ def mock_cli_scan_command():
         mock_model.files_scanned = mock_result_dict["files_scanned"]
         mock_model.bytes_scanned = mock_result_dict["bytes_scanned"]
         mock_model.has_errors = mock_result_dict["has_errors"]
+        mock_model.assets = mock_result_dict["assets"]
+        mock_model.file_metadata = mock_result_dict["file_metadata"]
 
         mock_scan.return_value = mock_model
         yield mock_scan

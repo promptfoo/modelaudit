@@ -24,10 +24,20 @@ def _nested_overlong_protocol0_line_operand() -> bytes:
 
 
 def _long_scalar_before_reduce_protocol0_pickle(opcode: bytes) -> bytes:
-    if opcode == b"I":
+    if opcode == b"F":
+        scalar = b"F" + (b"1" * 257) + b"\n"
+    elif opcode == b"I":
         scalar = b"I" + (b"1" * 257) + b"\n"
+    elif opcode == b"L":
+        scalar = b"L" + (b"1" * 256) + b"L\n"
+    elif opcode == b"P":
+        scalar = b"P" + (b"A" * 257) + b"\n"
     elif opcode == b"S":
         scalar = b"S'" + (b"A" * 257) + b"'\n"
+    elif opcode == b"g":
+        scalar = b"Np0\n0g" + (b"0" * 257) + b"\n"
+    elif opcode == b"p":
+        scalar = b"Np" + (b"0" * 257) + b"\n"
     else:
         scalar = b"V" + (b"A" * 257) + b"\n"
     return scalar + b"0cos\nsystem\n(S'id'\ntR."
@@ -189,6 +199,52 @@ def test_scan_bytes_detects_wrapped_base64_pickle_after_long_protocol0_scalar(
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
+@pytest.mark.parametrize("opcode", [b"F", b"I", b"L", b"P", b"S", b"V", b"g", b"p"])
+@pytest.mark.parametrize("decoded_prefix_len", [0, 1, 2])
+def test_scan_bytes_detects_base64_pickle_at_each_decoded_offset(
+    opcode: bytes,
+    decoded_prefix_len: int,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode((b"X" * decoded_prefix_len) + nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-long-scalar-decoded-offset.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("opcode", [b"g", b"p"])
+def test_scan_bytes_does_not_charge_contextual_probe_prefix_to_nested_limit(opcode: bytes) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-contextual-line-exact-nested-limit.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload),
+            max_string_literal_scan_chars=len(encoded) + SCAN_LIMIT_OVERHEAD_BYTES,
+        ),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    encoded_findings = [finding for finding in report.findings if finding.rule_code == "S601"]
+    assert encoded_findings
+    assert all(
+        isinstance(payload_size := finding.details.get("payload_size"), int)
+        and payload_size <= len(nested_payload)
+        and finding.details.get("analysis_incomplete") is not True
+        for finding in encoded_findings
+    )
+    assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
+
+
 @pytest.mark.parametrize("separator", ["!", " "])
 def test_scan_bytes_detects_lenient_base64_pickle_after_long_protocol0_scalar(
     separator: str,
@@ -254,7 +310,7 @@ def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None
     assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
 
 
-@pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
+@pytest.mark.parametrize("opcode", [b"F", b"I", b"L", b"S", b"V", b"g", b"p"])
 def test_scan_bytes_keeps_wrapped_benign_long_scalar_base64_pickle_clean(opcode: bytes) -> None:
     nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"0cos", maxsplit=1)[0] + b"."
     encoded = base64.b64encode(nested_payload).decode("ascii")
