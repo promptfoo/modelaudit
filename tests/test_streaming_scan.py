@@ -3,11 +3,13 @@
 import logging
 import os
 import pickle
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
@@ -17,9 +19,11 @@ from unittest.mock import patch
 import pytest
 
 from modelaudit.core import (
+    _complete_validated_shard_family_sources,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
     determine_exit_code,
+    scan_file,
     scan_model_directory_or_file,
     scan_model_streaming,
 )
@@ -663,6 +667,55 @@ def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings
         assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
 
 
+def test_streaming_shard_alias_aba_cannot_hide_malicious_content() -> None:
+    """Scanning must stay bound to the shard target selected before inspection."""
+    safe_header = b'{"__metadata__":{"format":"pt"}}'
+    malicious_header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    )
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        swaps: dict[str, tuple[Path, Path, Path]] = {}
+        for shard_index in range(1, 3):
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            malicious = root / "malicious.safetensors"
+            safe = root / "safe.safetensors"
+            malicious.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header + b"\0")
+            safe.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
+            alias = root / f"model-{shard_index:05d}-of-00002.safetensors"
+            alias.symlink_to(malicious.name)
+            shards.append(alias)
+            swaps[str(alias)] = (alias, malicious, safe)
+
+        real_scan_file = scan_file
+
+        def swap_during_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            entry = swaps.get(path)
+            if entry is None:
+                return real_scan_file(path, config=config)
+            alias, _malicious, safe = entry
+            alias.unlink()
+            alias.symlink_to(safe.name)
+            try:
+                return real_scan_file(path, config=config)
+            finally:
+                alias.unlink()
+                alias.symlink_to("malicious.safetensors")
+
+        with patch("modelaudit.core.scan_file", side_effect=swap_during_scan):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert all(shard.resolve().name == "malicious.safetensors" for shard in shards)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_does_not_reconcile_distinct_remote_model_directories() -> None:
     """One remote stream must not combine complementary shards from distinct logical parents."""
     with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
@@ -779,6 +832,28 @@ def test_stream_staging_family_group_rejects_plain_persistent_root(tmp_path: Pat
     assert "family_group" not in next(iter(snapshot.values()))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_stream_staging_family_group_rejects_publicly_writable_temp_root(tmp_path: Path) -> None:
+    """A forgeable temp prefix must not authorize a publicly mutable shard family."""
+    shard_dir = Path(tempfile.gettempdir()) / f"modelaudit_stream_public_{uuid.uuid4().hex}"
+    shard_dir.mkdir(mode=0o777)
+    shard_dir.chmod(0o777)
+    try:
+        shard_path = shard_dir / "model-00001-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+
+        snapshot = _snapshot_validated_shard_target(
+            str(shard_path),
+            family_group="attacker-controlled",
+            family_group_policy="stream_staging",
+        )
+
+        assert snapshot
+        assert "family_group" not in next(iter(snapshot.values()))
+    finally:
+        shutil.rmtree(shard_dir)
+
+
 def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() -> None:
     """An attacker-controlled shard count must not allocate the declared range."""
     script = "\n".join(
@@ -800,6 +875,66 @@ def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() 
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_cross_directory_shard_reconciliation_distinguishes_reused_inode_generations() -> None:
+    """Sequential streamed files may legitimately reuse an inode after deletion."""
+    shard_one = "/tmp/part-1/model-00001-of-00002.safetensors"
+    shard_two = "/tmp/part-2/model-00002-of-00002.safetensors"
+    targets: dict[str, dict[str, int | str]] = {
+        shard_one: {
+            "resolved_path": "/tmp/part-1/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 100,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+        shard_two: {
+            "resolved_path": "/tmp/part-2/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 200,
+            "ctime_ns": 200,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+    }
+
+    assert _complete_validated_shard_family_sources(targets) == {shard_one, shard_two}
+
+
+def test_cross_directory_shard_reconciliation_rejects_sequential_hardlinks() -> None:
+    """Deleting one hardlink must not make its peer look like a reused inode generation."""
+    shard_one = "/tmp/part-1/model-00001-of-00002.safetensors"
+    shard_two = "/tmp/part-2/model-00002-of-00002.safetensors"
+    targets: dict[str, dict[str, int | str]] = {
+        shard_one: {
+            "resolved_path": "/tmp/part-1/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 100,
+            "nlink": 2,
+            "family_group": "stream-staging:test",
+        },
+        shard_two: {
+            "resolved_path": "/tmp/part-2/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 200,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+    }
+
+    assert _complete_validated_shard_family_sources(targets) == set()
 
 
 def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> None:

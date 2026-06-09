@@ -710,6 +710,43 @@ def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tm
     )
 
 
+def test_scan_cross_directory_shards_keeps_ambiguous_incomplete_families(tmp_path: Path) -> None:
+    """Unmatched shards must not complete each other through a shared fallback group."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    incomplete_paths: set[str] = set()
+    for family_name, shard_directory_name, shard_index in (
+        ("complete", "left", 1),
+        ("complete", "right", 2),
+        ("incomplete-a", "left", 1),
+        ("incomplete-b", "right", 2),
+    ):
+        shard_dir = tmp_path / family_name / shard_directory_name
+        shard_dir.mkdir(parents=True)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+        if family_name.startswith("incomplete-"):
+            incomplete_paths.add(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is False
+    missing_locations = {
+        issue.get("location")
+        for issue in output_payload["issues"]
+        if issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+    }
+    assert missing_locations == incomplete_paths
+
+
 def test_scan_directory_does_not_assume_cross_directory_shard_family(tmp_path: Path) -> None:
     """The explicit-family opt-in must not combine shards discovered through a directory input."""
     header = b'{"__metadata__":{"format":"pt"}}'
@@ -749,6 +786,21 @@ def test_explicit_shard_family_groups_reject_resolved_non_shard_target(
     shard_link.symlink_to(target)
 
     assert _explicit_local_shard_family_groups((str(shard_link),)) == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_explicit_shard_family_groups_reject_publicly_writable_parents(tmp_path: Path) -> None:
+    """Cross-directory reconciliation must not trust mutable public staging directories."""
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir(mode=0o777)
+        shard_dir.chmod(0o777)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+        shard_paths.append(str(shard_path))
+
+    assert _explicit_local_shard_family_groups(tuple(shard_paths)) == {}
 
 
 def test_scan_multiple_cross_directory_shards_requires_explicit_family_opt_in(tmp_path: Path) -> None:
