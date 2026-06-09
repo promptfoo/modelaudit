@@ -1,5 +1,7 @@
 import pickle
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import MagicMock
 from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
@@ -85,6 +87,20 @@ class _FakeLargeRemoteFileSystem:
         return _FakeLargeRemoteFile(self._payload, self._read_sizes, self._first_read_limit)
 
 
+def _mock_stream_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    declared_size: object,
+    payload: bytes,
+) -> MagicMock:
+    fs = MagicMock()
+    fs.info.return_value = {"size": declared_size}
+    fs.open.return_value.__enter__.return_value = BytesIO(payload)
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda _url: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda _protocol, **_kwargs: fs)
+    return fs
+
+
 def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     signed_url = "https://bucket.example/model.pkl%3FX-Amz-Signature%3Dsecret"
     double_encoded_signed_url = "https://bucket.example/model.pkl%253FX-Amz-Signature%253Dsecret"
@@ -101,6 +117,86 @@ def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
     assert streaming.stream_source_path(double_encoded_literal_question_mark) == "/model?v1.pkl"
     assert streaming.stream_source_path(literal_question_mark_with_signed_query) == "/model?v1.pkl"
     assert streaming.can_stream_analyze(literal_question_mark_with_signed_query, PickleScanner()) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "s3://bucket/model?variant.pkl",
+        "gs://bucket/model#variant.pkl",
+        "r2://bucket/model?variant#fragment.pkl",
+    ],
+)
+def test_stream_source_path_preserves_native_object_key_delimiters(url: str) -> None:
+    assert streaming.stream_source_path(url).endswith(".pkl")
+    assert streaming.can_stream_analyze(url, PickleScanner()) is True
+
+
+def test_stream_analyze_file_uses_normalized_provider_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = MagicMock()
+    fs.info.return_value = {"size": 4}
+    fs.open.return_value.__enter__.return_value = BytesIO(b"data")
+    filesystem = MagicMock(return_value=fs)
+    source_url = "https://bucket.s3.us-west-2.amazonaws.com/model.pkl"
+    normalized_url = "s3://bucket/model.pkl"
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda _url: "s3")
+    monkeypatch.setattr(
+        streaming,
+        "get_cloud_filesystem_config",
+        lambda _url: ("s3", normalized_url, {"anon": True}),
+    )
+    monkeypatch.setattr(fsspec, "filesystem", filesystem)
+
+    result, analysis_complete = streaming.stream_analyze_file(source_url, RecordingStreamScanner())
+
+    assert result is not None
+    assert analysis_complete is True
+    filesystem.assert_called_once_with("s3", anon=True)
+    fs.info.assert_called_once_with(normalized_url)
+    fs.open.assert_called_once_with(normalized_url, "rb")
+
+
+def test_stream_analyze_file_preserves_authoritative_coverage_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MisreportingScanner(RecordingStreamScanner):
+        def scan_stream(self, file_obj: object, size: int, source: str = "<stream>") -> ScanResult:
+            result = super().scan_stream(file_obj, size, source)
+            result.metadata.update(
+                {
+                    "analysis_complete": True,
+                    "bytes_analyzed": 999,
+                    "bytes_complete": True,
+                    "file_size": 1,
+                    "file_size_known": True,
+                    "max_bytes": 999,
+                    "streaming_analysis": False,
+                }
+            )
+            return result
+
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=100, payload=b"payload", read_sizes=read_sizes)
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda _url: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda _protocol, **_kwargs: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/model.pkl",
+        MisreportingScanner(),
+        max_bytes=4,
+    )
+
+    assert result is not None
+    assert analysis_complete is False
+    assert result.metadata["analysis_complete"] is False
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["file_size"] == 100
+    assert result.metadata["file_size_known"] is True
+    assert result.metadata["reported_file_size"] == 100
+    assert result.metadata["max_bytes"] == 4
+    assert result.metadata["streaming_analysis"] is True
 
 
 def test_stream_analyze_file_default_read_is_bounded_for_large_remote(
@@ -585,6 +681,79 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path: Path, monkeyp
     assert result.metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
+def test_stream_analyze_file_bounds_negative_declared_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = _mock_stream_filesystem(monkeypatch, declared_size=-1, payload=b"malicious payload")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["file_size_known"] is False
+    assert result.metadata["bytes_analyzed"] == 4
+    fs.open.assert_called_once()
+
+
+def test_stream_analyze_file_marks_short_reads_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=8, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=8)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
+
+
+def test_stream_analyze_file_detects_underreported_size_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=2, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 3
+    assert result.metadata["bytes_complete"] is False
+    assert result.metadata["file_size"] is None
+    assert result.metadata["file_size_known"] is False
+    assert result.metadata["reported_file_size"] == 2
+
+
+def test_stream_analyze_file_detects_content_reported_as_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=0, payload=b"malicious payload")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 1
+    assert result.metadata["bytes_complete"] is False
+
+
+def test_stream_analyze_file_confirms_reported_empty_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = _mock_stream_filesystem(monkeypatch, declared_size=0, payload=b"")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_complete"] is True
+    assert result.metadata["analysis_complete"] is False
+    fs.open.assert_called_once()
+
+
+def test_stream_analyze_file_fails_closed_when_declared_size_equals_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_stream_filesystem(monkeypatch, declared_size=4, payload=b"1234")
+
+    result, was_complete = streaming.stream_analyze_file("file:///model.pkl", HeaderOnlyScanner(), max_bytes=4)
+
+    assert result is not None
+    assert was_complete is False
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["bytes_complete"] is False
 
 
 def test_stream_analyze_file_returns_clean_partial_scanner_result(
