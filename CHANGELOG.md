@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
