@@ -179,6 +179,9 @@ def test_looks_like_pickle_sniffs_binary_and_protocol_zero_payloads() -> None:
     assert _looks_like_pickle(pickle.dumps({"safe": True}, protocol=4)) is True
     assert _looks_like_pickle(b"\x80\x01K\x01.") is True
     assert _looks_like_pickle(b"cos\nsystem\n.") is True
+    assert _looks_like_pickle(b"].") is True
+    assert _looks_like_pickle(b"\x88.") is True
+    assert _looks_like_pickle(b"\x89.") is True
     assert _looks_like_pickle(b"not a pickle") is False
 
 
@@ -1752,7 +1755,7 @@ def test_raw_cve_setitem_detection_ignores_unparsed_tail_strings(tmp_path: Path)
 
 def test_raw_cve_setitem_detection_is_not_suppressed_by_comment_token(tmp_path: Path) -> None:
     path = tmp_path / "comment-token-setitem.pkl"
-    path.write_bytes(b"(dS'_rebuild_tensor # comment token is not a bypass'\nS'value'\ns.")
+    path.write_bytes(b"\x80\x02S'_rebuild_tensor # comment token is not a bypass'\n)\x81S'key'\nS'value'\ns.")
 
     result = PickleScanner().scan(str(path))
 
@@ -1792,7 +1795,7 @@ def test_raw_cve_attributions_are_deduplicated_by_rule(
 
     monkeypatch.setattr(cve_patterns, "analyze_cve_patterns", duplicate_analyze_cve_patterns)
     path = tmp_path / "duplicate-setitem-attribution.pkl"
-    path.write_bytes(b"(dS'_rebuild_tensor # comment token is not a bypass'\nS'value'\ns.")
+    path.write_bytes(b"\x80\x02S'_rebuild_tensor # comment token is not a bypass'\n)\x81S'key'\nS'value'\ns.")
 
     result = PickleScanner().scan(str(path))
 
@@ -1832,7 +1835,7 @@ def test_raw_cve_comment_only_text_does_not_trigger_setitem(tmp_path: Path) -> N
 def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_literal(tmp_path: Path) -> None:
     path = tmp_path / "doc-literal-real-global.pkl"
     path.write_bytes(
-        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+        b"\x80\x02S'# _rebuild_tensor\\n# documentation only'\n0ctorch\n_rebuild_tensor_v2\n)RS'key'\nS'value'\ns."
     )
 
     result = PickleScanner().scan(str(path))
@@ -1844,7 +1847,7 @@ def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_litera
 def test_rebuild_tensor_documentation_literal_detector_behavior() -> None:
     doc_only_payload = pickle.dumps({"doc": "# _rebuild_tensor\n# documentation only"}, protocol=4)
     real_global_payload = (
-        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+        b"\x80\x02S'# _rebuild_tensor\\n# documentation only'\n0ctorch\n_rebuild_tensor_v2\n)RS'key'\nS'value'\ns."
     )
 
     assert _rebuild_tensor_indicators_are_documentation_literals(doc_only_payload) is True
@@ -1861,7 +1864,7 @@ def test_raw_cve_rebuild_tensor_doc_filter_uses_rust_import_metadata(
     )
     path = tmp_path / "rust-rebuild-tensor-global.pkl"
     path.write_bytes(
-        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+        b"\x80\x02S'# _rebuild_tensor\\n# documentation only'\n0ctorch\n_rebuild_tensor_v2\n)RS'key'\nS'value'\ns."
     )
 
     result = PickleScanner().scan(str(path))
@@ -1873,7 +1876,7 @@ def test_raw_cve_rebuild_tensor_doc_filter_uses_rust_import_metadata(
     )
 
 
-def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path: Path) -> None:
+def test_opcode_summary_tracks_memoized_stack_global_in_dict_without_setitem_cve(tmp_path: Path) -> None:
     payload = b"\x80\x04\x8c\x02os\x94}\x94\x8c\x06system\x94h\x00h\x02\x93s."
     path = tmp_path / "memoized-stack-global.pkl"
     path.write_bytes(payload)
@@ -1882,9 +1885,7 @@ def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path:
     result = PickleScanner().scan(str(path))
 
     assert summary["dangerous_globals"] == ["os.system"]
-    assert any(
-        issue.rule_code == "S209" and issue.details.get("associated_global") == "os.system" for issue in result.issues
-    )
+    assert not any(issue.rule_code == "S209" for issue in result.issues)
 
 
 def test_raw_cve_setitem_scan_uses_rust_metadata_not_python_opcode_summary(
@@ -1896,7 +1897,7 @@ def test_raw_cve_setitem_scan_uses_rust_metadata_not_python_opcode_summary(
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner._pickle_opcode_summary", fail_opcode_summary)
     path = tmp_path / "rust-metadata-stack-global.pkl"
-    path.write_bytes(b"\x80\x04\x8c\x02os\x94}\x94\x8c\x06system\x94h\x00h\x02\x93s.")
+    path.write_bytes(b"\x80\x04\x8c\x02os\x8c\x06system\x93)R\x8c\x03key\x8c\x05values.")
 
     result = PickleScanner().scan(str(path))
 
