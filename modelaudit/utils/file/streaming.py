@@ -36,9 +36,7 @@ def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner", max_bytes: 
     else:
         configured_stream_max = scanner.config.get("streaming_max_bytes")
         resolved_max = (
-            configured_stream_max
-            if _is_positive_int(configured_stream_max)
-            else STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+            configured_stream_max if _is_positive_int(configured_stream_max) else STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
         )
 
     for config_key in ("max_file_size", "max_file_read_size"):
@@ -48,13 +46,27 @@ def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner", max_bytes: 
     return resolved_max
 
 
-def _is_unproven_partial_scan_issue(issue: Any) -> bool:
+def _is_unproven_partial_scan_issue(issue: Any, *, known_file_size: int | None) -> bool:
     """Return whether an issue can be explained solely by a bounded prefix ending."""
     details = getattr(issue, "details", None)
     if not isinstance(details, dict):
         return False
     if details.get("tamper_type") == "oversized_frame":
-        return True
+        if details.get("overrun_boundary") in {"stop", "next_frame"}:
+            return False
+        position = details.get("position")
+        frame_length = details.get("frame_length")
+        if known_file_size is None:
+            return True
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or isinstance(frame_length, bool)
+            or not isinstance(frame_length, int)
+        ):
+            return False
+        frame_payload_offset = position + 9
+        return frame_length <= max(known_file_size - frame_payload_offset, 0)
     if details.get("analysis_incomplete") is not True:
         return False
     return details.get("notice_code") == "parse_incomplete" or details.get("category") in {
@@ -190,11 +202,7 @@ def stream_analyze_file(
         extra_byte_observed = False
         with fs.open(url, "rb") as f:
             content = f.read(bytes_to_read)
-            if (
-                known_file_size is not None
-                and known_file_size < resolved_max_bytes
-                and len(content) == known_file_size
-            ):
+            if known_file_size is not None and known_file_size < resolved_max_bytes and len(content) == known_file_size:
                 # A legal short read can stop at the stale reported size even
                 # when the object grew. Probe EOF separately before treating
                 # exact-size coverage as complete.
@@ -248,7 +256,16 @@ def stream_analyze_file(
         if scan_result is not None:
             scanner_issues = list(scan_result.issues)
             if not bytes_complete:
-                scanner_issues = [issue for issue in scanner_issues if not _is_unproven_partial_scan_issue(issue)]
+                proof_file_size = (
+                    known_file_size
+                    if known_file_size is not None and bytes_read <= known_file_size and not extra_byte_observed
+                    else None
+                )
+                scanner_issues = [
+                    issue
+                    for issue in scanner_issues
+                    if not _is_unproven_partial_scan_issue(issue, known_file_size=proof_file_size)
+                ]
             issues.extend(scanner_issues)
             metadata.update(scan_result.metadata)
             if not scanner_issues and metadata.get("pickle_verdict") == "suspicious":

@@ -669,6 +669,52 @@ def test_stream_analyze_file_preserves_malicious_findings_from_partial_scan(
     assert result.metadata["scan_outcome"] == "inconclusive"
 
 
+def test_stream_analyze_file_preserves_proven_oversized_frame_from_partial_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed_pickle = b"\x80\x04\x95" + (1000).to_bytes(8, "little") + b"N."
+    payload = malformed_pickle + (b"padding" * 16)
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload), payload=payload, read_sizes=read_sizes)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/malformed.pkl",
+        PickleScanner(),
+        max_bytes=len(malformed_pickle),
+    )
+
+    assert analysis_complete is False
+    assert result is not None
+    assert any(issue.details.get("tamper_type") == "oversized_frame" for issue in result.issues)
+    assert result.metadata["scan_outcome"] == "inconclusive"
+
+
+def test_stream_analyze_file_does_not_use_stale_size_to_prove_oversized_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+    read_sizes: list[int] = []
+    fake_fs = _FakeLargeRemoteFileSystem(size=len(payload) - 2, payload=payload, read_sizes=read_sizes)
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "s3")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: fake_fs)
+
+    result, analysis_complete = streaming.stream_analyze_file(
+        "s3://bucket/growing.pkl",
+        PickleScanner(),
+    )
+
+    assert read_sizes == [len(payload) - 1]
+    assert analysis_complete is False
+    assert result is not None
+    assert not any(issue.details.get("tamper_type") == "oversized_frame" for issue in result.issues)
+    assert result.metadata["pickle_verdict"] == "unknown"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+
+
 def test_stream_analyze_file_returns_clean_partial_header_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
