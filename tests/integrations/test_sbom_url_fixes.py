@@ -143,6 +143,41 @@ class TestSBOMURLFixes:
         for leaked in ("password", "path-secret", "query-secret"):
             assert leaked not in sbom_json
 
+    @pytest.mark.parametrize(
+        ("raw_path", "safe_ref", "secret"),
+        [
+            (r"C:\models\token=windows-secret\model.pkl", "<source redacted>", "windows-secret"),
+            (r"\\host\share\password=unc-secret\model.pkl", "<source redacted>", "unc-secret"),
+            ("file:///tmp/model.pkl%3Ftoken%3Dfile-secret", "file:///tmp/model.pkl", "file-secret"),
+            (
+                "file:///tmp/model.pkl%253Ftoken%253Ddouble-secret",
+                "file:///tmp/model.pkl",
+                "double-secret",
+            ),
+            (
+                "api-key@bucket.example/model.pkl?token=query-secret",
+                "bucket.example/model.pkl",
+                "api-key",
+            ),
+            (
+                "https:/single-key@bucket.example/model.pkl",
+                "https://bucket.example/model.pkl",
+                "single-key",
+            ),
+        ],
+    )
+    def test_sbom_redacts_local_and_userinfo_edge_credentials(
+        self,
+        raw_path: str,
+        safe_ref: str,
+        secret: str,
+    ) -> None:
+        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
+        component = json.loads(sbom_json)["components"][0]
+
+        assert component["bom-ref"] == safe_ref
+        assert secret not in sbom_json
+
     def test_distinct_redacted_sources_keep_stable_component_refs(self) -> None:
         paths = [
             "https://storage.example/model.pkl?revision=first&token=secret-one",

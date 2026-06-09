@@ -97,6 +97,48 @@ def test_noncanonical_source_credentials_are_redacted(raw_path: str, safe_path: 
         assert leaked not in output
 
 
+@pytest.mark.parametrize(
+    ("raw_path", "safe_path", "secret"),
+    [
+        (r"C:\models\token=windows-secret\model.pkl", "<source redacted>", "windows-secret"),
+        (r"\\host\share\password=unc-secret\model.pkl", "<source redacted>", "unc-secret"),
+        ("file:///tmp/model.pkl%3Ftoken%3Dfile-secret", "file:///tmp/model.pkl", "file-secret"),
+        ("file:///tmp/model.pkl%253Ftoken%253Ddouble-secret", "file:///tmp/model.pkl", "double-secret"),
+        (
+            "api-key@bucket.example/model.pkl?token=query-secret",
+            "bucket.example/model.pkl",
+            "api-key",
+        ),
+        ("https:/single-key@bucket.example/model.pkl", "https://bucket.example/model.pkl", "single-key"),
+    ],
+)
+def test_edge_credentials_are_redacted_across_export_sinks(
+    raw_path: str,
+    safe_path: str,
+    secret: str,
+) -> None:
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=raw_path, type="pickle")]
+    result.issues = [
+        Issue(
+            message=f"Unsafe model from {raw_path}",
+            severity=IssueSeverity.WARNING,
+            location=raw_path,
+            details={"source_url": raw_path},
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    sarif_output = format_sarif_output(result, [raw_path])
+    json_output = _format_scan_output(result, [raw_path], output_format="json", verbose=True)
+    text_output = _format_scan_output(result, [raw_path], output_format="text", verbose=True)
+
+    assert json.loads(sarif_output)["runs"][0]["invocations"][0]["arguments"] == [safe_path]
+    for output in (sarif_output, json_output, text_output):
+        assert secret not in output
+
+
 def test_noncanonical_userinfo_rotation_preserves_fingerprint() -> None:
     def fingerprint(password: str) -> str:
         raw_path = f"//user:{password}@bucket.example/model.pkl?token=secret"
@@ -170,6 +212,27 @@ def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "local_path",
+    [
+        r"C:\models\sessionTokenCache=public\model.pkl",
+        r"\\host\share\password_policy=public\model.pkl",
+    ],
+)
+def test_nonexistent_windows_and_unc_near_matches_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+
+
+def test_existing_windows_assignment_filename_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    local_path = r"C:\models\token=literal-filename\model.pkl"
+    monkeypatch.setattr(
+        "modelaudit.integrations.source_redaction._local_path_exists",
+        lambda source: source == local_path,
+    )
+
+    assert redact_source_identifier(local_path) == local_path
+
+
+@pytest.mark.parametrize(
     ("local_path", "safe_path"),
     [
         (r"C:\models\model.pkl?token=windows-secret", r"C:\models\model.pkl"),
@@ -178,6 +241,18 @@ def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
 )
 def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path: str, safe_path: str) -> None:
     assert redact_source_identifier(local_path) == safe_path
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file:///tmp/model%3Fv1.pkl",
+        "file:///tmp/model.pkl%3Fversion%3D1",
+        "user@example.com",
+    ],
+)
+def test_encoded_file_names_and_email_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
 
 
 def test_unclassifiable_mapping_keys_fail_closed() -> None:

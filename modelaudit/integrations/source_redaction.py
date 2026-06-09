@@ -26,15 +26,15 @@ _URL_TOKEN_RE = re.compile(
 _URL_LIKE_PREFIX_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 _USERINFO_IDENTIFIER_RE = re.compile(
     r"^(?P<prefix>(?:(?P<scheme>[a-z][a-z0-9+.-]*):/{1,2}|//)?)"
-    r"(?P<userinfo>[^/\s?#@]+(?::|%(?:25)*3a)[^/\s?#@]+(?:@|%(?:25)*40))"
-    r"(?P<host>[^/\s?#]+)(?P<suffix>.*)$",
+    r"(?P<userinfo>[^/\s?#@]+(?:@|%(?:25)*40))"
+    r"(?P<host>[^/\s?#@]+)(?P<suffix>.*)$",
     re.IGNORECASE,
 )
 _USERINFO_TOKEN_RE = re.compile(
     r"(?<![0-9A-Za-z_%.-])(?P<identifier>"
     r"(?:(?:[a-z][a-z0-9+.-]*):/{1,2}|//)?"
-    r"[^\s\"'<>/@?#]+(?::|%(?:25)*3a)[^\s\"'<>/@?#]+(?:@|%(?:25)*40)"
-    r"[^\s\"'<>/?#]+(?:/[^\s\"'<>]*)?"
+    r"[^\s\"'<>/@?#]+(?:@|%(?:25)*40)"
+    r"[^\s\"'<>/?#@]+(?:/[^\s\"'<>]*)?"
     r")",
     re.IGNORECASE,
 )
@@ -144,14 +144,16 @@ def redact_source_identifier(source: str) -> str:
         return f"stream://{_redact_url_identifier(safe_stream_url)}"
     if _URL_LIKE_PREFIX_RE.match(normalized_source):
         parts = urlsplit(normalized_source)
-        if (
-            parts.scheme.casefold() == "file"
-            and not parts.username
-            and not parts.password
-            and not parts.query
-            and not parts.fragment
-        ):
-            return source
+        if parts.scheme.casefold() == "file" and not parts.username and not parts.password:
+            comparison_source = _normalize_percent_encoded_url_delimiters_for_display(normalized_source)
+            comparison_parts = urlsplit(comparison_source)
+            if _has_sensitive_path_assignment(comparison_parts.path):
+                return _redact_url_identifier(comparison_source)
+            if not comparison_parts.query and not comparison_parts.fragment:
+                return source
+            if _has_safe_schemeless_provenance_suffix(source):
+                return source
+            return _redact_url_identifier(comparison_source)
         return _redact_url_identifier(normalized_source)
     if _local_path_exists(source):
         return source
@@ -389,9 +391,20 @@ def _redact_userinfo_identifier(source: str) -> str | None:
 
     scheme = match.group("scheme")
     prefix = match.group("prefix")
-    safe_url = _redact_url_identifier(
-        f"{scheme or 'https'}://{match.group('userinfo')}{match.group('host')}{match.group('suffix')}"
-    )
+    userinfo = match.group("userinfo")
+    suffix = match.group("suffix")
+    if (
+        not prefix
+        and not suffix.startswith(("/", "\\"))
+        and re.search(
+            r":|%(?:25)*3a",
+            userinfo,
+            re.IGNORECASE,
+        )
+        is None
+    ):
+        return None
+    safe_url = _redact_url_identifier(f"{scheme or 'https'}://{userinfo}{match.group('host')}{suffix}")
     if scheme:
         return safe_url
 
@@ -458,7 +471,7 @@ def _redact_path_segment_assignment(segment: str) -> str:
 
 
 def _has_sensitive_path_assignment(path: str) -> bool:
-    return any(_redact_path_segment_assignment(segment) != segment for segment in path.split("/"))
+    return any(_redact_path_segment_assignment(segment) != segment for segment in re.split(r"[\\/]", path))
 
 
 def _strip_encoded_opaque_suffix(source: str) -> str:
@@ -522,14 +535,16 @@ def _redact_local_path_identifier(source: str) -> str:
     safe_source = _redact_local_path_suffix(source)
     if safe_source != source:
         return safe_source
-    if _is_windows_or_unc_path(source):
-        return source
 
     normalized_source = _normalize_percent_encoded_url_delimiters_for_display(
         _normalize_escaped_url_delimiters_for_display(source)
     )
     path_prefix = re.split(r"[?#;]", normalized_source, maxsplit=1)[0]
-    if _USERINFO_TOKEN_RE.search(path_prefix) or _has_sensitive_path_assignment(path_prefix):
+    if _has_sensitive_path_assignment(path_prefix):
+        return "<source redacted>"
+    if _is_windows_or_unc_path(source):
+        return source
+    if _USERINFO_TOKEN_RE.search(path_prefix):
         return "<source redacted>"
     return source
 
