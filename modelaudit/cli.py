@@ -2969,12 +2969,25 @@ def _resolve_scan_source_for_path(
             )
 
             audit_result.aggregate_scan_result(results.model_dump())
-            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
-            if download_refused:
+            download_refusal_type = next(
+                (
+                    issue_type
+                    for issue in results.issues
+                    if isinstance((issue_type := getattr(issue, "type", None)), str)
+                    and issue_type.startswith("mlflow_download_")
+                ),
+                None,
+            )
+            if download_refusal_type is not None:
                 if download_spinner:
                     download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
                 elif runtime.show_styled_output:
-                    click.echo("Download refused by configured size budget")
+                    refusal_reason = (
+                        "configured size budget"
+                        if download_refusal_type == "mlflow_download_budget"
+                        else "MLflow staging safety checks"
+                    )
+                    click.echo(f"Download refused by {refusal_reason}")
             else:
                 record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
                 if download_spinner:
