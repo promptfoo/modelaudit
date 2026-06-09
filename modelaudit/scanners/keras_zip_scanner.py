@@ -388,9 +388,17 @@ class _ConfigTraversalState:
     max_string_literals: int
     max_string_chars: int
     items_seen: int = 0
+    items_pending: int = 0
+    direct_items_seen: int = 0
     string_literals_seen: int = 0
     string_chars_seen: int = 0
+    item_limit_reached: bool = False
+    direct_item_limit_reached: bool = False
     halted: bool = False
+
+    @property
+    def exhausted(self) -> bool:
+        return self.halted or self.item_limit_reached
 
 
 class KerasZipScanner(BaseScanner):
@@ -987,7 +995,7 @@ class KerasZipScanner(BaseScanner):
             },
         )
 
-    def _reserve_config_traversal_item(
+    def _config_traversal_depth_allowed(
         self,
         state: _ConfigTraversalState,
         result: ScanResult,
@@ -1010,22 +1018,121 @@ class KerasZipScanner(BaseScanner):
             )
             return False
 
+        return True
+
+    def _mark_config_item_limit_exceeded(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        actual_items: int,
+    ) -> None:
+        state.item_limit_reached = True
+        self._mark_config_traversal_limit_exceeded(
+            result,
+            _CONFIG_TRAVERSAL_ITEM_LIMIT_EXCEEDED_REASON,
+            name="Config Traversal Item Limit",
+            message=f"Keras config.json traversal exceeds maximum of {state.max_items} items",
+            context=context,
+            details={
+                "actual_items": actual_items,
+                "max_config_traversal_items": state.max_items,
+            },
+        )
+
+    def _reserve_config_traversal_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+    ) -> bool:
+        if not self._config_traversal_depth_allowed(state, result, context=context, depth=depth):
+            return False
+
         if state.items_seen >= state.max_items:
-            state.halted = True
-            self._mark_config_traversal_limit_exceeded(
+            self._mark_config_item_limit_exceeded(
+                state,
                 result,
-                _CONFIG_TRAVERSAL_ITEM_LIMIT_EXCEEDED_REASON,
-                name="Config Traversal Item Limit",
-                message=f"Keras config.json traversal exceeds maximum of {state.max_items} items",
                 context=context,
-                details={
-                    "actual_items": state.items_seen + 1,
-                    "max_config_traversal_items": state.max_items,
-                },
+                actual_items=state.items_seen + 1,
             )
             return False
 
         state.items_seen += 1
+        return True
+
+    def _queue_config_traversal_item(
+        self,
+        pending: deque[Any],
+        item: Any,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+    ) -> bool:
+        if not self._reserve_config_traversal_pending_item(
+            state,
+            result,
+            context=context,
+            depth=depth,
+        ):
+            return False
+
+        pending.append(item)
+        return True
+
+    def _reserve_config_traversal_pending_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+    ) -> bool:
+        if state.exhausted:
+            return False
+        if not self._config_traversal_depth_allowed(state, result, context=context, depth=depth):
+            return False
+        if state.items_seen + state.items_pending >= state.max_items:
+            self._mark_config_item_limit_exceeded(
+                state,
+                result,
+                context=context,
+                actual_items=state.items_seen + state.items_pending + 1,
+            )
+            return False
+
+        state.items_pending += 1
+        return True
+
+    def _reserve_config_direct_item(
+        self,
+        state: _ConfigTraversalState,
+        result: ScanResult,
+        *,
+        context: str,
+        depth: int,
+    ) -> bool:
+        """Reserve bounded work for a direct mapping value not queued for traversal."""
+        if state.halted or state.direct_item_limit_reached:
+            return False
+        if not self._config_traversal_depth_allowed(state, result, context=context, depth=depth):
+            return False
+        if state.direct_items_seen >= state.max_items:
+            state.direct_item_limit_reached = True
+            self._mark_config_item_limit_exceeded(
+                state,
+                result,
+                context=context,
+                actual_items=state.direct_items_seen + 1,
+            )
+            return False
+
+        state.direct_items_seen += 1
         return True
 
     def _record_config_string_literal(
@@ -1055,7 +1162,6 @@ class KerasZipScanner(BaseScanner):
         next_string_chars_seen = state.string_chars_seen + len(value)
         if next_string_chars_seen > state.max_string_chars:
             state.halted = True
-            remaining_chars = max(state.max_string_chars - state.string_chars_seen, 0)
             state.string_chars_seen = state.max_string_chars
             self._mark_config_traversal_limit_exceeded(
                 result,
@@ -1069,7 +1175,7 @@ class KerasZipScanner(BaseScanner):
                     "string_literals_seen": state.string_literals_seen,
                 },
             )
-            return value[:remaining_chars] if remaining_chars > 0 else None
+            return None
 
         state.string_chars_seen = next_string_chars_seen
         return value
@@ -1078,8 +1184,10 @@ class KerasZipScanner(BaseScanner):
         """Walk config.json once to fail closed on budget-exhausted coverage."""
         state = self._new_config_traversal_state()
         pending: deque[tuple[Any, int, str]] = deque([(model_config, 0, "root")])
+        state.items_pending = 1
         while pending and not state.halted:
             node, depth, context = pending.popleft()
+            state.items_pending -= 1
             if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
                 continue
 
@@ -1088,38 +1196,40 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, dict):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, (key, value) in enumerate(node.items()):
+                if state.item_limit_reached:
+                    continue
+                for key, value in node.items():
                     redacted_key = redact_evidence_string(str(key), max_chars=64)
                     key_context = self._config_child_path(context, f".<key:{redacted_key}>")
                     if isinstance(key, str):
                         self._record_config_string_literal(key, state, result, context=key_context)
 
                     child_context = self._config_child_path(context, f".{redacted_key}")
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_context,
-                            depth=depth + 1,
-                        )
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, depth + 1, child_context),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((value, depth + 1, child_context))
                 continue
 
             if isinstance(node, list):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, value in enumerate(node):
-                    child_context = self._config_child_path(context, f"[{queued_items}]")
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_context,
-                            depth=depth + 1,
-                        )
+                if state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, depth + 1, child_context),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((value, depth + 1, child_context))
 
     @staticmethod
     def _has_embedded_weights_limit_reason(result: ScanResult) -> bool:
@@ -1944,8 +2054,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Arbitrary dangerous module references in .keras config can bypass safe_mode "
                         "and execute attacker-controlled code during model loading."
@@ -1972,8 +2082,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Non-allowlisted callable module references may indicate safe_mode bypass "
                         "paths in untrusted .keras config content."
@@ -1996,31 +2106,33 @@ class KerasZipScanner(BaseScanner):
         pending: deque[tuple[Any, str | None, bool, int, str]] = deque(
             [(config_value, None, trusted_container, 0, f"layer:{layer_name}")]
         )
+        state.items_pending = 1
         while pending:
             node, parent_key, container_is_trusted, depth, context = pending.popleft()
+            state.items_pending -= 1
             if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
                 continue
 
             if isinstance(node, list):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, item in enumerate(node):
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=self._config_child_path(context, f"[{queued_items}]"),
-                            depth=depth + 1,
-                        )
-                        break
-                    pending.append(
+                if state.item_limit_reached:
+                    continue
+                for index, item in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
                         (
                             item,
                             parent_key,
                             container_is_trusted,
                             depth + 1,
-                            self._config_child_path(context, f"[{queued_items}]"),
-                        )
-                    )
+                            child_context,
+                        ),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
                 continue
             if not isinstance(node, dict):
                 continue
@@ -2049,30 +2161,27 @@ class KerasZipScanner(BaseScanner):
                         )
 
             next_container_is_trusted = container_is_trusted and not is_serialized_object
-            queued_items = 0
-            remaining_items = max(state.max_items - state.items_seen, 0)
+            if state.item_limit_reached:
+                continue
             for key, value in node.items():
                 if key in {"module", "fn_module", "class_name", "registered_name"}:
                     continue
                 child_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
-                if queued_items >= remaining_items:
-                    self._reserve_config_traversal_item(
-                        state,
-                        result,
-                        context=child_context,
-                        depth=depth + 1,
-                    )
-                    break
-                pending.append(
+                if not self._queue_config_traversal_item(
+                    pending,
                     (
                         value,
                         str(key).lower(),
                         next_container_is_trusted,
                         depth + 1,
                         child_context,
-                    )
-                )
-                queued_items += 1
+                    ),
+                    state,
+                    result,
+                    context=child_context,
+                    depth=depth + 1,
+                ):
+                    break
 
     def _check_layer_module_references(
         self,
@@ -2158,31 +2267,46 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
+            if literal_state.direct_item_limit_reached:
+                continue
             direct_string_values: list[str] = []
             url_candidate_values: list[str] = []
             for key, value in node.items():
                 if literal_state.halted:
                     break
                 value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
-                direct_string_values.extend(
-                    self._extract_string_literals(
-                        value,
-                        result=result,
-                        state=literal_state,
+                value_is_direct_string = isinstance(value, str)
+                if value_is_direct_string:
+                    if not self._reserve_config_direct_item(
+                        literal_state,
+                        result,
                         context=value_context,
-                    )
-                )
+                        depth=1,
+                    ):
+                        break
+                elif literal_state.item_limit_reached:
+                    if not self._reserve_config_direct_item(
+                        literal_state,
+                        result,
+                        context=value_context,
+                        depth=1,
+                    ):
+                        break
+                    continue
                 key_lower = str(key).lower()
-                if key_lower in {"url", "origin", "args", "kwargs"}:
-                    url_candidate_values.extend(
-                        self._extract_string_literals(
-                            value,
-                            include_dict_values=True,
-                            result=result,
-                            state=literal_state,
-                            context=value_context,
-                        )
-                    )
+                is_url_candidate_field = key_lower in {"url", "origin", "args", "kwargs"}
+                extracted_literals = self._extract_string_literals(
+                    value,
+                    include_dict_values=is_url_candidate_field,
+                    result=result,
+                    state=literal_state,
+                    context=value_context,
+                    root_reserved=value_is_direct_string,
+                )
+                if not isinstance(value, dict):
+                    direct_string_values.extend(extracted_literals)
+                if is_url_candidate_field:
+                    url_candidate_values.extend(extracted_literals)
             has_get_file = _has_get_file_reference(direct_string_values)
             has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
@@ -2219,18 +2343,39 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
+            if literal_state.direct_item_limit_reached:
+                continue
 
             direct_string_values: list[str] = []
             for key, value in node.items():
                 if literal_state.halted:
                     break
                 value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
+                value_is_direct_string = isinstance(value, str)
+                if value_is_direct_string:
+                    if not self._reserve_config_direct_item(
+                        literal_state,
+                        result,
+                        context=value_context,
+                        depth=1,
+                    ):
+                        break
+                elif literal_state.item_limit_reached:
+                    if not self._reserve_config_direct_item(
+                        literal_state,
+                        result,
+                        context=value_context,
+                        depth=1,
+                    ):
+                        break
+                    continue
                 direct_string_values.extend(
                     self._extract_string_literals(
                         value,
                         result=result,
                         state=literal_state,
                         context=value_context,
+                        root_reserved=value_is_direct_string,
                     )
                 )
 
@@ -2405,8 +2550,10 @@ class KerasZipScanner(BaseScanner):
         """Detect object-scoped unsafe-deserialization references with bounded traversal."""
         state = self._new_config_traversal_state()
         pending: deque[tuple[Any, int, str, bool]] = deque([(obj, 0, "root", False)])
+        state.items_pending = 1
         while pending:
             node, depth, context, has_ancestor_keras_config_context = pending.popleft()
+            state.items_pending -= 1
             if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
                 continue
 
@@ -2424,16 +2571,46 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, dict):
+                if state.direct_item_limit_reached:
+                    continue
                 has_enable_unsafe = False
                 has_keras_config_context = False
+                deferred_children: list[tuple[Any, int, str]] = []
                 for key, value in node.items():
+                    if state.halted:
+                        return False
+                    child_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
                     if not isinstance(value, str):
+                        if self._reserve_config_traversal_pending_item(
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            deferred_children.append((value, depth + 1, child_context))
+                        elif not self._reserve_config_direct_item(
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
+                            break
                         continue
+                    if not self._reserve_config_direct_item(
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
+                        break
                     token = self._unsafe_deserialization_token(
                         value,
                         state,
                         result,
-                        self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}"),
+                        child_context,
                     )
                     if token is None:
                         continue
@@ -2449,40 +2626,26 @@ class KerasZipScanner(BaseScanner):
                     return True
 
                 child_has_keras_config_context = has_ancestor_keras_config_context or has_keras_config_context
-                queued_items = 0
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for key, value in node.items():
-                    if isinstance(value, str):
-                        continue
-                    child_context = self._config_child_path(
-                        context,
-                        f".{redact_evidence_string(str(key), max_chars=64)}",
-                    )
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_context,
-                            depth=depth + 1,
-                        )
-                        break
-                    pending.append((value, depth + 1, child_context, child_has_keras_config_context))
-                    queued_items += 1
+                pending.extend(
+                    (value, child_depth, child_context, child_has_keras_config_context)
+                    for value, child_depth, child_context in deferred_children
+                )
                 continue
 
             if isinstance(node, list):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, value in enumerate(node):
-                    child_context = self._config_child_path(context, f"[{queued_items}]")
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_context,
-                            depth=depth + 1,
-                        )
+                if state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_context = self._config_child_path(context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, depth + 1, child_context, has_ancestor_keras_config_context),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((value, depth + 1, child_context, has_ancestor_keras_config_context))
 
         return False
 
@@ -2571,23 +2734,18 @@ class KerasZipScanner(BaseScanner):
         if vulnerability_status is False:
             details["keras_version"] = keras_version
             details["metadata_only_assessment"] = True
-            details["parse_status"] = "metadata_non_vulnerable"
-            details["analysis_incomplete"] = True
-            details["scan_outcome_reason"] = _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON
-            self._mark_inconclusive_scan_result(
-                result,
-                _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON,
-            )
+            details["parse_status"] = "untrusted_artifact_version"
+            details["version_source"] = "keras_archive_metadata"
             result.add_check(
-                name="StringLookup External Vocabulary Metadata Check",
+                name="StringLookup External Vocabulary Risk (Untrusted Version Metadata)",
                 passed=False,
                 message=(
                     f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', "
-                    f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
-                    "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
-                    "verification"
+                    f"and archive metadata claims Keras {keras_version} outside the known CVE-2025-12058 "
+                    "vulnerable range (<3.12.0), but artifact-controlled version metadata cannot prove the loader "
+                    "runtime is fixed"
                 ),
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=location,
                 details=details,
                 why=get_cve_2025_12058_explanation("stringlookup_external_vocabulary"),
@@ -3300,14 +3458,19 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
         state: _ConfigTraversalState,
         context: str,
+        root_reserved: bool = False,
     ) -> list[str]:
         """Extract string literals from simple container values."""
         literals: list[str] = []
-        pending: deque[tuple[Any, int, str]] = deque([(value, 0, context)])
+        pending: deque[tuple[Any, int, str, bool]] = deque([(value, 0, context, not root_reserved)])
+        if not root_reserved:
+            state.items_pending = 1
         while pending and not state.halted:
-            node, depth, node_context = pending.popleft()
-            if not self._reserve_config_traversal_item(state, result, context=node_context, depth=depth):
-                continue
+            node, depth, node_context, pending_reservation = pending.popleft()
+            if pending_reservation:
+                state.items_pending -= 1
+                if not self._reserve_config_traversal_item(state, result, context=node_context, depth=depth):
+                    continue
 
             if isinstance(node, str):
                 bounded_value = self._record_config_string_literal(node, state, result, context=node_context)
@@ -3316,55 +3479,54 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, list | tuple | set):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, item in enumerate(node):
-                    child_context = self._config_child_path(node_context, f"[{queued_items}]")
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_context,
-                            depth=depth + 1,
-                        )
+                if state.item_limit_reached:
+                    continue
+                for index, item in enumerate(node):
+                    child_context = self._config_child_path(node_context, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (item, depth + 1, child_context, True),
+                        state,
+                        result,
+                        context=child_context,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((item, depth + 1, child_context))
                 continue
 
             if isinstance(node, dict):
-                queued_items = 0
-                remaining_items = max(state.max_items - state.items_seen, 0)
+                if state.item_limit_reached:
+                    continue
                 if include_dict_keys:
                     for key in node:
                         child_context = self._config_child_path(
                             node_context,
                             f".<key:{redact_evidence_string(str(key), max_chars=64)}>",
                         )
-                        if queued_items >= remaining_items:
-                            self._reserve_config_traversal_item(
-                                state,
-                                result,
-                                context=child_context,
-                                depth=depth + 1,
-                            )
+                        if not self._queue_config_traversal_item(
+                            pending,
+                            (key, depth + 1, child_context, True),
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
                             break
-                        pending.append((key, depth + 1, child_context))
-                        queued_items += 1
-                if include_dict_values and queued_items < remaining_items:
+                if include_dict_values and not state.item_limit_reached:
                     for key, item in node.items():
                         child_context = self._config_child_path(
                             node_context,
                             f".{redact_evidence_string(str(key), max_chars=64)}",
                         )
-                        if queued_items >= remaining_items:
-                            self._reserve_config_traversal_item(
-                                state,
-                                result,
-                                context=child_context,
-                                depth=depth + 1,
-                            )
+                        if not self._queue_config_traversal_item(
+                            pending,
+                            (item, depth + 1, child_context, True),
+                            state,
+                            result,
+                            context=child_context,
+                            depth=depth + 1,
+                        ):
                             break
-                        pending.append((item, depth + 1, child_context))
-                        queued_items += 1
         return literals
 
     @staticmethod
@@ -3482,43 +3644,47 @@ class KerasZipScanner(BaseScanner):
     ) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield all dict nodes with their traversal path."""
         pending: deque[tuple[Any, str, int]] = deque([(obj, path, 0)])
+        state.items_pending = 1
         while pending and not state.halted:
             node, node_path, depth = pending.popleft()
+            state.items_pending -= 1
             if not self._reserve_config_traversal_item(state, result, context=node_path, depth=depth):
                 continue
 
             if isinstance(node, dict):
                 yield node_path, node
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, (key, value) in enumerate(node.items()):
+                if state.item_limit_reached:
+                    continue
+                for key, value in node.items():
                     child_path = self._config_child_path(
                         node_path,
                         f".{redact_evidence_string(str(key), max_chars=64)}",
                     )
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_path,
-                            depth=depth + 1,
-                        )
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, child_path, depth + 1),
+                        state,
+                        result,
+                        context=child_path,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((value, child_path, depth + 1))
                 continue
 
             if isinstance(node, list):
-                remaining_items = max(state.max_items - state.items_seen, 0)
-                for queued_items, value in enumerate(node):
-                    child_path = self._config_child_path(node_path, f"[{queued_items}]")
-                    if queued_items >= remaining_items:
-                        self._reserve_config_traversal_item(
-                            state,
-                            result,
-                            context=child_path,
-                            depth=depth + 1,
-                        )
+                if state.item_limit_reached:
+                    continue
+                for index, value in enumerate(node):
+                    child_path = self._config_child_path(node_path, f"[{index}]")
+                    if not self._queue_config_traversal_item(
+                        pending,
+                        (value, child_path, depth + 1),
+                        state,
+                        result,
+                        context=child_path,
+                        depth=depth + 1,
+                    ):
                         break
-                    pending.append((value, child_path, depth + 1))
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
