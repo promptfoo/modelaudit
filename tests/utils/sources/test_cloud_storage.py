@@ -32,6 +32,7 @@ from modelaudit.utils.sources.cloud_storage import (
     _build_cloud_download_plan,
     _build_safe_local_path,
     _cloud_directory_cache_scope,
+    _cloud_url_local_basename,
     _download_cloud_object,
     _filter_scannable_cloud_files,
     _run_coroutine_sync,
@@ -2367,8 +2368,9 @@ def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_pat
 def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Path) -> None:
     base_url = "s3://bucket/models"
 
-    question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
-    fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
+        fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
 
     assert question_path == tmp_path / "model?one.pkl"
     assert fragment_path == tmp_path / "model#two.pkl"
@@ -2377,12 +2379,58 @@ def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Pat
 
 def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_path: Path) -> None:
     base_url = "s3://bucket/models"
-    first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
-    second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
+        second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
 
     assert first == tmp_path / "model.pkl?X-Amz-Signature=one"
     assert second == tmp_path / "model.pkl?X-Amz-Signature=two"
     assert first != second
+
+
+@pytest.mark.parametrize(
+    ("file_url", "expected_name"),
+    [
+        pytest.param("bucket/models/model?variant.pkl", "model?variant.pkl", id="question-mark"),
+        pytest.param("bucket/models/model#variant.pkl", "model#variant.pkl", id="fragment-marker"),
+    ],
+)
+def test_build_safe_local_path_preserves_protocol_less_literal_delimiters(
+    tmp_path: Path,
+    file_url: str,
+    expected_name: str,
+) -> None:
+    with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+        local_path = _build_safe_local_path("s3://bucket/models", file_url, tmp_path)
+
+    assert local_path == tmp_path / expected_name
+
+
+@pytest.mark.parametrize(
+    "file_url",
+    [
+        "https://bucket.s3.amazonaws.com/models/model.pkl?X-Amz-Signature=secret",
+        "https://bucket.s3.amazonaws.com/models/model.pkl#fragment-secret",
+    ],
+)
+def test_build_safe_local_path_strips_https_query_and_fragment_syntax(tmp_path: Path, file_url: str) -> None:
+    local_path = _build_safe_local_path("https://bucket.s3.amazonaws.com/models", file_url, tmp_path)
+
+    assert local_path == tmp_path / "model.pkl"
+    assert "secret" not in str(local_path)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.urlsplit", side_effect=ValueError("malformed secret URL"))
+def test_cloud_url_local_basename_logs_parse_fallback_without_url(
+    _mock_urlsplit: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="modelaudit.utils.sources.cloud_storage"):
+        basename = _cloud_url_local_basename("model.pkl?token=secret")
+
+    assert basename == "model.pkl?token=secret"
+    assert "Unable to parse cloud URL for local basename; using fallback path handling" in caplog.text
+    assert "token=secret" not in caplog.text
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -3197,6 +3245,17 @@ class TestCloudPathSecurity:
             Path("a/model.pkl"),
             Path("b/model.pkl"),
         ]
+
+    def test_download_plan_preserves_distinct_protocol_less_literal_delimiters(self, tmp_path: Path) -> None:
+        files = [
+            {"path": "bucket/models/model?one.pkl"},
+            {"path": "bucket/models/model#two.pkl"},
+        ]
+
+        with patch("modelaudit.utils.sources.cloud_storage._uses_windows_filename_rules", return_value=False):
+            plan = _build_cloud_download_plan("s3://bucket/models", files, tmp_path)
+
+        assert [local_path.name for _, _, local_path in plan] == ["model?one.pkl", "model#two.pkl"]
 
     @pytest.mark.parametrize(
         "base_url",

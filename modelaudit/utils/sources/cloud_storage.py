@@ -551,7 +551,7 @@ def _cloud_url_local_basename(url: str) -> str:
         if parsed.scheme.casefold() in {"s3", "gs", "gcs", "r2"} and (not parsed.path or parsed.path.endswith("/")):
             return ""
     except Exception:
-        pass
+        logger.debug("Unable to parse cloud URL for local basename; using fallback path handling")
     return _cloud_url_basename(url).replace("\\", "/").rsplit("/", 1)[-1]
 
 
@@ -2054,7 +2054,11 @@ def _protocol_less_cloud_relative_path(base_url: str, file_url: str) -> str:
     """Preserve provider-returned bucket/prefix paths when the scheme is omitted."""
     try:
         base = urlsplit(base_url)
-        file_path = urlsplit(file_url).path.replace("\\", "/").lstrip("/")
+        parsed_file = urlsplit(file_url)
+        # Provider listings commonly return bare object keys. In that form,
+        # URL delimiters are literal key text rather than query/fragment syntax.
+        file_path = parsed_file.path if parsed_file.scheme or parsed_file.netloc else file_url
+        file_path = file_path.replace("\\", "/").lstrip("/")
     except Exception:
         return _cloud_url_local_basename(file_url)
 
