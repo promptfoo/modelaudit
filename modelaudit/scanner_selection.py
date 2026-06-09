@@ -206,6 +206,8 @@ def allows_protobuf_model_candidate_analysis(policy: ScannerSelectionPolicy) -> 
 
 def allows_zip_structure_analysis(policy: ScannerSelectionPolicy, path: str | None = None) -> bool:
     """Return whether a selected route may analyze ZIP structure for this path."""
+    if "zip" in policy.exclude_scanner_ids:
+        return False
     selected_zip_scanner_ids = {
         scanner_id for scanner_id in _ZIP_STRUCTURE_ROUTED_SCANNER_IDS if policy.allows(scanner_id)
     }

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
 - bound Jinja static render analysis and fail closed on CPU-heavy aliased, recursive, container-wrapped, and arithmetic range probes when sandbox workers are unavailable
@@ -65,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
 - require explicit public progress hook egress hosts and reject internal webhook and SMTP destinations before sending scan details.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
-- fail closed on over-entry, oversized, inconsistent, hidden-entry, or trailing-record generic ZIP directories before `zipfile` materializes their entries, while scoping preflight to selected ZIP-backed routes.
+- fail closed on over-entry, oversized, inconsistent, hidden-entry, or trailing-record generic ZIP directories before `zipfile` materializes their entries, keep PyTorch ZIP budgets and loading on one descriptor, and validate generic ZIP symlinks against archive-root containment.
 - detect interpolated Hydra helper configs, legacy Hydra global-state aliases, and unsafe local or remote NeMo model-loader paths.
 - bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
 - keep bounded ExecuTorch ZIP snapshots seekable on Python 3.10 so benign and malicious pickle members remain analyzable

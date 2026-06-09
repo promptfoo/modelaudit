@@ -5,12 +5,15 @@ import io
 import logging
 import os
 import pickletools
+import posixpath
 import re
 import stat
+import struct
 import tempfile
 import zipfile
 from collections.abc import Callable
 from contextlib import suppress
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -22,7 +25,7 @@ from ..scanner_results import (
     mark_inconclusive_scan_result,
 )
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
-from ..utils import sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -134,6 +137,40 @@ _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+CRITICAL_SYSTEM_PATHS: tuple[str, ...] = (
+    "/etc",
+    "/bin",
+    "/usr",
+    "/var",
+    "/lib",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/sbin",
+    "C:\\Windows",
+)
+_WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+)
+_WINDOWS_DEVICE_SUPERSCRIPT_DIGITS = str.maketrans({"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"})
+_UNIX_MODE_ZIP_CREATOR_SYSTEMS: frozenset[int] = frozenset({3, 19})
+
+
+def _targets_windows_reserved_device(target: str) -> bool:
+    """Return whether any target component names a reserved Windows device."""
+    for component in target.replace("\\", "/").split("/"):
+        if not component or component in {".", ".."}:
+            continue
+        basename = component.split(":", 1)[0].split(".", 1)[0].rstrip(" ").upper()
+        if basename.translate(_WINDOWS_DEVICE_SUPERSCRIPT_DIGITS) in _WINDOWS_RESERVED_DEVICE_NAMES:
+            return True
+    return False
+
+
+def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+    """Return whether the entry uses Unix mode metadata to declare a symlink."""
+    return info.create_system in _UNIX_MODE_ZIP_CREATOR_SYSTEMS and stat.S_ISLNK(info.external_attr >> 16)
 
 
 @dataclass(frozen=True)
@@ -255,6 +292,8 @@ class PyTorchZipScanner(BaseScanner):
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
+    MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
+    MAX_SYMLINK_TARGET_COMPRESSED_BYTES: ClassVar[int] = 128 * 1024
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
     MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
@@ -659,6 +698,92 @@ class PyTorchZipScanner(BaseScanner):
             max_bytes=max_bytes,
         )
 
+    def _read_symlink_target(
+        self, zip_file: zipfile.ZipFile, info: zipfile.ZipInfo, result: ScanResult
+    ) -> tuple[str, bool]:
+        """Read a bounded ZIP symlink target and report whether it was complete."""
+        bounded_info = copy(info)
+        bounded_info.file_size = self.MAX_SYMLINK_TARGET_BYTES + 1
+        target = self._read_member_prefix(
+            zip_file,
+            bounded_info,
+            self.MAX_SYMLINK_TARGET_BYTES + 1,
+            phase="symlink_target_validation",
+            result=result,
+        )
+        target_complete = len(target) <= self.MAX_SYMLINK_TARGET_BYTES
+        bounded_target = target[: self.MAX_SYMLINK_TARGET_BYTES]
+        return bounded_target.decode("utf-8", errors="surrogateescape"), target_complete
+
+    @staticmethod
+    def _symlink_payload_bounds_match(zip_file: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+        """Return whether local ZIP metadata bounds the same payload as the central entry."""
+        archive = zip_file.fp
+        end_offset = getattr(info, "_end_offset", None)
+        if archive is None or not isinstance(end_offset, int):
+            return False
+
+        original_position = archive.tell()
+        try:
+            archive.seek(info.header_offset)
+            header = archive.read(30)
+            if len(header) != 30 or header[:4] != b"PK\x03\x04":
+                return False
+
+            local_flags, local_compress_type = struct.unpack_from("<HH", header, 6)
+            local_crc, local_compressed_size, local_file_size = struct.unpack_from("<III", header, 14)
+            filename_length, extra_length = struct.unpack_from("<HH", header, 26)
+            data_offset = info.header_offset + 30 + filename_length + extra_length
+            if data_offset > end_offset or local_flags != info.flag_bits or local_compress_type != info.compress_type:
+                return False
+
+            if not (local_flags & 0x08):
+                local_sizes_match = local_compressed_size in {info.compress_size, 0xFFFFFFFF} and local_file_size in {
+                    info.file_size,
+                    0xFFFFFFFF,
+                }
+                return local_crc == info.CRC and local_sizes_match and data_offset + info.compress_size == end_offset
+
+            descriptor_offset = data_offset + info.compress_size
+            if descriptor_offset > end_offset:
+                return False
+            descriptor_length = end_offset - descriptor_offset
+            if descriptor_length not in {12, 16, 20, 24}:
+                return False
+            archive.seek(descriptor_offset)
+            descriptor = archive.read(descriptor_length)
+            if descriptor.startswith(b"PK\x07\x08"):
+                descriptor = descriptor[4:]
+            if len(descriptor) == 12:
+                crc, compressed_size, file_size = struct.unpack("<III", descriptor)
+            elif len(descriptor) == 20:
+                crc, compressed_size, file_size = struct.unpack("<IQQ", descriptor)
+            else:
+                return False
+            return (crc, compressed_size, file_size) == (info.CRC, info.compress_size, info.file_size)
+        finally:
+            archive.seek(original_position)
+
+    @staticmethod
+    def _resolve_symlink_target(
+        target: str,
+        *,
+        resolved_name: str,
+        extraction_root: str,
+    ) -> tuple[str, bool]:
+        """Resolve a relative symlink target while enforcing the archive extraction root."""
+        if is_absolute_archive_path(target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
+
     def _read_member_to_spooled_file(
         self,
         zip_file: zipfile.ZipFile,
@@ -843,7 +968,7 @@ class PyTorchZipScanner(BaseScanner):
                     duplicate_entry_collisions_found = True
 
             # Check for path traversal
-            _, is_safe = sanitize_archive_path(name, temp_base)
+            resolved_name, is_safe = sanitize_archive_path(name, temp_base)
             if not is_safe:
                 result.add_check(
                     name="Path Traversal Protection",
@@ -857,36 +982,157 @@ class PyTorchZipScanner(BaseScanner):
                 continue
 
             # Check for symlinks (ZIP slip variant attack)
-            is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+            is_symlink = _is_zip_symlink(info)
             if is_symlink:
-                try:
-                    # Read only a bounded prefix (4KB) to avoid DoS from a
-                    # symlink entry that hides a large compressed payload.
-                    # Real symlink targets are short filesystem paths.
-                    target = self._read_member_prefix(
-                        zip_file,
-                        info,
-                        4096,
-                        phase="symlink_target_validation",
-                        result=result,
-                    ).decode("utf-8", "replace")
-                except Exception:
-                    target = "<unreadable>"
-                result.add_check(
-                    name="Symlink Safety Validation",
-                    passed=False,
-                    message=f"Symlink entry detected: {name} -> {target}",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{path}:{name}",
-                    details={
-                        "entry": name,
-                        "target": target,
-                        "risk": "Symlinks in PyTorch models can be used for path traversal attacks",
-                    },
-                    why="Symlinks in model archives are unusual and may indicate an attack attempt",
-                )
+                scan_symlink_content = True
+                if info.file_size > self.MAX_SYMLINK_TARGET_BYTES:
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has an invalid target that exceeds the maximum length",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "target": "<oversized>",
+                            "target_class": "invalid",
+                            "target_size": info.file_size,
+                            "max_target_size": self.MAX_SYMLINK_TARGET_BYTES,
+                        },
+                    )
+                    scan_symlink_content = False
+                elif info.compress_size > self.MAX_SYMLINK_TARGET_COMPRESSED_BYTES:
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has an invalid target with excessive compressed input",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "target": "<compressed-input-too-large>",
+                            "target_class": "invalid",
+                            "compressed_size": info.compress_size,
+                            "max_compressed_size": self.MAX_SYMLINK_TARGET_COMPRESSED_BYTES,
+                        },
+                    )
+                    scan_symlink_content = False
+                elif not self._symlink_payload_bounds_match(zip_file, info):
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has inconsistent ZIP payload bounds",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "target": "<inconsistent-zip-metadata>",
+                            "target_class": "invalid",
+                        },
+                    )
+                    scan_symlink_content = False
+                else:
+                    try:
+                        target, target_complete = self._read_symlink_target(zip_file, info, result)
+                    except Exception as exc:
+                        safe_error = redact_untrusted_error_message(exc)
+                        reason = "pytorch_zip_symlink_target_read_incomplete"
+                        mark_inconclusive_scan_result(result, reason)
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Unable to read symlink target for {name}: {safe_error}",
+                            severity=IssueSeverity.INFO,
+                            rule_code="S902",
+                            location=f"{path}:{name}",
+                            details={
+                                "entry": name,
+                                "exception": safe_error,
+                                "exception_type": type(exc).__name__,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": reason,
+                            },
+                        )
+                        scan_symlink_content = False
+                    else:
+                        safe_target = redact_evidence_string(target, max_chars=1024)
+                        if not target_complete:
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} has an invalid target that exceeds the maximum length",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                            scan_symlink_content = False
+                        elif not target or "\x00" in target:
+                            invalid_reason = "empty" if not target else "contains a NUL byte"
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} has an invalid target that {invalid_reason}",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                        elif _targets_windows_reserved_device(target):
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} targets a reserved Windows device name",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                        else:
+                            _target_resolved, target_safe = self._resolve_symlink_target(
+                                target,
+                                resolved_name=resolved_name,
+                                extraction_root=temp_base,
+                            )
+                            normalized_absolute_target = posixpath.normpath(target.replace("\\", "/"))
+                            targets_critical_system_path = is_absolute_archive_path(target) and is_critical_system_path(
+                                normalized_absolute_target,
+                                CRITICAL_SYSTEM_PATHS,
+                            )
+                            if not target_safe:
+                                if targets_critical_system_path:
+                                    message = f"Symlink {name} points to critical system path: {safe_target}"
+                                    target_class = "critical_system_path"
+                                    rule_code = "S408"
+                                else:
+                                    message = f"Symlink {name} resolves outside extraction directory"
+                                    target_class = "external"
+                                    rule_code = "S406"
+                                result.add_check(
+                                    name="Symlink Safety Validation",
+                                    passed=False,
+                                    message=message,
+                                    severity=IssueSeverity.CRITICAL,
+                                    rule_code=rule_code,
+                                    location=f"{path}:{name}",
+                                    details={"entry": name, "target": safe_target, "target_class": target_class},
+                                )
+                            else:
+                                result.add_check(
+                                    name="Symlink Safety Validation",
+                                    passed=True,
+                                    message=f"Symlink {name} is safe",
+                                    location=f"{path}:{name}",
+                                    rule_code=None,
+                                    details={"entry": name, "target": safe_target, "target_class": "safe"},
+                                )
+
                 symlink_issues_found = True
-                continue
+                if not scan_symlink_content:
+                    continue
 
             # Skip directories for content checks
             if name.endswith("/"):

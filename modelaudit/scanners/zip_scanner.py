@@ -56,7 +56,7 @@ _ZIP_MAX_ARCHIVE_EXTRA_DATA_RECORDS = 1024
 _ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_SIZE = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL = 64 * 1024 * 1024
-_ZIP_MAX_TRAILING_DATA_SCAN_SIZE = 64 * 1024 * 1024
+_ZIP_MAX_LOCAL_DESCRIPTOR_SEARCH_WORK = 1_000_000
 _ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
 _ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
 _ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
@@ -65,6 +65,7 @@ _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _ZIP64_EOCD_MIN_SIZE = 56
 _ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
 _ZIP64_SENTINEL_OFFSET = 0xFFFFFFFF
+_UNIX_MODE_ZIP_CREATOR_SYSTEMS = frozenset({3, 19})
 
 
 @dataclass(frozen=True)
@@ -809,20 +810,27 @@ class ZipScanner(BaseScanner):
         return False
 
     @classmethod
-    def _has_unreferenced_local_entry_ending_at(cls, handle: BinaryIO, boundary: int) -> bool:
-        if boundary < _ZIP_LOCAL_FILE_HEADER_SIZE:
+    def _has_unreferenced_local_entry_ending_at(
+        cls,
+        handle: BinaryIO,
+        boundary: int,
+        *,
+        start: int = 0,
+    ) -> bool:
+        if start < 0 or start > boundary or boundary - start < _ZIP_LOCAL_FILE_HEADER_SIZE:
             return False
-        if boundary > _ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE:
+        if boundary - start > _ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE:
             raise _InvalidZipDirectory(
-                "ZIP local-entry prefix is too large to validate safely",
+                "ZIP local-entry search region is too large to validate safely",
                 routing_evidence=True,
             )
 
         overlap = len(_ZIP_LOCAL_FILE_HEADER_SIGNATURE) - 1
-        search_offset = 0
+        search_offset = start
         trailing = b""
         candidate_count = 0
         payload_validation_budget = [_ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL]
+        descriptor_search_budget = [_ZIP_MAX_LOCAL_DESCRIPTOR_SEARCH_WORK]
         while search_offset < boundary:
             read_size = min(64 * 1024, boundary - search_offset)
             try:
@@ -848,6 +856,7 @@ class ZipScanner(BaseScanner):
                     candidate_offset,
                     boundary,
                     payload_validation_budget,
+                    descriptor_search_budget,
                 ):
                     return True
                 candidate_index = search_data.find(_ZIP_LOCAL_FILE_HEADER_SIGNATURE, candidate_index + 1)
@@ -960,6 +969,7 @@ class ZipScanner(BaseScanner):
         offset: int,
         boundary: int,
         payload_validation_budget: list[int],
+        descriptor_search_budget: list[int],
     ) -> bool:
         try:
             handle.seek(offset)
@@ -1015,6 +1025,15 @@ class ZipScanner(BaseScanner):
             descriptor_window = handle.read(boundary - descriptor_window_start)
         except OSError as exc:
             raise _InvalidZipDirectory(f"ZIP data descriptor could not be read: {exc}") from exc
+        descriptor_search_work = sum(
+            max(0, len(descriptor_window) - descriptor_size + 1) for descriptor_size in (12, 16, 20, 24)
+        )
+        if descriptor_search_work > descriptor_search_budget[0]:
+            raise _InvalidZipDirectory(
+                "ZIP local-entry data descriptor search exceeded its bounded work budget",
+                routing_evidence=True,
+            )
+        descriptor_search_budget[0] -= descriptor_search_work
         for size_width in (4, 8):
             for signature_size in (0, len(_ZIP_DATA_DESCRIPTOR_SIGNATURE)):
                 descriptor_size = signature_size + 4 + (2 * size_width)
@@ -1058,35 +1077,9 @@ class ZipScanner(BaseScanner):
             )
         return False
 
-    @staticmethod
-    def _trailing_data_contains_local_entry_marker(handle: BinaryIO, start: int, end: int) -> bool:
-        trailing_size = end - start
-        if trailing_size <= 0:
-            return False
-        if trailing_size > _ZIP_MAX_TRAILING_DATA_SCAN_SIZE:
-            raise _InvalidZipDirectory(
-                "ZIP trailing data is too large to validate safely",
-                routing_evidence=True,
-            )
-
-        overlap = len(_ZIP_LOCAL_FILE_HEADER_SIGNATURE) - 1
-        offset = start
-        carried = b""
-        while offset < end:
-            read_size = min(64 * 1024, end - offset)
-            try:
-                handle.seek(offset)
-                chunk = handle.read(read_size)
-            except OSError as exc:
-                raise _InvalidZipDirectory(f"ZIP trailing data could not be read: {exc}") from exc
-            if not chunk:
-                break
-            search_data = carried + chunk
-            if _ZIP_LOCAL_FILE_HEADER_SIGNATURE in search_data:
-                return True
-            carried = search_data[-overlap:]
-            offset += len(chunk)
-        return False
+    @classmethod
+    def _trailing_data_contains_local_entry_marker(cls, handle: BinaryIO, start: int, end: int) -> bool:
+        return cls._has_unreferenced_local_entry_ending_at(handle, end, start=start)
 
     @staticmethod
     def _candidate_has_directory_signature(
@@ -1177,9 +1170,10 @@ class ZipScanner(BaseScanner):
         if valid_preflight is not None:
             assert valid_eocd_index is not None
             valid_comment_length = int.from_bytes(tail[valid_eocd_index + 20 : valid_eocd_index + 22], "little")
+            valid_comment_start = valid_eocd_index + _ZIP_EOCD_MIN_SIZE
             valid_record_end = valid_eocd_index + _ZIP_EOCD_MIN_SIZE + valid_comment_length
-            valid_record_end_offset = file_size - tail_size + valid_record_end
-            if cls._trailing_data_contains_local_entry_marker(handle, valid_record_end_offset, file_size):
+            valid_comment_start_offset = file_size - tail_size + valid_comment_start
+            if cls._trailing_data_contains_local_entry_marker(handle, valid_comment_start_offset, file_size):
                 raise _InvalidZipDirectory(
                     "ZIP trailing data contains an unreferenced local entry",
                     routing_evidence=True,
@@ -1332,6 +1326,26 @@ class ZipScanner(BaseScanner):
                     raise ValueError(f"symlink target exceeds maximum size of {self.MAX_SYMLINK_TARGET_BYTES} bytes")
 
         return target_bytes.decode("utf-8", "replace")
+
+    @staticmethod
+    def _resolve_symlink_target(
+        target: str,
+        *,
+        resolved_name: str,
+        extraction_root: str,
+    ) -> tuple[str, bool]:
+        """Resolve a relative symlink target while enforcing the archive extraction root."""
+        if is_absolute_archive_path(target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -1512,7 +1526,7 @@ class ZipScanner(BaseScanner):
             )
             return False, True
 
-        is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+        is_symlink = info.create_system in _UNIX_MODE_ZIP_CREATOR_SYSTEMS and stat.S_ISLNK(info.external_attr >> 16)
         if is_symlink:
             if self._is_known_unreadable_archive_entry(info):
                 result.add_check(
@@ -1547,10 +1561,10 @@ class ZipScanner(BaseScanner):
                 )
                 return False, False
 
-            target_base = os.path.dirname(resolved_name)
-            _target_resolved, target_safe = sanitize_archive_path(
+            _target_resolved, target_safe = self._resolve_symlink_target(
                 target,
-                target_base,
+                resolved_name=resolved_name,
+                extraction_root=temp_base,
             )
             if not target_safe:
                 # Check if it's specifically a critical system path
@@ -2204,32 +2218,16 @@ class ZipScanner(BaseScanner):
 
 
 @contextlib.contextmanager
-def open_preflighted_zip_handle(
+def _open_preflighted_zip_handle(
     path: str | os.PathLike[str],
     config: dict[str, Any] | None = None,
     *,
     require_zip: bool = True,
-) -> Iterator[BinaryIO]:
-    """Open once, preflight that descriptor, and yield it without a pathname race."""
+) -> Iterator[tuple[BinaryIO, bool]]:
+    """Open once, preflight that descriptor, and yield it with its ZIP routing state."""
     scanner = ZipScanner(config=config)
     path_text = os.fspath(path)
     with open(path, "rb") as handle:
-        if not require_zip:
-            try:
-                leading_signature = handle.read(4)
-                if leading_signature not in {
-                    _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
-                    _ZIP_EOCD_SIGNATURE,
-                    _ZIP64_EOCD_SIGNATURE,
-                }:
-                    handle.seek(0)
-                    yield handle
-                    return
-            except OSError:
-                handle.seek(0)
-                yield handle
-                return
-            handle.seek(0)
         try:
             preflight = scanner._preflight_zip_directory(
                 handle,
@@ -2237,6 +2235,20 @@ def open_preflighted_zip_handle(
                 scanner.max_central_directory_size,
             )
         except _InvalidZipDirectory as exc:
+            if not require_zip:
+                handle.seek(0)
+                try:
+                    leading_signature = handle.read(4)
+                except OSError:
+                    leading_signature = b""
+                if not exc.routing_evidence and leading_signature not in {
+                    _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
+                    _ZIP_EOCD_SIGNATURE,
+                    _ZIP64_EOCD_SIGNATURE,
+                }:
+                    handle.seek(0)
+                    yield handle, False
+                    return
             raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, error=exc)) from exc
         if preflight is None:
             if require_zip:
@@ -2245,7 +2257,28 @@ def open_preflighted_zip_handle(
             entry_count, exceeds_limit = preflight
             if exceeds_limit:
                 raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, entry_count=entry_count))
+        preflight_is_zip = preflight is not None
+        if not require_zip and preflight is not None and preflight[0] == 0:
+            handle.seek(0)
+            leading_signature = handle.read(4)
+            preflight_is_zip = leading_signature in {
+                _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
+                _ZIP_EOCD_SIGNATURE,
+                _ZIP64_EOCD_SIGNATURE,
+            }
         handle.seek(0)
+        yield handle, preflight_is_zip
+
+
+@contextlib.contextmanager
+def open_preflighted_zip_handle(
+    path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+    *,
+    require_zip: bool = True,
+) -> Iterator[BinaryIO]:
+    """Open once, preflight that descriptor, and yield it without a pathname race."""
+    with _open_preflighted_zip_handle(path, config, require_zip=require_zip) as (handle, _is_zip):
         yield handle
 
 

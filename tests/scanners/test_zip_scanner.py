@@ -39,6 +39,7 @@ from modelaudit.scanners.zip_scanner import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
     ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
     ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
+    ZipPreflightRejected,
     ZipScanner,
     open_preflighted_zip_handle,
 )
@@ -7715,6 +7716,50 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_dos_entry_with_unix_symlink_bits_is_scanned_as_regular_file(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "fake-symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo("payload.pkl")
+            info.create_system = 0
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, b'cos\nsystem\n(S"echo replacement"\ntR.')
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(issue.rule_code == "S201" for issue in result.issues)
+        assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
+
+    def test_nested_symlink_target_within_archive_root_is_safe(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "nested-safe-symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("target.txt", "safe")
+            info = zipfile.ZipInfo("dir/link")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "../target.txt")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            check.name == "Symlink Safety Validation"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("entry") == "dir/link"
+            for check in result.checks
+        )
+        assert not any(issue.rule_code == "S406" for issue in result.issues)
+
+    def test_nested_symlink_target_outside_archive_root_is_rejected(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "nested-unsafe-symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo("dir/link")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "../../evil.txt")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(issue.rule_code == "S406" and issue.details.get("entry") == "dir/link" for issue in result.issues)
+
     def test_duplicate_symlink_names_validate_current_entry_target(self, tmp_path: Path) -> None:
         """Duplicate symlink entries should validate each ZipInfo target, not the last name alias."""
         import stat
@@ -9361,6 +9406,27 @@ class TestZipScanner:
         with open_preflighted_zip_handle(legacy_path, require_zip=False) as handle:
             assert handle.read() == payload
 
+    def test_optional_zip_guard_preflights_prefixed_zip_entry_limit(self, tmp_path: Path) -> None:
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("archive/data.pkl", b"payload")
+            archive.writestr("archive/version", "3")
+
+        archive_path = tmp_path / "prefixed.pt"
+        archive_path.write_bytes(b"SFX-STUB" + archive_bytes.getvalue())
+
+        with (
+            pytest.raises(ZipPreflightRejected) as exc_info,
+            open_preflighted_zip_handle(archive_path, {"max_zip_entries": 1}, require_zip=False),
+        ):
+            pass
+
+        assert exc_info.value.result.metadata["zip_entry_count_preflight"] == 2
+        assert any(
+            check.name == "Entry Count Limit Check" and check.status == CheckStatus.FAILED
+            for check in exc_info.value.result.checks
+        )
+
     def test_archive_member_scan_reuses_open_archive_after_path_replacement(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "original.zip"
         replacement_path = tmp_path / "replacement.zip"
@@ -9745,11 +9811,70 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_local_entry_hidden_in_eocd_comment_fails_closed_before_zipfile_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "comment_hidden_local_entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        filename = b"payload.pkl"
+        payload = b'cos\nsystem\n(S"echo hidden"\ntR.'
+        local_header = bytearray(30)
+        local_header[0:4] = b"PK\x03\x04"
+        local_header[4:6] = (20).to_bytes(2, "little")
+        local_header[14:18] = zlib.crc32(payload).to_bytes(4, "little")
+        local_header[18:22] = len(payload).to_bytes(4, "little")
+        local_header[22:26] = len(payload).to_bytes(4, "little")
+        local_header[26:28] = len(filename).to_bytes(2, "little")
+        hidden_record = bytes(local_header) + filename + payload
+
+        archive_bytes = bytearray(archive_path.read_bytes())
+        eocd_index = archive_bytes.rfind(b"PK\x05\x06")
+        assert eocd_index >= 0
+        archive_bytes[eocd_index + 20 : eocd_index + 22] = len(hidden_record).to_bytes(2, "little")
+        archive_path.write_bytes(archive_bytes + hidden_record)
+
+        with zipfile.ZipFile(archive_path) as archive:
+            assert archive.namelist() == ["safe.txt"]
+
+        def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("comment-hidden local entries must fail before ZipFile construction")
+
+        monkeypatch.setattr(zip_scanner_module.zipfile, "ZipFile", fail_zipfile_open)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "ZIP Central Directory Preflight"
+            and check.status == CheckStatus.FAILED
+            and "trailing data contains an unreferenced local entry" in check.message
+            for check in result.checks
+        )
+
     def test_trailing_local_header_near_match_remains_clean(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "trailing_local_header_near_match.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("safe.txt", "safe")
         archive_path.write_bytes(archive_path.read_bytes() + b"PK\x03\x05 benign trailer")
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_trailing_local_header_signature_without_record_remains_clean(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "trailing_local_header_signature.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+        archive_path.write_bytes(archive_path.read_bytes() + b"benign trailer PK\x03\x04 not a local record")
 
         result = ZipScanner().scan(str(archive_path))
 
@@ -9785,6 +9910,18 @@ class TestZipScanner:
             ZipScanner._has_unreferenced_local_entry_ending_at(handle, len(payload))
 
         assert handle.bytes_read < 64 * 1024 * 1024
+
+    def test_local_entry_data_descriptor_search_has_total_work_budget(self) -> None:
+        streamed_header = bytearray(30)
+        streamed_header[0:4] = b"PK\x03\x04"
+        streamed_header[4:6] = (20).to_bytes(2, "little")
+        streamed_header[6:8] = (0x0008).to_bytes(2, "little")
+        streamed_header[26:28] = (1).to_bytes(2, "little")
+        candidate = bytes(streamed_header) + b"x"
+        payload = candidate * 250
+
+        with pytest.raises(zip_scanner_module._InvalidZipDirectory, match=r"descriptor search.*bounded work budget"):
+            ZipScanner._has_unreferenced_local_entry_ending_at(io.BytesIO(payload), len(payload))
 
     def test_appended_empty_eocd_cannot_hide_invalid_real_directory(
         self,

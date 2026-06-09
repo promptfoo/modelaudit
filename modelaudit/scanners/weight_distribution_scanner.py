@@ -6,7 +6,7 @@ import numbers
 import os
 import zipfile
 from contextlib import suppress
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
@@ -502,71 +502,76 @@ class WeightDistributionScanner(BaseScanner):
         return root, member
 
     def _pytorch_load_within_budget(self, path: str) -> bool:
+        from .zip_scanner import _open_preflighted_zip_handle
+
+        with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (archive_handle, is_zip):
+            return self._pytorch_load_handle_within_budget(path, archive_handle, is_zip=is_zip)
+
+    def _pytorch_load_handle_within_budget(self, path: str, archive_handle: BinaryIO, *, is_zip: bool) -> bool:
         max_total_bytes = self._max_total_tensor_bytes()
         max_tensor_bytes = self._max_tensor_bytes()
 
         try:
-            from .zip_scanner import open_preflighted_zip_handle
-
-            with open_preflighted_zip_handle(path, self.config, require_zip=False) as archive_handle:
-                has_zip_signature = archive_handle.read(4).startswith(b"PK")
-                archive_handle.seek(0)
-                if has_zip_signature:
-                    with zipfile.ZipFile(archive_handle) as archive:
-                        selected = self._select_pytorch_data_pickle(archive)
-                        if selected is None:
-                            return not self.extraction_incomplete
-                        root, data_pkl_info = selected
-                        prefix_parts = root.split("/") if root else []
-                        selected_members = [data_pkl_info]
-                        selected_names = {data_pkl_info.filename}
-                        for member_info in archive.infolist():
-                            parts = member_info.filename.strip("/").split("/")
-                            is_storage = (
-                                len(parts) == len(prefix_parts) + 2
-                                and parts[: len(prefix_parts)] == prefix_parts
-                                and parts[-2] == "data"
-                                and parts[-1].isdigit()
-                            )
-                            if member_info.is_dir() or not is_storage:
-                                continue
-                            if member_info.filename in selected_names:
-                                self._record_extraction_incomplete(
-                                    "pytorch_archive_member_ambiguous",
-                                    failed_tensors=[member_info.filename],
-                                )
-                                return False
-                            selected_names.add(member_info.filename)
-                            selected_members.append(member_info)
-                            if max_tensor_bytes is not None and member_info.file_size > max_tensor_bytes:
-                                self._record_oversized_tensor(
-                                    "pytorch_tensor_storage_size_limit",
-                                    member_info.filename,
-                                    tensor_nbytes=member_info.file_size,
-                                )
-                                return False
-
-                        load_bytes = sum(member.file_size for member in selected_members)
-
-                        if max_total_bytes is not None and load_bytes > max_total_bytes:
+            archive_handle.seek(0)
+            if is_zip:
+                with zipfile.ZipFile(archive_handle) as archive:
+                    selected = self._select_pytorch_data_pickle(archive)
+                    if selected is None:
+                        return not self.extraction_incomplete
+                    root, data_pkl_info = selected
+                    prefix_parts = root.split("/") if root else []
+                    selected_members = [data_pkl_info]
+                    selected_names = {data_pkl_info.filename}
+                    for member_info in archive.infolist():
+                        parts = member_info.filename.strip("/").split("/")
+                        is_storage = (
+                            len(parts) == len(prefix_parts) + 2
+                            and parts[: len(prefix_parts)] == prefix_parts
+                            and parts[-2] == "data"
+                            and parts[-1].isdigit()
+                        )
+                        if member_info.is_dir() or not is_storage:
+                            continue
+                        if member_info.filename in selected_names:
                             self._record_extraction_incomplete(
-                                "pytorch_load_size_limit",
-                                failed_tensors=[path],
-                                oversized_tensors=1,
-                                tensor_nbytes=load_bytes,
-                                max_total_tensor_bytes=max_total_bytes,
+                                "pytorch_archive_member_ambiguous",
+                                failed_tensors=[member_info.filename],
+                            )
+                            return False
+                        selected_names.add(member_info.filename)
+                        selected_members.append(member_info)
+                        if max_tensor_bytes is not None and member_info.file_size > max_tensor_bytes:
+                            self._record_oversized_tensor(
+                                "pytorch_tensor_storage_size_limit",
+                                member_info.filename,
+                                tensor_nbytes=member_info.file_size,
                             )
                             return False
 
-                        data = self._read_zip_member_bounded(archive, data_pkl_info)
-                        if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
-                            return False
-                    return True
+                    load_bytes = sum(member.file_size for member in selected_members)
 
-                try:
-                    load_bytes = os.fstat(archive_handle.fileno()).st_size
-                except (AttributeError, OSError):
-                    load_bytes = os.path.getsize(path)
+                    if max_total_bytes is not None and load_bytes > max_total_bytes:
+                        self._record_extraction_incomplete(
+                            "pytorch_load_size_limit",
+                            failed_tensors=[path],
+                            oversized_tensors=1,
+                            tensor_nbytes=load_bytes,
+                            max_total_tensor_bytes=max_total_bytes,
+                        )
+                        return False
+
+                    data = self._read_zip_member_bounded(archive, data_pkl_info)
+                    if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
+                        return False
+                return True
+
+            try:
+                load_bytes = os.fstat(archive_handle.fileno()).st_size
+            except (AttributeError, OSError):
+                current_offset = archive_handle.tell()
+                archive_handle.seek(0, os.SEEK_END)
+                load_bytes = archive_handle.tell()
+                archive_handle.seek(current_offset)
         except (OSError, zipfile.BadZipFile):
             return True
 
@@ -921,13 +926,13 @@ class WeightDistributionScanner(BaseScanner):
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
 
-            if not self._pytorch_load_within_budget(path):
-                return {}
-
             # Load model with map_location to CPU to avoid GPU requirements
-            from .zip_scanner import open_preflighted_zip_handle
+            from .zip_scanner import _open_preflighted_zip_handle
 
-            with open_preflighted_zip_handle(path, self.config, require_zip=False) as model_handle:
+            with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (model_handle, is_zip):
+                if not self._pytorch_load_handle_within_budget(path, model_handle, is_zip=is_zip):
+                    return {}
+                model_handle.seek(0)
                 model_data = torch.load(model_handle, **load_kwargs)
 
             # Handle different PyTorch save formats
