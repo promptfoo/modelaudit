@@ -17,6 +17,7 @@ from modelaudit.integrations.mlflow import (
     _copy_local_mlflow_artifact,
     _local_mlflow_artifact_root,
     _mlflow_budget_failure_result,
+    _mlflow_download_safety_failure_result,
     _MlflowArtifact,
     _MlflowArtifactSizeChangedError,
     _MlflowLocalSource,
@@ -1184,6 +1185,23 @@ def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() ->
     assert result.checks[0].details["nested"]["source"] == ("models:/OtherModel/2?code=<redacted>&jwt=<redacted>")
 
 
+def test_mlflow_download_safety_failure_redacts_source_and_artifact_credentials() -> None:
+    result = _mlflow_download_safety_failure_result(
+        "models:/PublicModel/1?auth=MODELSECRET123",
+        "MLflow staging contains an unsupported filesystem object",
+        {
+            "reason": "artifact_download_path_unsupported",
+            "artifact_path": "model/access_token=PATHSECRET123.pkl",
+        },
+    )
+
+    serialized_result = result.model_dump_json()
+    assert "MODELSECRET123" not in serialized_result
+    assert "PATHSECRET123" not in serialized_result
+    assert result.checks[0].location == "models:/PublicModel/1?auth=<redacted>"
+    assert result.checks[0].details["artifact_path"] == "model/access_token=<redacted>"
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -1755,6 +1773,7 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
     cache_key = hashlib.sha256(b"models:/TestModel/1").hexdigest()[:16]
     expected_download_root = cache_dir / "mlflow"
     expected_download_dir = expected_download_root / f"{cache_key}-run"
+    expected_download_dir.mkdir(parents=True)
     mock_mkdtemp.return_value = str(expected_download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(expected_download_dir)
     mock_scan.return_value = {"bytes_scanned": 256, "issues": []}
@@ -1782,21 +1801,25 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
+def test_scan_mlflow_model_file_path(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test MLflow model scanning when download returns a file path."""
     # Mock MLflow
     mock_mlflow = MagicMock()
 
     # Create a temporary file path (simulating MLflow returning a file)
-    temp_dir = "/tmp/modelaudit_mlflow_test"
-    temp_file = "/tmp/modelaudit_mlflow_test/model.pkl"
-    mock_mlflow.artifacts.download_artifacts.return_value = temp_file
-    mock_mkdtemp.return_value = temp_dir
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    temp_file = temp_dir / "model.pkl"
+    temp_file.write_bytes(b"model")
+    mock_mlflow.artifacts.download_artifacts.return_value = str(temp_file)
+    mock_mkdtemp.return_value = str(temp_dir)
 
-    # Mock os.path.isfile to return True for our temp file
     with (
-        patch("os.path.isfile", return_value=True),
-        patch("os.path.dirname", return_value=temp_dir),
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
     ):
         mock_scan.return_value = {"bytes_scanned": 512, "issues": []}
@@ -1806,19 +1829,496 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
         # Verify scan was called with the directory path, not the file path
         mock_scan.assert_called_once()
         args, _kwargs = mock_scan.call_args
-        assert args[0] == temp_dir  # Should be directory, not file
+        assert args[0] == str(temp_dir.resolve())  # Should be directory, not file
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_download_return_outside_staging(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """MLflow backends must not redirect scanning outside ModelAudit's staging directory."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "modelaudit_mlflow_test"
+    download_dir.mkdir()
+    outside_model = tmp_path / "outside" / "model.pkl"
+    outside_model.parent.mkdir()
+    outside_model.write_bytes(b"model")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(outside_model)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.checks[0].name == "MLflow Download Path Check"
+    assert result.checks[0].details["reason"] == "artifact_download_path_escape"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_staging_root_symlink_swap(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A backend must not replace the private staging root with an outside link."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_model = outside_dir / "model.pkl"
+    outside_model.write_bytes(b"model")
+    mock_mkdtemp.return_value = str(download_dir)
+
+    def replace_staging_root(*, artifact_uri: str, dst_path: str) -> str:
+        assert artifact_uri == "models:/TestModel/1"
+        assert dst_path == str(download_dir)
+        download_dir.rmdir()
+        download_dir.symlink_to(outside_dir, target_is_directory=True)
+        return str(download_dir / outside_model.name)
+
+    mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_root_changed"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_staging_root_directory_swap(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A new directory at the same path is not the private staging root ModelAudit created."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+
+    def replace_staging_root(*, artifact_uri: str, dst_path: str) -> str:
+        assert artifact_uri == "models:/TestModel/1"
+        assert dst_path == str(download_dir)
+        download_dir.rmdir()
+        download_dir.mkdir()
+        replacement_model = download_dir / "model.pkl"
+        replacement_model.write_bytes(b"replacement")
+        return str(replacement_model)
+
+    mock_mlflow.artifacts.download_artifacts.side_effect = replace_staging_root
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_root_changed"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_staged_symlink_to_outside_file(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A staged symlink must not redirect scanning to an outside file."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    outside_model = tmp_path / "outside" / "model.pkl"
+    outside_model.parent.mkdir()
+    outside_model.write_bytes(b"model")
+    returned_link = download_dir / "model.pkl"
+    returned_link.symlink_to(outside_model)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(returned_link)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_escape"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_accepts_staged_symlink_to_staged_file(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """An in-staging symlink to an in-staging regular file remains scannable."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    target_dir = download_dir / "artifacts"
+    target_dir.mkdir(parents=True)
+    target_file = target_dir / "model.pkl"
+    target_file.write_bytes(b"model")
+    returned_link = download_dir / "model-link.pkl"
+    returned_link.symlink_to(target_file)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(returned_link)
+    mock_scan.return_value = {"bytes_scanned": 5, "issues": []}
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == mock_scan.return_value
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(target_dir.resolve())
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_fifo_without_blocking(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A returned FIFO is rejected by metadata without opening the pipe."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    fifo_path = download_dir / "model.pkl"
+    os.mkfifo(fifo_path)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(fifo_path)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_unsupported"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_symlink_loop(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A returned symlink loop fails closed instead of escaping the CLI error contract."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    first_link = download_dir / "first.pkl"
+    second_link = download_dir / "second.pkl"
+    first_link.symlink_to(second_link.name)
+    second_link.symlink_to(first_link.name)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(first_link)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_unavailable"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not supported on this platform")
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_nested_fifo_without_blocking(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A special file nested below an accepted directory must be rejected before core hashing."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    model_dir = download_dir / "model"
+    model_dir.mkdir(parents=True)
+    os.mkfifo(model_dir / "nested.pkl")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_unsupported"
+    assert result.checks[0].details["artifact_path"] == "model/nested.pkl"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_nested_file_symlink_escape(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A nested file symlink must not redirect core to a target outside staging."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    model_dir = download_dir / "model"
+    model_dir.mkdir(parents=True)
+    outside_file = tmp_path / "outside.pkl"
+    outside_file.write_bytes(b"outside")
+    (model_dir / "linked.pkl").symlink_to(outside_file)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_escape"
+    assert result.checks[0].details["artifact_path"] == "model/linked.pkl"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_nested_directory_symlink(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Directory links are rejected because core's non-following walk would omit their contents."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    model_dir = download_dir / "model"
+    target_dir = download_dir / "target"
+    model_dir.mkdir(parents=True)
+    target_dir.mkdir()
+    (target_dir / "hidden.pkl").write_bytes(b"payload")
+    (model_dir / "linked").symlink_to(target_dir, target_is_directory=True)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_directory_link_unsupported"
+    assert result.checks[0].details["artifact_path"] == "model/linked"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_nested_directory_junction(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows junctions are rejected even when pathlib does not classify them as symlinks."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    model_dir = download_dir / "model"
+    junction_dir = model_dir / "junction"
+    junction_dir.mkdir(parents=True)
+    (junction_dir / "hidden.pkl").write_bytes(b"payload")
+    monkeypatch.setattr(Path, "is_junction", lambda self: self == junction_dir, raising=False)
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(model_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_directory_link_unsupported"
+    assert result.checks[0].details["artifact_path"] == "model/junction"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_regular_file_reparse_point(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file reparse point must not be treated as an ordinary staged regular file."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    reparse_file = download_dir / "model.pkl"
+    reparse_file.write_bytes(b"model")
+    monkeypatch.setattr(
+        "modelaudit.integrations.mlflow._mlflow_entry_is_reparse_point",
+        lambda path, _path_stat: path == reparse_file,
+    )
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_unsupported"
+    assert result.checks[0].details["artifact_path"] == "model.pkl"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_hardlink_alias_outside_staging(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A staged file with an alias outside the private directory remains replaceable by that alias."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    staged_file = download_dir / "model.pkl"
+    staged_file.write_bytes(b"model")
+    try:
+        os.link(staged_file, tmp_path / "outside.pkl")
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_hardlink_escape"
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_accepts_hardlinks_contained_in_staging(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Hardlinks are safe when every alias remains inside the private staging directory."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    staged_file = download_dir / "model.pkl"
+    staged_file.write_bytes(b"model")
+    try:
+        os.link(staged_file, download_dir / "model-alias.pkl")
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
+    mock_scan.return_value = {"bytes_scanned": 5, "issues": []}
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == mock_scan.return_value
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(download_dir.resolve())
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_bounds_staging_tree_validation(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Recursive validation uses the same configurable artifact-entry budget as preflight."""
+    mock_mlflow = MagicMock()
+    download_dir = tmp_path / "staging"
+    download_dir.mkdir()
+    (download_dir / "first.pkl").write_bytes(b"one")
+    (download_dir / "second.pkl").write_bytes(b"two")
+    mock_mkdtemp.return_value = str(download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1", max_mlflow_artifact_entries=1)
+
+    mock_scan.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_download_path_entry_limit"
+    assert result.checks[0].details["max_artifact_entries"] == 1
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+def test_scan_mlflow_model_download_error(
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test error handling when MLflow download fails."""
     # Mock MLflow with download error
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.side_effect = Exception("Download failed")
 
-    temp_dir = "/tmp/modelaudit_mlflow_test"
-    mock_mkdtemp.return_value = temp_dir
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
@@ -1827,7 +2327,7 @@ def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
         scan_mlflow_model("models:/TestModel/1")
 
     # Verify cleanup still happens
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(str(temp_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
@@ -1836,11 +2336,14 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     model_uri = "models:/PrivateModel/access_token=DEBUGSECRET123"
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.side_effect = RuntimeError("Download failed")
-    mock_mkdtemp.return_value = "/tmp/modelaudit_mlflow_test"
+    temp_dir = tmp_path / "modelaudit_mlflow_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
 
     with (
         caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.mlflow"),
@@ -1851,17 +2354,19 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
 
     assert "models:/PrivateModel/access_token=<redacted>" in caplog.text
     assert "DEBUGSECRET123" not in caplog.text
-    mock_rmtree.assert_called_once_with("/tmp/modelaudit_mlflow_test", ignore_errors=True)
+    mock_rmtree.assert_called_once_with(str(temp_dir), ignore_errors=True)
 
 
-def test_scan_mlflow_model_no_registry_uri():
+def test_scan_mlflow_model_no_registry_uri(tmp_path: Path) -> None:
     """Test MLflow model scanning without registry URI."""
     mock_mlflow = MagicMock()
-    mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
+    download_dir = tmp_path / "test"
+    download_dir.mkdir()
+    mock_mlflow.artifacts.download_artifacts.return_value = str(download_dir)
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
-        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value="/tmp/test"),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
         patch("modelaudit.core.scan_model_directory_or_file", return_value={}),
         patch("modelaudit.integrations.mlflow.shutil.rmtree"),
     ):

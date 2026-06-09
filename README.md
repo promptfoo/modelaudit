@@ -143,6 +143,8 @@ modelaudit model.dvc
 - `GOOGLE_APPLICATION_CREDENTIALS` for GCS
 - `MLFLOW_TRACKING_URI` for MLflow registry access
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- `MODELAUDIT_JFROG_ALLOWED_HOSTS` for comma-separated custom JFrog hostnames that may receive credentials
+- `MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS` for comma-separated external redirect hostnames that may be downloaded without credentials
 - Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
 
 ## Installation
@@ -191,6 +193,7 @@ Common scan options:
 --strict                     Fail on warnings, scan all file types, strict license validation
 --sbom FILE                  Generate CycloneDX SBOM
 --stream                     Process files one-by-one; remote downloads are deleted after scanning
+--assume-shard-family        Treat explicitly listed cross-directory shards as one model family
 --max-size SIZE              Size limit (e.g., 10GB)
 --timeout SECONDS            Override scan timeout
 --dry-run                    Preview what would be scanned
