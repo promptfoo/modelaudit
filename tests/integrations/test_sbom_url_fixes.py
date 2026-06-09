@@ -314,33 +314,135 @@ class TestSBOMURLFixes:
         assert redact_source_identifier(f"model?revision={credential_value}") == "model"
 
     @pytest.mark.parametrize("legacy_generator", [False, True])
-    def test_equal_risk_collisions_have_deterministic_metadata_attribution(self, legacy_generator: bool) -> None:
-        first_path = "https://storage.example/model.pkl?token=z-secret"
-        second_path = "https://storage.example/model.pkl?token=a-secret"
-        paths = [first_path, second_path]
-        scan_result = create_mock_scan_result(files_scanned=2)
-        scan_result.file_metadata = {
-            first_path: FileMetadataModel(file_size=111),
-            second_path: FileMetadataModel(file_size=222),
+    def test_safe_schemeless_provenance_has_stable_risk_attribution(self, legacy_generator: bool) -> None:
+        safe_path = "bucket/model.pkl?revision=v1"
+        signed_path = f"{safe_path}&token=source-secret"
+        result = create_mock_scan_result(
+            files_scanned=2,
+            issues=[Issue(message="critical", severity=IssueSeverity.CRITICAL, location=signed_path)],
+        )
+
+        def risks(input_paths: Any) -> dict[str, str]:
+            if legacy_generator:
+                sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
+            else:
+                sbom_json = generate_sbom_pydantic(input_paths, result)
+            return {
+                component["bom-ref"]: next(
+                    prop["value"] for prop in component["properties"] if prop["name"] == "risk_score"
+                )
+                for component in json.loads(sbom_json)["components"]
+            }
+
+        assert (
+            risks([safe_path, signed_path])
+            == risks([signed_path, safe_path])
+            == {
+                safe_path: "0",
+                f"{safe_path}#modelaudit-component-2": "5",
+            }
+        )
+
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_repeated_identical_sources_emit_one_component(
+        self,
+        tmp_path: Path,
+        legacy_generator: bool,
+    ) -> None:
+        model_path = tmp_path / "model.pkl"
+        model_path.write_bytes(b"model")
+        result = create_mock_scan_result(files_scanned=1)
+
+        if legacy_generator:
+            sbom_json = generate_sbom([str(model_path), str(model_path)], result.model_dump(mode="python"))
+        else:
+            sbom_json = generate_sbom_pydantic([str(model_path), str(model_path)], result)
+
+        assert [component["bom-ref"] for component in json.loads(sbom_json)["components"]] == [str(model_path)]
+
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_generated_component_refs_do_not_collide_with_literal_refs(
+        self,
+        tmp_path: Path,
+        legacy_generator: bool,
+    ) -> None:
+        first = f"{tmp_path}/model.pkl?token=first-secret"
+        second = f"{tmp_path}/model.pkl?token=second-secret"
+        literal = tmp_path / "model.pkl#modelaudit-component-2"
+        literal.write_bytes(b"model")
+        paths = [first, second, str(literal)]
+        result = create_mock_scan_result(files_scanned=3)
+
+        def refs(input_paths: Any) -> set[str]:
+            if legacy_generator:
+                sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
+            else:
+                sbom_json = generate_sbom_pydantic(input_paths, result)
+            return {component["bom-ref"] for component in json.loads(sbom_json)["components"]}
+
+        first_refs = refs(paths)
+        assert first_refs == refs(reversed(paths))
+        assert len(first_refs) == 3
+        assert all(not reference.startswith("BomRef.") for reference in first_refs)
+
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_literal_component_ref_is_reserved_before_redacted_collisions(
+        self,
+        tmp_path: Path,
+        legacy_generator: bool,
+    ) -> None:
+        literal = tmp_path / "model.pkl"
+        literal.write_bytes(b"literal model")
+        signed = f"{literal}?token=source-secret"
+        result = create_mock_scan_result(
+            files_scanned=2,
+            issues=[Issue(message="critical", severity=IssueSeverity.CRITICAL, location=signed)],
+        )
+
+        if legacy_generator:
+            sbom_json = generate_sbom([signed, str(literal)], result.model_dump(mode="python"))
+        else:
+            sbom_json = generate_sbom_pydantic([signed, str(literal)], result)
+        components = {component["bom-ref"]: component for component in json.loads(sbom_json)["components"]}
+
+        assert set(components) == {
+            str(literal),
+            f"{literal}#modelaudit-component-2",
+        }
+        assert (
+            next(prop["value"] for prop in components[str(literal)]["properties"] if prop["name"] == "risk_score")
+            == "0"
+        )
+        assert (
+            next(
+                prop["value"]
+                for prop in components[f"{literal}#modelaudit-component-2"]["properties"]
+                if prop["name"] == "risk_score"
+            )
+            == "5"
+        )
+
+    @pytest.mark.parametrize("legacy_generator", [False, True])
+    def test_equal_risk_redacted_collisions_use_safe_metadata_identity(self, legacy_generator: bool) -> None:
+        first = "https://storage.example/model.pkl?token=first-secret"
+        second = "https://storage.example/model.pkl?token=second-secret"
+        result = create_mock_scan_result(files_scanned=2)
+        result.file_metadata = {
+            first: FileMetadataModel(file_size=10, license="MIT"),
+            second: FileMetadataModel(file_size=20, license="Apache-2.0"),
         }
 
-        def sizes_by_ref(input_paths: Any) -> dict[str, str]:
+        def sizes(input_paths: Any) -> dict[str, str]:
             if legacy_generator:
-                sbom_json = generate_sbom(input_paths, scan_result.model_dump(mode="python"))
+                sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
             else:
-                sbom_json = generate_sbom_pydantic(input_paths, scan_result)
+                sbom_json = generate_sbom_pydantic(input_paths, result)
             return {
                 component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == "size")
                 for component in json.loads(sbom_json)["components"]
             }
 
-        expected = sizes_by_ref(paths)
-
-        assert sizes_by_ref(reversed(paths)) == expected
-        assert expected == {
-            "https://storage.example/model.pkl": "222",
-            "https://storage.example/model.pkl#modelaudit-component-2": "111",
-        }
+        assert sizes([first, second]) == sizes([second, first])
 
     def test_existing_local_assignment_paths_remain_distinct(self, tmp_path: Path) -> None:
         first_path = tmp_path / "token=alpha" / "a.bin"

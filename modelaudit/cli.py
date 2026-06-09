@@ -18,6 +18,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
 
 import click
+from pydantic import TypeAdapter
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 
@@ -111,6 +112,7 @@ from .utils.sources.pytorch_hub import (
 )
 
 logger = logging.getLogger("modelaudit")
+_JSON_VALUE_ADAPTER = TypeAdapter(Any)
 
 
 def _display_path(path: str) -> str:
@@ -2222,8 +2224,8 @@ def _format_scan_output(
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
             audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
-        redacted_result = redact_source_value(audit_result.model_dump(mode="json", exclude_none=True))
-        return json.dumps(redacted_result, indent=2)
+        redacted_result = redact_source_value(audit_result.model_dump(mode="python", exclude_none=True))
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(redacted_result, mode="json"), indent=2)
 
     if output_format == "sarif":
         return format_sarif_output(audit_result, expanded_paths, verbose)

@@ -1,7 +1,9 @@
 import hashlib
+import json
 import os
 import stat
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from importlib.metadata import version as _pkg_version
 from typing import Any
 
@@ -13,7 +15,7 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
-from .source_redaction import redact_source_identifier, redact_source_reference
+from .source_redaction import redact_source_identifier, redact_source_reference, redact_source_value
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 _MAX_SYMLINK_HOPS = 40
@@ -25,6 +27,27 @@ _DESCRIPTOR_WALK_SUPPORTED = (
     and os.readlink in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
 )
+
+
+@dataclass
+class _BomRefState:
+    counts: dict[str, int] = field(default_factory=dict)
+    reserved: set[str] = field(default_factory=set)
+    used: set[str] = field(default_factory=set)
+
+    def allocate(self, base_reference: str, *, literal_reference: bool) -> str:
+        if literal_reference and base_reference not in self.used:
+            self.used.add(base_reference)
+            return base_reference
+
+        occurrence = self.counts.get(base_reference, 0)
+        while True:
+            occurrence += 1
+            candidate = base_reference if occurrence == 1 else f"{base_reference}#modelaudit-component-{occurrence}"
+            if candidate not in self.used and candidate not in self.reserved:
+                self.counts[base_reference] = occurrence
+                self.used.add(candidate)
+                return candidate
 
 
 def _get_component_type(path: str, metadata: dict[str, Any] | None) -> ComponentType:
@@ -423,7 +446,7 @@ def _is_non_filesystem_identifier(path: str) -> bool:
 def _redacted_component_identity(
     path: str,
     sha256: str = "",
-    bom_ref_counts: dict[str, int] | None = None,
+    bom_ref_state: _BomRefState | None = None,
 ) -> tuple[str, str]:
     """Return credential-safe component name and bom-ref values for exported SBOMs."""
     safe_identifier = redact_source_identifier(path)
@@ -435,12 +458,12 @@ def _redacted_component_identity(
         if sha256:
             base_reference = f"{base_reference}#modelaudit-content-sha256-{sha256}"
 
-    if bom_ref_counts is None:
+    if bom_ref_state is None:
         return component_name, base_reference
-    occurrence = bom_ref_counts.get(base_reference, 0) + 1
-    bom_ref_counts[base_reference] = occurrence
-    bom_ref = base_reference if occurrence == 1 else f"{base_reference}#modelaudit-component-{occurrence}"
-    return component_name, bom_ref
+    return component_name, bom_ref_state.allocate(
+        base_reference,
+        literal_reference=safe_identifier == path,
+    )
 
 
 def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
@@ -492,21 +515,45 @@ def _calculate_legacy_risk_score(path: str, issues: Iterable[dict[str, Any]]) ->
     return min(score, 10)
 
 
-def _stable_source_order(paths: Iterable[str], risk_score: Callable[[str], int]) -> list[str]:
+def _stable_source_order(
+    paths: Iterable[str],
+    risk_score: Callable[[str], int],
+    metadata_identity: Callable[[str], str] | None = None,
+) -> list[str]:
     """Order sources so colliding redacted refs keep deterministic risk attribution."""
     grouped_paths: dict[str, list[str]] = {}
-    reference_order: list[str] = []
+    seen_paths: set[str] = set()
     for path in paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
         reference = redact_source_reference(path)
-        if reference not in grouped_paths:
-            grouped_paths[reference] = []
-            reference_order.append(reference)
-        grouped_paths[reference].append(path)
+        grouped_paths.setdefault(reference, []).append(path)
 
     ordered_paths: list[str] = []
-    for reference in reference_order:
-        ordered_paths.extend(sorted(grouped_paths[reference], key=lambda path: (-risk_score(path), path)))
+    for reference in sorted(grouped_paths):
+        ordered_paths.extend(
+            sorted(
+                grouped_paths[reference],
+                key=lambda path: (
+                    redact_source_identifier(path) != path,
+                    -risk_score(path),
+                    metadata_identity(path) if metadata_identity is not None else "",
+                ),
+            )
+        )
     return ordered_paths
+
+
+def _metadata_identity_sort_key(metadata: Any) -> str:
+    if hasattr(metadata, "model_dump"):
+        metadata = metadata.model_dump(mode="python")
+    safe_metadata = redact_source_value(metadata or {})
+    if isinstance(safe_metadata, dict):
+        safe_metadata.pop("risk_score", None)
+        safe_metadata.pop("scan_timestamp", None)
+    serialized = json.dumps(safe_metadata, sort_keys=True, separators=(",", ":"), default=repr)
+    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExpression]:
@@ -601,7 +648,7 @@ def _component_for_file_pydantic(
     scan_root_fd: int | None = None,
     relative_path: str | None = None,
     require_stable_root: bool = False,
-    bom_ref_counts: dict[str, int] | None = None,
+    bom_ref_state: _BomRefState | None = None,
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
     size, sha256 = _resolve_component_size_and_sha256(
@@ -629,7 +676,7 @@ def _component_for_file_pydantic(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_counts)
+    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_state)
 
     # Create the component
     component = Component(
@@ -657,7 +704,7 @@ def _component_for_file(
     scan_root_fd: int | None = None,
     relative_path: str | None = None,
     require_stable_root: bool = False,
-    bom_ref_counts: dict[str, int] | None = None,
+    bom_ref_state: _BomRefState | None = None,
 ) -> Component:
     size, sha256 = _resolve_component_size_and_sha256(
         path,
@@ -752,7 +799,7 @@ def _component_for_file(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_counts)
+    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_state)
 
     component = Component(
         name=component_name,
@@ -771,7 +818,6 @@ def _component_for_file(
 
 def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     bom = Bom()
-    bom_ref_counts: dict[str, int] = {}
     issues = results.get("issues", [])
     # Convert issues to dicts if they are Pydantic models
     issues_dicts = []
@@ -784,7 +830,14 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     file_meta: dict[str, Any] = results.get("file_metadata", {})
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
 
-    ordered_paths = _stable_source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts))
+    ordered_paths = _stable_source_order(
+        paths,
+        lambda path: _calculate_legacy_risk_score(path, issues_dicts),
+        lambda path: _metadata_identity_sort_key(file_meta.get(path)),
+    )
+    bom_ref_state = _BomRefState(
+        reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
+    )
     for input_path in ordered_paths:
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
@@ -813,7 +866,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                         scan_root_fd=scan_root_fd,
                         relative_path=relative_path,
                         require_stable_root=require_stable_root,
-                        bom_ref_counts=bom_ref_counts,
+                        bom_ref_state=bom_ref_state,
                     )
                     bom.components.add(component)
             finally:
@@ -844,7 +897,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                     scan_root_fd=scan_root_fd,
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
-                    bom_ref_counts=bom_ref_counts,
+                    bom_ref_state=bom_ref_state,
                 )
                 bom.components.add(component)
             finally:
@@ -863,14 +916,20 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     without any dict conversions, providing full type safety.
     """
     bom = Bom()
-    bom_ref_counts: dict[str, int] = {}
 
     # Use Pydantic models directly
     issues: list[Issue] = results.issues or []
     file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets)
 
-    ordered_paths = _stable_source_order(paths, lambda path: _calculate_risk_score(path, issues))
+    ordered_paths = _stable_source_order(
+        paths,
+        lambda path: _calculate_risk_score(path, issues),
+        lambda path: _metadata_identity_sort_key(file_metadata.get(path)),
+    )
+    bom_ref_state = _BomRefState(
+        reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
+    )
     for input_path in ordered_paths:
         if os.path.isdir(input_path):
             scan_root = os.path.realpath(input_path)
@@ -894,7 +953,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                         scan_root_fd=scan_root_fd,
                         relative_path=relative_path,
                         require_stable_root=require_stable_root,
-                        bom_ref_counts=bom_ref_counts,
+                        bom_ref_state=bom_ref_state,
                     )
                     bom.components.add(component)
             finally:
@@ -920,7 +979,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                     scan_root_fd=scan_root_fd,
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
-                    bom_ref_counts=bom_ref_counts,
+                    bom_ref_state=bom_ref_state,
                 )
                 bom.components.add(component)
             finally:

@@ -52,6 +52,7 @@ _HEADER_KEY_RE = re.compile(
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
 _URL_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z+._%-])"
     rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
     re.IGNORECASE,
 )
@@ -65,6 +66,7 @@ _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
 )
 _PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
 _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
+    r"(?<![0-9A-Za-z+._%-])"
     r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
     re.IGNORECASE,
 )

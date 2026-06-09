@@ -1,7 +1,9 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -9,6 +11,7 @@ from modelaudit.cli import _format_scan_output
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.source_redaction import (
     redact_source_identifier,
+    redact_source_reference,
     redact_source_text,
     redact_source_value,
 )
@@ -415,6 +418,55 @@ def test_export_alias_assignments_and_mapping_keys_are_redacted() -> None:
     assert "public-cache" in output
 
 
+@pytest.mark.parametrize("key", ["GoogleAccessId", "google_access_id", "pwd", "jwt", "passphrase"])
+def test_common_export_credential_aliases_are_redacted(key: str) -> None:
+    secret = "EXPORT-SECRET-123"
+
+    assert secret not in redact_source_text(f"{key}={secret}; visible=yes")
+    assert redact_source_value({key: secret}) == {key: "<redacted>"}
+    assert secret not in redact_source_identifier(f"https://example.com/{key}={secret}/model.pkl")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'payload={"token":"EXPORT-SECRET-123"}',
+        "token[]=EXPORT-SECRET-123",
+        "headers[token]=EXPORT-SECRET-123",
+        'headers["token"]=EXPORT-SECRET-123',
+        'headers[ "token" ]=EXPORT-SECRET-123',
+        "headers[ token]=EXPORT-SECRET-123",
+        "headers[token ]=EXPORT-SECRET-123",
+        r'payload={"\u0074oken":"EXPORT-SECRET-123"}',
+        r'payload={"to\u006ben":"EXPORT-SECRET-123"}',
+        '"token"=EXPORT-SECRET-123',
+        r"payload={\"token\":\"EXPORT-SECRET-123\"}",
+        "Authorization Bearer EXPORT-SECRET-123",
+        "Authorization Digest EXPORT-SECRET-123",
+        "Authorization ApiKey EXPORT-SECRET-123",
+        "Authorization DPoP EXPORT-SECRET-123",
+        "Authorization Hawk EXPORT-SECRET-123",
+        "Proxy-Authorization NTLM EXPORT-SECRET-123",
+        "Proxy-Authorization ApiKey EXPORT-SECRET-123",
+        "--token EXPORT-SECRET-123 --verbose",
+        "token <- EXPORT-SECRET-123; visible=yes",
+    ],
+)
+def test_serialized_and_argument_credentials_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+
+
+def test_redact_source_text_handles_dense_credential_assignments() -> None:
+    text = "token=EXPORT-SECRET-123;" * 5_000
+
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+    assert redacted.count("<redacted>") == 5_000
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -436,6 +488,76 @@ def test_encoded_quoted_and_url_adjacent_assignments_are_redacted(text: str) -> 
 
     assert "SECRET" not in redacted
     assert "<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('--token "EXPORT SECRET 123" --verbose', "--token <redacted> --verbose"),
+        ('Authorization Bearer "EXPORT SECRET 123" tail', "Authorization Bearer <redacted> tail"),
+        ("payload=[token=EXPORT-SECRET-123] tail", "payload=[token=<redacted>] tail"),
+        ("--token=EXPORT-SECRET-123 --verbose", "--token=<redacted> --verbose"),
+        ("token: |\n  EXPORT-SECRET-123\nnext=safe", "token: <redacted>\nnext=safe"),
+        ("token: >\n  EXPORT SECRET 123\nnext=safe", "token: <redacted>\nnext=safe"),
+    ],
+)
+def test_credential_redaction_preserves_surrounding_context(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
+
+
+def test_oversized_export_text_fails_closed() -> None:
+    assert redact_source_text("a" * (256 * 1024 + 1)) == "<redacted oversized value>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "request_signature_algorithm=rsa",
+        "authorization_method=oauth2",
+        "Authorization method oauth2",
+        "Authorization status disabled",
+        "password_policy=strong",
+        "my_secret_ingredient=salt",
+        "token_count=42",
+        "token_type_ids=[1, 2]",
+        "signature_algorithm=rsa",
+    ],
+)
+def test_export_credential_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("bucket/user:EXPORT-SECRET-123@host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%3AEXPORT-SECRET-123%40host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%253AEXPORT-SECRET-123%2540host/model.pkl", "bucket/host/model.pkl"),
+        ("///user:EXPORT-SECRET-123@host/model.pkl", "<source redacted>"),
+        ("stream://jdbc:postgresql://user:EXPORT-SECRET-123@host/db", "stream://jdbc:postgresql://host/db"),
+    ],
+)
+def test_nested_userinfo_is_redacted_from_direct_identifiers(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+def test_malformed_url_authority_fails_closed() -> None:
+    source = "https://user:EXPORT-SECRET-123@[broken/model.pkl"
+
+    assert redact_source_identifier(source) == "<cloud URL redacted>"
+    assert redact_source_reference(source) == "<cloud URL redacted>"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "model.pkl?branch=main",
+        "file:///tmp/model.pkl?tag=v1",
+        "model.pkl#tag=v1",
+    ],
+)
+def test_safe_source_reference_provenance_is_not_duplicated(source: str) -> None:
+    assert redact_source_reference(source) == source
 
 
 @pytest.mark.parametrize(
@@ -574,12 +696,20 @@ def test_bare_and_protocol_relative_opaque_source_text_redaction(text: str, expe
 
 
 def test_format_scan_output_serializes_pydantic_urls_and_preserves_text_findings() -> None:
+    generated_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    scan_id = UUID("12345678-1234-5678-1234-567812345678")
     result = create_initial_audit_result()
     result.issues = [
         Issue(
             message="Critical finding",
             severity=IssueSeverity.CRITICAL,
             timestamp=time.time(),
+            details={
+                "binary": b"\xff",
+                "generated_at": generated_at,
+                "local_path": Path("models/model.pkl"),
+                "scan_id": scan_id,
+            },
         )
     ]
     result.file_metadata = {
@@ -596,9 +726,14 @@ def test_format_scan_output_serializes_pydantic_urls_and_preserves_text_findings
     result.finalize_statistics()
 
     json_output = _format_scan_output(result, ["model.pkl"], output_format="json", verbose=True)
-    assert json.loads(json_output)["file_metadata"]["model.pkl"]["license_info"][0]["url"] == (
-        "https://example.com/license"
-    )
+    payload = json.loads(json_output)
+    assert payload["file_metadata"]["model.pkl"]["license_info"][0]["url"] == "https://example.com/license"
+    assert payload["issues"][0]["details"] == {
+        "binary": "<binary data>",
+        "generated_at": "2026-01-02T03:04:05Z",
+        "local_path": "models/model.pkl",
+        "scan_id": "12345678-1234-5678-1234-567812345678",
+    }
 
     text_output = _format_scan_output(result, ["model.pkl"], output_format="text", verbose=True)
     assert "Critical Issues" in text_output
