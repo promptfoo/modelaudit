@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
+- redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
 - bound 7z member-name collection before archive entry-limit failures
 - bound remote streaming-analysis reads and report actual received-byte coverage for truncated objects
 - avoid sending raw model identifiers, source paths, object keys, issue locations, or free-form errors in telemetry
