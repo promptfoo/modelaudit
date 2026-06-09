@@ -397,9 +397,7 @@ class TestDvcIntegration:
         requires_symlinks: None,
     ) -> None:
         """Unrelated cache symlinks must stay on the generic symlink-handling path."""
-        hf_home = tmp_path / ".cache" / "huggingface"
-        monkeypatch.setenv("HF_HOME", str(hf_home))
-        snapshots = hf_home / "hub" / "models--test" / "snapshots" / "abc"
+        snapshots = tmp_path / "cache" / "snapshots" / "abc"
         snapshots.mkdir(parents=True)
         broken_link = snapshots / "model.bin"
         broken_link.symlink_to(Path("../../blobs/missing"))

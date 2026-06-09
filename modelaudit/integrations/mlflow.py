@@ -180,8 +180,9 @@ def _mlflow_download_safety_failure_result(
 
     why = (
         "ModelAudit stages MLflow downloads in a private directory before scanning. "
-        "Refusing returned paths outside that directory prevents a registry or artifact backend "
-        "from redirecting the scan to unintended local files."
+        "Refusing returned paths outside that directory, unavailable paths, and unsupported filesystem objects "
+        "prevents a registry or artifact backend from redirecting the scan to unintended local files or devices "
+        "and from blocking the scanner on special files."
     )
     result.checks.append(
         Check(
@@ -724,7 +725,7 @@ def _preflight_local_mlflow_sources(
             f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
             details,
         )
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         details.update(
             {
                 "reason": "artifact_size_unavailable",
@@ -1280,7 +1281,29 @@ def _resolve_mlflow_download_path(model_uri: str, local_path: str, download_dir:
             {"reason": "artifact_download_path_escape"},
         )
 
-    scan_path = returned_path.parent if returned_path.is_file() else returned_path
+    try:
+        returned_stat = returned_path.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to inspect MLflow artifact download path",
+            {
+                "reason": "artifact_download_path_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    if stat.S_ISREG(returned_stat.st_mode):
+        scan_path = returned_path.parent
+    elif stat.S_ISDIR(returned_stat.st_mode):
+        scan_path = returned_path
+    else:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download returned an unsupported filesystem object",
+            {"reason": "artifact_download_path_unsupported"},
+        )
+
     if not scan_path.is_relative_to(download_root):
         return _mlflow_download_safety_failure_result(
             model_uri,
