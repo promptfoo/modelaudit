@@ -337,6 +337,28 @@ def test_raw_pickle_classifier_skips_large_unicode_operands_without_genops(
     assert JoblibScanner()._looks_like_raw_pickle_payload(payload) is True
 
 
+@pytest.mark.parametrize(
+    "leading_operand",
+    [
+        b"T" + (4).to_bytes(4, "little") + b"safe",
+        b"\x8b" + (1).to_bytes(4, "little") + b"\x01",
+    ],
+)
+def test_scan_detects_raw_protocol0_pickle_after_four_byte_length_operand(
+    tmp_path: Path,
+    leading_operand: bytes,
+) -> None:
+    payload = leading_operand + b"0cos\nsystem\n(S'echo owned'\ntR."
+
+    assert JoblibScanner()._looks_like_raw_pickle_payload(payload) is True
+
+    result = _scan_payload(tmp_path, payload, "four_byte_length_operand.joblib")
+
+    assert result.success is False
+    assert _has_system_reduce_failure(result)
+    assert _compression_failures(result) == []
+
+
 def test_scan_accepts_raw_protocol4_primitive_pickle_joblib(tmp_path: Path) -> None:
     payload = pickle.dumps(7, protocol=4)
 

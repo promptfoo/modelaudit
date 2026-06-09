@@ -181,6 +181,24 @@ def test_escaped_stack_global_operands_do_not_depend_on_raw_seed_or_result_metad
     )
 
 
+def test_escaped_rebuild_stack_global_does_not_depend_on_result_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(pickle_scanner, "_result_opcode_counts", lambda _result: {})
+    monkeypatch.setattr(pickle_scanner, "_result_import_references", lambda _result: [])
+    pickle_bytes = b"S'\\x74orch._utils'\nS'\\x5frebuild_tensor_v2'\n\x93)RS'key'\nS'value'\ns."
+    path = tmp_path / "escaped-rebuild-stack-global.pkl"
+    path.write_bytes(pickle_bytes)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "CVE-2026-24747 Pattern Detection" and check.details.get("pickle_stream_index") == 0
+        for check in result.checks
+    )
+
+
 def test_no_binunicode8_setitem_false_positive(tmp_path: Path) -> None:
     pickle_bytes = b"\x80\x04}" + _binunicode8("key") + _binunicode8("value") + b"s."
     test_file = tmp_path / "normal_dict_binunicode8_setitem.pkl"
@@ -329,6 +347,20 @@ def test_detects_rebuild_tensor_setitem_after_unrecognized_separator(tmp_path: P
         and check.details.get("pickle_stream_parse_incomplete") is False
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("separator", [b"B", b"X"])
+def test_detects_rebuild_tensor_after_failed_separator_probe(tmp_path: Path, separator: bytes) -> None:
+    first_stream = pickle.dumps(None, protocol=4)
+    malicious_stream = (
+        b"S'\\x74orch._utils'\nS'\\x5frebuild_tensor_v2'\n\x93)R" + _binunicode8("key") + _binunicode8("value") + b"s."
+    )
+    path = tmp_path / "later-stream-after-failed-probe.pkl"
+    path.write_bytes(first_stream + separator + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(check.rule_code == "S209" for check in result.checks)
 
 
 def test_detects_protocol_zero_rebuild_tensor_setitem_in_later_pickle_stream(tmp_path: Path) -> None:
@@ -526,6 +558,82 @@ def test_seedless_pickle_skips_python_setitem_analysis(
 
     assert result.success is True
     assert result.metadata["pickle_cve_raw_detector_skipped"] is True
+
+
+def test_unrelated_cve_seed_skips_python_setitem_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_setitem_analysis(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unrelated CVE seeds should not run Python SETITEM analysis")
+
+    monkeypatch.setattr(pickle_scanner, "_analyze_pickle_setitem_entries", fail_setitem_analysis)
+    path = tmp_path / "safe-framework-metadata.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "framework": "pytorch",
+                "storage_type": "torch.storage",
+                "binary_metadata": b"\x93\\",
+                "safe": "value",
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert _cve_2026_24747_issues(result) == []
+
+
+def test_benign_rebuild_key_uses_one_candidate_stack_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_analysis = pickle_scanner._analyze_pickle_setitem_entries
+    calls = 0
+
+    def count_setitem_analysis(
+        data: bytes,
+        *,
+        global_needles: tuple[str, ...],
+        literal_needles: tuple[str, ...] = (),
+    ) -> pickle_scanner._PickleSetitemAnalysis:
+        nonlocal calls
+        calls += 1
+        return original_analysis(
+            data,
+            global_needles=global_needles,
+            literal_needles=literal_needles,
+        )
+
+    monkeypatch.setattr(pickle_scanner, "_analyze_pickle_setitem_entries", count_setitem_analysis)
+    path = tmp_path / "benign-rebuild-key.pkl"
+    path.write_bytes(b"\x80\x04}" + _binunicode8("_rebuild_tensor") + _binunicode8("ordinary value") + b"s.")
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert _cve_2026_24747_issues(result) == []
+    assert calls == 1
+
+
+def test_pickle_cve_streams_reuses_reported_first_stream_extent(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    def fail_stream_probe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("reported first stream extent should avoid reparsing")
+
+    monkeypatch.setattr(pickle_scanner, "_probe_pickle_stream", fail_stream_probe)
+
+    streams, limit_exceeded = pickle_scanner._pickle_cve_streams(
+        payload,
+        first_stream_extent=len(payload),
+    )
+
+    assert streams == (pickle_scanner._PickleCveStream(payload, 0, False),)
+    assert limit_exceeded is False
 
 
 def test_pickle_cve_stream_limit_allows_exact_limit(tmp_path: Path) -> None:

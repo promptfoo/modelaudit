@@ -64,7 +64,7 @@ _TRUNCATED_RAW_PICKLE_SIGNAL_OPCODES = frozenset(
 )
 _PICKLE_OPCODE_BY_BYTE = {ord(opcode.code): opcode for opcode in pickletools.opcodes}
 _PICKLE_TWO_LINE_ARGUMENT_OPCODES = frozenset({"GLOBAL", "INST"})
-_PICKLE_LENGTH_PREFIX_BYTES = {-2: 1, -3: 2, -4: 4, -5: 8}
+_PICKLE_LENGTH_PREFIX_BYTES = {-2: 1, -3: 4, -4: 4, -5: 8}
 
 
 def _next_pickle_opcode_offset(data: bytes, offset: int, opcode: Any) -> int | None:
