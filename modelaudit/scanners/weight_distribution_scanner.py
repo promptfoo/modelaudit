@@ -1,8 +1,9 @@
 """Scanner for detecting anomalous weight distributions in model files."""
 
 import inspect
+import math
+import numbers
 import os
-import re
 import zipfile
 from contextlib import suppress
 from typing import Any, ClassVar
@@ -11,13 +12,58 @@ from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
-_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
-_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_-]*)\s*$")
-_TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
-_TORCH_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
-_TORCH_POSTRELEASE_SUFFIX = r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
-_TORCH_STABLE_SUFFIX_PATTERN = re.compile(
-    rf"(?i)^(?:{_TORCH_LOCAL_SUFFIX}|{_TORCH_POSTRELEASE_SUFFIX}(?:{_TORCH_LOCAL_SUFFIX})?)$"
+_FINAL_LAYER_NAME_PATTERNS = ("fc", "classifier", "head", "output", "final", "dense")
+_ZIP_MEMBER_READ_CHUNK_SIZE = 64 * 1024
+_MAX_PICKLE_METADATA_BYTES = 10 * 1024 * 1024
+_DEFAULT_MAX_TENSOR_BYTES = 100 * 1024 * 1024
+_DEFAULT_MAX_TOTAL_TENSOR_BYTES = 512 * 1024 * 1024
+_ESTIMATED_PICKLE_OBJECT_BYTES = 64
+_MAX_RESTRICTED_PICKLE_BYTES = 10 * 1024 * 1024
+_MAX_RESTRICTED_PICKLE_NODES = 1_000_000
+_MAX_RESTRICTED_PICKLE_OPCODES = 500_000
+_MAX_RESTRICTED_PICKLE_MEMO_ENTRIES = 100_000
+_MAX_NUMERIC_SCALAR_BYTES = 16
+_MIN_NUMPY_ARRAY_BUDGET_BYTES = 256
+_PICKLE_OBJECT_OPCODES = frozenset(
+    {
+        "BINBYTES",
+        "BINBYTES8",
+        "BINFLOAT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "BINSTRING",
+        "BINUNICODE",
+        "BINUNICODE8",
+        "BYTEARRAY8",
+        "DICT",
+        "EMPTY_DICT",
+        "EMPTY_LIST",
+        "EMPTY_SET",
+        "EMPTY_TUPLE",
+        "FLOAT",
+        "FROZENSET",
+        "INT",
+        "LIST",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "NEWFALSE",
+        "NEWTRUE",
+        "NONE",
+        "SHORT_BINBYTES",
+        "SHORT_BINSTRING",
+        "SHORT_BINUNICODE",
+        "STRING",
+        "TUPLE",
+        "TUPLE1",
+        "TUPLE2",
+        "TUPLE3",
+        "UNICODE",
+    }
+)
+_ADDITIVE_EXTRACTION_DETAIL_KEYS = frozenset(
+    {"external_reference_tensors", "oversized_tensors", "tensor_read_failures"}
 )
 
 
@@ -52,15 +98,25 @@ class WeightDistributionScanner(BaseScanner):
         self.llm_vocab_threshold = self.config.get("llm_vocab_threshold", 10000)
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
         # Use max_array_size for in-memory array size limits (default 100MB)
-        self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        self.max_array_size = self.config.get("max_array_size", _DEFAULT_MAX_TENSOR_BYTES)
+        default_total_tensor_bytes = (
+            0
+            if self._configured_byte_limit(self.max_array_size, fallback=_DEFAULT_MAX_TENSOR_BYTES) is None
+            else _DEFAULT_MAX_TOTAL_TENSOR_BYTES
+        )
+        self.max_total_tensor_bytes = self.config.get(
+            "max_weight_distribution_total_bytes",
+            default_total_tensor_bytes,
+        )
         # Direct torch.load on untrusted files can trigger pickle RCE. Keep opt-in.
-        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load", False)
+        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load") is True
         # Flag set when weight extraction would be unsafe
         self.extraction_unsafe = False
         self.extraction_unsafe_reason: str | None = None
         self.extraction_incomplete = False
         self.extraction_incomplete_reasons: list[str] = []
         self.extraction_incomplete_details: dict[str, Any] = {}
+        self.retained_tensor_bytes = 0
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -131,6 +187,7 @@ class WeightDistributionScanner(BaseScanner):
         self.extraction_incomplete = False
         self.extraction_incomplete_reasons = []
         self.extraction_incomplete_details = {}
+        self.retained_tensor_bytes = 0
 
         try:
             # Extract weights based on file format
@@ -163,6 +220,11 @@ class WeightDistributionScanner(BaseScanner):
                     return result
 
             if not weights_info:
+                if self.extraction_unsafe:
+                    self._record_extraction_incomplete(
+                        "unsafe_pytorch_weight_extraction",
+                        unsafe_reason=self.extraction_unsafe_reason,
+                    )
                 if self.extraction_incomplete:
                     self._mark_analysis_incomplete(
                         result,
@@ -237,22 +299,6 @@ class WeightDistributionScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    @staticmethod
-    def _torch_weights_only_is_patched_version(version: object) -> bool:
-        version_text = str(version).strip()
-        match = _TORCH_RELEASE_VERSION_PATTERN.match(version_text)
-        if not match:
-            return False
-
-        release = tuple(int(part) for part in match.groups()[:3])
-        suffix = match.group(4)
-        normalized_suffix = suffix.lstrip("._-")
-        if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
-            return False
-        if suffix and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(suffix) is None:
-            return False
-        return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
-
     def _record_extraction_incomplete(self, reason: str, **details: Any) -> None:
         """Record incomplete tensor extraction while preserving already-read tensors."""
         self.extraction_incomplete = True
@@ -263,8 +309,10 @@ class WeightDistributionScanner(BaseScanner):
             if value is None:
                 continue
             existing = self.extraction_incomplete_details.get(key)
-            if isinstance(existing, int) and isinstance(value, int):
+            if key in _ADDITIVE_EXTRACTION_DETAIL_KEYS and isinstance(existing, int) and isinstance(value, int):
                 self.extraction_incomplete_details[key] = existing + value
+            elif existing == value:
+                continue
             elif isinstance(existing, list):
                 if isinstance(value, list):
                     existing.extend(value)
@@ -299,6 +347,531 @@ class WeightDistributionScanner(BaseScanner):
             },
         )
 
+    @staticmethod
+    def _configured_byte_limit(value: Any, *, fallback: int | None = None) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            return fallback
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            return fallback
+        if numeric_value == 0:
+            return None
+        if numeric_value < 0:
+            return fallback
+        return max(int(numeric_value), 1)
+
+    def _max_tensor_bytes(self) -> int | None:
+        return self._configured_byte_limit(self.max_array_size, fallback=_DEFAULT_MAX_TENSOR_BYTES)
+
+    def _max_total_tensor_bytes(self) -> int | None:
+        return self._configured_byte_limit(
+            self.max_total_tensor_bytes,
+            fallback=self._max_tensor_bytes(),
+        )
+
+    def _remaining_tensor_bytes(self) -> int | None:
+        limits = [limit for limit in (self._max_tensor_bytes(),) if limit is not None]
+        max_total_bytes = self._max_total_tensor_bytes()
+        if max_total_bytes is not None:
+            limits.append(max(max_total_bytes - self.retained_tensor_bytes, 0))
+        if not limits:
+            return None
+        return min(limits)
+
+    def _tensor_fits_budget(
+        self,
+        reason: str,
+        name: str,
+        *,
+        tensor_nbytes: int | None,
+        retain: bool = False,
+    ) -> bool:
+        max_tensor_bytes = self._max_tensor_bytes()
+        if tensor_nbytes is None or tensor_nbytes < 0:
+            self._record_oversized_tensor(reason, name, tensor_nbytes=tensor_nbytes)
+            return False
+        if max_tensor_bytes is not None and tensor_nbytes > max_tensor_bytes:
+            self._record_oversized_tensor(reason, name, tensor_nbytes=tensor_nbytes)
+            return False
+
+        max_total_bytes = self._max_total_tensor_bytes()
+        projected_total = self.retained_tensor_bytes + tensor_nbytes
+        if max_total_bytes is not None and projected_total > max_total_bytes:
+            self._record_extraction_incomplete(
+                f"{reason}_total",
+                failed_tensors=[name],
+                oversized_tensors=1,
+                tensor_nbytes=tensor_nbytes,
+                retained_tensor_bytes=self.retained_tensor_bytes,
+                max_total_tensor_bytes=max_total_bytes,
+            )
+            return False
+
+        if retain:
+            self.retained_tensor_bytes = projected_total
+        return True
+
+    @staticmethod
+    def _logical_tensor_nbytes(shape: Any, dtype: Any) -> int | None:
+        if dtype is None:
+            return None
+        try:
+            dimensions = [int(dim) for dim in shape]
+        except Exception:
+            return None
+        if any(dim < 0 for dim in dimensions):
+            return None
+
+        try:
+            itemsize = int(dtype.itemsize)
+        except Exception:
+            try:
+                import numpy as np
+
+                itemsize = int(np.dtype(dtype).itemsize)
+            except Exception:
+                return None
+
+        if itemsize <= 0:
+            return None
+
+        return math.prod(dimensions) * itemsize
+
+    def _record_oversized_tensor(self, reason: str, name: str, *, tensor_nbytes: int | None) -> None:
+        self._record_extraction_incomplete(
+            reason,
+            failed_tensors=[name],
+            oversized_tensors=1,
+            tensor_nbytes=tensor_nbytes,
+            max_array_size=self._max_tensor_bytes(),
+        )
+
+    def _select_pytorch_data_pickle(
+        self,
+        archive: zipfile.ZipFile,
+    ) -> tuple[str, zipfile.ZipInfo] | None:
+        members = [member for member in archive.infolist() if not member.is_dir()]
+        pickle_candidates: list[tuple[str, zipfile.ZipInfo]] = []
+        for member in members:
+            parts = member.filename.strip("/").split("/")
+            if parts and parts[-1] == "data.pkl":
+                pickle_candidates.append(("/".join(parts[:-1]), member))
+
+        if not pickle_candidates:
+            return None
+
+        candidate_names = [member.filename for _root, member in pickle_candidates]
+        if len(candidate_names) != len(set(candidate_names)):
+            self._record_extraction_incomplete(
+                "pytorch_pickle_member_ambiguous",
+                pickle_member_count=len(candidate_names),
+                pickle_members=candidate_names,
+            )
+            return None
+
+        if len(pickle_candidates) == 1:
+            return pickle_candidates[0]
+
+        member_names = {member.filename.strip("/") for member in members}
+        ranked: list[tuple[int, int, str, zipfile.ZipInfo]] = []
+        for root, member in pickle_candidates:
+            prefix = f"{root}/" if root else ""
+            has_root_marker = any(f"{prefix}{marker}" in member_names for marker in ("version", "byteorder"))
+            has_numeric_storage = any(
+                name.startswith(f"{prefix}data/")
+                and "/" not in name[len(f"{prefix}data/") :]
+                and name[len(f"{prefix}data/") :].isdigit()
+                for name in member_names
+            )
+            credibility = 2 if has_root_marker else int(has_numeric_storage)
+            depth = len(root.split("/")) if root else 0
+            ranked.append((credibility, depth, root, member))
+
+        credible = [candidate for candidate in ranked if candidate[0] > 0]
+        if len(credible) != 1:
+            self._record_extraction_incomplete(
+                "pytorch_pickle_member_ambiguous",
+                pickle_member_count=len(candidate_names),
+                pickle_members=candidate_names,
+            )
+            return None
+        _credibility, _depth, root, member = credible[0]
+        return root, member
+
+    def _pytorch_load_within_budget(self, path: str) -> bool:
+        max_total_bytes = self._max_total_tensor_bytes()
+        max_tensor_bytes = self._max_tensor_bytes()
+
+        try:
+            if zipfile.is_zipfile(path):
+                with zipfile.ZipFile(path, "r") as archive:
+                    selected = self._select_pytorch_data_pickle(archive)
+                    if selected is None:
+                        return not self.extraction_incomplete
+                    root, data_pkl_info = selected
+                    prefix_parts = root.split("/") if root else []
+                    selected_members = [data_pkl_info]
+                    selected_names = {data_pkl_info.filename}
+                    for member_info in archive.infolist():
+                        parts = member_info.filename.strip("/").split("/")
+                        is_storage = (
+                            len(parts) == len(prefix_parts) + 2
+                            and parts[: len(prefix_parts)] == prefix_parts
+                            and parts[-2] == "data"
+                            and parts[-1].isdigit()
+                        )
+                        if member_info.is_dir() or not is_storage:
+                            continue
+                        if member_info.filename in selected_names:
+                            self._record_extraction_incomplete(
+                                "pytorch_archive_member_ambiguous",
+                                failed_tensors=[member_info.filename],
+                            )
+                            return False
+                        selected_names.add(member_info.filename)
+                        selected_members.append(member_info)
+                        if max_tensor_bytes is not None and member_info.file_size > max_tensor_bytes:
+                            self._record_oversized_tensor(
+                                "pytorch_tensor_storage_size_limit",
+                                member_info.filename,
+                                tensor_nbytes=member_info.file_size,
+                            )
+                            return False
+
+                    load_bytes = sum(member.file_size for member in selected_members)
+
+                    if max_total_bytes is not None and load_bytes > max_total_bytes:
+                        self._record_extraction_incomplete(
+                            "pytorch_load_size_limit",
+                            failed_tensors=[path],
+                            oversized_tensors=1,
+                            tensor_nbytes=load_bytes,
+                            max_total_tensor_bytes=max_total_bytes,
+                        )
+                        return False
+
+                    data = self._read_zip_member_bounded(archive, data_pkl_info)
+                    if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
+                        return False
+                return True
+            else:
+                load_bytes = os.path.getsize(path)
+        except (OSError, zipfile.BadZipFile):
+            return True
+
+        if max_tensor_bytes is not None and load_bytes > max_tensor_bytes:
+            self._record_oversized_tensor(
+                "pytorch_legacy_load_size_limit",
+                os.path.basename(path),
+                tensor_nbytes=load_bytes,
+            )
+            return False
+        if max_total_bytes is None or load_bytes <= max_total_bytes:
+            return True
+
+        self._record_extraction_incomplete(
+            "pytorch_load_size_limit",
+            failed_tensors=[path],
+            oversized_tensors=1,
+            tensor_nbytes=load_bytes,
+            max_total_tensor_bytes=max_total_bytes,
+        )
+        return False
+
+    def _pickle_object_budget_allows(self, data: bytes, name: str) -> bool:
+        remaining_bytes = self._remaining_tensor_bytes()
+        budget_bytes = min(limit for limit in (remaining_bytes, _MAX_PICKLE_METADATA_BYTES) if limit is not None)
+        max_objects = max(budget_bytes // _ESTIMATED_PICKLE_OBJECT_BYTES, 1024)
+        object_count = 0
+
+        import pickletools
+
+        for opcode, _arg, _pos in pickletools.genops(data):
+            if opcode.name not in _PICKLE_OBJECT_OPCODES:
+                continue
+            object_count += 1
+            if object_count > max_objects:
+                self._record_extraction_incomplete(
+                    "pytorch_pickle_object_budget",
+                    failed_tensors=[name],
+                    oversized_tensors=1,
+                    pickle_objects=object_count,
+                    max_pickle_objects=max_objects,
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _torch_tensor_nbytes(tensor: Any) -> int | None:
+        try:
+            numel = int(tensor.numel())
+            element_size = int(tensor.element_size())
+        except Exception:
+            return None
+        if numel < 0 or element_size <= 0:
+            return None
+        return numel * element_size
+
+    def _convert_torch_tensor(
+        self,
+        tensor: Any,
+        name: str,
+        seen_storages: set[int] | None = None,
+    ) -> Any | None:
+        tensor_nbytes = self._torch_tensor_nbytes(tensor)
+        if not self._tensor_fits_budget("pytorch_tensor_size_limit", name, tensor_nbytes=tensor_nbytes):
+            return None
+
+        storage_identity: int
+        storage_nbytes: int | None
+        try:
+            storage = tensor.untyped_storage()
+            storage_identity = int(getattr(storage, "_cdata", id(storage)))
+            storage_nbytes = int(storage.nbytes())
+        except Exception:
+            storage_identity = id(tensor)
+            storage_nbytes = tensor_nbytes
+        retain_storage = seen_storages is None or storage_identity not in seen_storages
+        if retain_storage and not self._tensor_fits_budget(
+            "pytorch_tensor_storage_size_limit",
+            name,
+            tensor_nbytes=storage_nbytes,
+        ):
+            return None
+        try:
+            array = tensor.detach().cpu().numpy()
+        except Exception as exc:
+            self._record_extraction_incomplete(
+                "pytorch_tensor_read_failed",
+                failed_tensors=[name],
+                tensor_read_failures=1,
+                exception_type=type(exc).__name__,
+            )
+            return None
+        if not self._tensor_fits_budget(
+            "pytorch_tensor_size_limit",
+            name,
+            tensor_nbytes=int(array.nbytes),
+        ):
+            return None
+        if retain_storage:
+            if not self._tensor_fits_budget(
+                "pytorch_tensor_storage_size_limit",
+                name,
+                tensor_nbytes=storage_nbytes,
+                retain=True,
+            ):
+                return None
+            if seen_storages is not None:
+                seen_storages.add(storage_identity)
+        return array.T
+
+    def _python_tensor_nbytes(self, value: Any) -> int | None:
+        max_bytes = self._remaining_tensor_bytes()
+        stack: list[tuple[Any, bool]] = [(value, False)]
+        active_containers: set[int] = set()
+        scalar_count = 0
+        max_itemsize = 1
+
+        while stack:
+            item, exiting = stack.pop()
+            if isinstance(item, (list, tuple)):
+                item_id = id(item)
+                if exiting:
+                    active_containers.remove(item_id)
+                    continue
+                if item_id in active_containers:
+                    return None
+                active_containers.add(item_id)
+                stack.append((item, True))
+                stack.extend((child, False) for child in reversed(item))
+                continue
+            if isinstance(item, bool):
+                itemsize = 1
+            elif isinstance(item, complex):
+                itemsize = 16
+            elif isinstance(item, float) or (isinstance(item, int) and -(2**63) <= item < 2**63):
+                itemsize = 8
+            else:
+                return None
+            scalar_count += 1
+            max_itemsize = max(max_itemsize, itemsize)
+            estimated_nbytes = scalar_count * max_itemsize
+            if max_bytes is not None and estimated_nbytes > max_bytes:
+                return estimated_nbytes
+
+        return scalar_count * max_itemsize
+
+    @staticmethod
+    def _python_tensor_has_matrix_shape(value: Any) -> bool:
+        if not isinstance(value, (list, tuple)) or not value:
+            return False
+        return isinstance(value[0], (list, tuple))
+
+    def _restricted_pickle_array_limit(self) -> int:
+        """Return a hard-bounded array budget for the primitive pickle fallback."""
+        remaining_bytes = self._remaining_tensor_bytes()
+        if remaining_bytes is None:
+            return 100 * 1024 * 1024
+        return min(remaining_bytes, 100 * 1024 * 1024)
+
+    def _new_primitive_array_budget(self) -> dict[str, int]:
+        byte_limit = self._restricted_pickle_array_limit()
+        max_numeric_items = byte_limit // _MAX_NUMERIC_SCALAR_BYTES
+        return {
+            "remaining_bytes": byte_limit,
+            "remaining_nodes": min(_MAX_RESTRICTED_PICKLE_NODES, max(1, max_numeric_items * 2 + 1)),
+        }
+
+    def _restricted_pickle_opcode_limit(self) -> int:
+        return min(
+            _MAX_RESTRICTED_PICKLE_OPCODES,
+            max(1024, self._restricted_pickle_array_limit() // 8),
+        )
+
+    def _bounded_primitive_array(self, value: Any, np: Any, budget: dict[str, int]) -> Any | None:
+        """Materialize a primitive numeric array only after bounded graph traversal."""
+        active_container_ids: set[int] = set()
+        stack: list[tuple[Any, bool]] = [(value, False)]
+        numeric_items = 0
+        max_numeric_item_bytes = 1
+        metadata_items = 0
+
+        while stack:
+            node, leaving = stack.pop()
+            if leaving:
+                active_container_ids.remove(id(node))
+                continue
+
+            budget["remaining_nodes"] -= 1
+            if budget["remaining_nodes"] < 0:
+                raise ValueError("Primitive tensor structure exceeds aggregate node limit")
+
+            if isinstance(node, (list, tuple)):
+                node_id = id(node)
+                if node_id in active_container_ids:
+                    raise ValueError("Primitive tensor structure contains a cycle")
+                active_container_ids.add(node_id)
+                stack.append((node, True))
+                stack.extend((item, False) for item in reversed(node))
+                continue
+
+            if isinstance(node, bool):
+                metadata_items += 1
+                continue
+            if isinstance(node, numbers.Number):
+                numeric_items += 1
+                if isinstance(node, complex):
+                    max_numeric_item_bytes = max(max_numeric_item_bytes, 16)
+                elif isinstance(node, (int, float)):
+                    max_numeric_item_bytes = max(max_numeric_item_bytes, 8)
+                else:
+                    max_numeric_item_bytes = max(max_numeric_item_bytes, _MAX_NUMERIC_SCALAR_BYTES)
+                continue
+            if isinstance(node, (str, bytes)) or node is None:
+                metadata_items += 1
+                continue
+            raise ValueError(f"Primitive tensor contains unsupported value type: {type(node).__name__}")
+
+        if numeric_items and metadata_items:
+            raise ValueError("Primitive tensor mixes numeric values with non-numeric metadata")
+        if metadata_items or numeric_items == 0:
+            return None
+
+        required_bytes = max(
+            numeric_items * max_numeric_item_bytes,
+            _MIN_NUMPY_ARRAY_BUDGET_BYTES,
+        )
+        if required_bytes > budget["remaining_bytes"]:
+            raise ValueError(
+                "Primitive tensor materialization exceeds aggregate byte limit "
+                f"({required_bytes} > {budget['remaining_bytes']})"
+            )
+        budget["remaining_bytes"] -= required_bytes
+
+        array = np.array(value)
+        if not np.issubdtype(array.dtype, np.number):
+            raise ValueError(f"Primitive tensor has non-numeric dtype: {array.dtype}")
+        if array.nbytes > required_bytes:
+            raise ValueError(
+                f"Primitive tensor materialization exceeded reserved bytes ({array.nbytes} > {required_bytes})"
+            )
+        return array
+
+    def _read_zip_member_bounded(self, archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> bytes | None:
+        max_tensor_bytes = self._max_tensor_bytes()
+        remaining_tensor_bytes = self._remaining_tensor_bytes()
+        max_bytes = min(
+            limit
+            for limit in (max_tensor_bytes, remaining_tensor_bytes, _MAX_PICKLE_METADATA_BYTES)
+            if limit is not None
+        )
+        if member_info.file_size > max_bytes:
+            self._record_extraction_incomplete(
+                "pytorch_zip_data_pkl_size_limit",
+                failed_tensors=[member_info.filename],
+                oversized_tensors=1,
+                tensor_nbytes=member_info.file_size,
+                max_array_size=max_tensor_bytes,
+                max_pickle_metadata_bytes=max_bytes,
+            )
+            return None
+
+        data = bytearray()
+        with archive.open(member_info, "r") as member:
+            while True:
+                chunk = member.read(_ZIP_MEMBER_READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    self._record_extraction_incomplete(
+                        "pytorch_zip_data_pkl_size_limit",
+                        failed_tensors=[member_info.filename],
+                        oversized_tensors=1,
+                        tensor_nbytes=len(data),
+                        max_array_size=max_tensor_bytes,
+                        max_pickle_metadata_bytes=max_bytes,
+                    )
+                    return None
+        return bytes(data)
+
+    @staticmethod
+    def _is_weight_tensor_name(name: str) -> bool:
+        lowered_name = name.lower()
+        return "kernel" in lowered_name or "weight" in lowered_name
+
+    @staticmethod
+    def _weight_tensor_name_priority(name: str) -> int:
+        lowered_name = name.lower()
+        return int(any(pattern in lowered_name for pattern in _FINAL_LAYER_NAME_PATTERNS))
+
+    @staticmethod
+    def _tensorflow_dtype_itemsize(dtype: Any) -> int | None:
+        try:
+            import numpy as np
+
+            as_numpy_dtype = getattr(dtype, "as_numpy_dtype", dtype)
+            numpy_dtype = np.dtype(as_numpy_dtype)
+            if numpy_dtype.hasobject or numpy_dtype.kind in "SU" or numpy_dtype.itemsize <= 0:
+                return None
+            return int(numpy_dtype.itemsize)
+        except Exception:
+            return None
+
+    def _tensorflow_checkpoint_variable_nbytes(self, shape: Any, dtype: Any | None) -> int | None:
+        try:
+            dimensions = [int(dim) for dim in shape]
+        except Exception:
+            return None
+        if any(dim < 0 for dim in dimensions):
+            return None
+
+        itemsize = self._tensorflow_dtype_itemsize(dtype) if dtype is not None else None
+        if itemsize is None:
+            return None
+        return math.prod(dimensions) * itemsize
+
     def _extract_pytorch_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from PyTorch model files"""
         try:
@@ -312,12 +885,21 @@ class WeightDistributionScanner(BaseScanner):
         self.extraction_unsafe_reason = None
 
         weights_info: dict[str, Any] = {}
+        seen_storages: set[int] = set()
 
         try:
-            # SECURITY: avoid unsafe torch.load on untrusted files unless explicitly allowed.
-            # Use weights_only=True on patched versions, and block unsafe fallbacks by default.
+            if not self.enable_unsafe_torch_load:
+                self.extraction_unsafe = True
+                self.extraction_unsafe_reason = (
+                    "Blocked torch.load on untrusted model input. weights_only=True narrows the "
+                    "deserialization attack surface but is not a trust boundary. Set "
+                    "enable_unsafe_torch_load=true to opt in."
+                )
+                raise RuntimeError(self.extraction_unsafe_reason)
+
+            # The explicit unsafe opt-in permits torch.load; retain weights_only when available
+            # as defense in depth.
             load_kwargs: dict[str, Any] = {"map_location": torch.device("cpu")}
-            torch_version = getattr(torch, "__version__", "unknown")
             supports_weights_only = False
             try:
                 load_sig = inspect.signature(torch.load)
@@ -327,23 +909,9 @@ class WeightDistributionScanner(BaseScanner):
 
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
-                is_patched_version = self._torch_weights_only_is_patched_version(torch_version)
 
-                if not is_patched_version and not self.enable_unsafe_torch_load:
-                    self.extraction_unsafe = True
-                    self.extraction_unsafe_reason = (
-                        "Blocked torch.load: weights_only=True is only treated as safe on stable "
-                        "PyTorch 2.6.0 or newer. Prerelease, dev, and unknown versions may still "
-                        "be vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
-                    )
-                    raise RuntimeError(self.extraction_unsafe_reason)
-            elif not self.enable_unsafe_torch_load:
-                self.extraction_unsafe = True
-                self.extraction_unsafe_reason = (
-                    "Blocked torch.load: this PyTorch version does not support weights_only=True. "
-                    "Set enable_unsafe_torch_load=true to override."
-                )
-                raise RuntimeError(self.extraction_unsafe_reason)
+            if not self._pytorch_load_within_budget(path):
+                return {}
 
             # Load model with map_location to CPU to avoid GPU requirements
             model_data = torch.load(path, **load_kwargs)
@@ -355,10 +923,11 @@ class WeightDistributionScanner(BaseScanner):
 
                 # Find final layer weights (classification head)
                 for key, value in state_dict.items():
+                    key_text = str(key)
                     if isinstance(value, torch.Tensor) and (
                         (
                             any(
-                                pattern in key.lower()
+                                pattern in key_text.lower()
                                 for pattern in [
                                     "fc",
                                     "classifier",
@@ -367,36 +936,49 @@ class WeightDistributionScanner(BaseScanner):
                                     "final",
                                 ]
                             )
-                            and "weight" in key.lower()
+                            and "weight" in key_text.lower()
                         )
-                        or ("weight" in key.lower() and len(value.shape) >= 2)
+                        or "weight" in key_text.lower()
                     ):
-                        # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
-                        weights_info[key] = value.detach().cpu().numpy().T
+                        if len(value.shape) < 2:
+                            continue
+                        array = self._convert_torch_tensor(value, key_text, seen_storages)
+                        if array is not None:
+                            weights_info[key_text] = array
 
             elif hasattr(model_data, "state_dict"):
                 # Full model format
                 state_dict = model_data.state_dict()
                 for key, value in state_dict.items():
-                    if "weight" in key.lower() and isinstance(value, torch.Tensor):
-                        # PyTorch uses (out_features, in_features) but we expect (in_features, out_features)
-                        weights_info[key] = value.detach().cpu().numpy().T
+                    key_text = str(key)
+                    if "weight" in key_text.lower() and isinstance(value, torch.Tensor):
+                        if len(value.shape) < 2:
+                            continue
+                        array = self._convert_torch_tensor(value, key_text, seen_storages)
+                        if array is not None:
+                            weights_info[key_text] = array
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
-            # Try loading as a zip file (newer PyTorch format)
+            safe_fallback_processed = False
             try:
                 with zipfile.ZipFile(path, "r") as z:
-                    data_pkl_path = next(
-                        (n for n in z.namelist() if n.endswith("/data.pkl") or n == "data.pkl"),
-                        None,
-                    )
-                    if data_pkl_path:
+                    selected = self._select_pytorch_data_pickle(z)
+                    if selected is not None:
                         import io
                         import pickle
                         import pickletools
 
-                        data = z.read(data_pkl_path)
+                        _root, data_pkl_info = selected
+                        data = self._read_zip_member_bounded(z, data_pkl_info)
+                        if data is None:
+                            self.extraction_unsafe = False
+                            self.extraction_unsafe_reason = None
+                            return weights_info
+                        if not self._pickle_object_budget_allows(data, data_pkl_info.filename):
+                            self.extraction_unsafe = False
+                            self.extraction_unsafe_reason = None
+                            return weights_info
 
                         # Look for disallowed opcodes that could trigger code execution
                         disallowed = {
@@ -410,17 +992,57 @@ class WeightDistributionScanner(BaseScanner):
                             "NEWOBJ_EX",
                         }
                         unsafe = False
-                        for opcode, _arg, _pos in pickletools.genops(data):
+                        pickle_opcode_limit = self._restricted_pickle_opcode_limit()
+                        pickle_graph_over_budget = False
+                        pickle_memo_entries = 0
+                        pickle_memo_limit = min(_MAX_RESTRICTED_PICKLE_MEMO_ENTRIES, pickle_opcode_limit)
+                        for pickle_opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(data), start=1):
+                            if pickle_opcode_count > pickle_opcode_limit:
+                                self._record_extraction_incomplete(
+                                    "pytorch_pickle_graph_budget_exceeded",
+                                    pickle_opcode_count=pickle_opcode_count,
+                                    pickle_opcode_limit=pickle_opcode_limit,
+                                )
+                                pickle_graph_over_budget = True
+                                break
+                            if opcode.name in {"PUT", "BINPUT", "LONG_BINPUT"}:
+                                if (
+                                    not isinstance(arg, int)
+                                    or arg < 0
+                                    or arg > pickle_memo_entries
+                                    or arg >= pickle_memo_limit
+                                ):
+                                    self._record_extraction_incomplete(
+                                        "pytorch_pickle_graph_budget_exceeded",
+                                        pickle_memo_index=arg,
+                                        pickle_memo_entries=pickle_memo_entries,
+                                        pickle_memo_limit=pickle_memo_limit,
+                                        pickle_memo_opcode=opcode.name,
+                                    )
+                                    pickle_graph_over_budget = True
+                                    break
+                                if arg == pickle_memo_entries:
+                                    pickle_memo_entries += 1
+                            elif opcode.name == "MEMOIZE":
+                                if pickle_memo_entries >= pickle_memo_limit:
+                                    self._record_extraction_incomplete(
+                                        "pytorch_pickle_graph_budget_exceeded",
+                                        pickle_memo_entries=pickle_memo_entries,
+                                        pickle_memo_limit=pickle_memo_limit,
+                                        pickle_memo_opcode=opcode.name,
+                                    )
+                                    pickle_graph_over_budget = True
+                                    break
+                                pickle_memo_entries += 1
                             if opcode.name in disallowed:
                                 unsafe = True
                                 break
 
-                        if unsafe:
+                        if pickle_graph_over_budget:
+                            safe_fallback_processed = True
+                        elif unsafe:
                             self.extraction_unsafe = True
-                            if self.extraction_unsafe_reason is None:
-                                self.extraction_unsafe_reason = (
-                                    "Unsafe to extract weights from data.pkl in PyTorch archive"
-                                )
+                            self.extraction_unsafe_reason = "Unsafe to extract weights from data.pkl in PyTorch archive"
                         else:
                             try:
 
@@ -430,31 +1052,75 @@ class WeightDistributionScanner(BaseScanner):
 
                                 obj = RestrictedUnpickler(io.BytesIO(data)).load()
                                 if isinstance(obj, dict):
+                                    primitive_budget = self._new_primitive_array_budget()
+                                    primitive_arrays: dict[int, Any | None] = {}
+                                    retained_primitive_arrays: set[int] = set()
+                                    primitive_array_names: dict[int, str] = {}
                                     for key, value in obj.items():
-                                        array = np.array(value)
-                                        if len(array.shape) >= 2 and (
-                                            "weight" in key.lower() or "kernel" in key.lower()
+                                        if not isinstance(key, str) or not self._is_weight_tensor_name(key):
+                                            continue
+                                        if not self._python_tensor_has_matrix_shape(value):
+                                            continue
+                                        value_identity = id(value)
+                                        if value_identity in primitive_arrays:
+                                            array = primitive_arrays[value_identity]
+                                        else:
+                                            try:
+                                                array = self._bounded_primitive_array(value, np, primitive_budget)
+                                            except Exception as array_error:
+                                                self._record_extraction_incomplete(
+                                                    "pytorch_tensor_materialization_failed",
+                                                    failed_tensors=[key],
+                                                    tensor_read_failures=1,
+                                                    exception_type=type(array_error).__name__,
+                                                )
+                                                primitive_arrays[value_identity] = None
+                                                continue
+                                            primitive_arrays[value_identity] = array
+                                        if array is None or len(array.shape) < 2:
+                                            continue
+                                        if value_identity in retained_primitive_arrays:
+                                            previous_name = primitive_array_names[value_identity]
+                                            if self._weight_tensor_name_priority(
+                                                key
+                                            ) > self._weight_tensor_name_priority(previous_name):
+                                                weights_info.pop(previous_name, None)
+                                                weights_info[key] = array
+                                                primitive_array_names[value_identity] = key
+                                            continue
+                                        if self._tensor_fits_budget(
+                                            "pytorch_zip_tensor_size_limit",
+                                            key,
+                                            tensor_nbytes=int(array.nbytes),
+                                            retain=True,
                                         ):
                                             weights_info[key] = array
+                                            retained_primitive_arrays.add(value_identity)
+                                            primitive_array_names[value_identity] = key
+                                    safe_fallback_processed = True
                                 else:
-                                    self.extraction_unsafe = True
-                                    if self.extraction_unsafe_reason is None:
-                                        self.extraction_unsafe_reason = (
-                                            "Restricted unpickler could not parse PyTorch archive safely"
-                                        )
-                            except Exception as e2:  # pragma: no cover - defensive
-                                logger.debug(
-                                    f"Failed restricted unpickle for {path}: {e2}",
-                                )
-                                self.extraction_unsafe = True
-                                if self.extraction_unsafe_reason is None:
-                                    self.extraction_unsafe_reason = (
-                                        "Restricted unpickler failed while extracting PyTorch archive"
+                                    self._record_extraction_incomplete(
+                                        "pytorch_pickle_unsupported_root",
+                                        pickle_root_type=type(obj).__name__,
                                     )
+                                    safe_fallback_processed = True
+                            except Exception as e2:  # pragma: no cover - defensive
+                                logger.debug(f"Failed restricted unpickle for {path}: {e2}")
+                                self._record_extraction_incomplete(
+                                    "pytorch_pickle_parse_failed",
+                                    exception_type=type(e2).__name__,
+                                )
+                                safe_fallback_processed = True
+                    elif self.extraction_incomplete:
+                        safe_fallback_processed = True
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
 
-        if weights_info:
+            if safe_fallback_processed:
+                self.extraction_unsafe = False
+                self.extraction_unsafe_reason = None
+
+        if weights_info and not self.extraction_incomplete:
             self.extraction_unsafe = False
             self.extraction_unsafe_reason = None
 
@@ -472,13 +1138,125 @@ class WeightDistributionScanner(BaseScanner):
 
         try:
             with h5py.File(path, "r") as f:
-                # Navigate through the HDF5 structure to find weights
-                def extract_weights(name, obj):
-                    if (
-                        isinstance(obj, h5py.Dataset)
-                        and ("kernel" in name or "weight" in name)
-                        and np.issubdtype(obj.dtype, np.number)
-                    ):
+                visited_group_states: set[tuple[Any, bool, bool]] = set()
+                materialized_datasets: dict[Any, Any] = {}
+                materialized_dataset_names: dict[Any, str] = {}
+                skipped_dataset_ids: set[Any] = set()
+                groups_to_visit: list[tuple[Any, str]] = [(f, "")]
+
+                while groups_to_visit:
+                    group, prefix = groups_to_visit.pop()
+                    lowered_prefix = prefix.lower()
+                    group_state = (
+                        group.id,
+                        self._is_weight_tensor_name(prefix),
+                        any(pattern in lowered_prefix for pattern in _FINAL_LAYER_NAME_PATTERNS),
+                    )
+                    if group_state in visited_group_states:
+                        continue
+                    visited_group_states.add(group_state)
+
+                    for child_name in group:
+                        name = f"{prefix}/{child_name}" if prefix else str(child_name)
+                        try:
+                            link = group.get(child_name, getlink=True)
+                        except Exception as exc:
+                            if self._is_weight_tensor_name(name):
+                                self._record_extraction_incomplete(
+                                    "keras_hdf5_link_read_failed",
+                                    failed_tensors=[name],
+                                    tensor_read_failures=1,
+                                    exception_type=type(exc).__name__,
+                                )
+                            continue
+
+                        if isinstance(link, h5py.ExternalLink):
+                            if not self._is_weight_tensor_name(name) and not self._is_weight_tensor_name(link.path):
+                                continue
+                            self._record_extraction_incomplete(
+                                "keras_hdf5_external_link_skipped",
+                                failed_tensors=[name],
+                                external_reference_tensors=1,
+                                link_type=type(link).__name__,
+                            )
+                            continue
+
+                        try:
+                            obj = group.get(child_name, getlink=False)
+                        except Exception as exc:
+                            if self._is_weight_tensor_name(name):
+                                self._record_extraction_incomplete(
+                                    "keras_hdf5_object_read_failed",
+                                    failed_tensors=[name],
+                                    tensor_read_failures=1,
+                                    exception_type=type(exc).__name__,
+                                )
+                            continue
+
+                        if isinstance(obj, h5py.Group):
+                            groups_to_visit.append((obj, name))
+                            continue
+
+                        if obj is None:
+                            if self._is_weight_tensor_name(name):
+                                self._record_extraction_incomplete(
+                                    "keras_hdf5_object_read_failed",
+                                    failed_tensors=[name],
+                                    tensor_read_failures=1,
+                                    exception_type="DanglingLink",
+                                )
+                            continue
+
+                        if not (
+                            isinstance(obj, h5py.Dataset)
+                            and self._is_weight_tensor_name(name)
+                            and np.issubdtype(obj.dtype, np.number)
+                        ):
+                            continue
+
+                        dataset_identity = obj.id
+                        if dataset_identity in materialized_datasets:
+                            previous_name = materialized_dataset_names[dataset_identity]
+                            if self._weight_tensor_name_priority(name) > self._weight_tensor_name_priority(
+                                previous_name
+                            ):
+                                weights_info.pop(previous_name, None)
+                                weights_info[name] = materialized_datasets[dataset_identity]
+                                materialized_dataset_names[dataset_identity] = name
+                            continue
+                        if dataset_identity in skipped_dataset_ids:
+                            continue
+                        skipped_dataset_ids.add(dataset_identity)
+
+                        storage_properties = obj.id.get_create_plist()
+                        if storage_properties.get_external_count() > 0:
+                            self._record_extraction_incomplete(
+                                "keras_hdf5_external_storage_skipped",
+                                failed_tensors=[name],
+                                external_reference_tensors=1,
+                            )
+                            continue
+
+                        try:
+                            virtual_source_count = storage_properties.get_virtual_count()
+                        except ValueError:
+                            virtual_source_count = 0
+                        if virtual_source_count > 0:
+                            self._record_extraction_incomplete(
+                                "keras_hdf5_virtual_dataset_skipped",
+                                failed_tensors=[name],
+                                external_reference_tensors=1,
+                            )
+                            continue
+
+                        tensor_nbytes = self._logical_tensor_nbytes(obj.shape, obj.dtype)
+                        if not self._tensor_fits_budget(
+                            "keras_tensor_size_limit",
+                            name,
+                            tensor_nbytes=tensor_nbytes,
+                        ):
+                            continue
+
                         try:
                             array = np.array(obj)
                         except Exception as exc:
@@ -489,10 +1267,18 @@ class WeightDistributionScanner(BaseScanner):
                                 tensor_read_failures=1,
                                 exception_type=type(exc).__name__,
                             )
-                            return
+                            continue
+                        if not self._tensor_fits_budget(
+                            "keras_tensor_size_limit",
+                            name,
+                            tensor_nbytes=int(array.nbytes),
+                            retain=True,
+                        ):
+                            continue
+                        materialized_datasets[dataset_identity] = array
+                        materialized_dataset_names[dataset_identity] = name
+                        skipped_dataset_ids.discard(dataset_identity)
                         weights_info[name] = array
-
-                f.visititems(extract_weights)
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
@@ -523,12 +1309,30 @@ class WeightDistributionScanner(BaseScanner):
 
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
-                    for name, _shape in tf.train.list_variables(ckpt_prefix):
+                    variable_dtype_map: dict[str, Any] = {}
+                    with suppress(Exception):
+                        checkpoint_reader = tf.train.load_checkpoint(ckpt_prefix)
+                        if hasattr(checkpoint_reader, "get_variable_to_dtype_map"):
+                            variable_dtype_map = dict(checkpoint_reader.get_variable_to_dtype_map())
+
+                    for name, shape in tf.train.list_variables(ckpt_prefix):
                         if "weight" not in name.lower() and "kernel" not in name.lower():
+                            continue
+                        if len(shape) < 2:
+                            continue
+                        tensor_nbytes = self._tensorflow_checkpoint_variable_nbytes(
+                            shape,
+                            variable_dtype_map.get(name),
+                        )
+                        if not self._tensor_fits_budget(
+                            "tensorflow_checkpoint_tensor_size_limit",
+                            name,
+                            tensor_nbytes=tensor_nbytes,
+                        ):
                             continue
                         try:
                             tensor = tf.train.load_variable(ckpt_prefix, name)
-                            array = np.array(tensor)
+                            array = np.asarray(tensor)
                         except Exception as exc:
                             logger.warning(
                                 "TensorFlow weight variable '%s' could not be read from %s: %s", name, path, exc
@@ -540,7 +1344,12 @@ class WeightDistributionScanner(BaseScanner):
                                 exception_type=type(exc).__name__,
                             )
                             continue
-                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                        if not self._tensor_fits_budget(
+                            "tensorflow_checkpoint_tensor_size_limit",
+                            name,
+                            tensor_nbytes=int(array.nbytes),
+                            retain=len(array.shape) >= 2,
+                        ):
                             continue
                         # Only include 2D+ tensors for consistency with .pb file handling
                         if len(array.shape) >= 2:
@@ -556,7 +1365,7 @@ class WeightDistributionScanner(BaseScanner):
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2
 
-                from modelaudit.utils.tensorflow_compat import tensor_proto_to_ndarray
+                from modelaudit.utils.tensorflow_compat import DTYPE_MAP, tensor_proto_to_ndarray
 
                 nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
@@ -580,10 +1389,27 @@ class WeightDistributionScanner(BaseScanner):
                         continue
 
                     tensor_proto = node.attr["value"].tensor
+                    tensor_dtype = DTYPE_MAP.get(int(tensor_proto.dtype))
+                    if tensor_dtype is None or tensor_dtype.hasobject or tensor_dtype.kind in "SU":
+                        self._record_extraction_incomplete(
+                            "tensorflow_const_tensor_dtype_unsupported",
+                            failed_tensors=[node.name],
+                            tensor_read_failures=1,
+                            tensor_dtype=int(tensor_proto.dtype),
+                        )
+                        continue
+                    remaining_tensor_bytes = self._remaining_tensor_bytes()
+                    if remaining_tensor_bytes == 0:
+                        self._record_oversized_tensor(
+                            "tensorflow_const_tensor_size_limit",
+                            node.name,
+                            tensor_nbytes=None,
+                        )
+                        continue
                     try:
                         array = tensor_proto_to_ndarray(
                             tensor_proto,
-                            max_tensor_bytes=self.max_array_size,
+                            max_tensor_bytes=remaining_tensor_bytes,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -597,7 +1423,12 @@ class WeightDistributionScanner(BaseScanner):
                         )
                         continue
 
-                    if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                    if not self._tensor_fits_budget(
+                        "tensorflow_const_tensor_size_limit",
+                        node.name,
+                        tensor_nbytes=int(array.nbytes),
+                        retain=len(array.shape) >= 2,
+                    ):
                         continue
                     if len(array.shape) >= 2:
                         weights_info[node.name] = array
@@ -606,6 +1437,35 @@ class WeightDistributionScanner(BaseScanner):
             raise RuntimeError(f"Failed to extract TensorFlow weights from {path}") from e
 
         return weights_info
+
+    @staticmethod
+    def _onnx_inline_storage_nbytes(onnx: Any, initializer: Any) -> int:
+        raw_data = getattr(initializer, "raw_data", b"")
+        raw_bytes = len(raw_data)
+        data_type = getattr(initializer, "data_type", None)
+        tensor_proto = getattr(onnx, "TensorProto", None)
+
+        packed_multiplier = 1
+        for dtype_name in ("FLOAT4E2M1", "INT4", "UINT4"):
+            if tensor_proto is not None and data_type == getattr(tensor_proto, dtype_name, None):
+                packed_multiplier = 2
+                break
+        for dtype_name in ("INT2", "UINT2"):
+            if tensor_proto is not None and data_type == getattr(tensor_proto, dtype_name, None):
+                packed_multiplier = 4
+                break
+
+        typed_bytes = 0
+        for field_name, itemsize in (
+            ("float_data", 4),
+            ("int32_data", 4),
+            ("int64_data", 8),
+            ("double_data", 8),
+            ("uint64_data", 8),
+        ):
+            typed_bytes += len(getattr(initializer, field_name, ())) * itemsize
+        typed_bytes += sum(len(value) for value in getattr(initializer, "string_data", ()))
+        return raw_bytes * packed_multiplier + typed_bytes
 
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from ONNX model files.
@@ -622,6 +1482,18 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, Any] = {}
 
         try:
+            max_total_bytes = self._max_total_tensor_bytes()
+            model_size = os.path.getsize(path)
+            if max_total_bytes is not None and model_size > max_total_bytes:
+                self._record_extraction_incomplete(
+                    "onnx_model_size_limit",
+                    failed_tensors=[path],
+                    oversized_tensors=1,
+                    tensor_nbytes=model_size,
+                    max_total_tensor_bytes=max_total_bytes,
+                )
+                return {}
+
             # Use load_external_data=False to prevent ValidationError when
             # external data files (e.g. weights.pb) are missing. This is the
             # common case for models downloaded from HuggingFace or distributed
@@ -638,15 +1510,46 @@ class WeightDistributionScanner(BaseScanner):
                 if len(initializer.dims) < 2:
                     continue
 
+                initializer_name = str(initializer.name)
+                external_location = getattr(getattr(onnx, "TensorProto", None), "EXTERNAL", 1)
+                if getattr(initializer, "data_location", None) == external_location or bool(
+                    getattr(initializer, "external_data", ())
+                ):
+                    self._record_extraction_incomplete(
+                        "onnx_external_initializer_skipped",
+                        failed_tensors=[initializer_name],
+                        external_reference_tensors=1,
+                    )
+                    continue
+
                 # Pre-check estimated byte size before materializing the
                 # full array — avoids memory exhaustion on huge tensors.
+                tensor_dtype: Any | None = None
                 with suppress(Exception):
+                    tensor_dtype = onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)
+                if tensor_dtype is None:
                     _onnx_mapping = getattr(onnx, "mapping", None)
-                    if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
-                        tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
-                        estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
-                        if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
-                            continue
+                    with suppress(Exception):
+                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                with suppress(Exception):
+                    numpy_dtype = np.dtype(tensor_dtype)
+                    if numpy_dtype.hasobject or numpy_dtype.kind in "SU" or numpy_dtype.itemsize <= 0:
+                        tensor_dtype = None
+                inline_storage_nbytes = self._onnx_inline_storage_nbytes(onnx, initializer)
+                if not self._tensor_fits_budget(
+                    "onnx_initializer_storage_size_limit",
+                    initializer_name,
+                    tensor_nbytes=inline_storage_nbytes,
+                ):
+                    continue
+                estimated_size = self._logical_tensor_nbytes(initializer.dims, tensor_dtype)
+                if not self._tensor_fits_budget(
+                    "onnx_initializer_size_limit",
+                    initializer_name,
+                    tensor_nbytes=estimated_size,
+                ):
+                    continue
 
                 try:
                     arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
@@ -656,14 +1559,19 @@ class WeightDistributionScanner(BaseScanner):
                     )
                     self._record_extraction_incomplete(
                         "onnx_initializer_read_failed",
-                        failed_tensors=[initializer.name],
+                        failed_tensors=[initializer_name],
                         tensor_read_failures=1,
                         exception_type=type(exc).__name__,
                     )
                     continue
-                if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                if not self._tensor_fits_budget(
+                    "onnx_initializer_size_limit",
+                    initializer_name,
+                    tensor_nbytes=int(arr.nbytes),
+                    retain=True,
+                ):
                     continue
-                weights_info[initializer.name] = arr
+                weights_info[initializer_name] = arr
 
         except Exception as e:
             logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
@@ -707,18 +1615,7 @@ class WeightDistributionScanner(BaseScanner):
         final_layer_candidates = {}
         for name, weights in weights_info.items():
             if (
-                any(
-                    pattern in name.lower()
-                    for pattern in [
-                        "fc",
-                        "classifier",
-                        "head",
-                        "output",
-                        "final",
-                        "dense",
-                    ]
-                )
-                and "weight" in name.lower()
+                any(pattern in name.lower() for pattern in _FINAL_LAYER_NAME_PATTERNS) and "weight" in name.lower()
             ) and len(weights.shape) == 2:  # Ensure it's a 2D weight matrix
                 final_layer_candidates[name] = weights
 

@@ -1016,17 +1016,6 @@ def _redact_urls_in_text(text: str) -> str:
     return _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
 
 
-def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
-    scheme_marker = data.rfind(b"://", scan_start, match_start)
-    if scheme_marker < 0:
-        return None
-
-    url_start = scheme_marker
-    while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
-        url_start -= 1
-    return url_start
-
-
 def _url_is_likely_call_endpoint(data: bytes, match_end: int, url_start: int) -> bool:
     cursor = match_end
     while cursor < url_start and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
@@ -1203,29 +1192,8 @@ def _bare_endpoint_with_optional_port(data: bytes, endpoint_start: int, endpoint
 
 
 def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
-    start = max(0, match_start - before)
-    end = min(len(data), match_end + after)
-    scan_start = max(0, start - _MAX_SNIPPET_URL_EXPANSION_BYTES)
-    scan_end = min(len(data), end + _MAX_SNIPPET_URL_EXPANSION_BYTES)
-
-    url_start = _bounded_url_start_before_match(data, match_start, scan_start)
-    if url_start is not None:
-        start = min(start, url_start)
-        url_end = match_end
-        while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
-            url_end += 1
-        end = max(end, url_end)
-    else:
-        scheme_marker = data.find(b"://", match_end, min(len(data), match_end + after))
-        if scheme_marker >= 0:
-            url_start = scheme_marker
-            while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
-                url_start -= 1
-            url_end = scheme_marker + 3
-            while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
-                url_end += 1
-            start = min(start, url_start)
-            end = max(end, url_end)
+    scan_start = max(0, match_start - before - _MAX_SNIPPET_URL_EXPANSION_BYTES)
+    scan_end = min(len(data), match_end + after + _MAX_SNIPPET_URL_EXPANSION_BYTES)
 
     match_text = data[match_start:match_end].decode("utf-8", errors="ignore")
     snippet_parts = [match_text]

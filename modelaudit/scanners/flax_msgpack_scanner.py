@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
+from collections.abc import Iterable
 from contextlib import suppress
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any, BinaryIO, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
@@ -25,11 +28,348 @@ _EVIDENCE_SAMPLE_CHARS = 200
 _EVIDENCE_LOCATION_CHARS = 300
 _EVIDENCE_REDACTION_INPUT_CHARS = 4096
 _MIN_SHORT_BINARY_TEXT_PERCENT = 85
+_MAX_STREAM_TENSOR_SAMPLES = 64
+_MAX_STREAM_SEQUENCE_EVIDENCE = 64
+_STREAM_MARKER_CHUNK_BYTES = 64 * 1024
+_STREAM_TEXT_CHUNK_BYTES = 64 * 1024
+_STREAM_TEXT_OVERLAP_CHARS = 4096
+_DEFAULT_MAX_STREAM_KEY_LENGTH = 1024 * 1024
+_UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
+_WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
+_JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
+
+
+class _StreamCoverageStopped(Exception):
+    """Internal signal that a fail-closed container budget ended the walk."""
+
+
+@dataclass
+class _StreamValue:
+    type_name: str
+    value: Any = None
+    direct_string_keys: set[str] = field(default_factory=set)
+    sequence_summary: _StreamSequenceSummary | None = None
+
+    @property
+    def is_container(self) -> bool:
+        return self.type_name in {"dict", "list"}
+
+
+@dataclass
+class _StreamTraversalState:
+    max_nodes: int
+    nodes: int = 0
+    node_budget_reported: bool = False
+    decode_limit_reported: bool = False
+    recursion_limit_reported: bool = False
+
+
+@dataclass
+class _StreamMarkerReader:
+    source: BinaryIO
+    chunk_start: int = -1
+    chunk: bytes = b""
+
+    def read(self, offset: int, max_bytes: int) -> bytes:
+        chunk_offset = offset - self.chunk_start
+        if chunk_offset >= 0 and chunk_offset + max_bytes <= len(self.chunk):
+            return self.chunk[chunk_offset : chunk_offset + max_bytes]
+
+        source_offset = self.source.tell()
+        try:
+            self.source.seek(offset)
+            self.chunk_start = offset
+            self.chunk = self.source.read(_STREAM_MARKER_CHUNK_BYTES)
+        finally:
+            self.source.seek(source_offset)
+        return self.chunk[:max_bytes]
+
+    def peek(self, offset: int) -> int | None:
+        prefix = self.read(offset, 1)
+        return prefix[0] if prefix else None
+
+
+@dataclass
+class _StreamSequenceSummary:
+    item_count: int
+    evidence_values: list[Any] = field(default_factory=list)
+    evidence_complete: bool = True
+    negative_dimension: tuple[int, int] | None = None
+    oversized_dimension: tuple[int, int] | None = None
+
+
+@dataclass
+class _FlaxStreamSummary:
+    analysis_complete: bool = True
+    top_level_type: str = "unknown"
+    top_level_keys: list[Any] = field(default_factory=list)
+    top_level_string_keys: set[str] = field(default_factory=set)
+    top_level_key_count: int = 0
+    has_nested_transformer_keys: bool = False
+    orbax_format: bool = False
+    architecture_hints: set[str] = field(default_factory=set)
+    layer_keywords: set[str] = field(default_factory=set)
+    parameter_count: int = 0
+    layer_count: int = 0
+    has_optimizer_state: bool = False
+    tensor_count: int = 0
+    large_tensor_count: int = 0
+    compatible_tensor_count: int = 0
+    compatible_tensor_samples: list[dict[str, Any]] = field(default_factory=list)
+    embedding_tensor_count: int = 0
+    embedding_evidence: list[str] = field(default_factory=list)
+    suspicious_tensor_count: int = 0
+    bounded_text_chars: int = 0
+
+
+_MSGPACK_MARKER_HEADER_BYTES = {
+    0xC4: 2,
+    0xC5: 3,
+    0xC6: 5,
+    0xC7: 3,
+    0xC8: 4,
+    0xC9: 6,
+    0xCA: 5,
+    0xCB: 9,
+    0xCC: 2,
+    0xCD: 3,
+    0xCE: 5,
+    0xCF: 9,
+    0xD0: 2,
+    0xD1: 3,
+    0xD2: 5,
+    0xD3: 9,
+    0xD4: 2,
+    0xD5: 2,
+    0xD6: 2,
+    0xD7: 2,
+    0xD8: 2,
+    0xD9: 2,
+    0xDA: 3,
+    0xDB: 5,
+    0xDC: 3,
+    0xDD: 5,
+    0xDE: 3,
+    0xDF: 5,
+}
+
+
+def _msgpack_marker_header_bytes(marker: int) -> int:
+    return _MSGPACK_MARKER_HEADER_BYTES.get(marker, 1)
+
+
+def _msgpack_declared_data_bytes(marker: int, prefix: bytes) -> int | None:
+    if 0xA0 <= marker <= 0xBF:
+        return marker & 0x1F
+    if marker in {0xC4, 0xC7, 0xD9} and len(prefix) >= 2:
+        return prefix[1]
+    if marker in {0xC5, 0xC8, 0xDA} and len(prefix) >= 3:
+        return int.from_bytes(prefix[1:3], "big")
+    if marker in {0xC6, 0xC9, 0xDB} and len(prefix) >= 5:
+        return int.from_bytes(prefix[1:5], "big")
+    return {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}.get(marker)
 
 
 def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
     value_lower = value_str.lower()
     return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
+
+
+def _contains_suspicious_getattr(value: str) -> bool:
+    """Match the default unbounded getattr rule without catastrophic regex backtracking."""
+    lowered = value.lower()
+    search_offset = 0
+    has_getattr_call = False
+    while search_offset < len(value):
+        getattr_index = lowered.find("getattr", search_offset)
+        comma_index = value.find(",", search_offset)
+        if getattr_index == -1 and comma_index == -1:
+            return False
+        if getattr_index != -1 and (comma_index == -1 or getattr_index < comma_index):
+            open_index = getattr_index + len("getattr")
+            while open_index < len(value) and value[open_index].isspace():
+                open_index += 1
+            if open_index < len(value) and value[open_index] == "(":
+                has_getattr_call = True
+            search_offset = getattr_index + len("getattr")
+            continue
+
+        if comma_index == -1:
+            return False
+        if has_getattr_call:
+            quote_index = comma_index + 1
+            while quote_index < len(value) and value[quote_index].isspace():
+                quote_index += 1
+            if quote_index < len(value) and value[quote_index] in {'"', "'"}:
+                quote = value[quote_index]
+                end_quote = value.find(quote, quote_index + 1)
+                if end_quote != -1:
+                    attribute = value[quote_index + 1 : end_quote]
+                    if attribute.startswith("__") and attribute.endswith("__"):
+                        return True
+        search_offset = comma_index + 1
+    return False
+
+
+def _get_regex_parser() -> Any:
+    return vars(re).get("_parser")
+
+
+def _strip_stream_safe_whitespace_repeats(pattern: str) -> str:
+    remaining: list[str] = []
+    in_character_class = False
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "[":
+            in_character_class = True
+            remaining.append(char)
+            index += 1
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            remaining.append(char)
+            index += 1
+            continue
+        if char != "\\" or index + 1 >= len(pattern):
+            remaining.append(char)
+            index += 1
+            continue
+
+        escaped_char = pattern[index + 1]
+        if not in_character_class and escaped_char == "s":
+            suffix = pattern[index + 2 :]
+            if suffix.startswith(("*", "+")):
+                index += 3
+                continue
+            if suffix.startswith(("{0,}", "{1,}")):
+                index += 6
+                continue
+
+        remaining.extend((char, escaped_char))
+        index += 2
+
+    return "".join(remaining)
+
+
+def _pattern_has_stream_unsafe_repeat(pattern: str) -> bool:
+    """Return whether bounded overlap cannot guarantee coverage for this regex."""
+    remaining = _strip_stream_safe_whitespace_repeats(pattern)
+    parser = _get_regex_parser()
+    if parser is not None:
+        try:
+            _, max_width = parser.parse(remaining, re.IGNORECASE).getwidth()
+        except Exception:
+            return True
+        return max_width > _STREAM_TEXT_OVERLAP_CHARS
+
+    escaped = False
+    in_character_class = False
+    for index, char in enumerate(remaining):
+        if escaped:
+            if char.isdigit() and char != "0":
+                return True
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "[":
+            in_character_class = True
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            continue
+        if in_character_class:
+            continue
+        if char in {"*", "+"}:
+            return True
+        if char == "?" and (index == 0 or remaining[index - 1] != "("):
+            return True
+        if char == "{" and re.match(r"(?:\d+(?:,\d*)?|,\d+)\}", remaining[index + 1 :]):
+            return True
+        if remaining.startswith("(?P=", index):
+            return True
+
+    return len(remaining) > _STREAM_TEXT_OVERLAP_CHARS
+
+
+def _pattern_literal_anchors(pattern: str) -> tuple[str, ...] | None:
+    """Return literals required by a simple regex, or None when that cannot be proven."""
+    if "(?" in pattern:
+        return None
+    literal_runs: list[str] = []
+    current_run: list[str] = []
+    escaped = False
+    in_character_class = False
+    index = 0
+
+    def flush_run() -> None:
+        if len(current_run) >= 2:
+            literal_runs.append("".join(current_run).lower()[:64])
+        current_run.clear()
+
+    while index < len(pattern):
+        char = pattern[index]
+        if escaped:
+            escaped = False
+            flush_run()
+            if char in {"x", "u", "U", "N"}:
+                return None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            flush_run()
+            index += 1
+            continue
+        if char == "[":
+            in_character_class = True
+            flush_run()
+            index += 1
+            continue
+        if char == "]" and in_character_class:
+            in_character_class = False
+            index += 1
+            continue
+        if in_character_class:
+            index += 1
+            continue
+        if char == "|":
+            return None
+        if char in {"?", "*"}:
+            if current_run:
+                current_run.pop()
+            elif index > 0 and pattern[index - 1] == ")":
+                return None
+            flush_run()
+            index += 1
+            continue
+        if char == "{":
+            closing_index = pattern.find("}", index + 1)
+            if closing_index == -1:
+                return None
+            repeat_range = pattern[index + 1 : closing_index]
+            repeat_match = re.fullmatch(r"(\d+)(?:,\d*)?", repeat_range)
+            if repeat_match is None:
+                return None
+            if int(repeat_match.group(1)) == 0:
+                if current_run:
+                    current_run.pop()
+                elif index > 0 and pattern[index - 1] == ")":
+                    return None
+            flush_run()
+            index = closing_index + 1
+            continue
+        if char.isascii() and (char.isalnum() or char == "_"):
+            current_run.append(char)
+        else:
+            flush_run()
+        index += 1
+    flush_run()
+    if not literal_runs:
+        return None
+    return tuple(dict.fromkeys(literal_runs))
 
 
 def _is_text_like_short_binary(value: bytes | bytearray) -> bool:
@@ -61,6 +401,17 @@ def _stringify_safe_evidence_fragment(value: Any) -> str:
         except UnicodeDecodeError:
             return REDACTED_EVIDENCE_VALUE
     return _stringify_evidence_fragment(value)
+
+
+def _text_for_security_matching(value: Any) -> str | None:
+    if HAS_MSGPACK and isinstance(value, msgpack.ExtType):
+        value = value.data
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes | bytearray):
+        with suppress(UnicodeDecodeError):
+            return bytes(value).decode("utf-8")
+    return None
 
 
 def _join_evidence_path(path: str, key: Any) -> str:
@@ -100,8 +451,13 @@ class FlaxMsgpackScanner(BaseScanner):
     RECURSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_recursion_limit_exceeded"
     STRUCTURE_BUDGET_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_structure_budget_exceeded"
     DECODE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_decode_limit_exceeded"
+    BINARY_PATTERN_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_binary_pattern_coverage_incomplete"
+    TRUNCATED_STREAM_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_truncated_stream"
     DEFAULT_MAX_STRUCTURE_NODES: ClassVar[int] = 200_000
     DEFAULT_MAX_BOUNDED_TEXT_CHARS: ClassVar[int] = 1_000_000
+    DEFAULT_MAX_MSGPACK_DECODE_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    # Container traversal is streaming, so total file size is no longer a memory proxy.
+    default_max_file_read_size: ClassVar[int] = 0
     # Enhanced file extension support for JAX/Flax ecosystem
     supported_extensions: ClassVar[list[str]] = [
         ".msgpack",
@@ -120,12 +476,16 @@ class FlaxMsgpackScanner(BaseScanner):
         self.max_items_per_container = self.config.get("max_items_per_container", 50000)  # Increased for large models
         self.max_msgpack_stream_objects = self.config.get("max_msgpack_stream_objects", 4096)
         default_decode_limit = (
-            self.max_file_read_size if self.max_file_read_size > 0 else self.default_max_file_read_size
+            self.max_file_read_size if self.max_file_read_size > 0 else self.DEFAULT_MAX_MSGPACK_DECODE_BYTES
         )
         self.max_msgpack_decode_bytes = self._positive_int_config("max_msgpack_decode_bytes", default_decode_limit)
         self.max_structure_nodes = self._positive_int_config(
             "max_msgpack_structure_nodes",
             self.DEFAULT_MAX_STRUCTURE_NODES,
+        )
+        self.max_stream_key_length = self._positive_int_config(
+            "max_msgpack_key_length",
+            _DEFAULT_MAX_STREAM_KEY_LENGTH,
         )
         self.max_bounded_text_chars = self._positive_int_config(
             "max_msgpack_bounded_text_chars",
@@ -161,7 +521,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 r"jax\.vmap\s*\(\s*exec",
                 r"jax\.pmap\s*\(\s*eval",
                 # Dynamic code execution
-                r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]",
+                _UNBOUNDED_GETATTR_PATTERN,
                 # Dangerous imports in serialized functions
                 r"import\s+subprocess",
                 r"from\s+subprocess\s+import",
@@ -172,6 +532,11 @@ class FlaxMsgpackScanner(BaseScanner):
         self._compiled_suspicious_patterns = tuple(
             (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
         )
+        self._stream_unsafe_pattern_anchors = {
+            pattern: _pattern_literal_anchors(pattern)
+            for pattern in self.suspicious_patterns
+            if _pattern_has_stream_unsafe_repeat(pattern)
+        }
 
         self.suspicious_keys = self.config.get(
             "suspicious_keys",
@@ -336,6 +701,50 @@ class FlaxMsgpackScanner(BaseScanner):
         ml_analysis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Extract JAX/Flax specific metadata from the checkpoint."""
+        if isinstance(obj, _FlaxStreamSummary):
+            architecture_hints = sorted(obj.architecture_hints)
+            model_type = "unknown"
+            if any(pattern in architecture_hints for pattern in self.jax_patterns["transformer_patterns"]):
+                model_type = "transformer"
+            elif any(pattern in architecture_hints for pattern in self.jax_patterns["cnn_patterns"]):
+                model_type = "cnn"
+            elif any(pattern in architecture_hints for pattern in self.jax_patterns["embedding_patterns"]):
+                model_type = "embedding"
+
+            if ml_analysis is None:
+                ml_analysis = self._analyze_ml_structure(obj, result)
+            stream_metadata: dict[str, Any] = {
+                "model_type": model_type,
+                "architecture_hints": architecture_hints,
+                "parameter_count": obj.parameter_count,
+                "layer_count": obj.layer_count,
+                "has_optimizer_state": obj.has_optimizer_state,
+                "jax_version_hints": [],
+                "orbax_format": obj.orbax_format,
+                "confidence": ml_analysis["confidence"],
+                "is_ml_model": ml_analysis["is_ml_model"],
+                "ml_evidence": ml_analysis["evidence"],
+                "tensor_count": ml_analysis["tensor_count"],
+            }
+            if obj.orbax_format:
+                result.add_check(
+                    name="Checkpoint Format Detection",
+                    passed=True,
+                    message="Orbax checkpoint format detected",
+                    location="root",
+                    details={"checkpoint_format": "orbax"},
+                    rule_code=None,
+                )
+            result.metadata.update(
+                {
+                    "jax_metadata": stream_metadata,
+                    "estimated_parameters": obj.parameter_count,
+                    "model_architecture": model_type,
+                    "layer_count": obj.layer_count,
+                }
+            )
+            return stream_metadata
+
         metadata: dict[str, Any] = {
             "model_type": "unknown",
             "architecture_hints": [],
@@ -437,18 +846,31 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> None:
         """Check one visible key/value pair for dangerous JAX transforms."""
         for transform in _matching_jax_transforms(key.lower(), value):
-            result.add_check(
-                name="JAX Transform Security Check",
-                passed=False,
-                message=f"Suspicious JAX transform detected: {transform}",
-                severity=IssueSeverity.CRITICAL,
-                location=_redact_evidence_location(location),
-                details={
-                    "transform": transform,
-                    "context": _redact_evidence_sample(value),
-                },
-                rule_code="S1105",
-            )
+            self._add_jax_transform_check(transform, value, location, result)
+
+    @staticmethod
+    def _add_jax_transform_check(transform: str, context: str, location: str, result: ScanResult) -> None:
+        safe_location = _redact_evidence_location(location)
+        seen_findings = result._private_metadata.get(_JAX_TRANSFORM_DEDUP_METADATA_KEY)
+        if not isinstance(seen_findings, set):
+            seen_findings = set()
+            result._private_metadata[_JAX_TRANSFORM_DEDUP_METADATA_KEY] = seen_findings
+        finding_key = (safe_location, transform)
+        if finding_key in seen_findings:
+            return
+        seen_findings.add(finding_key)
+        result.add_check(
+            name="JAX Transform Security Check",
+            passed=False,
+            message=f"Suspicious JAX transform detected: {transform}",
+            severity=IssueSeverity.CRITICAL,
+            location=safe_location,
+            details={
+                "transform": transform,
+                "context": _redact_evidence_sample(context),
+            },
+            rule_code="S1105",
+        )
 
     @staticmethod
     def _check_jax_array_metadata(value: dict[Any, Any], location: str, result: ScanResult) -> None:
@@ -489,6 +911,56 @@ class FlaxMsgpackScanner(BaseScanner):
                 rule_code="S804",
             )
 
+    @classmethod
+    def _check_stream_shape_metadata(
+        cls,
+        shape: _StreamSequenceSummary,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        """Preserve shape validation without retaining arbitrarily large arrays."""
+        if shape.evidence_complete and len(shape.evidence_values) == shape.item_count:
+            cls._check_jax_array_metadata({"shape": shape.evidence_values}, location, result)
+            return
+
+        shape_evidence = [_redact_evidence_key(dim) for dim in shape.evidence_values]
+        common_details = {
+            "shape": shape_evidence,
+            "shape_item_count": shape.item_count,
+            "shape_evidence_truncated": True,
+        }
+        if shape.negative_dimension is not None:
+            dimension_index, dimension = shape.negative_dimension
+            result.add_check(
+                name="Tensor Shape Validation",
+                passed=False,
+                message="Invalid tensor shape with negative dimensions",
+                severity=IssueSeverity.INFO,
+                location=_redact_evidence_location(location),
+                details={
+                    **common_details,
+                    "dimension_index": dimension_index,
+                    "dimension": dimension,
+                },
+                rule_code="S902",
+            )
+        elif shape.oversized_dimension is not None:
+            dimension_index, dimension = shape.oversized_dimension
+            result.add_check(
+                name="Tensor Dimension Check",
+                passed=False,
+                message="Suspiciously large tensor dimensions",
+                severity=IssueSeverity.WARNING,
+                location=_redact_evidence_location(location),
+                details={
+                    **common_details,
+                    "dimension_index": dimension_index,
+                    "dimension": dimension,
+                    "max_safe_dimension": 10**9,
+                },
+                rule_code="S804",
+            )
+
     def _check_suspicious_strings(
         self,
         value: str,
@@ -501,29 +973,47 @@ class FlaxMsgpackScanner(BaseScanner):
         sample_value = value if evidence_value is None else evidence_value
         for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
             if compiled_pattern.search(value):
-                # Determine appropriate rule code based on pattern
-                if "eval" in lowered_pattern:
-                    rule_code = "S104"  # eval/exec usage
-                elif "compile" in lowered_pattern:
-                    rule_code = "S105"  # compile usage
-                elif "import\\s+os" in lowered_pattern or "os\\.system" in lowered_pattern:
-                    rule_code = "S101"  # os module usage
-                else:
-                    rule_code = "S999"  # Unknown/generic suspicious pattern
-
-                result.add_check(
-                    name="Code Pattern Security Check",
-                    passed=False,
-                    message=f"Suspicious code pattern detected: {pattern}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=_redact_evidence_location(location),
-                    details={
-                        "pattern": pattern,
-                        "sample": _redact_evidence_sample(sample_value),
-                        "full_length": len(value),
-                    },
-                    rule_code=rule_code,
+                self._add_suspicious_string_check(
+                    pattern,
+                    lowered_pattern,
+                    sample_value,
+                    len(value),
+                    location,
+                    result,
                 )
+
+    @staticmethod
+    def _suspicious_pattern_rule_code(lowered_pattern: str) -> str:
+        if "eval" in lowered_pattern:
+            return "S104"
+        if "compile" in lowered_pattern:
+            return "S105"
+        if "import\\s+os" in lowered_pattern or "os\\.system" in lowered_pattern:
+            return "S101"
+        return "S999"
+
+    def _add_suspicious_string_check(
+        self,
+        pattern: str,
+        lowered_pattern: str,
+        sample_value: Any,
+        full_length: int,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        result.add_check(
+            name="Code Pattern Security Check",
+            passed=False,
+            message=f"Suspicious code pattern detected: {pattern}",
+            severity=IssueSeverity.CRITICAL,
+            location=_redact_evidence_location(location),
+            details={
+                "pattern": pattern,
+                "sample": _redact_evidence_sample(sample_value),
+                "full_length": full_length,
+            },
+            rule_code=self._suspicious_pattern_rule_code(lowered_pattern),
+        )
 
     def _check_suspicious_keys(
         self,
@@ -564,9 +1054,10 @@ class FlaxMsgpackScanner(BaseScanner):
 
     def _value_names_dangerous_callable(self, value: Any) -> bool:
         """Return whether a metadata value directly names a dangerous callable."""
-        if not isinstance(value, str):
+        value_text = _text_for_security_matching(value)
+        if value_text is None:
             return False
-        normalized = value.strip().lower()
+        normalized = value_text.strip().lower()
         return normalized in self.dangerous_callable_names
 
     def _add_incomplete_check(
@@ -840,7 +1331,8 @@ class FlaxMsgpackScanner(BaseScanner):
             for index, (k, v) in enumerate(value.items()):
                 if index >= self.max_items_per_container:
                     break
-                key_str = _stringify_evidence_fragment(k)
+                key_text = _text_for_security_matching(k)
+                key_str = key_text if key_text is not None else _stringify_evidence_fragment(k)
                 safe_key_str = _stringify_safe_evidence_fragment(k)
                 key_location = _join_evidence_path(location, k)
                 self._check_jax_transform(
@@ -923,6 +1415,45 @@ class FlaxMsgpackScanner(BaseScanner):
             "weight_matrices": [],
             "suspicious_patterns": [],
         }
+
+        if isinstance(obj, _FlaxStreamSummary):
+            analysis["tensor_count"] = obj.tensor_count
+            if obj.tensor_count == 0:
+                analysis["suspicious_patterns"].append("No numerical data found - not a typical ML model")
+                return analysis
+            if obj.large_tensor_count == 0:
+                analysis["suspicious_patterns"].append("No substantial weight matrices found")
+                return analysis
+
+            if obj.compatible_tensor_count:
+                analysis["evidence"].append(
+                    f"Found {obj.compatible_tensor_count} tensors with ML-compatible dimensions"
+                )
+                analysis["weight_matrices"] = obj.compatible_tensor_samples
+                analysis["confidence"] += 0.4
+
+            layer_evidence = len(obj.layer_keywords)
+            if layer_evidence >= 2:
+                analysis["evidence"].append(f"Found hierarchical layer structure ({layer_evidence} layer indicators)")
+                analysis["confidence"] += 0.5
+
+            analysis["evidence"].extend(obj.embedding_evidence)
+            if obj.embedding_tensor_count:
+                analysis["confidence"] += 0.3
+
+            if obj.suspicious_tensor_count > obj.tensor_count * 0.5:
+                analysis["confidence"] *= 0.5
+
+            if analysis["confidence"] >= 0.7:
+                analysis["is_ml_model"] = True
+                analysis["evidence"].append(
+                    "High confidence this is a legitimate ML model based on structural analysis"
+                )
+            elif analysis["confidence"] > 0.4:
+                analysis["evidence"].append("Moderate confidence this could be an ML model")
+            else:
+                analysis["suspicious_patterns"].append("Low confidence in ML model structure - may be malicious data")
+            return analysis
 
         if not isinstance(obj, dict):
             return analysis
@@ -1057,21 +1588,28 @@ class FlaxMsgpackScanner(BaseScanner):
         ml_analysis: dict[str, Any] | None = None,
     ) -> None:
         """Validate that the msgpack structure looks like a legitimate Flax checkpoint using structural analysis."""
-        if not isinstance(obj, dict):
+        is_stream_summary = isinstance(obj, _FlaxStreamSummary)
+        top_level_type = obj.top_level_type if is_stream_summary else type(obj).__name__
+        if (is_stream_summary and obj.top_level_type != "dict") or (
+            not is_stream_summary and not isinstance(obj, dict)
+        ):
             result.add_check(
                 name="Flax Structure Validation",
                 passed=False,
-                message=f"Unexpected top-level type: {type(obj).__name__} (expected dict)",
+                message=f"Unexpected top-level type: {top_level_type} (expected dict)",
                 rule_code="S903",
                 severity=IssueSeverity.WARNING,
                 location="root",
-                details={"actual_type": type(obj).__name__, "expected_type": "dict"},
+                details={"actual_type": top_level_type, "expected_type": "dict"},
             )
             return
 
         # Check for standard Flax checkpoint patterns first
         expected_keys = {"params", "state", "opt_state", "model_state", "step", "epoch"}
-        found_keys = set(obj.keys()) if isinstance(obj, dict) else set()
+        found_keys = obj.top_level_string_keys if is_stream_summary else set(obj.keys())
+        displayed_found_keys = (
+            obj.top_level_keys if is_stream_summary else [_redact_evidence_key(key) for key in list(found_keys)[:20]]
+        )
 
         # Also check for common transformer model patterns (BERT, GPT, T5, etc.)
         transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
@@ -1105,9 +1643,11 @@ class FlaxMsgpackScanner(BaseScanner):
             "score",
         }
         has_transformer_keys = any(key in found_keys for key in transformer_keys)
+        if is_stream_summary:
+            has_transformer_keys = has_transformer_keys or obj.has_nested_transformer_keys
 
         # Check if any top-level key contains transformer sub-keys (nested model structure)
-        if not has_transformer_keys:
+        if not has_transformer_keys and not is_stream_summary:
             for key in found_keys:
                 value = obj.get(key)
                 if isinstance(value, dict):
@@ -1155,7 +1695,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 details={
                     "found_transformer_keys": [k for k in transformer_keys if k in found_keys],
                     "model_type": "transformer_model",
-                    "all_keys": [_redact_evidence_key(key) for key in list(found_keys)[:20]],
+                    "all_keys": displayed_found_keys,
                 },
                 rule_code=None,  # Passing check
             )
@@ -1203,7 +1743,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 location="root",
                 details={
                     "analysis": ml_analysis,
-                    "found_keys": [_redact_evidence_key(key) for key in list(found_keys)[:20]],
+                    "found_keys": displayed_found_keys,
                     "expected_any_of": list(expected_keys),
                     "model_type": "suspicious",
                     "suspicious_patterns": ml_analysis["suspicious_patterns"],
@@ -1225,15 +1765,19 @@ class FlaxMsgpackScanner(BaseScanner):
             "__import__",
         }
 
-        suspicious_top_level = found_keys & dangerous_keys
+        suspicious_top_level = {
+            key_text
+            for key in found_keys
+            if (key_text := _text_for_security_matching(key)) is not None and key_text in dangerous_keys
+        }
         if suspicious_top_level:
             result.add_check(
                 name="Top-Level Key Security Check",
                 passed=False,
-                message=f"Dangerous top-level keys detected: {suspicious_top_level}",
+                message=f"Dangerous top-level keys detected: {sorted(suspicious_top_level)}",
                 severity=IssueSeverity.CRITICAL,
                 location="root",
-                details={"dangerous_keys": list(suspicious_top_level)},
+                details={"dangerous_keys": sorted(suspicious_top_level)},
                 rule_code="S902",
             )
 
@@ -1251,6 +1795,353 @@ class FlaxMsgpackScanner(BaseScanner):
     def _msgpack_stream_read_size(self) -> int:
         """Leave decoder-buffer headroom for an object split across filesystem reads."""
         return min(self.chunk_size, max(self.max_msgpack_decode_bytes // 2, 1))
+
+    def _msgpack_event_unpacker_kwargs(self) -> dict[str, Any]:
+        """Allow container headers through; the event walker enforces their budgets."""
+        kwargs = self._msgpack_unpacker_kwargs()
+        kwargs["max_array_len"] = 2**32 - 1
+        kwargs["max_map_len"] = 2**32 - 1
+        return kwargs
+
+    def _record_stream_text(self, value: str, summary: _FlaxStreamSummary) -> None:
+        remaining = self.max_bounded_text_chars - summary.bounded_text_chars
+        if remaining <= 0:
+            return
+        visible = value[:remaining].lower()
+        summary.bounded_text_chars += len(visible)
+
+        for patterns in self.jax_patterns.values():
+            summary.architecture_hints.update(pattern for pattern in patterns if pattern in visible)
+        summary.layer_keywords.update(
+            keyword for keyword in ("layer", "block", "attention", "ffn", "mlp", "linear", "conv") if keyword in visible
+        )
+        if any(indicator in visible for indicator in ("opt_state", "optimizer", "adam", "sgd", "learning_rate")):
+            summary.has_optimizer_state = True
+
+    def _record_stream_tensor(self, value: bytes | bytearray, location: str, summary: _FlaxStreamSummary) -> None:
+        size = len(value)
+        if size >= 16 and size % 4 == 0:
+            summary.parameter_count += size // 4
+        if size < 16 or (size % 4 != 0 and size % 8 != 0):
+            return
+
+        summary.tensor_count += 1
+        if size < 100 or size > 500 * 1024 * 1024:
+            summary.suspicious_tensor_count += 1
+        if size <= 1024:
+            return
+
+        summary.large_tensor_count += 1
+        elements = size // 4
+        potential_shapes: list[tuple[int, int]] = []
+        for dim1 in (64, 128, 256, 512, 768, 1024, 1536, 2048, 4096, 8192):
+            if elements % dim1 == 0:
+                dim2 = elements // dim1
+                if 1 <= dim2 <= 100000:
+                    potential_shapes.append((dim1, dim2))
+        if potential_shapes:
+            summary.compatible_tensor_count += 1
+            if len(summary.compatible_tensor_samples) < _MAX_STREAM_TENSOR_SAMPLES:
+                summary.compatible_tensor_samples.append(
+                    {
+                        "tensor": {
+                            "path": _redact_evidence_location(location),
+                            "size": size,
+                            "type": "binary_blob",
+                            "potential_elements": elements,
+                        },
+                        "potential_shapes": potential_shapes[:5],
+                    }
+                )
+
+        for vocab_size in (30522, 50257, 32000, 28996, 51200):
+            matched = False
+            for embed_dim in (128, 256, 384, 512, 768, 1024, 1536, 2048):
+                expected_elements = vocab_size * embed_dim
+                if abs(elements - expected_elements) < expected_elements * 0.1:
+                    summary.embedding_tensor_count += 1
+                    if len(summary.embedding_evidence) < _MAX_STREAM_TENSOR_SAMPLES:
+                        summary.embedding_evidence.append(f"Found embedding-like matrix: ~{vocab_size}x{embed_dim}")
+                    matched = True
+                    break
+            if matched:
+                break
+
+    def _analyze_streamed_text_chunks(
+        self,
+        chunks: Iterable[str],
+        location: str,
+        result: ScanResult,
+        *,
+        full_length: int,
+        finding_location: str,
+        coverage_details: dict[str, Any],
+        check_jax_transform: bool,
+        jax_location: str | None = None,
+    ) -> None:
+        """Analyze decoded text with bounded regex windows and conservative coverage checks."""
+        raw_tail = ""
+        normalized_tail = ""
+        previous_chunk_ended_with_whitespace = False
+        decoded_chars = 0
+        matched_patterns: dict[str, tuple[str, str]] = {}
+        matched_transforms: dict[str, str] = {}
+        unresolved_pattern_candidates: set[str] = set()
+        seen_pattern_anchors: dict[str, set[str]] = {}
+
+        def inspect_windows(raw_window: str, normalized_window: str) -> None:
+            raw_window_lower = raw_window.lower()
+            normalized_window_lower = normalized_window.lower()
+            if check_jax_transform:
+                for transform in _DANGEROUS_JAX_TRANSFORMS:
+                    if transform not in matched_transforms and transform in raw_window_lower:
+                        matched_transforms[transform] = raw_window
+            for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
+                if pattern in self._stream_unsafe_pattern_anchors:
+                    anchors = self._stream_unsafe_pattern_anchors[pattern]
+                    window_has_all_anchors = anchors is None or all(
+                        anchor in normalized_window_lower for anchor in anchors
+                    )
+                    if anchors is None:
+                        unresolved_pattern_candidates.add(pattern)
+                    else:
+                        seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
+                        seen_anchors.update(anchor for anchor in anchors if anchor in normalized_window_lower)
+                        if len(seen_anchors) == len(anchors):
+                            unresolved_pattern_candidates.add(pattern)
+
+                    if (
+                        pattern == _UNBOUNDED_GETATTR_PATTERN
+                        and pattern not in matched_patterns
+                        and window_has_all_anchors
+                    ):
+                        match_sample: str | None = None
+                        if _contains_suspicious_getattr(raw_window):
+                            match_sample = raw_window
+                        elif _contains_suspicious_getattr(normalized_window):
+                            match_sample = normalized_window
+                        if match_sample is not None:
+                            matched_patterns[pattern] = (lowered_pattern, match_sample)
+                    continue
+
+                if pattern in matched_patterns:
+                    continue
+                match_sample = None
+                if compiled_pattern.search(raw_window):
+                    match_sample = raw_window
+                elif "\\s" in pattern and compiled_pattern.search(normalized_window):
+                    match_sample = normalized_window
+                if match_sample is not None:
+                    matched_patterns[pattern] = (lowered_pattern, match_sample)
+
+        for chunk in chunks:
+            decoded_chars += len(chunk)
+            normalized_chunk = _WHITESPACE_RUN_PATTERN.sub(" ", chunk)
+            if previous_chunk_ended_with_whitespace and normalized_chunk.startswith(" "):
+                normalized_chunk = normalized_chunk[1:]
+            if chunk:
+                previous_chunk_ended_with_whitespace = chunk[-1].isspace()
+
+            raw_window = raw_tail + chunk
+            normalized_window = normalized_tail + normalized_chunk
+            inspect_windows(raw_window, normalized_window)
+            raw_tail = raw_window[-_STREAM_TEXT_OVERLAP_CHARS:]
+            normalized_tail = normalized_window[-_STREAM_TEXT_OVERLAP_CHARS:]
+
+        for transform, context in matched_transforms.items():
+            self._add_jax_transform_check(transform, context, jax_location or location, result)
+        for pattern, (lowered_pattern, sample) in matched_patterns.items():
+            self._add_suspicious_string_check(
+                pattern,
+                lowered_pattern,
+                sample,
+                decoded_chars,
+                finding_location,
+                result,
+            )
+
+        unresolved_patterns = sorted(unresolved_pattern_candidates - set(matched_patterns))
+        existing_reasons = result.metadata.get("scan_outcome_reasons", [])
+        if unresolved_patterns and self.BINARY_PATTERN_INCONCLUSIVE_REASON not in existing_reasons:
+            self._add_incomplete_check(
+                result,
+                reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
+                name="Flax MessagePack Binary Pattern Coverage",
+                message="Large text contained an unresolved pattern beyond the streaming overlap",
+                location=location,
+                details={
+                    "pattern": unresolved_patterns[0],
+                    "patterns": unresolved_patterns,
+                    "full_length": full_length,
+                    "stream_overlap_chars": _STREAM_TEXT_OVERLAP_CHARS,
+                    **coverage_details,
+                },
+            )
+
+    def _analyze_large_text(
+        self,
+        value: str,
+        location: str,
+        result: ScanResult,
+        *,
+        check_jax_transform: bool,
+        jax_location: str | None = None,
+    ) -> None:
+        chunks = (
+            value[offset : offset + _STREAM_TEXT_CHUNK_BYTES]
+            for offset in range(0, len(value), _STREAM_TEXT_CHUNK_BYTES)
+        )
+        self._analyze_streamed_text_chunks(
+            chunks,
+            location,
+            result,
+            full_length=len(value),
+            finding_location=location,
+            coverage_details={"text_length": len(value)},
+            check_jax_transform=check_jax_transform,
+            jax_location=jax_location,
+        )
+
+    def _analyze_large_binary_text(self, value: bytes | bytearray, location: str, result: ScanResult) -> None:
+        raw_value = memoryview(value)
+
+        def decoded_chunks() -> Iterable[str]:
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for offset in range(0, len(raw_value), _STREAM_TEXT_CHUNK_BYTES):
+                yield decoder.decode(raw_value[offset : offset + _STREAM_TEXT_CHUNK_BYTES], final=False)
+            final_chunk = decoder.decode(b"", final=True)
+            if final_chunk:
+                yield final_chunk
+
+        self._analyze_streamed_text_chunks(
+            decoded_chunks(),
+            location,
+            result,
+            full_length=len(value),
+            finding_location=f"{location}[decoded_binary]",
+            coverage_details={"binary_size": len(value)},
+            check_jax_transform=True,
+        )
+
+    def _analyze_stream_scalar(
+        self,
+        value: Any,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        check_string_jax_transform: bool = True,
+    ) -> None:
+        if HAS_MSGPACK and isinstance(value, msgpack.ExtType):
+            self._analyze_stream_scalar(
+                value.data,
+                f"{location}[1]",
+                result,
+                summary,
+                check_string_jax_transform=check_string_jax_transform,
+            )
+            return
+
+        if isinstance(value, bytes | bytearray):
+            size = len(value)
+            if size > self.max_blob_bytes:
+                result.add_check(
+                    name="Binary Blob Size Check",
+                    passed=False,
+                    message=f"Suspiciously large binary blob: {size:,} bytes",
+                    severity=IssueSeverity.INFO,
+                    location=_redact_evidence_location(location),
+                    details={"size": size, "max_allowed": self.max_blob_bytes},
+                    rule_code="S902",
+                )
+            if size > _STREAM_TEXT_CHUNK_BYTES:
+                self._analyze_large_binary_text(value, location, result)
+            else:
+                decoded = bytes(value).decode("utf-8", errors="replace")
+                if check_string_jax_transform:
+                    self._check_jax_transform("", decoded, location, result)
+                if len(decoded) > 50 or _is_text_like_short_binary(value):
+                    self._check_suspicious_strings(decoded, f"{location}[decoded_binary]", result)
+            self._record_stream_tensor(value, location, summary)
+            return
+
+        if isinstance(value, str):
+            if len(value) > _STREAM_TEXT_CHUNK_BYTES:
+                self._analyze_large_text(
+                    value,
+                    location,
+                    result,
+                    check_jax_transform=check_string_jax_transform,
+                )
+            else:
+                if check_string_jax_transform:
+                    self._check_jax_transform("", value, location, result)
+                self._check_suspicious_strings(value, location, result)
+            if len(value) > 100000:
+                result.add_check(
+                    name="String Length Check",
+                    passed=False,
+                    message=f"Extremely long string found: {len(value):,} characters",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=_redact_evidence_location(location),
+                    details={"length": len(value), "threshold": 100000},
+                )
+            self._record_stream_text(value, summary)
+            return
+
+        if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**63:
+            result.add_check(
+                name="Integer Value Range Check",
+                passed=False,
+                message=f"Extremely large integer value: {value}",
+                severity=IssueSeverity.INFO,
+                location=_redact_evidence_location(location),
+                details={"value": value},
+                rule_code="S902",
+            )
+
+    def _analyze_stream_key(
+        self,
+        key: Any,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+    ) -> tuple[str, str]:
+        key_str = _stringify_evidence_fragment(key)
+        safe_key_str = _stringify_safe_evidence_fragment(key)
+        location_key = _redact_evidence_location(key)
+        key_value_location = f"{location}/{location_key}" if location else location_key
+        key_evidence_location = f"{location}[key:{location_key}]"
+        if len(key_str) > _STREAM_TEXT_CHUNK_BYTES:
+            self._analyze_large_text(
+                key_str,
+                key_evidence_location,
+                result,
+                check_jax_transform=True,
+                jax_location=key_value_location,
+            )
+        else:
+            self._check_jax_transform(key_str, "", key_value_location, result)
+            self._check_suspicious_strings(
+                key_str,
+                key_evidence_location,
+                result,
+                evidence_value=safe_key_str,
+            )
+        self._record_stream_text(key_str, summary)
+        layer_words = ("layer", "block", "level")
+        if len(key_str) <= _STREAM_TEXT_CHUNK_BYTES:
+            has_layer_word = any(layer_word in key_str.lower() for layer_word in layer_words)
+        else:
+            has_layer_word = any(
+                layer_word in key_str[offset : offset + _STREAM_TEXT_CHUNK_BYTES].lower()
+                for offset in range(0, len(key_str), _STREAM_TEXT_CHUNK_BYTES)
+                for layer_word in layer_words
+            )
+        if has_layer_word:
+            summary.layer_count += 1
+        return key_str, location_key
 
     @staticmethod
     def _is_msgpack_limit_error(error: Exception) -> bool:
@@ -1272,6 +2163,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 "error_type": type(error).__name__,
                 "max_msgpack_decode_bytes": self.max_msgpack_decode_bytes,
                 "max_items_per_container": self.max_items_per_container,
+                "max_msgpack_key_length": self.max_stream_key_length,
             },
         )
         result.finish(success=False)
@@ -1289,11 +2181,37 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         result.finish(success=False)
 
+    def _add_msgpack_truncated_stream_check(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        stream_offset: int,
+        stream_size: int,
+    ) -> None:
+        parse_error = "incomplete trailing msgpack object"
+        self._add_incomplete_check(
+            result,
+            reason=self.TRUNCATED_STREAM_INCONCLUSIVE_REASON,
+            name="Msgpack Parse Check",
+            message=f"Failed to parse msgpack data: {parse_error}",
+            location=path,
+            details={
+                "parse_error": parse_error,
+                "stream_offset": stream_offset,
+                "stream_size": stream_size,
+            },
+        )
+        result.finish(success=False)
+
     def _add_msgpack_stream_object_limit_check(self, result: ScanResult, path: str, parsed_object_count: int) -> None:
         result.add_check(
             name="Msgpack Stream Object Limit",
             passed=False,
-            message=f"Msgpack stream object count exceeds configured limit ({self.max_msgpack_stream_objects})",
+            message=(
+                "Msgpack stream has unvalidated trailing data after the configured object limit "
+                f"({self.max_msgpack_stream_objects})"
+            ),
             severity=IssueSeverity.WARNING,
             location=path,
             details={
@@ -1310,28 +2228,286 @@ class FlaxMsgpackScanner(BaseScanner):
     def _is_msgpack_out_of_data(error: Exception) -> bool:
         return type(error).__name__ == "OutOfData"
 
-    def _drain_msgpack_unpacker(self, unpacker: Any, objects: list[Any], result: ScanResult, path: str) -> bool | None:
-        """Append complete objects and report whether the unpacker consumed a partial tail."""
-        while True:
-            previous_offset = unpacker.tell()
-            try:
-                stream_obj = unpacker.unpack()
-            except Exception as error:
-                if self._is_msgpack_out_of_data(error):
-                    return unpacker.tell() > previous_offset
-                raise
-
-            if len(objects) >= self.max_msgpack_stream_objects:
-                self._add_msgpack_stream_object_limit_check(result, path, len(objects))
-                return None
-            objects.append(stream_obj)
-
-    def _add_msgpack_stream_integrity_check(self, objects: list[Any], result: ScanResult, path: str) -> None:
-        if len(objects) <= 1:
+    def _report_stream_decode_limit(
+        self,
+        state: _StreamTraversalState,
+        result: ScanResult,
+        path: str,
+        message: str,
+    ) -> None:
+        if state.decode_limit_reported:
             return
-        trailing_objects_are_container_like = all(
-            isinstance(stream_obj, (dict, list, tuple)) for stream_obj in objects[1:]
-        )
+        state.decode_limit_reported = True
+        self._add_msgpack_decode_limit_check(result, path, ValueError(message))
+
+    def _read_stream_value(
+        self,
+        unpacker: Any,
+        marker_reader: _StreamMarkerReader,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        state: _StreamTraversalState,
+        *,
+        path: str,
+        location: str,
+        depth: int,
+        analyze_scalar: bool = True,
+        top_level: bool = False,
+        count_node: bool = True,
+        capture_sequence: bool = False,
+    ) -> _StreamValue:
+        if state.node_budget_reported:
+            summary.analysis_complete = False
+            raise _StreamCoverageStopped
+        if count_node:
+            state.nodes += 1
+        if count_node and state.nodes > state.max_nodes:
+            summary.analysis_complete = False
+            if not state.node_budget_reported:
+                self._add_structure_budget_check(
+                    result,
+                    location=location,
+                    budget="node_count",
+                    observed=state.nodes,
+                    maximum=state.max_nodes,
+                )
+                state.node_budget_reported = True
+            raise _StreamCoverageStopped
+
+        if depth > self.max_recursion_depth:
+            summary.analysis_complete = False
+            if not state.recursion_limit_reported:
+                self._add_incomplete_check(
+                    result,
+                    reason=self.RECURSION_LIMIT_INCONCLUSIVE_REASON,
+                    name="Flax MessagePack Preanalysis Depth Limit",
+                    message=f"Maximum preanalysis recursion depth exceeded: {depth}",
+                    location=location,
+                    details={"depth": depth, "max_allowed": self.max_recursion_depth},
+                )
+                self._add_incomplete_check(
+                    result,
+                    reason=self.RECURSION_LIMIT_INCONCLUSIVE_REASON,
+                    name="Recursion Depth Check",
+                    message=f"Maximum recursion depth exceeded: {depth}",
+                    location=location,
+                    details={"depth": depth, "max_allowed": self.max_recursion_depth},
+                )
+                state.recursion_limit_reported = True
+            raise _StreamCoverageStopped
+
+        marker = marker_reader.peek(unpacker.tell())
+        if marker is not None and (0x80 <= marker <= 0x8F or marker in {0xDE, 0xDF}):
+            map_length = unpacker.read_map_header()
+            if top_level:
+                summary.top_level_key_count = map_length
+            direct_string_keys: set[str] = set()
+            has_jax_array = False
+            visible_items = min(map_length, self.max_items_per_container)
+            if map_length > self.max_items_per_container:
+                summary.analysis_complete = False
+                self._report_stream_decode_limit(
+                    state,
+                    result,
+                    path,
+                    f"map length {map_length} exceeds max_map_len({self.max_items_per_container})",
+                )
+
+            transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
+            model_name_keys = {
+                "bert",
+                "roberta",
+                "distilbert",
+                "albert",
+                "electra",
+                "xlm",
+                "gpt2",
+                "gpt_neo",
+                "gpt_neox",
+                "gptj",
+                "opt",
+                "llama",
+                "t5",
+                "bart",
+                "pegasus",
+                "mbart",
+                "blenderbot",
+                "vit",
+                "clip",
+                "whisper",
+                "wav2vec2",
+                "flax_model",
+                "classifier",
+                "qa_outputs",
+                "lm_head",
+                "score",
+            }
+
+            for index in range(visible_items):
+                key_offset = unpacker.tell()
+                key_prefix = marker_reader.read(key_offset, 6)
+                if key_prefix:
+                    declared_key_length = _msgpack_declared_data_bytes(key_prefix[0], key_prefix)
+                    if declared_key_length is not None and declared_key_length > self.max_stream_key_length:
+                        summary.analysis_complete = False
+                        self._report_stream_decode_limit(
+                            state,
+                            result,
+                            path,
+                            "map key length "
+                            f"{declared_key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
+                        )
+                        raise _StreamCoverageStopped
+                key_value = self._read_stream_value(
+                    unpacker,
+                    marker_reader,
+                    result,
+                    summary,
+                    state,
+                    path=path,
+                    location=f"{location}[key:{index}]",
+                    depth=depth + 1,
+                    analyze_scalar=False,
+                    count_node=False,
+                )
+                key = key_value.value
+                if key_value.is_container or key_value.type_name == "skipped":
+                    key = f"<{key_value.type_name}_key>"
+                key_length: int | None = None
+                if HAS_MSGPACK and isinstance(key, msgpack.ExtType):
+                    key_length = len(key.data)
+                elif isinstance(key, str | bytes | bytearray):
+                    key_length = len(key)
+                if key_length is not None and key_length > self.max_stream_key_length:
+                    summary.analysis_complete = False
+                    self._report_stream_decode_limit(
+                        state,
+                        result,
+                        path,
+                        f"map key length {key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
+                    )
+                    raise _StreamCoverageStopped
+                key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
+                key_text = _text_for_security_matching(key)
+                key_location = f"{location}/{safe_key_str}" if location else safe_key_str
+                if key_text is not None and key_text in transformer_keys:
+                    direct_string_keys.add(key_text)
+                if top_level:
+                    if len(summary.top_level_keys) < 50:
+                        summary.top_level_keys.append(_redact_evidence_key(key))
+                    if key_text is not None and len(key_text) <= 128:
+                        summary.top_level_string_keys.add(key_text)
+                        if key_text.startswith("__orbax"):
+                            summary.orbax_format = True
+
+                value = self._read_stream_value(
+                    unpacker,
+                    marker_reader,
+                    result,
+                    summary,
+                    state,
+                    path=path,
+                    location=key_location,
+                    depth=depth + 1,
+                    count_node=True,
+                    capture_sequence=key_text == "shape",
+                )
+                self._check_suspicious_keys(key_str, value.value, key_location, result)
+
+                if key_text == "__jax_array__":
+                    has_jax_array = True
+
+                if (
+                    top_level
+                    and value.type_name == "dict"
+                    and key_text is not None
+                    and (value.direct_string_keys & transformer_keys or key_text.lower() in model_name_keys)
+                ):
+                    summary.has_nested_transformer_keys = True
+
+            if map_length > visible_items:
+                raise _StreamCoverageStopped
+
+            if has_jax_array:
+                self._check_jax_array_metadata({"__jax_array__": True}, location, result)
+            return _StreamValue("dict", direct_string_keys=direct_string_keys)
+
+        if marker is not None and (0x90 <= marker <= 0x9F or marker in {0xDC, 0xDD}):
+            array_length = unpacker.read_array_header()
+            visible_items = min(array_length, self.max_items_per_container)
+            if array_length > self.max_items_per_container:
+                summary.analysis_complete = False
+                self._report_stream_decode_limit(
+                    state,
+                    result,
+                    path,
+                    f"array length {array_length} exceeds max_array_len({self.max_items_per_container})",
+                )
+            sequence_summary = _StreamSequenceSummary(item_count=array_length) if capture_sequence else None
+            for index in range(visible_items):
+                value = self._read_stream_value(
+                    unpacker,
+                    marker_reader,
+                    result,
+                    summary,
+                    state,
+                    path=path,
+                    location=f"{location}[{index}]",
+                    depth=depth + 1,
+                    count_node=True,
+                )
+                if sequence_summary is None:
+                    continue
+
+                if isinstance(value.value, int) and not isinstance(value.value, bool):
+                    if value.value < 0 and sequence_summary.negative_dimension is None:
+                        sequence_summary.negative_dimension = (index, value.value)
+                    elif value.value > 10**9 and sequence_summary.oversized_dimension is None:
+                        sequence_summary.oversized_dimension = (index, value.value)
+
+                if len(sequence_summary.evidence_values) >= _MAX_STREAM_SEQUENCE_EVIDENCE or (
+                    value.is_container
+                    or value.type_name == "skipped"
+                    or (isinstance(value.value, str | bytes | bytearray) and len(value.value) > 4096)
+                    or (HAS_MSGPACK and isinstance(value.value, msgpack.ExtType))
+                ):
+                    sequence_summary.evidence_complete = False
+                else:
+                    sequence_summary.evidence_values.append(value.value)
+            if sequence_summary is not None:
+                shape_location = location.rsplit("/", 1)[0] if "/" in location else location
+                self._check_stream_shape_metadata(sequence_summary, shape_location, result)
+            if array_length > visible_items:
+                raise _StreamCoverageStopped
+            captured_values = None
+            if (
+                sequence_summary is not None
+                and sequence_summary.evidence_complete
+                and len(sequence_summary.evidence_values) == sequence_summary.item_count
+            ):
+                captured_values = sequence_summary.evidence_values
+            return _StreamValue("list", value=captured_values, sequence_summary=sequence_summary)
+
+        value = unpacker.unpack()
+        if analyze_scalar:
+            self._analyze_stream_scalar(value, location, result, summary)
+        if value is None:
+            type_name = "NoneType"
+        elif HAS_MSGPACK and isinstance(value, msgpack.ExtType):
+            type_name = "ExtType"
+        else:
+            type_name = type(value).__name__
+        return _StreamValue(type_name, value=value)
+
+    def _add_msgpack_stream_integrity_check_from_types(
+        self,
+        object_types: list[str],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        if len(object_types) <= 1:
+            return
+        trailing_objects_are_container_like = all(object_type in {"dict", "list"} for object_type in object_types[1:])
         result.add_check(
             name="Msgpack Stream Integrity Check",
             passed=False,
@@ -1340,134 +2516,114 @@ class FlaxMsgpackScanner(BaseScanner):
             location=path,
             details={
                 "has_trailing_data": True,
-                "trailing_object_count": len(objects) - 1,
-                "trailing_object_types": [type(stream_obj).__name__ for stream_obj in objects[1:9]],
+                "trailing_object_count": len(object_types) - 1,
+                "trailing_object_types": object_types[1:9],
                 "trailing_objects_are_container_like": trailing_objects_are_container_like,
             },
             rule_code="S902",
         )
 
-    def _unpack_bounded_msgpack_preview_value(
-        self,
-        unpacker: Any,
-        *,
-        depth: int,
-        state: dict[str, int],
-    ) -> tuple[Any, bool]:
-        """Decode a bounded visible prefix without materializing oversized containers."""
-        if depth > self.max_recursion_depth or state["nodes"] >= self.max_structure_nodes:
-            return None, False
-        state["nodes"] += 1
-
-        try:
-            map_length = unpacker.read_map_header()
-        except ValueError:
-            pass
-        else:
-            pairs: list[dict[Any, Any]] = []
-            for _ in range(min(map_length, self.max_items_per_container)):
-                key, key_complete = self._unpack_bounded_msgpack_preview_value(
-                    unpacker,
-                    depth=depth + 1,
-                    state=state,
-                )
-                if not key_complete:
-                    pairs.append({"<partial_key>": key})
-                    return pairs, False
-                value, value_complete = self._unpack_bounded_msgpack_preview_value(
-                    unpacker,
-                    depth=depth + 1,
-                    state=state,
-                )
-                normalized_key = str(key) if isinstance(key, list | dict) else key
-                pair = {normalized_key: value}
-                pairs.append(pair)
-                if not value_complete:
-                    return pairs, False
-            return pairs, map_length <= self.max_items_per_container
-
-        try:
-            array_length = unpacker.read_array_header()
-        except ValueError:
-            pass
-        else:
-            items: list[Any] = []
-            for _ in range(min(array_length, self.max_items_per_container)):
-                value, value_complete = self._unpack_bounded_msgpack_preview_value(
-                    unpacker,
-                    depth=depth + 1,
-                    state=state,
-                )
-                items.append(value)
-                if not value_complete:
-                    return items, False
-            return items, array_length <= self.max_items_per_container
-
-        return unpacker.unpack(), True
-
-    def _scan_bounded_msgpack_decode_prefix(self, path: str, result: ScanResult) -> None:
-        """Preserve visible security findings when normal decoding hits a budget."""
-        state = {"nodes": 0}
+    def _scan_msgpack_stream_from_path(self, path: str, result: ScanResult) -> _FlaxStreamSummary | None:
+        """Walk MessagePack tokens without materializing container objects."""
+        primary_summary = _FlaxStreamSummary()
+        object_types: list[str] = []
+        primary_state = _StreamTraversalState(max_nodes=self.max_structure_nodes)
+        trailing_state = _StreamTraversalState(max_nodes=self.max_structure_nodes)
         try:
             with open(path, "rb") as source:
+                stream_size = os.fstat(source.fileno()).st_size
+                marker_reader = _StreamMarkerReader(source)
                 unpacker = msgpack.Unpacker(
                     source,
                     read_size=self._msgpack_stream_read_size(),
-                    **self._msgpack_unpacker_kwargs(),
+                    **self._msgpack_event_unpacker_kwargs(),
                 )
-                for object_index in range(self.max_msgpack_stream_objects):
-                    preview, complete = self._unpack_bounded_msgpack_preview_value(
-                        unpacker,
-                        depth=0,
-                        state=state,
-                    )
-                    if preview is not None:
-                        self._analyze_content(preview, f"root[bounded_decode_prefix_{object_index}]", result)
-                    if not complete:
-                        break
-        except Exception:
-            # The original decode failure is already surfaced as inconclusive.
-            return
-
-    def _unpack_msgpack_objects_from_path(self, path: str, result: ScanResult) -> list[Any] | None:
-        """Stream MessagePack from disk so scans do not allocate the whole file before decoding."""
-        unpacker = msgpack.Unpacker(**self._msgpack_unpacker_kwargs())
-        objects: list[Any] = []
-        has_incomplete_tail = False
-        try:
-            with open(path, "rb") as source:
-                while chunk := source.read(self._msgpack_stream_read_size()):
-                    unpacker.feed(chunk)
-                    drain_result = self._drain_msgpack_unpacker(unpacker, objects, result, path)
-                    if drain_result is None:
+                while True:
+                    previous_offset = unpacker.tell()
+                    if len(object_types) >= self.max_msgpack_stream_objects:
+                        if previous_offset == stream_size:
+                            break
+                        marker = marker_reader.peek(previous_offset)
+                        required_header_bytes = 1 if marker is None else _msgpack_marker_header_bytes(marker)
+                        remaining_bytes = stream_size - previous_offset
+                        marker_prefix = marker_reader.read(previous_offset, required_header_bytes)
+                        declared_data_bytes = (
+                            None if marker is None else _msgpack_declared_data_bytes(marker, marker_prefix)
+                        )
+                        scalar_is_truncated = (
+                            declared_data_bytes is not None
+                            and remaining_bytes < required_header_bytes + declared_data_bytes
+                        )
+                        if (
+                            marker is None
+                            or marker == 0xC1
+                            or remaining_bytes < required_header_bytes
+                            or scalar_is_truncated
+                        ):
+                            self._add_msgpack_truncated_stream_check(
+                                result,
+                                path,
+                                stream_offset=previous_offset,
+                                stream_size=stream_size,
+                            )
+                            return None
+                        self._add_msgpack_stream_object_limit_check(result, path, len(object_types))
                         return None
-                    has_incomplete_tail = drain_result
-        except Exception as e:
-            if self._is_msgpack_limit_error(e):
-                self._scan_bounded_msgpack_decode_prefix(path, result)
-                self._add_msgpack_decode_limit_check(result, path, e)
-            else:
-                self._add_msgpack_parse_failure_check(result, path, e)
-            return None
 
-        if has_incomplete_tail:
-            self._add_msgpack_parse_failure_check(result, path, ValueError("incomplete trailing msgpack object"))
-            return None
-        if not objects:
-            result.add_check(
-                name="Msgpack Parse Check",
-                passed=False,
-                message="Failed to parse msgpack data: no decodable objects",
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"parse_error": "no decodable objects"},
-                rule_code="S902",
-            )
+                    object_index = len(object_types)
+                    summary = primary_summary if object_index == 0 else _FlaxStreamSummary()
+                    state = primary_state if object_index == 0 else trailing_state
+                    location = "root" if object_index == 0 else f"root[msgpack_object_{object_index}]"
+                    try:
+                        value = self._read_stream_value(
+                            unpacker,
+                            marker_reader,
+                            result,
+                            summary,
+                            state,
+                            path=path,
+                            location=location,
+                            depth=0,
+                            top_level=True,
+                        )
+                    except Exception as error:
+                        if self._is_msgpack_out_of_data(error):
+                            current_offset = unpacker.tell()
+                            if current_offset == previous_offset and previous_offset == stream_size:
+                                break
+                            self._add_msgpack_truncated_stream_check(
+                                result,
+                                path,
+                                stream_offset=current_offset,
+                                stream_size=stream_size,
+                            )
+                            return None
+                        raise
+                    object_types.append(value.type_name)
+                    if object_index == 0:
+                        primary_summary.top_level_type = value.type_name
+        except _StreamCoverageStopped:
             result.finish(success=False)
             return None
+        except Exception as error:
+            if self._is_msgpack_limit_error(error):
+                self._add_msgpack_decode_limit_check(result, path, error)
+            else:
+                self._add_msgpack_parse_failure_check(result, path, error)
+            return None
 
-        self._add_msgpack_stream_integrity_check(objects, result, path)
-        return objects
+        if not object_types:
+            self._add_msgpack_parse_failure_check(result, path, ValueError("no decodable objects"))
+            return None
+
+        if len(object_types) > 1:
+            result.metadata["msgpack_object_count"] = len(object_types)
+        result.metadata["msgpack_stream_analyzed_nodes"] = min(primary_state.nodes, primary_state.max_nodes) + min(
+            trailing_state.nodes, trailing_state.max_nodes
+        )
+        result.metadata["msgpack_stream_node_budget"] = primary_state.max_nodes + trailing_state.max_nodes
+        self._add_msgpack_stream_integrity_check_from_types(object_types, result, path)
+        return primary_summary
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -1521,48 +2677,20 @@ class FlaxMsgpackScanner(BaseScanner):
         try:
             self.current_file_path = path
 
-            objects = self._unpack_msgpack_objects_from_path(path, result)
-            if objects is None:
+            summary = self._scan_msgpack_stream_from_path(path, result)
+            if summary is None:
                 return result
 
-            obj = objects[0]
-
             # Record metadata
-            result.metadata["top_level_type"] = type(obj).__name__
-            if isinstance(obj, dict):
-                result.metadata["top_level_keys"] = [_redact_evidence_key(key) for key in list(obj.keys())[:50]]
-                result.metadata["key_count"] = len(obj.keys())
-            if len(objects) > 1:
-                result.metadata["msgpack_object_count"] = len(objects)
+            result.metadata["top_level_type"] = summary.top_level_type
+            if summary.top_level_type == "dict":
+                result.metadata["top_level_keys"] = summary.top_level_keys
+                result.metadata["key_count"] = summary.top_level_key_count
 
-            preanalysis_complete = self._check_preanalysis_structure_budget(
-                obj,
-                result,
-                location="root",
-                max_nodes=self.max_structure_nodes,
-            )
-            ml_analysis: dict[str, Any] | None = None
-            if preanalysis_complete:
-                # Extract JAX/Flax specific metadata and architecture information
-                ml_analysis = self._analyze_ml_structure(obj, result)
-                self._extract_jax_metadata(obj, result, ml_analysis=ml_analysis)
-
-                # Validate Flax structure with enhanced analysis
-                self._validate_flax_structure(obj, result, ml_analysis=ml_analysis)
-
-            # Perform deep security analysis
-            traversal_state = self._new_content_traversal_state(max_nodes=self.max_structure_nodes)
-            self._analyze_content(obj, "root", result, traversal_state=traversal_state)
-
-            trailing_max_nodes_per_object = max(1, self.max_structure_nodes // max(1, len(objects) - 1))
-            for object_index, stream_obj in enumerate(objects[1:], start=1):
-                stream_location = f"root[msgpack_object_{object_index}]"
-                self._analyze_content(
-                    stream_obj,
-                    stream_location,
-                    result,
-                    traversal_state=self._new_content_traversal_state(max_nodes=trailing_max_nodes_per_object),
-                )
+            if summary.analysis_complete:
+                ml_analysis = self._analyze_ml_structure(summary, result)
+                self._extract_jax_metadata(summary, result, ml_analysis=ml_analysis)
+                self._validate_flax_structure(summary, result, ml_analysis=ml_analysis)
 
             result.bytes_scanned = file_size
         except MemoryError:

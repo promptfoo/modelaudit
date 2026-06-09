@@ -716,6 +716,13 @@ def _detect_huggingface_content_route_format(
         prefix[:16],
         max(len(prefix), 1),
         None,
+        pickle_probe_sample=prefix,
+        pickle_probe_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            prefix,
+            _HF_CONTENT_SNIFF_BYTES,
+        ),
     )
     if detected_format in {"rknn", "torch7"} and not _allows_renamed_binary_content_route(remote_path):
         detected_format = "unknown"
@@ -855,6 +862,7 @@ def _get_hf_content_route_formats() -> set[str]:
         EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
         MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
         XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -869,6 +877,7 @@ def _get_hf_content_route_formats() -> set[str]:
             EXECUTABLE_ZIP_POLYGLOT_FORMAT,
             LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
             MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+            PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
             PROTOBUF_MODEL_CANDIDATE_FORMAT,
             TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
             XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -1927,6 +1936,9 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
         ValueError: If max_size is set and file size is unknown or exceeds it
         Exception: If download fails
     """
+    repo_id, branch, filename = parse_huggingface_file_url(url)
+    display_url = redact_huggingface_url_for_display(url)
+
     try:
         from huggingface_hub import HfApi, hf_hub_download
     except ImportError as e:
@@ -1934,9 +1946,6 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
             "huggingface-hub package is required for HuggingFace URL support. "
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
-
-    repo_id, branch, filename = parse_huggingface_file_url(url)
-    display_url = redact_huggingface_url_for_display(url)
 
     try:
         if max_size is not None and max_size < 0:

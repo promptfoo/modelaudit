@@ -8,7 +8,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool, str | None]:
     """
-    Validate Python code syntax without executing it.
+    Validate Python code syntax entirely in memory without executing it.
 
     Args:
         code: Python code string to validate

@@ -78,11 +78,16 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve fail-closed nested protocol 0 analysis after `INST` opcodes
 - fail closed when known-size pickle boundaries cannot be verified or contain trailing bytes, and bind file scans to one descriptor
 - fail closed before copying protocol 0 line operands larger than 8 MiB
 - fail closed before copying protocol 0 line operands larger than 8 MiB,
   including nested payload probes
+- fail closed when nested protocol 0 operand analysis reaches the recursion depth limit
+- detect nested pickles accepted by permissive base64 and hex decoders, and fail
+  closed when decoded prefixes leave over-budget encoded tails
 - Invalidate cached call-graph analysis when Python sources, import hooks, loaded module origins, or parent package markers change.
+- fail closed when PyTorch ZIP archives exceed the standalone pickle-member scan budget
 - detect dangerous call-like strings split across newline-separated statements
 - scan raw nested pickle payloads carried inside Unicode string literals
 - fail closed on protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
@@ -116,6 +121,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance Improvements
 
 - expose a bounded, source-validated analysis cache scope for multi-artifact scan operations
+- skip redundant raw nested-pickle probes for fully recognized base64 and hex literals
 - skip Python call-graph enrichment when native analysis has no references or
   has already classified every reference as critical
 
